@@ -1,0 +1,14 @@
+/target
+.agents/
+.claude/
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+__pycache__/
+*.pyc
