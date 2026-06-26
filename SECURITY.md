@@ -6,7 +6,13 @@
 
 ## Reporting A Vulnerability
 
-This repository does not yet have a public security contact configured. Until one is added, do not disclose exploitable issues publicly.
+Please report security vulnerabilities **privately** via GitHub's private
+vulnerability reporting: open the
+[Security tab](https://github.com/Sannrox/sekai-chisei/security/advisories/new)
+and click **"Report a vulnerability"**. This keeps the report confidential
+until a fix is available.
+
+Do not open public issues or pull requests for exploitable vulnerabilities.
 
 When reporting a vulnerability, include:
 
