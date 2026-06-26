@@ -10,7 +10,7 @@ description = "Local-first Rust control plane for policy-governed AI-assisted so
 # gRPC
 tonic = "0.12"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
