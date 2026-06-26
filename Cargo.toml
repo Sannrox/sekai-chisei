@@ -8,7 +8,7 @@ description = "Local-first Rust control plane for policy-governed AI-assisted so
 
 [dependencies]
 # gRPC
-tonic = "0.12"
+tonic = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 
