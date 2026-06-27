@@ -334,6 +334,10 @@ mod tests {
             auth_token: None,
             sample_rate: 0.05,
             sample_risk_threshold: 0.7,
+            scoring_enabled: false,
+            scoring_interval_secs: 60,
+            scoring_model: "claude-opus-4-8".into(),
+            scoring_batch_size: 16,
         }
     }
 
