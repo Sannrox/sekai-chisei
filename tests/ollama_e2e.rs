@@ -60,6 +60,10 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         auth_token: None,
         sample_rate: 0.05,
         sample_risk_threshold: 0.7,
+        scoring_enabled: false,
+        scoring_interval_secs: 60,
+        scoring_model: "claude-opus-4-8".into(),
+        scoring_batch_size: 16,
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
