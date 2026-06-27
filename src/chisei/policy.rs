@@ -11,7 +11,6 @@ pub struct Policy {
 
 pub struct PolicyResolver {
     namespace_policies: Mutex<HashMap<String, Policy>>,
-    repo_policies: Mutex<HashMap<String, Policy>>, // "ns:repo" -> policy
 }
 
 impl Default for PolicyResolver {
@@ -24,7 +23,6 @@ impl PolicyResolver {
     pub fn new() -> Self {
         Self {
             namespace_policies: Mutex::new(HashMap::new()),
-            repo_policies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -32,18 +30,7 @@ impl PolicyResolver {
         self.namespace_policies.lock().unwrap().insert(ns.into(), p);
     }
 
-    pub fn set_repo_policy(&self, ns: &str, repo: &str, p: Policy) {
-        self.repo_policies
-            .lock()
-            .unwrap()
-            .insert(format!("{}:{}", ns, repo), p);
-    }
-
-    pub fn effective_policy(&self, namespace: &str, repo: &str) -> Option<Policy> {
-        let repo_key = format!("{}:{}", namespace, repo);
-        if let Some(policy) = self.repo_policies.lock().unwrap().get(&repo_key).cloned() {
-            return Some(policy);
-        }
+    pub fn effective_policy(&self, namespace: &str) -> Option<Policy> {
         self.namespace_policies
             .lock()
             .unwrap()
@@ -54,17 +41,9 @@ impl PolicyResolver {
     pub fn resolve(
         &self,
         namespace: &str,
-        repo: &str,
         preferred_runtime: &str,
         preferred_model: &str,
     ) -> Result<(String, String), String> {
-        // Check repo-level override first
-        let repo_key = format!("{}:{}", namespace, repo);
-        let repos = self.repo_policies.lock().unwrap();
-        if let Some(p) = repos.get(&repo_key) {
-            return self.apply_policy(p, preferred_runtime, preferred_model);
-        }
-        drop(repos);
         // Then namespace
         let nss = self.namespace_policies.lock().unwrap();
         if let Some(p) = nss.get(namespace) {
@@ -124,7 +103,7 @@ mod tests {
     #[test]
     fn test_no_policy_allows_all() {
         let r = PolicyResolver::new();
-        let (rt, m) = r.resolve("ns", "repo", "kiro", "claude-4").unwrap();
+        let (rt, m) = r.resolve("ns", "kiro", "claude-4").unwrap();
         assert_eq!(rt, "kiro");
         assert_eq!(m, "claude-4");
     }
@@ -141,14 +120,14 @@ mod tests {
                 default_model: "claude-sonnet".into(),
             },
         );
-        let result = r.resolve("prod", "repo", "kiro", "gpt-4");
+        let result = r.resolve("prod", "kiro", "gpt-4");
         // gpt-4 not in allowed → falls to default
         let (_, m) = result.unwrap();
         assert_eq!(m, "claude-sonnet");
     }
 
     #[test]
-    fn test_repo_override() {
+    fn test_namespace_only_policy() {
         let r = PolicyResolver::new();
         r.set_namespace_policy(
             "ns",
@@ -159,18 +138,8 @@ mod tests {
                 default_model: "claude".into(),
             },
         );
-        r.set_repo_policy(
-            "ns",
-            "special",
-            Policy {
-                allowed_runtimes: vec![],
-                allowed_models: vec!["gpt-4".into()],
-                default_runtime: "codex".into(),
-                default_model: "gpt-4".into(),
-            },
-        );
-        let (rt, m) = r.resolve("ns", "special", "", "").unwrap();
-        assert_eq!(rt, "codex");
-        assert_eq!(m, "gpt-4");
+        let (rt, m) = r.resolve("ns", "", "").unwrap();
+        assert_eq!(rt, "kiro");
+        assert_eq!(m, "claude");
     }
 }

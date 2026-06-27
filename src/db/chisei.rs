@@ -27,7 +27,7 @@ impl SekaiDb {
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
                 suite_id TEXT NOT NULL,
-                repo TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '',
                 changed_file TEXT NOT NULL,
                 diff_hash TEXT NOT NULL,
                 parent_iteration_id TEXT NOT NULL,
@@ -49,7 +49,7 @@ impl SekaiDb {
             );
             CREATE TABLE IF NOT EXISTS chisei_sample_observations (
                 request_id TEXT PRIMARY KEY,
-                repo TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '',
                 spec TEXT NOT NULL DEFAULT '',
                 resolved_model TEXT NOT NULL DEFAULT '',
                 output_content TEXT NOT NULL DEFAULT '',
@@ -65,7 +65,7 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         match conn.execute(
-            "ALTER TABLE chisei_eval_iterations ADD COLUMN repo TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE chisei_eval_iterations ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
             [],
         ) {
             Ok(_) => {}
@@ -89,9 +89,9 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_evolve_tasks")?
             && table_exists(&conn, "aipp_evolve_enhancements")?
         {
-            let legacy_iter_repo_projection =
-                if column_exists(&conn, "aipp_eval_iterations", "repo")? {
-                    "repo"
+            let legacy_iter_namespace_projection =
+                if column_exists(&conn, "aipp_eval_iterations", "namespace")? {
+                    "namespace"
                 } else {
                     "''"
                 };
@@ -111,10 +111,10 @@ impl SekaiDb {
             conn.execute(
                 &format!(
                     "INSERT OR IGNORE INTO chisei_eval_iterations(
-                        id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id,
+                        id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id,
                         baseline_run_id, candidate_run_id, delta, regressed, created
                      )
-                     SELECT id, run_id, suite_id, {legacy_iter_repo_projection}, changed_file, diff_hash,
+                     SELECT id, run_id, suite_id, {legacy_iter_namespace_projection}, changed_file, diff_hash,
                             parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created
                      FROM aipp_eval_iterations"
                 ),
@@ -142,7 +142,7 @@ impl SekaiDb {
                      FROM chisei_eval_iterations i
                      LEFT JOIN chisei_eval_suites s ON s.id = i.suite_id
                      LEFT JOIN chisei_eval_runs r ON r.id = i.run_id
-                     WHERE i.repo = ''",
+                     WHERE i.namespace = ''",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -159,7 +159,7 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
         };
         for (id, changed_file, cases_json, results_json) in legacy_rows {
-            let Some(repo) = infer_legacy_iteration_repo(
+            let Some(namespace) = infer_legacy_iteration_namespace(
                 &changed_file,
                 cases_json.as_deref(),
                 results_json.as_deref(),
@@ -167,8 +167,8 @@ impl SekaiDb {
                 continue;
             };
             conn.execute(
-                "UPDATE chisei_eval_iterations SET repo = ?1 WHERE id = ?2 AND repo = ''",
-                params![repo, id],
+                "UPDATE chisei_eval_iterations SET namespace = ?1 WHERE id = ?2 AND namespace = ''",
+                params![namespace, id],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -335,12 +335,12 @@ impl SekaiDb {
     pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 iteration.id,
                 iteration.run_id,
                 iteration.suite_id,
-                iteration.repo,
+                iteration.namespace,
                 iteration.changed_file,
                 iteration.diff_hash,
                 iteration.parent_iteration_id,
@@ -362,7 +362,7 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created, id",
+                "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -371,7 +371,7 @@ impl SekaiDb {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -390,7 +390,7 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations ORDER BY created, id",
+                "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations ORDER BY created, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -399,7 +399,7 @@ impl SekaiDb {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -420,14 +420,14 @@ impl SekaiDb {
     ) -> Result<Option<eval::Iteration>, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE changed_file = ?1 ORDER BY created DESC, id DESC LIMIT 1",
+            "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE changed_file = ?1 ORDER BY created DESC, id DESC LIMIT 1",
             params![changed_file],
             |row| {
                 Ok(eval::Iteration {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -509,11 +509,11 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO chisei_sample_observations
-                (request_id, repo, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored)
+                (request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
             params![
                 obs.request_id,
-                obs.repo,
+                obs.namespace,
                 obs.spec,
                 obs.resolved_model,
                 obs.output_content,
@@ -537,7 +537,7 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT request_id, repo, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored
+                "SELECT request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored
                  FROM chisei_sample_observations WHERE scored = 0 ORDER BY timestamp, request_id LIMIT ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -545,7 +545,7 @@ impl SekaiDb {
             .query_map(params![effective_limit], |row| {
                 Ok(crate::chisei::scoring::SampleObservation {
                     request_id: row.get(0)?,
-                    repo: row.get(1)?,
+                    namespace: row.get(1)?,
                     spec: row.get(2)?,
                     resolved_model: row.get(3)?,
                     output_content: row.get(4)?,
@@ -605,24 +605,24 @@ impl SekaiDb {
     }
 }
 
-fn infer_legacy_iteration_repo(
+fn infer_legacy_iteration_namespace(
     changed_file: &str,
     cases_json: Option<&str>,
     results_json: Option<&str>,
 ) -> Option<String> {
     let cases: Vec<eval::Case> = serde_json::from_str(cases_json?).ok()?;
     let results: Vec<eval::CaseResult> = serde_json::from_str(results_json?).ok()?;
-    let case_repos: HashMap<_, _> = cases.into_iter().map(|case| (case.id, case.repo)).collect();
-    let repos: BTreeSet<String> = results
+    let case_namespaces: HashMap<_, _> = cases.into_iter().map(|case| (case.id, case.namespace)).collect();
+    let namespaces: BTreeSet<String> = results
         .iter()
-        .filter_map(|result| case_repos.get(&result.case_id).cloned())
+        .filter_map(|result| case_namespaces.get(&result.case_id).cloned())
         .collect();
-    if repos.len() == 1 {
-        return repos.into_iter().next();
+    if namespaces.len() == 1 {
+        return namespaces.into_iter().next();
     }
-    let matching: Vec<String> = repos
+    let matching: Vec<String> = namespaces
         .into_iter()
-        .filter(|repo| changed_file.contains(repo))
+        .filter(|namespace| changed_file.contains(namespace))
         .collect();
     if matching.len() == 1 {
         Some(matching[0].clone())
