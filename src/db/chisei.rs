@@ -46,7 +46,21 @@ impl SekaiDb {
             CREATE TABLE IF NOT EXISTS chisei_evolve_enhancements (
                 request_id TEXT PRIMARY KEY,
                 original_spec TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS chisei_sample_observations (
+                request_id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL DEFAULT '',
+                spec TEXT NOT NULL DEFAULT '',
+                resolved_model TEXT NOT NULL DEFAULT '',
+                output_content TEXT NOT NULL DEFAULT '',
+                sample_reason TEXT NOT NULL DEFAULT '',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT NOT NULL DEFAULT '',
+                timestamp INTEGER NOT NULL,
+                scored INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);",
         )
         .map_err(|e| e.to_string())?;
         match conn.execute(
@@ -443,6 +457,77 @@ impl SekaiDb {
         conn.execute(
             "INSERT OR REPLACE INTO chisei_evolve_enhancements (request_id, original_spec) VALUES (?1, ?2)",
             params![request_id, original_spec],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Persist a sampled execution observation captured at execute time. Idempotent on
+    /// `request_id` (re-execution does not reset the `scored` flag).
+    pub fn put_sample_observation(
+        &self,
+        obs: &crate::chisei::scoring::SampleObservation,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO chisei_sample_observations
+                (request_id, repo, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+            params![
+                obs.request_id,
+                obs.repo,
+                obs.spec,
+                obs.resolved_model,
+                obs.output_content,
+                obs.sample_reason,
+                obs.input_tokens,
+                obs.output_tokens,
+                obs.stop_reason,
+                obs.timestamp,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Oldest-first batch of observations the scoring job has not yet consumed.
+    pub fn list_unscored_observations(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
+        let effective_limit = if limit > 0 { limit } else { 16 };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT request_id, repo, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored
+                 FROM chisei_sample_observations WHERE scored = 0 ORDER BY timestamp, request_id LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![effective_limit], |row| {
+                Ok(crate::chisei::scoring::SampleObservation {
+                    request_id: row.get(0)?,
+                    repo: row.get(1)?,
+                    spec: row.get(2)?,
+                    resolved_model: row.get(3)?,
+                    output_content: row.get(4)?,
+                    sample_reason: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    stop_reason: row.get(8)?,
+                    timestamp: row.get(9)?,
+                    scored: row.get::<_, i64>(10)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn mark_observation_scored(&self, request_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chisei_sample_observations SET scored = 1 WHERE request_id = ?1",
+            params![request_id],
         )
         .map_err(|e| e.to_string())?;
         Ok(())

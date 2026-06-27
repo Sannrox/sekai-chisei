@@ -65,6 +65,17 @@ impl ChiseiServiceImpl {
         }
     }
 
+    /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
+    /// and config — so emitted runs are visible to live regression checks immediately.
+    pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
+        crate::chisei::scoring::ScoringJob::new(
+            self.db.clone(),
+            self.eval.clone(),
+            self.config.clone(),
+            self.budget.clone(),
+        )
+    }
+
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let _ = db.migrate_chisei();
         db.migrate_audit();
@@ -793,6 +804,24 @@ impl ChiseiService for ChiseiServiceImpl {
                 target_id: input.request_id.clone(),
                 outcome: "observed".into(),
             });
+            // Durable, judge-able record (spec + output) that the scoring job consumes to
+            // produce real eval runs. Kept in its own table so large content stays out of the
+            // audit evidence JSON.
+            let _ = self
+                .db
+                .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                    request_id: input.request_id.clone(),
+                    repo: input.repo.clone(),
+                    spec: plan.enriched_spec.clone(),
+                    resolved_model: plan.resolved_model.clone(),
+                    output_content: chat.content.clone(),
+                    sample_reason: plan.sample_reason.clone(),
+                    input_tokens: chat.input_tokens,
+                    output_tokens: chat.output_tokens,
+                    stop_reason: chat.stop_reason.clone(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    scored: false,
+                });
         }
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         Ok(Response::new(ExecutePlanResponse {
@@ -1353,6 +1382,10 @@ mod tests {
             auth_token: None,
             sample_rate: 0.0,
             sample_risk_threshold: 0.7,
+            scoring_enabled: false,
+            scoring_interval_secs: 60,
+            scoring_model: "claude-opus-4-8".into(),
+            scoring_batch_size: 16,
         }
     }
 
