@@ -116,6 +116,9 @@ message ExecutionPlan {
   repeated string affinity_repos = 18;
   bool eval_regressed = 19;
   string eval_regression_reason = 20;
+  bool sampled = 21;
+  double sample_rate = 22;
+  string sample_reason = 23;
 }
 
 message PlannedChatResponse {
