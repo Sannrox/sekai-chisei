@@ -64,6 +64,9 @@ const PASS_THRESHOLD: i32 = 60;
 const SNIPPET_LEN: usize = 2000;
 /// Judge output cap.
 const JUDGE_MAX_TOKENS: i32 = 1024;
+/// After this many judge failures an observation is retired (recorded + deleted) so a record that
+/// fails deterministically cannot occupy a batch slot forever and starve healthy work.
+const MAX_JUDGE_ATTEMPTS: i64 = 3;
 
 const JUDGE_SYSTEM_PREAMBLE: &str = "You are a rigorous, impartial evaluator of an AI coding \
 assistant's output. Score the output against the rubric and call the `record_score` tool exactly \
@@ -161,8 +164,9 @@ impl ScoringJob {
             for obs in &group {
                 // Per-observation isolation: a judge failure on one record (provider error,
                 // oversized content, misconfigured key/model) must not abort the batch or block
-                // the pipeline. Leave the record unscored so it is retried on a later cycle; the
-                // rest of the batch — and every other repo group — still makes progress.
+                // the pipeline. The rest of the batch — and every other repo group — still makes
+                // progress. A transient failure is retried next cycle; a record that fails
+                // MAX_JUDGE_ATTEMPTS times is retired so it cannot occupy a batch slot forever.
                 let verdict = match self
                     .judge
                     .judge(&self.model, &rubric, &obs.spec, &obs.output_content)
@@ -170,7 +174,7 @@ impl ScoringJob {
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("scoring job: judge failed for {}: {e}", obs.request_id);
+                        self.handle_judge_failure(&repo, obs, &e);
                         continue;
                     }
                 };
@@ -221,6 +225,42 @@ impl ScoringJob {
             }
         }
         Ok(total_scored)
+    }
+
+    /// Handle a judge failure for one observation: count the attempt and, once it has failed
+    /// `MAX_JUDGE_ATTEMPTS` times, retire it (audit + delete) so a deterministically-failing record
+    /// cannot permanently occupy an oldest-first batch slot and starve healthy observations.
+    fn handle_judge_failure(&self, repo: &str, obs: &SampleObservation, err: &str) {
+        let attempts = self
+            .db
+            .bump_observation_attempts(&obs.request_id)
+            .unwrap_or(MAX_JUDGE_ATTEMPTS);
+        if attempts >= MAX_JUDGE_ATTEMPTS {
+            eprintln!(
+                "scoring job: retiring {} after {attempts} judge failures: {err}",
+                obs.request_id
+            );
+            let mut evidence = std::collections::HashMap::new();
+            evidence.insert("repo".to_string(), repo.to_string());
+            evidence.insert("attempts".to_string(), attempts.to_string());
+            evidence.insert("error".to_string(), err.to_string());
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.scoring".into(),
+                action: "judge_failed".into(),
+                reason: format!("retired after {attempts} judge failures"),
+                evidence,
+                target_id: obs.request_id.clone(),
+                outcome: "retired".into(),
+            });
+            let _ = self.db.delete_observation(&obs.request_id);
+        } else {
+            eprintln!(
+                "scoring job: judge failed for {} (attempt {attempts}), will retry: {err}",
+                obs.request_id
+            );
+        }
     }
 
     /// Build a synthetic per-repo suite (one case per observation, mirroring the run's case ids so
@@ -407,7 +447,10 @@ impl Judge for LlmJudge {
             max_tokens: JUDGE_MAX_TOKENS,
         };
 
-        // Reserve against a dedicated scoring budget bucket, then reconcile to actual usage.
+        // Account judge usage against the shared budget tracker under the `chisei.scoring` bucket
+        // and reconcile to actual usage. This is only *enforced* if an operator registers a limit
+        // for that bucket (via SetBudgetLimit) — otherwise check_and_reserve is a no-op. By default
+        // judge cost is bounded by throughput instead: batch_size observations per interval.
         let user_id = "chisei.scoring";
         let estimated = (system_estimate(&req)).max(1);
         self.budget.check_and_reserve(user_id, estimated)?;
@@ -683,6 +726,39 @@ mod tests {
         );
         assert!(eval.repo_regression_signal("acme").is_none());
         assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn poison_record_is_retired_after_max_attempts() {
+        let (db, eval) = setup();
+        observe_with_output(&db, "req-bad", "acme", 100, "poison output");
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(PoisonJudge),
+            16,
+            "claude-opus-4-8",
+        );
+
+        // It survives the first MAX_JUDGE_ATTEMPTS-1 cycles, then is retired so it can't keep
+        // occupying an (oldest-first) batch slot and starve healthy work.
+        for _ in 0..(MAX_JUDGE_ATTEMPTS - 1) {
+            assert_eq!(job.run_once().await.unwrap(), 0);
+            assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
+        }
+        assert_eq!(job.run_once().await.unwrap(), 0);
+        assert!(db.list_unscored_observations(16).unwrap().is_empty());
+
+        // Retirement is auditable.
+        let retired = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("judge_failed".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].target_id, "req-bad");
     }
 
     #[tokio::test]

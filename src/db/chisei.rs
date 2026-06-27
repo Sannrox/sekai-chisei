@@ -58,13 +58,23 @@ impl SekaiDb {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 stop_reason TEXT NOT NULL DEFAULT '',
                 timestamp INTEGER NOT NULL,
-                scored INTEGER NOT NULL DEFAULT 0
+                scored INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);",
         )
         .map_err(|e| e.to_string())?;
         match conn.execute(
             "ALTER TABLE chisei_eval_iterations ADD COLUMN repo TEXT NOT NULL DEFAULT ''",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") => {}
+            Err(err) => return Err(err.to_string()),
+        }
+        match conn.execute(
+            "ALTER TABLE chisei_sample_observations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
             [],
         ) {
             Ok(_) => {}
@@ -521,6 +531,23 @@ impl SekaiDb {
             })
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Increment and return the judge-failure count for an observation, so the scoring job can
+    /// retire records that fail deterministically instead of letting them occupy batch slots forever.
+    pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chisei_sample_observations SET attempts = attempts + 1 WHERE request_id = ?1",
+            params![request_id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT attempts FROM chisei_sample_observations WHERE request_id = ?1",
+            params![request_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Remove a consumed observation. The row is queue input only — the scored outcome is
