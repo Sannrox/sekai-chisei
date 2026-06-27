@@ -92,6 +92,10 @@ const MAX_JUDGE_ATTEMPTS: i64 = 3;
 /// Per-field cap on the spec/output embedded in the judge prompt. Bounds cost and removes the
 /// context-overflow failure class (an oversized input would otherwise fail the provider forever).
 const JUDGE_INPUT_LEN: usize = 12000;
+/// How many runs/iterations to retain per synthetic sampling suite. The scoring job emits one of
+/// each per repo per cycle; without a cap they grow unbounded (and are hydrated into memory at
+/// startup). Keeping the most recent N preserves the regression baseline while bounding growth.
+const SAMPLING_RETENTION: i64 = 20;
 
 const JUDGE_SYSTEM_PREAMBLE: &str = "You are a rigorous, impartial evaluator of an AI coding \
 assistant's output. Score the output against the rubric and call the `record_score` tool exactly \
@@ -305,7 +309,8 @@ impl ScoringJob {
 
     /// Build a synthetic per-repo suite (one case per observation, mirroring the run's case ids so
     /// the eval store can infer the repo), persist the run + a tracked iteration, and record an
-    /// audit decision. Bounded: the suite only ever holds the current batch's cases.
+    /// audit decision. Bounded: the suite holds only the current batch's cases, and runs/iterations
+    /// are pruned to the most recent `SAMPLING_RETENTION` per suite (DB and memory).
     fn emit_run(
         &self,
         repo: &str,
@@ -380,6 +385,22 @@ impl ScoringJob {
             // regression signal. Don't fail the whole batch over it.
             Err(e) => eprintln!("scoring job: skipped iteration for repo {repo:?}: {e}"),
         }
+
+        // Bound the continuously-produced runs/iterations for this synthetic suite, in both the DB
+        // and the in-memory store (the latter is hydrated wholesale at startup). Retention keeps
+        // enough history for the regression baseline; pruning is scoped to this sampling suite, so
+        // user-authored eval data is never affected. Best-effort: a prune failure must not drop the
+        // scored run.
+        let _ = self
+            .db
+            .prune_eval_runs_for_suite(&suite_id, SAMPLING_RETENTION);
+        let _ = self
+            .db
+            .prune_eval_iterations_for_suite(&suite_id, SAMPLING_RETENTION);
+        self.eval
+            .retain_recent_runs(&suite_id, SAMPLING_RETENTION as usize);
+        self.eval
+            .retain_recent_iterations(&suite_id, SAMPLING_RETENTION as usize);
         Ok(())
     }
 
@@ -860,6 +881,40 @@ mod tests {
             })
             .unwrap();
         assert!(retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sampling_runs_and_iterations_are_retention_bounded() {
+        let (db, eval) = setup();
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(StubJudge {
+                score: 80,
+                passed: true,
+            }),
+            16,
+            "claude-opus-4-8",
+        );
+
+        // Emit more cycles than the retention bound; one run + iteration is produced per cycle.
+        let cycles = (SAMPLING_RETENTION + 5) as usize;
+        for i in 0..cycles {
+            observe(&db, &format!("req-{i}"), "acme", 1000 + i as i64);
+            assert_eq!(job.run_once().await.unwrap(), 1);
+            // Space cycles so each run gets a distinct millisecond-based id (as in production,
+            // where cycles are seconds apart).
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        let suite = "sampling-acme";
+        assert!(db.list_eval_run_records(suite).unwrap().len() as i64 <= SAMPLING_RETENTION);
+        assert!(db.list_eval_iteration_records(suite).unwrap().len() as i64 <= SAMPLING_RETENTION);
+        assert!(eval.list_runs(suite).len() as i64 <= SAMPLING_RETENTION);
+        assert!(eval.list_iterations(suite).len() as i64 <= SAMPLING_RETENTION);
+
+        // The regression baseline survives pruning, so the signal still resolves.
+        assert!(eval.repo_regression_signal("acme").is_some());
     }
 
     #[tokio::test]

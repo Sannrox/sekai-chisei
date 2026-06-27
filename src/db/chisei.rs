@@ -304,6 +304,34 @@ impl SekaiDb {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Keep only the newest `keep` runs for a suite (newest by timestamp), deleting the rest. Used
+    /// to bound the rows the scoring job's continuous per-cycle run emission would otherwise grow
+    /// without limit. Scoped to a single suite id, so user-authored suites are never touched.
+    pub fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chisei_eval_runs WHERE suite_id = ?1 AND id NOT IN (
+                SELECT id FROM chisei_eval_runs WHERE suite_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2
+            )",
+            params![suite_id, keep],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Keep only the newest `keep` iterations for a suite (newest by `created`), deleting the rest.
+    pub fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chisei_eval_iterations WHERE suite_id = ?1 AND id NOT IN (
+                SELECT id FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created DESC, id DESC LIMIT ?2
+            )",
+            params![suite_id, keep],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
