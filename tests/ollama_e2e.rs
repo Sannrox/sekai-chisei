@@ -58,6 +58,8 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         ollama_url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
         native_llm_url: None,
         auth_token: None,
+        sample_rate: 0.05,
+        sample_risk_threshold: 0.7,
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
