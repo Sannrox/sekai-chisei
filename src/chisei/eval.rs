@@ -165,6 +165,41 @@ impl EvalStore {
             .insert(iteration.id.clone(), iteration);
     }
 
+    /// Drop all but the newest `keep` runs for a suite from memory (newest by timestamp). Used to
+    /// bound the runs a continuous producer (the scoring job) accumulates for its synthetic suites.
+    pub fn retain_recent_runs(&self, suite_id: &str, keep: usize) {
+        let mut runs = self.runs.lock().unwrap();
+        let mut ordered: Vec<(String, i64)> = runs
+            .values()
+            .filter(|r| r.suite_id == suite_id)
+            .map(|r| (r.id.clone(), r.timestamp))
+            .collect();
+        if ordered.len() <= keep {
+            return;
+        }
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        for (id, _) in ordered.into_iter().skip(keep) {
+            runs.remove(&id);
+        }
+    }
+
+    /// Drop all but the newest `keep` iterations for a suite from memory (newest by `created`).
+    pub fn retain_recent_iterations(&self, suite_id: &str, keep: usize) {
+        let mut iterations = self.iterations.lock().unwrap();
+        let mut ordered: Vec<(String, i64)> = iterations
+            .values()
+            .filter(|i| i.suite_id == suite_id)
+            .map(|i| (i.id.clone(), i.created))
+            .collect();
+        if ordered.len() <= keep {
+            return;
+        }
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        for (id, _) in ordered.into_iter().skip(keep) {
+            iterations.remove(&id);
+        }
+    }
+
     pub fn list_iterations(&self, suite_id: &str) -> Vec<Iteration> {
         let mut iterations: Vec<_> = self
             .iterations
