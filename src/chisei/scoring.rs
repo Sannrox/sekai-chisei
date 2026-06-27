@@ -7,6 +7,12 @@
 //! gate, and emits one [`eval::Run`] per repo via the same persistence path the `CreateEvalRun`
 //! RPC uses. The resulting iterations feed [`EvalStore::repo_regression_signal`], which already
 //! drives adaptive sampling (`reason = "eval_regressed"`) — closing the learning loop.
+//!
+//! NOTE: the regression signal here is a batch-vs-batch heuristic: each cycle's mean judge score is
+//! compared against the previous cycle's, over *disjoint* sampled task sets. Only batches of at
+//! least [`MIN_OBS_FOR_REGRESSION`] observations are allowed to drive the (execution-gating) signal,
+//! which removes the worst single-record noise, but a statistically rigorous design (stable
+//! per-case baselines / variance-aware thresholds over like-for-like tasks) is a deferred follow-up.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -96,6 +102,12 @@ const JUDGE_INPUT_LEN: usize = 12000;
 /// each per repo per cycle; without a cap they grow unbounded (and are hydrated into memory at
 /// startup). Keeping the most recent N preserves the regression baseline while bounding growth.
 const SAMPLING_RETENTION: i64 = 20;
+/// Minimum observations in a batch before it may drive the (execution-gating) regression signal.
+/// Consecutive sampled batches contain *different* tasks, so a tiny batch's mean is dominated by
+/// task-mix variance; requiring a meaningful sample keeps single-record noise from flapping the
+/// gate. (A like-for-like baseline design would be more rigorous — see module note — but this
+/// removes the worst false-positive source without a redesign.) The scored run is always recorded.
+const MIN_OBS_FOR_REGRESSION: usize = 5;
 
 const JUDGE_SYSTEM_PREAMBLE: &str = "You are a rigorous, impartial evaluator of an AI coding \
 assistant's output. Score the output against the rubric and call the `record_score` tool exactly \
@@ -182,6 +194,7 @@ impl ScoringJob {
             return Ok(0);
         }
 
+        let pending = observations.len();
         let mut by_repo: BTreeMap<String, Vec<SampleObservation>> = BTreeMap::new();
         for obs in observations {
             by_repo.entry(obs.repo.clone()).or_default().push(obs);
@@ -251,11 +264,28 @@ impl ScoringJob {
 
             // Consumed rows are deleted — they are queue input, not durable state. The scored
             // outcome lives on in the eval run, iteration, and audit decision. This bounds the
-            // table to the unscored backlog plus the in-flight batch.
+            // table to the unscored backlog plus the in-flight batch. Best-effort: the run is
+            // already committed, so a rare delete failure must not abort the cycle (skipping the
+            // remaining repo groups); the row is simply re-scored on a later cycle.
             for obs in &scored_obs {
-                self.db.delete_observation(&obs.request_id)?;
+                if let Err(e) = self.db.delete_observation(&obs.request_id) {
+                    eprintln!(
+                        "scoring job: failed to delete consumed observation {}: {e}",
+                        obs.request_id
+                    );
+                }
                 total_scored += 1;
             }
+        }
+
+        // A non-empty backlog that scored nothing means every judge call failed this cycle — most
+        // likely a misconfigured SCORING_MODEL/credentials. Surface it so the condition (which
+        // otherwise re-sends the same records and accrues cost silently) is visible, not silent.
+        if total_scored == 0 {
+            eprintln!(
+                "scoring job: {pending} observation(s) pending but none scored this cycle — check SCORING_MODEL/credentials (model={})",
+                self.model
+            );
         }
         Ok(total_scored)
     }
@@ -351,40 +381,53 @@ impl ScoringJob {
         self.db.put_eval_run(&run)?;
         self.eval.create_run(run.clone());
 
-        // Track an iteration so regression detection (and adaptive sampling) picks this up.
+        // Track an iteration so regression detection (and adaptive sampling) picks this up — but
+        // only for statistically meaningful batches, since the delta compares this batch's mean
+        // against the previous *disjoint* batch and a tiny sample is dominated by task-mix variance.
         // `diff_hash` is the run id — a stable, unique marker for this batch.
-        match self
-            .eval
-            .track_iteration(&suite_id, &run.id, &changed_file, &run.id)
-        {
-            Ok(iteration) => {
-                self.db.put_eval_iteration(&iteration)?;
-                let mut evidence = std::collections::HashMap::new();
-                evidence.insert("repo".to_string(), repo.to_string());
-                evidence.insert("run_id".to_string(), run.id.clone());
-                evidence.insert("model".to_string(), self.model.clone());
-                evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
-                evidence.insert("delta".to_string(), format!("{:.1}", iteration.delta));
-                evidence.insert("regressed".to_string(), iteration.regressed.to_string());
-                let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now,
-                    actor: "chisei.scoring".into(),
-                    action: "scored".into(),
-                    reason: format!("scored {total} sampled observation(s) for repo {repo}"),
-                    evidence,
-                    target_id: repo.to_string(),
-                    outcome: if iteration.regressed {
-                        "regressed".into()
-                    } else {
-                        "stable".into()
-                    },
-                });
+        let mut delta: Option<f64> = None;
+        let mut regressed = false;
+        if group.len() >= MIN_OBS_FOR_REGRESSION {
+            match self
+                .eval
+                .track_iteration(&suite_id, &run.id, &changed_file, &run.id)
+            {
+                Ok(iteration) => {
+                    self.db.put_eval_iteration(&iteration)?;
+                    delta = Some(iteration.delta);
+                    regressed = iteration.regressed;
+                }
+                // An empty repo (or otherwise un-inferable) run still persists; it simply has no
+                // regression signal. Don't fail the whole batch over it.
+                Err(e) => eprintln!("scoring job: skipped iteration for repo {repo:?}: {e}"),
             }
-            // An empty repo (or otherwise un-inferable) run still persists; it simply has no
-            // regression signal. Don't fail the whole batch over it.
-            Err(e) => eprintln!("scoring job: skipped iteration for repo {repo:?}: {e}"),
         }
+
+        // Always record the scored run as an audit decision (the durable, queryable outcome),
+        // whether or not it was large enough to drive a regression signal.
+        let mut evidence = std::collections::HashMap::new();
+        evidence.insert("repo".to_string(), repo.to_string());
+        evidence.insert("run_id".to_string(), run.id.clone());
+        evidence.insert("model".to_string(), self.model.clone());
+        evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
+        if let Some(delta) = delta {
+            evidence.insert("delta".to_string(), format!("{delta:.1}"));
+            evidence.insert("regressed".to_string(), regressed.to_string());
+        }
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now,
+            actor: "chisei.scoring".into(),
+            action: "scored".into(),
+            reason: format!("scored {total} sampled observation(s) for repo {repo}"),
+            evidence,
+            target_id: repo.to_string(),
+            outcome: if regressed {
+                "regressed".into()
+            } else {
+                "stable".into()
+            },
+        });
 
         // Bound the continuously-produced runs/iterations for this synthetic suite, in both the DB
         // and the in-memory store (the latter is hydrated wholesale at startup). Retention keeps
@@ -714,11 +757,18 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed `count` observations for a repo with distinct ids/timestamps from `base`.
+    fn observe_batch(db: &SekaiDb, repo: &str, base: &str, count: usize, ts_base: i64) {
+        for i in 0..count {
+            observe(db, &format!("{base}-{i}"), repo, ts_base + i as i64);
+        }
+    }
+
     #[tokio::test]
     async fn scores_observations_into_a_run_and_iteration() {
         let (db, eval) = setup();
-        observe(&db, "req-1", "acme", 100);
-        observe(&db, "req-2", "acme", 101);
+        // A batch at/above MIN_OBS_FOR_REGRESSION so it drives the regression signal.
+        observe_batch(&db, "acme", "req", MIN_OBS_FOR_REGRESSION, 100);
 
         let job = ScoringJob::with_judge(
             db.clone(),
@@ -732,12 +782,12 @@ mod tests {
         );
 
         let scored = job.run_once().await.unwrap();
-        assert_eq!(scored, 2);
+        assert_eq!(scored, MIN_OBS_FOR_REGRESSION);
 
-        // A run with both case results is persisted under the synthetic repo suite.
+        // One run holding every case result is persisted under the synthetic repo suite.
         let runs = db.list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].results.len(), 2);
+        assert_eq!(runs[0].results.len(), MIN_OBS_FOR_REGRESSION);
         assert!(runs[0].results.iter().all(|r| r.passed && r.score == 90));
 
         // Observations are consumed.
@@ -751,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn second_batch_with_low_scores_marks_regression() {
         let (db, eval) = setup();
-        observe(&db, "req-1", "acme", 100);
+        observe_batch(&db, "acme", "good", MIN_OBS_FOR_REGRESSION, 100);
         let good = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),
@@ -762,10 +812,10 @@ mod tests {
             16,
             "claude-opus-4-8",
         );
-        assert_eq!(good.run_once().await.unwrap(), 1);
+        assert_eq!(good.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
         assert!(!eval.repo_regression_signal("acme").unwrap().regressed);
 
-        observe(&db, "req-2", "acme", 200);
+        observe_batch(&db, "acme", "bad", MIN_OBS_FOR_REGRESSION, 200);
         let bad = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),
@@ -776,10 +826,34 @@ mod tests {
             16,
             "claude-opus-4-8",
         );
-        assert_eq!(bad.run_once().await.unwrap(), 1);
+        assert_eq!(bad.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
 
         // 10 vs 95 is a >10 point drop → regression flagged, which is what adaptive sampling reads.
         assert!(eval.repo_regression_signal("acme").unwrap().regressed);
+    }
+
+    #[tokio::test]
+    async fn small_batches_do_not_drive_a_regression_signal() {
+        let (db, eval) = setup();
+        // A sub-threshold batch is scored and recorded, but must not flap the execution gate.
+        observe_batch(&db, "acme", "req", MIN_OBS_FOR_REGRESSION - 1, 100);
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(StubJudge {
+                score: 5,
+                passed: false,
+            }),
+            16,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(job.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION - 1);
+        // The run is recorded (data preserved)…
+        assert_eq!(db.list_eval_run_records("sampling-acme").unwrap().len(), 1);
+        // …but no iteration was created, so there is no regression signal to gate execution.
+        assert!(eval.repo_regression_signal("acme").is_none());
     }
 
     #[tokio::test]
@@ -911,10 +985,17 @@ mod tests {
         );
 
         // Emit more cycles than the retention bound; one run + iteration is produced per cycle.
+        // Each batch is at the regression threshold so iterations (not just runs) are produced.
         let cycles = (SAMPLING_RETENTION + 5) as usize;
         for i in 0..cycles {
-            observe(&db, &format!("req-{i}"), "acme", 1000 + i as i64);
-            assert_eq!(job.run_once().await.unwrap(), 1);
+            observe_batch(
+                &db,
+                "acme",
+                &format!("c{i}"),
+                MIN_OBS_FOR_REGRESSION,
+                1000 + (i * 100) as i64,
+            );
+            assert_eq!(job.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
             // Space cycles so each run gets a distinct millisecond-based id (as in production,
             // where cycles are seconds apart).
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
