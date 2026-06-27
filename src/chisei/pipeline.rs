@@ -314,6 +314,32 @@ impl Step for RiskStep {
     }
 }
 
+/// Classifies a request's complexity from its task type and spec.
+/// Returns `Some("cheap")` for trivial work, `Some("capable")` for complex
+/// work, or `None` when the task is standard. Shared by `ComplexityRouteStep`
+/// (model bias) and `SamplingStep` (capable-model oversampling trigger).
+pub(crate) fn complexity_class(req: &PipelineRequest) -> Option<&'static str> {
+    if req.task_type == "lint"
+        || req.task_type == "typo"
+        || req.spec.split_whitespace().count() < 20
+    {
+        return Some("cheap");
+    }
+    let lower = req.spec.to_lowercase();
+    if [
+        "architecture",
+        "migration",
+        "breaking change",
+        "cross-cutting",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        return Some("capable");
+    }
+    None
+}
+
 pub struct ComplexityRouteStep;
 impl Step for ComplexityRouteStep {
     fn name(&self) -> &str {
@@ -321,30 +347,16 @@ impl Step for ComplexityRouteStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, _db: &SekaiDb) -> StepDecision {
-        let lower = req.spec.to_lowercase();
-        let action = if req.task_type == "lint"
-            || req.task_type == "typo"
-            || req.spec.split_whitespace().count() < 20
-        {
-            Some((
+        let action = match complexity_class(req) {
+            Some("cheap") => Some((
                 "cheap",
                 "task classified as trivial; prefer cheapest allowed model",
-            ))
-        } else if [
-            "architecture",
-            "migration",
-            "breaking change",
-            "cross-cutting",
-        ]
-        .iter()
-        .any(|kw| lower.contains(kw))
-        {
-            Some((
+            )),
+            Some("capable") => Some((
                 "capable",
                 "task classified as complex; prefer most capable allowed model",
-            ))
-        } else {
-            None
+            )),
+            _ => None,
         };
         match action {
             Some((value, reasoning)) => StepDecision {
@@ -444,6 +456,13 @@ impl Step for ReviewPolicyStep {
 }
 
 pub fn default_pipeline() -> Pipeline {
+    default_pipeline_with(0.05, 0.7)
+}
+
+/// Builds the pipeline with sampler parameters threaded from config:
+/// `base_rate` is the unconditional sampling probability and `risk_threshold`
+/// is the `risk_score` at or above which a request is force-sampled.
+pub fn default_pipeline_with(base_rate: f64, risk_threshold: f64) -> Pipeline {
     Pipeline::new(vec![
         Box::new(LearningsEnrichStep),
         Box::new(SpecEnrichStep),
@@ -451,6 +470,10 @@ pub fn default_pipeline() -> Pipeline {
         Box::new(ComplexityRouteStep),
         Box::new(ModelSelectStep),
         Box::new(ReviewPolicyStep),
+        Box::new(super::sampling::SamplingStep::new(
+            base_rate,
+            risk_threshold,
+        )),
     ])
 }
 
@@ -499,9 +522,10 @@ mod tests {
         let p = default_pipeline();
         let mut req = make_req();
         let result = p.run(&mut req, &db);
-        assert_eq!(result.steps.len(), 6);
+        assert_eq!(result.steps.len(), 7);
         assert_eq!(result.steps[0].step, "learnings_enrich");
         assert_eq!(result.steps[5].step, "review_policy");
+        assert_eq!(result.steps[6].step, "sampling");
     }
 
     #[test]

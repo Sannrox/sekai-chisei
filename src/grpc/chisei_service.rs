@@ -31,6 +31,7 @@ const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
         let _ = db.migrate_chisei();
+        db.migrate_audit();
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -54,7 +55,7 @@ impl ChiseiServiceImpl {
         Self {
             budget: Arc::new(BudgetTracker::new()),
             policy: Arc::new(PolicyResolver::new()),
-            pipeline: pipe::default_pipeline(),
+            pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
@@ -66,6 +67,7 @@ impl ChiseiServiceImpl {
 
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let _ = db.migrate_chisei();
+        db.migrate_audit();
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -89,7 +91,7 @@ impl ChiseiServiceImpl {
         Self {
             budget,
             policy: Arc::new(PolicyResolver::new()),
-            pipeline: pipe::default_pipeline(),
+            pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
@@ -233,6 +235,40 @@ impl ChiseiServiceImpl {
             .unwrap_or_default();
         let executable = allowed && !eval_regressed;
         let low_success_repo = affinity.low_success;
+        // Sampling: the pipeline decides from request metadata; the eval-driven
+        // adaptive trigger (oversample regressed repos) is applied here since the
+        // eval store lives on the service.
+        let mut sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
+            crate::chisei::sampling::SamplingDecision {
+                sampled: false,
+                effective_rate: self.config.sample_rate,
+                reason: "not_sampled".into(),
+            },
+        );
+        if eval_regressed && !sampling.sampled {
+            sampling.sampled = true;
+            sampling.effective_rate = 1.0;
+            sampling.reason = "eval_regressed".into();
+        }
+        if sampling.sampled {
+            let mut evidence = std::collections::HashMap::new();
+            evidence.insert(
+                "effective_rate".to_string(),
+                sampling.effective_rate.to_string(),
+            );
+            evidence.insert("risk_score".to_string(), run.risk_score.to_string());
+            evidence.insert("model".to_string(), resolved_model.clone());
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.sampling".into(),
+                action: "sample".into(),
+                reason: sampling.reason.clone(),
+                evidence,
+                target_id: input.request_id.clone(),
+                outcome: "sampled".into(),
+            });
+        }
         Ok(ExecutionPlan {
             plan_id: uuid::Uuid::new_v4().to_string(),
             input: Some(normalized_input),
@@ -275,6 +311,9 @@ impl ChiseiServiceImpl {
             affinity_repos: affinity.repos,
             eval_regressed,
             eval_regression_reason,
+            sampled: sampling.sampled,
+            sample_rate: sampling.effective_rate,
+            sample_reason: sampling.reason,
         })
     }
 
@@ -733,6 +772,28 @@ impl ChiseiService for ChiseiServiceImpl {
             chat.input_tokens + chat.output_tokens,
         )
         .map_err(Status::internal)?;
+        // Sampling consumption: a sampled request was selected for deeper
+        // observation, so capture its actual execution outcome as a durable
+        // audit record keyed to the request. Unsampled executions skip this —
+        // bounded overhead is the whole point of sampling.
+        if plan.sampled {
+            let mut evidence = std::collections::HashMap::new();
+            evidence.insert("model".to_string(), plan.resolved_model.clone());
+            evidence.insert("input_tokens".to_string(), chat.input_tokens.to_string());
+            evidence.insert("output_tokens".to_string(), chat.output_tokens.to_string());
+            evidence.insert("stop_reason".to_string(), chat.stop_reason.clone());
+            evidence.insert("sample_rate".to_string(), plan.sample_rate.to_string());
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.sampling".into(),
+                action: "sample_observed".into(),
+                reason: plan.sample_reason.clone(),
+                evidence,
+                target_id: input.request_id.clone(),
+                outcome: "observed".into(),
+            });
+        }
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         Ok(Response::new(ExecutePlanResponse {
             response: Some(PlannedChatResponse {
@@ -1290,6 +1351,8 @@ mod tests {
             ollama_url: "http://127.0.0.1:11434".into(),
             native_llm_url: Some("http://127.0.0.1:9999".into()),
             auth_token: None,
+            sample_rate: 0.0,
+            sample_risk_threshold: 0.7,
         }
     }
 
@@ -1522,6 +1585,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eval_regressed_repo_is_force_sampled_and_audited() {
+        let svc = memory_service();
+        create_suite(&svc, "repo-a").await;
+
+        // Two runs whose drop trips the regression signal for repo-a.
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-1", "suite-1", 92, 100)),
+            changed_file: "skills/repo-a.md".into(),
+            diff_hash: "hash-a".into(),
+        }))
+        .await
+        .unwrap();
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-2", "suite-1", 60, 200)),
+            changed_file: "skills/repo-a.md".into(),
+            diff_hash: "hash-b".into(),
+        }))
+        .await
+        .unwrap();
+
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-sample".into(),
+                    namespace: "ns".into(),
+                    spec: "ship repo-a fix".into(),
+                    repo: "repo-a".into(),
+                    branch: "main".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        // Base rate is 0.0 in the test config, so sampling here is purely the
+        // eval-driven adaptive trigger.
+        assert!(plan.sampled);
+        assert_eq!(plan.sample_reason, "eval_regressed");
+        assert_eq!(plan.sample_rate, 1.0);
+
+        // A matching audit decision was recorded.
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("sample".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.target_id == "task-sample" && d.reason == "eval_regressed"),
+            "expected a sampling audit decision for task-sample"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_reload_backfills_legacy_iteration_repo_gates() {
         let path = format!(
             "{}/sekai-chisei-legacy-{}.db",
@@ -1612,6 +1744,9 @@ mod tests {
                 affinity_repos: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let newest = ExecutionPlan {
@@ -1635,6 +1770,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(newest.clone());
 
@@ -1672,6 +1810,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -1715,6 +1856,9 @@ mod tests {
                 affinity_repos: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let inserted = ExecutionPlan {
@@ -1738,6 +1882,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(inserted.clone());
 
