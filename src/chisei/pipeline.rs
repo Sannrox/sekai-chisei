@@ -470,7 +470,10 @@ pub fn default_pipeline_with(base_rate: f64, risk_threshold: f64) -> Pipeline {
         Box::new(ComplexityRouteStep),
         Box::new(ModelSelectStep),
         Box::new(ReviewPolicyStep),
-        Box::new(super::sampling::SamplingStep::new(base_rate, risk_threshold)),
+        Box::new(super::sampling::SamplingStep::new(
+            base_rate,
+            risk_threshold,
+        )),
     ])
 }
 

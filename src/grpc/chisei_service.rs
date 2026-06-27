@@ -238,12 +238,13 @@ impl ChiseiServiceImpl {
         // Sampling: the pipeline decides from request metadata; the eval-driven
         // adaptive trigger (oversample regressed repos) is applied here since the
         // eval store lives on the service.
-        let mut sampling = crate::chisei::sampling::decode_sampling(&run.steps)
-            .unwrap_or(crate::chisei::sampling::SamplingDecision {
+        let mut sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
+            crate::chisei::sampling::SamplingDecision {
                 sampled: false,
                 effective_rate: self.config.sample_rate,
                 reason: "not_sampled".into(),
-            });
+            },
+        );
         if eval_regressed && !sampling.sampled {
             sampling.sampled = true;
             sampling.effective_rate = 1.0;
@@ -251,7 +252,10 @@ impl ChiseiServiceImpl {
         }
         if sampling.sampled {
             let mut evidence = std::collections::HashMap::new();
-            evidence.insert("effective_rate".to_string(), sampling.effective_rate.to_string());
+            evidence.insert(
+                "effective_rate".to_string(),
+                sampling.effective_rate.to_string(),
+            );
             evidence.insert("risk_score".to_string(), run.risk_score.to_string());
             evidence.insert("model".to_string(), resolved_model.clone());
             let _ = self.db.record_decision(&crate::sekai::audit::Decision {
@@ -1740,9 +1744,9 @@ mod tests {
                 affinity_repos: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
-            sampled: false,
-            sample_rate: 0.0,
-            sample_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let newest = ExecutionPlan {
@@ -1766,9 +1770,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
-        sampled: false,
-        sample_rate: 0.0,
-        sample_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(newest.clone());
 
@@ -1806,9 +1810,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
-        sampled: false,
-        sample_rate: 0.0,
-        sample_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -1852,9 +1856,9 @@ mod tests {
                 affinity_repos: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
-            sampled: false,
-            sample_rate: 0.0,
-            sample_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let inserted = ExecutionPlan {
@@ -1878,9 +1882,9 @@ mod tests {
             affinity_repos: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
-        sampled: false,
-        sample_rate: 0.0,
-        sample_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(inserted.clone());
 

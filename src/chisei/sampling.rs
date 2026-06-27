@@ -16,7 +16,7 @@
 //! `plan_from_input` in `grpc/chisei_service.rs`.
 
 use super::budget::PressureLevel;
-use super::pipeline::{complexity_class, PipelineRequest, Step, StepDecision};
+use super::pipeline::{PipelineRequest, Step, StepDecision, complexity_class};
 use crate::db::sekai::SekaiDb;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -132,7 +132,8 @@ mod tests {
         PipelineRequest {
             request_id: id.into(),
             namespace: "ns".into(),
-            spec: "a standard task that is not trivially short but otherwise plain work here".into(),
+            spec: "a standard task that is not trivially short but otherwise plain work here"
+                .into(),
             repo: "repo".into(),
             branch: "main".into(),
             model: "claude-sonnet-4-20250514".into(),
