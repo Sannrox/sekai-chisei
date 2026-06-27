@@ -540,8 +540,7 @@ impl Judge for LlmJudge {
         self.budget
             .adjust(user_id, estimated, resp.input_tokens + resp.output_tokens);
 
-        // An unparseable verdict is specific to this response/record — count it toward retirement.
-        parse_verdict(&resp).map_err(JudgeError::Permanent)
+        parse_verdict(&resp)
     }
 }
 
@@ -551,22 +550,36 @@ fn system_estimate(req: &llm::ChatRequest) -> i32 {
     (body as i32) / 4 + req.max_tokens
 }
 
-/// Extract the verdict from a `record_score` tool call, falling back to JSON in the text content.
-fn parse_verdict(resp: &llm::ChatResponse) -> Result<JudgeVerdict, String> {
-    let args = resp
-        .tool_calls
-        .iter()
-        .find(|tc| tc.name == "record_score")
-        .map(|tc| tc.args.clone())
-        .or_else(|| serde_json::from_str::<serde_json::Value>(resp.content.trim()).ok());
-    let Some(args) = args else {
-        return Err("judge returned no record_score tool call and no JSON content".to_string());
-    };
-    let score = args
-        .get("score")
-        .and_then(|v| v.as_i64())
-        .map(|v| v.clamp(0, 100) as i32)
-        .ok_or("judge verdict missing integer `score`")?;
+/// Extract the verdict, classifying failures so retirement only ever counts record-specific ones.
+///
+/// - A `record_score` tool call with malformed arguments is record-specific (`Permanent`): the
+///   model engaged the contract but produced unusable args for this input.
+/// - No tool call and no parseable JSON is shaped like a model/config fault (e.g. a `SCORING_MODEL`
+///   that cannot tool-call) — uniform across records — so it is `Transient` and must not delete data.
+fn parse_verdict(resp: &llm::ChatResponse) -> Result<JudgeVerdict, JudgeError> {
+    if let Some(tc) = resp.tool_calls.iter().find(|tc| tc.name == "record_score") {
+        return verdict_from_args(&tc.args).ok_or_else(|| {
+            JudgeError::Permanent(format!(
+                "record_score called with malformed arguments: {}",
+                tc.args
+            ))
+        });
+    }
+    // Some providers emit the JSON verdict in the message content instead of a tool call.
+    if let Some(verdict) = serde_json::from_str::<serde_json::Value>(resp.content.trim())
+        .ok()
+        .and_then(|args| verdict_from_args(&args))
+    {
+        return Ok(verdict);
+    }
+    Err(JudgeError::Transient(
+        "judge returned no record_score tool call and no parseable JSON verdict".to_string(),
+    ))
+}
+
+/// Build a verdict from a structured-args value, or `None` if the required `score` is absent/invalid.
+fn verdict_from_args(args: &serde_json::Value) -> Option<JudgeVerdict> {
+    let score = args.get("score").and_then(|v| v.as_i64())?.clamp(0, 100) as i32;
     let passed = args
         .get("passed")
         .and_then(|v| v.as_bool())
@@ -576,7 +589,7 @@ fn parse_verdict(resp: &llm::ChatResponse) -> Result<JudgeVerdict, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(JudgeVerdict {
+    Some(JudgeVerdict {
         score,
         passed,
         reasoning,
@@ -915,6 +928,55 @@ mod tests {
 
         // The regression baseline survives pruning, so the signal still resolves.
         assert!(eval.repo_regression_signal("acme").is_some());
+    }
+
+    fn resp(content: &str, tool_calls: Vec<llm::ToolCall>) -> llm::ChatResponse {
+        llm::ChatResponse {
+            content: content.to_string(),
+            tool_calls,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: "end_turn".to_string(),
+        }
+    }
+
+    fn record_score_call(args: serde_json::Value) -> llm::ToolCall {
+        llm::ToolCall {
+            id: "tc1".into(),
+            name: "record_score".into(),
+            args,
+        }
+    }
+
+    #[test]
+    fn parse_verdict_classifies_failures() {
+        // Well-formed tool call → verdict.
+        let v = parse_verdict(&resp(
+            "",
+            vec![record_score_call(
+                serde_json::json!({"score": 73, "passed": true, "reasoning": "ok"}),
+            )],
+        ))
+        .expect("valid verdict");
+        assert_eq!(v.score, 73);
+        assert!(v.passed);
+
+        // JSON in content, no tool call → verdict (passed defaults from threshold).
+        let v = parse_verdict(&resp(r#"{"score": 40}"#, vec![])).expect("content json verdict");
+        assert_eq!(v.score, 40);
+        assert!(!v.passed); // 40 < PASS_THRESHOLD
+
+        // Tool call present but malformed args → Permanent (record-specific).
+        let err = parse_verdict(&resp(
+            "",
+            vec![record_score_call(serde_json::json!({"verdict": "great"}))],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, JudgeError::Permanent(_)));
+
+        // No tool call and prose content → Transient (model/config-shaped; must not delete data).
+        let err = parse_verdict(&resp("I think this looks pretty good!", vec![])).unwrap_err();
+        assert!(matches!(err, JudgeError::Transient(_)));
     }
 
     #[tokio::test]
