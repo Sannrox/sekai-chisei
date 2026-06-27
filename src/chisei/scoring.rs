@@ -13,6 +13,10 @@
 //! least [`MIN_OBS_FOR_REGRESSION`] observations are allowed to drive the (execution-gating) signal,
 //! which removes the worst single-record noise, but a statistically rigorous design (stable
 //! per-case baselines / variance-aware thresholds over like-for-like tasks) is a deferred follow-up.
+//! A corollary of the per-cycle threshold: when many repos share one batch, a repo's slice may stay
+//! below the threshold every cycle and never produce a signal — the scored runs/audit are still
+//! recorded, but closing the loop under multi-repo load needs cross-cycle per-repo accumulation,
+//! which is part of that same deferred follow-up.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -295,6 +299,11 @@ impl ScoringJob {
     /// retirement; once it has failed `MAX_JUDGE_ATTEMPTS` times it is retired (audit + delete) so
     /// it cannot permanently occupy an oldest-first batch slot and starve healthy observations.
     fn handle_judge_failure(&self, repo: &str, obs: &SampleObservation, err: &JudgeError) {
+        // Transient failures are retried without bound *by design*: never delete data over a shared
+        // outage. The trade-off is that a record which reliably elicits an unparseable (e.g.
+        // prose-only) response is re-attempted indefinitely. The per-cycle "scored nothing" warning
+        // in `run_once` surfaces sustained cases; an outage-aware transient dead-letter (parking,
+        // not deleting) is part of the deferred follow-up noted at the module level.
         let JudgeError::Permanent(message) = err else {
             eprintln!(
                 "scoring job: transient judge failure for {}, will retry: {}",
