@@ -806,22 +806,25 @@ impl ChiseiService for ChiseiServiceImpl {
             });
             // Durable, judge-able record (spec + output) that the scoring job consumes to
             // produce real eval runs. Kept in its own table so large content stays out of the
-            // audit evidence JSON.
-            let _ = self
-                .db
-                .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                    request_id: input.request_id.clone(),
-                    repo: input.repo.clone(),
-                    spec: plan.enriched_spec.clone(),
-                    resolved_model: plan.resolved_model.clone(),
-                    output_content: chat.content.clone(),
-                    sample_reason: plan.sample_reason.clone(),
-                    input_tokens: chat.input_tokens,
-                    output_tokens: chat.output_tokens,
-                    stop_reason: chat.stop_reason.clone(),
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    scored: false,
-                });
+            // audit evidence JSON. Only captured when scoring is enabled — otherwise there is no
+            // consumer and the (full-content) rows would accumulate as dead data.
+            if self.config.scoring_enabled {
+                let _ =
+                    self.db
+                        .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                            request_id: input.request_id.clone(),
+                            repo: input.repo.clone(),
+                            spec: plan.enriched_spec.clone(),
+                            resolved_model: plan.resolved_model.clone(),
+                            output_content: chat.content.clone(),
+                            sample_reason: plan.sample_reason.clone(),
+                            input_tokens: chat.input_tokens,
+                            output_tokens: chat.output_tokens,
+                            stop_reason: chat.stop_reason.clone(),
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                            scored: false,
+                        });
+            }
         }
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         Ok(Response::new(ExecutePlanResponse {

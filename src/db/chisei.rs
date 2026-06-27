@@ -523,10 +523,13 @@ impl SekaiDb {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn mark_observation_scored(&self, request_id: &str) -> Result<(), String> {
+    /// Remove a consumed observation. The row is queue input only — the scored outcome is
+    /// preserved durably in the eval run, iteration, and audit decision — so deleting it bounds
+    /// table growth to the unscored backlog plus the in-flight batch.
+    pub fn delete_observation(&self, request_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE chisei_sample_observations SET scored = 1 WHERE request_id = ?1",
+            "DELETE FROM chisei_sample_observations WHERE request_id = ?1",
             params![request_id],
         )
         .map_err(|e| e.to_string())?;

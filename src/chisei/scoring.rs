@@ -157,11 +157,23 @@ impl ScoringJob {
             let rubric = self.build_rubric(&repo);
 
             let mut results = Vec::with_capacity(group.len());
+            let mut scored_obs: Vec<&SampleObservation> = Vec::with_capacity(group.len());
             for obs in &group {
-                let verdict = self
+                // Per-observation isolation: a judge failure on one record (provider error,
+                // oversized content, misconfigured key/model) must not abort the batch or block
+                // the pipeline. Leave the record unscored so it is retried on a later cycle; the
+                // rest of the batch — and every other repo group — still makes progress.
+                let verdict = match self
                     .judge
                     .judge(&self.model, &rubric, &obs.spec, &obs.output_content)
-                    .await?;
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("scoring job: judge failed for {}: {e}", obs.request_id);
+                        continue;
+                    }
+                };
                 let status = status_from_stop_reason(&obs.stop_reason);
                 // Deterministic gate: only applied when authored assertions exist for the repo.
                 let (gate_ok, gate_reason) = if reference_assertions.is_empty() {
@@ -189,12 +201,22 @@ impl ScoringJob {
                     reason,
                     elapsed: 0,
                 });
+                scored_obs.push(obs);
             }
 
-            self.emit_run(&repo, &group, results)?;
+            // Every observation in this group failed to judge this cycle. Don't emit an empty run
+            // (it would aggregate to score 0 and falsely register a regression); retry next cycle.
+            if results.is_empty() {
+                continue;
+            }
 
-            for obs in &group {
-                self.db.mark_observation_scored(&obs.request_id)?;
+            self.emit_run(&repo, &scored_obs, results)?;
+
+            // Consumed rows are deleted — they are queue input, not durable state. The scored
+            // outcome lives on in the eval run, iteration, and audit decision. This bounds the
+            // table to the unscored backlog plus the in-flight batch.
+            for obs in &scored_obs {
+                self.db.delete_observation(&obs.request_id)?;
                 total_scored += 1;
             }
         }
@@ -207,7 +229,7 @@ impl ScoringJob {
     fn emit_run(
         &self,
         repo: &str,
-        group: &[SampleObservation],
+        group: &[&SampleObservation],
         results: Vec<eval::CaseResult>,
     ) -> Result<(), String> {
         let suite_id = format!("{SUITE_PREFIX}{repo}");
@@ -256,10 +278,7 @@ impl ScoringJob {
                 evidence.insert("repo".to_string(), repo.to_string());
                 evidence.insert("run_id".to_string(), run.id.clone());
                 evidence.insert("model".to_string(), self.model.clone());
-                evidence.insert(
-                    "pass_rate".to_string(),
-                    format!("{pass_count}/{total}"),
-                );
+                evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
                 evidence.insert("delta".to_string(), format!("{:.1}", iteration.delta));
                 evidence.insert("regressed".to_string(), iteration.regressed.to_string());
                 let _ = self.db.record_decision(&crate::sekai::audit::Decision {
@@ -407,7 +426,8 @@ impl Judge for LlmJudge {
 }
 
 fn system_estimate(req: &llm::ChatRequest) -> i32 {
-    let body: usize = req.system.len() + req.messages.iter().map(|m| m.content.len()).sum::<usize>();
+    let body: usize =
+        req.system.len() + req.messages.iter().map(|m| m.content.len()).sum::<usize>();
     (body as i32) / 4 + req.max_tokens
 }
 
@@ -492,6 +512,29 @@ mod tests {
         }
     }
 
+    /// Fails to judge any observation whose output contains `poison`; otherwise passes.
+    struct PoisonJudge;
+
+    #[async_trait::async_trait]
+    impl Judge for PoisonJudge {
+        async fn judge(
+            &self,
+            _model: &str,
+            _rubric: &str,
+            _spec: &str,
+            output: &str,
+        ) -> Result<JudgeVerdict, String> {
+            if output.contains("poison") {
+                return Err("simulated hard judge failure".to_string());
+            }
+            Ok(JudgeVerdict {
+                score: 80,
+                passed: true,
+                reasoning: "ok".to_string(),
+            })
+        }
+    }
+
     fn setup() -> (Arc<SekaiDb>, Arc<EvalStore>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         db.migrate_chisei().unwrap();
@@ -500,12 +543,16 @@ mod tests {
     }
 
     fn observe(db: &SekaiDb, request_id: &str, repo: &str, ts: i64) {
+        observe_with_output(db, request_id, repo, ts, "here is the thing");
+    }
+
+    fn observe_with_output(db: &SekaiDb, request_id: &str, repo: &str, ts: i64, output: &str) {
         db.put_sample_observation(&SampleObservation {
             request_id: request_id.into(),
             repo: repo.into(),
             spec: "do the thing".into(),
             resolved_model: "claude-opus-4-8".into(),
-            output_content: "here is the thing".into(),
+            output_content: output.into(),
             sample_reason: "base".into(),
             input_tokens: 10,
             output_tokens: 20,
@@ -582,6 +629,60 @@ mod tests {
 
         // 10 vs 95 is a >10 point drop → regression flagged, which is what adaptive sampling reads.
         assert!(eval.repo_regression_signal("acme").unwrap().regressed);
+    }
+
+    #[tokio::test]
+    async fn judge_failure_is_isolated_and_does_not_block_the_batch() {
+        let (db, eval) = setup();
+        // One healthy observation and one that the judge hard-fails on, same repo.
+        observe_with_output(&db, "req-ok", "acme", 100, "good output");
+        observe_with_output(&db, "req-bad", "acme", 101, "poison output");
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(PoisonJudge),
+            16,
+            "claude-opus-4-8",
+        );
+
+        // The healthy one is scored; the failing one neither aborts the batch nor is consumed.
+        let scored = job.run_once().await.unwrap();
+        assert_eq!(scored, 1);
+
+        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].results.len(), 1);
+        assert_eq!(runs[0].results[0].case_id, "req-ok");
+
+        // The poisoned record remains queued for a later retry (no head-of-line block).
+        let remaining = db.list_unscored_observations(16).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].request_id, "req-bad");
+    }
+
+    #[tokio::test]
+    async fn all_failing_group_emits_no_run() {
+        let (db, eval) = setup();
+        observe_with_output(&db, "req-bad", "acme", 100, "poison output");
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(PoisonJudge),
+            16,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(job.run_once().await.unwrap(), 0);
+        // No empty run (which would falsely regress), and the record is retained.
+        assert!(
+            db.list_eval_run_records("sampling-acme")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(eval.repo_regression_signal("acme").is_none());
+        assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
     }
 
     #[tokio::test]
