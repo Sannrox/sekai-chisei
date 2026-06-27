@@ -74,6 +74,13 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
     let sekai_svc = sekai_service::SekaiServiceImpl::new(db.clone());
     let chisei_svc =
         chisei_service::ChiseiServiceImpl::with_budget(db, config.clone(), budget.clone());
+    if config.scoring_enabled {
+        println!(
+            "scoring job enabled (model={}, interval={}s, batch={})",
+            config.scoring_model, config.scoring_interval_secs, config.scoring_batch_size
+        );
+        tokio::spawn(chisei_svc.scoring_job().run_loop());
+    }
     println!("gRPC server listening on {}", addr);
 
     Server::builder()
