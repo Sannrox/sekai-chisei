@@ -63,7 +63,12 @@ impl RunResult {
 }
 
 const VERDICT_KEYS: [&str; 3] = ["verdict", "prior_verdict", "last_verdict"];
-const CONVICTION_KEYS: [&str; 4] = ["conviction", "conviction_score", "confidence", "confidence_score"];
+const CONVICTION_KEYS: [&str; 4] = [
+    "conviction",
+    "conviction_score",
+    "confidence",
+    "confidence_score",
+];
 
 fn extract_object_context_refs(namespace: &str, spec: &str) -> Vec<(String, String)> {
     let mut refs = Vec::new();
@@ -80,16 +85,17 @@ fn extract_object_context_refs(namespace: &str, spec: &str) -> Vec<(String, Stri
 }
 
 fn parse_object_reference(text: &str) -> Option<(String, String)> {
-    let token = text.trim().trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')'));
-    let mut parts = token.splitn(2, ':');
-    let raw_kind = parts.next()?;
-    let raw_value = parts.next()?;
-    if raw_value.is_empty() || raw_kind.is_empty() || !token.contains(':') {
+    let token = text
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')'));
+    let (raw_kind, raw_value) = token.split_once(':')?;
+    if raw_value.is_empty() || raw_kind.is_empty() {
         return None;
     }
 
     let kind = normalize_identifier(raw_kind)?;
-    let mut value = raw_value.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')'));
+    let mut value =
+        raw_value.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')'));
     if value.starts_with('{') && value.ends_with('}') && value.len() > 2 {
         value = &value[1..value.len() - 1];
     }
@@ -114,14 +120,15 @@ fn normalize_identifier(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn property_value_for_keys<'a>(obj: &'a crate::domain::Object, keys: &'a [&str]) -> Option<&'a str> {
-    keys.iter().find_map(|key| obj.properties.get(*key).map(String::as_str))
+fn property_value_for_keys<'a>(
+    obj: &'a crate::domain::Object,
+    keys: &'a [&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| obj.properties.get(*key).map(String::as_str))
 }
 
-fn resolve_context_objects(
-    req: &PipelineRequest,
-    db: &SekaiDb,
-) -> Vec<crate::domain::Object> {
+fn resolve_context_objects(req: &PipelineRequest, db: &SekaiDb) -> Vec<crate::domain::Object> {
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
     for (kind, value) in extract_object_context_refs(&req.namespace, &req.spec) {
@@ -197,11 +204,11 @@ impl Step for ObjectContextEnrichStep {
                 details.push(format!("conviction: {}", conviction));
                 has_content = true;
             }
-            if let Some(score) = obj.properties.get("score").filter(|s| !s.is_empty()) {
-                if !details.iter().any(|d| d.contains("conviction")) {
-                    details.push(format!("score: {}", score));
-                    has_content = true;
-                }
+            if let Some(score) = obj.properties.get("score").filter(|s| !s.is_empty())
+                && !details.iter().any(|d| d.contains("conviction"))
+            {
+                details.push(format!("score: {}", score));
+                has_content = true;
             }
             if let Some(rate) = property_value_for_keys(&obj, &["success_rate"]) {
                 details.push(format!("success_rate: {}", rate));
@@ -259,16 +266,17 @@ impl Step for ObjectContextEnrichStep {
                 value: String::new(),
             };
         }
-        req.spec.push_str(&format!(
-            "\n\n[Object context]\n{}",
-            lines.join("\n")
-        ));
+        req.spec
+            .push_str(&format!("\n\n[Object context]\n{}", lines.join("\n")));
         StepDecision {
             step: String::new(),
             action: "enrich".into(),
             reasoning: format!("injected {} object context block(s)", lines.len()),
             confidence: 1.0,
-            suggestion: format!("enriched spec with generic object context from {}", lines.len()),
+            suggestion: format!(
+                "enriched spec with generic object context from {}",
+                lines.len()
+            ),
             value: lines.len().to_string(),
         }
     }
@@ -288,10 +296,7 @@ mod object_context_tests {
             parse_object_reference("ticker:{AAPL}"),
             Some(("ticker".into(), "AAPL".into()))
         );
-        assert_eq!(
-            parse_object_reference("ignore http://example"),
-            None
-        );
+        assert_eq!(parse_object_reference("ignore http://example"), None);
         assert_eq!(parse_object_reference("namespace"), None);
     }
 

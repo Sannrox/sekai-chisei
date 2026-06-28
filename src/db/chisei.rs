@@ -89,12 +89,9 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_evolve_tasks")?
             && table_exists(&conn, "aipp_evolve_enhancements")?
         {
-            let aipp_namespace_projection = legacy_namespace_projection_column(
-                &conn,
-                "aipp_eval_iterations",
-                true,
-            )?
-            .unwrap_or_else(|| "''".to_string());
+            let aipp_namespace_projection =
+                legacy_namespace_projection_column(&conn, "aipp_eval_iterations", true)?
+                    .unwrap_or_else(|| "''".to_string());
 
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_eval_suites(id, name, description, cases_json)
@@ -132,7 +129,7 @@ impl SekaiDb {
                  SELECT task_id, original_spec FROM aipp_evolve_enhancements",
                 [],
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         }
 
         if let Some(legacy_namespace_column) =
@@ -659,28 +656,6 @@ fn table_exists(conn: &rusqlite::Connection, table_name: &str) -> Result<bool, S
     Ok(exists.is_some())
 }
 
-fn column_exists(
-    conn: &rusqlite::Connection,
-    table_name: &str,
-    column_name: &str,
-) -> Result<bool, String> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({})", table_name))
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query_map([], |row| {
-            let name: String = row.get(1)?;
-            Ok(name)
-        })
-        .map_err(|e| e.to_string())?;
-    while let Some(row) = rows.next().transpose().map_err(|e| e.to_string())? {
-        if row == column_name {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn legacy_namespace_projection_column(
     conn: &rusqlite::Connection,
     table_name: &str,
@@ -699,12 +674,11 @@ fn legacy_namespace_projection_column(
     let mut unknown_text_columns: Vec<String> = Vec::new();
     for row in rows {
         let (column_name, column_type) = row.map_err(|e| e.to_string())?;
-        if column_name == "namespace" {
-            if prefer_exact_namespace {
-                return Ok(Some("\"namespace\"".to_string()));
-            }
+        if column_name == "namespace" && prefer_exact_namespace {
+            return Ok(Some("\"namespace\"".to_string()));
         }
-        if !is_known_namespace_column(table_name, &column_name) && is_text_affinity_column(&column_type)
+        if !is_known_namespace_column(table_name, &column_name)
+            && is_text_affinity_column(&column_type)
         {
             unknown_text_columns.push(format!("\"{}\"", column_name));
         }
@@ -720,8 +694,7 @@ fn is_known_namespace_column(table_name: &str, column_name: &str) -> bool {
         "chisei_eval_iterations" => {
             matches!(
                 column_name,
-                "id"
-                    | "run_id"
+                "id" | "run_id"
                     | "suite_id"
                     | "namespace"
                     | "changed_file"
@@ -737,8 +710,7 @@ fn is_known_namespace_column(table_name: &str, column_name: &str) -> bool {
         "aipp_eval_iterations" => {
             matches!(
                 column_name,
-                "id"
-                    | "run_id"
+                "id" | "run_id"
                     | "suite_id"
                     | "changed_file"
                     | "diff_hash"
