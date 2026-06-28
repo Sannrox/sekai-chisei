@@ -129,7 +129,7 @@ mod tests {
         let exec = ActionExecutor::new();
         let params = HashMap::from([
             ("id".into(), "o1".into()),
-            ("kind".into(), "repo".into()),
+            ("kind".into(), "namespace".into()),
             ("name".into(), "test".into()),
         ]);
         let msg = exec.execute(&db, "create_object", &params, "user").unwrap();
@@ -142,7 +142,7 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "o1".into(),
-            kind: "repo".into(),
+            kind: "namespace".into(),
             name: "r".into(),
             namespace: "".into(),
             external_id: "".into(),

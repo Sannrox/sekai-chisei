@@ -47,7 +47,7 @@ pub struct Assertion {
 pub struct Case {
     pub id: String,
     pub name: String,
-    pub repo: String,
+    pub namespace: String,
     pub spec: String,
     pub assertions: Vec<Assertion>,
 }
@@ -85,7 +85,7 @@ pub struct Iteration {
     pub id: String,
     pub run_id: String,
     pub suite_id: String,
-    pub repo: String,
+    pub namespace: String,
     pub changed_file: String,
     pub diff_hash: String,
     pub parent_iteration_id: String,
@@ -111,7 +111,7 @@ pub struct EvalStore {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RepoRegressionSignal {
+pub struct NamespaceRegressionSignal {
     pub regressed: bool,
     pub reason: String,
     pub iteration: Option<Iteration>,
@@ -258,13 +258,13 @@ impl EvalStore {
                 run.id, run.suite_id, suite_id
             ));
         }
-        let repo = self.infer_iteration_repo(suite_id, &run, changed_file)?;
+        let namespace = self.infer_iteration_namespace(suite_id, &run, changed_file)?;
         let previous = self.latest_iteration_for_suite_file(suite_id, changed_file);
         let mut iteration = Iteration {
             id: format!("iter-{}-{}", run.id, chrono::Utc::now().timestamp_millis()),
             run_id: run.id.clone(),
             suite_id: suite_id.to_string(),
-            repo,
+            namespace,
             changed_file: changed_file.to_string(),
             diff_hash: diff_hash.to_string(),
             parent_iteration_id: String::new(),
@@ -289,58 +289,58 @@ impl EvalStore {
         Ok(iteration)
     }
 
-    pub fn repo_regression_signal(&self, repo: &str) -> Option<RepoRegressionSignal> {
-        if repo.is_empty() {
+    pub fn namespace_regression_signal(&self, namespace: &str) -> Option<NamespaceRegressionSignal> {
+        if namespace.is_empty() {
             return None;
         }
         let iterations: Vec<_> = self.iterations.lock().unwrap().values().cloned().collect();
         let latest = self
-            .iterations_for_repo(&iterations, repo)
+            .iterations_for_namespace(&iterations, namespace)
             .into_iter()
             .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))?;
         let reason = if latest.regressed {
             format!(
-                "latest eval iteration regressed for repo {} on {} (delta {:.1})",
-                repo, latest.changed_file, latest.delta
+                "latest eval iteration regressed for namespace {} on {} (delta {:.1})",
+                namespace, latest.changed_file, latest.delta
             )
         } else {
             format!(
-                "latest eval iteration is stable for repo {} on {} (delta {:.1})",
-                repo, latest.changed_file, latest.delta
+                "latest eval iteration is stable for namespace {} on {} (delta {:.1})",
+                namespace, latest.changed_file, latest.delta
             )
         };
-        Some(RepoRegressionSignal {
+        Some(NamespaceRegressionSignal {
             regressed: latest.regressed,
             reason,
             iteration: Some(latest),
         })
     }
 
-    fn iterations_for_repo(&self, iterations: &[Iteration], repo: &str) -> Vec<Iteration> {
+    fn iterations_for_namespace(&self, iterations: &[Iteration], namespace: &str) -> Vec<Iteration> {
         iterations
             .iter()
-            .filter(|iteration| self.iteration_matches_repo(iteration, repo))
+            .filter(|iteration| self.iteration_matches_namespace(iteration, namespace))
             .cloned()
             .collect()
     }
 
-    fn iteration_matches_repo(&self, iteration: &Iteration, repo: &str) -> bool {
-        if iteration.repo == repo {
+    fn iteration_matches_namespace(&self, iteration: &Iteration, namespace: &str) -> bool {
+        if iteration.namespace == namespace {
             return true;
         }
-        if !iteration.repo.is_empty() {
+        if !iteration.namespace.is_empty() {
             return false;
         }
         let run = match self.get_run(&iteration.run_id) {
             Some(run) => run,
             None => return false,
         };
-        self.infer_iteration_repo(&iteration.suite_id, &run, &iteration.changed_file)
-            .map(|inferred_repo| inferred_repo == repo)
+        self.infer_iteration_namespace(&iteration.suite_id, &run, &iteration.changed_file)
+            .map(|inferred_namespace| inferred_namespace == namespace)
             .unwrap_or(false)
     }
 
-    fn infer_iteration_repo(
+    fn infer_iteration_namespace(
         &self,
         suite_id: &str,
         run: &Run,
@@ -350,7 +350,7 @@ impl EvalStore {
         let suite = suites
             .get(suite_id)
             .ok_or_else(|| format!("eval suite not found: {suite_id}"))?;
-        let mut repos: Vec<String> = run
+        let mut namespaces: Vec<String> = run
             .results
             .iter()
             .filter_map(|result| {
@@ -358,23 +358,23 @@ impl EvalStore {
                     .cases
                     .iter()
                     .find(|case| case.id == result.case_id)
-                    .map(|case| case.repo.clone())
+                    .map(|case| case.namespace.clone())
             })
             .collect();
-        repos.sort();
-        repos.dedup();
-        if repos.len() == 1 {
-            return Ok(repos[0].clone());
+        namespaces.sort();
+        namespaces.dedup();
+        if namespaces.len() == 1 {
+            return Ok(namespaces[0].clone());
         }
-        let matching: Vec<String> = repos
+        let matching: Vec<String> = namespaces
             .into_iter()
-            .filter(|repo| changed_file.contains(repo))
+            .filter(|namespace| changed_file.contains(namespace))
             .collect();
         if matching.len() == 1 {
             Ok(matching[0].clone())
         } else {
             Err(format!(
-                "unable to infer repo for iteration in suite {} from file {}",
+                "unable to infer namespace for iteration in suite {} from file {}",
                 suite_id, changed_file
             ))
         }
@@ -589,7 +589,7 @@ mod tests {
             cases: vec![Case {
                 id: "c1".into(),
                 name: "case1".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 spec: "s".into(),
                 assertions: vec![],
             }],
@@ -768,7 +768,7 @@ mod tests {
             cases: vec![Case {
                 id: "c1".into(),
                 name: "case".into(),
-                repo: "repo-a".into(),
+                namespace: "namespace-a".into(),
                 spec: "spec".into(),
                 assertions: vec![],
             }],
@@ -838,7 +838,7 @@ mod tests {
             cases: vec![Case {
                 id: "c1".into(),
                 name: "case".into(),
-                repo: "repo-a".into(),
+                namespace: "namespace-a".into(),
                 spec: "spec".into(),
                 assertions: vec![],
             }],
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn test_track_iteration_keeps_file_history_within_suite() {
         let store = EvalStore::new();
-        for (suite_id, repo) in [("suite-a", "repo-a"), ("suite-b", "repo-b")] {
+        for (suite_id, namespace) in [("suite-a", "namespace-a"), ("suite-b", "namespace-b")] {
             store.create_suite(Suite {
                 id: suite_id.into(),
                 name: format!("suite {suite_id}"),
@@ -895,7 +895,7 @@ mod tests {
                 cases: vec![Case {
                     id: "c1".into(),
                     name: "case".into(),
-                    repo: repo.into(),
+                    namespace: namespace.into(),
                     spec: "spec".into(),
                     assertions: vec![],
                 }],
@@ -940,16 +940,16 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_regression_signal_uses_latest_repo_suite_iteration() {
+    fn test_namespace_regression_signal_uses_latest_namespace_suite_iteration() {
         let store = EvalStore::new();
         store.create_suite(Suite {
             id: "suite-a".into(),
-            name: "repo suite".into(),
+            name: "namespace suite".into(),
             description: String::new(),
             cases: vec![Case {
                 id: "c1".into(),
                 name: "case".into(),
-                repo: "repo-a".into(),
+                namespace: "namespace-a".into(),
                 spec: "spec".into(),
                 assertions: vec![],
             }],
@@ -972,20 +972,20 @@ mod tests {
             });
         }
         store
-            .track_iteration("suite-a", "r1", "skills/repo-a.md", "hash-a")
+            .track_iteration("suite-a", "r1", "skills/namespace-a.md", "hash-a")
             .expect("baseline");
         store
-            .track_iteration("suite-a", "r2", "skills/repo-a.md", "hash-b")
+            .track_iteration("suite-a", "r2", "skills/namespace-a.md", "hash-b")
             .expect("candidate");
 
-        let signal = store.repo_regression_signal("repo-a").expect("repo signal");
+        let signal = store.namespace_regression_signal("namespace-a").expect("namespace signal");
         assert!(signal.regressed);
         assert!(signal.reason.contains("regressed"));
-        assert!(signal.reason.contains("repo-a"));
+        assert!(signal.reason.contains("namespace-a"));
     }
 
     #[test]
-    fn test_repo_regression_signal_ignores_other_repo_iterations_in_shared_suite() {
+    fn test_namespace_regression_signal_ignores_other_namespace_iterations_in_shared_suite() {
         let store = EvalStore::new();
         store.create_suite(Suite {
             id: "shared-suite".into(),
@@ -994,15 +994,15 @@ mod tests {
             cases: vec![
                 Case {
                     id: "case-a".into(),
-                    name: "repo a".into(),
-                    repo: "repo-a".into(),
+                    name: "namespace a".into(),
+                    namespace: "namespace-a".into(),
                     spec: "spec-a".into(),
                     assertions: vec![],
                 },
                 Case {
                     id: "case-b".into(),
-                    name: "repo b".into(),
-                    repo: "repo-b".into(),
+                    name: "namespace b".into(),
+                    namespace: "namespace-b".into(),
                     spec: "spec-b".into(),
                     assertions: vec![],
                 },
@@ -1070,21 +1070,21 @@ mod tests {
         });
 
         store
-            .track_iteration("shared-suite", "run-a1", "skills/repo-a.md", "hash-a1")
-            .expect("repo a baseline");
+            .track_iteration("shared-suite", "run-a1", "skills/namespace-a.md", "hash-a1")
+            .expect("namespace a baseline");
         store
-            .track_iteration("shared-suite", "run-a2", "skills/repo-a.md", "hash-a2")
-            .expect("repo a candidate");
+            .track_iteration("shared-suite", "run-a2", "skills/namespace-a.md", "hash-a2")
+            .expect("namespace a candidate");
         store
-            .track_iteration("shared-suite", "run-b1", "skills/repo-b.md", "hash-b1")
-            .expect("repo b baseline");
+            .track_iteration("shared-suite", "run-b1", "skills/namespace-b.md", "hash-b1")
+            .expect("namespace b baseline");
         store
-            .track_iteration("shared-suite", "run-b2", "skills/repo-b.md", "hash-b2")
-            .expect("repo b candidate");
+            .track_iteration("shared-suite", "run-b2", "skills/namespace-b.md", "hash-b2")
+            .expect("namespace b candidate");
 
         let signal = store
-            .repo_regression_signal("repo-a")
-            .expect("repo a signal");
+            .namespace_regression_signal("namespace-a")
+            .expect("namespace a signal");
         assert!(!signal.regressed);
         assert!(signal.reason.contains("stable"));
         assert!(
@@ -1093,12 +1093,12 @@ mod tests {
                 .as_ref()
                 .expect("iteration")
                 .changed_file
-                .contains("repo-a")
+                .contains("namespace-a")
         );
     }
 
     #[test]
-    fn test_repo_regression_signal_falls_back_for_legacy_iterations_without_repo() {
+    fn test_namespace_regression_signal_falls_back_for_legacy_iterations_without_namespace() {
         let store = EvalStore::new();
         store.create_suite(Suite {
             id: "suite-a".into(),
@@ -1106,8 +1106,8 @@ mod tests {
             description: String::new(),
             cases: vec![Case {
                 id: "case-a".into(),
-                name: "repo a".into(),
-                repo: "repo-a".into(),
+                name: "namespace a".into(),
+                namespace: "namespace-a".into(),
                 spec: "spec-a".into(),
                 assertions: vec![],
             }],
@@ -1131,8 +1131,8 @@ mod tests {
             id: "legacy-1".into(),
             run_id: "run-a1".into(),
             suite_id: "suite-a".into(),
-            repo: String::new(),
-            changed_file: "skills/repo-a.md".into(),
+            namespace: String::new(),
+            changed_file: "skills/namespace-a.md".into(),
             diff_hash: "hash-a".into(),
             parent_iteration_id: String::new(),
             baseline_run_id: "run-a1".into(),
@@ -1143,8 +1143,8 @@ mod tests {
         });
 
         let signal = store
-            .repo_regression_signal("repo-a")
-            .expect("repo a signal");
+            .namespace_regression_signal("namespace-a")
+            .expect("namespace a signal");
         assert!(signal.regressed);
         assert!(signal.reason.contains("regressed"));
     }

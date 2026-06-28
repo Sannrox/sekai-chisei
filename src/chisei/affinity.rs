@@ -2,32 +2,37 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_MODEL, REL_CONTAINS, REL_TOUCHES};
 
 pub struct AffinityResult {
-    pub repos: Vec<String>,
+    pub namespaces: Vec<String>,
     pub best_model: String,
     pub low_success: bool,
 }
 
-pub fn get_affinity(db: &SekaiDb, repo: &str) -> AffinityResult {
-    let best_model = model_for_repo(db, repo);
-    let low_success = low_success_repo(db, repo);
+fn namespace_object(db: &SekaiDb, namespace: &str) -> Option<crate::domain::Object> {
+    if namespace.is_empty() {
+        return None;
+    }
+
+    db.find_by_external_id(&format!("namespace:{namespace}"))
+        .ok()
+        .flatten()
+}
+
+pub fn get_affinity(db: &SekaiDb, namespace: &str) -> AffinityResult {
+    let best_model = model_for_namespace(db, namespace);
+    let low_success = low_success_namespace(db, namespace);
     AffinityResult {
-        repos: Vec::new(),
+        namespaces: Vec::new(),
         best_model,
         low_success,
     }
 }
 
-fn model_for_repo(db: &SekaiDb, repo: &str) -> String {
-    let repo_obj = match db
-        .find_by_external_id(&format!("repo:{}", repo))
-        .ok()
-        .flatten()
-    {
-        Some(o) => o,
-        None => return String::new(),
+fn model_for_namespace(db: &SekaiDb, namespace: &str) -> String {
+    let Some(namespace_obj) = namespace_object(db, namespace) else {
+        return String::new();
     };
     let comps = db
-        .get_linked_objects(&repo_obj.id, REL_CONTAINS, &Direction::Outgoing)
+        .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     let mut best = String::new();
     let mut best_score = 0.0f64;
@@ -69,17 +74,12 @@ fn model_for_repo(db: &SekaiDb, repo: &str) -> String {
     best
 }
 
-fn low_success_repo(db: &SekaiDb, repo: &str) -> bool {
-    let repo_obj = match db
-        .find_by_external_id(&format!("repo:{}", repo))
-        .ok()
-        .flatten()
-    {
-        Some(o) => o,
-        None => return false,
+fn low_success_namespace(db: &SekaiDb, namespace: &str) -> bool {
+    let Some(namespace_obj) = namespace_object(db, namespace) else {
+        return false;
     };
     let comps = db
-        .get_linked_objects(&repo_obj.id, REL_CONTAINS, &Direction::Outgoing)
+        .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     comps.iter().any(|c| {
         if c.kind != KIND_COMPONENT {
@@ -106,14 +106,14 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_low_success_repo() {
+    fn test_low_success_namespace() {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
-            external_id: "repo:repo".into(),
+            external_id: "namespace:namespace".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
@@ -141,6 +141,6 @@ mod tests {
             created: 0,
         })
         .unwrap();
-        assert!(low_success_repo(&db, "repo"));
+        assert!(low_success_namespace(&db, "namespace"));
     }
 }

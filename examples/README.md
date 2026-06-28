@@ -29,17 +29,17 @@ cargo run --example demo_client
 
 **sekai · typed object graph**
 
-- Creates a `repo` object and a `service` object
-- Links them `repo --deploys--> service`
+- Creates a `namespace` object and a `service` object
+- Links them `namespace --deploys--> service`
 - Reads the relationship back with `GetLinkedObjects`
-- Traverses the graph outward from the repo
+- Traverses the graph outward from the namespace
 - Lists objects filtered by `kind`
 
 **chisei · budget & decision pipeline**
 
 - Sets a daily token budget for a user
 - Checks the budget, then records usage and checks again
-- Resolves a model policy for the namespace/repo
+- Resolves a model policy for the namespace/namespace
 - Runs the decision pipeline over a task spec and prints each step's action,
   confidence, and reasoning
 
@@ -80,7 +80,7 @@ It always sends `x-principal: demo-client` as the caller identity.
 
 - Object and link ids carry a random suffix per run, so repeated invocations do
   not collide.
-- The pipeline resolves a repo by its own naming convention rather than the
-  demo's generated object id, so it reports `repo not found in sekai` for the
-  enrichment steps. That is expected — the graph object and the pipeline's repo
+- The pipeline resolves a namespace by its own naming convention rather than the
+  demo's generated object id, so it reports `namespace not found in sekai` for the
+  enrichment steps. That is expected — the graph object and the pipeline's namespace
   lookup are independent in this demo.
