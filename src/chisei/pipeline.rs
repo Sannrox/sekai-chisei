@@ -350,20 +350,33 @@ impl Step for LearningsEnrichStep {
         let mut found_context = false;
         for context in resolve_context_objects(req, db) {
             found_context = true;
-            let learnings = db
-                .get_linked_objects(&context.id, REL_TOUCHES, &Direction::Incoming)
-                .unwrap_or_default();
-            for obj in learnings {
-                if obj.kind != KIND_LEARNING {
-                    continue;
+            let mut sources = vec![context.id.clone()];
+            if let Some(ns_obj) = db
+                .find_by_external_id(&format!("namespace:{}", context.kind))
+                .ok()
+                .flatten()
+            {
+                sources.push(ns_obj.id);
+            }
+            for source_id in sources {
+                let learnings = db
+                    .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
+                    .unwrap_or_default();
+                for obj in learnings {
+                    if obj.kind != KIND_LEARNING {
+                        continue;
+                    }
+                    let Some(title) = obj.properties.get("title") else {
+                        continue;
+                    };
+                    let Some(prevention) = obj.properties.get("prevention") else {
+                        continue;
+                    };
+                    pitfalls.push(format!("{title} - {prevention}"));
+                    if pitfalls.len() >= 3 {
+                        break;
+                    }
                 }
-                let Some(title) = obj.properties.get("title") else {
-                    continue;
-                };
-                let Some(prevention) = obj.properties.get("prevention") else {
-                    continue;
-                };
-                pitfalls.push(format!("{title} - {prevention}"));
                 if pitfalls.len() >= 3 {
                     break;
                 }
@@ -770,6 +783,17 @@ mod tests {
             name: "service".into(),
             namespace: "".into(),
             external_id: "component:service".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "ns-component".into(),
+            kind: "namespace".into(),
+            name: "component".into(),
+            namespace: "".into(),
+            external_id: "namespace:component".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
