@@ -4,8 +4,8 @@
 //! records a judge-able payload (spec + model output) in `chisei_sample_observations`. This
 //! background job consumes that dataset, scores each observation with a hybrid of
 //! state-of-the-art LLM-as-judge grading and the existing deterministic [`eval::check_assertions`]
-//! gate, and emits one [`eval::Run`] per repo via the same persistence path the `CreateEvalRun`
-//! RPC uses. The resulting iterations feed [`EvalStore::repo_regression_signal`], which already
+//! gate, and emits one [`eval::Run`] per namespace via the same persistence path the `CreateEvalRun`
+//! RPC uses. The resulting iterations feed [`EvalStore::namespace_regression_signal`], which already
 //! drives adaptive sampling (`reason = "eval_regressed"`) — closing the learning loop.
 //!
 //! NOTE: the regression signal here is a batch-vs-batch heuristic: each cycle's mean judge score is
@@ -13,9 +13,9 @@
 //! least [`MIN_OBS_FOR_REGRESSION`] observations are allowed to drive the (execution-gating) signal,
 //! which removes the worst single-record noise, but a statistically rigorous design (stable
 //! per-case baselines / variance-aware thresholds over like-for-like tasks) is a deferred follow-up.
-//! A corollary of the per-cycle threshold: when many repos share one batch, a repo's slice may stay
+//! A corollary of the per-cycle threshold: when many namespaces share one batch, a namespace's slice may stay
 //! below the threshold every cycle and never produce a signal — the scored runs/audit are still
-//! recorded, but closing the loop under multi-repo load needs cross-cycle per-repo accumulation,
+//! recorded, but closing the loop under multi-namespace load needs cross-cycle per-namespace accumulation,
 //! which is part of that same deferred follow-up.
 
 use std::collections::BTreeMap;
@@ -34,7 +34,7 @@ use crate::llm;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleObservation {
     pub request_id: String,
-    pub repo: String,
+    pub namespace: String,
     pub spec: String,
     pub resolved_model: String,
     pub output_content: String,
@@ -87,7 +87,7 @@ pub trait Judge: Send + Sync {
     ) -> Result<JudgeVerdict, JudgeError>;
 }
 
-/// Synthetic suite id namespace for sampled observations of a repo.
+/// Synthetic suite id namespace for sampled observations of a namespace.
 const SUITE_PREFIX: &str = "sampling-";
 /// LLM-judge score (0..=100) at or above which an observation passes on the judge axis.
 const PASS_THRESHOLD: i32 = 60;
@@ -103,7 +103,7 @@ const MAX_JUDGE_ATTEMPTS: i64 = 3;
 /// context-overflow failure class (an oversized input would otherwise fail the provider forever).
 const JUDGE_INPUT_LEN: usize = 12000;
 /// How many runs/iterations to retain per synthetic sampling suite. The scoring job emits one of
-/// each per repo per cycle; without a cap they grow unbounded (and are hydrated into memory at
+/// each per namespace per cycle; without a cap they grow unbounded (and are hydrated into memory at
 /// startup). Keeping the most recent N preserves the regression baseline while bounding growth.
 const SAMPLING_RETENTION: i64 = 20;
 /// Minimum observations in a batch before it may drive the (execution-gating) regression signal.
@@ -190,7 +190,7 @@ impl ScoringJob {
         }
     }
 
-    /// Consume one batch of unscored observations, score them, and emit one eval run per repo.
+    /// Consume one batch of unscored observations, score them, and emit one eval run per namespace.
     /// Returns the number of observations scored.
     pub async fn run_once(&self) -> Result<usize, String> {
         let observations = self.db.list_unscored_observations(self.batch_size)?;
@@ -199,22 +199,22 @@ impl ScoringJob {
         }
 
         let pending = observations.len();
-        let mut by_repo: BTreeMap<String, Vec<SampleObservation>> = BTreeMap::new();
+        let mut by_namespace: BTreeMap<String, Vec<SampleObservation>> = BTreeMap::new();
         for obs in observations {
-            by_repo.entry(obs.repo.clone()).or_default().push(obs);
+            by_namespace.entry(obs.namespace.clone()).or_default().push(obs);
         }
 
         let mut total_scored = 0usize;
-        for (repo, group) in by_repo {
-            let reference_assertions = self.reference_assertions(&repo);
-            let rubric = self.build_rubric(&repo);
+        for (namespace, group) in by_namespace {
+            let reference_assertions = self.reference_assertions(&namespace);
+            let rubric = self.build_rubric(&namespace);
 
             let mut results = Vec::with_capacity(group.len());
             let mut scored_obs: Vec<&SampleObservation> = Vec::with_capacity(group.len());
             for obs in &group {
                 // Per-observation isolation: a judge failure on one record (provider error,
                 // oversized content, misconfigured key/model) must not abort the batch or block
-                // the pipeline. The rest of the batch — and every other repo group — still makes
+                // the pipeline. The rest of the batch — and every other namespace group — still makes
                 // progress. A transient failure is retried next cycle; a record that fails
                 // MAX_JUDGE_ATTEMPTS times is retired so it cannot occupy a batch slot forever.
                 let verdict = match self
@@ -224,12 +224,12 @@ impl ScoringJob {
                 {
                     Ok(v) => v,
                     Err(err) => {
-                        self.handle_judge_failure(&repo, obs, &err);
+                        self.handle_judge_failure(&namespace, obs, &err);
                         continue;
                     }
                 };
                 let status = status_from_stop_reason(&obs.stop_reason);
-                // Deterministic gate: only applied when authored assertions exist for the repo.
+                // Deterministic gate: only applied when authored assertions exist for the namespace.
                 let (gate_ok, gate_reason) = if reference_assertions.is_empty() {
                     (true, String::new())
                 } else {
@@ -264,13 +264,13 @@ impl ScoringJob {
                 continue;
             }
 
-            self.emit_run(&repo, &scored_obs, results)?;
+            self.emit_run(&namespace, &scored_obs, results)?;
 
             // Consumed rows are deleted — they are queue input, not durable state. The scored
             // outcome lives on in the eval run, iteration, and audit decision. This bounds the
             // table to the unscored backlog plus the in-flight batch. Best-effort: the run is
             // already committed, so a rare delete failure must not abort the cycle (skipping the
-            // remaining repo groups); the row is simply re-scored on a later cycle.
+            // remaining namespace groups); the row is simply re-scored on a later cycle.
             for obs in &scored_obs {
                 if let Err(e) = self.db.delete_observation(&obs.request_id) {
                     eprintln!(
@@ -298,7 +298,7 @@ impl ScoringJob {
     /// indefinitely and never delete data. A record-specific (permanent) failure counts toward
     /// retirement; once it has failed `MAX_JUDGE_ATTEMPTS` times it is retired (audit + delete) so
     /// it cannot permanently occupy an oldest-first batch slot and starve healthy observations.
-    fn handle_judge_failure(&self, repo: &str, obs: &SampleObservation, err: &JudgeError) {
+    fn handle_judge_failure(&self, namespace: &str, obs: &SampleObservation, err: &JudgeError) {
         // Transient failures are retried without bound *by design*: never delete data over a shared
         // outage. The trade-off is that a record which reliably elicits an unparseable (e.g.
         // prose-only) response is re-attempted indefinitely. The per-cycle "scored nothing" warning
@@ -324,7 +324,7 @@ impl ScoringJob {
                 obs.request_id
             );
             let mut evidence = std::collections::HashMap::new();
-            evidence.insert("repo".to_string(), repo.to_string());
+            evidence.insert("namespace".to_string(), namespace.to_string());
             evidence.insert("attempts".to_string(), attempts.to_string());
             evidence.insert("error".to_string(), message.clone());
             let _ = self.db.record_decision(&crate::sekai::audit::Decision {
@@ -346,30 +346,30 @@ impl ScoringJob {
         }
     }
 
-    /// Build a synthetic per-repo suite (one case per observation, mirroring the run's case ids so
-    /// the eval store can infer the repo), persist the run + a tracked iteration, and record an
+    /// Build a synthetic per-namespace suite (one case per observation, mirroring the run's case ids so
+    /// the eval store can infer the namespace), persist the run + a tracked iteration, and record an
     /// audit decision. Bounded: the suite holds only the current batch's cases, and runs/iterations
     /// are pruned to the most recent `SAMPLING_RETENTION` per suite (DB and memory).
     fn emit_run(
         &self,
-        repo: &str,
+        namespace: &str,
         group: &[&SampleObservation],
         results: Vec<eval::CaseResult>,
     ) -> Result<(), String> {
-        let suite_id = format!("{SUITE_PREFIX}{repo}");
-        let changed_file = format!("sampling/{repo}");
+        let suite_id = format!("{SUITE_PREFIX}{namespace}");
+        let changed_file = format!("sampling/{namespace}");
         let now = chrono::Utc::now().timestamp_millis();
 
         let suite = eval::Suite {
             id: suite_id.clone(),
-            name: format!("Sampled observations: {repo}"),
+            name: format!("Sampled observations: {namespace}"),
             description: "Auto-generated suite of control-plane sampled executions.".to_string(),
             cases: group
                 .iter()
                 .map(|obs| eval::Case {
                     id: obs.request_id.clone(),
                     name: obs.request_id.clone(),
-                    repo: repo.to_string(),
+                    namespace: namespace.to_string(),
                     spec: obs.spec.clone(),
                     assertions: vec![],
                 })
@@ -379,7 +379,7 @@ impl ScoringJob {
         self.eval.create_suite(suite);
 
         let run = eval::Run {
-            id: format!("sampling-run-{repo}-{now}"),
+            id: format!("sampling-run-{namespace}-{now}"),
             suite_id: suite_id.clone(),
             config_ref: self.model.clone(),
             results,
@@ -406,16 +406,16 @@ impl ScoringJob {
                     delta = Some(iteration.delta);
                     regressed = iteration.regressed;
                 }
-                // An empty repo (or otherwise un-inferable) run still persists; it simply has no
+                // An empty namespace (or otherwise un-inferable) run still persists; it simply has no
                 // regression signal. Don't fail the whole batch over it.
-                Err(e) => eprintln!("scoring job: skipped iteration for repo {repo:?}: {e}"),
+                Err(e) => eprintln!("scoring job: skipped iteration for namespace {namespace:?}: {e}"),
             }
         }
 
         // Always record the scored run as an audit decision (the durable, queryable outcome),
         // whether or not it was large enough to drive a regression signal.
         let mut evidence = std::collections::HashMap::new();
-        evidence.insert("repo".to_string(), repo.to_string());
+        evidence.insert("namespace".to_string(), namespace.to_string());
         evidence.insert("run_id".to_string(), run.id.clone());
         evidence.insert("model".to_string(), self.model.clone());
         evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
@@ -428,9 +428,9 @@ impl ScoringJob {
             timestamp: now,
             actor: "chisei.scoring".into(),
             action: "scored".into(),
-            reason: format!("scored {total} sampled observation(s) for repo {repo}"),
+            reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
             evidence,
-            target_id: repo.to_string(),
+            target_id: namespace.to_string(),
             outcome: if regressed {
                 "regressed".into()
             } else {
@@ -456,9 +456,9 @@ impl ScoringJob {
         Ok(())
     }
 
-    /// Union of assertions from any authored (non-sampling) suite whose cases target this repo.
-    fn reference_assertions(&self, repo: &str) -> Vec<eval::Assertion> {
-        if repo.is_empty() {
+    /// Union of assertions from any authored (non-sampling) suite whose cases target this namespace.
+    fn reference_assertions(&self, namespace: &str) -> Vec<eval::Assertion> {
+        if namespace.is_empty() {
             return vec![];
         }
         let mut assertions = Vec::new();
@@ -466,7 +466,7 @@ impl ScoringJob {
             if suite.id.starts_with(SUITE_PREFIX) {
                 continue;
             }
-            for case in suite.cases.iter().filter(|c| c.repo == repo) {
+            for case in suite.cases.iter().filter(|c| c.namespace == namespace) {
                 assertions.extend(case.assertions.iter().cloned());
             }
         }
@@ -474,10 +474,10 @@ impl ScoringJob {
     }
 
     /// Rubric for the judge: the default quality rubric, plus criteria distilled from any authored
-    /// suite cases for this repo (their names/specs describe what "good" looks like).
-    fn build_rubric(&self, repo: &str) -> String {
+    /// suite cases for this namespace (their names/specs describe what "good" looks like).
+    fn build_rubric(&self, namespace: &str) -> String {
         let mut rubric = DEFAULT_RUBRIC.to_string();
-        if repo.is_empty() {
+        if namespace.is_empty() {
             return rubric;
         }
         let mut criteria = Vec::new();
@@ -485,7 +485,7 @@ impl ScoringJob {
             if suite.id.starts_with(SUITE_PREFIX) {
                 continue;
             }
-            for case in suite.cases.iter().filter(|c| c.repo == repo) {
+            for case in suite.cases.iter().filter(|c| c.namespace == namespace) {
                 let spec = case.spec.trim();
                 if spec.is_empty() {
                     criteria.push(format!("- {}", case.name));
@@ -495,7 +495,7 @@ impl ScoringJob {
             }
         }
         if !criteria.is_empty() {
-            rubric.push_str("\n\nRepo-specific reference criteria:\n");
+            rubric.push_str("\n\nNamespace-specific reference criteria:\n");
             rubric.push_str(&criteria.join("\n"));
         }
         rubric
@@ -745,14 +745,14 @@ mod tests {
         (db, Arc::new(EvalStore::new()))
     }
 
-    fn observe(db: &SekaiDb, request_id: &str, repo: &str, ts: i64) {
-        observe_with_output(db, request_id, repo, ts, "here is the thing");
+    fn observe(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64) {
+        observe_with_output(db, request_id, namespace, ts, "here is the thing");
     }
 
-    fn observe_with_output(db: &SekaiDb, request_id: &str, repo: &str, ts: i64, output: &str) {
+    fn observe_with_output(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64, output: &str) {
         db.put_sample_observation(&SampleObservation {
             request_id: request_id.into(),
-            repo: repo.into(),
+            namespace: namespace.into(),
             spec: "do the thing".into(),
             resolved_model: "claude-opus-4-8".into(),
             output_content: output.into(),
@@ -766,10 +766,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Seed `count` observations for a repo with distinct ids/timestamps from `base`.
-    fn observe_batch(db: &SekaiDb, repo: &str, base: &str, count: usize, ts_base: i64) {
+    /// Seed `count` observations for a namespace with distinct ids/timestamps from `base`.
+    fn observe_batch(db: &SekaiDb, namespace: &str, base: &str, count: usize, ts_base: i64) {
         for i in 0..count {
-            observe(db, &format!("{base}-{i}"), repo, ts_base + i as i64);
+            observe(db, &format!("{base}-{i}"), namespace, ts_base + i as i64);
         }
     }
 
@@ -793,7 +793,7 @@ mod tests {
         let scored = job.run_once().await.unwrap();
         assert_eq!(scored, MIN_OBS_FOR_REGRESSION);
 
-        // One run holding every case result is persisted under the synthetic repo suite.
+        // One run holding every case result is persisted under the synthetic namespace suite.
         let runs = db.list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].results.len(), MIN_OBS_FOR_REGRESSION);
@@ -802,8 +802,8 @@ mod tests {
         // Observations are consumed.
         assert!(db.list_unscored_observations(16).unwrap().is_empty());
 
-        // An iteration exists and the repo now has a (stable) regression signal.
-        let signal = eval.repo_regression_signal("acme").unwrap();
+        // An iteration exists and the namespace now has a (stable) regression signal.
+        let signal = eval.namespace_regression_signal("acme").unwrap();
         assert!(!signal.regressed);
     }
 
@@ -822,7 +822,7 @@ mod tests {
             "claude-opus-4-8",
         );
         assert_eq!(good.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
-        assert!(!eval.repo_regression_signal("acme").unwrap().regressed);
+        assert!(!eval.namespace_regression_signal("acme").unwrap().regressed);
 
         observe_batch(&db, "acme", "bad", MIN_OBS_FOR_REGRESSION, 200);
         let bad = ScoringJob::with_judge(
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(bad.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
 
         // 10 vs 95 is a >10 point drop → regression flagged, which is what adaptive sampling reads.
-        assert!(eval.repo_regression_signal("acme").unwrap().regressed);
+        assert!(eval.namespace_regression_signal("acme").unwrap().regressed);
     }
 
     #[tokio::test]
@@ -862,13 +862,13 @@ mod tests {
         // The run is recorded (data preserved)…
         assert_eq!(db.list_eval_run_records("sampling-acme").unwrap().len(), 1);
         // …but no iteration was created, so there is no regression signal to gate execution.
-        assert!(eval.repo_regression_signal("acme").is_none());
+        assert!(eval.namespace_regression_signal("acme").is_none());
     }
 
     #[tokio::test]
     async fn judge_failure_is_isolated_and_does_not_block_the_batch() {
         let (db, eval) = setup();
-        // One healthy observation and one that the judge hard-fails on, same repo.
+        // One healthy observation and one that the judge hard-fails on, same namespace.
         observe_with_output(&db, "req-ok", "acme", 100, "good output");
         observe_with_output(&db, "req-bad", "acme", 101, "poison output");
 
@@ -915,7 +915,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(eval.repo_regression_signal("acme").is_none());
+        assert!(eval.namespace_regression_signal("acme").is_none());
         assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
     }
 
@@ -1017,7 +1017,7 @@ mod tests {
         assert!(eval.list_iterations(suite).len() as i64 <= SAMPLING_RETENTION);
 
         // The regression baseline survives pruning, so the signal still resolves.
-        assert!(eval.repo_regression_signal("acme").is_some());
+        assert!(eval.namespace_regression_signal("acme").is_some());
     }
 
     fn resp(content: &str, tool_calls: Vec<llm::ToolCall>) -> llm::ChatResponse {

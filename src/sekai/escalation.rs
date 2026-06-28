@@ -12,13 +12,13 @@ pub struct EscalationResult {
 
 pub fn check_escalation(
     db: &SekaiDb,
-    repo: &str,
+    namespace: &str,
     threshold: Option<i32>,
 ) -> Option<EscalationResult> {
     let thresh = threshold.unwrap_or(DEFAULT_THRESHOLD);
-    let repo_obj = db.find_by_external_id(&format!("repo:{}", repo)).ok()??;
+    let namespace_obj = db.find_by_external_id(&format!("namespace:{}", namespace)).ok()??;
     let components = db
-        .get_linked_objects(&repo_obj.id, REL_CONTAINS, &Direction::Outgoing)
+        .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .ok()?;
     for comp in &components {
         if comp.kind != KIND_COMPONENT {
@@ -34,8 +34,8 @@ pub fn check_escalation(
                 component: comp.name.clone(),
                 failures,
                 goal_spec: format!(
-                    "Component '{}' in repo '{}' has {} consecutive failures. Create a goal to investigate root cause.",
-                    comp.name, repo, failures
+                    "Component '{}' in namespace '{}' has {} consecutive failures. Create a goal to investigate root cause.",
+                    comp.name, namespace, failures
                 ),
             });
         }
@@ -54,10 +54,10 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
-            external_id: "repo:repo".into(),
+            external_id: "namespace:namespace".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
@@ -83,7 +83,7 @@ mod tests {
         })
         .unwrap();
 
-        let result = check_escalation(&db, "repo", None);
+        let result = check_escalation(&db, "namespace", None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().failures, 5);
     }
@@ -93,10 +93,10 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
-            external_id: "repo:repo".into(),
+            external_id: "namespace:namespace".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
@@ -122,6 +122,6 @@ mod tests {
         })
         .unwrap();
 
-        assert!(check_escalation(&db, "repo", None).is_none());
+        assert!(check_escalation(&db, "namespace", None).is_none());
     }
 }

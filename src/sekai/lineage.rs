@@ -94,7 +94,7 @@ pub fn get_lineage(
 
 fn role_for(kind: &str) -> String {
     match kind {
-        "repo" => "repo",
+        "namespace" => "namespace",
         "commit" => "commit",
         "pull_request" => "pr",
         _ => "other",
@@ -128,7 +128,7 @@ mod tests {
             created: 0,
             updated: 0,
         };
-        db.create_object(&mk("r1", "repo")).unwrap();
+        db.create_object(&mk("r1", "namespace")).unwrap();
         db.create_object(&mk("cm1", "commit")).unwrap();
         db.create_object(&mk("pr1", "pull_request")).unwrap();
         db.create_link(&Link {
@@ -151,7 +151,7 @@ mod tests {
         let res = get_lineage(&db, "r1", 0).unwrap();
         assert_eq!(res.nodes.len(), 3);
         assert_eq!(res.edges.len(), 2);
-        assert_eq!(res.nodes[0].role, "repo");
+        assert_eq!(res.nodes[0].role, "namespace");
         assert!(!res.truncated);
     }
 
