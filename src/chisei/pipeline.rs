@@ -89,7 +89,7 @@ fn parse_object_reference(text: &str) -> Option<(String, String)> {
     }
 
     let kind = normalize_identifier(raw_kind)?;
-    let mut value = raw_value.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')' | '}' ));
+    let mut value = raw_value.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | ')'));
     if value.starts_with('{') && value.ends_with('}') && value.len() > 2 {
         value = &value[1..value.len() - 1];
     }

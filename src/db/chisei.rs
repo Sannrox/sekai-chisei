@@ -89,12 +89,17 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_evolve_tasks")?
             && table_exists(&conn, "aipp_evolve_enhancements")?
         {
-            let legacy_iter_namespace_projection =
-                if column_exists(&conn, "aipp_eval_iterations", "namespace")? {
-                    "namespace"
-                } else {
-                    "''"
-                };
+            let legacy_iter_namespace_projection = if column_exists(
+                &conn,
+                "aipp_eval_iterations",
+                "namespace",
+            )? {
+                "namespace"
+            } else if column_exists(&conn, "aipp_eval_iterations", "repo")? {
+                "repo"
+            } else {
+                "''"
+            };
 
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_eval_suites(id, name, description, cases_json)
@@ -130,6 +135,15 @@ impl SekaiDb {
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_evolve_enhancements(request_id, original_spec)
                  SELECT task_id, original_spec FROM aipp_evolve_enhancements",
+                [],
+            )
+                .map_err(|e| e.to_string())?;
+        }
+
+        if column_exists(&conn, "chisei_eval_iterations", "repo")? {
+            conn.execute(
+                "UPDATE chisei_eval_iterations SET namespace = COALESCE(NULLIF(namespace, ''), repo)
+                 WHERE namespace = '' AND COALESCE(repo, '') <> ''",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -610,9 +624,17 @@ fn infer_legacy_iteration_namespace(
     cases_json: Option<&str>,
     results_json: Option<&str>,
 ) -> Option<String> {
-    let cases: Vec<eval::Case> = serde_json::from_str(cases_json?).ok()?;
+    let cases: Vec<serde_json::Value> = serde_json::from_str(cases_json?).ok()?;
     let results: Vec<eval::CaseResult> = serde_json::from_str(results_json?).ok()?;
-    let case_namespaces: HashMap<_, _> = cases.into_iter().map(|case| (case.id, case.namespace)).collect();
+    let case_namespaces: HashMap<_, _> = cases
+        .into_iter()
+        .filter_map(|case| {
+            let id = case.get("id")?.as_str()?.to_string();
+            let namespace = case.get("namespace").and_then(|v| v.as_str());
+            let legacy = case.get("repo").and_then(|v| v.as_str());
+            namespace.or(legacy).map(|value| (id, value.to_string()))
+        })
+        .collect();
     let namespaces: BTreeSet<String> = results
         .iter()
         .filter_map(|result| case_namespaces.get(&result.case_id).cloned())
