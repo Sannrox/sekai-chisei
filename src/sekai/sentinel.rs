@@ -6,22 +6,22 @@ const MIN_TASKS: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ProposedTask {
-    pub repo: String,
+    pub namespace: String,
     pub spec: String,
     pub priority: i32,
 }
 
 pub fn scan(db: &SekaiDb) -> Vec<ProposedTask> {
-    let repos = db
+    let namespaces = db
         .list_objects(&crate::domain::ListFilter {
-            kind: Some("repo".into()),
+            kind: Some("namespace".into()),
             ..Default::default()
         })
         .unwrap_or_default();
     let mut proposals = Vec::new();
-    for repo in &repos {
+    for namespace in &namespaces {
         let components = db
-            .get_linked_objects(&repo.id, REL_CONTAINS, &Direction::Outgoing)
+            .get_linked_objects(&namespace.id, REL_CONTAINS, &Direction::Outgoing)
             .unwrap_or_default();
         for comp in &components {
             if comp.kind != KIND_COMPONENT {
@@ -42,8 +42,8 @@ pub fn scan(db: &SekaiDb) -> Vec<ProposedTask> {
                 .unwrap_or(100);
             if rate < SUCCESS_RATE_THRESHOLD {
                 proposals.push(ProposedTask {
-                    repo: repo.name.clone(),
-                    spec: format!("Component '{}' in repo '{}' has success rate {}% (threshold {}%). Investigate and fix.", comp.name, repo.name, rate, SUCCESS_RATE_THRESHOLD),
+                    namespace: namespace.name.clone(),
+                    spec: format!("Component '{}' in namespace '{}' has success rate {}% (threshold {}%). Investigate and fix.", comp.name, namespace.name, rate, SUCCESS_RATE_THRESHOLD),
                     priority: 2,
                 });
             }
@@ -66,8 +66,8 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "my-repo".into(),
+            kind: "namespace".into(),
+            name: "my-namespace".into(),
             namespace: "".into(),
             external_id: "".into(),
             properties: HashMap::new(),
@@ -130,8 +130,8 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
             external_id: "".into(),
             properties: HashMap::new(),

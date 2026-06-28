@@ -279,12 +279,12 @@ mod tests {
     #[test]
     fn test_crud_object() {
         let db = test_db();
-        let mut obj = make_obj("o1", "repo", "my-repo");
+        let mut obj = make_obj("o1", "namespace", "my-namespace");
         obj.properties.insert("language".into(), "rust".into());
         db.create_object(&obj).unwrap();
 
         let got = db.get_object("o1").unwrap().unwrap();
-        assert_eq!(got.name, "my-repo");
+        assert_eq!(got.name, "my-namespace");
         assert_eq!(got.properties["language"], "rust");
 
         obj.name = "renamed".into();
@@ -300,30 +300,30 @@ mod tests {
     #[test]
     fn test_list_and_find() {
         let db = test_db();
-        db.create_object(&make_obj("r1", "repo", "alpha")).unwrap();
-        db.create_object(&make_obj("r2", "repo", "beta")).unwrap();
+        db.create_object(&make_obj("r1", "namespace", "alpha")).unwrap();
+        db.create_object(&make_obj("r2", "namespace", "beta")).unwrap();
         db.create_object(&make_obj("c1", "component", "comp"))
             .unwrap();
 
         let all = db.list_objects(&ListFilter::default()).unwrap();
         assert_eq!(all.len(), 3);
 
-        let repos = db
+        let namespaces = db
             .list_objects(&ListFilter {
-                kind: Some("repo".into()),
+                kind: Some("namespace".into()),
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(repos.len(), 2);
+        assert_eq!(namespaces.len(), 2);
 
-        let found = db.find_by_external_id("repo:alpha").unwrap();
+        let found = db.find_by_external_id("namespace:alpha").unwrap();
         assert_eq!(found.unwrap().id, "r1");
     }
 
     #[test]
     fn test_links() {
         let db = test_db();
-        db.create_object(&make_obj("r1", "repo", "my-repo"))
+        db.create_object(&make_obj("r1", "namespace", "my-namespace"))
             .unwrap();
         db.create_object(&make_obj("c1", "component", "comp"))
             .unwrap();
@@ -353,7 +353,7 @@ mod tests {
             .get_linked_objects("c1", "contains", &Direction::Incoming)
             .unwrap();
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].name, "my-repo");
+        assert_eq!(incoming[0].name, "my-namespace");
 
         db.delete_link("l1").unwrap();
         let links = db

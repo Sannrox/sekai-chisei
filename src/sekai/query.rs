@@ -104,13 +104,13 @@ mod tests {
 
     fn setup() -> SekaiDb {
         let db = SekaiDb::new(":memory:").unwrap();
-        // repo -> comp1, comp2; comp1 -> file1
+        // namespace -> comp1, comp2; comp1 -> file1
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
-            external_id: "repo:main".into(),
+            external_id: "namespace:main".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
@@ -231,7 +231,7 @@ mod tests {
     fn test_start_external_id() {
         let db = setup();
         let q = GraphQuery {
-            start_external_id: "repo:main".into(),
+            start_external_id: "namespace:main".into(),
             max_depth: 1,
             ..Default::default()
         };
