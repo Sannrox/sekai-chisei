@@ -6,7 +6,7 @@ use std::collections::HashMap;
 pub type ObjectKind = String;
 
 // Kinds the chisei routing logic matches on. Not a closed taxonomy — objects
-// may use any kind; these just name the strings the code branches on, in one
+// may use any kind; these just name the strings the code uses, in one
 // place. `model`/`component` drive model selection in chisei::affinity (live
 // via the GetAffinity RPC). `learning` is matched only in the learning/pipeline
 // graph helpers, which are not yet wired to an RPC.
@@ -96,10 +96,10 @@ mod tests {
     fn test_object_serde() {
         let obj = Object {
             id: "obj-1".into(),
-            kind: "repo".into(),
-            name: "test-repo".into(),
+            kind: "namespace".into(),
+            name: "test-namespace".into(),
             namespace: "default".into(),
-            external_id: "repo:test-repo".into(),
+            external_id: "namespace:test-namespace".into(),
             properties: HashMap::from([("language".into(), "rust".into())]),
             created: 1000,
             updated: 1000,

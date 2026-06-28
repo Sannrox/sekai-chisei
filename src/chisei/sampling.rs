@@ -11,7 +11,7 @@
 //! 3. **Deterministic draw** — the random draw is seeded from `request_id`, so a given
 //!    request is reproducibly sampled-or-not (replayable, testable).
 //!
-//! The eval-driven adaptive trigger (oversample when the repo's eval signal is
+//! The eval-driven adaptive trigger (oversample when the namespace eval signal is
 //! regressed) lives in the service layer, which holds the eval store; see
 //! `plan_from_input` in `grpc/chisei_service.rs`.
 
@@ -134,8 +134,6 @@ mod tests {
             namespace: "ns".into(),
             spec: "a standard task that is not trivially short but otherwise plain work here"
                 .into(),
-            repo: "repo".into(),
-            branch: "main".into(),
             model: "claude-sonnet-4-20250514".into(),
             runtime: "native".into(),
             task_type: "feature".into(),

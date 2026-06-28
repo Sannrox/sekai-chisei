@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-`sekai-chisei` is pre-1.0. Security fixes are expected to target the current `main` branch.
+`sekai-chisei` is pre-1.0. Security fixes are expected to target the current `main` line.
 
 ## Reporting A Vulnerability
 

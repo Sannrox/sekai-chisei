@@ -20,12 +20,10 @@ message PipelineRequest {
   string request_id = 1;
   string namespace = 2;
   string spec = 3;
-  string repo = 4;
-  string branch = 5;
-  string model = 6;
-  string runtime = 7;
-  string task_type = 8;
-  int32 priority = 9;
+  string model = 4;
+  string runtime = 5;
+  string task_type = 6;
+  int32 priority = 7;
 }
 
 message StepDecision {
@@ -79,19 +77,17 @@ message ExecutionInput {
   string request_id = 1;
   string namespace = 2;
   string spec = 3;
-  string repo = 4;
-  string branch = 5;
-  string preferred_model = 6;
-  string preferred_runtime = 7;
-  string task_type = 8;
-  int32 priority = 9;
-  string user_id = 10;
-  int32 estimated_tokens = 11;
-  repeated ChatMessage messages = 12;
-  repeated ToolDef tools = 13;
-  string system = 14;
-  int32 max_tokens = 15;
-  reserved 16;
+  string preferred_model = 4;
+  string preferred_runtime = 5;
+  string task_type = 6;
+  int32 priority = 7;
+  string user_id = 8;
+  int32 estimated_tokens = 9;
+  repeated ChatMessage messages = 10;
+  repeated ToolDef tools = 11;
+  string system = 12;
+  int32 max_tokens = 13;
+  reserved 15;
   reserved "agent_id";
 }
 
@@ -108,12 +104,12 @@ message ExecutionPlan {
   repeated StepDecision steps = 10;
   ReviewPolicy review_policy = 11;
   double risk_score = 12;
-  bool low_success_repo = 13;
+  bool low_success_namespace = 13;
   bool executable = 14;
   repeated string warnings = 15;
   int32 max_tokens = 16;
   int64 created_at = 17;
-  repeated string affinity_repos = 18;
+  repeated string affinity_namespaces = 18;
   bool eval_regressed = 19;
   string eval_regression_reason = 20;
   bool sampled = 21;
@@ -131,7 +127,7 @@ message PlannedChatResponse {
 }
 
 message AffinityResult {
-  repeated string repos = 1;
+  repeated string namespaces = 1;
   string best_model = 2;
   bool low_success = 3;
 }
@@ -144,7 +140,7 @@ message EvalAssertion {
 message EvalCase {
   string id = 1;
   string name = 2;
-  string repo = 3;
+  string namespace = 3;
   string spec = 4;
   repeated EvalAssertion assertions = 5;
 }
@@ -303,7 +299,11 @@ message RecordUsageResponse { BudgetUsage usage = 1; }
 message SetBudgetLimitRequest { string user_id = 1; int32 max_tokens = 2; string period_type = 3; }
 message SetBudgetLimitResponse {}
 
-message ResolvePolicyRequest { string namespace = 1; string repo = 2; string preferred_runtime = 3; string preferred_model = 4; }
+message ResolvePolicyRequest {
+  string namespace = 1;
+  string preferred_runtime = 2;
+  string preferred_model = 3;
+}
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 
 message RunPipelineRequest { PipelineRequest request = 1; }
@@ -318,7 +318,7 @@ message ExecutePlanResponse { PlannedChatResponse response = 1; int64 executed_a
 message GetAffinityRequest {
   reserved 1;
   reserved "agent_id";
-  string repo = 2;
+  string namespace = 2;
 }
 message GetAffinityResponse { AffinityResult result = 1; }
 
