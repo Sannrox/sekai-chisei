@@ -89,17 +89,12 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_evolve_tasks")?
             && table_exists(&conn, "aipp_evolve_enhancements")?
         {
-            let legacy_iter_namespace_projection = if column_exists(
+            let aipp_namespace_projection = legacy_namespace_projection_column(
                 &conn,
                 "aipp_eval_iterations",
-                "namespace",
-            )? {
-                "namespace"
-            } else if column_exists(&conn, "aipp_eval_iterations", "repo")? {
-                "repo"
-            } else {
-                "''"
-            };
+                true,
+            )?
+            .unwrap_or_else(|| "''".to_string());
 
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_eval_suites(id, name, description, cases_json)
@@ -119,7 +114,7 @@ impl SekaiDb {
                         id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id,
                         baseline_run_id, candidate_run_id, delta, regressed, created
                      )
-                     SELECT id, run_id, suite_id, {legacy_iter_namespace_projection}, changed_file, diff_hash,
+                     SELECT id, run_id, suite_id, {aipp_namespace_projection}, changed_file, diff_hash,
                             parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created
                      FROM aipp_eval_iterations"
                 ),
@@ -140,13 +135,14 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
         }
 
-        if column_exists(&conn, "chisei_eval_iterations", "repo")? {
-            conn.execute(
-                "UPDATE chisei_eval_iterations SET namespace = COALESCE(NULLIF(namespace, ''), repo)
-                 WHERE namespace = '' AND COALESCE(repo, '') <> ''",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
+        if let Some(legacy_namespace_column) =
+            legacy_namespace_projection_column(&conn, "chisei_eval_iterations", false)?
+        {
+            let update_sql = format!(
+                "UPDATE chisei_eval_iterations SET namespace = COALESCE(NULLIF(namespace, ''), {legacy_namespace_column})
+                 WHERE namespace = '' AND COALESCE({legacy_namespace_column}, '') <> ''"
+            );
+            conn.execute(&update_sql, []).map_err(|e| e.to_string())?;
         }
 
         let legacy_rows = {
@@ -630,9 +626,7 @@ fn infer_legacy_iteration_namespace(
         .into_iter()
         .filter_map(|case| {
             let id = case.get("id")?.as_str()?.to_string();
-            let namespace = case.get("namespace").and_then(|v| v.as_str());
-            let legacy = case.get("repo").and_then(|v| v.as_str());
-            namespace.or(legacy).map(|value| (id, value.to_string()))
+            legacy_case_namespace(&case).map(|namespace| (id, namespace))
         })
         .collect();
     let namespaces: BTreeSet<String> = results
@@ -685,4 +679,114 @@ fn column_exists(
         }
     }
     Ok(false)
+}
+
+fn legacy_namespace_projection_column(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    prefer_exact_namespace: bool,
+) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", table_name))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let column_type: String = row.get(2)?;
+            Ok((name, column_type))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut unknown_text_columns: Vec<String> = Vec::new();
+    for row in rows {
+        let (column_name, column_type) = row.map_err(|e| e.to_string())?;
+        if column_name == "namespace" {
+            if prefer_exact_namespace {
+                return Ok(Some("\"namespace\"".to_string()));
+            }
+        }
+        if !is_known_namespace_column(table_name, &column_name) && is_text_affinity_column(&column_type)
+        {
+            unknown_text_columns.push(format!("\"{}\"", column_name));
+        }
+    }
+    if unknown_text_columns.len() == 1 {
+        return Ok(unknown_text_columns.into_iter().next());
+    }
+    Ok(None)
+}
+
+fn is_known_namespace_column(table_name: &str, column_name: &str) -> bool {
+    match table_name {
+        "chisei_eval_iterations" => {
+            matches!(
+                column_name,
+                "id"
+                    | "run_id"
+                    | "suite_id"
+                    | "namespace"
+                    | "changed_file"
+                    | "diff_hash"
+                    | "parent_iteration_id"
+                    | "baseline_run_id"
+                    | "candidate_run_id"
+                    | "delta"
+                    | "regressed"
+                    | "created"
+            )
+        }
+        "aipp_eval_iterations" => {
+            matches!(
+                column_name,
+                "id"
+                    | "run_id"
+                    | "suite_id"
+                    | "changed_file"
+                    | "diff_hash"
+                    | "parent_iteration_id"
+                    | "baseline_run_id"
+                    | "candidate_run_id"
+                    | "delta"
+                    | "regressed"
+                    | "created"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_text_affinity_column(column_type: &str) -> bool {
+    let normalized = column_type.trim().to_uppercase();
+    normalized.is_empty()
+        || normalized.contains("CHAR")
+        || normalized.contains("CLOB")
+        || normalized.contains("TEXT")
+}
+
+fn legacy_case_namespace(case: &serde_json::Value) -> Option<String> {
+    case.get("namespace")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            case.as_object().and_then(|object| {
+                let mut candidates: Vec<String> = object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        if is_legacy_case_namespace_key(key) && value.is_string() {
+                            value.as_str().map(|value| value.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if candidates.len() == 1 {
+                    candidates.pop()
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn is_legacy_case_namespace_key(key: &str) -> bool {
+    !matches!(key, "id" | "name" | "assertions" | "spec")
 }
