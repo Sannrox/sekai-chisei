@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 pub struct TaskCompletion {
     pub request_id: String,
-    pub repo: String,
+    pub namespace: String,
     pub model: String,
     pub status: String,
     pub packages: Vec<String>,
@@ -14,9 +14,9 @@ pub fn on_task_completed(db: &SekaiDb, event: &TaskCompletion) {
     let now = chrono::Utc::now().timestamp();
     let succeeded = event.status == "done";
 
-    // Find or skip repo
-    let repo_obj = match db
-        .find_by_external_id(&format!("repo:{}", event.repo))
+    // Find or skip namespace
+    let namespace_obj = match db
+        .find_by_external_id(&format!("namespace:{}", event.namespace))
         .ok()
         .flatten()
     {
@@ -26,7 +26,7 @@ pub fn on_task_completed(db: &SekaiDb, event: &TaskCompletion) {
 
     // Update component stats
     let components = db
-        .get_linked_objects(&repo_obj.id, REL_CONTAINS, &Direction::Outgoing)
+        .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     for mut comp in components {
         if comp.kind != KIND_COMPONENT {
@@ -95,10 +95,10 @@ mod tests {
         let now = 0i64;
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "my-repo".into(),
+            kind: "namespace".into(),
+            name: "my-namespace".into(),
             namespace: "".into(),
-            external_id: "repo:my-repo".into(),
+            external_id: "namespace:my-namespace".into(),
             properties: HashMap::new(),
             created: now,
             updated: now,
@@ -133,7 +133,7 @@ mod tests {
             &db,
             &TaskCompletion {
                 request_id: "t1".into(),
-                repo: "my-repo".into(),
+                namespace: "my-namespace".into(),
                 model: "claude".into(),
                 status: "done".into(),
                 packages: vec![],
@@ -143,7 +143,7 @@ mod tests {
             &db,
             &TaskCompletion {
                 request_id: "t2".into(),
-                repo: "my-repo".into(),
+                namespace: "my-namespace".into(),
                 model: "claude".into(),
                 status: "failed".into(),
                 packages: vec![],
@@ -164,7 +164,7 @@ mod tests {
             &db,
             &TaskCompletion {
                 request_id: "t1".into(),
-                repo: "my-repo".into(),
+                namespace: "my-namespace".into(),
                 model: "claude-sonnet".into(),
                 status: "done".into(),
                 packages: vec![],

@@ -5,7 +5,7 @@ Thanks for your interest in `sekai-chisei`.
 ## Development Setup
 
 1. Install a recent Rust toolchain with edition 2024 support.
-2. Clone the repository.
+2. Clone the project.
 3. Run `cargo test`.
 4. Run `SEKAI_INSECURE=1 cargo run` for local development.
 
