@@ -16,7 +16,9 @@ pub fn check_escalation(
     threshold: Option<i32>,
 ) -> Option<EscalationResult> {
     let thresh = threshold.unwrap_or(DEFAULT_THRESHOLD);
-    let namespace_obj = db.find_by_external_id(&format!("namespace:{}", namespace)).ok()??;
+    let namespace_obj = db
+        .find_by_external_id(&format!("namespace:{}", namespace))
+        .ok()??;
     let components = db
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .ok()?;
