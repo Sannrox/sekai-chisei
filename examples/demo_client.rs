@@ -120,37 +120,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Distinct ids per run so repeated invocations don't collide.
     let run = &uuid::Uuid::new_v4().to_string()[..8];
-    let repo_id = format!("repo-{run}");
+    let namespace_id = format!("ctx-{run}");
     let service_id = format!("svc-{run}");
 
-    sekai_demo(&mut sekai, &repo_id, &service_id).await;
-    chisei_demo(&mut chisei, &repo_id).await;
-    execute_demo(&mut chisei, &repo_id).await;
+    sekai_demo(&mut sekai, &namespace_id, &service_id).await;
+    chisei_demo(&mut chisei, &namespace_id).await;
+    execute_demo(&mut chisei, &namespace_id).await;
 
     println!("\n\x1b[1;32mdemo complete.\x1b[0m");
     Ok(())
 }
 
 /// Builds a tiny typed-object graph and reads it back.
-async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
+async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     section("sekai · typed object graph");
 
-    let repo = Object {
-        id: repo_id.to_string(),
-        kind: "repo".to_string(),
+    let context_obj = Object {
+        id: namespace_id.to_string(),
+        kind: "component".to_string(),
         name: "sekai-chisei".to_string(),
         namespace: "demo".to_string(),
-        external_id: format!("github.com/acme/{repo_id}"),
+        external_id: format!("ctx:{namespace_id}"),
         properties: props(&[("language", "rust"), ("visibility", "private")]),
         created: now_ms(),
         updated: now_ms(),
     };
     match sekai
-        .create_object(CreateObjectRequest { object: Some(repo) })
+        .create_object(CreateObjectRequest {
+            object: Some(context_obj),
+        })
         .await
     {
-        Ok(_) => ok(format!("created repo object  {repo_id}")),
-        Err(e) => warn("create repo", &e),
+        Ok(_) => ok(format!("created context object  {namespace_id}")),
+        Err(e) => warn("create context object", &e),
     }
 
     let service = Object {
@@ -173,12 +175,12 @@ async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
         Err(e) => warn("create service", &e),
     }
 
-    // repo --deploys--> service
+    // context --deploys--> service
     match sekai
         .create_link(CreateLinkRequest {
             link: Some(Link {
-                id: format!("link-{repo_id}-{service_id}"),
-                from_id: repo_id.to_string(),
+                id: format!("link-{namespace_id}-{service_id}"),
+                from_id: namespace_id.to_string(),
                 to_id: service_id.to_string(),
                 relation: "deploys".to_string(),
                 created: now_ms(),
@@ -186,14 +188,14 @@ async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
         })
         .await
     {
-        Ok(_) => ok("linked  repo --deploys--> service"),
+        Ok(_) => ok("linked  context --deploys--> service"),
         Err(e) => warn("create link", &e),
     }
 
     // Read the relationship back out.
     match sekai
         .get_linked_objects(GetLinkedObjectsRequest {
-            object_id: repo_id.to_string(),
+            object_id: namespace_id.to_string(),
             relation: "deploys".to_string(),
             direction: "out".to_string(),
         })
@@ -201,7 +203,7 @@ async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
     {
         Ok(resp) => {
             let objs = resp.into_inner().objects;
-            ok(format!("repo deploys {} object(s):", objs.len()));
+            ok(format!("context deploys {} object(s):", objs.len()));
             for o in objs {
                 println!("      - {} ({}) [{}]", o.name, o.kind, o.id);
             }
@@ -209,11 +211,11 @@ async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
         Err(e) => warn("get linked objects", &e),
     }
 
-    // Traverse the graph outward from the repo.
+    // Traverse the graph outward from the context object.
     match sekai
         .traverse(TraverseRequest {
             query: Some(GraphQuery {
-                start_id: repo_id.to_string(),
+                start_id: namespace_id.to_string(),
                 direction: "out".to_string(),
                 max_depth: 3,
                 ..Default::default()
@@ -252,7 +254,7 @@ async fn sekai_demo(sekai: &mut Sekai, repo_id: &str, service_id: &str) {
 }
 
 /// Drives the chisei budget + decision pipeline.
-async fn chisei_demo(chisei: &mut Chisei, repo_id: &str) {
+async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
     section("chisei · budget & decision pipeline");
 
     let user = "demo-user";
@@ -305,7 +307,6 @@ async fn chisei_demo(chisei: &mut Chisei, repo_id: &str) {
     match chisei
         .resolve_policy(ResolvePolicyRequest {
             namespace: "demo".to_string(),
-            repo: repo_id.to_string(),
             preferred_runtime: String::new(),
             preferred_model: String::new(),
         })
@@ -331,8 +332,6 @@ async fn chisei_demo(chisei: &mut Chisei, repo_id: &str) {
                 request_id: request_id.clone(),
                 namespace: "demo".to_string(),
                 spec: "Add rate limiting to the billing-api login endpoint".to_string(),
-                repo: repo_id.to_string(),
-                branch: "main".to_string(),
                 model: String::new(),
                 runtime: String::new(),
                 task_type: "feature".to_string(),
@@ -371,7 +370,7 @@ async fn chisei_demo(chisei: &mut Chisei, repo_id: &str) {
 /// `PlanExecution` resolves policy/budget and caches a server-side plan;
 /// `ExecutePlan` then actually calls the model. The model defaults to
 /// `ollama/llama3.2:latest` and can be overridden with `DEMO_MODEL`.
-async fn execute_demo(chisei: &mut Chisei, repo_id: &str) {
+async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
     section("chisei · execute (live LLM call)");
 
     let model =
@@ -381,10 +380,8 @@ async fn execute_demo(chisei: &mut Chisei, repo_id: &str) {
     let request_id = format!("exec-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let input = ExecutionInput {
         request_id: request_id.clone(),
-        namespace: "demo".to_string(),
+        namespace: namespace_id.to_string(),
         spec: "Explain API rate limiting in one or two sentences.".to_string(),
-        repo: repo_id.to_string(),
-        branch: "main".to_string(),
         preferred_model: model.clone(),
         preferred_runtime: String::new(),
         task_type: "question".to_string(),

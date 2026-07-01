@@ -27,7 +27,7 @@ impl SekaiDb {
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
                 suite_id TEXT NOT NULL,
-                repo TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '',
                 changed_file TEXT NOT NULL,
                 diff_hash TEXT NOT NULL,
                 parent_iteration_id TEXT NOT NULL,
@@ -46,11 +46,35 @@ impl SekaiDb {
             CREATE TABLE IF NOT EXISTS chisei_evolve_enhancements (
                 request_id TEXT PRIMARY KEY,
                 original_spec TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS chisei_sample_observations (
+                request_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT '',
+                spec TEXT NOT NULL DEFAULT '',
+                resolved_model TEXT NOT NULL DEFAULT '',
+                output_content TEXT NOT NULL DEFAULT '',
+                sample_reason TEXT NOT NULL DEFAULT '',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT NOT NULL DEFAULT '',
+                timestamp INTEGER NOT NULL,
+                scored INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);",
         )
         .map_err(|e| e.to_string())?;
         match conn.execute(
-            "ALTER TABLE chisei_eval_iterations ADD COLUMN repo TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE chisei_eval_iterations ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") => {}
+            Err(err) => return Err(err.to_string()),
+        }
+        match conn.execute(
+            "ALTER TABLE chisei_sample_observations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
             [],
         ) {
             Ok(_) => {}
@@ -65,12 +89,9 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_evolve_tasks")?
             && table_exists(&conn, "aipp_evolve_enhancements")?
         {
-            let legacy_iter_repo_projection =
-                if column_exists(&conn, "aipp_eval_iterations", "repo")? {
-                    "repo"
-                } else {
-                    "''"
-                };
+            let aipp_namespace_projection =
+                legacy_namespace_projection_column(&conn, "aipp_eval_iterations", true)?
+                    .unwrap_or_else(|| "''".to_string());
 
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_eval_suites(id, name, description, cases_json)
@@ -87,10 +108,10 @@ impl SekaiDb {
             conn.execute(
                 &format!(
                     "INSERT OR IGNORE INTO chisei_eval_iterations(
-                        id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id,
+                        id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id,
                         baseline_run_id, candidate_run_id, delta, regressed, created
                      )
-                     SELECT id, run_id, suite_id, {legacy_iter_repo_projection}, changed_file, diff_hash,
+                     SELECT id, run_id, suite_id, {aipp_namespace_projection}, changed_file, diff_hash,
                             parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created
                      FROM aipp_eval_iterations"
                 ),
@@ -111,6 +132,16 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         }
 
+        if let Some(legacy_namespace_column) =
+            legacy_namespace_projection_column(&conn, "chisei_eval_iterations", false)?
+        {
+            let update_sql = format!(
+                "UPDATE chisei_eval_iterations SET namespace = COALESCE(NULLIF(namespace, ''), {legacy_namespace_column})
+                 WHERE namespace = '' AND COALESCE({legacy_namespace_column}, '') <> ''"
+            );
+            conn.execute(&update_sql, []).map_err(|e| e.to_string())?;
+        }
+
         let legacy_rows = {
             let mut stmt = conn
                 .prepare(
@@ -118,7 +149,7 @@ impl SekaiDb {
                      FROM chisei_eval_iterations i
                      LEFT JOIN chisei_eval_suites s ON s.id = i.suite_id
                      LEFT JOIN chisei_eval_runs r ON r.id = i.run_id
-                     WHERE i.repo = ''",
+                     WHERE i.namespace = ''",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -135,7 +166,7 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
         };
         for (id, changed_file, cases_json, results_json) in legacy_rows {
-            let Some(repo) = infer_legacy_iteration_repo(
+            let Some(namespace) = infer_legacy_iteration_namespace(
                 &changed_file,
                 cases_json.as_deref(),
                 results_json.as_deref(),
@@ -143,8 +174,8 @@ impl SekaiDb {
                 continue;
             };
             conn.execute(
-                "UPDATE chisei_eval_iterations SET repo = ?1 WHERE id = ?2 AND repo = ''",
-                params![repo, id],
+                "UPDATE chisei_eval_iterations SET namespace = ?1 WHERE id = ?2 AND namespace = ''",
+                params![namespace, id],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -280,15 +311,43 @@ impl SekaiDb {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Keep only the newest `keep` runs for a suite (newest by timestamp), deleting the rest. Used
+    /// to bound the rows the scoring job's continuous per-cycle run emission would otherwise grow
+    /// without limit. Scoped to a single suite id, so user-authored suites are never touched.
+    pub fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chisei_eval_runs WHERE suite_id = ?1 AND id NOT IN (
+                SELECT id FROM chisei_eval_runs WHERE suite_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2
+            )",
+            params![suite_id, keep],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Keep only the newest `keep` iterations for a suite (newest by `created`), deleting the rest.
+    pub fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chisei_eval_iterations WHERE suite_id = ?1 AND id NOT IN (
+                SELECT id FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created DESC, id DESC LIMIT ?2
+            )",
+            params![suite_id, keep],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 iteration.id,
                 iteration.run_id,
                 iteration.suite_id,
-                iteration.repo,
+                iteration.namespace,
                 iteration.changed_file,
                 iteration.diff_hash,
                 iteration.parent_iteration_id,
@@ -310,7 +369,7 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created, id",
+                "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -319,7 +378,7 @@ impl SekaiDb {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -338,7 +397,7 @@ impl SekaiDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations ORDER BY created, id",
+                "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations ORDER BY created, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -347,7 +406,7 @@ impl SekaiDb {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -368,14 +427,14 @@ impl SekaiDb {
     ) -> Result<Option<eval::Iteration>, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, run_id, suite_id, repo, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE changed_file = ?1 ORDER BY created DESC, id DESC LIMIT 1",
+            "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE changed_file = ?1 ORDER BY created DESC, id DESC LIMIT 1",
             params![changed_file],
             |row| {
                 Ok(eval::Iteration {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     suite_id: row.get(2)?,
-                    repo: row.get(3)?,
+                    namespace: row.get(3)?,
                     changed_file: row.get(4)?,
                     diff_hash: row.get(5)?,
                     parent_iteration_id: row.get(6)?,
@@ -448,6 +507,97 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Persist a sampled execution observation captured at execute time. Idempotent on
+    /// `request_id` (re-execution does not reset the `scored` flag).
+    pub fn put_sample_observation(
+        &self,
+        obs: &crate::chisei::scoring::SampleObservation,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO chisei_sample_observations
+                (request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+            params![
+                obs.request_id,
+                obs.namespace,
+                obs.spec,
+                obs.resolved_model,
+                obs.output_content,
+                obs.sample_reason,
+                obs.input_tokens,
+                obs.output_tokens,
+                obs.stop_reason,
+                obs.timestamp,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Oldest-first batch of observations the scoring job has not yet consumed.
+    pub fn list_unscored_observations(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
+        let effective_limit = if limit > 0 { limit } else { 16 };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored
+                 FROM chisei_sample_observations WHERE scored = 0 ORDER BY timestamp, request_id LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![effective_limit], |row| {
+                Ok(crate::chisei::scoring::SampleObservation {
+                    request_id: row.get(0)?,
+                    namespace: row.get(1)?,
+                    spec: row.get(2)?,
+                    resolved_model: row.get(3)?,
+                    output_content: row.get(4)?,
+                    sample_reason: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    stop_reason: row.get(8)?,
+                    timestamp: row.get(9)?,
+                    scored: row.get::<_, i64>(10)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Increment and return the judge-failure count for an observation, so the scoring job can
+    /// retire records that fail deterministically instead of letting them occupy batch slots forever.
+    pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chisei_sample_observations SET attempts = attempts + 1 WHERE request_id = ?1",
+            params![request_id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT attempts FROM chisei_sample_observations WHERE request_id = ?1",
+            params![request_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Remove a consumed observation. The row is queue input only — the scored outcome is
+    /// preserved durably in the eval run, iteration, and audit decision — so deleting it bounds
+    /// table growth to the unscored backlog plus the in-flight batch.
+    pub fn delete_observation(&self, request_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chisei_sample_observations WHERE request_id = ?1",
+            params![request_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -462,24 +612,30 @@ impl SekaiDb {
     }
 }
 
-fn infer_legacy_iteration_repo(
+fn infer_legacy_iteration_namespace(
     changed_file: &str,
     cases_json: Option<&str>,
     results_json: Option<&str>,
 ) -> Option<String> {
-    let cases: Vec<eval::Case> = serde_json::from_str(cases_json?).ok()?;
+    let cases: Vec<serde_json::Value> = serde_json::from_str(cases_json?).ok()?;
     let results: Vec<eval::CaseResult> = serde_json::from_str(results_json?).ok()?;
-    let case_repos: HashMap<_, _> = cases.into_iter().map(|case| (case.id, case.repo)).collect();
-    let repos: BTreeSet<String> = results
-        .iter()
-        .filter_map(|result| case_repos.get(&result.case_id).cloned())
-        .collect();
-    if repos.len() == 1 {
-        return repos.into_iter().next();
-    }
-    let matching: Vec<String> = repos
+    let case_namespaces: HashMap<_, _> = cases
         .into_iter()
-        .filter(|repo| changed_file.contains(repo))
+        .filter_map(|case| {
+            let id = case.get("id")?.as_str()?.to_string();
+            legacy_case_namespace(&case).map(|namespace| (id, namespace))
+        })
+        .collect();
+    let namespaces: BTreeSet<String> = results
+        .iter()
+        .filter_map(|result| case_namespaces.get(&result.case_id).cloned())
+        .collect();
+    if namespaces.len() == 1 {
+        return namespaces.into_iter().next();
+    }
+    let matching: Vec<String> = namespaces
+        .into_iter()
+        .filter(|namespace| changed_file.contains(namespace))
         .collect();
     if matching.len() == 1 {
         Some(matching[0].clone())
@@ -500,24 +656,109 @@ fn table_exists(conn: &rusqlite::Connection, table_name: &str) -> Result<bool, S
     Ok(exists.is_some())
 }
 
-fn column_exists(
+fn legacy_namespace_projection_column(
     conn: &rusqlite::Connection,
     table_name: &str,
-    column_name: &str,
-) -> Result<bool, String> {
+    prefer_exact_namespace: bool,
+) -> Result<Option<String>, String> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({})", table_name))
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt
+    let rows = stmt
         .query_map([], |row| {
             let name: String = row.get(1)?;
-            Ok(name)
+            let column_type: String = row.get(2)?;
+            Ok((name, column_type))
         })
         .map_err(|e| e.to_string())?;
-    while let Some(row) = rows.next().transpose().map_err(|e| e.to_string())? {
-        if row == column_name {
-            return Ok(true);
+    let mut unknown_text_columns: Vec<String> = Vec::new();
+    for row in rows {
+        let (column_name, column_type) = row.map_err(|e| e.to_string())?;
+        if column_name == "namespace" && prefer_exact_namespace {
+            return Ok(Some("\"namespace\"".to_string()));
+        }
+        if !is_known_namespace_column(table_name, &column_name)
+            && is_text_affinity_column(&column_type)
+        {
+            unknown_text_columns.push(format!("\"{}\"", column_name));
         }
     }
-    Ok(false)
+    if unknown_text_columns.len() == 1 {
+        return Ok(unknown_text_columns.into_iter().next());
+    }
+    Ok(None)
+}
+
+fn is_known_namespace_column(table_name: &str, column_name: &str) -> bool {
+    match table_name {
+        "chisei_eval_iterations" => {
+            matches!(
+                column_name,
+                "id" | "run_id"
+                    | "suite_id"
+                    | "namespace"
+                    | "changed_file"
+                    | "diff_hash"
+                    | "parent_iteration_id"
+                    | "baseline_run_id"
+                    | "candidate_run_id"
+                    | "delta"
+                    | "regressed"
+                    | "created"
+            )
+        }
+        "aipp_eval_iterations" => {
+            matches!(
+                column_name,
+                "id" | "run_id"
+                    | "suite_id"
+                    | "changed_file"
+                    | "diff_hash"
+                    | "parent_iteration_id"
+                    | "baseline_run_id"
+                    | "candidate_run_id"
+                    | "delta"
+                    | "regressed"
+                    | "created"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_text_affinity_column(column_type: &str) -> bool {
+    let normalized = column_type.trim().to_uppercase();
+    normalized.is_empty()
+        || normalized.contains("CHAR")
+        || normalized.contains("CLOB")
+        || normalized.contains("TEXT")
+}
+
+fn legacy_case_namespace(case: &serde_json::Value) -> Option<String> {
+    case.get("namespace")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            case.as_object().and_then(|object| {
+                let mut candidates: Vec<String> = object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        if is_legacy_case_namespace_key(key) && value.is_string() {
+                            value.as_str().map(|value| value.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if candidates.len() == 1 {
+                    candidates.pop()
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn is_legacy_case_namespace_key(key: &str) -> bool {
+    !matches!(key, "id" | "name" | "assertions" | "spec")
 }
