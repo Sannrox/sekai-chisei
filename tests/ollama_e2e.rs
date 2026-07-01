@@ -58,6 +58,12 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         ollama_url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
         native_llm_url: None,
         auth_token: None,
+        sample_rate: 0.05,
+        sample_risk_threshold: 0.7,
+        scoring_enabled: false,
+        scoring_interval_secs: 60,
+        scoring_model: "claude-opus-4-8".into(),
+        scoring_batch_size: 16,
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
@@ -75,7 +81,6 @@ async fn grpc_chat_round_trip_with_local_ollama() {
     let policy = client
         .resolve_policy(ResolvePolicyRequest {
             namespace: "default".into(),
-            repo: "".into(),
             preferred_runtime: String::new(),
             preferred_model: model.clone(),
         })
@@ -90,8 +95,6 @@ async fn grpc_chat_round_trip_with_local_ollama() {
                 request_id: "ollama-e2e".into(),
                 namespace: "default".into(),
                 spec: "Say hello in one short sentence.".into(),
-                repo: String::new(),
-                branch: String::new(),
                 preferred_model: model,
                 preferred_runtime: String::new(),
                 task_type: String::new(),

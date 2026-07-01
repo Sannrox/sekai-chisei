@@ -8,7 +8,7 @@ Its job is not just to call models. Its job is to maintain enough structured mem
 
 In practical terms, this project combines two layers:
 
-- `sekai`: a durable graph and dataset system for repositories, components, agents, tasks, learnings, lineage, access, and audit history
+- `sekai`: a durable graph and dataset system for namespaces, components, agents, tasks, learnings, lineage, access, and audit history
 - `chisei`: a decision layer that applies budget controls, policy resolution, task routing, model selection, evaluation, and evolution based on what `sekai` knows
 
 The long-term goal is to make AI execution look less like isolated prompt calls and more like an operating system for engineering work.
@@ -41,9 +41,9 @@ If this project succeeds, an engineering organization can represent its working 
 
 ### 1. World Model
 
-`sekai` should be the canonical memory layer for engineering operations:
+`sekai` should be the canonical memory layer for operations:
 
-- repositories, packages, files, components, environments, deployments, pull requests, issues, tasks, goals, agents, models, and learnings
+- components, tasks, models, agents, policies, learnings, audit records, and graph relations
 - typed relations between those objects
 - graph traversal, lineage, schema validation, derived properties, datasets, and virtual tables
 - audit trails for decisions and object changes
@@ -55,7 +55,7 @@ This layer should stay simple, queryable, and durable. It is the ground truth th
 
 `chisei` should decide how work gets executed:
 
-- resolve allowed runtimes and models from namespace or repo policy
+- resolve allowed runtimes and models from namespace or namespace policy
 - enforce token budgets and surface capacity pressure
 - enrich tasks with prior learnings and risk signals
 - recommend execution choices instead of treating every task as stateless
@@ -108,7 +108,7 @@ The codebase already establishes the core direction:
 - a Rust gRPC server with separate `sekai`, `chisei`, and `llm` services
 - a SQLite-backed object graph with links, datasets, virtual tables, lineage, audit, actions, and security controls
 - policy resolution and budget tracking for AI execution
-- a pipeline that enriches tasks, scores repo risk, and recommends a model
+- a pipeline that enriches tasks, scores namespace risk, and recommends a model
 - an evaluation store with baseline comparison
 - evolution utilities that extract patterns and improve task specs
 - provider adapters for OpenAI, Anthropic, Ollama-compatible, and native endpoints
@@ -126,14 +126,13 @@ That means the project is past the idea stage. The next challenge is turning the
 
 ### Mid Term
 
-- Add richer ingestion paths from repos, CI, issue trackers, and agent runtimes
 - Improve model and runtime selection using observed performance instead of defaults
 - Build stronger lineage between tasks, code changes, evaluations, and deployed outcomes
 - Support operational reporting for reliability, budget pressure, and agent effectiveness
 
 ### Long Term
 
-- Become the backbone for multi-agent software delivery across many repos and teams
+- Become the backbone for multi-agent software delivery across many namespaces and teams
 - Enable organizations to treat AI execution policy as infrastructure
 - Make engineering memory cumulative so every completed task improves future execution quality
 

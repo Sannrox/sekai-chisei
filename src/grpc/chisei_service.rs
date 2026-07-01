@@ -31,6 +31,7 @@ const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
         let _ = db.migrate_chisei();
+        db.migrate_audit();
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -54,7 +55,7 @@ impl ChiseiServiceImpl {
         Self {
             budget: Arc::new(BudgetTracker::new()),
             policy: Arc::new(PolicyResolver::new()),
-            pipeline: pipe::default_pipeline(),
+            pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
@@ -64,8 +65,20 @@ impl ChiseiServiceImpl {
         }
     }
 
+    /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
+    /// and config — so emitted runs are visible to live regression checks immediately.
+    pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
+        crate::chisei::scoring::ScoringJob::new(
+            self.db.clone(),
+            self.eval.clone(),
+            self.config.clone(),
+            self.budget.clone(),
+        )
+    }
+
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let _ = db.migrate_chisei();
+        db.migrate_audit();
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -89,7 +102,7 @@ impl ChiseiServiceImpl {
         Self {
             budget,
             policy: Arc::new(PolicyResolver::new()),
-            pipeline: pipe::default_pipeline(),
+            pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
@@ -106,12 +119,11 @@ impl ChiseiServiceImpl {
             input.user_id.clone()
         };
         let budget_pressure = self.budget.namespace_pressure(&input.namespace);
+        let namespace_hint = input.namespace.trim().to_string();
         let mut pipeline_req = pipe::PipelineRequest {
             request_id: input.request_id.clone(),
             namespace: input.namespace.clone(),
             spec: input.spec.clone(),
-            repo: input.repo.clone(),
-            branch: input.branch.clone(),
             model: input.preferred_model.clone(),
             runtime: input.preferred_runtime.clone(),
             task_type: input.task_type.clone(),
@@ -120,14 +132,14 @@ impl ChiseiServiceImpl {
             budget_pressure: budget_pressure.clone(),
             review_model: String::new(),
         };
-        let affinity = crate::chisei::affinity::get_affinity(&self.db, &input.repo);
+        let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let run = self.pipeline.run(&mut pipeline_req, &self.db);
         let recommended_model = run
             .recommended_model()
             .map(|(model, _)| model.to_string())
             .unwrap_or_else(|| pipeline_req.model.clone());
         let route_bias = crate::chisei::model_routing::route_bias(&run.steps);
-        let effective_policy = self.policy.effective_policy(&input.namespace, &input.repo);
+        let effective_policy = self.policy.effective_policy(&input.namespace);
         let preferred_model = choose_preferred_model(
             &input.preferred_model,
             &recommended_model,
@@ -138,7 +150,6 @@ impl ChiseiServiceImpl {
             .policy
             .resolve(
                 &input.namespace,
-                &input.repo,
                 &if input.preferred_runtime.is_empty() {
                     pipeline_req.runtime.clone()
                 } else {
@@ -218,21 +229,62 @@ impl ChiseiServiceImpl {
         } else {
             None
         };
-        let repo_eval_signal = self.eval.repo_regression_signal(&input.repo);
-        if let Some(signal) = repo_eval_signal.as_ref().filter(|signal| signal.regressed) {
+        let namespace_eval_signal = if namespace_hint.is_empty() {
+            None
+        } else {
+            self.eval.namespace_regression_signal(&namespace_hint)
+        };
+        if let Some(signal) = namespace_eval_signal
+            .as_ref()
+            .filter(|signal| signal.regressed)
+        {
             warnings.push(signal.reason.clone());
         }
-        let eval_regressed = repo_eval_signal
+        let eval_regressed = namespace_eval_signal
             .as_ref()
             .map(|signal| signal.regressed)
             .unwrap_or(false);
-        let eval_regression_reason = repo_eval_signal
+        let eval_regression_reason = namespace_eval_signal
             .as_ref()
             .filter(|signal| signal.regressed)
             .map(|signal| signal.reason.clone())
             .unwrap_or_default();
         let executable = allowed && !eval_regressed;
-        let low_success_repo = affinity.low_success;
+        let low_success_namespace = affinity.low_success;
+        // Sampling: the pipeline decides from request metadata; the eval-driven
+        // adaptive trigger (oversample regressed namespaces) is applied here since the
+        // eval store lives on the service.
+        let mut sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
+            crate::chisei::sampling::SamplingDecision {
+                sampled: false,
+                effective_rate: self.config.sample_rate,
+                reason: "not_sampled".into(),
+            },
+        );
+        if eval_regressed && !sampling.sampled {
+            sampling.sampled = true;
+            sampling.effective_rate = 1.0;
+            sampling.reason = "eval_regressed".into();
+        }
+        if sampling.sampled {
+            let mut evidence = std::collections::HashMap::new();
+            evidence.insert(
+                "effective_rate".to_string(),
+                sampling.effective_rate.to_string(),
+            );
+            evidence.insert("risk_score".to_string(), run.risk_score.to_string());
+            evidence.insert("model".to_string(), resolved_model.clone());
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.sampling".into(),
+                action: "sample".into(),
+                reason: sampling.reason.clone(),
+                evidence,
+                target_id: input.request_id.clone(),
+                outcome: "sampled".into(),
+            });
+        }
         Ok(ExecutionPlan {
             plan_id: uuid::Uuid::new_v4().to_string(),
             input: Some(normalized_input),
@@ -267,14 +319,17 @@ impl ChiseiServiceImpl {
                 .collect(),
             review_policy,
             risk_score: run.risk_score,
-            low_success_repo,
+            low_success_namespace,
             executable,
             warnings,
             max_tokens: input.max_tokens,
             created_at: chrono::Utc::now().timestamp_millis(),
-            affinity_repos: affinity.repos,
+            affinity_namespaces: affinity.namespaces,
             eval_regressed,
             eval_regression_reason,
+            sampled: sampling.sampled,
+            sample_rate: sampling.effective_rate,
+            sample_reason: sampling.reason,
         })
     }
 
@@ -349,7 +404,7 @@ impl ChiseiServiceImpl {
     fn record_evolve_task(
         &self,
         request_id: &str,
-        repo: &str,
+        namespace: &str,
         spec: &str,
         original_spec: Option<&str>,
         status: &str,
@@ -364,13 +419,13 @@ impl ChiseiServiceImpl {
                 id: request_id.to_string(),
                 spec: spec.to_string(),
                 status: status.to_string(),
-                repo: repo.to_string(),
+                namespace: namespace.to_string(),
                 tokens_used,
                 original_spec: original_spec.map(ToOwned::to_owned),
                 created: chrono::Utc::now().timestamp(),
             }
         });
-        entry.repo = repo.to_string();
+        entry.namespace = namespace.to_string();
         entry.spec = spec.to_string();
         entry.status = status.to_string();
         entry.tokens_used = tokens_used;
@@ -550,15 +605,10 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ResolvePolicyRequest>,
     ) -> Result<Response<ResolvePolicyResponse>, Status> {
         let r = req.into_inner();
-        let effective_policy = self.policy.effective_policy(&r.namespace, &r.repo);
+        let effective_policy = self.policy.effective_policy(&r.namespace);
         let (runtime, model) = self
             .policy
-            .resolve(
-                &r.namespace,
-                &r.repo,
-                &r.preferred_runtime,
-                &r.preferred_model,
-            )
+            .resolve(&r.namespace, &r.preferred_runtime, &r.preferred_model)
             .map_err(Status::invalid_argument)?;
         let model = self
             .resolve_live_model(&model, effective_policy.as_ref(), None)
@@ -581,8 +631,6 @@ impl ChiseiService for ChiseiServiceImpl {
             request_id: r.request_id,
             namespace: r.namespace,
             spec: r.spec,
-            repo: r.repo,
-            branch: r.branch,
             model: r.model,
             runtime: r.runtime,
             task_type: r.task_type,
@@ -631,9 +679,10 @@ impl ChiseiService for ChiseiServiceImpl {
             .ok_or(Status::invalid_argument("input required"))?;
         let plan = self.plan_from_input(input).await?;
         if let Some(plan_input) = &plan.input {
+            let namespace_hint = plan_input.namespace.trim().to_string();
             self.record_evolve_task(
                 &plan_input.request_id,
-                &plan_input.repo,
+                &namespace_hint,
                 &plan.enriched_spec,
                 self.tracked_original_spec(
                     &plan_input.request_id,
@@ -677,9 +726,10 @@ impl ChiseiService for ChiseiServiceImpl {
             .input
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
+        let namespace_hint = input.namespace.trim().to_string();
         if let Some(signal) = self
             .eval
-            .repo_regression_signal(&input.repo)
+            .namespace_regression_signal(&namespace_hint)
             .filter(|signal| signal.regressed)
         {
             return Err(Status::failed_precondition(signal.reason));
@@ -725,7 +775,7 @@ impl ChiseiService for ChiseiServiceImpl {
         let chat = execute_chat_request(&self.config, self.budget.clone(), llm_req).await?;
         self.record_evolve_task(
             &input.request_id,
-            &input.repo,
+            &namespace_hint,
             &plan.enriched_spec,
             self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
                 .as_deref(),
@@ -733,6 +783,49 @@ impl ChiseiService for ChiseiServiceImpl {
             chat.input_tokens + chat.output_tokens,
         )
         .map_err(Status::internal)?;
+        // Sampling consumption: a sampled request was selected for deeper
+        // observation, so capture its actual execution outcome as a durable
+        // audit record keyed to the request. Unsampled executions skip this —
+        // bounded overhead is the whole point of sampling.
+        if plan.sampled {
+            let mut evidence = std::collections::HashMap::new();
+            evidence.insert("model".to_string(), plan.resolved_model.clone());
+            evidence.insert("input_tokens".to_string(), chat.input_tokens.to_string());
+            evidence.insert("output_tokens".to_string(), chat.output_tokens.to_string());
+            evidence.insert("stop_reason".to_string(), chat.stop_reason.clone());
+            evidence.insert("sample_rate".to_string(), plan.sample_rate.to_string());
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.sampling".into(),
+                action: "sample_observed".into(),
+                reason: plan.sample_reason.clone(),
+                evidence,
+                target_id: input.request_id.clone(),
+                outcome: "observed".into(),
+            });
+            // Durable, judge-able record (spec + output) that the scoring job consumes to
+            // produce real eval runs. Kept in its own table so large content stays out of the
+            // audit evidence JSON. Only captured when scoring is enabled — otherwise there is no
+            // consumer and the (full-content) rows would accumulate as dead data.
+            if self.config.scoring_enabled {
+                let _ =
+                    self.db
+                        .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                            request_id: input.request_id.clone(),
+                            namespace: namespace_hint.clone(),
+                            spec: plan.enriched_spec.clone(),
+                            resolved_model: plan.resolved_model.clone(),
+                            output_content: chat.content.clone(),
+                            sample_reason: plan.sample_reason.clone(),
+                            input_tokens: chat.input_tokens,
+                            output_tokens: chat.output_tokens,
+                            stop_reason: chat.stop_reason.clone(),
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                            scored: false,
+                        });
+            }
+        }
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         Ok(Response::new(ExecutePlanResponse {
             response: Some(PlannedChatResponse {
@@ -760,10 +853,10 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<GetAffinityRequest>,
     ) -> Result<Response<GetAffinityResponse>, Status> {
         let r = req.into_inner();
-        let a = crate::chisei::affinity::get_affinity(&self.db, &r.repo);
+        let a = crate::chisei::affinity::get_affinity(&self.db, &r.namespace);
         Ok(Response::new(GetAffinityResponse {
             result: Some(AffinityResult {
-                repos: a.repos,
+                namespaces: a.namespaces,
                 best_model: a.best_model,
                 low_success: a.low_success,
             }),
@@ -788,7 +881,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map(|c| crate::chisei::eval::Case {
                     id: c.id.clone(),
                     name: c.name.clone(),
-                    repo: c.repo.clone(),
+                    namespace: c.namespace.clone(),
                     spec: c.spec.clone(),
                     assertions: c
                         .assertions
@@ -1085,11 +1178,11 @@ impl ChiseiService for ChiseiServiceImpl {
             .evolve_task(&request_id)
             .ok_or(Status::not_found("task not found"))?;
         let tasks = self.evolve_tasks();
-        let repo_tasks: Vec<_> = tasks
+        let namespace_tasks: Vec<_> = tasks
             .into_iter()
-            .filter(|candidate| candidate.repo == task.repo)
+            .filter(|candidate| candidate.namespace == task.namespace)
             .collect();
-        let patterns = crate::chisei::evolve::mine_patterns(&repo_tasks);
+        let patterns = crate::chisei::evolve::mine_patterns(&namespace_tasks);
         let suggestions = crate::chisei::evolve::suggest(&task, &patterns);
         Ok(Response::new(EvolveSuggestResponse {
             suggestions: suggestions
@@ -1114,7 +1207,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .map(|task| {
                 tasks
                     .into_iter()
-                    .filter(|candidate| candidate.repo == task.repo)
+                    .filter(|candidate| candidate.namespace == task.namespace)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| self.evolve_tasks());
@@ -1290,6 +1383,12 @@ mod tests {
             ollama_url: "http://127.0.0.1:11434".into(),
             native_llm_url: Some("http://127.0.0.1:9999".into()),
             auth_token: None,
+            sample_rate: 0.0,
+            sample_risk_threshold: 0.7,
+            scoring_enabled: false,
+            scoring_interval_secs: 60,
+            scoring_model: "claude-opus-4-8".into(),
+            scoring_batch_size: 16,
         }
     }
 
@@ -1303,7 +1402,7 @@ mod tests {
         ChiseiServiceImpl::new(db, config(path))
     }
 
-    async fn create_suite(svc: &ChiseiServiceImpl, repo: &str) {
+    async fn create_suite(svc: &ChiseiServiceImpl, namespace: &str) {
         svc.create_eval_suite(Request::new(CreateEvalSuiteRequest {
             suite: Some(EvalSuite {
                 id: "suite-1".into(),
@@ -1312,7 +1411,7 @@ mod tests {
                 cases: vec![EvalCase {
                     id: "case-1".into(),
                     name: "case".into(),
-                    repo: repo.into(),
+                    namespace: namespace.into(),
                     spec: "spec".into(),
                     assertions: vec![],
                 }],
@@ -1343,11 +1442,11 @@ mod tests {
     #[tokio::test]
     async fn create_eval_run_auto_tracks_iteration() {
         let svc = memory_service();
-        create_suite(&svc, "repo-a").await;
+        create_suite(&svc, "context-a").await;
 
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-1", "suite-1", 90, 100)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-a".into(),
         }))
         .await
@@ -1355,7 +1454,7 @@ mod tests {
 
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-2", "suite-1", 70, 200)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-b".into(),
         }))
         .await
@@ -1363,7 +1462,7 @@ mod tests {
 
         let latest = svc
             .get_latest_eval_iteration(Request::new(GetLatestEvalIterationRequest {
-                changed_file: "skills/repo-a.md".into(),
+                changed_file: "skills/context-a.md".into(),
             }))
             .await
             .unwrap()
@@ -1393,18 +1492,18 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let svc = file_service(&path);
-        create_suite(&svc, "repo-a").await;
+        create_suite(&svc, "context-a").await;
 
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-a".into(),
         }))
         .await
         .unwrap();
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-b".into(),
         }))
         .await
@@ -1415,7 +1514,7 @@ mod tests {
         let svc = file_service(&path);
         let latest = svc
             .get_latest_eval_iteration(Request::new(GetLatestEvalIterationRequest {
-                changed_file: "skills/repo-a.md".into(),
+                changed_file: "skills/context-a.md".into(),
             }))
             .await
             .unwrap()
@@ -1428,10 +1527,8 @@ mod tests {
             .plan_execution(Request::new(PlanExecutionRequest {
                 input: Some(ExecutionInput {
                     request_id: "task-1".into(),
-                    namespace: "ns".into(),
-                    spec: "ship repo-a fix".into(),
-                    repo: "repo-a".into(),
-                    branch: "main".into(),
+                    namespace: "context-a".into(),
+                    spec: "ship context-a fix".into(),
                     preferred_model: "native-default".into(),
                     preferred_runtime: "kiro".into(),
                     task_type: String::new(),
@@ -1451,7 +1548,7 @@ mod tests {
             .unwrap();
         assert!(plan.eval_regressed);
         assert!(!plan.executable);
-        assert!(plan.eval_regression_reason.contains("repo-a"));
+        assert!(plan.eval_regression_reason.contains("context-a"));
         assert!(
             plan.warnings
                 .iter()
@@ -1464,18 +1561,18 @@ mod tests {
     #[tokio::test]
     async fn execute_plan_rechecks_regression_gate() {
         let svc = memory_service();
-        create_suite(&svc, "repo-a").await;
+        create_suite(&svc, "context-a").await;
 
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-a".into(),
         }))
         .await
         .unwrap();
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-b".into(),
         }))
         .await
@@ -1485,10 +1582,8 @@ mod tests {
             .plan_execution(Request::new(PlanExecutionRequest {
                 input: Some(ExecutionInput {
                     request_id: "task-1".into(),
-                    namespace: "ns".into(),
-                    spec: "ship repo-a fix".into(),
-                    repo: "repo-a".into(),
-                    branch: "main".into(),
+                    namespace: "context-a".into(),
+                    spec: "ship context-a fix".into(),
                     preferred_model: "native-default".into(),
                     preferred_runtime: "kiro".into(),
                     task_type: String::new(),
@@ -1511,7 +1606,7 @@ mod tests {
 
         plan.executable = true;
         if let Some(input) = plan.input.as_mut() {
-            input.repo = "repo-b".into();
+            input.namespace = "context-b".into();
         }
         let err = svc
             .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
@@ -1522,25 +1617,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_reload_backfills_legacy_iteration_repo_gates() {
-        let path = format!(
-            "{}/sekai-chisei-legacy-{}.db",
-            std::env::temp_dir().display(),
-            uuid::Uuid::new_v4()
-        );
-        let svc = file_service(&path);
-        create_suite(&svc, "repo-a").await;
+    async fn eval_regressed_context_is_force_sampled_and_audited() {
+        let svc = memory_service();
+        create_suite(&svc, "context-a").await;
 
+        // Two runs whose drop trips the regression signal for context-a.
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-a".into(),
         }))
         .await
         .unwrap();
         svc.create_eval_run(Request::new(CreateEvalRunRequest {
             run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/repo-a.md".into(),
+            changed_file: "skills/context-a.md".into(),
+            diff_hash: "hash-b".into(),
+        }))
+        .await
+        .unwrap();
+
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-sample".into(),
+                    namespace: "context-a".into(),
+                    spec: "ship context-a fix".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        // Base rate is 0.0 in the test config, so sampling here is purely the
+        // eval-driven adaptive trigger.
+        assert!(plan.sampled);
+        assert_eq!(plan.sample_reason, "eval_regressed");
+        assert_eq!(plan.sample_rate, 1.0);
+
+        // A matching audit decision was recorded.
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("sample".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.target_id == "task-sample" && d.reason == "eval_regressed"),
+            "expected a sampling audit decision for task-sample"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_reload_backfills_legacy_iteration_context_gates() {
+        let path = format!(
+            "{}/sekai-chisei-legacy-{}.db",
+            std::env::temp_dir().display(),
+            uuid::Uuid::new_v4()
+        );
+        let svc = file_service(&path);
+        create_suite(&svc, "context-a").await;
+
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-1", "suite-1", 92, 100)),
+            changed_file: "skills/context-a.md".into(),
+            diff_hash: "hash-a".into(),
+        }))
+        .await
+        .unwrap();
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-2", "suite-1", 60, 200)),
+            changed_file: "skills/context-a.md".into(),
             diff_hash: "hash-b".into(),
         }))
         .await
@@ -1550,7 +1712,7 @@ mod tests {
             .conn
             .lock()
             .unwrap()
-            .execute("UPDATE chisei_eval_iterations SET repo = ''", [])
+            .execute("UPDATE chisei_eval_iterations SET namespace = ''", [])
             .unwrap();
         drop(svc);
 
@@ -1559,10 +1721,8 @@ mod tests {
             .plan_execution(Request::new(PlanExecutionRequest {
                 input: Some(ExecutionInput {
                     request_id: "task-1".into(),
-                    namespace: "ns".into(),
-                    spec: "ship repo-a fix".into(),
-                    repo: "repo-a".into(),
-                    branch: "main".into(),
+                    namespace: "context-a".into(),
+                    spec: "ship context-a fix".into(),
                     preferred_model: "native-default".into(),
                     preferred_runtime: "kiro".into(),
                     task_type: String::new(),
@@ -1581,7 +1741,7 @@ mod tests {
             .plan
             .unwrap();
         assert!(plan.eval_regressed);
-        assert!(plan.eval_regression_reason.contains("repo-a"));
+        assert!(plan.eval_regression_reason.contains("context-a"));
 
         let _ = fs::remove_file(&path);
     }
@@ -1604,14 +1764,17 @@ mod tests {
                 steps: vec![],
                 review_policy: None,
                 risk_score: 0.0,
-                low_success_repo: false,
+                low_success_namespace: false,
                 executable: true,
                 warnings: vec![],
                 max_tokens: 0,
                 created_at: now,
-                affinity_repos: vec![],
+                affinity_namespaces: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let newest = ExecutionPlan {
@@ -1627,14 +1790,17 @@ mod tests {
             steps: vec![],
             review_policy: None,
             risk_score: 0.0,
-            low_success_repo: false,
+            low_success_namespace: false,
             executable: true,
             warnings: vec![],
             max_tokens: 0,
             created_at: now,
-            affinity_repos: vec![],
+            affinity_namespaces: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(newest.clone());
 
@@ -1662,16 +1828,19 @@ mod tests {
             steps: vec![],
             review_policy: None,
             risk_score: 0.0,
-            low_success_repo: false,
+            low_success_namespace: false,
             executable: true,
             warnings: vec![],
             max_tokens: 0,
             created_at: chrono::Utc::now().timestamp_millis()
                 - MAX_CACHED_EXECUTION_PLAN_AGE_MS
                 - 1,
-            affinity_repos: vec![],
+            affinity_namespaces: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -1707,14 +1876,17 @@ mod tests {
                 steps: vec![],
                 review_policy: None,
                 risk_score: 0.0,
-                low_success_repo: false,
+                low_success_namespace: false,
                 executable: true,
                 warnings: vec![],
                 max_tokens: 0,
                 created_at: now,
-                affinity_repos: vec![],
+                affinity_namespaces: vec![],
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
+                sampled: false,
+                sample_rate: 0.0,
+                sample_reason: String::new(),
             });
         }
         let inserted = ExecutionPlan {
@@ -1730,14 +1902,17 @@ mod tests {
             steps: vec![],
             review_policy: None,
             risk_score: 0.0,
-            low_success_repo: false,
+            low_success_namespace: false,
             executable: true,
             warnings: vec![],
             max_tokens: 0,
             created_at: now,
-            affinity_repos: vec![],
+            affinity_namespaces: vec![],
             eval_regressed: false,
             eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
         };
         svc.cache_plan(inserted.clone());
 
