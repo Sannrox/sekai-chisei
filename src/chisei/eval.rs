@@ -289,7 +289,10 @@ impl EvalStore {
         Ok(iteration)
     }
 
-    pub fn namespace_regression_signal(&self, namespace: &str) -> Option<NamespaceRegressionSignal> {
+    pub fn namespace_regression_signal(
+        &self,
+        namespace: &str,
+    ) -> Option<NamespaceRegressionSignal> {
         if namespace.is_empty() {
             return None;
         }
@@ -316,7 +319,11 @@ impl EvalStore {
         })
     }
 
-    fn iterations_for_namespace(&self, iterations: &[Iteration], namespace: &str) -> Vec<Iteration> {
+    fn iterations_for_namespace(
+        &self,
+        iterations: &[Iteration],
+        namespace: &str,
+    ) -> Vec<Iteration> {
         iterations
             .iter()
             .filter(|iteration| self.iteration_matches_namespace(iteration, namespace))
@@ -978,7 +985,9 @@ mod tests {
             .track_iteration("suite-a", "r2", "skills/namespace-a.md", "hash-b")
             .expect("candidate");
 
-        let signal = store.namespace_regression_signal("namespace-a").expect("namespace signal");
+        let signal = store
+            .namespace_regression_signal("namespace-a")
+            .expect("namespace signal");
         assert!(signal.regressed);
         assert!(signal.reason.contains("regressed"));
         assert!(signal.reason.contains("namespace-a"));

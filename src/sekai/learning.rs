@@ -31,7 +31,10 @@ pub fn produce_learning(db: &SekaiDb, namespace: &str, title: &str, prevention: 
         }
     }
     let now = chrono::Utc::now().timestamp();
-    let id = format!("learning:{:x}", md5_hash(&format!("{}:{}", namespace, title)));
+    let id = format!(
+        "learning:{:x}",
+        md5_hash(&format!("{}:{}", namespace, title))
+    );
     let obj = Object {
         id: id.clone(),
         kind: KIND_LEARNING.into(),
