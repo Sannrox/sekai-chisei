@@ -6,7 +6,7 @@ pub struct TaskRecord {
     pub id: String,
     pub spec: String,
     pub status: String,
-    pub repo: String,
+    pub namespace: String,
     pub tokens_used: i32,
     pub original_spec: Option<String>,
     pub created: i64,
@@ -38,7 +38,7 @@ pub struct Report {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Template {
-    pub repo: String,
+    pub namespace: String,
     pub name: String,
     pub content: String,
 }
@@ -189,22 +189,22 @@ pub fn report(tasks: &[TaskRecord]) -> Report {
 }
 
 pub fn generate_templates(tasks: &[TaskRecord]) -> Vec<Template> {
-    let mut by_repo: HashMap<&str, Vec<&TaskRecord>> = HashMap::new();
+    let mut by_namespace: HashMap<&str, Vec<&TaskRecord>> = HashMap::new();
     for task in tasks {
-        if task.repo.is_empty() || task.status != "done" {
+        if task.namespace.is_empty() || task.status != "done" {
             continue;
         }
-        by_repo.entry(&task.repo).or_default().push(task);
+        by_namespace.entry(&task.namespace).or_default().push(task);
     }
 
-    let mut templates: Vec<Template> = by_repo
+    let mut templates: Vec<Template> = by_namespace
         .into_iter()
-        .filter_map(|(repo, repo_tasks)| {
-            if repo_tasks.len() < 2 {
+        .filter_map(|(namespace, namespace_tasks)| {
+            if namespace_tasks.len() < 2 {
                 return None;
             }
             let patterns = mine_patterns(
-                &repo_tasks
+                &namespace_tasks
                     .iter()
                     .map(|task| (*task).clone())
                     .collect::<Vec<TaskRecord>>(),
@@ -224,8 +224,8 @@ pub fn generate_templates(tasks: &[TaskRecord]) -> Vec<Template> {
                 )
             };
             Some(Template {
-                repo: repo.to_string(),
-                name: format!("evolve-{repo}"),
+                namespace: namespace.to_string(),
+                name: format!("evolve-{namespace}"),
                 content,
             })
         })
@@ -331,9 +331,9 @@ fn feature_key(task: &TaskRecord) -> String {
     if task.original_spec.is_some() {
         key.push_str("+enhanced");
     }
-    if !task.repo.is_empty() {
+    if !task.namespace.is_empty() {
         key.push(':');
-        key.push_str(&task.repo);
+        key.push_str(&task.namespace);
     }
     key
 }
@@ -445,9 +445,9 @@ mod tests {
         vec![
             TaskRecord {
                 id: "1".into(),
-                spec: "fix the broken test in repo".into(),
+                spec: "fix the broken test in namespace".into(),
                 status: "done".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 tokens_used: 100,
                 original_spec: None,
                 created: 100,
@@ -456,7 +456,7 @@ mod tests {
                 id: "2".into(),
                 spec: "fix the broken build".into(),
                 status: "done".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 tokens_used: 200,
                 original_spec: None,
                 created: 200,
@@ -465,7 +465,7 @@ mod tests {
                 id: "3".into(),
                 spec: "fix the broken deploy".into(),
                 status: "failed".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 tokens_used: 300,
                 original_spec: Some("fix the broken deploy".into()),
                 created: 300,
@@ -474,7 +474,7 @@ mod tests {
                 id: "4".into(),
                 spec: "add new feature for users".into(),
                 status: "done".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 tokens_used: 150,
                 original_spec: Some("add new feature".into()),
                 created: 400,
@@ -483,7 +483,7 @@ mod tests {
                 id: "5".into(),
                 spec: "fix the ci pipeline issue".into(),
                 status: "failed".into(),
-                repo: "r".into(),
+                namespace: "r".into(),
                 tokens_used: 100,
                 original_spec: None,
                 created: 500,
@@ -506,7 +506,7 @@ mod tests {
             id: "x".into(),
             spec: "fix".into(),
             status: "".into(),
-            repo: "".into(),
+            namespace: "".into(),
             tokens_used: 0,
             original_spec: None,
             created: 0,
@@ -551,7 +551,7 @@ mod tests {
             id: "6".into(),
             spec: "fix another broken test".into(),
             status: "planned".into(),
-            repo: "r".into(),
+            namespace: "r".into(),
             tokens_used: 50,
             original_spec: None,
             created: 600,
@@ -576,7 +576,7 @@ mod tests {
             id: "f".into(),
             spec: "too short".into(),
             status: "failed".into(),
-            repo: "r".into(),
+            namespace: "r".into(),
             tokens_used: 1,
             original_spec: None,
             created: 1,

@@ -378,7 +378,7 @@ mod tests {
             name: "test".into(),
             description: "".into(),
             params: vec![],
-            pipeline: vec![step("filter", "repo", "", "", "")],
+            pipeline: vec![step("filter", "namespace", "", "", "")],
             created: 0,
         };
         assert!(validate_function(&f).is_ok());
@@ -401,8 +401,8 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
             external_id: "".into(),
             properties: HashMap::new(),
@@ -455,7 +455,7 @@ mod tests {
             params: vec![],
             created: 0,
             pipeline: vec![
-                step("filter", "repo", "", "", ""),
+                step("filter", "namespace", "", "", ""),
                 step("traverse", "", "contains", "", ""),
                 step("aggregate", "", "", "count", ""),
             ],

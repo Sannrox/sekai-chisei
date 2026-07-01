@@ -47,7 +47,7 @@ impl ComputeRegistry {
 pub fn default_compute_registry() -> ComputeRegistry {
     let mut c = ComputeRegistry::new();
     c.register(
-        "repo",
+        "namespace",
         "component_count",
         Box::new(|obj, db| {
             let linked = db
@@ -92,17 +92,17 @@ mod tests {
     #[test]
     fn test_compute_component_count() {
         let db = SekaiDb::new(":memory:").unwrap();
-        let mut repo = Object {
+        let mut namespace = Object {
             id: "r1".into(),
-            kind: "repo".into(),
-            name: "repo".into(),
+            kind: "namespace".into(),
+            name: "namespace".into(),
             namespace: "".into(),
             external_id: "".into(),
             properties: HashMap::new(),
             created: 0,
             updated: 0,
         };
-        db.create_object(&repo).unwrap();
+        db.create_object(&namespace).unwrap();
         let comp = Object {
             id: "c1".into(),
             kind: KIND_COMPONENT.into(),
@@ -124,8 +124,8 @@ mod tests {
         .unwrap();
 
         let reg = default_compute_registry();
-        reg.resolve(&mut repo, &db);
-        assert_eq!(repo.properties.get("component_count").unwrap(), "1");
+        reg.resolve(&mut namespace, &db);
+        assert_eq!(namespace.properties.get("component_count").unwrap(), "1");
     }
 
     #[test]
