@@ -300,8 +300,10 @@ mod tests {
     #[test]
     fn test_list_and_find() {
         let db = test_db();
-        db.create_object(&make_obj("r1", "namespace", "alpha")).unwrap();
-        db.create_object(&make_obj("r2", "namespace", "beta")).unwrap();
+        db.create_object(&make_obj("r1", "namespace", "alpha"))
+            .unwrap();
+        db.create_object(&make_obj("r2", "namespace", "beta"))
+            .unwrap();
         db.create_object(&make_obj("c1", "component", "comp"))
             .unwrap();
 
