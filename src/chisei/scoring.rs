@@ -201,7 +201,10 @@ impl ScoringJob {
         let pending = observations.len();
         let mut by_namespace: BTreeMap<String, Vec<SampleObservation>> = BTreeMap::new();
         for obs in observations {
-            by_namespace.entry(obs.namespace.clone()).or_default().push(obs);
+            by_namespace
+                .entry(obs.namespace.clone())
+                .or_default()
+                .push(obs);
         }
 
         let mut total_scored = 0usize;
@@ -408,7 +411,9 @@ impl ScoringJob {
                 }
                 // An empty namespace (or otherwise un-inferable) run still persists; it simply has no
                 // regression signal. Don't fail the whole batch over it.
-                Err(e) => eprintln!("scoring job: skipped iteration for namespace {namespace:?}: {e}"),
+                Err(e) => {
+                    eprintln!("scoring job: skipped iteration for namespace {namespace:?}: {e}")
+                }
             }
         }
 

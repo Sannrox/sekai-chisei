@@ -608,11 +608,7 @@ impl ChiseiService for ChiseiServiceImpl {
         let effective_policy = self.policy.effective_policy(&r.namespace);
         let (runtime, model) = self
             .policy
-            .resolve(
-                &r.namespace,
-                &r.preferred_runtime,
-                &r.preferred_model,
-            )
+            .resolve(&r.namespace, &r.preferred_runtime, &r.preferred_model)
             .map_err(Status::invalid_argument)?;
         let model = self
             .resolve_live_model(&model, effective_policy.as_ref(), None)
@@ -1643,7 +1639,7 @@ mod tests {
 
         let plan = svc
             .plan_execution(Request::new(PlanExecutionRequest {
-            input: Some(ExecutionInput {
+                input: Some(ExecutionInput {
                     request_id: "task-sample".into(),
                     namespace: "context-a".into(),
                     spec: "ship context-a fix".into(),
@@ -1746,7 +1742,7 @@ mod tests {
             .unwrap();
         assert!(plan.eval_regressed);
         assert!(plan.eval_regression_reason.contains("context-a"));
-        
+
         let _ = fs::remove_file(&path);
     }
 
