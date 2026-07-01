@@ -141,6 +141,8 @@ mod tests {
             risk_score: 0.0,
             budget_pressure: PressureLevel::None,
             review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
         }
     }
 
