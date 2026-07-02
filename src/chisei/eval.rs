@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VarianceCaseResult {
@@ -108,6 +109,7 @@ pub struct EvalStore {
     suites: Mutex<HashMap<String, Suite>>,
     runs: Mutex<HashMap<String, Run>>,
     iterations: Mutex<HashMap<String, Iteration>>,
+    sequence: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,7 +131,17 @@ impl EvalStore {
             suites: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             iterations: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(0),
         }
+    }
+
+    /// A process-wide monotonically increasing counter, used to guarantee unique run/iteration
+    /// ids even when two are minted within the same millisecond (wall-clock timestamps alone
+    /// are not fine-grained enough for fast, in-memory batches). Colliding ids previously caused
+    /// `INSERT OR REPLACE` to silently overwrite an earlier run, corrupting the baseline lookup
+    /// used for regression detection.
+    pub fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn create_suite(&self, s: Suite) {
