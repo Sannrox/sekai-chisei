@@ -115,6 +115,15 @@ message ExecutionPlan {
   bool sampled = 21;
   double sample_rate = 22;
   string sample_reason = 23;
+  repeated EgressDecision egress_decisions = 24;
+}
+
+message EgressDecision {
+  string provider = 1;
+  bool external = 2;
+  repeated string included = 3;
+  repeated string redacted = 4;
+  repeated string reasons = 5;
 }
 
 message PlannedChatResponse {
