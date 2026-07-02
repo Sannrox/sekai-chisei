@@ -1,6 +1,7 @@
 use crate::chisei::budget::PressureLevel;
+use crate::chisei::egress;
 use crate::db::sekai::SekaiDb;
-use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, REL_CONTAINS, REL_TOUCHES};
+use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
 use std::collections::HashSet;
 
@@ -16,6 +17,8 @@ pub struct PipelineRequest {
     pub risk_score: f64,
     pub budget_pressure: PressureLevel,
     pub review_model: String,
+    pub egress_records: Vec<egress::ContextEgressRecord>,
+    pub external_egress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,7 @@ pub struct RunResult {
     pub prepared_spec: String,
     pub risk_score: f64,
     pub review_policy: Option<ReviewPolicy>,
+    pub egress_records: Vec<egress::ContextEgressRecord>,
 }
 
 impl RunResult {
@@ -120,14 +124,6 @@ fn normalize_identifier(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn property_value_for_keys<'a>(
-    obj: &'a crate::domain::Object,
-    keys: &'a [&str],
-) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| obj.properties.get(*key).map(String::as_str))
-}
-
 fn resolve_context_objects(req: &PipelineRequest, db: &SekaiDb) -> Vec<crate::domain::Object> {
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
@@ -144,34 +140,56 @@ fn resolve_context_objects(req: &PipelineRequest, db: &SekaiDb) -> Vec<crate::do
     objects
 }
 
-fn collect_verdicts(obj: &crate::domain::Object, db: &SekaiDb) -> Vec<String> {
-    let linked = db
+fn collect_related_verdict_context(
+    obj: &Object,
+    db: &SekaiDb,
+    external_egress: bool,
+) -> (Vec<String>, Vec<egress::ContextEgressRecord>) {
+    let mut lines = Vec::new();
+    let mut records = Vec::new();
+    let mut candidates = db
         .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Vec<_>>();
+        .unwrap_or_default();
+    candidates.extend(
+        db.get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Outgoing)
+            .unwrap_or_default(),
+    );
 
-    let mut verdicts = Vec::new();
-    for candidate in linked {
-        if let Some(v) = property_value_for_keys(&candidate, &VERDICT_KEYS) {
-            verdicts.push(format!("{} ({})", v, candidate.name));
+    for candidate in candidates {
+        if candidate.kind == KIND_LEARNING {
+            continue;
         }
-        if verdicts.len() >= 3 {
+        let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
+            candidate
+                .properties
+                .get(**key)
+                .is_some_and(|value| !value.is_empty())
+        }) else {
+            continue;
+        };
+        let mut record = egress::new_record(&candidate);
+        let Some(verdict) =
+            egress::filter_property(&candidate, verdict_key, &mut record, external_egress)
+        else {
+            records.push(record);
+            continue;
+        };
+        if !external_egress || egress::include_identity(&candidate) {
+            record.included_fields.push("identity".into());
+            lines.push(format!("related_verdict: {} - {}", candidate.name, verdict));
+        } else {
+            record.redacted_fields.push("identity".into());
+            record
+                .reasons
+                .push("identity denied by default egress policy".into());
+            lines.push(format!("related_verdict: {}", verdict));
+        }
+        records.push(record);
+        if lines.len() >= 3 {
             break;
         }
     }
-    for candidate in &db
-        .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Outgoing)
-        .unwrap_or_default()
-    {
-        if let Some(v) = property_value_for_keys(candidate, &VERDICT_KEYS) {
-            verdicts.push(format!("{} ({})", v, candidate.name));
-        }
-        if verdicts.len() >= 3 {
-            break;
-        }
-    }
-    verdicts
+    (lines, records)
 }
 
 pub struct ObjectContextEnrichStep;
@@ -194,23 +212,51 @@ impl Step for ObjectContextEnrichStep {
             };
         }
         for obj in context_objects {
+            let mut egress_record = egress::new_record(&obj);
             let mut has_content = false;
             let mut details = Vec::new();
-            if let Some(verdict) = property_value_for_keys(&obj, &VERDICT_KEYS) {
+            if let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
+                obj.properties
+                    .get(**key)
+                    .is_some_and(|value| !value.is_empty())
+            }) && let Some(verdict) =
+                egress::filter_property(&obj, verdict_key, &mut egress_record, req.external_egress)
+            {
                 details.push(format!("prior_verdict: {}", verdict));
                 has_content = true;
             }
-            if let Some(conviction) = property_value_for_keys(&obj, &CONVICTION_KEYS) {
+            if let Some(conviction_key) = CONVICTION_KEYS.iter().find(|key| {
+                obj.properties
+                    .get(**key)
+                    .is_some_and(|value| !value.is_empty())
+            }) && let Some(conviction) = egress::filter_property(
+                &obj,
+                conviction_key,
+                &mut egress_record,
+                req.external_egress,
+            ) {
                 details.push(format!("conviction: {}", conviction));
                 has_content = true;
             }
-            if let Some(score) = obj.properties.get("score").filter(|s| !s.is_empty())
+            if obj.properties.get("score").is_some_and(|s| !s.is_empty())
                 && !details.iter().any(|d| d.contains("conviction"))
+                && let Some(score) =
+                    egress::filter_property(&obj, "score", &mut egress_record, req.external_egress)
             {
                 details.push(format!("score: {}", score));
                 has_content = true;
             }
-            if let Some(rate) = property_value_for_keys(&obj, &["success_rate"]) {
+            if obj
+                .properties
+                .get("success_rate")
+                .is_some_and(|value| !value.is_empty())
+                && let Some(rate) = egress::filter_property(
+                    &obj,
+                    "success_rate",
+                    &mut egress_record,
+                    req.external_egress,
+                )
+            {
                 details.push(format!("success_rate: {}", rate));
                 has_content = true;
             }
@@ -219,20 +265,27 @@ impl Step for ObjectContextEnrichStep {
                 .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             let mut pitfalls = Vec::new();
-            let mut related_verdicts = Vec::new();
             for candidate in learnings {
                 if candidate.kind == KIND_LEARNING {
-                    let Some(title) = candidate.properties.get("title") else {
-                        continue;
-                    };
-                    let Some(prevention) = candidate.properties.get("prevention") else {
-                        continue;
-                    };
-                    pitfalls.push(format!("{title} - {prevention}"));
-                } else if let Some(v) = property_value_for_keys(&candidate, &VERDICT_KEYS) {
-                    related_verdicts.push(format!("{} - {}", candidate.name, v));
+                    let mut learning_record = egress::new_record(&candidate);
+                    let title = egress::filter_property(
+                        &candidate,
+                        "title",
+                        &mut learning_record,
+                        req.external_egress,
+                    );
+                    let prevention = egress::filter_property(
+                        &candidate,
+                        "prevention",
+                        &mut learning_record,
+                        req.external_egress,
+                    );
+                    if let (Some(title), Some(prevention)) = (title, prevention) {
+                        pitfalls.push(format!("{title} - {prevention}"));
+                    }
+                    req.egress_records.push(learning_record);
                 }
-                if pitfalls.len() >= 3 && related_verdicts.len() >= 3 {
+                if pitfalls.len() >= 3 {
                     break;
                 }
             }
@@ -240,19 +293,35 @@ impl Step for ObjectContextEnrichStep {
                 details.push(format!("recent_learning: {}", pitfalls.join(", ")));
                 has_content = true;
             }
-            for verdict in collect_verdicts(&obj, db).into_iter().take(3) {
-                details.push(format!("related_verdict: {}", verdict));
+            let (related_verdicts, mut related_records) =
+                collect_related_verdict_context(&obj, db, req.external_egress);
+            if !related_verdicts.is_empty() {
+                details.extend(related_verdicts);
                 has_content = true;
             }
-
+            req.egress_records.append(&mut related_records);
             if has_content {
-                lines.push(format!(
-                    "object {} ({}) [{}] {}",
-                    obj.kind,
-                    obj.name,
-                    obj.external_id,
-                    details.join(", ")
-                ));
+                if !req.external_egress || egress::include_identity(&obj) {
+                    egress_record.included_fields.push("identity".into());
+                    lines.push(format!(
+                        "object {} ({}) [{}] {}",
+                        obj.kind,
+                        obj.name,
+                        obj.external_id,
+                        details.join(", ")
+                    ));
+                } else {
+                    egress_record.redacted_fields.push("identity".into());
+                    egress_record
+                        .reasons
+                        .push("identity denied by default egress policy".into());
+                    lines.push(format!("object context {}", details.join(", ")));
+                }
+            }
+            if !egress_record.included_fields.is_empty()
+                || !egress_record.redacted_fields.is_empty()
+            {
+                req.egress_records.push(egress_record);
             }
         }
 
@@ -340,6 +409,7 @@ impl Pipeline {
             prepared_spec: req.spec.clone(),
             risk_score: req.risk_score,
             review_policy,
+            egress_records: req.egress_records.clone(),
         }
     }
 }
@@ -371,13 +441,23 @@ impl Step for LearningsEnrichStep {
                     if obj.kind != KIND_LEARNING {
                         continue;
                     }
-                    let Some(title) = obj.properties.get("title") else {
-                        continue;
-                    };
-                    let Some(prevention) = obj.properties.get("prevention") else {
-                        continue;
-                    };
-                    pitfalls.push(format!("{title} - {prevention}"));
+                    let mut learning_record = egress::new_record(&obj);
+                    let title = egress::filter_property(
+                        &obj,
+                        "title",
+                        &mut learning_record,
+                        req.external_egress,
+                    );
+                    let prevention = egress::filter_property(
+                        &obj,
+                        "prevention",
+                        &mut learning_record,
+                        req.external_egress,
+                    );
+                    if let (Some(title), Some(prevention)) = (title, prevention) {
+                        pitfalls.push(format!("{title} - {prevention}"));
+                    }
+                    req.egress_records.push(learning_record);
                     if pitfalls.len() >= 3 {
                         break;
                     }
@@ -440,21 +520,46 @@ impl Step for SpecEnrichStep {
                 if comp.kind != KIND_COMPONENT {
                     continue;
                 }
-                let total = comp
-                    .properties
-                    .get("task_total")
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(0);
-                let rate = comp
-                    .properties
-                    .get("success_rate")
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(100);
+                let mut comp_record = egress::new_record(&comp);
+                let Some(safe_total) = egress::filter_property(
+                    &comp,
+                    "task_total",
+                    &mut comp_record,
+                    req.external_egress,
+                ) else {
+                    if !comp_record.redacted_fields.is_empty() {
+                        req.egress_records.push(comp_record);
+                    }
+                    continue;
+                };
+                let Some(safe_rate) = egress::filter_property(
+                    &comp,
+                    "success_rate",
+                    &mut comp_record,
+                    req.external_egress,
+                ) else {
+                    if !comp_record.redacted_fields.is_empty() {
+                        req.egress_records.push(comp_record);
+                    }
+                    continue;
+                };
+                let total = safe_total.parse::<i32>().unwrap_or(0);
+                let rate = safe_rate.parse::<i32>().unwrap_or(100);
                 if total >= 3 && rate < 50 {
-                    hints.push(format!(
-                        "component {} is degraded ({}% success)",
-                        comp.name, rate
-                    ));
+                    if !req.external_egress || egress::include_identity(&comp) {
+                        comp_record.included_fields.push("identity".into());
+                        hints.push(format!(
+                            "component {} is degraded ({}% success)",
+                            comp.name, safe_rate
+                        ));
+                    } else {
+                        comp_record.redacted_fields.push("identity".into());
+                        comp_record
+                            .reasons
+                            .push("identity denied by default egress policy".into());
+                        hints.push(format!("component is degraded ({}% success)", safe_rate));
+                    }
+                    req.egress_records.push(comp_record);
                 }
             }
         }
@@ -765,6 +870,8 @@ mod tests {
             risk_score: 0.0,
             budget_pressure: PressureLevel::None,
             review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
         }
     }
 
@@ -804,7 +911,32 @@ mod tests {
             updated: 0,
         })
         .unwrap();
-        crate::sekai::learning::produce_learning(&db, "component", "always test", "add tests");
+        db.create_object(&Object {
+            id: "learning-service".into(),
+            kind: KIND_LEARNING.into(),
+            name: "service learning".into(),
+            namespace: "".into(),
+            external_id: "learning:service".into(),
+            properties: HashMap::from([
+                ("title".into(), "always test".into()),
+                ("prevention".into(), "add tests".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "title,prevention".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "touches-service-learning".into(),
+            from_id: "learning-service".into(),
+            to_id: "r1".into(),
+            relation: REL_TOUCHES.into(),
+            created: 0,
+        })
+        .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "component:service".into();
@@ -827,6 +959,10 @@ mod tests {
             properties: HashMap::from([
                 ("verdict".into(), "bullish".into()),
                 ("conviction".into(), "0.87".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "verdict,conviction".into(),
+                ),
             ]),
             created,
             updated: created,
@@ -841,6 +977,10 @@ mod tests {
             properties: HashMap::from([
                 ("title".into(), "avoid overstated upside".into()),
                 ("prevention".into(), "require earnings confirmation".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "title,prevention".into(),
+                ),
             ]),
             created,
             updated: created,
@@ -867,12 +1007,254 @@ mod tests {
             risk_score: 0.0,
             budget_pressure: PressureLevel::None,
             review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");
         assert!(result.prepared_spec.contains("Object context"));
         assert!(result.prepared_spec.contains("prior_verdict: bullish"));
         assert!(result.prepared_spec.contains("conviction: 0.87"));
+        assert!(!result.prepared_spec.contains("object ticker (AAPL)"));
+        assert!(
+            result
+                .egress_records
+                .iter()
+                .any(|record| record.redacted_fields.contains(&"identity".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_object_context_denies_unlabelled_properties() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "asset-secret".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::from([
+                ("verdict".into(), "do not disclose".into()),
+                ("score".into(), "99".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "asset:SECRET".into();
+        let result = p.run(&mut req, &db);
+        assert_eq!(result.steps[0].action, "none");
+        assert!(!result.prepared_spec.contains("do not disclose"));
+        assert!(
+            result
+                .egress_records
+                .iter()
+                .any(|record| record.redacted_fields.contains(&"verdict".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_local_object_context_allows_unlabelled_properties() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "asset-local".into(),
+            kind: "asset".into(),
+            name: "LocalCo".into(),
+            namespace: "".into(),
+            external_id: "asset:LOCAL".into(),
+            properties: HashMap::from([
+                ("verdict".into(), "local insight".into()),
+                ("score".into(), "99".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "asset:LOCAL".into();
+        req.external_egress = false;
+        let result = p.run(&mut req, &db);
+        assert_eq!(result.steps[0].action, "enrich");
+        assert!(result.prepared_spec.contains("local insight"));
+        assert!(result.prepared_spec.contains("LocalCo"));
+        assert!(
+            result
+                .egress_records
+                .iter()
+                .any(|record| record.included_fields.contains(&"identity".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_object_context_includes_identity_only_when_allowed() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "asset-secret".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::from([
+                ("verdict".into(), "approved".into()),
+                (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
+                (egress::INCLUDE_IDENTITY_KEY.into(), "true".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "asset:SECRET".into();
+        let result = p.run(&mut req, &db);
+        assert!(result.prepared_spec.contains("object asset (SecretCo)"));
+        assert!(result.prepared_spec.contains("[asset:SECRET]"));
+    }
+
+    #[test]
+    fn test_learning_context_requires_explicit_allowed_fields() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "component-service".into(),
+            kind: "component".into(),
+            name: "service".into(),
+            namespace: "".into(),
+            external_id: "component:service".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "learning-secret".into(),
+            kind: KIND_LEARNING.into(),
+            name: "secret learning".into(),
+            namespace: "".into(),
+            external_id: "learning:secret".into(),
+            properties: HashMap::from([
+                ("title".into(), "sensitive title".into()),
+                ("prevention".into(), "sensitive prevention".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "touches-secret".into(),
+            from_id: "learning-secret".into(),
+            to_id: "component-service".into(),
+            relation: REL_TOUCHES.into(),
+            created: 0,
+        })
+        .unwrap();
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "component:service".into();
+        let result = p.run(&mut req, &db);
+        assert!(!result.prepared_spec.contains("Known pitfalls"));
+        assert!(!result.prepared_spec.contains("sensitive title"));
+    }
+
+    #[test]
+    fn test_degraded_component_hint_requires_allowed_task_total() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "namespace-alpha".into(),
+            kind: "namespace".into(),
+            name: "alpha".into(),
+            namespace: "".into(),
+            external_id: "namespace:alpha".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "component-secret".into(),
+            kind: KIND_COMPONENT.into(),
+            name: "secret service".into(),
+            namespace: "".into(),
+            external_id: "component:secret-service".into(),
+            properties: HashMap::from([
+                ("task_total".into(), "5".into()),
+                ("success_rate".into(), "20".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "success_rate".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "contains-secret".into(),
+            from_id: "namespace-alpha".into(),
+            to_id: "component-secret".into(),
+            relation: REL_CONTAINS.into(),
+            created: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "namespace:alpha".into();
+        let result = p.run(&mut req, &db);
+
+        assert!(!result.prepared_spec.contains("component is degraded"));
+        assert!(!result.prepared_spec.contains("20% success"));
+        assert!(result.egress_records.iter().any(|record| {
+            record.object_ref == "component:secret-service"
+                && record.redacted_fields.contains(&"task_total".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_local_related_verdict_context_is_preserved() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "asset-local".into(),
+            kind: "asset".into(),
+            name: "LocalCo".into(),
+            namespace: "".into(),
+            external_id: "asset:LOCAL".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "analysis-local".into(),
+            kind: "analysis".into(),
+            name: "Local analysis".into(),
+            namespace: "".into(),
+            external_id: "analysis:LOCAL".into(),
+            properties: HashMap::from([("verdict".into(), "watch margin risk".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "touches-analysis".into(),
+            from_id: "analysis-local".into(),
+            to_id: "asset-local".into(),
+            relation: REL_TOUCHES.into(),
+            created: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "asset:LOCAL".into();
+        req.external_egress = false;
+        let result = p.run(&mut req, &db);
+        assert_eq!(result.steps[0].action, "enrich");
+        assert!(result.prepared_spec.contains("related_verdict"));
+        assert!(result.prepared_spec.contains("watch margin risk"));
+        assert!(result.prepared_spec.contains("Local analysis"));
     }
 
     #[test]
