@@ -131,37 +131,72 @@ impl ChiseiServiceImpl {
             risk_score: 0.0,
             budget_pressure: budget_pressure.clone(),
             review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
-        let run = self.pipeline.run(&mut pipeline_req, &self.db);
-        let recommended_model = run
-            .recommended_model()
-            .map(|(model, _)| model.to_string())
-            .unwrap_or_else(|| pipeline_req.model.clone());
-        let route_bias = crate::chisei::model_routing::route_bias(&run.steps);
+        let initial_run = self.pipeline.run(&mut pipeline_req, &self.db);
         let effective_policy = self.policy.effective_policy(&input.namespace);
-        let preferred_model = choose_preferred_model(
-            &input.preferred_model,
-            &recommended_model,
-            route_bias,
-            effective_policy.as_ref(),
-        );
-        let (resolved_runtime, resolved_model) = self
-            .policy
-            .resolve(
-                &input.namespace,
-                &if input.preferred_runtime.is_empty() {
-                    pipeline_req.runtime.clone()
-                } else {
-                    input.preferred_runtime.clone()
-                },
-                &preferred_model,
+        let fallback_runtime = pipeline_req.runtime.clone();
+        let (initial_runtime, initial_model) = self
+            .resolve_model_for_run(
+                &input,
+                &fallback_runtime,
+                &initial_run,
+                effective_policy.as_ref(),
             )
-            .map_err(Status::invalid_argument)?;
-        let resolved_model = self
-            .resolve_live_model(&resolved_model, effective_policy.as_ref(), route_bias)
-            .await
-            .map_err(Status::failed_precondition)?;
+            .await?;
+        let initial_provider = crate::llm::provider_name(&initial_model).to_string();
+        let initial_provider_is_external =
+            crate::chisei::egress::is_external_provider(&initial_provider);
+        let (run, resolved_runtime, resolved_model, provider, provider_is_external) =
+            if initial_provider_is_external {
+                (
+                    initial_run,
+                    initial_runtime,
+                    initial_model,
+                    initial_provider,
+                    true,
+                )
+            } else {
+                let mut local_pipeline_req = pipe::PipelineRequest {
+                    request_id: input.request_id.clone(),
+                    namespace: input.namespace.clone(),
+                    spec: input.spec.clone(),
+                    model: input.preferred_model.clone(),
+                    runtime: input.preferred_runtime.clone(),
+                    task_type: input.task_type.clone(),
+                    priority: input.priority,
+                    risk_score: 0.0,
+                    budget_pressure: budget_pressure.clone(),
+                    review_model: String::new(),
+                    egress_records: vec![],
+                    external_egress: false,
+                };
+                let local_run = self.pipeline.run(&mut local_pipeline_req, &self.db);
+                let (local_runtime, local_model) = self
+                    .resolve_model_for_run(
+                        &input,
+                        &local_pipeline_req.runtime,
+                        &local_run,
+                        effective_policy.as_ref(),
+                    )
+                    .await?;
+                let local_provider = crate::llm::provider_name(&local_model).to_string();
+                if crate::chisei::egress::is_external_provider(&local_provider) {
+                    (
+                        initial_run,
+                        initial_runtime,
+                        initial_model,
+                        initial_provider,
+                        true,
+                    )
+                } else {
+                    (local_run, local_runtime, local_model, local_provider, false)
+                }
+            };
+        let egress_decisions =
+            build_egress_decisions(&run.egress_records, &provider, provider_is_external);
         let prepared_messages = build_prepared_messages(&input, &run.prepared_spec);
         let estimate_req = super::pb::llm::ChatRequest {
             model: resolved_model.clone(),
@@ -213,11 +248,14 @@ impl ChiseiServiceImpl {
         normalized_input.user_id = normalized_user_id;
         normalized_input.estimated_tokens = estimated_tokens;
         let mut warnings = run.warnings();
+        let final_route_bias_value =
+            crate::chisei::model_routing::route_bias(&run.steps).map(str::to_string);
+        let final_route_bias = final_route_bias_value.as_deref();
         let review_policy = if let Some(p) = run.review_policy.as_ref() {
             let model = if p.model.is_empty() {
                 resolved_model.clone()
             } else {
-                self.resolve_live_model(&p.model, effective_policy.as_ref(), route_bias)
+                self.resolve_live_model(&p.model, effective_policy.as_ref(), final_route_bias)
                     .await
                     .unwrap_or_else(|_| resolved_model.clone())
             };
@@ -285,6 +323,13 @@ impl ChiseiServiceImpl {
                 outcome: "sampled".into(),
             });
         }
+        self.record_egress_audit(
+            "prepare_context",
+            &input.request_id,
+            &provider,
+            &resolved_model,
+            &egress_decisions,
+        );
         Ok(ExecutionPlan {
             plan_id: uuid::Uuid::new_v4().to_string(),
             input: Some(normalized_input),
@@ -330,6 +375,7 @@ impl ChiseiServiceImpl {
             sampled: sampling.sampled,
             sample_rate: sampling.effective_rate,
             sample_reason: sampling.reason,
+            egress_decisions,
         })
     }
 
@@ -342,6 +388,74 @@ impl ChiseiServiceImpl {
         let inserted_plan_id = plan.plan_id.clone();
         plans.insert(inserted_plan_id.clone(), plan);
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
+    }
+
+    async fn resolve_model_for_run(
+        &self,
+        input: &ExecutionInput,
+        fallback_runtime: &str,
+        run: &pipe::RunResult,
+        policy: Option<&crate::chisei::policy::Policy>,
+    ) -> Result<(String, String), Status> {
+        let recommended_model = run
+            .recommended_model()
+            .map(|(model, _)| model.to_string())
+            .unwrap_or_else(|| input.preferred_model.clone());
+        let route_bias_value =
+            crate::chisei::model_routing::route_bias(&run.steps).map(str::to_string);
+        let route_bias = route_bias_value.as_deref();
+        let preferred_model = choose_preferred_model(
+            &input.preferred_model,
+            &recommended_model,
+            route_bias,
+            policy,
+        );
+        let preferred_runtime = if input.preferred_runtime.is_empty() {
+            fallback_runtime
+        } else {
+            &input.preferred_runtime
+        };
+        let (runtime, model) = self
+            .policy
+            .resolve(&input.namespace, preferred_runtime, &preferred_model)
+            .map_err(Status::invalid_argument)?;
+        let model = self
+            .resolve_live_model(&model, policy, route_bias)
+            .await
+            .map_err(Status::failed_precondition)?;
+        Ok((runtime, model))
+    }
+
+    fn record_egress_audit(
+        &self,
+        action: &str,
+        request_id: &str,
+        provider: &str,
+        model: &str,
+        decisions: &[EgressDecision],
+    ) {
+        let included_count: usize = decisions.iter().map(|d| d.included.len()).sum();
+        let redacted_count: usize = decisions.iter().map(|d| d.redacted.len()).sum();
+        let mut evidence = std::collections::HashMap::new();
+        evidence.insert("provider".to_string(), provider.to_string());
+        evidence.insert("model".to_string(), model.to_string());
+        evidence.insert("decisions".to_string(), decisions.len().to_string());
+        evidence.insert("included_count".to_string(), included_count.to_string());
+        evidence.insert("redacted_count".to_string(), redacted_count.to_string());
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.egress".into(),
+            action: action.into(),
+            reason: "context egress policy applied".into(),
+            evidence,
+            target_id: request_id.into(),
+            outcome: if redacted_count > 0 {
+                "redacted".into()
+            } else {
+                "included".into()
+            },
+        });
     }
 
     async fn resolve_live_model(
@@ -511,6 +625,52 @@ fn prune_excess_plans(plans: &mut HashMap<String, ExecutionPlan>, protected_plan
     }
 }
 
+fn build_egress_decisions(
+    records: &[crate::chisei::egress::ContextEgressRecord],
+    provider: &str,
+    external: bool,
+) -> Vec<EgressDecision> {
+    if records.is_empty() {
+        return vec![EgressDecision {
+            provider: provider.into(),
+            external,
+            included: vec![],
+            redacted: vec![],
+            reasons: vec!["no sekai context selected".into()],
+        }];
+    }
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let object_ref = if record
+                .included_fields
+                .iter()
+                .any(|field| field == "identity")
+            {
+                record.object_ref.clone()
+            } else {
+                format!("object#{}", index + 1)
+            };
+            EgressDecision {
+                provider: provider.into(),
+                external,
+                included: record
+                    .included_fields
+                    .iter()
+                    .map(|field| format!("{object_ref}.{field}"))
+                    .collect(),
+                redacted: record
+                    .redacted_fields
+                    .iter()
+                    .map(|field| format!("{object_ref}.{field}"))
+                    .collect(),
+                reasons: record.reasons.clone(),
+            }
+        })
+        .collect()
+}
+
 fn build_prepared_messages(input: &ExecutionInput, enriched_spec: &str) -> Vec<ChatMessage> {
     let mut messages = input.messages.clone();
     if messages.is_empty() {
@@ -638,6 +798,8 @@ impl ChiseiService for ChiseiServiceImpl {
             risk_score: 0.0,
             budget_pressure: self.budget.namespace_pressure(""),
             review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
         };
         let result = self.pipeline.run(&mut pr, &self.db);
         let steps = result
@@ -727,6 +889,14 @@ impl ChiseiService for ChiseiServiceImpl {
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
         let namespace_hint = input.namespace.trim().to_string();
+        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
+        if crate::chisei::egress::is_external_provider(&provider)
+            && plan.egress_decisions.is_empty()
+        {
+            return Err(Status::failed_precondition(
+                "external execution plan missing egress decisions",
+            ));
+        }
         if let Some(signal) = self
             .eval
             .namespace_regression_signal(&namespace_hint)
@@ -739,6 +909,13 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             input.user_id.clone()
         };
+        self.record_egress_audit(
+            "execute_context",
+            &input.request_id,
+            &provider,
+            &plan.resolved_model,
+            &plan.egress_decisions,
+        );
         let llm_req = super::pb::llm::ChatRequest {
             model: plan.resolved_model.clone(),
             system: plan.prepared_system.clone(),
@@ -826,7 +1003,6 @@ impl ChiseiService for ChiseiServiceImpl {
                         });
             }
         }
-        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         Ok(Response::new(ExecutePlanResponse {
             response: Some(PlannedChatResponse {
                 content: chat.content,
@@ -1371,6 +1547,7 @@ impl ChiseiService for ChiseiServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Object;
     use std::fs;
     use std::sync::Arc;
 
@@ -1684,6 +1861,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_execution_exposes_and_audits_egress_decisions() {
+        let svc = memory_service();
+        svc.db
+            .create_object(&Object {
+                id: "asset-secret".into(),
+                kind: "asset".into(),
+                name: "SecretCo".into(),
+                namespace: "".into(),
+                external_id: "asset:SECRET".into(),
+                properties: std::collections::HashMap::from([
+                    ("verdict".into(), "approved".into()),
+                    ("score".into(), "99".into()),
+                    (
+                        crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "verdict".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-egress".into(),
+                    namespace: "asset:SECRET".into(),
+                    spec: "analyze the referenced asset".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        assert!(plan.egress_decisions.iter().any(|decision| {
+            decision.provider == "native"
+                && decision.external
+                && decision.included.contains(&"object#1.verdict".into())
+                && decision.redacted.contains(&"object#1.score".into())
+                && decision.redacted.contains(&"object#1.identity".into())
+        }));
+        assert!(plan.enriched_spec.contains("prior_verdict: approved"));
+        assert!(!plan.enriched_spec.contains("score: 99"));
+        assert!(!plan.enriched_spec.contains("SecretCo"));
+        let egress_text = format!("{:?}", plan.egress_decisions);
+        assert!(!egress_text.contains("asset:SECRET"));
+
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                actor: Some("chisei.egress".into()),
+                action: Some("prepare_context".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(decisions.iter().any(|d| {
+            d.target_id == "task-egress"
+                && d.evidence.get("provider") == Some(&"native".to_string())
+                && d.evidence.get("redacted_count") == Some(&"2".to_string())
+        }));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_rejects_external_plan_without_egress_decisions() {
+        let svc = memory_service();
+        let plan = ExecutionPlan {
+            plan_id: "plan-forged-egress".into(),
+            input: Some(ExecutionInput {
+                request_id: "task-forged-egress".into(),
+                namespace: "ns".into(),
+                spec: "do work".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                task_type: String::new(),
+                priority: 0,
+                user_id: "user-1".into(),
+                estimated_tokens: 0,
+                messages: vec![],
+                tools: vec![],
+                system: String::new(),
+                max_tokens: 512,
+            }),
+            resolved_runtime: "kiro".into(),
+            resolved_model: "native-default".into(),
+            enriched_spec: "do work".into(),
+            prepared_system: String::new(),
+            prepared_messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "do work".into(),
+                tool_call_id: String::new(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            budget: Some(BudgetVerdict {
+                allowed: true,
+                usage: None,
+                reason: String::new(),
+            }),
+            steps: vec![],
+            review_policy: None,
+            risk_score: 0.0,
+            low_success_namespace: false,
+            executable: true,
+            warnings: vec![],
+            max_tokens: 512,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            affinity_namespaces: vec![],
+            eval_regressed: false,
+            eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
+            egress_decisions: vec![],
+        };
+        svc.cache_plan(plan.clone());
+
+        let err = svc
+            .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+            .await
+            .expect_err("external plan without egress decisions should be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("missing egress decisions"));
+    }
+
+    #[tokio::test]
     async fn sqlite_reload_backfills_legacy_iteration_context_gates() {
         let path = format!(
             "{}/sekai-chisei-legacy-{}.db",
@@ -1775,6 +2089,7 @@ mod tests {
                 sampled: false,
                 sample_rate: 0.0,
                 sample_reason: String::new(),
+                egress_decisions: vec![],
             });
         }
         let newest = ExecutionPlan {
@@ -1801,6 +2116,7 @@ mod tests {
             sampled: false,
             sample_rate: 0.0,
             sample_reason: String::new(),
+            egress_decisions: vec![],
         };
         svc.cache_plan(newest.clone());
 
@@ -1841,6 +2157,7 @@ mod tests {
             sampled: false,
             sample_rate: 0.0,
             sample_reason: String::new(),
+            egress_decisions: vec![],
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -1887,6 +2204,7 @@ mod tests {
                 sampled: false,
                 sample_rate: 0.0,
                 sample_reason: String::new(),
+                egress_decisions: vec![],
             });
         }
         let inserted = ExecutionPlan {
@@ -1913,6 +2231,7 @@ mod tests {
             sampled: false,
             sample_rate: 0.0,
             sample_reason: String::new(),
+            egress_decisions: vec![],
         };
         svc.cache_plan(inserted.clone());
 
