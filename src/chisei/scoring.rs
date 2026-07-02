@@ -381,8 +381,12 @@ impl ScoringJob {
         self.db.put_eval_suite(&suite)?;
         self.eval.create_suite(suite);
 
+        // `now` alone can collide across two batches processed within the same millisecond; the
+        // suffix guarantees a unique id so `INSERT OR REPLACE` never aliases an earlier run (which
+        // previously corrupted the baseline lookup used for regression detection).
+        let seq = self.eval.next_sequence();
         let run = eval::Run {
-            id: format!("sampling-run-{namespace}-{now}"),
+            id: format!("sampling-run-{namespace}-{now}-{seq}"),
             suite_id: suite_id.clone(),
             config_ref: self.model.clone(),
             results,
