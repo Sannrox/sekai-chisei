@@ -5,7 +5,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Certificate, ClientTlsConfig, Endpoint, Uri};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri};
 use tower::service_fn;
 
 #[derive(Clone)]
