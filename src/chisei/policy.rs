@@ -38,6 +38,16 @@ impl PolicyResolver {
             .cloned()
     }
 
+    pub fn effective_policy_for_scopes(&self, scopes: &[String]) -> Option<(String, Policy)> {
+        let policies = self.namespace_policies.lock().unwrap();
+        scopes.iter().find_map(|scope| {
+            policies
+                .get(scope)
+                .cloned()
+                .map(|policy| (scope.clone(), policy))
+        })
+    }
+
     pub fn resolve(
         &self,
         namespace: &str,
@@ -64,7 +74,7 @@ impl PolicyResolver {
         ))
     }
 
-    fn apply_policy(
+    pub(crate) fn apply_policy(
         &self,
         p: &Policy,
         preferred_runtime: &str,
@@ -141,5 +151,34 @@ mod tests {
         let (rt, m) = r.resolve("ns", "", "").unwrap();
         assert_eq!(rt, "kiro");
         assert_eq!(m, "claude");
+    }
+
+    #[test]
+    fn effective_policy_for_scopes_prefers_first_match() {
+        let r = PolicyResolver::new();
+        r.set_namespace_policy(
+            "project:sekai-chisei",
+            Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5-mini".into(),
+            },
+        );
+        r.set_namespace_policy(
+            "agent:codex-app",
+            Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+            },
+        );
+
+        let (scope, policy) = r
+            .effective_policy_for_scopes(&["agent:codex-app".into(), "project:sekai-chisei".into()])
+            .unwrap();
+        assert_eq!(scope, "agent:codex-app");
+        assert_eq!(policy.default_model, "gpt-5.5");
     }
 }

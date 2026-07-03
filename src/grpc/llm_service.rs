@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
 use super::pb::llm::llm_service_server::LlmService;
@@ -111,6 +113,130 @@ pub async fn execute_chat_request(
     })
 }
 
+pub type ChatStreamResponse =
+    Pin<Box<dyn futures_util::Stream<Item = Result<ChatStreamChunk, Status>> + Send + 'static>>;
+
+pub async fn execute_chat_request_stream(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    r: ChatRequest,
+) -> Result<ChatStreamResponse, Status> {
+    let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
+    let estimated = estimate_chat_request(&r);
+    budget
+        .check_and_reserve(&user_id, estimated)
+        .map_err(Status::resource_exhausted)?;
+    let provider = match llm::resolve(
+        &r.model,
+        config.anthropic_api_key.as_deref(),
+        config.openai_api_key.as_deref(),
+        &config.ollama_url,
+        config.native_llm_url.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            budget.adjust(&user_id, estimated, 0);
+            return Err(Status::failed_precondition(e));
+        }
+    };
+    let chat_req = pb_chat_to_domain(r);
+    let stream = match provider.chat_stream(&chat_req).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            budget.adjust(&user_id, estimated, 0);
+            return Err(Status::internal(e));
+        }
+    };
+    let mut adjusted = false;
+    let mut last_tokens = 0;
+    let budget_for_stream = budget.clone();
+    Ok(Box::pin(async_stream::stream! {
+        futures_util::pin_mut!(stream);
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(chunk) => {
+                    let actual_tokens = chunk.input_tokens + chunk.output_tokens;
+                    if actual_tokens > 0 {
+                        last_tokens = actual_tokens;
+                    }
+                    let done = chunk.done;
+                    yield Ok(domain_chunk_to_pb(chunk));
+                    if done && !adjusted {
+                        budget_for_stream.adjust(&user_id, estimated, last_tokens);
+                        adjusted = true;
+                    }
+                }
+                Err(err) => {
+                    if !adjusted {
+                        budget_for_stream.adjust(&user_id, estimated, 0);
+                    }
+                    yield Err(Status::internal(err));
+                    return;
+                }
+            }
+        }
+        if !adjusted {
+            budget_for_stream.adjust(&user_id, estimated, last_tokens);
+        }
+    }))
+}
+
+fn pb_chat_to_domain(r: ChatRequest) -> llm::ChatRequest {
+    llm::ChatRequest {
+        model: r.model,
+        system: r.system,
+        messages: r
+            .messages
+            .iter()
+            .map(|m| llm::Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+                tool_calls: m
+                    .tool_calls
+                    .iter()
+                    .map(|tc| llm::ToolCall {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        args: serde_json::from_str(&tc.args_json).unwrap_or(serde_json::json!({})),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        tools: r
+            .tools
+            .iter()
+            .map(|t| llm::ToolDef {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: serde_json::from_str(&t.input_schema_json)
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect(),
+        max_tokens: r.max_tokens,
+    }
+}
+
+fn domain_chunk_to_pb(chunk: llm::ChatStreamChunk) -> ChatStreamChunk {
+    ChatStreamChunk {
+        content_delta: chunk.content_delta,
+        content: chunk.content,
+        tool_calls: chunk
+            .tool_calls
+            .into_iter()
+            .map(|tc| ToolCall {
+                id: tc.id,
+                name: tc.name,
+                args_json: tc.args.to_string(),
+            })
+            .collect(),
+        input_tokens: chunk.input_tokens,
+        output_tokens: chunk.output_tokens,
+        stop_reason: chunk.stop_reason,
+        done: chunk.done,
+    }
+}
+
 pub fn estimate_chat_request(r: &ChatRequest) -> i32 {
     let system_tokens = r.system.len() as i32 / 4;
     let message_tokens = r
@@ -135,9 +261,20 @@ pub fn estimate_chat_request(r: &ChatRequest) -> i32 {
 
 #[tonic::async_trait]
 impl LlmService for LlmServiceImpl {
+    type ChatStreamStream = ChatStreamResponse;
+
     async fn chat(&self, req: Request<ChatRequest>) -> Result<Response<ChatResponse>, Status> {
         let resp =
             execute_chat_request(&self.config, self.budget.clone(), req.into_inner()).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn chat_stream(
+        &self,
+        req: Request<ChatRequest>,
+    ) -> Result<Response<Self::ChatStreamStream>, Status> {
+        let resp = execute_chat_request_stream(&self.config, self.budget.clone(), req.into_inner())
+            .await?;
         Ok(Response::new(resp))
     }
 

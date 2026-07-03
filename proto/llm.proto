@@ -37,10 +37,21 @@ message ChatResponse {
   string stop_reason = 5;
 }
 
+message ChatStreamChunk {
+  string content_delta = 1;
+  string content = 2;
+  repeated ToolCall tool_calls = 3;
+  int32 input_tokens = 4;
+  int32 output_tokens = 5;
+  string stop_reason = 6;
+  bool done = 7;
+}
+
 message ResolveProviderRequest { string model = 1; }
 message ResolveProviderResponse { string provider = 1; }
 
 service LlmService {
   rpc Chat(ChatRequest) returns (ChatResponse);
+  rpc ChatStream(ChatRequest) returns (stream ChatStreamChunk);
   rpc ResolveProvider(ResolveProviderRequest) returns (ResolveProviderResponse);
 }
