@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
+use metrics::gauge;
 use std::collections::HashMap;
 
 pub const KIND_CAPACITY_SNAPSHOT: &str = "capacity_snapshot";
@@ -16,6 +17,12 @@ pub struct CapacityMetrics {
 }
 
 pub fn record_snapshot(db: &SekaiDb, metrics: &CapacityMetrics) -> Result<(), String> {
+    gauge!("sekai_queue_depth").set(metrics.queue_depth as f64);
+    gauge!("sekai_running_tasks").set(metrics.running_tasks as f64);
+    gauge!("sekai_agent_count").set(metrics.agent_count as f64);
+    gauge!("sekai_utilization").set(metrics.utilization as f64);
+    gauge!("sekai_failure_rate").set(metrics.failure_rate as f64);
+
     let id = format!("cap:{}", metrics.timestamp);
     let props = HashMap::from([
         ("queue_depth".into(), metrics.queue_depth.to_string()),

@@ -90,6 +90,12 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
+    pub fn ping(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT 1", [], |_| Ok(()))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn get_principal_credential(
         &self,
         token_hash: &str,

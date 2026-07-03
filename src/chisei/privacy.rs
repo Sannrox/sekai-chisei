@@ -200,6 +200,8 @@ mod tests {
     fn safe_providers_always_include_ollama() {
         let config = Config {
             grpc_port: 50051,
+            ops_port: None,
+            ops_bind: "127.0.0.1".into(),
             db_path: ":memory:".into(),
             sekai_socket: None,
             anthropic_api_key: None,

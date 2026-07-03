@@ -53,6 +53,8 @@ async fn grpc_chat_round_trip_with_local_ollama() {
     let addr = free_local_addr();
     let config = Config {
         grpc_port: addr.port(),
+        ops_port: None,
+        ops_bind: "127.0.0.1".into(),
         sekai_socket: None,
         db_path: ":memory:".into(),
         anthropic_api_key: None,
@@ -156,6 +158,8 @@ async fn delegation_chain_keeps_private_context_local() {
     let addr = free_local_addr();
     let config = Config {
         grpc_port: addr.port(),
+        ops_port: None,
+        ops_bind: "127.0.0.1".into(),
         sekai_socket: None,
         db_path: ":memory:".into(),
         anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
