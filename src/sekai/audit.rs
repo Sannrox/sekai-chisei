@@ -1,6 +1,7 @@
 use crate::db::sekai::SekaiDb;
-use rusqlite::params;
-use std::collections::HashMap;
+use crate::domain::Object;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct Decision {
@@ -32,6 +33,132 @@ pub struct DecisionFilter {
     pub after: i64,
     pub limit: i32,
     pub offset: i32,
+}
+
+pub fn record_object_diff(
+    db: &SekaiDb,
+    actor: &str,
+    before: Option<&Object>,
+    after: Option<&Object>,
+) -> Result<u32, String> {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let changes = object_diff_changes(actor, before, after, timestamp);
+    let count = changes.len() as u32;
+    db.record_object_changes(&changes)?;
+    Ok(count)
+}
+
+fn object_diff_changes(
+    actor: &str,
+    before: Option<&Object>,
+    after: Option<&Object>,
+    timestamp: i64,
+) -> Vec<ObjectChange> {
+    let mut changes = Vec::new();
+
+    match (before, after) {
+        (None, Some(after)) => changes.push(ObjectChange {
+            id: uuid::Uuid::new_v4().to_string(),
+            object_id: after.id.clone(),
+            field: "_created".into(),
+            old_value: String::new(),
+            new_value: format!("{}/{}", after.kind, after.name),
+            changed_by: actor.into(),
+            timestamp,
+        }),
+        (Some(before), None) => changes.push(ObjectChange {
+            id: uuid::Uuid::new_v4().to_string(),
+            object_id: before.id.clone(),
+            field: "_deleted".into(),
+            old_value: format!("{}/{}", before.kind, before.name),
+            new_value: String::new(),
+            changed_by: actor.into(),
+            timestamp,
+        }),
+        (Some(before), Some(after)) => {
+            push_if_changed(
+                &mut changes,
+                actor,
+                timestamp,
+                &after.id,
+                "kind",
+                &before.kind,
+                &after.kind,
+            );
+            push_if_changed(
+                &mut changes,
+                actor,
+                timestamp,
+                &after.id,
+                "name",
+                &before.name,
+                &after.name,
+            );
+            push_if_changed(
+                &mut changes,
+                actor,
+                timestamp,
+                &after.id,
+                "namespace",
+                &before.namespace,
+                &after.namespace,
+            );
+            push_if_changed(
+                &mut changes,
+                actor,
+                timestamp,
+                &after.id,
+                "external_id",
+                &before.external_id,
+                &after.external_id,
+            );
+
+            let property_keys = before
+                .properties
+                .keys()
+                .chain(after.properties.keys())
+                .collect::<BTreeSet<_>>();
+            for key in property_keys {
+                let old_value = before.properties.get(key).cloned().unwrap_or_default();
+                let new_value = after.properties.get(key).cloned().unwrap_or_default();
+                push_if_changed(
+                    &mut changes,
+                    actor,
+                    timestamp,
+                    &after.id,
+                    &format!("properties.{key}"),
+                    &old_value,
+                    &new_value,
+                );
+            }
+        }
+        (None, None) => {}
+    }
+
+    changes
+}
+
+fn push_if_changed(
+    changes: &mut Vec<ObjectChange>,
+    actor: &str,
+    timestamp: i64,
+    object_id: &str,
+    field: &str,
+    old_value: &str,
+    new_value: &str,
+) {
+    if old_value == new_value {
+        return;
+    }
+    changes.push(ObjectChange {
+        id: uuid::Uuid::new_v4().to_string(),
+        object_id: object_id.into(),
+        field: field.into(),
+        old_value: old_value.into(),
+        new_value: new_value.into(),
+        changed_by: actor.into(),
+        timestamp,
+    });
 }
 
 impl SekaiDb {
@@ -116,6 +243,130 @@ impl SekaiDb {
         Ok(())
     }
 
+    pub fn record_object_changes(&self, changes: &[ObjectChange]) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        insert_object_changes(&tx, changes)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let props = serde_json::to_string(&object.properties).unwrap_or_default();
+        tx.execute(
+            "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                object.id,
+                object.kind,
+                object.name,
+                object.namespace,
+                object.external_id,
+                props,
+                object.created,
+                object.updated
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let changes = object_diff_changes(
+            actor,
+            None,
+            Some(object),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        insert_object_changes(&tx, &changes)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn update_object_with_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+    ) -> Result<Option<Object>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![object.id],
+                |row| Ok(crate::db::sekai::row_to_object(row)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(before_object) = before else {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        };
+        let props = serde_json::to_string(&object.properties).unwrap_or_default();
+        tx.execute(
+            "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
+            params![
+                object.id,
+                object.kind,
+                object.name,
+                object.namespace,
+                object.external_id,
+                props,
+                object.updated
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let changes = object_diff_changes(
+            actor,
+            Some(&before_object),
+            Some(object),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        insert_object_changes(&tx, &changes)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(before_object))
+    }
+
+    pub fn delete_object_with_audit(
+        &self,
+        id: &str,
+        actor: &str,
+    ) -> Result<Option<Object>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![id],
+                |row| Ok(crate::db::sekai::row_to_object(row)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_links WHERE from_id = ?1 OR to_id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(before) = &before {
+            insert_object_changes(
+                &tx,
+                &[ObjectChange {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    object_id: before.id.clone(),
+                    field: "_deleted".into(),
+                    old_value: format!("{}/{}", before.kind, before.name),
+                    new_value: String::new(),
+                    changed_by: actor.into(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                }],
+            )?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(before)
+    }
+
     pub fn list_object_changes(
         &self,
         object_id: &str,
@@ -124,7 +375,7 @@ impl SekaiDb {
     ) -> Result<Vec<ObjectChange>, String> {
         let conn = self.conn.lock().unwrap();
         let effective_limit = if limit > 0 { limit } else { 100 };
-        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3";
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let mut results = Vec::new();
         let mut rows = stmt
@@ -162,6 +413,25 @@ impl SekaiDb {
     }
 }
 
+fn insert_object_changes(conn: &Connection, changes: &[ObjectChange]) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)")
+        .map_err(|e| e.to_string())?;
+    for change in changes {
+        stmt.execute(params![
+            change.id,
+            change.object_id,
+            change.field,
+            change.old_value,
+            change.new_value,
+            change.changed_by,
+            change.timestamp
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +440,25 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         db.migrate_audit();
         db
+    }
+
+    fn object(
+        id: &str,
+        name: &str,
+        namespace: &str,
+        external_id: &str,
+        properties: HashMap<String, String>,
+    ) -> Object {
+        Object {
+            id: id.into(),
+            kind: "component".into(),
+            name: name.into(),
+            namespace: namespace.into(),
+            external_id: external_id.into(),
+            properties,
+            created: 1,
+            updated: 1,
+        }
     }
 
     #[test]
@@ -242,5 +531,107 @@ mod tests {
 
         let changes = db.list_object_changes("o1", 10, 0).unwrap();
         assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn record_object_diff_records_lifecycle_rows() {
+        let db = setup();
+        let obj = object("o1", "api", "default", "ext-1", HashMap::new());
+
+        assert_eq!(
+            record_object_diff(&db, "tester", None, Some(&obj)).unwrap(),
+            1
+        );
+        assert_eq!(
+            record_object_diff(&db, "tester", Some(&obj), None).unwrap(),
+            1
+        );
+
+        let changes = db.list_object_changes("o1", 10, 0).unwrap();
+        assert_eq!(changes[0].field, "_deleted");
+        assert_eq!(changes[0].old_value, "component/api");
+        assert_eq!(changes[1].field, "_created");
+        assert_eq!(changes[1].new_value, "component/api");
+        assert!(changes.iter().all(|change| change.changed_by == "tester"));
+    }
+
+    #[test]
+    fn record_object_diff_records_changed_fields_and_properties() {
+        let db = setup();
+        let before = object(
+            "o1",
+            "api",
+            "default",
+            "ext-1",
+            HashMap::from([
+                ("removed".into(), "old".into()),
+                ("status".into(), "todo".into()),
+                ("same".into(), "kept".into()),
+            ]),
+        );
+        let after = object(
+            "o1",
+            "worker",
+            "prod",
+            "ext-2",
+            HashMap::from([
+                ("added".into(), "new".into()),
+                ("status".into(), "done".into()),
+                ("same".into(), "kept".into()),
+            ]),
+        );
+        let mut after = after;
+        after.kind = "service".into();
+
+        assert_eq!(
+            record_object_diff(&db, "tester", Some(&before), Some(&after)).unwrap(),
+            7
+        );
+
+        let changes = db.list_object_changes("o1", 10, 0).unwrap();
+        let fields = changes
+            .iter()
+            .map(|change| change.field.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                "properties.status",
+                "properties.removed",
+                "properties.added",
+                "external_id",
+                "namespace",
+                "name",
+                "kind",
+            ]
+        );
+        assert_eq!(changes[0].old_value, "todo");
+        assert_eq!(changes[0].new_value, "done");
+        assert_eq!(changes[1].old_value, "old");
+        assert_eq!(changes[1].new_value, "");
+        assert_eq!(changes[2].old_value, "");
+        assert_eq!(changes[2].new_value, "new");
+        assert_eq!(changes[6].old_value, "component");
+        assert_eq!(changes[6].new_value, "service");
+    }
+
+    #[test]
+    fn record_object_diff_ignores_noop_update() {
+        let db = setup();
+        let obj = object("o1", "api", "default", "ext-1", HashMap::new());
+
+        assert_eq!(
+            record_object_diff(&db, "tester", Some(&obj), Some(&obj)).unwrap(),
+            0
+        );
+        assert!(db.list_object_changes("o1", 10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_object_diff_returns_insert_errors() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let obj = object("o1", "api", "default", "ext-1", HashMap::new());
+
+        assert!(record_object_diff(&db, "tester", None, Some(&obj)).is_err());
     }
 }

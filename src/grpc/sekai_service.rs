@@ -27,6 +27,7 @@ impl SekaiServiceImpl {
         db.migrate_coordination();
         db.migrate_functions();
         db.migrate_grants();
+        db.migrate_audit();
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
@@ -748,8 +749,9 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
-            .create_object(&domain_obj)
+            .create_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?;
         Ok(Response::new(CreateObjectResponse { object: Some(obj) }))
     }
@@ -789,9 +791,11 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
-            .update_object(&domain_obj)
-            .map_err(Status::internal)?;
+            .update_object_with_audit(&domain_obj, actor)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
         Ok(Response::new(UpdateObjectResponse { object: Some(obj) }))
     }
     async fn delete_object(
@@ -801,7 +805,10 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         let id = req.into_inner().id;
         check_write(&self.security, &id, &principals)?;
-        self.db.delete_object(&id).map_err(Status::internal)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        self.db
+            .delete_object_with_audit(&id, actor)
+            .map_err(Status::internal)?;
         Ok(Response::new(DeleteObjectResponse {}))
     }
     async fn list_objects(
@@ -2731,6 +2738,213 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(executed.result.unwrap().aggregates["total"], "5");
+    }
+
+    #[tokio::test]
+    async fn object_mutations_record_audit_changes() {
+        let svc = service();
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(Object {
+                    id: "audit-1".into(),
+                    kind: "component".into(),
+                    name: "api".into(),
+                    namespace: "default".into(),
+                    external_id: "component:api".into(),
+                    properties: HashMap::from([("status".into(), "todo".into())]),
+                    created: 1,
+                    updated: 1,
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        svc.update_object(with_named_principal(
+            UpdateObjectRequest {
+                object: Some(Object {
+                    id: "audit-1".into(),
+                    kind: "component".into(),
+                    name: "worker".into(),
+                    namespace: "default".into(),
+                    external_id: "component:api".into(),
+                    properties: HashMap::from([("status".into(), "done".into())]),
+                    created: 1,
+                    updated: 2,
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        svc.delete_object(with_named_principal(
+            DeleteObjectRequest {
+                id: "audit-1".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let changes = svc
+            .list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: "audit-1".into(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+
+        assert_eq!(changes.len(), 4);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_deleted", "properties.status", "name", "_created"]
+        );
+        assert!(changes.iter().all(|change| change.changed_by == "alice"));
+        assert_eq!(changes[0].old_value, "component/worker");
+        assert_eq!(changes[1].old_value, "todo");
+        assert_eq!(changes[1].new_value, "done");
+        assert_eq!(changes[2].old_value, "api");
+        assert_eq!(changes[2].new_value, "worker");
+    }
+
+    #[tokio::test]
+    async fn noop_update_does_not_record_audit_change() {
+        let svc = service();
+        let object = Object {
+            id: "audit-noop".into(),
+            kind: "component".into(),
+            name: "api".into(),
+            namespace: "default".into(),
+            external_id: "component:api".into(),
+            properties: HashMap::from([("status".into(), "todo".into())]),
+            created: 1,
+            updated: 1,
+        };
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(object.clone()),
+        }))
+        .await
+        .unwrap();
+
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(object),
+        }))
+        .await
+        .unwrap();
+
+        let changes = svc
+            .list_object_changes(with_principal(ListObjectChangesRequest {
+                object_id: "audit-noop".into(),
+                limit: 10,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "_created");
+    }
+
+    #[tokio::test]
+    async fn audit_insert_failure_rolls_back_create() {
+        let svc = service();
+        svc.db
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE sekai_object_changes", [])
+            .unwrap();
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: "audit-fail-closed".into(),
+                    kind: "component".into(),
+                    name: "api".into(),
+                    namespace: "default".into(),
+                    external_id: "component:api".into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                }),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(svc.db.get_object("audit-fail-closed").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_fails_closed_when_delete_audit_insert_fails() {
+        let svc = service();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "delete-audit-fail".into(),
+                kind: "component".into(),
+                name: "api".into(),
+                namespace: "default".into(),
+                external_id: "component:api".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE sekai_object_changes", [])
+            .unwrap();
+
+        let err = svc
+            .delete_object(with_principal(DeleteObjectRequest {
+                id: "delete-audit-fail".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(svc.db.get_object("delete-audit-fail").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_object_remains_idempotent_when_missing() {
+        let svc = service();
+
+        svc.delete_object(with_principal(DeleteObjectRequest {
+            id: "missing-object".into(),
+        }))
+        .await
+        .unwrap();
+
+        let changes = svc
+            .list_object_changes(with_principal(ListObjectChangesRequest {
+                object_id: "missing-object".into(),
+                limit: 10,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+
+        assert!(changes.is_empty());
     }
 
     #[tokio::test]
