@@ -1,7 +1,7 @@
 pub mod chisei;
 pub mod config;
-pub mod db;
 pub mod credential_cli;
+pub mod db;
 pub mod domain;
 pub mod gateway;
 pub mod gateway_keys;

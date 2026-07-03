@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
     RwLock,
+    atomic::{AtomicI64, Ordering},
 };
 
 use crate::db::sekai::{PrincipalCredential, SekaiDb};

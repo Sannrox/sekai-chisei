@@ -16,8 +16,8 @@ pub mod pb {
 }
 
 use std::path::Path;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
@@ -28,7 +28,7 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tonic::{metadata::MetadataValue, Request, Status};
+use tonic::{Request, Status, metadata::MetadataValue};
 
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
@@ -66,7 +66,12 @@ impl TokenAuthInterceptor {
         if raw.is_empty() {
             return None;
         }
-        Some(raw.strip_prefix("Bearer ").unwrap_or(raw).trim().to_string())
+        Some(
+            raw.strip_prefix("Bearer ")
+                .unwrap_or(raw)
+                .trim()
+                .to_string(),
+        )
     }
 }
 
@@ -81,12 +86,11 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             .ok_or_else(|| Status::unauthenticated("invalid token"))?;
 
         while req.metadata_mut().remove("x-principal").is_some() {}
-        req.metadata_mut()
-            .insert(
-                "x-principal",
-                MetadataValue::from_str(&principal)
-                    .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
-            );
+        req.metadata_mut().insert(
+            "x-principal",
+            MetadataValue::from_str(&principal)
+                .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
+        );
         Ok(req)
     }
 }
@@ -100,21 +104,31 @@ impl LocalInterceptor {
     }
 }
 
+impl Default for LocalInterceptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         if req.metadata().get("x-principal").is_none() {
-            req.metadata_mut().insert("x-principal", MetadataValue::from_static("local"));
+            req.metadata_mut()
+                .insert("x-principal", MetadataValue::from_static("local"));
         }
         Ok(req)
     }
 }
 
-pub fn tls_policy(
-    bind_addr: &str,
-    config: &Config,
-) -> Result<Option<(String, String)>, String> {
-    let cert = config.tls_cert.clone().filter(|value| !value.trim().is_empty());
-    let key = config.tls_key.clone().filter(|value| !value.trim().is_empty());
+pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, String)>, String> {
+    let cert = config
+        .tls_cert
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let key = config
+        .tls_key
+        .clone()
+        .filter(|value| !value.trim().is_empty());
 
     match (cert, key) {
         (Some(cert), Some(key)) => Ok(Some((cert, key))),
@@ -141,9 +155,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
 
     let token_auth_mode = config.auth_token.is_some() || credential_store.has_any();
     if config.auth_token.is_some() {
-        eprintln!(
-            "warning: SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`"
-        );
+        eprintln!("warning: SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`");
     }
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
@@ -204,7 +216,11 @@ async fn run_tcp(
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<SekaiDb>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = if token_auth_mode { "0.0.0.0" } else { "127.0.0.1" };
+    let bind_addr = if token_auth_mode {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
 
     if token_auth_mode {
         serve_tcp_listener(
