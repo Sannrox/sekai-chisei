@@ -4,10 +4,13 @@ use std::collections::HashMap;
 
 type ExecuteFn =
     Box<dyn Fn(&SekaiDb, &HashMap<String, String>) -> Result<String, String> + Send + Sync>;
+type TargetIdsFn =
+    Box<dyn Fn(&SekaiDb, &HashMap<String, String>) -> Result<Vec<String>, String> + Send + Sync>;
 
 pub struct ActionDef {
     pub name: String,
     pub required: Vec<String>,
+    pub target_ids: TargetIdsFn,
     pub execute: ExecuteFn,
 }
 
@@ -41,12 +44,31 @@ impl ActionExecutor {
             .registry
             .get(action)
             .ok_or_else(|| format!("unknown action: {}", action))?;
+        Self::validate_required(def, params)?;
+        (def.execute)(db, params)
+    }
+
+    pub fn target_ids(
+        &self,
+        db: &SekaiDb,
+        action: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        let def = self
+            .registry
+            .get(action)
+            .ok_or_else(|| format!("unknown action: {}", action))?;
+        Self::validate_required(def, params)?;
+        (def.target_ids)(db, params)
+    }
+
+    fn validate_required(def: &ActionDef, params: &HashMap<String, String>) -> Result<(), String> {
         for r in &def.required {
             if !params.contains_key(r) {
                 return Err(format!("missing required param: {}", r));
             }
         }
-        (def.execute)(db, params)
+        Ok(())
     }
 
     fn register_builtins(&mut self) {
@@ -55,6 +77,7 @@ impl ActionExecutor {
             ActionDef {
                 name: "create_object".into(),
                 required: vec!["id".into(), "kind".into(), "name".into()],
+                target_ids: Box::new(|_, p| Ok(vec![p["id"].clone()])),
                 execute: Box::new(|db, p| {
                     let now = chrono::Utc::now().timestamp();
                     let obj = Object {
@@ -77,6 +100,7 @@ impl ActionExecutor {
             ActionDef {
                 name: "set_property".into(),
                 required: vec!["id".into(), "key".into(), "value".into()],
+                target_ids: Box::new(|_, p| Ok(vec![p["id"].clone()])),
                 execute: Box::new(|db, p| {
                     let mut obj = db.get_object(&p["id"])?.ok_or("object not found")?;
                     obj.properties.insert(p["key"].clone(), p["value"].clone());
@@ -91,6 +115,7 @@ impl ActionExecutor {
             ActionDef {
                 name: "create_link".into(),
                 required: vec!["from_id".into(), "to_id".into(), "relation".into()],
+                target_ids: Box::new(|_, p| Ok(vec![p["from_id"].clone(), p["to_id"].clone()])),
                 execute: Box::new(|db, p| {
                     let id = format!("{}->{}", p["from_id"], p["to_id"]);
                     let link = Link {
@@ -110,6 +135,10 @@ impl ActionExecutor {
             ActionDef {
                 name: "delete_link".into(),
                 required: vec!["id".into()],
+                target_ids: Box::new(|db, p| {
+                    let link = db.get_link(&p["id"])?.ok_or("link not found")?;
+                    Ok(vec![link.from_id, link.to_id])
+                }),
                 execute: Box::new(|db, p| {
                     db.delete_link(&p["id"])?;
                     Ok(format!("deleted link {}", p["id"]))
@@ -132,6 +161,10 @@ mod tests {
             ("kind".into(), "namespace".into()),
             ("name".into(), "test".into()),
         ]);
+        assert_eq!(
+            exec.target_ids(&db, "create_object", &params).unwrap(),
+            vec!["o1".to_string()]
+        );
         let msg = exec.execute(&db, "create_object", &params, "user").unwrap();
         assert!(msg.contains("o1"));
         assert!(db.get_object("o1").unwrap().is_some());
