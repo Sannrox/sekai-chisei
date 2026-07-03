@@ -12,6 +12,7 @@ use crate::sekai::action::ActionExecutor;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, coordination, dataset, function, security};
+use uuid::Uuid;
 
 pub struct SekaiServiceImpl {
     db: Arc<SekaiDb>,
@@ -229,6 +230,216 @@ fn check_work_unit_write(
     } else {
         Err(Status::permission_denied("work unit write denied"))
     }
+}
+
+const DEFAULT_LIST_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
+const MAX_LIST_LIMIT: i32 = domain::MAX_LIST_LIMIT;
+
+fn read_limit_offset(limit: i32, offset: i32) -> Result<(i32, i32), Status> {
+    if offset < 0 {
+        return Err(Status::invalid_argument("offset must be >= 0"));
+    }
+    let effective_limit = if limit <= 0 {
+        DEFAULT_LIST_LIMIT
+    } else {
+        limit.min(MAX_LIST_LIMIT)
+    };
+    Ok((effective_limit, offset))
+}
+
+fn parse_property_operator(op: &str) -> Result<&'static str, Status> {
+    match op.to_lowercase().as_str() {
+        "eq" => Ok("eq"),
+        "ne" | "neq" => Ok("ne"),
+        "gt" => Ok("gt"),
+        "gte" => Ok("gte"),
+        "lt" => Ok("lt"),
+        "lte" => Ok("lte"),
+        "contains" => Ok("contains"),
+        "prefix" => Ok("prefix"),
+        "in" => Ok("in"),
+        other => Err(Status::invalid_argument(format!(
+            "unsupported property operator: {other}"
+        ))),
+    }
+}
+
+fn parse_order_by(order_by: &str) -> Result<String, Status> {
+    if order_by.is_empty() {
+        return Ok(String::new());
+    }
+    let normalized = order_by.trim().to_lowercase();
+    if normalized == "name" || normalized == "created" || normalized == "updated" {
+        return Ok(normalized);
+    }
+    if let Some((prefix, key)) = order_by.trim().split_once(':') {
+        if !prefix.eq_ignore_ascii_case("property") {
+            return Err(Status::invalid_argument("unsupported order_by"));
+        }
+        if !domain::is_valid_property_key(key) {
+            return Err(Status::invalid_argument("invalid property key"));
+        }
+        return Ok(format!("property:{}", key.trim()));
+    }
+    Err(Status::invalid_argument("unsupported order_by"))
+}
+
+fn parse_list_filter(f: ListFilter) -> Result<domain::ListFilter, Status> {
+    let (limit, offset) = read_limit_offset(f.limit, f.offset)?;
+    let mut property_filters = Vec::new();
+    for pf in f.property_filters {
+        if !domain::is_valid_property_key(&pf.key) {
+            return Err(Status::invalid_argument("invalid property key"));
+        }
+        property_filters.push(domain::PropertyFilter {
+            key: pf.key,
+            op: parse_property_operator(&pf.op)?.to_string(),
+            value: pf.value,
+        });
+    }
+    let order_by = parse_order_by(&f.order_by)?;
+    Ok(domain::ListFilter {
+        kind: if f.kind.is_empty() {
+            None
+        } else {
+            Some(f.kind)
+        },
+        name: if f.name.is_empty() {
+            None
+        } else {
+            Some(f.name)
+        },
+        namespace: if f.namespace.is_empty() {
+            None
+        } else {
+            Some(f.namespace)
+        },
+        property_filters,
+        limit,
+        offset,
+        order_by,
+        descending: f.descending,
+    })
+}
+
+fn to_proto_object_set(set: &domain::ObjectSet) -> ObjectSet {
+    ObjectSet {
+        id: set.id.clone(),
+        name: set.name.clone(),
+        description: set.description.clone(),
+        filter: Some(to_proto_list_filter(&set.filter)),
+        owner_principal: set.owner_principal.clone(),
+        created: set.created,
+    }
+}
+
+fn to_proto_list_filter(filter: &domain::ListFilter) -> ListFilter {
+    ListFilter {
+        kind: filter.kind.clone().unwrap_or_default(),
+        name: filter.name.clone().unwrap_or_default(),
+        namespace: filter.namespace.clone().unwrap_or_default(),
+        property_filters: filter
+            .property_filters
+            .iter()
+            .map(|pf| PropertyFilter {
+                key: pf.key.clone(),
+                op: pf.op.clone(),
+                value: pf.value.clone(),
+            })
+            .collect(),
+        limit: filter.limit,
+        offset: filter.offset,
+        order_by: filter.order_by.clone(),
+        descending: filter.descending,
+    }
+}
+
+fn parse_set_filter_from_request(
+    input: &ObjectSet,
+) -> Result<domain::ListFilter, Status> {
+    let filter = input.filter.clone().ok_or(Status::invalid_argument("filter required"))?;
+    let mut property_filters = Vec::new();
+    for pf in filter.property_filters {
+        if !domain::is_valid_property_key(&pf.key) {
+            return Err(Status::invalid_argument("invalid property key"));
+        }
+        property_filters.push(domain::PropertyFilter {
+            key: pf.key,
+            op: parse_property_operator(&pf.op)?.to_string(),
+            value: pf.value,
+        });
+    }
+    if filter.offset < 0 {
+        return Err(Status::invalid_argument("offset must be >= 0"));
+    }
+    let order_by = parse_order_by(&filter.order_by)?;
+    Ok(domain::ListFilter {
+        kind: if filter.kind.is_empty() {
+            None
+        } else {
+            Some(filter.kind)
+        },
+        name: if filter.name.is_empty() {
+            None
+        } else {
+            Some(filter.name)
+        },
+        namespace: if filter.namespace.is_empty() {
+            None
+        } else {
+            Some(filter.namespace)
+        },
+        property_filters,
+        // Keep zero/negative input as "use runtime request default" for resolves.
+        // Callers should treat persisted ObjectSet filters as declarative query
+        // descriptors, not already-paginated result sets.
+        limit: if filter.limit <= 0 {
+            0
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        },
+        offset: filter.offset.max(0),
+        order_by,
+        descending: filter.descending,
+    })
+}
+
+fn to_domain_object_set(
+    input: ObjectSet,
+    owner_principal: &str,
+) -> Result<domain::ObjectSet, Status> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name required"));
+    }
+    let requested_owner = input.owner_principal.clone();
+    if !requested_owner.is_empty() && requested_owner != owner_principal {
+        return Err(Status::invalid_argument("owner_principal mismatch"));
+    }
+
+    let filter = parse_set_filter_from_request(&input)?;
+    let created = if input.created > 0 {
+        input.created
+    } else {
+        now_millis()
+    };
+    let id = if input.id.is_empty() {
+        format!("set-{}", Uuid::new_v4().simple())
+    } else {
+        input.id
+    };
+    Ok(domain::ObjectSet {
+        id,
+        name,
+        description: input.description,
+        filter,
+        owner_principal: if requested_owner.is_empty() {
+            owner_principal.to_string()
+        } else {
+            requested_owner
+        },
+        created,
+    })
 }
 
 fn to_proto_obj(o: &domain::Object) -> Object {
@@ -816,29 +1027,19 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
-        let f = req.into_inner().filter.unwrap_or_default();
-        let filter = domain::ListFilter {
-            kind: if f.kind.is_empty() {
-                None
-            } else {
-                Some(f.kind)
-            },
-            name: if f.name.is_empty() {
-                None
-            } else {
-                Some(f.name)
-            },
-            namespace: if f.namespace.is_empty() {
-                None
-            } else {
-                Some(f.namespace)
-            },
-        };
-        let objs = self.db.list_objects(&filter).map_err(Status::internal)?;
-        let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
-        let filtered = self.security.filter_objects(&objs, &refs);
+        let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        // The API now defaults paging at 100 rows when no limit is provided;
+        // DB callers using list_objects(&filter) remain unchanged.
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        // Query visibility in SQL so list pagination and totals honor grants
+        // consistently across callers.
+        let (objects, total) = self
+            .db
+            .list_objects_with_total_for_principals(&filter, &principal_refs)
+            .map_err(Status::internal)?;
         Ok(Response::new(ListObjectsResponse {
-            objects: filtered.iter().map(|o| to_proto_obj(o)).collect(),
+            objects: objects.iter().map(to_proto_obj).collect(),
+            total,
         }))
     }
     async fn find_by_external_id(
@@ -871,6 +1072,108 @@ impl SekaiService for SekaiServiceImpl {
         let filtered = self.security.filter_objects(&objs, &refs);
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(|o| to_proto_obj(o)).collect(),
+            total: filtered.len() as i32,
+        }))
+    }
+    async fn create_object_set(
+        &self,
+        req: Request<CreateObjectSetRequest>,
+    ) -> Result<Response<CreateObjectSetResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let owner = principals.first().cloned().unwrap_or_default();
+        let domain_set = to_domain_object_set(
+            req.into_inner()
+                .object_set
+                .ok_or(Status::invalid_argument("object_set required"))?,
+            owner.as_str(),
+        )?;
+        self.db.create_object_set(&domain_set).map_err(|e| {
+            if e.starts_with("UNIQUE constraint failed:")
+                && e.contains("sekai_object_sets.owner_principal")
+                && e.contains("sekai_object_sets.name")
+            {
+                Status::already_exists("object set already exists")
+            } else if e.starts_with("UNIQUE constraint failed:")
+                && e.contains("sekai_object_sets.id")
+            {
+                Status::already_exists("object set already exists")
+            } else {
+                Status::internal(e)
+            }
+        })?;
+        Ok(Response::new(CreateObjectSetResponse {
+            object_set: Some(to_proto_object_set(&domain_set)),
+        }))
+    }
+    async fn list_object_sets(
+        &self,
+        req: Request<ListObjectSetsRequest>,
+    ) -> Result<Response<ListObjectSetsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let sets = self
+            .db
+            .list_object_sets_for_principals(&principal_refs)
+            .map_err(Status::internal)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(Response::new(ListObjectSetsResponse {
+            object_sets: sets.iter().map(to_proto_object_set).collect(),
+        }))
+    }
+    async fn delete_object_set(
+        &self,
+        req: Request<DeleteObjectSetRequest>,
+    ) -> Result<Response<DeleteObjectSetResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let id = req.into_inner().id;
+        if id.is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        if self
+            .db
+            .delete_object_set_for_principals(&id, &principal_refs)
+            .map_err(Status::internal)?
+        {
+            return Ok(Response::new(DeleteObjectSetResponse {}));
+        }
+        Err(Status::not_found("not found"))
+    }
+    async fn resolve_object_set(
+        &self,
+        req: Request<ResolveObjectSetRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let set = self
+            .db
+            .get_object_set(&inner.id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
+        if !principal_matches(&set.owner_principal, &principals) {
+            return Err(Status::not_found("not found"));
+        }
+        let mut filter = set.filter.clone();
+        let (limit, offset) = read_limit_offset(inner.limit, inner.offset)?;
+        if inner.limit > 0 {
+            filter.limit = limit;
+        } else if filter.limit <= 0 {
+            filter.limit = limit;
+        }
+        filter.offset = offset;
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let (objects, total) = self
+            .db
+            .list_objects_with_total_for_principals(&filter, &principal_refs)
+            .map_err(Status::internal)?;
+        Ok(Response::new(ListObjectsResponse {
+            objects: objects.iter().map(to_proto_obj).collect(),
+            total,
         }))
     }
     async fn create_link(
@@ -4113,5 +4416,423 @@ mod tests {
             .work_unit
             .unwrap();
         assert_eq!(still_running.status, coordination::WORK_UNIT_STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn list_objects_enforces_limit_and_returns_total() {
+        let svc = service();
+        for i in 0..1105 {
+            let object = Object {
+                id: format!("obj-{i}"),
+                kind: "query-demo".into(),
+                name: format!("object-{i}"),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::from([("team".into(), "backend".into())]),
+                created: i64::from(i),
+                updated: i64::from(i),
+            };
+            svc.db.create_object(&object).unwrap();
+        }
+
+        let response = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        kind: "query-demo".into(),
+                        order_by: "name".into(),
+                        limit: 2000,
+                        offset: 0,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.total, 1105);
+        assert_eq!(response.objects.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn list_objects_omits_filter_uses_defaults() {
+        let svc = service();
+        svc.db
+            .create_object(&Object {
+                id: "default-filter".into(),
+                kind: "query-demo".into(),
+                name: "default-filter".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::from([("team".into(), "backend".into())]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+
+        let response = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: None,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.objects.len(), 1);
+        assert_eq!(response.objects[0].id, "default-filter");
+    }
+
+    #[tokio::test]
+    async fn list_objects_rejects_unknown_property_operator() {
+        let svc = service();
+        let err = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        kind: "query-demo".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "team".into(),
+                            op: "nope".into(),
+                            value: "backend".into(),
+                        }],
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn object_sets_resolve_like_inline_filter_and_owner_only_access() {
+        let svc = service();
+        svc.db
+            .create_object(&Object {
+                id: "owner-visible".into(),
+                kind: "query-demo".into(),
+                name: "owner-visible".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::from([("team".into(), "alpha".into())]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        grant_object_role(&svc, "owner-visible", "alice", security::Role::Viewer);
+
+        svc.db
+            .create_object(&Object {
+                id: "other-visible".into(),
+                kind: "query-demo".into(),
+                name: "other-visible".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::from([("team".into(), "alpha".into())]),
+                created: 2,
+                updated: 2,
+            })
+            .unwrap();
+        grant_object_role(&svc, "other-visible", "bob", security::Role::Viewer);
+
+        let inline = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        kind: "query-demo".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "team".into(),
+                            op: "eq".into(),
+                            value: "alpha".into(),
+                        }],
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let created_set = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "alpha-set".into(),
+                        description: "only alpha objects".into(),
+                        filter: Some(ListFilter {
+                            kind: "query-demo".into(),
+                            property_filters: vec![PropertyFilter {
+                                key: "team".into(),
+                                op: "eq".into(),
+                                value: "alpha".into(),
+                            }],
+                            ..Default::default()
+                        }),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let set_id = created_set.object_set.unwrap().id;
+
+        let resolved_by_owner = svc
+            .resolve_object_set(with_named_principal(
+                ResolveObjectSetRequest {
+                    id: set_id.clone(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let resolved_owner_ids = resolved_by_owner
+            .objects
+            .iter()
+            .map(|obj| obj.id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(inline.total, 1);
+        assert_eq!(resolved_by_owner.total, inline.total);
+        assert_eq!(resolved_owner_ids, vec!["owner-visible"]);
+
+        let err = svc
+            .resolve_object_set(with_named_principal(
+                ResolveObjectSetRequest {
+                    id: set_id,
+                    limit: 10,
+                    offset: 0,
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_object_set_prevents_future_resolve() {
+        let svc = service();
+        let created = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "temp".into(),
+                        description: "temp set".into(),
+                        filter: Some(ListFilter {
+                            kind: "query-demo".into(),
+                            ..Default::default()
+                        }),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object_set
+            .unwrap();
+
+        svc.delete_object_set(with_named_principal(
+            DeleteObjectSetRequest {
+                id: created.id.clone(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let err = svc
+            .resolve_object_set(with_named_principal(
+                ResolveObjectSetRequest {
+                    id: created.id,
+                    limit: 10,
+                    offset: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn create_object_set_rejects_duplicate_name_for_same_owner() {
+        let svc = service();
+        let payload = CreateObjectSetRequest {
+            object_set: Some(ObjectSet {
+                id: String::new(),
+                name: "dup-name".into(),
+                description: "first".into(),
+                filter: Some(ListFilter {
+                    kind: "query-demo".into(),
+                    ..Default::default()
+                }),
+                owner_principal: String::new(),
+                created: 0,
+            }),
+        };
+
+        svc.create_object_set(with_named_principal(payload.clone(), "alice"))
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_object_set(with_named_principal(payload, "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn create_object_set_rejects_duplicate_id_for_same_owner() {
+        let svc = service();
+        let first = CreateObjectSetRequest {
+            object_set: Some(ObjectSet {
+                id: "fixed-id".into(),
+                name: "first-id".into(),
+                description: "first".into(),
+                filter: Some(ListFilter {
+                    kind: "query-demo".into(),
+                    ..Default::default()
+                }),
+                owner_principal: String::new(),
+                created: 0,
+            }),
+        };
+        svc.create_object_set(with_named_principal(first.clone(), "alice"))
+            .await
+            .unwrap();
+
+        let second = CreateObjectSetRequest {
+            object_set: Some(ObjectSet {
+                id: "fixed-id".into(),
+                name: "second-id".into(),
+                description: "second".into(),
+                filter: Some(ListFilter {
+                    kind: "query-demo".into(),
+                    ..Default::default()
+                }),
+                owner_principal: String::new(),
+                created: 0,
+            }),
+        };
+
+        let err = svc
+            .create_object_set(with_named_principal(second, "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn create_object_set_rejects_blank_name() {
+        let svc = service();
+        let err = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "  ".into(),
+                        description: "blank".into(),
+                        filter: Some(ListFilter::default()),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn resolve_object_set_offset_zero_overrides_stored_offset() {
+        let svc = service();
+        svc.db
+            .create_object(&Object {
+                id: "first".into(),
+                kind: "query-demo".into(),
+                name: "first".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "second".into(),
+                kind: "query-demo".into(),
+                name: "second".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 2,
+                updated: 2,
+            })
+            .unwrap();
+
+        let created = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "offset-set".into(),
+                        description: "offset override".into(),
+                        filter: Some(ListFilter {
+                            kind: "query-demo".into(),
+                            order_by: "name".into(),
+                            limit: 1,
+                            offset: 1,
+                            ..Default::default()
+                        }),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+                .await
+                .unwrap()
+                .into_inner()
+                .object_set
+                .unwrap();
+
+        let response = svc
+            .resolve_object_set(with_named_principal(
+                ResolveObjectSetRequest {
+                    id: created.id,
+                    limit: 1,
+                    offset: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.objects.len(), 1);
+        assert_eq!(response.objects[0].id, "first");
     }
 }

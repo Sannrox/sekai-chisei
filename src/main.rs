@@ -24,7 +24,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(SekaiDb::new(&config.db_path).expect("failed to open database"));
     db.migrate_datasets();
     db.migrate_functions();
-    db.migrate_grants();
     db.migrate_audit();
     db.migrate_schema_types()
         .expect("failed to migrate schema types");

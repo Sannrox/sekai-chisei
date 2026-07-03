@@ -13,7 +13,7 @@ pub struct ProposedTask {
 
 pub fn scan(db: &SekaiDb) -> Vec<ProposedTask> {
     let namespaces = db
-        .list_objects(&crate::domain::ListFilter {
+        .list_all_objects(&crate::domain::ListFilter {
             kind: Some("namespace".into()),
             ..Default::default()
         })
