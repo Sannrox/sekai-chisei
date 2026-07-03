@@ -399,6 +399,7 @@ mod tests {
     #[test]
     fn token_auth_interceptor_overwrites_client_principal() {
         let db = in_memory_db();
+        db.migrate_principal_credentials().unwrap();
         let store = PrincipalCredentialStore::new();
         let token = hash_gateway_key("sekai-client-token");
         db.create_principal_credential("agent-a", &token, 1)
