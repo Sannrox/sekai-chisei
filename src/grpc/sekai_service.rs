@@ -1060,13 +1060,28 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<ExecuteActionRequest>,
     ) -> Result<Response<ExecuteActionResponse>, Status> {
+        let principals = caller_principals(&req);
         let r = req
             .into_inner()
             .request
             .ok_or(Status::invalid_argument("request required"))?;
+        let target_ids = self
+            .actions
+            .target_ids(&self.db, &r.action, &r.params)
+            .map_err(|err| {
+                if r.action == "delete_link" && err == "link not found" {
+                    Status::permission_denied("write denied")
+                } else {
+                    Status::invalid_argument(err)
+                }
+            })?;
+        for target_id in target_ids {
+            check_write(&self.security, &target_id, &principals)?;
+        }
+        let actor = principals.first().cloned().unwrap_or_default();
         let msg = self
             .actions
-            .execute(&self.db, &r.action, &r.params, &r.actor)
+            .execute(&self.db, &r.action, &r.params, &actor)
             .map_err(Status::invalid_argument)?;
         Ok(Response::new(ExecuteActionResponse {
             result: Some(ActionResult {
@@ -2384,6 +2399,208 @@ mod tests {
         };
         svc.db.create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
+    }
+
+    fn grant_object_role(
+        svc: &SekaiServiceImpl,
+        object_id: &str,
+        principal: &str,
+        role: security::Role,
+    ) {
+        let grant = security::Grant {
+            id: format!("grant-{}", uuid::Uuid::new_v4().simple()),
+            object_id: object_id.into(),
+            principal: principal.into(),
+            role,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+
+    fn seed_domain_object(svc: &SekaiServiceImpl, id: &str) {
+        svc.db
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "namespace".into(),
+                name: id.into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_action_denies_ungranted_principal_even_when_actor_claims_owner() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "set_property".into(),
+                        params: HashMap::from([
+                            ("id".into(), "obj-1".into()),
+                            ("key".into(), "status".into()),
+                            ("value".into(), "done".into()),
+                        ]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_allows_granted_principal() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "done".into()),
+                    ]),
+                    actor: "bob".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn execute_action_allows_local_principal_on_unrestricted_object() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "local".into()),
+                    ]),
+                    actor: "".into(),
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "local");
+    }
+
+    #[tokio::test]
+    async fn execute_action_create_link_requires_write_on_both_endpoints() {
+        let svc = service();
+        seed_domain_object(&svc, "from-1");
+        seed_domain_object(&svc, "to-1");
+        grant_object_role(&svc, "from-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "to-1", "bob", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "create_link".into(),
+                        params: HashMap::from([
+                            ("from_id".into(), "from-1".into()),
+                            ("to_id".into(), "to-1".into()),
+                            ("relation".into(), "depends_on".into()),
+                        ]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.get_link("from-1->to-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_action_delete_link_requires_write_on_both_endpoints() {
+        let svc = service();
+        seed_domain_object(&svc, "from-1");
+        seed_domain_object(&svc, "to-1");
+        svc.db
+            .create_link(&domain::Link {
+                id: "link-1".into(),
+                from_id: "from-1".into(),
+                to_id: "to-1".into(),
+                relation: "depends_on".into(),
+                created: 0,
+            })
+            .unwrap();
+        grant_object_role(&svc, "from-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "to-1", "bob", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "delete_link".into(),
+                        params: HashMap::from([("id".into(), "link-1".into())]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.message(), "write denied");
+        assert!(svc.db.get_link("link-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_action_delete_link_hides_unknown_link() {
+        let svc = service();
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "delete_link".into(),
+                        params: HashMap::from([("id".into(), "missing-link".into())]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.message(), "write denied");
     }
 
     #[tokio::test]
