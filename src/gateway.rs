@@ -424,7 +424,7 @@ async fn proxy_gateway(
     if upstream_auth_mode == UpstreamAuthMode::GatewayKey {
         upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
             Ok(upstream) => upstream,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     }
     for (name, value) in headers.iter() {
@@ -706,7 +706,7 @@ async fn resolve_policy_preflight(
                                 GatewayRejection::json(
                                     StatusCode::BAD_REQUEST,
                                     "invalid_request_error",
-                                    &format!("failed to rewrite request model: {err}"),
+                                    format!("failed to rewrite request model: {err}"),
                                 )
                             })?;
                         record_gateway_decision(
@@ -1455,7 +1455,7 @@ async fn governance_error(
 }
 
 fn estimate_tokens_from_bytes(request_bytes: usize) -> i32 {
-    ((request_bytes + 3) / 4).min(i32::MAX as usize) as i32
+    request_bytes.div_ceil(4).min(i32::MAX as usize) as i32
 }
 
 async fn resolve_identity(
@@ -1466,13 +1466,13 @@ async fn resolve_identity(
     let Some(key) = client_key(headers) else {
         return Err(IdentityError::MissingKey);
     };
-    if config.allow_auth_passthrough {
-        if let Some(identity) = passthrough_identity(headers, &config.default_project) {
-            return Ok(IdentityContext {
-                identity,
-                upstream_auth: UpstreamAuthMode::Passthrough,
-            });
-        }
+    if config.allow_auth_passthrough
+        && let Some(identity) = passthrough_identity(headers, &config.default_project)
+    {
+        return Ok(IdentityContext {
+            identity,
+            upstream_auth: UpstreamAuthMode::Passthrough,
+        });
     }
 
     if let Some(identity) = config.gateway_keys.get(key) {
@@ -1944,29 +1944,29 @@ fn apply_provider_auth(
     upstream: reqwest::RequestBuilder,
     config: &GatewayConfig,
     provider: ProviderKind,
-) -> Result<reqwest::RequestBuilder, Response<Body>> {
+) -> Result<reqwest::RequestBuilder, Box<Response<Body>>> {
     match provider {
         ProviderKind::OpenAi(_) => config
             .openai_api_key
             .as_ref()
             .map(|key| upstream.bearer_auth(key))
             .ok_or_else(|| {
-                json_error(
+                Box::new(json_error(
                     StatusCode::BAD_GATEWAY,
                     "gateway_config_error",
                     "OPENAI_API_KEY is not configured",
-                )
+                ))
             }),
         ProviderKind::Anthropic => config
             .anthropic_api_key
             .as_ref()
             .map(|key| upstream.header(X_API_KEY, key))
             .ok_or_else(|| {
-                json_error(
+                Box::new(json_error(
                     StatusCode::BAD_GATEWAY,
                     "gateway_config_error",
                     "ANTHROPIC_API_KEY is not configured",
-                )
+                ))
             }),
     }
 }
@@ -2087,42 +2087,13 @@ async fn record_usage_and_append(
                     values: values.clone(),
                 }],
             };
-            match sekai.append_rows(gateway_request(append.clone())).await {
-                Ok(_) => {
-                    link_work_unit_usage(&mut sekai, identity, context, &values).await;
-                    record_gateway_pipeline_decision(
-                        config,
-                        identity,
-                        context,
-                        pipeline_observation,
-                    )
-                    .await;
-                }
-                Err(err) if err.code() == tonic::Code::NotFound => {
-                    if let Err(create_err) = ensure_llm_calls_dataset(&mut sekai).await {
-                        eprintln!("chisei-gateway llm_calls dataset create failed: {create_err}");
-                        return;
-                    }
-                    match sekai.append_rows(gateway_request(append)).await {
-                        Ok(_) => {
-                            link_work_unit_usage(&mut sekai, identity, context, &values).await;
-                            record_gateway_pipeline_decision(
-                                config,
-                                identity,
-                                context,
-                                pipeline_observation,
-                            )
-                            .await;
-                        }
-                        Err(append_err) => {
-                            eprintln!("chisei-gateway llm_calls append failed: {append_err}");
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("chisei-gateway llm_calls append failed: {err}");
-                }
+            let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
+            if let Err(append_err) = append_result {
+                eprintln!("chisei-gateway llm_calls append failed: {append_err}");
+                return;
             }
+            link_work_unit_usage(&mut sekai, identity, context, &values).await;
+            record_gateway_pipeline_decision(config, identity, context, pipeline_observation).await;
         }
         Err(err) => {
             eprintln!("chisei-gateway usage append skipped; Chisei unavailable: {err}");
@@ -2183,24 +2154,28 @@ async fn record_refusal_and_append(
                     values: values.clone(),
                 }],
             };
-            match sekai.append_rows(gateway_request(append.clone())).await {
-                Ok(_) => link_work_unit_usage(&mut sekai, identity, context, &values).await,
-                Err(err) if err.code() == tonic::Code::NotFound => {
-                    if let Err(create_err) = ensure_llm_calls_dataset(&mut sekai).await {
-                        eprintln!("chisei-gateway llm_calls dataset create failed: {create_err}");
-                        return;
-                    }
-                    match sekai.append_rows(gateway_request(append)).await {
-                        Ok(_) => link_work_unit_usage(&mut sekai, identity, context, &values).await,
-                        Err(append_err) => {
-                            eprintln!("chisei-gateway refusal append failed: {append_err}");
-                        }
-                    }
-                }
-                Err(err) => eprintln!("chisei-gateway refusal append failed: {err}"),
+            let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
+            if let Err(append_err) = append_result {
+                eprintln!("chisei-gateway refusal append failed: {append_err}");
+                return;
             }
+            link_work_unit_usage(&mut sekai, identity, context, &values).await;
         }
         Err(err) => eprintln!("chisei-gateway refusal append skipped; Chisei unavailable: {err}"),
+    }
+}
+
+async fn append_llm_calls_rows(
+    sekai: &mut SekaiServiceClient<GatewayClient>,
+    append: AppendRowsRequest,
+) -> Result<(), tonic::Status> {
+    match sekai.append_rows(gateway_request(append.clone())).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.code() == tonic::Code::NotFound => {
+            ensure_llm_calls_dataset(sekai).await?;
+            sekai.append_rows(gateway_request(append)).await.map(|_| ())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -2585,13 +2560,12 @@ async fn record_gateway_event(
         return;
     };
     let mut sekai = SekaiServiceClient::new(channel.clone());
-    if let Err(err) = ensure_llm_calls_dataset(&mut sekai).await {
-        if err.code() != tonic::Code::InvalidArgument
-            || !err.message().contains("UNIQUE constraint failed")
-        {
-            eprintln!("chisei-gateway audit target create failed: {err}");
-            return;
-        }
+    if let Err(err) = ensure_llm_calls_dataset(&mut sekai).await
+        && (err.code() != tonic::Code::InvalidArgument
+            || !err.message().contains("UNIQUE constraint failed"))
+    {
+        eprintln!("chisei-gateway audit target create failed: {err}");
+        return;
     }
     let mut chisei = ChiseiServiceClient::new(channel);
     if let Err(err) = chisei

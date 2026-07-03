@@ -79,10 +79,10 @@ async fn run_refresh(args: Vec<String>) -> Result<(), Box<dyn std::error::Error 
         url.trim_end_matches('/').trim_end_matches("/v1")
     );
     let mut request = reqwest::Client::new().post(endpoint);
-    if let Ok(token) = std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN") {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if let Ok(token) = std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token);
     }
     let response = request.send().await?;
     let status = response.status();
