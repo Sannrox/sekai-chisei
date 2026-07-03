@@ -9,7 +9,7 @@ use crate::gateway_keys::hash_gateway_key;
 
 const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = 5000;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct PrincipalCredentialStore {
     pub by_hash: RwLock<HashMap<String, String>>,
     pub last_reload_ms: AtomicI64,
