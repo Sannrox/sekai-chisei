@@ -69,6 +69,9 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         default_data_class: "unclassified".into(),
         safe_egress_providers: vec![],
         leak_review_model: None,
+        tls_cert: None,
+        tls_key: None,
+        allow_plaintext: false,
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
@@ -169,6 +172,9 @@ async fn delegation_chain_keeps_private_context_local() {
         default_data_class: "unclassified".into(),
         safe_egress_providers: vec![],
         leak_review_model: None,
+        tls_cert: None,
+        tls_key: None,
+        allow_plaintext: false,
     };
     let local_model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));

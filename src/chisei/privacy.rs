@@ -216,6 +216,9 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec!["native".into()],
             leak_review_model: None,
+            tls_cert: None,
+            tls_key: None,
+            allow_plaintext: false,
         };
         let safe = safe_providers(&config);
         assert!(provider_safe_to_send("ollama", &safe));
