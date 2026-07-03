@@ -92,6 +92,14 @@ Configuration is read from environment variables:
 
 See [.env.example](.env.example) for a local template.
 
+Sekai object RPC mutations and object-mutating built-in actions write audit rows
+in the same SQLite transaction as the object mutation. Updates emit one row per
+changed scalar or property field. Creates and deletes emit lifecycle summary rows
+using `_created` and `_deleted`; they do not snapshot every property value.
+High-churn deployments should schedule audit retention by calling
+`purge_old_records` with the desired cutoff; the server does not purge audit
+history automatically.
+
 ### Authentication and transport
 
 For TCP mode, control-plane identity is verified from bearer token metadata:
