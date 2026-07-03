@@ -1,11 +1,24 @@
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::domain::{Direction, Link, ListFilter, Object};
 
 pub struct SekaiDb {
     pub(crate) conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrincipalCredential {
+    pub id: String,
+    pub principal: String,
+    pub token_hash: String,
+    pub status: String,
+    pub created: i64,
+    pub rotated_at: i64,
+    pub revoked_at: i64,
 }
 
 impl SekaiDb {
@@ -21,6 +34,8 @@ impl SekaiDb {
             .ok();
             Connection::open(path).map_err(|e| e.to_string())?
         };
+        conn.busy_timeout(Duration::from_secs(1))
+            .map_err(|e| e.to_string())?;
         let db = Self {
             conn: Mutex::new(conn),
         };
@@ -55,6 +70,174 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn migrate_principal_credentials(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
+                id TEXT PRIMARY KEY,
+                principal TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                rotated_at INTEGER NOT NULL DEFAULT 0,
+                revoked_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_token_hash ON sekai_principal_credentials(token_hash);
+            CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);",
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn get_principal_credential(&self, token_hash: &str) -> Option<PrincipalCredential> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            params![token_hash],
+            row_to_principal_credential,
+        )
+        .optional()
+        .unwrap_or_default()
+    }
+
+    pub fn create_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                principal,
+                token_hash,
+                "active",
+                now,
+                now,
+                0_i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".to_string(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+        })
+    }
+
+    pub fn rotate_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        let mut active_stmt = conn
+            .prepare(
+                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let active_id = active_stmt
+            .query_row(params![principal], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(active) = &active_id {
+            conn.execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE id=?2",
+                params![now, active],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        conn.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                principal,
+                token_hash,
+                "active",
+                now,
+                now,
+                0_i64
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".to_string(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+        })
+    }
+
+    pub fn revoke_principal_credential(
+        &self,
+        principal: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let credential: Option<PrincipalCredential> = stmt
+            .query_row(params![principal], |row| Ok(row_to_principal_credential(row)))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(credential) = &credential {
+            conn.execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE id=?2",
+                params![now, credential.id],
+            )
+            .map_err(|e| e.to_string())?;
+            let revoked = PrincipalCredential {
+                status: "revoked".to_string(),
+                revoked_at: now,
+                ..credential.clone()
+            };
+            return Ok(Some(revoked));
+        }
+        Ok(None)
+    }
+
+    pub fn list_credentials(
+        &self,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE 1=1".to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(principal) = principal {
+            sql.push_str(&format!(" AND principal = ?{}", args.len() + 1));
+            args.push(Box::new(principal.to_string()));
+        }
+        if let Some(status) = status {
+            sql.push_str(&format!(" AND status = ?{}", args.len() + 1));
+            args.push(Box::new(status.to_string()));
+        }
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| Ok(row_to_principal_credential(row)))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
+        self.list_credentials(None, Some("active"))
     }
 
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
@@ -245,6 +428,18 @@ fn row_to_object(row: &rusqlite::Row) -> Object {
     }
 }
 
+fn row_to_principal_credential(row: &rusqlite::Row) -> PrincipalCredential {
+    PrincipalCredential {
+        id: row.get(0).unwrap_or_default(),
+        principal: row.get(1).unwrap_or_default(),
+        token_hash: row.get(2).unwrap_or_default(),
+        status: row.get(3).unwrap_or_default(),
+        created: row.get(4).unwrap_or_default(),
+        rotated_at: row.get(5).unwrap_or_default(),
+        revoked_at: row.get(6).unwrap_or_default(),
+    }
+}
+
 fn row_to_link(row: &rusqlite::Row) -> Link {
     Link {
         id: row.get(0).unwrap(),
@@ -362,5 +557,40 @@ mod tests {
             .get_links("r1", "contains", &Direction::Outgoing)
             .unwrap();
         assert_eq!(links.len(), 0);
+    }
+
+    #[test]
+    fn principal_credentials_round_trip() {
+        let db = test_db();
+        db.migrate_principal_credentials().unwrap();
+        let credential = db
+            .create_principal_credential("alice", "hash-alice", 1)
+            .unwrap();
+        let active = db.list_active_credentials().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].principal, "alice");
+        assert_eq!(active[0].status, "active");
+
+        let rotated = db
+            .rotate_principal_credential("alice", "hash-alice-2")
+            .unwrap();
+        assert_eq!(rotated.principal, "alice");
+
+        let all = db
+            .list_credentials(Some("alice"), None)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|c| c.status == "revoked"));
+
+        let revoked = db.revoke_principal_credential("alice").unwrap();
+        assert!(revoked.is_some());
+        let active = db.list_active_credentials().unwrap();
+        assert!(active.is_empty());
+        assert!(matches!(
+            db.list_credentials(Some("alice"), Some("revoked"))
+                .unwrap()
+                .len(),
+            2..=2
+        ));
     }
 }

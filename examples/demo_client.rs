@@ -17,8 +17,11 @@
 //! cargo run --example demo_client
 //! ```
 //!
-//! Honors the same env vars as the server: `GRPC_PORT` (default 50051) and
-//! `SEKAI_AUTH_TOKEN` (attaches `authorization: Bearer <token>` when set).
+//! Honors the same env vars as the server: `GRPC_PORT` (default 50051),
+//! `SEKAI_SOCKET` for UDS, and `SEKAI_AUTH_TOKEN` (attaches
+//! `authorization: Bearer <token>` when set).
+//!
+//! Use `SEKAI_PRINCIPAL` to set the caller identity (default: `demo-client`).
 
 use std::collections::HashMap;
 
@@ -96,24 +99,26 @@ fn warn(label: &str, err: &Status) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let principal = std::env::var("SEKAI_PRINCIPAL").unwrap_or_else(|_| "demo-client".into());
     let endpoint = std::env::var("SEKAI_SOCKET").unwrap_or_else(|_| {
         let port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
         format!("http://127.0.0.1:{port}")
     });
     let auth = DemoAuth {
         token: std::env::var("SEKAI_AUTH_TOKEN").ok(),
-        principal: "demo-client".to_string(),
+        principal,
     };
 
     println!("\x1b[1msekai-chisei demo client\x1b[0m");
     println!("  connecting to {endpoint}");
     println!(
-        "  auth: {}",
+        "  auth: {} / principal: {}",
         if auth.token.is_some() {
             "bearer token"
         } else {
             "insecure (no token)"
-        }
+        },
+        auth.principal
     );
 
     let channel = connect_sekai(&endpoint).await?;
