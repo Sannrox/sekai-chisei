@@ -386,6 +386,25 @@ impl SekaiDb {
         Ok(())
     }
 
+    pub fn get_link(&self, id: &str) -> Result<Option<Link>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Link {
+                    id: row.get(0)?,
+                    from_id: row.get(1)?,
+                    to_id: row.get(2)?,
+                    relation: row.get(3)?,
+                    created: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
     pub fn get_links(
         &self,
         object_id: &str,
