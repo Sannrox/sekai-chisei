@@ -52,6 +52,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
     let addr = free_local_addr();
     let config = Config {
         grpc_port: addr.port(),
+        sekai_socket: None,
         db_path: ":memory:".into(),
         anthropic_api_key: None,
         openai_api_key: None,
@@ -83,6 +84,10 @@ async fn grpc_chat_round_trip_with_local_ollama() {
             namespace: "default".into(),
             preferred_runtime: String::new(),
             preferred_model: model.clone(),
+            subject: String::new(),
+            project: "default".into(),
+            agent: "ollama-e2e".into(),
+            key_id: String::new(),
         })
         .await
         .expect("resolve policy")
