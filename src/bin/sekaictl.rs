@@ -1,10 +1,10 @@
 use sekai_chisei::credential_cli::{
-    create_credential, list_credentials, parse_credential_command, revoke_credential,
-    rotate_credential, CredentialCommand, usage as credential_usage,
+    CredentialCommand, create_credential, list_credentials, parse_credential_command,
+    revoke_credential, rotate_credential, usage as credential_usage,
 };
-use sekai_chisei::gateway_report::{report_usage, run_report, GatewayReportConfig};
+use sekai_chisei::gateway_report::{GatewayReportConfig, report_usage, run_report};
 use sekai_chisei::gateway_setup::{
-    key_usage, run_gateway_key_command, run_setup, usage as setup_usage, GatewaySetupConfig,
+    GatewaySetupConfig, key_usage, run_gateway_key_command, run_setup, usage as setup_usage,
 };
 
 #[tokio::main]
@@ -30,11 +30,11 @@ async fn run_credential_command(
     args: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.is_empty() {
-        println!("{credential_usage}");
+        println!("{}", credential_usage());
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{credential_usage}");
+        println!("{}", credential_usage());
         return Ok(());
     }
 
@@ -57,7 +57,10 @@ async fn run_credential_command(
             for credential in credentials {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    credential.principal, credential.status, credential.created, credential.rotated_at
+                    credential.principal,
+                    credential.status,
+                    credential.created,
+                    credential.rotated_at
                 );
             }
         }
@@ -85,8 +88,11 @@ async fn run_gateway_command(
             run_setup(config).await
         }
         "key" => {
-            if args.get(1).is_some_and(|arg| arg == "--help" || arg == "-h") {
-                println!("{key_usage}");
+            if args
+                .get(1)
+                .is_some_and(|arg| arg == "--help" || arg == "-h")
+            {
+                println!("{}", key_usage());
                 return Ok(());
             }
             run_gateway_key_command(args.into_iter().skip(1)).await

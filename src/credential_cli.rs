@@ -97,12 +97,22 @@ pub fn create_credential(principal: &str) -> Result<String, String> {
         .list_credentials(Some(principal), Some("active"))?
         .is_empty()
     {
-        return Err(format!("active credential already exists for {principal:?}; run rotate instead"));
+        return Err(format!(
+            "active credential already exists for {principal:?}; run rotate instead"
+        ));
     }
 
-    let token = format!("sekai_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    db.create_principal_credential(principal, &hash_gateway_key(&token), Utc::now().timestamp_millis())
-        .map_err(|err| format!("create credential: {err}"))?;
+    let token = format!(
+        "sekai_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    db.create_principal_credential(
+        principal,
+        &hash_gateway_key(&token),
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(|err| format!("create credential: {err}"))?;
     Ok(token)
 }
 
@@ -119,7 +129,11 @@ pub fn rotate_credential(principal: &str) -> Result<String, String> {
         return Err(format!("no active credential for {principal:?}"));
     }
 
-    let token = format!("sekai_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token = format!(
+        "sekai_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
     db.rotate_principal_credential(principal, &hash_gateway_key(&token))
         .map_err(|err| format!("rotate credential: {err}"))?;
     Ok(token)
@@ -149,7 +163,8 @@ mod tests {
 
     #[test]
     fn parse_create() {
-        let command = parse_credential_command(["create".to_string(), "agent-a".to_string()]).unwrap();
+        let command =
+            parse_credential_command(["create".to_string(), "agent-a".to_string()]).unwrap();
         assert_eq!(
             command,
             CredentialCommand::Create {

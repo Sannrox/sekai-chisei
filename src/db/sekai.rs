@@ -1,8 +1,8 @@
 use rusqlite::{Connection, OptionalExtension, params};
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::domain::{Direction, Link, ListFilter, Object};
 
@@ -229,7 +229,8 @@ impl SekaiDb {
             args.push(Box::new(status.to_string()));
         }
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            args.iter().map(|arg| arg.as_ref()).collect();
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_principal_credential)
             .map_err(|e| e.to_string())?;
@@ -428,7 +429,9 @@ fn row_to_object(row: &rusqlite::Row) -> Object {
     }
 }
 
-fn row_to_principal_credential(row: &rusqlite::Row) -> Result<PrincipalCredential, rusqlite::Error> {
+fn row_to_principal_credential(
+    row: &rusqlite::Row,
+) -> Result<PrincipalCredential, rusqlite::Error> {
     Ok(PrincipalCredential {
         id: row.get(0)?,
         principal: row.get(1)?,
@@ -576,9 +579,7 @@ mod tests {
             .unwrap();
         assert_eq!(rotated.principal, "alice");
 
-        let all = db
-            .list_credentials(Some("alice"), None)
-            .unwrap();
+        let all = db.list_credentials(Some("alice"), None).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|c| c.status == "revoked"));
 
