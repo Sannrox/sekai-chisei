@@ -1,3 +1,4 @@
+use regex::Regex;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -14,9 +15,10 @@ use crate::chisei::budget::BudgetTracker;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
+use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
-use crate::domain;
+use crate::domain::{ListFilter, Object};
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -33,55 +35,6 @@ pub struct ChiseiServiceImpl {
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
-
-fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
-    let Ok(objects) = db.list_objects(&domain::ListFilter {
-        kind: Some(POLICY_KIND.to_string()),
-        ..Default::default()
-    }) else {
-        return;
-    };
-    for object in objects {
-        let Some(namespace) = object.properties.get("namespace") else {
-            continue;
-        };
-        let policy = policy_from_properties(&object.properties);
-        resolver.set_namespace_policy(namespace, policy);
-    }
-}
-
-fn policy_from_request(req: &SetNamespacePolicyRequest) -> Policy {
-    Policy {
-        allowed_runtimes: req.allowed_runtimes.clone(),
-        allowed_models: req.allowed_models.clone(),
-        default_runtime: req.default_runtime.clone(),
-        default_model: req.default_model.clone(),
-    }
-}
-
-fn policy_from_properties(properties: &HashMap<String, String>) -> Policy {
-    Policy {
-        allowed_runtimes: split_csv_property(properties.get("allowed_runtimes")),
-        allowed_models: split_csv_property(properties.get("allowed_models")),
-        default_runtime: properties
-            .get("default_runtime")
-            .cloned()
-            .unwrap_or_default(),
-        default_model: properties.get("default_model").cloned().unwrap_or_default(),
-    }
-}
-
-fn split_csv_property(value: Option<&String>) -> Vec<String> {
-    value
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 struct FinishStreamedExecution<'a> {
     db: &'a SekaiDb,
@@ -201,23 +154,8 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
 fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
     let external_id = format!("policy:{namespace}");
-    let mut properties = HashMap::from([
-        ("namespace".to_string(), namespace.to_string()),
-        (
-            "allowed_runtimes".to_string(),
-            policy.allowed_runtimes.join(","),
-        ),
-        (
-            "allowed_models".to_string(),
-            policy.allowed_models.join(","),
-        ),
-        (
-            "default_runtime".to_string(),
-            policy.default_runtime.clone(),
-        ),
-        ("default_model".to_string(), policy.default_model.clone()),
-    ]);
-    properties.retain(|_, value| !value.is_empty());
+    let mut properties = policy_properties(policy);
+    properties.insert("namespace".to_string(), namespace.to_string());
 
     if let Some(mut existing) = db.find_by_external_id(&external_id)? {
         existing.name = namespace.to_string();
@@ -226,7 +164,7 @@ fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> R
         existing.updated = now;
         db.update_object(&existing)
     } else {
-        db.create_object(&domain::Object {
+        db.create_object(&Object {
             id: format!("policy-{namespace}"),
             kind: POLICY_KIND.to_string(),
             name: namespace.to_string(),
@@ -265,6 +203,8 @@ impl ChiseiServiceImpl {
         let evolve_enhancements = Arc::new(Mutex::new(
             db.list_evolve_enhancements().unwrap_or_default(),
         ));
+        let policy = Arc::new(PolicyResolver::new());
+        load_namespace_policies(&db, &policy);
         Self {
             budget: Arc::new(BudgetTracker::new()),
             policy,
@@ -314,6 +254,8 @@ impl ChiseiServiceImpl {
         let evolve_enhancements = Arc::new(Mutex::new(
             db.list_evolve_enhancements().unwrap_or_default(),
         ));
+        let policy = Arc::new(PolicyResolver::new());
+        load_namespace_policies(&db, &policy);
         Self {
             budget,
             policy,
@@ -335,6 +277,13 @@ impl ChiseiServiceImpl {
         };
         let budget_pressure = self.budget.namespace_pressure(&input.namespace);
         let namespace_hint = input.namespace.trim().to_string();
+        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let data_class = self.data_class(effective_policy.as_ref());
+        let task_class = TaskClass::parse(&input.task_class);
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
+        let template_only =
+            data_class == DataClass::Sensitive && task_class == TaskClass::TemplateOnly;
         let mut pipeline_req = pipe::PipelineRequest {
             request_id: input.request_id.clone(),
             namespace: input.namespace.clone(),
@@ -347,11 +296,11 @@ impl ChiseiServiceImpl {
             budget_pressure: budget_pressure.clone(),
             review_model: String::new(),
             egress_records: vec![],
-            external_egress: true,
+            external_egress: !safe_only,
+            template_only,
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let initial_run = self.pipeline.run(&mut pipeline_req, &self.db);
-        let effective_policy = self.policy.effective_policy(&input.namespace);
         let fallback_runtime = pipeline_req.runtime.clone();
         let (initial_runtime, initial_model) = self
             .resolve_model_for_run(
@@ -359,13 +308,15 @@ impl ChiseiServiceImpl {
                 &fallback_runtime,
                 &initial_run,
                 effective_policy.as_ref(),
+                safe_only,
+                &safe_providers,
             )
             .await?;
         let initial_provider = crate::llm::provider_name(&initial_model).to_string();
         let initial_provider_is_external =
             crate::chisei::egress::is_external_provider(&initial_provider);
         let (run, resolved_runtime, resolved_model, provider, provider_is_external) =
-            if initial_provider_is_external {
+            if initial_provider_is_external || safe_only || template_only {
                 (
                     initial_run,
                     initial_runtime,
@@ -387,6 +338,7 @@ impl ChiseiServiceImpl {
                     review_model: String::new(),
                     egress_records: vec![],
                     external_egress: false,
+                    template_only,
                 };
                 let local_run = self.pipeline.run(&mut local_pipeline_req, &self.db);
                 let (local_runtime, local_model) = self
@@ -395,6 +347,8 @@ impl ChiseiServiceImpl {
                         &local_pipeline_req.runtime,
                         &local_run,
                         effective_policy.as_ref(),
+                        safe_only,
+                        &safe_providers,
                     )
                     .await?;
                 let local_provider = crate::llm::provider_name(&local_model).to_string();
@@ -470,9 +424,15 @@ impl ChiseiServiceImpl {
             let model = if p.model.is_empty() {
                 resolved_model.clone()
             } else {
-                self.resolve_live_model(&p.model, effective_policy.as_ref(), final_route_bias)
-                    .await
-                    .unwrap_or_else(|_| resolved_model.clone())
+                self.resolve_live_model(
+                    &p.model,
+                    effective_policy.as_ref(),
+                    final_route_bias,
+                    safe_only,
+                    &safe_providers,
+                )
+                .await
+                .unwrap_or_else(|_| resolved_model.clone())
             };
             Some(ReviewPolicy {
                 confidence_threshold: p.confidence_threshold,
@@ -502,7 +462,7 @@ impl ChiseiServiceImpl {
             .filter(|signal| signal.regressed)
             .map(|signal| signal.reason.clone())
             .unwrap_or_default();
-        let executable = allowed && !eval_regressed;
+        let mut executable = allowed && !eval_regressed;
         let low_success_namespace = affinity.low_success;
         // Sampling: the pipeline decides from request metadata; the eval-driven
         // adaptive trigger (oversample regressed namespaces) is applied here since the
@@ -537,6 +497,71 @@ impl ChiseiServiceImpl {
                 target_id: input.request_id.clone(),
                 outcome: "sampled".into(),
             });
+        }
+        if safe_only {
+            let provider_safe =
+                crate::chisei::privacy::provider_safe_to_send(&provider, &safe_providers);
+            if !provider_safe {
+                self.record_privacy_audit(
+                    "blocked",
+                    &input.request_id,
+                    &provider,
+                    data_class,
+                    task_class,
+                    "unsafe_provider",
+                );
+                return Err(Status::failed_precondition(
+                    crate::chisei::privacy::gate_reason(data_class, task_class, &provider),
+                ));
+            }
+            self.record_privacy_audit(
+                "forced_local",
+                &input.request_id,
+                &provider,
+                data_class,
+                task_class,
+                "safe_provider_required",
+            );
+        } else if template_only && provider_is_external {
+            self.record_privacy_audit(
+                "allowed_template_only",
+                &input.request_id,
+                &provider,
+                data_class,
+                task_class,
+                "template_only_sanitization_contract",
+            );
+        }
+        let mut egress_decisions = egress_decisions;
+        let leak_findings = self.leak_findings_for_payload(
+            &input.namespace,
+            &provider,
+            data_class,
+            &payload_for_leak_check(&input.system, &prepared_messages, &input.tools),
+        );
+        if !leak_findings.is_empty() {
+            egress_decisions.extend(leak_findings_to_decisions(
+                &provider,
+                provider_is_external,
+                &leak_findings,
+            ));
+            self.record_leak_audit("leak_check", &input.request_id, &provider, &leak_findings);
+            if leak_findings
+                .iter()
+                .any(|finding| finding.action == LeakAction::Block)
+            {
+                executable = false;
+                warnings.push("privacy leak checker blocked outbound payload".into());
+            }
+        }
+        if data_class == DataClass::Sensitive
+            && task_class == TaskClass::TemplateOnly
+            && !crate::chisei::privacy::provider_safe_to_send(&provider, &safe_providers)
+            && let Some(warning) = self
+                .run_leak_reviewer(&input.request_id, &provider, &input.spec)
+                .await
+        {
+            warnings.push(warning);
         }
         self.record_egress_audit(
             "prepare_context",
@@ -591,6 +616,7 @@ impl ChiseiServiceImpl {
             sample_rate: sampling.effective_rate,
             sample_reason: sampling.reason,
             egress_decisions,
+            task_class: task_class.as_str().into(),
         })
     }
 
@@ -611,6 +637,8 @@ impl ChiseiServiceImpl {
         fallback_runtime: &str,
         run: &pipe::RunResult,
         policy: Option<&crate::chisei::policy::Policy>,
+        safe_only: bool,
+        safe_providers: &std::collections::HashSet<String>,
     ) -> Result<(String, String), Status> {
         let recommended_model = run
             .recommended_model()
@@ -635,10 +663,86 @@ impl ChiseiServiceImpl {
             .resolve(&input.namespace, preferred_runtime, &preferred_model)
             .map_err(Status::invalid_argument)?;
         let model = self
-            .resolve_live_model(&model, policy, route_bias)
+            .resolve_live_model(&model, policy, route_bias, safe_only, safe_providers)
             .await
             .map_err(Status::failed_precondition)?;
         Ok((runtime, model))
+    }
+
+    fn data_class(&self, policy: Option<&crate::chisei::policy::Policy>) -> DataClass {
+        policy
+            .map(|policy| DataClass::parse(&policy.data_class))
+            .filter(|class| *class != DataClass::Unclassified)
+            .unwrap_or_else(|| DataClass::parse(&self.config.default_data_class))
+    }
+
+    fn leak_findings_for_payload(
+        &self,
+        namespace: &str,
+        provider: &str,
+        data_class: DataClass,
+        payload: &str,
+    ) -> Vec<LeakFinding> {
+        let safe = crate::chisei::privacy::safe_providers(&self.config);
+        if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
+            return vec![];
+        }
+        let rules = self.leak_rules(namespace);
+        let entities = if data_class == DataClass::Sensitive {
+            self.sensitive_entities(namespace)
+        } else {
+            vec![]
+        };
+        crate::chisei::privacy::check_payload(payload, &rules, &entities)
+    }
+
+    fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
+        let mut rules = Vec::new();
+        for ns in ["", namespace] {
+            let Ok(objects) = self.db.list_objects(&ListFilter {
+                kind: Some("leak_rule".into()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            }) else {
+                continue;
+            };
+            for obj in objects {
+                let Some(pattern) = obj.properties.get("pattern") else {
+                    continue;
+                };
+                let Ok(pattern) = Regex::new(pattern) else {
+                    continue;
+                };
+                rules.push(LeakRule {
+                    id: obj.id,
+                    label: obj
+                        .properties
+                        .get("label")
+                        .cloned()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(obj.name),
+                    pattern,
+                    action: LeakAction::parse(
+                        obj.properties
+                            .get("action")
+                            .map(String::as_str)
+                            .unwrap_or("block"),
+                    ),
+                });
+            }
+        }
+        rules
+    }
+
+    fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
+        let objects = self
+            .db
+            .list_objects(&ListFilter {
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        crate::chisei::privacy::entity_scan_literals(&objects)
     }
 
     fn record_egress_audit(
@@ -673,11 +777,183 @@ impl ChiseiServiceImpl {
         });
     }
 
+    fn record_privacy_audit(
+        &self,
+        outcome: &str,
+        request_id: &str,
+        provider: &str,
+        data_class: DataClass,
+        task_class: TaskClass,
+        reason: &str,
+    ) {
+        let mut evidence = std::collections::HashMap::new();
+        evidence.insert("provider".to_string(), provider.to_string());
+        evidence.insert("data_class".to_string(), data_class.as_str().to_string());
+        evidence.insert("task_class".to_string(), task_class.as_str().to_string());
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.privacy".into(),
+            action: "gate".into(),
+            reason: reason.into(),
+            evidence,
+            target_id: request_id.into(),
+            outcome: outcome.into(),
+        });
+    }
+
+    fn record_leak_audit(
+        &self,
+        action: &str,
+        request_id: &str,
+        provider: &str,
+        findings: &[LeakFinding],
+    ) {
+        let mut evidence = std::collections::HashMap::new();
+        evidence.insert("provider".to_string(), provider.to_string());
+        evidence.insert("finding_count".to_string(), findings.len().to_string());
+        evidence.insert(
+            "block_count".to_string(),
+            findings
+                .iter()
+                .filter(|finding| finding.action == LeakAction::Block)
+                .count()
+                .to_string(),
+        );
+        evidence.insert(
+            "labels".to_string(),
+            findings
+                .iter()
+                .map(|finding| format!("{}:{}", finding.rule_label, finding.match_count))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.privacy".into(),
+            action: action.into(),
+            reason: "leak checker evaluated outbound payload".into(),
+            evidence,
+            target_id: request_id.into(),
+            outcome: if findings
+                .iter()
+                .any(|finding| finding.action == LeakAction::Block)
+            {
+                "leak_blocked".into()
+            } else {
+                "leak_warned".into()
+            },
+        });
+    }
+
+    async fn run_leak_reviewer(
+        &self,
+        request_id: &str,
+        provider: &str,
+        abstract_task: &str,
+    ) -> Option<String> {
+        let model = self.config.leak_review_model.as_ref()?;
+        let safe = crate::chisei::privacy::safe_providers(&self.config);
+        let reviewer_provider = crate::llm::provider_name(model);
+        if !crate::chisei::privacy::provider_safe_to_send(reviewer_provider, &safe) {
+            self.record_leak_reviewer_audit(
+                request_id,
+                provider,
+                model,
+                "reviewer_error",
+                "reviewer model is not safe to send sensitive-review prompts",
+            );
+            return Some("local leak reviewer was skipped because its model is not safe".into());
+        }
+        let Ok(reviewer) = crate::llm::resolve(
+            model,
+            self.config.anthropic_api_key.as_deref(),
+            self.config.openai_api_key.as_deref(),
+            &self.config.ollama_url,
+            self.config.native_llm_url.as_deref(),
+        ) else {
+            self.record_leak_reviewer_audit(
+                request_id,
+                provider,
+                model,
+                "reviewer_error",
+                "reviewer provider is not configured",
+            );
+            return Some("local leak reviewer could not run".into());
+        };
+        let req = crate::llm::ChatRequest {
+            model: model.clone(),
+            system: "You are a local privacy reviewer. Answer only SAFE or RISK with one short reason. Does this abstract request reveal sector, position, timing, or proprietary intent?".into(),
+            messages: vec![crate::llm::Message {
+                role: "user".into(),
+                content: abstract_task.to_string(),
+                tool_call_id: String::new(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            max_tokens: 64,
+        };
+        match reviewer.chat(&req).await {
+            Ok(resp) => {
+                let lower = resp.content.to_ascii_lowercase();
+                let risky = lower.contains("risk") || lower.contains("unsafe");
+                self.record_leak_reviewer_audit(
+                    request_id,
+                    provider,
+                    model,
+                    if risky { "warn" } else { "pass" },
+                    if risky {
+                        "reviewer flagged template-inversion risk"
+                    } else {
+                        "reviewer did not flag template-inversion risk"
+                    },
+                );
+                risky.then(|| "local leak reviewer flagged template-inversion risk".into())
+            }
+            Err(_) => {
+                self.record_leak_reviewer_audit(
+                    request_id,
+                    provider,
+                    model,
+                    "reviewer_error",
+                    "reviewer call failed",
+                );
+                Some("local leak reviewer could not run".into())
+            }
+        }
+    }
+
+    fn record_leak_reviewer_audit(
+        &self,
+        request_id: &str,
+        provider: &str,
+        reviewer_model: &str,
+        outcome: &str,
+        reason: &str,
+    ) {
+        let mut evidence = std::collections::HashMap::new();
+        evidence.insert("provider".to_string(), provider.to_string());
+        evidence.insert("reviewer_model".to_string(), reviewer_model.to_string());
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.privacy".into(),
+            action: "leak_review".into(),
+            reason: reason.into(),
+            evidence,
+            target_id: request_id.into(),
+            outcome: outcome.into(),
+        });
+    }
+
     async fn resolve_live_model(
         &self,
         model: &str,
         policy: Option<&crate::chisei::policy::Policy>,
         route_bias: Option<&str>,
+        safe_only: bool,
+        safe_providers: &std::collections::HashSet<String>,
     ) -> Result<String, String> {
         let empty_allowed = Vec::new();
         let allowed_models = policy
@@ -689,6 +965,8 @@ impl ChiseiServiceImpl {
             route_bias,
             config: &self.config,
             ollama_models: &[],
+            safe_only,
+            safe_providers,
         };
         let needs_ollama_first = !model.contains('/')
             && model != "native-default"
@@ -879,6 +1157,82 @@ fn prune_excess_plans(plans: &mut HashMap<String, ExecutionPlan>, protected_plan
     }
 }
 
+fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
+    for kind in ["policy", "namespace_policy"] {
+        let Ok(objects) = db.list_objects(&ListFilter {
+            kind: Some(kind.into()),
+            ..Default::default()
+        }) else {
+            continue;
+        };
+        for obj in objects {
+            let namespace = policy_namespace(&obj);
+            if namespace.is_empty() {
+                continue;
+            }
+            resolver.set_namespace_policy(&namespace, policy_from_properties(&obj.properties));
+        }
+    }
+}
+
+fn policy_namespace(obj: &crate::domain::Object) -> String {
+    if !obj.namespace.trim().is_empty() {
+        return obj.namespace.trim().to_string();
+    }
+    for prefix in ["namespace_policy:", "policy:", "namespace:"] {
+        if let Some(value) = obj.external_id.strip_prefix(prefix)
+            && !value.trim().is_empty()
+        {
+            return value.trim().to_string();
+        }
+    }
+    obj.name.trim().to_string()
+}
+
+fn policy_from_properties(properties: &std::collections::HashMap<String, String>) -> Policy {
+    Policy {
+        allowed_runtimes: csv_property(properties.get("allowed_runtimes")),
+        allowed_models: csv_property(properties.get("allowed_models")),
+        default_runtime: properties
+            .get("default_runtime")
+            .cloned()
+            .unwrap_or_default(),
+        default_model: properties.get("default_model").cloned().unwrap_or_default(),
+        data_class: properties.get("data_class").cloned().unwrap_or_default(),
+    }
+}
+
+fn policy_properties(policy: &Policy) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("allowed_runtimes".into(), policy.allowed_runtimes.join(",")),
+        ("allowed_models".into(), policy.allowed_models.join(",")),
+        ("default_runtime".into(), policy.default_runtime.clone()),
+        ("default_model".into(), policy.default_model.clone()),
+        ("data_class".into(), policy.data_class.clone()),
+    ])
+}
+
+fn policy_from_request(r: &SetNamespacePolicyRequest) -> Policy {
+    Policy {
+        allowed_runtimes: r.allowed_runtimes.clone(),
+        allowed_models: r.allowed_models.clone(),
+        default_runtime: r.default_runtime.clone(),
+        default_model: r.default_model.clone(),
+        data_class: DataClass::parse(&r.data_class).as_str().into(),
+    }
+}
+
+fn csv_property(value: Option<&String>) -> Vec<String> {
+    value
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn build_egress_decisions(
     records: &[crate::chisei::egress::ContextEgressRecord],
     provider: &str,
@@ -921,6 +1275,46 @@ fn build_egress_decisions(
                     .collect(),
                 reasons: record.reasons.clone(),
             }
+        })
+        .collect()
+}
+
+fn payload_for_leak_check(system: &str, messages: &[ChatMessage], tools: &[ToolDef]) -> String {
+    let mut payload = String::new();
+    payload.push_str(system);
+    for message in messages {
+        payload.push('\n');
+        payload.push_str(&message.role);
+        payload.push_str(": ");
+        payload.push_str(&message.content);
+    }
+    for tool in tools {
+        payload.push('\n');
+        payload.push_str(&tool.name);
+        payload.push_str(": ");
+        payload.push_str(&tool.description);
+        payload.push('\n');
+        payload.push_str(&tool.input_schema_json);
+    }
+    payload
+}
+
+fn leak_findings_to_decisions(
+    provider: &str,
+    external: bool,
+    findings: &[LeakFinding],
+) -> Vec<EgressDecision> {
+    findings
+        .iter()
+        .map(|finding| EgressDecision {
+            provider: provider.into(),
+            external,
+            included: vec![],
+            redacted: vec![],
+            reasons: vec![format!(
+                "leak_checker {} {} match(es)",
+                finding.rule_label, finding.match_count
+            )],
         })
         .collect()
 }
@@ -1035,6 +1429,7 @@ impl ChiseiService for ChiseiServiceImpl {
             return Err(Status::invalid_argument("namespace required"));
         }
         let policy = policy_from_request(&r);
+        let policy_data_class = policy.data_class.clone();
         persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
         self.policy.set_namespace_policy(&r.namespace, policy);
         let (runtime, model) = self
@@ -1045,6 +1440,7 @@ impl ChiseiService for ChiseiServiceImpl {
             resolution: Some(PolicyResolution {
                 runtime,
                 model,
+                data_class: policy_data_class,
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
             }),
@@ -1088,10 +1484,38 @@ impl ChiseiService for ChiseiServiceImpl {
                 .resolve(&policy_scope, &r.preferred_runtime, preferred_model)
                 .map_err(Status::invalid_argument)?
         };
+
+        let data_class = self.data_class(effective_policy.as_ref());
+        let task_class = TaskClass::parse(&r.task_class);
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
         let model = self
-            .resolve_live_model(&model, effective_policy.as_ref(), None)
+            .resolve_live_model(
+                &model,
+                effective_policy.as_ref(),
+                None,
+                safe_only,
+                &safe_providers,
+            )
             .await
-            .map_err(Status::failed_precondition)?;
+            .map_err(|err| {
+                if safe_only {
+                    Status::permission_denied(format!(
+                        "{}: {err}",
+                        crate::chisei::privacy::gate_reason(data_class, task_class, "unsafe")
+                    ))
+                } else {
+                    Status::failed_precondition(err)
+                }
+            })?;
+
+        let provider = crate::llm::provider_name(&model);
+        if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
+            return Err(Status::permission_denied(
+                crate::chisei::privacy::gate_reason(data_class, task_class, provider),
+            ));
+        }
+
         Ok(Response::new(ResolvePolicyResponse {
             resolution: Some(PolicyResolution {
                 runtime,
@@ -1100,7 +1524,48 @@ impl ChiseiService for ChiseiServiceImpl {
                 eval_regression_reason: regression_signal
                     .map(|signal| signal.reason)
                     .unwrap_or_default(),
+                data_class: data_class.as_str().into(),
             }),
+        }))
+    }
+
+    async fn check_egress(
+        &self,
+        req: Request<CheckEgressRequest>,
+    ) -> Result<Response<CheckEgressResponse>, Status> {
+        let r = req.into_inner();
+        let data_class = self.data_class(self.policy.effective_policy(&r.namespace).as_ref());
+        let provider_is_external = crate::chisei::egress::is_external_provider(&r.provider);
+        let task_class = TaskClass::parse(&r.task_class);
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let mut findings = Vec::new();
+        if !crate::chisei::privacy::external_allowed(data_class, task_class)
+            && !crate::chisei::privacy::provider_safe_to_send(&r.provider, &safe_providers)
+        {
+            findings.push(EgressDecision {
+                provider: r.provider.clone(),
+                external: provider_is_external,
+                included: vec![],
+                redacted: vec![],
+                reasons: vec![crate::chisei::privacy::gate_reason(
+                    data_class,
+                    task_class,
+                    &r.provider,
+                )],
+            });
+            return Ok(Response::new(CheckEgressResponse {
+                allowed: false,
+                findings,
+            }));
+        }
+        let findings =
+            self.leak_findings_for_payload(&r.namespace, &r.provider, data_class, &r.payload);
+        let allowed = !findings
+            .iter()
+            .any(|finding| finding.action == LeakAction::Block);
+        Ok(Response::new(CheckEgressResponse {
+            allowed,
+            findings: leak_findings_to_decisions(&r.provider, provider_is_external, &findings),
         }))
     }
 
@@ -1125,6 +1590,7 @@ impl ChiseiService for ChiseiServiceImpl {
             review_model: String::new(),
             egress_records: vec![],
             external_egress: true,
+            template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
         };
         let result = self.pipeline.run(&mut pr, &self.db);
         let steps = result
@@ -1303,6 +1769,24 @@ impl ChiseiService for ChiseiServiceImpl {
             .ok_or(Status::invalid_argument("plan input required"))?;
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
+        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let data_class = self.data_class(effective_policy.as_ref());
+        let task_class = TaskClass::parse(&plan.task_class);
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
+        if safe_only && !crate::chisei::privacy::provider_safe_to_send(&provider, &safe_providers) {
+            self.record_privacy_audit(
+                "blocked",
+                &input.request_id,
+                &provider,
+                data_class,
+                task_class,
+                "cached_plan_unsafe_provider",
+            );
+            return Err(Status::failed_precondition(
+                crate::chisei::privacy::gate_reason(data_class, task_class, &provider),
+            ));
+        }
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
@@ -1322,6 +1806,24 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             input.user_id.clone()
         };
+        let payload =
+            payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
+        let leak_findings =
+            self.leak_findings_for_payload(&input.namespace, &provider, data_class, &payload);
+        if leak_findings
+            .iter()
+            .any(|finding| finding.action == LeakAction::Block)
+        {
+            self.record_leak_audit(
+                "execute_leak_check",
+                &input.request_id,
+                &provider,
+                &leak_findings,
+            );
+            return Err(Status::failed_precondition(
+                "privacy leak checker blocked outbound payload",
+            ));
+        }
         self.record_egress_audit(
             "execute_context",
             &input.request_id,
@@ -2205,6 +2707,9 @@ mod tests {
             scoring_interval_secs: 60,
             scoring_model: "claude-opus-4-8".into(),
             scoring_batch_size: 16,
+            default_data_class: "unclassified".into(),
+            safe_egress_providers: vec![],
+            leak_review_model: None,
         }
     }
 
@@ -2231,6 +2736,8 @@ mod tests {
             project: String::new(),
             agent: String::new(),
             key_id: String::new(),
+            task_class: String::new(),
+            user_id: String::new(),
         }
     }
 
@@ -2376,6 +2883,7 @@ mod tests {
             allowed_models: vec!["native-default".into()],
             default_runtime: "openai".into(),
             default_model: "native-default".into(),
+            data_class: String::new(),
         }))
         .await
         .unwrap();
@@ -2405,6 +2913,7 @@ mod tests {
             allowed_models: vec!["native-mini".into()],
             default_runtime: "native".into(),
             default_model: "native-mini".into(),
+            data_class: String::new(),
         }))
         .await
         .unwrap();
@@ -2414,6 +2923,7 @@ mod tests {
             allowed_models: vec!["native-default".into()],
             default_runtime: "native".into(),
             default_model: "native-default".into(),
+            data_class: String::new(),
         }))
         .await
         .unwrap();
@@ -2442,6 +2952,7 @@ mod tests {
             allowed_models: vec!["native-default".into(), "native-cheap".into()],
             default_runtime: "native".into(),
             default_model: "native-default".into(),
+            data_class: String::new(),
         }))
         .await
         .unwrap();
@@ -2492,6 +3003,7 @@ mod tests {
             allowed_models: vec!["native-default".into()],
             default_runtime: "openai".into(),
             default_model: "native-default".into(),
+            data_class: String::new(),
         }))
         .await
         .unwrap();
@@ -2615,6 +3127,7 @@ mod tests {
                     tools: vec![],
                     system: String::new(),
                     max_tokens: 512,
+                    task_class: String::new(),
                 }),
             }))
             .await
@@ -2670,6 +3183,7 @@ mod tests {
                     tools: vec![],
                     system: String::new(),
                     max_tokens: 512,
+                    task_class: String::new(),
                 }),
             }))
             .await
@@ -2729,6 +3243,7 @@ mod tests {
                     tools: vec![],
                     system: String::new(),
                     max_tokens: 512,
+                    task_class: String::new(),
                 }),
             }))
             .await
@@ -2798,6 +3313,7 @@ mod tests {
                     tools: vec![],
                     system: String::new(),
                     max_tokens: 512,
+                    task_class: String::new(),
                 }),
             }))
             .await
@@ -2834,6 +3350,404 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn namespace_policy_reloads_data_class_from_sekai_object_store() {
+        let path = format!(
+            "{}/sekai-chisei-policy-{}.db",
+            std::env::temp_dir().display(),
+            uuid::Uuid::new_v4()
+        );
+        {
+            let db = SekaiDb::new(&path).unwrap();
+            db.create_object(&Object {
+                id: "policy-alpha".into(),
+                kind: "policy".into(),
+                name: "alpha".into(),
+                namespace: String::new(),
+                external_id: "policy:alpha".into(),
+                properties: std::collections::HashMap::from([
+                    (
+                        "allowed_models".into(),
+                        "native-default,ollama/capable".into(),
+                    ),
+                    ("default_runtime".into(), "kiro".into()),
+                    ("default_model".into(), "native-default".into()),
+                    ("data_class".into(), "sensitive".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        }
+
+        let svc = file_service(&path);
+        let policy = svc
+            .policy
+            .effective_policy("alpha")
+            .expect("policy should load from object store");
+        assert_eq!(policy.data_class, "sensitive");
+        assert_eq!(
+            policy.allowed_models,
+            vec!["native-default", "ollama/capable"]
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn set_namespace_policy_persists_data_class() {
+        let path = format!(
+            "{}/sekai-chisei-policy-rpc-{}.db",
+            std::env::temp_dir().display(),
+            uuid::Uuid::new_v4()
+        );
+        let svc = file_service(&path);
+        let response = svc
+            .set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+                namespace: "alpha".into(),
+                allowed_runtimes: vec!["kiro".into()],
+                allowed_models: vec!["native-default".into()],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.resolution.unwrap().data_class, "sensitive");
+        drop(svc);
+
+        let reloaded = file_service(&path);
+        let policy = reloaded
+            .policy
+            .effective_policy("alpha")
+            .expect("policy should reload");
+        assert_eq!(policy.data_class, "sensitive");
+        assert_eq!(policy.default_model, "native-default");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn sensitive_private_rejects_unsafe_provider() {
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+
+        let err = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-sensitive-private".into(),
+                    namespace: "alpha".into(),
+                    spec: "analyze private holdings".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                    task_class: String::new(),
+                }),
+            }))
+            .await
+            .expect_err("unsafe provider should be rejected for sensitive private work");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("not safe"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_denies_sensitive_private_unsafe_provider() {
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+
+        let err = svc
+            .resolve_policy(Request::new(ResolvePolicyRequest {
+                namespace: "alpha".into(),
+                preferred_runtime: "kiro".into(),
+                preferred_model: "native-default".into(),
+                subject: String::new(),
+                project: String::new(),
+                agent: String::new(),
+                key_id: String::new(),
+                task_class: String::new(),
+                user_id: String::new(),
+            }))
+            .await
+            .expect_err("sensitive private preflight should deny unsafe provider");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sensitive_template_only_skips_context_enrichment() {
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+        svc.db
+            .create_object(&Object {
+                id: "asset-secret".into(),
+                kind: "asset".into(),
+                name: "SecretCo".into(),
+                namespace: "alpha".into(),
+                external_id: "asset:SECRET".into(),
+                properties: std::collections::HashMap::from([(
+                    "verdict".into(),
+                    "approved".into(),
+                )]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-template".into(),
+                    namespace: "alpha".into(),
+                    spec: "write a generic evaluation rubric".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                    task_class: "template_only".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        assert_eq!(plan.task_class, "template_only");
+        assert!(plan.executable);
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| { step.step == "object_context_enrich" && step.action == "skipped" })
+        );
+        assert!(!plan.enriched_spec.contains("SecretCo"));
+        assert!(!plan.enriched_spec.contains("approved"));
+    }
+
+    #[tokio::test]
+    async fn template_only_plan_blocks_known_entity_leak() {
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+        svc.db
+            .create_object(&Object {
+                id: "asset-secret".into(),
+                kind: "asset".into(),
+                name: "SecretCo".into(),
+                namespace: "alpha".into(),
+                external_id: "asset:SECRET".into(),
+                properties: std::collections::HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "leak-rule-secretco".into(),
+                kind: "leak_rule".into(),
+                name: "company-name".into(),
+                namespace: "alpha".into(),
+                external_id: "leak_rule:secretco".into(),
+                properties: std::collections::HashMap::from([
+                    ("pattern".into(), "SecretCo".into()),
+                    ("label".into(), "company_name".into()),
+                    ("action".into(), "block".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-leak".into(),
+                    namespace: "alpha".into(),
+                    spec: "write a generic rubric for SecretCo".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                    task_class: "template_only".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        assert!(!plan.executable);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("leak checker blocked"))
+        );
+        assert!(plan.egress_decisions.iter().any(|decision| {
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("known_entity:SecretCo"))
+        }));
+        assert!(plan.egress_decisions.iter().any(|decision| {
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("company_name"))
+        }));
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                actor: Some("chisei.privacy".into()),
+                action: Some("leak_check".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(decisions.iter().any(|decision| {
+            decision.target_id == "task-leak"
+                && decision.outcome == "leak_blocked"
+                && decision
+                    .evidence
+                    .get("labels")
+                    .is_some_and(|labels| labels.contains("company_name"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn check_egress_denies_sensitive_private_unsafe_provider() {
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+
+        let response = svc
+            .check_egress(Request::new(CheckEgressRequest {
+                namespace: "alpha".into(),
+                payload: "generic payload".into(),
+                provider: "native".into(),
+                task_class: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!response.allowed);
+        assert!(response.findings.iter().any(|decision| {
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("privacy gate"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_rejects_after_policy_flips_sensitive() {
+        let svc = memory_service();
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-stale-policy".into(),
+                    namespace: "alpha".into(),
+                    spec: "do ordinary work".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    task_type: String::new(),
+                    priority: 0,
+                    user_id: "user-1".into(),
+                    estimated_tokens: 0,
+                    messages: vec![],
+                    tools: vec![],
+                    system: String::new(),
+                    max_tokens: 512,
+                    task_class: String::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert!(plan.executable);
+
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+
+        let err = svc
+            .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+            .await
+            .expect_err("stale external plan should be blocked after policy flip");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("privacy gate"));
+    }
+
     #[tokio::test]
     async fn execute_plan_rejects_external_plan_without_egress_decisions() {
         let svc = memory_service();
@@ -2853,6 +3767,7 @@ mod tests {
                 tools: vec![],
                 system: String::new(),
                 max_tokens: 512,
+                task_class: String::new(),
             }),
             resolved_runtime: "kiro".into(),
             resolved_model: "native-default".into(),
@@ -2885,6 +3800,7 @@ mod tests {
             sample_rate: 0.0,
             sample_reason: String::new(),
             egress_decisions: vec![],
+            task_class: String::new(),
         };
         svc.cache_plan(plan.clone());
 
@@ -2910,6 +3826,7 @@ mod tests {
                 task_type: String::new(),
                 priority: 0,
                 user_id: "user-1".into(),
+                task_class: String::new(),
                 estimated_tokens: 0,
                 messages: vec![],
                 tools: vec![],
@@ -2947,6 +3864,7 @@ mod tests {
             sample_rate: 0.0,
             sample_reason: String::new(),
             egress_decisions: vec![],
+            task_class: String::new(),
         };
         svc.cache_plan(plan.clone());
 
@@ -3010,6 +3928,7 @@ mod tests {
                     tools: vec![],
                     system: String::new(),
                     max_tokens: 512,
+                    task_class: String::new(),
                 }),
             }))
             .await
@@ -3053,6 +3972,7 @@ mod tests {
                 sample_rate: 0.0,
                 sample_reason: String::new(),
                 egress_decisions: vec![],
+                task_class: String::new(),
             });
         }
         let newest = ExecutionPlan {
@@ -3080,6 +4000,7 @@ mod tests {
             sample_rate: 0.0,
             sample_reason: String::new(),
             egress_decisions: vec![],
+            task_class: String::new(),
         };
         svc.cache_plan(newest.clone());
 
@@ -3121,6 +4042,7 @@ mod tests {
             sample_rate: 0.0,
             sample_reason: String::new(),
             egress_decisions: vec![],
+            task_class: String::new(),
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -3168,6 +4090,7 @@ mod tests {
                 sample_rate: 0.0,
                 sample_reason: String::new(),
                 egress_decisions: vec![],
+                task_class: String::new(),
             });
         }
         let inserted = ExecutionPlan {
@@ -3195,6 +4118,7 @@ mod tests {
             sample_rate: 0.0,
             sample_reason: String::new(),
             egress_decisions: vec![],
+            task_class: String::new(),
         };
         svc.cache_plan(inserted.clone());
 

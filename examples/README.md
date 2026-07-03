@@ -60,6 +60,18 @@ ollama pull llama3.2
 If the model is not reachable, the step reports the error and the demo still
 finishes.
 
+## delegation
+
+[delegation.rs](delegation.rs) sketches the privacy-preserving delegation chain:
+local Ollama planning with private context, a frontier `template_only` rubric
+request, local private composition, and a leak-checked `template_only` polish
+pass. It prints the `PlanExecution` request sequence without making network or
+model calls:
+
+```bash
+cargo run --example delegation
+```
+
 ### Configuration
 
 The example honors the same environment variables as the server:
