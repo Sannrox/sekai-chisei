@@ -51,9 +51,6 @@ impl TokenAuthInterceptor {
     }
 
     fn resolve_principal(&self, token: &str) -> Option<String> {
-        if let Some(principal) = self.store.resolve(token) {
-            return Some(principal);
-        }
         self.store.maybe_reload(&self.db);
         if let Some(principal) = self.store.resolve(token) {
             return Some(principal);
@@ -150,7 +147,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
     }
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
-    let insecure = config.allow_plaintext || std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
+    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
 
     if let Some(socket_path) = config.sekai_socket.clone() {
         let uds_server = serve_uds(
