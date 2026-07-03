@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use std::pin::Pin;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use super::pb::llm::llm_service_server::LlmService;
@@ -147,11 +149,13 @@ pub async fn execute_chat_request_stream(
             return Err(Status::internal(e));
         }
     };
-    let mut adjusted = false;
-    let mut last_tokens = 0;
     let budget_for_stream = budget.clone();
-    Ok(Box::pin(async_stream::stream! {
-        futures_util::pin_mut!(stream);
+    let (tx, rx) = mpsc::channel::<Result<ChatStreamChunk, Status>>(16);
+    let user_id_for_stream = user_id.clone();
+
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut last_tokens = 0;
         while let Some(next) = stream.next().await {
             match next {
                 Ok(chunk) => {
@@ -160,25 +164,26 @@ pub async fn execute_chat_request_stream(
                         last_tokens = actual_tokens;
                     }
                     let done = chunk.done;
-                    yield Ok(domain_chunk_to_pb(chunk));
-                    if done && !adjusted {
-                        budget_for_stream.adjust(&user_id, estimated, last_tokens);
-                        adjusted = true;
+                    let pb_chunk = domain_chunk_to_pb(chunk);
+                    if tx.send(Ok(pb_chunk)).await.is_err() {
+                        continue;
+                    }
+                    if done {
+                        budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
+                        return;
                     }
                 }
                 Err(err) => {
-                    if !adjusted {
-                        budget_for_stream.adjust(&user_id, estimated, 0);
-                    }
-                    yield Err(Status::internal(err));
+                    budget_for_stream.adjust(&user_id_for_stream, estimated, 0);
+                    let _ = tx.send(Err(Status::internal(err))).await;
                     return;
                 }
             }
         }
-        if !adjusted {
-            budget_for_stream.adjust(&user_id, estimated, last_tokens);
-        }
-    }))
+        budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
+    });
+
+    Ok(Box::pin(ReceiverStream::new(rx)))
 }
 
 fn pb_chat_to_domain(r: ChatRequest) -> llm::ChatRequest {
