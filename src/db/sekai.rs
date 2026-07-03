@@ -193,7 +193,7 @@ impl SekaiDb {
             )
             .map_err(|e| e.to_string())?;
         let credential: Option<PrincipalCredential> = stmt
-            .query_row(params![principal], |row| Ok(row_to_principal_credential(row)))
+            .query_row(params![principal], row_to_principal_credential)
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(credential) = &credential {
@@ -231,7 +231,7 @@ impl SekaiDb {
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let params_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| Ok(row_to_principal_credential(row)))
+            .query_map(params_refs.as_slice(), row_to_principal_credential)
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
