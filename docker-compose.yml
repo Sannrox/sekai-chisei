@@ -1,0 +1,52 @@
+services:
+  server:
+    build: .
+    volumes:
+      - sekai-data:/data
+    environment:
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+    # For Linux hosts without native host.docker.internal resolution,
+    # use `extra_hosts` together with a reachable Ollama/socket target.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "[ -S /data/sekai.sock ]"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  gateway:
+    build: .
+    command: ["chisei-gateway"]
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - sekai-data:/data
+    ports:
+      - "8080:8080"
+    environment:
+      - GATEWAY_BIND=0.0.0.0:8080
+      - GATEWAY_KEYS=${GATEWAY_KEYS:?Set GATEWAY_KEYS to `key=agent:project` before running gateway in production and local Docker workflows}
+      - ANTHROPIC_API_KEY
+      - OPENAI_API_KEY
+      - CHISEI_GATEWAY_ADMIN_TOKEN=${CHISEI_GATEWAY_ADMIN_TOKEN:?Set CHISEI_GATEWAY_ADMIN_TOKEN for admin endpoint protection}
+
+      # Optional TCP transport mode instead of shared-UDS:
+      # On gateway:
+      #   CHISEI_GRPC_URL: http://server:50051
+      #   SEKAI_SOCKET: ""
+      # On server (required auth):
+      #   SEKAI_AUTH_TOKEN: ${SEKAI_AUTH_TOKEN:?}
+      #   GRPC_PORT: 50051
+      # On gateway:
+      #   SEKAI_AUTH_TOKEN: ${SEKAI_AUTH_TOKEN:?}
+      #   GATEWAY_BIND: 0.0.0.0:8080
+      # Expose server gRPC:
+      #   ports:
+      #     - "50051:50051"
+
+volumes:
+  sekai-data:
