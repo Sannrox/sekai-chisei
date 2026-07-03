@@ -102,6 +102,16 @@ impl GatewayConfig {
             std::env::var("GATEWAY_GOVERNANCE_FAILURE").as_deref(),
             Ok("closed") | Ok("fail-closed") | Ok("1") | Ok("true")
         );
+        if fail_closed && chisei_grpc_target.is_none() {
+            return Err(
+                "GATEWAY_GOVERNANCE_FAILURE is enabled, but CHISEI_GRPC_URL/SEKAI_SOCKET is not set".into(),
+            );
+        }
+        if chisei_grpc_target.is_none() {
+            eprintln!(
+                "warning: CHISEI_GRPC_URL/SEKAI_SOCKET is unset; running without control-plane governance"
+            );
+        }
         let default_project =
             std::env::var("GATEWAY_DEFAULT_PROJECT").unwrap_or_else(|_| "default".to_string());
         let gateway_keys = parse_gateway_keys(
@@ -642,7 +652,7 @@ async fn resolve_policy_preflight(
                         )
                         .await;
                     };
-                    if resolved_provider != provider && !config.allow_cross_provider {
+                    if !provider.same_family(resolved_provider) && !config.allow_cross_provider {
                         return policy_denied(
                             config,
                             identity,
@@ -789,7 +799,23 @@ fn is_openai_compatible_model(model: &str) -> bool {
     if model.is_empty() || model.starts_with("claude") {
         return false;
     }
-    true
+    if model.starts_with("native-") || model.starts_with("ollama/") {
+        return true;
+    }
+    const NON_OPENAI_PREFIXES: &[&str] = &[
+        "gemini",
+        "vertex",
+        "palm",
+        "bedrock",
+        "anthropic",
+        "azure",
+        "cohere",
+        "claude",
+    ];
+
+    !NON_OPENAI_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
 }
 
 fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
@@ -826,7 +852,7 @@ async fn prepare_upstream_request(
     body: Vec<u8>,
     resolved_model: Option<&str>,
 ) -> Result<PreparedUpstreamRequest, Response<Body>> {
-    if client_provider == resolved_provider {
+    if client_provider == resolved_provider || client_provider.same_family(resolved_provider) {
         return Ok(PreparedUpstreamRequest {
             provider: client_provider,
             url: upstream_url_for_provider(config, uri, client_provider),
@@ -835,7 +861,7 @@ async fn prepare_upstream_request(
         });
     }
     if client_provider == ProviderKind::Anthropic
-        && resolved_provider == ProviderKind::OpenAi
+        && resolved_provider.is_openai()
         && is_anthropic_messages_path(uri.path())
     {
         if request_stream_enabled(&body) {
@@ -901,7 +927,7 @@ async fn prepare_upstream_request(
         )
         .await;
         return Ok(PreparedUpstreamRequest {
-            provider: ProviderKind::OpenAi,
+            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             url: openai_chat_completions_url(config, uri),
             body: translated,
             response_adapter: ResponseAdapter::OpenAiChatToAnthropicMessage,
@@ -1785,15 +1811,24 @@ fn format_usd_micros(value: i64) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderKind {
+enum OpenAiRuntime {
     OpenAi,
+    Ollama,
+    Native,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    OpenAi(OpenAiRuntime),
     Anthropic,
 }
 
 impl ProviderKind {
     fn from_runtime(runtime: &str) -> Option<Self> {
         match runtime {
-            "openai" | "ollama" | "native" => Some(Self::OpenAi),
+            "openai" => Some(Self::OpenAi(OpenAiRuntime::OpenAi)),
+            "ollama" => Some(Self::OpenAi(OpenAiRuntime::Ollama)),
+            "native" => Some(Self::OpenAi(OpenAiRuntime::Native)),
             "anthropic" => Some(Self::Anthropic),
             _ => None,
         }
@@ -1801,14 +1836,25 @@ impl ProviderKind {
 
     fn runtime_name(self) -> &'static str {
         match self {
-            Self::OpenAi => "openai",
+            Self::OpenAi(_) => "openai",
             Self::Anthropic => "anthropic",
         }
     }
 
+    fn is_openai(self) -> bool {
+        matches!(self, Self::OpenAi(_))
+    }
+
+    fn same_family(self, other: Self) -> bool {
+        self.is_openai() == other.is_openai()
+    }
+
     fn is_compatible_model(self, model: &str) -> bool {
         match self {
-            Self::OpenAi => is_openai_compatible_model(model),
+            Self::OpenAi(openai_runtime) => match openai_runtime {
+                OpenAiRuntime::OpenAi => is_openai_compatible_model(model),
+                OpenAiRuntime::Ollama | OpenAiRuntime::Native => !model.starts_with("claude"),
+            },
             Self::Anthropic => model.starts_with("claude"),
         }
     }
@@ -1825,37 +1871,37 @@ fn upstream_url(config: &GatewayConfig, uri: &Uri) -> Option<UpstreamTarget> {
     let (provider, base_url, upstream_path) = if let Some(rest) = path.strip_prefix("/v1/responses")
     {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/responses{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/responses") {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/responses{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/v1/chat/completions") {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/chat/completions{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/chat/completions") {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/chat/completions{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/v1/models") {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/models{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/models") {
         (
-            ProviderKind::OpenAi,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             config.openai_base_url.as_str(),
             format!("/models{rest}"),
         )
@@ -1900,7 +1946,7 @@ fn apply_provider_auth(
     provider: ProviderKind,
 ) -> Result<reqwest::RequestBuilder, Response<Body>> {
     match provider {
-        ProviderKind::OpenAi => config
+        ProviderKind::OpenAi(_) => config
             .openai_api_key
             .as_ref()
             .map(|key| upstream.bearer_auth(key))
@@ -1931,7 +1977,7 @@ fn upstream_auth_mode(
     provider: ProviderKind,
 ) -> UpstreamAuthMode {
     if requested_mode == UpstreamAuthMode::Passthrough
-        && provider == ProviderKind::OpenAi
+        && provider.is_openai()
         && config.rewrite_openai_passthrough_auth
         && config.openai_api_key.is_some()
     {
@@ -5044,7 +5090,20 @@ mod tests {
     fn openai_compatibility_accepts_codex_models() {
         assert!(is_openai_compatible_model("gpt-5.5"));
         assert!(is_openai_compatible_model("o3-mini"));
+        assert!(is_openai_compatible_model("o5-pro"));
+        assert!(is_openai_compatible_model("text-embedding-3-small"));
+        assert!(is_openai_compatible_model("tts-1"));
+        assert!(is_openai_compatible_model("ft:gpt-4o-mini:personal:abc"));
+        assert!(is_openai_compatible_model("mistral-large"));
+        assert!(is_openai_compatible_model("deepseek-chat"));
+        assert!(is_openai_compatible_model("llama-3.3-70b"));
+        assert!(is_openai_compatible_model("codex-mini-latest"));
+        assert!(is_openai_compatible_model("qwen2"));
+        assert!(is_openai_compatible_model("phi3"));
+        assert!(is_openai_compatible_model("mixtral"));
         assert!(!is_openai_compatible_model("claude-sonnet-4"));
+        assert!(!is_openai_compatible_model("gemini-pro"));
+        assert!(!is_openai_compatible_model("anthropic-3"));
         assert!(is_openai_compatible_model("native-default"));
         assert!(is_openai_compatible_model("ollama/gpt-oss"));
     }
