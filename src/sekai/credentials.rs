@@ -130,4 +130,23 @@ mod tests {
         assert_eq!(store.resolve("token-alice"), Some("alice".to_string()));
         assert!(store.has_any());
     }
+
+    #[test]
+    fn removes_cached_principal_when_db_record_is_inactive() {
+        let db = test_db();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("token-bob");
+        db.create_principal_credential("bob", &token, fixed_time(1))
+            .unwrap();
+
+        let credentials = db.list_active_credentials().unwrap();
+        store.load(&credentials);
+
+        assert_eq!(store.resolve("token-bob"), Some("bob".to_string()));
+
+        db.revoke_principal_credential("bob").unwrap();
+
+        assert_eq!(store.resolve("token-bob"), None);
+        assert!(!store.has_any());
+    }
 }
