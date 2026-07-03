@@ -8,8 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
     println!("sekai-chisei v0.1.0");
 
-    let insecure =
-        config.allow_plaintext || std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
+    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
     if config.auth_token.is_some() {
         eprintln!(
             "warning: SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
