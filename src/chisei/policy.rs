@@ -7,6 +7,7 @@ pub struct Policy {
     pub allowed_models: Vec<String>,
     pub default_runtime: String,
     pub default_model: String,
+    pub data_class: String,
 }
 
 pub struct PolicyResolver {
@@ -128,6 +129,7 @@ mod tests {
                 allowed_models: vec!["claude-sonnet".into()],
                 default_runtime: "kiro".into(),
                 default_model: "claude-sonnet".into(),
+                data_class: String::new(),
             },
         );
         let result = r.resolve("prod", "kiro", "gpt-4");
@@ -146,6 +148,7 @@ mod tests {
                 allowed_models: vec!["claude".into()],
                 default_runtime: "kiro".into(),
                 default_model: "claude".into(),
+                data_class: String::new(),
             },
         );
         let (rt, m) = r.resolve("ns", "", "").unwrap();
@@ -163,6 +166,7 @@ mod tests {
                 allowed_models: vec!["gpt-5.5-mini".into()],
                 default_runtime: "openai".into(),
                 default_model: "gpt-5.5-mini".into(),
+                data_class: String::new(),
             },
         );
         r.set_namespace_policy(
@@ -172,6 +176,7 @@ mod tests {
                 allowed_models: vec!["gpt-5.5".into()],
                 default_runtime: "openai".into(),
                 default_model: "gpt-5.5".into(),
+                data_class: String::new(),
             },
         );
 

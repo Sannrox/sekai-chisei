@@ -140,6 +140,7 @@ pub async fn run_setup(
             },
             default_runtime: config.default_runtime.clone(),
             default_model: config.default_model.clone(),
+            data_class: String::new(),
         }))
         .await?;
 
@@ -748,6 +749,9 @@ mod tests {
             scoring_interval_secs: 60,
             scoring_model: "claude-opus-4-8".into(),
             scoring_batch_size: 16,
+            default_data_class: "unclassified".into(),
+            safe_egress_providers: vec![],
+            leak_review_model: None,
         }
     }
 
@@ -899,8 +903,10 @@ mod tests {
                 preferred_runtime: "openai".to_string(),
                 preferred_model: "gpt-4.1".to_string(),
                 subject: "agent:codex-app".to_string(),
+                task_class: String::new(),
                 project: "sekai-chisei".to_string(),
                 agent: "codex-app".to_string(),
+                user_id: String::new(),
                 key_id: "codex-app".to_string(),
             }))
             .await
