@@ -142,8 +142,10 @@ impl SekaiDb {
         token_hash: &str,
     ) -> Result<PrincipalCredential, String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let conn = self.conn.lock().unwrap();
-        let mut active_stmt = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let mut active_stmt = tx
             .prepare(
                 "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             )
@@ -152,15 +154,16 @@ impl SekaiDb {
             .query_row(params![principal], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|e| e.to_string())?;
+        drop(active_stmt);
         if let Some(active) = &active_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE id=?2",
                 params![now, active],
             )
             .map_err(|e| e.to_string())?;
         }
         let id = format!("credential-{}", Uuid::new_v4().simple());
-        conn.execute(
+        tx.execute(
             "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 id,
@@ -173,6 +176,7 @@ impl SekaiDb {
             ],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(PrincipalCredential {
             id,
             principal: principal.to_string(),
