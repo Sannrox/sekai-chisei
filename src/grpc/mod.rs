@@ -56,6 +56,12 @@ impl TokenAuthInterceptor {
         let token_hash = hash_gateway_key(token);
         let cached_principal = self.store.resolve(token);
 
+        if let Some(principal) = self.legacy_root_token.as_ref() {
+            if token.as_bytes().ct_eq(principal.as_bytes()).into() {
+                return Some("root".to_string());
+            }
+        }
+
         if cached_principal.is_none() {
             match self.db.get_principal_credential(&token_hash) {
                 Ok(Some(credential)) => {
@@ -69,12 +75,6 @@ impl TokenAuthInterceptor {
 
         if let Some(principal) = cached_principal {
             return Some(principal);
-        }
-
-        if let Some(principal) = self.legacy_root_token.as_ref() {
-            if token.as_bytes().ct_eq(principal.as_bytes()).into() {
-                return Some("root".to_string());
-            }
         }
 
         None
