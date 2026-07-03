@@ -34,7 +34,9 @@ impl Config {
             openai_api_key: env::var("OPENAI_API_KEY").ok(),
             ollama_url: env("OLLAMA_URL", "http://localhost:11434"),
             native_llm_url: env::var("NATIVE_LLM_URL").ok(),
-            auth_token: env::var("SEKAI_AUTH_TOKEN").ok(),
+            auth_token: env::var("SEKAI_AUTH_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             sample_rate: env("SAMPLE_RATE", "0.05").parse().unwrap_or(0.05),
             sample_risk_threshold: env("SAMPLE_RISK_THRESHOLD", "0.7").parse().unwrap_or(0.7),
             scoring_enabled: env("SCORING_ENABLED", "false").parse().unwrap_or(false),
