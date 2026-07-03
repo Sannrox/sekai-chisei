@@ -62,16 +62,16 @@ impl TokenAuthInterceptor {
             return Some("root".to_string());
         }
 
-        if let Some(cached_principal) = cached_principal {
-            if cache_trustworthy {
-                return Some(cached_principal);
-            }
+        if let Some(cached_principal) = cached_principal
+            && cache_trustworthy
+        {
+            return Some(cached_principal);
         }
 
         match self.db.get_principal_credential(&token_hash) {
             Ok(Some(credential)) => {
                 self.store.load_credential(&credential);
-                return Some(credential.principal);
+                Some(credential.principal)
             }
             Ok(None) => None,
             Err(_) => None,
