@@ -5,18 +5,19 @@ use tokio::signal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    sekai_chisei::obs::logging::init();
     let config = Config::from_env();
     if let Some(mode) = std::env::args().nth(1)
         && mode == "gateway-report"
     {
         return run_gateway_report(&config);
     }
-    println!("sekai-chisei v0.1.0");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "sekai-chisei starting");
 
     let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
     if config.auth_token.is_some() {
-        eprintln!(
-            "warning: SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
+        tracing::warn!(
+            "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
         );
     }
 
@@ -32,36 +33,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (config.auth_token.is_some() || !db.list_active_credentials()?.is_empty()) && !insecure;
 
     if token_auth_mode {
-        println!("  grpc: 0.0.0.0:{}", config.grpc_port);
+        tracing::info!(
+            bind = "0.0.0.0",
+            port = config.grpc_port,
+            "gRPC TCP listener enabled"
+        );
     } else if insecure {
-        println!("  grpc: 127.0.0.1:{}", config.grpc_port);
+        tracing::info!(
+            bind = "127.0.0.1",
+            port = config.grpc_port,
+            "gRPC TCP listener enabled"
+        );
     } else {
-        println!("  grpc: tcp disabled");
+        tracing::info!("gRPC TCP listener disabled");
     }
 
     if let Some(socket_path) = &config.sekai_socket {
-        println!("  uds:  {}", socket_path);
+        tracing::info!(socket_path, "gRPC UDS listener enabled");
     }
-    println!("  db:   {}", config.db_path);
-    println!(
-        "  llm:  anthropic={} openai={} ollama={}",
-        if config.anthropic_api_key.is_some() {
-            "yes"
-        } else {
-            "no"
-        },
-        if config.openai_api_key.is_some() {
-            "yes"
-        } else {
-            "no"
-        },
-        config.ollama_url
+    tracing::info!(db_path = %config.db_path, "database configured");
+    tracing::info!(
+        anthropic = config.anthropic_api_key.is_some(),
+        openai = config.openai_api_key.is_some(),
+        ollama_url = %config.ollama_url,
+        "LLM providers configured"
     );
 
     let server = sekai_chisei::grpc::run(config.grpc_port, db);
     let shutdown = async {
         signal::ctrl_c().await.ok();
-        println!("\nshutting down...");
+        tracing::info!("shutting down");
     };
 
     tokio::select! {

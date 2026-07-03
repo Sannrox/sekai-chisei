@@ -73,6 +73,8 @@ Configuration is read from environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | gRPC listen port |
+| `OPS_PORT` | `9464` | HTTP ops listener port for `/metrics`, `/healthz`, and `/readyz`; set empty to disable |
+| `OPS_BIND` | `127.0.0.1` | HTTP ops listener bind address; use `0.0.0.0` when Kubernetes kubelet probes must reach the pod |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path for local gRPC; set empty to disable |
 | `DB_PATH` | `./data/sekai.db` | SQLite database path |
 | `SEKAI_AUTH_TOKEN` | unset | **Deprecated fallback:** maps all tokens to principal `root`; prefer `sekaictl credential ...` |
@@ -81,6 +83,8 @@ Configuration is read from environment variables:
 | `SEKAI_TLS_CA` | unset | Optional client trust anchor (PEM) for TLS custom CA validation |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set to `1` to allow authenticated `0.0.0.0` bind without TLS |
 | `SEKAI_INSECURE` | unset | Set to `1` for local unauthenticated development |
+| `RUST_LOG` | `info` | Structured logging filter |
+| `LOG_FORMAT` | pretty | Set to `json` for JSON logs |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama-compatible endpoint |
 | `NATIVE_LLM_URL` | unset | Native local LLM endpoint |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
@@ -96,6 +100,36 @@ For TCP mode, control-plane identity is verified from bearer token metadata:
 - `SEKAI_AUTH_TOKEN` is a deprecated compatibility path and now maps to fixed principal `root`
 - `0.0.0.0` requires TLS via `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless `SEKAI_ALLOW_PLAINTEXT=1`
 - local UDS paths and `SEKAI_INSECURE=1` stay plaintext and keep self-asserted `x-principal` (defaults to `local` when absent)
+
+## Observability
+
+The server exposes unauthenticated health and Prometheus endpoints on the loopback
+ops listener by default:
+
+```bash
+curl -s http://127.0.0.1:9464/healthz
+curl -s http://127.0.0.1:9464/readyz
+curl -s http://127.0.0.1:9464/metrics
+```
+
+Use HTTP probes in Kubernetes with `OPS_BIND=0.0.0.0` so kubelet can reach the
+listener through the pod IP:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 9464
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 9464
+```
+
+The gRPC health service is also registered without the auth interceptor, so native
+gRPC probes can check `grpc.health.v1.Health/Check` even when token auth protects
+the application services. OpenTelemetry/OTLP export is a deliberate follow-up;
+this release exports Prometheus metrics only.
 
 ## Codex Gateway Preview
 
