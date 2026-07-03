@@ -67,6 +67,7 @@ The example honors the same environment variables as the server:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | Port to connect to |
+| `SEKAI_SOCKET` | unset | Unix socket path to connect to instead of TCP |
 | `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request |
 | `DEMO_MODEL` | `ollama/llama3.2:latest` | Model used for the live execute step |
 
