@@ -23,7 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = db.migrate_chisei();
     db.migrate_principal_credentials()
         .map_err(std::io::Error::other)?;
-    let token_auth_mode = config.auth_token.is_some() || !db.list_active_credentials()?.is_empty();
+    let token_auth_mode =
+        (config.auth_token.is_some() || !db.list_active_credentials()?.is_empty()) && !insecure;
 
     if token_auth_mode {
         println!("  grpc: 0.0.0.0:{}", config.grpc_port);
