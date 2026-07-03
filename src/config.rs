@@ -19,6 +19,9 @@ pub struct Config {
     pub default_data_class: String,
     pub safe_egress_providers: Vec<String>,
     pub leak_review_model: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub allow_plaintext: bool,
 }
 
 impl Config {
@@ -43,6 +46,9 @@ impl Config {
             leak_review_model: env::var("LEAK_REVIEW_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            tls_cert: env::var("SEKAI_TLS_CERT").ok().filter(|value| !value.trim().is_empty()),
+            tls_key: env::var("SEKAI_TLS_KEY").ok().filter(|value| !value.trim().is_empty()),
+            allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
         }
     }
 }

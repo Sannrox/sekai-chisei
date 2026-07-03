@@ -665,11 +665,11 @@ where
 }
 
 pub fn usage() -> String {
-    "Usage: chisei-gateway-setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       chisei-gateway-setup key <create|list|rotate|revoke> [options]\n\nRun `chisei-gateway-setup key --help` for gateway-key lifecycle commands.".to_string()
+    "Usage: sekaictl gateway setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       sekaictl gateway key <create|list|rotate|revoke> [options]\n\nRun `sekaictl gateway key --help` for gateway-key lifecycle commands.".to_string()
 }
 
 pub fn key_usage() -> String {
-    "Usage: chisei-gateway-setup key create [<name>] [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       chisei-gateway-setup key list [--target <grpc-url>] [--project <name>]\n       chisei-gateway-setup key rotate [--target <grpc-url>] --gateway-key-name <name> --gateway-key <new-secret>\n       chisei-gateway-setup key revoke [--target <grpc-url>] --gateway-key-name <name>".to_string()
+    "Usage: sekaictl gateway key create [<name>] [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       sekaictl gateway key list [--target <grpc-url>] [--project <name>]\n       sekaictl gateway key rotate [--target <grpc-url>] --gateway-key-name <name> --gateway-key <new-secret>\n       sekaictl gateway key revoke [--target <grpc-url>] --gateway-key-name <name>".to_string()
 }
 
 #[cfg(test)]
@@ -752,6 +752,9 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
             leak_review_model: None,
+            tls_cert: None,
+            tls_key: None,
+            allow_plaintext: false,
         }
     }
 

@@ -5,7 +5,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::{Channel, Certificate, ClientTlsConfig, Endpoint, Uri};
 use tower::service_fn;
 
 #[derive(Clone)]
@@ -37,7 +37,22 @@ pub async fn connect_sekai(
     let interceptor = GatewayAuthInterceptor { auth_token };
 
     if target.starts_with("http://") || target.starts_with("https://") {
-        let channel = Channel::from_shared(target.to_string())?.connect().await?;
+        let tls_ca = std::env::var("SEKAI_TLS_CA").ok();
+        let tls = if target.starts_with("https://") {
+            let mut cfg = ClientTlsConfig::new().with_native_roots();
+            if let Some(path) = tls_ca.filter(|value| !value.trim().is_empty()) {
+                let cert = std::fs::read(path)?;
+                cfg = cfg.ca_certificate(Certificate::from_pem(cert));
+            }
+            Some(cfg)
+        } else {
+            None
+        };
+        let mut channel = Channel::from_shared(target.to_string())?;
+        if let Some(tls) = tls {
+            channel = channel.tls_config(tls)?;
+        }
+        let channel = channel.connect().await?;
         return Ok(InterceptedService::new(channel, interceptor));
     }
 
