@@ -62,6 +62,23 @@ impl TokenAuthInterceptor {
             return Some("root".to_string());
         }
 
+        if let Some(cached_principal) = cached_principal {
+            match self.db.get_principal_credential(&token_hash) {
+                Ok(Some(credential)) => {
+                    if credential.principal == cached_principal {
+                        return Some(cached_principal);
+                    }
+                    self.store.load_credential(&credential);
+                    return Some(credential.principal);
+                }
+                Ok(None) => {
+                    self.store.remove_hash(&token_hash);
+                    return None;
+                }
+                Err(_) => return None,
+            }
+        }
+
         if cached_principal.is_none() {
             match self.db.get_principal_credential(&token_hash) {
                 Ok(Some(credential)) => {
@@ -71,10 +88,6 @@ impl TokenAuthInterceptor {
                 Ok(None) => return None,
                 Err(_) => return None,
             }
-        }
-
-        if let Some(principal) = cached_principal {
-            return Some(principal);
         }
 
         None
