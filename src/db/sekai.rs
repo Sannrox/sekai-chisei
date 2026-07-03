@@ -290,28 +290,61 @@ impl SekaiDb {
     }
 
     pub fn update_object(&self, o: &Object) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        let props = serde_json::to_string(&o.properties).unwrap_or_default();
-        let n = conn.execute(
-            "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
-            params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.updated],
-        ).map_err(|e| e.to_string())?;
-        if n == 0 {
+        if self.update_object_with_existing(o)?.is_none() {
             return Err("not found".into());
         }
         Ok(())
     }
 
-    pub fn delete_object(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+    pub fn update_object_with_existing(&self, o: &Object) -> Result<Option<Object>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![o.id],
+                |row| Ok(row_to_object(row)),
+            )
+            .optional()
             .map_err(|e| e.to_string())?;
-        conn.execute(
+        if before.is_none() {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(None);
+        }
+        let props = serde_json::to_string(&o.properties).unwrap_or_default();
+        tx.execute(
+            "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
+            params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.updated],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(before)
+    }
+
+    pub fn delete_object(&self, id: &str) -> Result<(), String> {
+        self.delete_object_with_existing(id)?;
+        Ok(())
+    }
+
+    pub fn delete_object_with_existing(&self, id: &str) -> Result<Option<Object>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let before = tx
+            .query_row(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+                params![id],
+                |row| Ok(row_to_object(row)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
             "DELETE FROM sekai_links WHERE from_id = ?1 OR to_id = ?1",
             params![id],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(before)
     }
 
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
@@ -462,7 +495,7 @@ impl SekaiDb {
     }
 }
 
-fn row_to_object(row: &rusqlite::Row) -> Object {
+pub(crate) fn row_to_object(row: &rusqlite::Row) -> Object {
     let props_str: String = row.get(5).unwrap_or_default();
     let properties: HashMap<String, String> = serde_json::from_str(&props_str).unwrap_or_default();
     Object {
