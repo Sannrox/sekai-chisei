@@ -44,6 +44,10 @@ See [examples/README.md](examples/README.md) for what the demo exercises.
 Early-stage (`v0.1.0`). The gRPC server, SQLite-backed graph, and chisei policy
 pipeline are working. APIs will evolve before v1.0.
 
+## Running with Docker
+
+See [docs/docker.md](docs/docker.md).
+
 ## Features
 
 - SQLite-backed typed-object graph with generic objects, links, and schema definitions
