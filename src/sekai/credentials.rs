@@ -31,13 +31,25 @@ impl PrincipalCredentialStore {
         }
     }
 
-    pub fn resolve(&self, token: &str) -> Option<String> {
-        let hash = hash_gateway_key(token);
+    pub fn load_credential(&self, credential: &PrincipalCredential) {
+        let mut map = self.by_hash.write().unwrap();
+        map.insert(credential.token_hash.clone(), credential.principal.clone());
+    }
+
+    pub fn remove_hash(&self, token_hash: &str) {
+        self.by_hash.write().unwrap().remove(token_hash);
+    }
+
+    fn resolve_hashed(&self, token_hash: &str) -> Option<String> {
         self.by_hash
             .read()
             .unwrap()
-            .get(&hash)
+            .get(token_hash)
             .map(std::string::ToString::to_string)
+    }
+
+    pub fn resolve(&self, token: &str) -> Option<String> {
+        self.resolve_hashed(&hash_gateway_key(token))
     }
 
     pub fn maybe_reload(&self, db: &SekaiDb) {
@@ -53,8 +65,14 @@ impl PrincipalCredentialStore {
         {
             return;
         }
-        if let Ok(credentials) = db.list_active_credentials() {
-            self.load(&credentials);
+        match db.list_active_credentials() {
+            Ok(credentials) => {
+                self.load(&credentials);
+                self.last_reload_ms.store(now, Ordering::Release);
+            }
+            Err(_) => {
+                self.last_reload_ms.store(last, Ordering::Release);
+            }
         }
     }
 
