@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
@@ -9,7 +9,7 @@ use super::pb::sekai::*;
 use crate::db::sekai::SekaiDb;
 use crate::domain;
 use crate::sekai::action::ActionExecutor;
-use crate::sekai::schema::SchemaRegistry;
+use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, coordination, dataset, function, security};
 
@@ -17,6 +17,9 @@ pub struct SekaiServiceImpl {
     db: Arc<SekaiDb>,
     actions: ActionExecutor,
     security: Arc<SecurityChecker>,
+    schema: Arc<RwLock<SchemaRegistry>>,
+    schema_unavailable_error: Arc<RwLock<Option<String>>>,
+    schema_load_errors: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl SekaiServiceImpl {
@@ -27,10 +30,85 @@ impl SekaiServiceImpl {
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
+        let (types, schema_unavailable_error, schema_load_errors) =
+            match db.list_object_types_with_errors() {
+                Ok((types, errors)) => {
+                    for (kind, error) in &errors {
+                        tracing::error!(kind, %error, "failed to load schema type");
+                    }
+                    (types, None, errors)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to load schema types");
+                    (Vec::new(), Some(error), std::collections::HashMap::new())
+                }
+            };
+        let registry = SchemaRegistry::from_types(types);
+        let schema = Arc::new(RwLock::new(registry));
         Self {
             db,
             actions: ActionExecutor::new(),
             security,
+            schema,
+            schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
+            schema_load_errors: Arc::new(RwLock::new(schema_load_errors)),
+        }
+    }
+
+    fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
+        self.recover_schema_registry()?;
+        let errors = self
+            .schema_load_errors
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        if let Some(error) = errors.get(kind) {
+            return Err(Status::internal(format!(
+                "schema type {kind} unavailable: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn recover_schema_registry(&self) -> Result<(), Status> {
+        let current_error = self
+            .schema_unavailable_error
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .clone();
+        if current_error.is_none() {
+            return Ok(());
+        }
+
+        match self.db.list_object_types_with_errors() {
+            Ok((types, errors)) => {
+                for (kind, error) in &errors {
+                    tracing::error!(kind, %error, "failed to load schema type");
+                }
+                *self
+                    .schema
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))? =
+                    SchemaRegistry::from_types(types);
+                *self
+                    .schema_load_errors
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))? = errors;
+                *self
+                    .schema_unavailable_error
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))? = None;
+                Ok(())
+            }
+            Err(error) => {
+                *self
+                    .schema_unavailable_error
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))? =
+                    Some(error.clone());
+                Err(Status::internal(format!(
+                    "schema registry unavailable: {error}"
+                )))
+            }
         }
     }
 }
@@ -80,6 +158,23 @@ fn check_write(
         return Err(Status::permission_denied("write denied"));
     }
     Ok(())
+}
+
+fn check_schema_admin(
+    security: &SecurityChecker,
+    kind: &str,
+    principals: &[String],
+) -> Result<(), Status> {
+    let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+        || security.can_admin("schema", &refs)
+        || security.can_admin(&schema_object_id(kind), &refs)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("schema admin required"))
 }
 
 fn principal_matches(owner_principal: &str, principals: &[String]) -> bool {
@@ -169,6 +264,64 @@ fn from_proto_obj(o: &Object) -> domain::Object {
         created: o.created,
         updated: o.updated,
     }
+}
+
+fn to_proto_schema_type(object_type: &schema::ObjectType) -> ObjectType {
+    ObjectType {
+        kind: object_type.kind.clone(),
+        description: object_type.description.clone(),
+        properties: object_type
+            .properties
+            .iter()
+            .map(to_proto_property_def)
+            .collect(),
+        is_builtin: object_type.is_builtin,
+    }
+}
+
+fn to_proto_property_def(property: &schema::PropertyDef) -> PropertyDef {
+    PropertyDef {
+        name: property.name.clone(),
+        r#type: property.prop_type.as_str().to_string(),
+        required: property.required,
+        description: property.description.clone(),
+        enum_values: property.enum_values.clone(),
+        link_kind: property.link_kind.clone(),
+        compute_expr: property.compute_expr.clone(),
+    }
+}
+
+fn from_proto_schema_type(object_type: &ObjectType) -> Result<schema::ObjectType, Status> {
+    let properties = object_type
+        .properties
+        .iter()
+        .map(from_proto_property_def)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(schema::ObjectType {
+        kind: object_type.kind.clone(),
+        description: object_type.description.clone(),
+        properties,
+        is_builtin: object_type.is_builtin,
+    })
+}
+
+fn from_proto_property_def(property: &PropertyDef) -> Result<schema::PropertyDef, Status> {
+    let prop_type = schema::PropertyType::parse(&property.r#type).ok_or_else(|| {
+        Status::invalid_argument(format!("unknown property type: {}", property.r#type))
+    })?;
+    Ok(schema::PropertyDef {
+        name: property.name.clone(),
+        prop_type,
+        required: property.required,
+        description: property.description.clone(),
+        enum_values: property.enum_values.clone(),
+        link_kind: property.link_kind.clone(),
+        compute_expr: property.compute_expr.clone(),
+    })
+}
+
+fn schema_object_id(kind: &str) -> String {
+    format!("schema:{kind}")
 }
 
 fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
@@ -589,7 +742,10 @@ impl SekaiService for SekaiServiceImpl {
         }
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
-        SchemaRegistry::new()
+        self.require_schema_kind_loaded(&domain_obj.kind)?;
+        self.schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
         self.db
@@ -622,8 +778,17 @@ impl SekaiService for SekaiServiceImpl {
             .into_inner()
             .object
             .ok_or(Status::invalid_argument("object required"))?;
+        if obj.id.is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
+        self.require_schema_kind_loaded(&domain_obj.kind)?;
+        self.schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .validate(&domain_obj)
+            .map_err(Status::invalid_argument)?;
         self.db
             .update_object(&domain_obj)
             .map_err(Status::internal)?;
@@ -795,9 +960,101 @@ impl SekaiService for SekaiServiceImpl {
     }
     async fn list_schema_types(
         &self,
-        _req: Request<ListSchemaTypesRequest>,
+        req: Request<ListSchemaTypesRequest>,
     ) -> Result<Response<ListSchemaTypesResponse>, Status> {
-        Ok(Response::new(ListSchemaTypesResponse { types: vec![] }))
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let types = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .all()
+            .iter()
+            .filter(|object_type| {
+                check_read(
+                    &self.security,
+                    &schema_object_id(&object_type.kind),
+                    &principals,
+                )
+                .is_ok()
+            })
+            .map(to_proto_schema_type)
+            .collect();
+        Ok(Response::new(ListSchemaTypesResponse { types }))
+    }
+    async fn create_schema_type(
+        &self,
+        req: Request<CreateSchemaTypeRequest>,
+    ) -> Result<Response<CreateSchemaTypeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let object_type = req
+            .into_inner()
+            .r#type
+            .ok_or(Status::invalid_argument("schema type required"))?;
+        let parsed = from_proto_schema_type(&object_type)?;
+        check_schema_admin(&self.security, &parsed.kind, &principals)?;
+        {
+            let registry = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            schema::validate_object_type_definition(&parsed, registry.get(&parsed.kind))
+                .map_err(Status::invalid_argument)?;
+        }
+        self.db
+            .upsert_object_type(&parsed)
+            .map_err(Status::internal)?;
+        self.schema
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .register(parsed.clone());
+        self.schema_load_errors
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .remove(&parsed.kind);
+        Ok(Response::new(CreateSchemaTypeResponse {
+            r#type: Some(to_proto_schema_type(&parsed)),
+        }))
+    }
+    async fn delete_schema_type(
+        &self,
+        req: Request<DeleteSchemaTypeRequest>,
+    ) -> Result<Response<DeleteSchemaTypeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let kind = req.into_inner().kind;
+        if kind.trim().is_empty() {
+            return Err(Status::invalid_argument("kind required"));
+        }
+        check_schema_admin(&self.security, &kind, &principals)?;
+        {
+            let registry = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            if registry
+                .get(&kind)
+                .map(|object_type| object_type.is_builtin)
+                .unwrap_or(false)
+            {
+                return Err(Status::invalid_argument(
+                    "cannot delete builtin schema type",
+                ));
+            }
+        }
+        self.db
+            .delete_object_type(&kind)
+            .map_err(Status::internal)?;
+        self.schema
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .remove(&kind);
+        self.schema_load_errors
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .remove(&kind);
+        Ok(Response::new(DeleteSchemaTypeResponse {}))
     }
     async fn execute_action(
         &self,
@@ -2076,6 +2333,59 @@ mod tests {
         req
     }
 
+    fn widget_schema_type() -> ObjectType {
+        ObjectType {
+            kind: "widget".into(),
+            description: "A widget".into(),
+            properties: vec![
+                PropertyDef {
+                    name: "name".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    description: "".into(),
+                    enum_values: vec![],
+                    link_kind: "".into(),
+                    compute_expr: "".into(),
+                },
+                PropertyDef {
+                    name: "color".into(),
+                    r#type: "enum".into(),
+                    required: false,
+                    description: "".into(),
+                    enum_values: vec!["red".into(), "blue".into()],
+                    link_kind: "".into(),
+                    compute_expr: "".into(),
+                },
+            ],
+            is_builtin: false,
+        }
+    }
+
+    fn widget_object(id: &str, properties: HashMap<String, String>) -> Object {
+        Object {
+            id: id.into(),
+            kind: "widget".into(),
+            name: "widget".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties,
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    fn grant_schema_admin(svc: &SekaiServiceImpl) {
+        let grant = security::Grant {
+            id: format!("schema-admin-{}", uuid::Uuid::new_v4().simple()),
+            object_id: "schema".into(),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+
     #[tokio::test]
     async fn dataset_rpc_round_trip() {
         let svc = service();
@@ -2204,6 +2514,286 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(executed.result.unwrap().aggregates["total"], "5");
+    }
+
+    #[tokio::test]
+    async fn schema_type_enforces_create_and_update() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let created = svc
+            .create_schema_type(with_principal(CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(created.r#type.unwrap().kind, "widget");
+
+        let missing_required = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(widget_object("w1", HashMap::new())),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_required.code(), tonic::Code::InvalidArgument);
+        assert!(missing_required.message().contains("name"));
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(widget_object(
+                "w1",
+                HashMap::from([
+                    ("name".into(), "first".into()),
+                    ("color".into(), "red".into()),
+                ]),
+            )),
+        }))
+        .await
+        .unwrap();
+
+        let invalid_update = svc
+            .update_object(with_principal(UpdateObjectRequest {
+                object: Some(widget_object(
+                    "w1",
+                    HashMap::from([
+                        ("name".into(), "first".into()),
+                        ("color".into(), "green".into()),
+                    ]),
+                )),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_update.code(), tonic::Code::InvalidArgument);
+        assert!(invalid_update.message().contains("color"));
+    }
+
+    #[tokio::test]
+    async fn untyped_kind_still_writes_and_schema_types_list() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "loose-1".into(),
+                kind: "loose".into(),
+                name: "loose".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let listed = svc
+            .list_schema_types(with_principal(ListSchemaTypesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            listed
+                .types
+                .iter()
+                .any(|object_type| object_type.kind == "widget" && !object_type.is_builtin)
+        );
+        assert!(
+            listed
+                .types
+                .iter()
+                .any(|object_type| object_type.kind == "namespace" && object_type.is_builtin)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_schema_types_requires_principal() {
+        let svc = service();
+        let err = svc
+            .list_schema_types(Request::new(ListSchemaTypesRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn delete_schema_type_rejects_builtin() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let err = svc
+            .delete_schema_type(with_principal(DeleteSchemaTypeRequest {
+                kind: "namespace".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("builtin"));
+    }
+
+    #[tokio::test]
+    async fn create_schema_type_requires_schema_admin() {
+        let svc = service();
+        let err = svc
+            .create_schema_type(with_principal(CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        db.migrate_schema_types().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                ("broken", "Broken schema", "[", 1_i64),
+            )
+            .unwrap();
+        }
+        let svc = SekaiServiceImpl::new(db.clone());
+        grant_schema_admin(&svc);
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "loose-1".into(),
+                kind: "loose".into(),
+                name: "loose".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: "broken-1".into(),
+                    kind: "broken".into(),
+                    name: "broken".into(),
+                    namespace: "".into(),
+                    external_id: "".into(),
+                    properties: HashMap::new(),
+                    created: 0,
+                    updated: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("broken"));
+
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "broken".into(),
+                description: "Repaired".into(),
+                properties: vec![],
+                is_builtin: false,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "broken-2".into(),
+                kind: "broken".into(),
+                name: "broken".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_table_read_failure_blocks_object_writes() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "CREATE TABLE sekai_object_types (kind TEXT PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
+        }
+        let svc = SekaiServiceImpl::new(db.clone());
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: "loose-1".into(),
+                    kind: "loose".into(),
+                    name: "loose".into(),
+                    namespace: "".into(),
+                    external_id: "".into(),
+                    properties: HashMap::new(),
+                    created: 0,
+                    updated: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("schema registry unavailable"));
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE sekai_object_types", []).unwrap();
+        }
+        db.migrate_schema_types().unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "loose-2".into(),
+                kind: "loose".into(),
+                name: "loose".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_schema_type_removes_enforcement() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.delete_schema_type(with_principal(DeleteSchemaTypeRequest {
+            kind: "widget".into(),
+        }))
+        .await
+        .unwrap();
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(widget_object("w1", HashMap::new())),
+        }))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

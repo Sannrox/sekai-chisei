@@ -26,6 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.migrate_functions();
     db.migrate_grants();
     db.migrate_audit();
+    db.migrate_schema_types()
+        .expect("failed to migrate schema types");
     let _ = db.migrate_chisei();
     db.migrate_principal_credentials()
         .map_err(std::io::Error::other)?;
