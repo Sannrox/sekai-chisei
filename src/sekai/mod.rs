@@ -5,6 +5,7 @@ pub mod compute;
 pub mod coordination;
 pub mod dataset;
 pub mod escalation;
+pub mod credentials;
 pub mod function;
 pub mod learning;
 pub mod lineage;

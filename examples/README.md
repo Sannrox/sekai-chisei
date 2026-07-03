@@ -80,10 +80,11 @@ The example honors the same environment variables as the server:
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | Port to connect to |
 | `SEKAI_SOCKET` | unset | Unix socket path to connect to instead of TCP |
-| `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request |
+| `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request (deprecated fallback to principal `root`; prefer per-principal tokens from `sekaictl credential ...`) |
+| `SEKAI_PRINCIPAL` | `demo-client` | Caller identity (`x-principal`) sent in request metadata |
 | `DEMO_MODEL` | `ollama/llama3.2:latest` | Model used for the live execute step |
 
-It always sends `x-principal: demo-client` as the caller identity.
+It sends caller identity via `x-principal` using `SEKAI_PRINCIPAL`.
 
 > The model provider is configured on the **server**, not the client. The server
 > routes `ollama/<tag>` models to its `OLLAMA_URL`, so the Ollama server must be

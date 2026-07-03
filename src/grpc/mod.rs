@@ -15,163 +15,264 @@ pub mod pb {
     }
 }
 
+use std::path::Path;
+use std::sync::Arc;
+
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
-use std::path::Path;
-use std::sync::Arc;
+use crate::sekai::credentials::PrincipalCredentialStore;
 use subtle::ConstantTimeEq;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Server;
-use tonic::{Request, Status};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{metadata::MetadataValue, Request, Status};
 
 #[derive(Clone)]
-pub struct AuthInterceptor {
-    token: Option<String>,
+pub struct TokenAuthInterceptor {
+    store: Arc<PrincipalCredentialStore>,
+    db: Arc<SekaiDb>,
+    legacy_root_token: Option<String>,
 }
 
-impl AuthInterceptor {
-    pub fn new(token: Option<String>) -> Self {
-        Self { token }
+impl TokenAuthInterceptor {
+    pub fn new(
+        store: Arc<PrincipalCredentialStore>,
+        db: Arc<SekaiDb>,
+        legacy_root_token: Option<String>,
+    ) -> Self {
+        Self {
+            store,
+            db,
+            legacy_root_token,
+        }
+    }
+
+    fn resolve_principal(&self, token: &str) -> Option<String> {
+        if let Some(principal) = self.store.resolve(token) {
+            return Some(principal);
+        }
+        self.store.maybe_reload(&self.db);
+        if let Some(principal) = self.store.resolve(token) {
+            return Some(principal);
+        }
+        self.legacy_root_token
+            .as_ref()
+            .filter(|root| token.as_bytes().ct_eq(root.as_bytes()).into())
+            .map(|_| "root".to_string())
+    }
+
+    fn parse_bearer_token(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
+        let raw = metadata.get("authorization")?.to_str().ok()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(raw.strip_prefix("Bearer ").unwrap_or(raw).trim().to_string())
     }
 }
 
-impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        let Some(expected) = &self.token else {
-            return Ok(req);
+impl tonic::service::Interceptor for TokenAuthInterceptor {
+    fn call<T>(&mut self, mut req: Request<T>) -> Result<Request<T>, Status> {
+        let Some(token) = Self::parse_bearer_token(req.metadata()) else {
+            return Err(Status::unauthenticated("missing authorization"));
         };
-        match req.metadata().get("authorization") {
-            Some(val) => {
-                let val = val
-                    .to_str()
-                    .map_err(|_| Status::unauthenticated("invalid auth header"))?;
-                let token = val.strip_prefix("Bearer ").unwrap_or(val);
-                if token.as_bytes().ct_eq(expected.as_bytes()).into() {
-                    Ok(req)
-                } else {
-                    Err(Status::unauthenticated("invalid token"))
-                }
+
+        let principal = self
+            .resolve_principal(&token)
+            .ok_or_else(|| Status::unauthenticated("invalid token"))?;
+
+        while req.metadata_mut().remove("x-principal").is_some() {}
+        req.metadata_mut()
+            .insert(
+                "x-principal",
+                MetadataValue::from_str(&principal)
+                    .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
+            )
+            .ok();
+        Ok(req)
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalInterceptor;
+
+impl LocalInterceptor {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl tonic::service::Interceptor for LocalInterceptor {
+    fn call<T>(&mut self, mut req: Request<T>) -> Result<Request<T>, Status> {
+        if req.metadata().get("x-principal").is_none() {
+            req.metadata_mut().insert("x-principal", MetadataValue::from_static("local"));
+        }
+        Ok(req)
+    }
+}
+
+pub fn tls_policy(
+    bind_addr: &str,
+    config: &Config,
+) -> Result<Option<(String, String)>, String> {
+    let cert = config.tls_cert.clone().filter(|value| !value.trim().is_empty());
+    let key = config.tls_key.clone().filter(|value| !value.trim().is_empty());
+
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some((cert, key))),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("both SEKAI_TLS_CERT and SEKAI_TLS_KEY are required for TLS".to_string())
+        }
+        (None, None) => {
+            if bind_addr == "0.0.0.0" && !config.allow_plaintext {
+                Err("0.0.0.0 requires TLS certificates; set SEKAI_TLS_CERT, SEKAI_TLS_KEY, or SEKAI_ALLOW_PLAINTEXT=1".to_string())
+            } else {
+                Ok(None)
             }
-            None => Err(Status::unauthenticated("missing authorization")),
         }
     }
 }
 
 pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
-    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
-    let serve_tcp = config.auth_token.is_some() || insecure;
-    let Some(socket_path) = config.sekai_socket.clone() else {
-        if config.auth_token.is_none() && !insecure {
-            return Err(
-                "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev".into(),
-            );
-        }
-        return run_tcp(port, db, config).await;
-    };
+    db.migrate_principal_credentials()?;
 
-    if !serve_tcp {
-        println!("gRPC TCP listener disabled; serving local UDS only");
-    }
+    let credential_store = Arc::new(PrincipalCredentialStore::new());
+    let active_credentials = db.list_active_credentials().unwrap_or_default();
+    credential_store.load(&active_credentials);
 
-    let interceptor = AuthInterceptor::new(config.auth_token.clone());
-    let budget = Arc::new(BudgetTracker::new());
-    let sekai_svc = Arc::new(sekai_service::SekaiServiceImpl::new(db.clone()));
-    let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        db,
-        config.clone(),
-        budget,
-    ));
-    if config.scoring_enabled {
-        println!(
-            "scoring job enabled (model={}, interval={}s, batch={})",
-            config.scoring_model, config.scoring_interval_secs, config.scoring_batch_size
+    let token_auth_mode = config.auth_token.is_some() || credential_store.has_any();
+    if config.auth_token.is_some() {
+        eprintln!(
+            "warning: SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`"
         );
-        tokio::spawn(chisei_svc.scoring_job().run_loop());
     }
 
-    let uds_server = serve_uds(
-        socket_path,
-        sekai_svc.clone(),
-        chisei_svc.clone(),
-        interceptor.clone(),
-    );
-    if serve_tcp {
-        let tcp_server = serve_tcp_listener(port, config, sekai_svc, chisei_svc, interceptor);
-        tokio::select! {
-            result = tcp_server => result,
-            result = uds_server => result,
+    let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
+    let insecure = config.allow_plaintext || std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
+
+    if let Some(socket_path) = config.sekai_socket.clone() {
+        let uds_server = serve_uds(
+            socket_path,
+            sekai_svc.clone(),
+            chisei_svc.clone(),
+            LocalInterceptor::new(),
+        );
+
+        if token_auth_mode || insecure {
+            let tcp_server = run_tcp(
+                port,
+                &config,
+                sekai_svc,
+                chisei_svc,
+                token_auth_mode,
+                credential_store,
+                db,
+            );
+            return tokio::select! {
+                result = tcp_server => result,
+                result = uds_server => result,
+            };
         }
-    } else {
-        uds_server.await
+
+        return uds_server.await;
     }
+
+    if !token_auth_mode && !insecure {
+        return Err(std::io::Error::other(
+            "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
+        )
+        .into());
+    }
+
+    run_tcp(
+        port,
+        &config,
+        sekai_svc,
+        chisei_svc,
+        token_auth_mode,
+        credential_store,
+        db,
+    )
+    .await
 }
 
 async fn run_tcp(
     port: u16,
-    db: Arc<SekaiDb>,
-    config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
-    if config.auth_token.is_none() && !insecure {
-        return Err("SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev".into());
-    }
-    let interceptor = AuthInterceptor::new(config.auth_token.clone());
-    let budget = Arc::new(BudgetTracker::new());
-    let sekai_svc = Arc::new(sekai_service::SekaiServiceImpl::new(db.clone()));
-    let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        db,
-        config.clone(),
-        budget,
-    ));
-    if config.scoring_enabled {
-        println!(
-            "scoring job enabled (model={}, interval={}s, batch={})",
-            config.scoring_model, config.scoring_interval_secs, config.scoring_batch_size
-        );
-        tokio::spawn(chisei_svc.scoring_job().run_loop());
-    }
-    serve_tcp_listener(port, config, sekai_svc, chisei_svc, interceptor).await
-}
-
-async fn serve_tcp_listener(
-    port: u16,
-    config: Config,
+    config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
-    interceptor: AuthInterceptor,
+    token_auth_mode: bool,
+    credential_store: Arc<PrincipalCredentialStore>,
+    db: Arc<SekaiDb>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = if config.auth_token.is_some() {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    };
-    let addr = format!("{}:{}", bind_addr, port).parse()?;
-    println!("gRPC server listening on {}", addr);
+    let bind_addr = if token_auth_mode { "0.0.0.0" } else { "127.0.0.1" };
 
-    Server::builder()
+    if token_auth_mode {
+        serve_tcp_listener(
+            bind_addr,
+            port,
+            config,
+            sekai_svc,
+            chisei_svc,
+            TokenAuthInterceptor::new(credential_store, db, config.auth_token.clone()),
+        )
+        .await
+    } else {
+        serve_tcp_listener(
+            bind_addr,
+            port,
+            config,
+            sekai_svc,
+            chisei_svc,
+            LocalInterceptor::new(),
+        )
+        .await
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_tcp_listener<I>(
+    bind_addr: &str,
+    port: u16,
+    config: &Config,
+    sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
+    chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
+    interceptor: I,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+{
+    let maybe_tls = tls_policy(bind_addr, config).map_err(std::io::Error::other)?;
+    let addr = format!("{}:{}", bind_addr, port).parse()?;
+    println!("gRPC server listening on {addr}");
+
+    let mut server = Server::builder();
+    if let Some((cert, key)) = maybe_tls {
+        let identity = Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
+        server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
+    }
+
+    Ok(server
         .add_service(InterceptedService::new(
-            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc),
+            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             interceptor.clone(),
         ))
         .add_service(InterceptedService::new(
-            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc),
-            interceptor.clone(),
+            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc.clone()),
+            interceptor,
         ))
         .serve(addr)
-        .await?;
-
-    Ok(())
+        .await
+        .map_err(Into::into))
 }
 
 async fn serve_uds(
     socket_path: String,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
-    interceptor: AuthInterceptor,
+    interceptor: LocalInterceptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(&socket_path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -187,19 +288,43 @@ async fn serve_uds(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    println!("gRPC server listening on unix://{}", socket_path);
+    println!("gRPC server listening on unix://{socket_path}");
 
-    Server::builder()
+    Ok(tonic::transport::Server::builder()
         .add_service(InterceptedService::new(
-            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc),
+            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             interceptor.clone(),
         ))
         .add_service(InterceptedService::new(
-            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc),
-            interceptor.clone(),
+            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc.clone()),
+            interceptor,
         ))
         .serve_with_incoming(UnixListenerStream::new(listener))
-        .await?;
+        .await?)
+}
 
-    Ok(())
+fn build_services(
+    config: &Config,
+    db: Arc<SekaiDb>,
+) -> (
+    Arc<sekai_service::SekaiServiceImpl>,
+    Arc<chisei_service::ChiseiServiceImpl>,
+) {
+    let budget = Arc::new(BudgetTracker::new());
+    let sekai_svc = Arc::new(sekai_service::SekaiServiceImpl::new(db.clone()));
+    let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
+        db,
+        config.clone(),
+        budget,
+    ));
+
+    if config.scoring_enabled {
+        println!(
+            "scoring job enabled (model={}, interval={}s, batch={})",
+            config.scoring_model, config.scoring_interval_secs, config.scoring_batch_size
+        );
+        tokio::spawn(chisei_svc.scoring_job().run_loop());
+    }
+
+    (sekai_svc, chisei_svc)
 }
