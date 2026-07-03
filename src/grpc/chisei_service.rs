@@ -83,102 +83,116 @@ fn split_csv_property(value: Option<&String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+struct FinishStreamedExecution<'a> {
+    db: &'a SekaiDb,
+    evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
+    request_id: &'a str,
+    namespace: &'a str,
+    enriched_spec: &'a str,
+    original_spec: Option<&'a str>,
+    resolved_model: &'a str,
+    sampled: bool,
+    sample_rate: f64,
+    sample_reason: &'a str,
+    scoring_enabled: bool,
+    response: &'a PlannedChatResponse,
+}
+
+struct EvolveTaskRecord<'a> {
+    request_id: &'a str,
+    namespace: &'a str,
+    spec: &'a str,
+    original_spec: Option<&'a str>,
+    status: &'a str,
+    tokens_used: i32,
+}
+
 fn record_evolve_task_on(
     db: &SekaiDb,
     evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
-    request_id: &str,
-    namespace: &str,
-    spec: &str,
-    original_spec: Option<&str>,
-    status: &str,
-    tokens_used: i32,
+    task: EvolveTaskRecord<'_>,
 ) -> Result<(), String> {
-    if request_id.is_empty() {
+    if task.request_id.is_empty() {
         return Ok(());
     }
     let mut history = evolve_history.lock().expect("evolve history poisoned");
-    let entry = history.entry(request_id.to_string()).or_insert_with(|| {
-        crate::chisei::evolve::TaskRecord {
-            id: request_id.to_string(),
-            spec: spec.to_string(),
-            status: status.to_string(),
-            namespace: namespace.to_string(),
-            tokens_used,
-            original_spec: original_spec.map(ToOwned::to_owned),
+    let entry = history
+        .entry(task.request_id.to_string())
+        .or_insert_with(|| crate::chisei::evolve::TaskRecord {
+            id: task.request_id.to_string(),
+            spec: task.spec.to_string(),
+            status: task.status.to_string(),
+            namespace: task.namespace.to_string(),
+            tokens_used: task.tokens_used,
+            original_spec: task.original_spec.map(ToOwned::to_owned),
             created: chrono::Utc::now().timestamp(),
-        }
-    });
-    entry.namespace = namespace.to_string();
-    entry.spec = spec.to_string();
-    entry.status = status.to_string();
-    entry.tokens_used = tokens_used;
-    entry.original_spec = original_spec.map(ToOwned::to_owned);
+        });
+    entry.namespace = task.namespace.to_string();
+    entry.spec = task.spec.to_string();
+    entry.status = task.status.to_string();
+    entry.tokens_used = task.tokens_used;
+    entry.original_spec = task.original_spec.map(ToOwned::to_owned);
     db.put_evolve_task(entry)?;
     Ok(())
 }
-
-#[allow(clippy::too_many_arguments)]
-fn finish_streamed_execution(
-    db: &SekaiDb,
-    evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
-    request_id: &str,
-    namespace: &str,
-    enriched_spec: &str,
-    original_spec: Option<&str>,
-    resolved_model: &str,
-    sampled: bool,
-    sample_rate: f64,
-    sample_reason: &str,
-    scoring_enabled: bool,
-    response: &PlannedChatResponse,
-) -> Result<(), String> {
+fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), String> {
     record_evolve_task_on(
-        db,
-        evolve_history,
-        request_id,
-        namespace,
-        enriched_spec,
-        original_spec,
-        "done",
-        response.input_tokens + response.output_tokens,
+        execution.db,
+        execution.evolve_history,
+        EvolveTaskRecord {
+            request_id: execution.request_id,
+            namespace: execution.namespace,
+            spec: execution.enriched_spec,
+            original_spec: execution.original_spec,
+            status: "done",
+            tokens_used: execution.response.input_tokens + execution.response.output_tokens,
+        },
     )?;
-    if sampled {
+    if execution.sampled {
         let mut evidence = HashMap::new();
-        evidence.insert("model".to_string(), resolved_model.to_string());
+        evidence.insert("model".to_string(), execution.resolved_model.to_string());
         evidence.insert(
             "input_tokens".to_string(),
-            response.input_tokens.to_string(),
+            execution.response.input_tokens.to_string(),
         );
         evidence.insert(
             "output_tokens".to_string(),
-            response.output_tokens.to_string(),
+            execution.response.output_tokens.to_string(),
         );
-        evidence.insert("stop_reason".to_string(), response.stop_reason.clone());
-        evidence.insert("sample_rate".to_string(), sample_rate.to_string());
-        let _ = db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.sampling".into(),
-            action: "sample_observed".into(),
-            reason: sample_reason.to_string(),
-            evidence,
-            target_id: request_id.to_string(),
-            outcome: "observed".into(),
-        });
-        if scoring_enabled {
-            let _ = db.put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                request_id: request_id.to_string(),
-                namespace: namespace.to_string(),
-                spec: enriched_spec.to_string(),
-                resolved_model: resolved_model.to_string(),
-                output_content: response.content.clone(),
-                sample_reason: sample_reason.to_string(),
-                input_tokens: response.input_tokens,
-                output_tokens: response.output_tokens,
-                stop_reason: response.stop_reason.clone(),
+        evidence.insert(
+            "stop_reason".to_string(),
+            execution.response.stop_reason.clone(),
+        );
+        evidence.insert("sample_rate".to_string(), execution.sample_rate.to_string());
+        let _ = execution
+            .db
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
                 timestamp: chrono::Utc::now().timestamp_millis(),
-                scored: false,
+                actor: "chisei.sampling".into(),
+                action: "sample_observed".into(),
+                reason: execution.sample_reason.to_string(),
+                evidence,
+                target_id: execution.request_id.to_string(),
+                outcome: "observed".into(),
             });
+        if execution.scoring_enabled {
+            let _ =
+                execution
+                    .db
+                    .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                        request_id: execution.request_id.to_string(),
+                        namespace: execution.namespace.to_string(),
+                        spec: execution.enriched_spec.to_string(),
+                        resolved_model: execution.resolved_model.to_string(),
+                        output_content: execution.response.content.clone(),
+                        sample_reason: execution.sample_reason.to_string(),
+                        input_tokens: execution.response.input_tokens,
+                        output_tokens: execution.response.output_tokens,
+                        stop_reason: execution.response.stop_reason.clone(),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        scored: false,
+                    });
         }
     }
     Ok(())
@@ -728,12 +742,14 @@ impl ChiseiServiceImpl {
         record_evolve_task_on(
             &self.db,
             &self.evolve_history,
-            request_id,
-            namespace,
-            spec,
-            original_spec,
-            status,
-            tokens_used,
+            EvolveTaskRecord {
+                request_id,
+                namespace,
+                spec,
+                original_spec,
+                status,
+                tokens_used,
+            },
         )
     }
 
@@ -1059,7 +1075,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .filter(|signal| signal.regressed);
         let preferred_model = regression_signal
             .as_ref()
-            .and_then(|_| effective_policy.as_ref())
+            .and(effective_policy.as_ref())
             .map(|policy| policy.default_model.as_str())
             .filter(|model| !model.is_empty())
             .unwrap_or(&r.preferred_model);
@@ -1574,20 +1590,21 @@ impl ChiseiService for ChiseiServiceImpl {
                         stop_reason: stop_reason.clone(),
                         provider: provider.clone(),
                     };
-                    let _ = finish_streamed_execution(
-                        &db,
-                        &evolve_history,
-                        &request_id,
-                        &namespace_hint,
-                        &enriched_spec,
-                        original_spec.as_deref(),
-                        &resolved_model,
+                    let execution = FinishStreamedExecution {
+                        db: &db,
+                        evolve_history: &evolve_history,
+                        request_id: &request_id,
+                        namespace: &namespace_hint,
+                        enriched_spec: &enriched_spec,
+                        original_spec: original_spec.as_deref(),
+                        resolved_model: &resolved_model,
                         sampled,
                         sample_rate,
-                        &sample_reason,
+                        sample_reason: &sample_reason,
                         scoring_enabled,
-                        &response,
-                    );
+                        response: &response,
+                    };
+                    let _ = finish_streamed_execution(&execution);
                     yield Ok(ExecutePlanStreamEvent {
                         content_delta: chunk.content_delta,
                         response: Some(response),
@@ -1619,20 +1636,21 @@ impl ChiseiService for ChiseiServiceImpl {
                     stop_reason,
                     provider,
                 };
-                let _ = finish_streamed_execution(
-                    &db,
-                    &evolve_history,
-                    &request_id,
-                    &namespace_hint,
-                    &enriched_spec,
-                    original_spec.as_deref(),
-                    &resolved_model,
+                let execution = FinishStreamedExecution {
+                    db: &db,
+                    evolve_history: &evolve_history,
+                    request_id: &request_id,
+                    namespace: &namespace_hint,
+                    enriched_spec: &enriched_spec,
+                    original_spec: original_spec.as_deref(),
+                    resolved_model: &resolved_model,
                     sampled,
                     sample_rate,
-                    &sample_reason,
+                    sample_reason: &sample_reason,
                     scoring_enabled,
-                    &response,
-                );
+                    response: &response,
+                };
+                let _ = finish_streamed_execution(&execution);
                 yield Ok(ExecutePlanStreamEvent {
                     content_delta: String::new(),
                     response: Some(response),

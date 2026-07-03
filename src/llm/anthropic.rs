@@ -253,19 +253,17 @@ fn parse_anthropic_sse_event(
                 }
                 *output_tokens = value["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32;
             }
-            "message_stop" => {
-                if !*emitted_done {
-                    *emitted_done = true;
-                    chunks.push(ChatStreamChunk {
-                        content_delta: String::new(),
-                        content: content.clone(),
-                        tool_calls: Vec::new(),
-                        input_tokens: *input_tokens,
-                        output_tokens: *output_tokens,
-                        stop_reason: stop_reason.clone(),
-                        done: true,
-                    });
-                }
+            "message_stop" if !*emitted_done => {
+                *emitted_done = true;
+                chunks.push(ChatStreamChunk {
+                    content_delta: String::new(),
+                    content: content.clone(),
+                    tool_calls: Vec::new(),
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    stop_reason: stop_reason.clone(),
+                    done: true,
+                });
             }
             _ => {}
         }
