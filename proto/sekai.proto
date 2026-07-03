@@ -158,6 +158,8 @@ message ObjectChange {
 message ActionRequest {
   string action = 1;
   map<string, string> params = 2;
+  // Advisory display label only. Authorization uses the authenticated caller
+  // principal from request metadata, not this field.
   string actor = 3;
 }
 
