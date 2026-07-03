@@ -164,6 +164,78 @@ pub async fn run_report(
     Ok(())
 }
 
+pub fn egress_rows(
+    db: &crate::db::sekai::SekaiDb,
+    after: i64,
+    limit: i32,
+) -> Result<Vec<Row>, String> {
+    let rows = db.query_rows(
+        "llm_calls",
+        &crate::sekai::dataset::RowQuery {
+            filters: vec![crate::sekai::dataset::RowFilter {
+                column: "timestamp_ms".to_string(),
+                op: "gte".to_string(),
+                value: after.to_string(),
+            }],
+            columns: vec![],
+            limit,
+            offset: 0,
+        },
+    )?;
+    Ok(rows.into_iter().map(|values| Row { values }).collect())
+}
+
+pub fn render_egress_html(rows: &[Row]) -> String {
+    let since = rows
+        .iter()
+        .filter_map(|row| row.values.get("timestamp_ms"))
+        .filter_map(|value| value.parse::<i64>().ok())
+        .min()
+        .unwrap_or(0);
+    render_dashboard(rows, since)
+}
+
+pub fn render_egress_csv(rows: &[Row]) -> String {
+    let mut columns = std::collections::BTreeSet::new();
+    for row in rows {
+        for key in row.values.keys() {
+            columns.insert(key.clone());
+        }
+    }
+    let ordered: Vec<_> = columns
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let mut out = String::new();
+    out.push_str(&ordered.join(","));
+    if !ordered.is_empty() {
+        out.push('\n');
+    }
+
+    for row in rows {
+        for (index, column) in ordered.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let value = row
+                .values
+                .get(column)
+                .map(|value| value.as_str())
+                .unwrap_or("");
+            /*
+            let escaped = value.replace('"', "\\"\"");
+            */
+            let escaped = value.replace('"', "\"\"");
+            out.push('"');
+            out.push_str(&escaped);
+            out.push('"');
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayReportRow> {
     let mut groups: BTreeMap<String, GatewayReportRow> = BTreeMap::new();
     for row in rows {

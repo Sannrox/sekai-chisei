@@ -143,6 +143,7 @@ mod tests {
             review_model: String::new(),
             egress_records: vec![],
             external_egress: true,
+            template_only: false,
         }
     }
 
