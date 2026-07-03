@@ -56,19 +56,15 @@ impl TokenAuthInterceptor {
         let token_hash = hash_gateway_key(token);
         let cached_principal = self.store.resolve(token);
 
-        match self.db.get_principal_credential(&token_hash) {
-            Ok(Some(credential)) => {
-                if cached_principal.as_deref() != Some(credential.principal.as_str()) {
+        if cached_principal.is_none() {
+            match self.db.get_principal_credential(&token_hash) {
+                Ok(Some(credential)) => {
                     self.store.load_credential(&credential);
+                    return Some(credential.principal);
                 }
-                return Some(credential.principal);
+                Ok(None) => return None,
+                Err(_) => return None,
             }
-            Ok(None) => {
-                if cached_principal.is_some() {
-                    self.store.remove_hash(&token_hash);
-                }
-            }
-            Err(_) => {}
         }
 
         if let Some(principal) = cached_principal {
@@ -189,53 +185,20 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
 
     if let Some(socket_path) = config.sekai_socket.clone() {
-        if effective_token_auth_mode {
-            let interceptor = TokenAuthInterceptor::new(
-                credential_store.clone(),
-                db.clone(),
-                config.auth_token.clone(),
-            );
-            let uds_server = serve_uds(
-                socket_path,
-                sekai_svc.clone(),
-                chisei_svc.clone(),
-                interceptor,
-            );
-
-            if insecure {
-                let tcp_server = run_tcp(
-                    port,
-                    &config,
-                    sekai_svc,
-                    chisei_svc,
-                    effective_token_auth_mode,
-                    credential_store,
-                    db,
-                );
-                return tokio::select! {
-                    result = tcp_server => result,
-                    result = uds_server => result,
-                };
-            }
-
-            return uds_server.await;
-        }
-
-        let interceptor = LocalInterceptor::new();
         let uds_server = serve_uds(
             socket_path,
             sekai_svc.clone(),
             chisei_svc.clone(),
-            interceptor,
+            LocalInterceptor::new(),
         );
 
-        if insecure {
+        if token_auth_mode || insecure {
             let tcp_server = run_tcp(
                 port,
                 &config,
                 sekai_svc,
                 chisei_svc,
-                token_auth_mode,
+                effective_token_auth_mode,
                 credential_store,
                 db,
             );
