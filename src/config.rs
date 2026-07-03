@@ -16,6 +16,9 @@ pub struct Config {
     pub scoring_interval_secs: u64,
     pub scoring_model: String,
     pub scoring_batch_size: i32,
+    pub default_data_class: String,
+    pub safe_egress_providers: Vec<String>,
+    pub leak_review_model: Option<String>,
 }
 
 impl Config {
@@ -35,6 +38,11 @@ impl Config {
             scoring_interval_secs: env("SCORING_INTERVAL_SECS", "60").parse().unwrap_or(60),
             scoring_model: env("SCORING_MODEL", "claude-opus-4-8"),
             scoring_batch_size: env("SCORING_BATCH_SIZE", "16").parse().unwrap_or(16),
+            default_data_class: env("CHISEI_DEFAULT_DATA_CLASS", "unclassified"),
+            safe_egress_providers: csv_env("CHISEI_SAFE_EGRESS_PROVIDERS"),
+            leak_review_model: env::var("LEAK_REVIEW_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 }
@@ -49,4 +57,14 @@ fn socket_path(key: &str, default: &str) -> Option<String> {
         Ok(value) => Some(value),
         Err(_) => Some(default.to_string()),
     }
+}
+
+fn csv_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
 }

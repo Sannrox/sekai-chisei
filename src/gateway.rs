@@ -628,6 +628,8 @@ async fn resolve_policy_preflight(
                 project: identity.project.clone(),
                 agent: identity.agent.clone(),
                 key_id: identity.key_id.clone(),
+                task_class: String::new(),
+                user_id: String::new(),
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
@@ -2260,6 +2262,7 @@ async fn run_gateway_pipeline_observation(
                 model,
                 runtime: context.provider.runtime_name().to_string(),
                 task_type: "gateway_llm_call".to_string(),
+                task_class: String::new(),
                 priority: 0,
             }),
         }))
@@ -3272,6 +3275,9 @@ mod tests {
             scoring_interval_secs: 60,
             scoring_model: "claude-opus-4-8".into(),
             scoring_batch_size: 16,
+            default_data_class: "unclassified".into(),
+            safe_egress_providers: vec![],
+            leak_review_model: None,
         }
     }
 
@@ -3338,6 +3344,7 @@ mod tests {
                 allowed_models: vec!["gpt-5.5".to_string(), "gpt-5.5-mini".to_string()],
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
+                data_class: String::new(),
             }))
             .await
             .unwrap();
@@ -3830,6 +3837,7 @@ mod tests {
                 allowed_models: vec!["gpt-5.5".to_string()],
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
+                data_class: String::new(),
             }))
             .await
             .unwrap();
@@ -4032,6 +4040,7 @@ mod tests {
                 allowed_models: vec!["gpt-5.5".to_string()],
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
+                data_class: String::new(),
             }))
             .await
             .unwrap();

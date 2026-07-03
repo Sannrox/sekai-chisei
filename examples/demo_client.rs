@@ -328,6 +328,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             project: "demo".to_string(),
             agent: "demo-client".to_string(),
             key_id: String::new(),
+            task_class: String::new(),
+            user_id: String::new(),
         })
         .await
     {
@@ -355,6 +357,7 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
                 runtime: String::new(),
                 task_type: "feature".to_string(),
                 priority: 5,
+                task_class: String::new(),
             }),
         })
         .await
@@ -417,6 +420,7 @@ async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
         system: "You are a terse engineering assistant. Answer in one or two sentences."
             .to_string(),
         max_tokens: 256,
+        task_class: String::new(),
     };
 
     // Step 1: plan the execution (budget + policy + enrichment, no model call yet).

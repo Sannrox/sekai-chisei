@@ -6,5 +6,6 @@ pub mod evolve;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;
+pub mod privacy;
 pub mod sampling;
 pub mod scoring;
