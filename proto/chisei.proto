@@ -14,6 +14,8 @@ message BudgetUsage {
 message PolicyResolution {
   string runtime = 1;
   string model = 2;
+  bool eval_regressed = 3;
+  string eval_regression_reason = 4;
 }
 
 message PipelineRequest {
@@ -301,17 +303,52 @@ message EvolveAbReport {
 
 // --- Request/Response wrappers ---
 
-message CheckBudgetRequest { string user_id = 1; int32 estimated_tokens = 2; }
+message CheckBudgetRequest {
+  string user_id = 1;
+  int32 estimated_tokens = 2;
+  string subject = 3;
+  string project = 4;
+  string agent = 5;
+  string key_id = 6;
+}
 message CheckBudgetResponse { bool allowed = 1; BudgetUsage usage = 2; }
-message RecordUsageRequest { string user_id = 1; int32 tokens_used = 2; }
+message RecordUsageRequest {
+  string user_id = 1;
+  int32 tokens_used = 2;
+  string subject = 3;
+  string project = 4;
+  string agent = 5;
+  string key_id = 6;
+}
 message RecordUsageResponse { BudgetUsage usage = 1; }
-message SetBudgetLimitRequest { string user_id = 1; int32 max_tokens = 2; string period_type = 3; }
+message SetBudgetLimitRequest {
+  string user_id = 1;
+  int32 max_tokens = 2;
+  string period_type = 3;
+  string subject = 4;
+  string project = 5;
+  string agent = 6;
+  string key_id = 7;
+}
 message SetBudgetLimitResponse {}
+
+message SetNamespacePolicyRequest {
+  string namespace = 1;
+  repeated string allowed_runtimes = 2;
+  repeated string allowed_models = 3;
+  string default_runtime = 4;
+  string default_model = 5;
+}
+message SetNamespacePolicyResponse { PolicyResolution resolution = 1; }
 
 message ResolvePolicyRequest {
   string namespace = 1;
   string preferred_runtime = 2;
   string preferred_model = 3;
+  string subject = 4;
+  string project = 5;
+  string agent = 6;
+  string key_id = 7;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 
@@ -319,10 +356,42 @@ message RunPipelineRequest { PipelineRequest request = 1; }
 message RunPipelineResponse { PipelineRunResult result = 1; }
 message ListPipelineRunsRequest { int32 limit = 1; }
 message ListPipelineRunsResponse { repeated PipelineRunResult runs = 1; }
+message SampleObservation {
+  string request_id = 1;
+  string namespace = 2;
+  string spec = 3;
+  string resolved_model = 4;
+  string output_content = 5;
+  string sample_reason = 6;
+  int32 input_tokens = 7;
+  int32 output_tokens = 8;
+  string stop_reason = 9;
+  int64 timestamp = 10;
+}
+message RecordSampleObservationRequest { SampleObservation observation = 1; }
+message RecordSampleObservationResponse { bool recorded = 1; }
+message GatewayAuditEvent {
+  string id = 1;
+  int64 timestamp = 2;
+  string actor = 3;
+  string action = 4;
+  string reason = 5;
+  map<string, string> evidence = 6;
+  string target_id = 7;
+  string outcome = 8;
+}
+message RecordGatewayAuditRequest { GatewayAuditEvent event = 1; }
+message RecordGatewayAuditResponse { GatewayAuditEvent event = 1; }
 message PlanExecutionRequest { ExecutionInput input = 1; }
 message PlanExecutionResponse { ExecutionPlan plan = 1; }
 message ExecutePlanRequest { ExecutionPlan plan = 1; }
 message ExecutePlanResponse { PlannedChatResponse response = 1; int64 executed_at = 2; }
+message ExecutePlanStreamEvent {
+  string content_delta = 1;
+  PlannedChatResponse response = 2;
+  bool done = 3;
+  int64 executed_at = 4;
+}
 
 message GetAffinityRequest {
   reserved 1;
@@ -386,13 +455,17 @@ service ChiseiService {
   rpc SetBudgetLimit(SetBudgetLimitRequest) returns (SetBudgetLimitResponse);
 
   // Model Policy
+  rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
   rpc ResolvePolicy(ResolvePolicyRequest) returns (ResolvePolicyResponse);
 
   // Pipeline
   rpc RunPipeline(RunPipelineRequest) returns (RunPipelineResponse);
   rpc ListPipelineRuns(ListPipelineRunsRequest) returns (ListPipelineRunsResponse);
+  rpc RecordSampleObservation(RecordSampleObservationRequest) returns (RecordSampleObservationResponse);
+  rpc RecordGatewayAudit(RecordGatewayAuditRequest) returns (RecordGatewayAuditResponse);
   rpc PlanExecution(PlanExecutionRequest) returns (PlanExecutionResponse);
   rpc ExecutePlan(ExecutePlanRequest) returns (ExecutePlanResponse);
+  rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);
