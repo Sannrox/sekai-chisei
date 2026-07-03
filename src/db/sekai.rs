@@ -90,7 +90,10 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
-    pub fn get_principal_credential(&self, token_hash: &str) -> Option<PrincipalCredential> {
+    pub fn get_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
@@ -98,7 +101,7 @@ impl SekaiDb {
             row_to_principal_credential,
         )
         .optional()
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
     }
 
     pub fn create_principal_credential(
