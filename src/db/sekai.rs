@@ -428,16 +428,16 @@ fn row_to_object(row: &rusqlite::Row) -> Object {
     }
 }
 
-fn row_to_principal_credential(row: &rusqlite::Row) -> PrincipalCredential {
-    PrincipalCredential {
-        id: row.get(0).unwrap_or_default(),
-        principal: row.get(1).unwrap_or_default(),
-        token_hash: row.get(2).unwrap_or_default(),
-        status: row.get(3).unwrap_or_default(),
-        created: row.get(4).unwrap_or_default(),
-        rotated_at: row.get(5).unwrap_or_default(),
-        revoked_at: row.get(6).unwrap_or_default(),
-    }
+fn row_to_principal_credential(row: &rusqlite::Row) -> Result<PrincipalCredential, rusqlite::Error> {
+    Ok(PrincipalCredential {
+        id: row.get(0)?,
+        principal: row.get(1)?,
+        token_hash: row.get(2)?,
+        status: row.get(3)?,
+        created: row.get(4)?,
+        rotated_at: row.get(5)?,
+        revoked_at: row.get(6)?,
+    })
 }
 
 fn row_to_link(row: &rusqlite::Row) -> Link {

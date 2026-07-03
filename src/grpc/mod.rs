@@ -17,6 +17,7 @@ pub mod pb {
 
 use std::path::Path;
 use std::sync::Arc;
+use std::str::FromStr;
 
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
@@ -73,7 +74,7 @@ impl TokenAuthInterceptor {
 }
 
 impl tonic::service::Interceptor for TokenAuthInterceptor {
-    fn call<T>(&mut self, mut req: Request<T>) -> Result<Request<T>, Status> {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
             return Err(Status::unauthenticated("missing authorization"));
         };
@@ -88,8 +89,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 "x-principal",
                 MetadataValue::from_str(&principal)
                     .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
-            )
-            .ok();
+            );
         Ok(req)
     }
 }
@@ -104,7 +104,7 @@ impl LocalInterceptor {
 }
 
 impl tonic::service::Interceptor for LocalInterceptor {
-    fn call<T>(&mut self, mut req: Request<T>) -> Result<Request<T>, Status> {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         if req.metadata().get("x-principal").is_none() {
             req.metadata_mut().insert("x-principal", MetadataValue::from_static("local"));
         }
@@ -254,7 +254,7 @@ where
         server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
     }
 
-    Ok(server
+    server
         .add_service(InterceptedService::new(
             pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             interceptor.clone(),
@@ -265,7 +265,7 @@ where
         ))
         .serve(addr)
         .await
-        .map_err(Into::into))
+        .map_err(Into::into)
 }
 
 async fn serve_uds(
