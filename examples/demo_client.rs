@@ -27,7 +27,7 @@ use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 
-use sekai_chisei::grpc::client::connect_sekai;
+use sekai_chisei::grpc::client::{GatewayClient, connect_sekai};
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
     ChatMessage, CheckBudgetRequest, ExecutePlanRequest, ExecutionInput, PipelineRequest,
@@ -64,8 +64,8 @@ impl Interceptor for DemoAuth {
     }
 }
 
-type Sekai = SekaiServiceClient<InterceptedService<tonic::transport::Channel, DemoAuth>>;
-type Chisei = ChiseiServiceClient<InterceptedService<tonic::transport::Channel, DemoAuth>>;
+type Sekai = SekaiServiceClient<InterceptedService<GatewayClient, DemoAuth>>;
+type Chisei = ChiseiServiceClient<InterceptedService<GatewayClient, DemoAuth>>;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -117,8 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let channel = connect_sekai(&endpoint).await?;
-    let mut sekai: Sekai = SekaiServiceClient::with_interceptor(channel.clone(), auth.clone());
-    let mut chisei: Chisei = ChiseiServiceClient::with_interceptor(channel, auth);
+    let mut sekai: Sekai =
+        SekaiServiceClient::new(InterceptedService::new(channel.clone(), auth.clone()));
+    let mut chisei: Chisei = ChiseiServiceClient::new(InterceptedService::new(channel, auth));
 
     // Distinct ids per run so repeated invocations don't collide.
     let run = &uuid::Uuid::new_v4().to_string()[..8];
