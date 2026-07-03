@@ -3,7 +3,7 @@ use crate::domain::{Link, Object};
 use std::collections::HashMap;
 
 type ExecuteFn =
-    Box<dyn Fn(&SekaiDb, &HashMap<String, String>) -> Result<String, String> + Send + Sync>;
+    Box<dyn Fn(&SekaiDb, &HashMap<String, String>, &str) -> Result<String, String> + Send + Sync>;
 type TargetIdsFn =
     Box<dyn Fn(&SekaiDb, &HashMap<String, String>) -> Result<Vec<String>, String> + Send + Sync>;
 
@@ -38,14 +38,14 @@ impl ActionExecutor {
         db: &SekaiDb,
         action: &str,
         params: &HashMap<String, String>,
-        _actor: &str,
+        actor: &str,
     ) -> Result<String, String> {
         let def = self
             .registry
             .get(action)
             .ok_or_else(|| format!("unknown action: {}", action))?;
         Self::validate_required(def, params)?;
-        (def.execute)(db, params)
+        (def.execute)(db, params, actor)
     }
 
     pub fn target_ids(
@@ -78,7 +78,7 @@ impl ActionExecutor {
                 name: "create_object".into(),
                 required: vec!["id".into(), "kind".into(), "name".into()],
                 target_ids: Box::new(|_, p| Ok(vec![p["id"].clone()])),
-                execute: Box::new(|db, p| {
+                execute: Box::new(|db, p, actor| {
                     let now = chrono::Utc::now().timestamp();
                     let obj = Object {
                         id: p["id"].clone(),
@@ -90,7 +90,7 @@ impl ActionExecutor {
                         created: now,
                         updated: now,
                     };
-                    db.create_object(&obj)?;
+                    db.create_object_with_audit(&obj, actor)?;
                     Ok(format!("created object {}", obj.id))
                 }),
             },
@@ -101,11 +101,12 @@ impl ActionExecutor {
                 name: "set_property".into(),
                 required: vec!["id".into(), "key".into(), "value".into()],
                 target_ids: Box::new(|_, p| Ok(vec![p["id"].clone()])),
-                execute: Box::new(|db, p| {
+                execute: Box::new(|db, p, actor| {
                     let mut obj = db.get_object(&p["id"])?.ok_or("object not found")?;
                     obj.properties.insert(p["key"].clone(), p["value"].clone());
                     obj.updated = chrono::Utc::now().timestamp();
-                    db.update_object(&obj)?;
+                    db.update_object_with_audit(&obj, actor)?
+                        .ok_or("object not found")?;
                     Ok(format!("set {}.{} = {}", obj.id, p["key"], p["value"]))
                 }),
             },
@@ -116,7 +117,7 @@ impl ActionExecutor {
                 name: "create_link".into(),
                 required: vec!["from_id".into(), "to_id".into(), "relation".into()],
                 target_ids: Box::new(|_, p| Ok(vec![p["from_id"].clone(), p["to_id"].clone()])),
-                execute: Box::new(|db, p| {
+                execute: Box::new(|db, p, _actor| {
                     let id = format!("{}->{}", p["from_id"], p["to_id"]);
                     let link = Link {
                         id: id.clone(),
@@ -139,7 +140,7 @@ impl ActionExecutor {
                     let link = db.get_link(&p["id"])?.ok_or("link not found")?;
                     Ok(vec![link.from_id, link.to_id])
                 }),
-                execute: Box::new(|db, p| {
+                execute: Box::new(|db, p, _actor| {
                     db.delete_link(&p["id"])?;
                     Ok(format!("deleted link {}", p["id"]))
                 }),
@@ -155,6 +156,7 @@ mod tests {
     #[test]
     fn test_create_object_action() {
         let db = SekaiDb::new(":memory:").unwrap();
+        db.migrate_audit();
         let exec = ActionExecutor::new();
         let params = HashMap::from([
             ("id".into(), "o1".into()),
@@ -168,11 +170,16 @@ mod tests {
         let msg = exec.execute(&db, "create_object", &params, "user").unwrap();
         assert!(msg.contains("o1"));
         assert!(db.get_object("o1").unwrap().is_some());
+        let changes = db.list_object_changes("o1", 10, 0).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "_created");
+        assert_eq!(changes[0].changed_by, "user");
     }
 
     #[test]
     fn test_set_property_action() {
         let db = SekaiDb::new(":memory:").unwrap();
+        db.migrate_audit();
         db.create_object(&Object {
             id: "o1".into(),
             kind: "namespace".into(),
@@ -193,6 +200,11 @@ mod tests {
         exec.execute(&db, "set_property", &params, "user").unwrap();
         let obj = db.get_object("o1").unwrap().unwrap();
         assert_eq!(obj.properties["language"], "rust");
+        let changes = db.list_object_changes("o1", 10, 0).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "properties.language");
+        assert_eq!(changes[0].new_value, "rust");
+        assert_eq!(changes[0].changed_by, "user");
     }
 
     #[test]
