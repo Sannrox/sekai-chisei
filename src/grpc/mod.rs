@@ -446,6 +446,56 @@ mod tests {
     }
 
     #[test]
+    fn token_auth_interceptor_rejects_revoked_cached_principal() {
+        let db = in_memory_db();
+        db.migrate_principal_credentials().unwrap();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("sekai-client-token");
+        db.create_principal_credential("agent-a", &token, 1)
+            .unwrap();
+
+        let credentials = db.list_active_credentials().unwrap();
+        store.load(&credentials);
+
+        let mut interceptor = TokenAuthInterceptor::new(
+            Arc::new(store),
+            db.clone(),
+            Some("legacy-root-token".to_string()),
+        );
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer sekai-client-token"),
+        );
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("attacker"));
+        let request = interceptor.call(request).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "agent-a"
+        );
+
+        db.revoke_principal_credential("agent-a").unwrap();
+
+        let mut revoked_request = Request::new(());
+        revoked_request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer sekai-client-token"),
+        );
+        revoked_request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("attacker"));
+        assert!(interceptor.call(revoked_request).is_err());
+    }
+
+    #[test]
     fn token_auth_interceptor_supports_legacy_root_token() {
         let db = in_memory_db();
         let store = Arc::new(PrincipalCredentialStore::new());
