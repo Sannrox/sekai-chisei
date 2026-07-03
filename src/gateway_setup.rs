@@ -736,6 +736,8 @@ mod tests {
     fn test_config() -> Config {
         Config {
             grpc_port: 0,
+            ops_port: None,
+            ops_bind: "127.0.0.1".into(),
             sekai_socket: None,
             db_path: ":memory:".into(),
             anthropic_api_key: None,

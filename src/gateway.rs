@@ -16,6 +16,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
+use tracing::{error, info, warn};
 
 use crate::gateway_keys::hash_gateway_key;
 use crate::grpc::client::{GatewayClient, connect_sekai};
@@ -108,8 +109,8 @@ impl GatewayConfig {
             );
         }
         if chisei_grpc_target.is_none() {
-            eprintln!(
-                "warning: CHISEI_GRPC_URL/SEKAI_SOCKET is unset; running without control-plane governance"
+            warn!(
+                "CHISEI_GRPC_URL/SEKAI_SOCKET is unset; running without control-plane governance"
             );
         }
         let default_project =
@@ -242,7 +243,7 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    println!("chisei-gateway listening on http://{}", bind_addr);
+    info!(addr = %bind_addr, "chisei-gateway listening");
     axum::serve(listener, app(config)).await?;
     Ok(())
 }
@@ -1451,7 +1452,7 @@ async fn governance_error(
             message,
         ))
     } else {
-        eprintln!("chisei-gateway governance fail-open: {message}");
+        warn!(message, "chisei-gateway governance fail-open");
         Ok(())
     }
 }
@@ -2017,7 +2018,7 @@ async fn record_usage_and_append(
                         }))
                         .await
                     {
-                        eprintln!("chisei-gateway usage record failed: {err}");
+                        warn!(error = %err, "chisei-gateway usage record failed");
                     }
                 }
             }
@@ -2091,14 +2092,14 @@ async fn record_usage_and_append(
             };
             let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
             if let Err(append_err) = append_result {
-                eprintln!("chisei-gateway llm_calls append failed: {append_err}");
+                warn!(error = %append_err, "chisei-gateway llm_calls append failed");
                 return;
             }
             link_work_unit_usage(&mut sekai, identity, context, &values).await;
             record_gateway_pipeline_decision(config, identity, context, pipeline_observation).await;
         }
         Err(err) => {
-            eprintln!("chisei-gateway usage append skipped; Chisei unavailable: {err}");
+            warn!(error = %err, "chisei-gateway usage append skipped; Chisei unavailable");
         }
     }
 }
@@ -2158,12 +2159,15 @@ async fn record_refusal_and_append(
             };
             let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
             if let Err(append_err) = append_result {
-                eprintln!("chisei-gateway refusal append failed: {append_err}");
+                warn!(error = %append_err, "chisei-gateway refusal append failed");
                 return;
             }
             link_work_unit_usage(&mut sekai, identity, context, &values).await;
         }
-        Err(err) => eprintln!("chisei-gateway refusal append skipped; Chisei unavailable: {err}"),
+        Err(err) => warn!(
+            error = %err,
+            "chisei-gateway refusal append skipped; Chisei unavailable"
+        ),
     }
 }
 
@@ -2328,7 +2332,7 @@ async fn record_sample_observation_if_needed(
         .await
     {
         Ok(_) => {}
-        Err(err) => eprintln!("chisei-gateway sample observation record failed: {err}"),
+        Err(err) => warn!(error = %err, "chisei-gateway sample observation record failed"),
     }
 }
 
@@ -2387,7 +2391,7 @@ async fn link_work_unit_usage(
     {
         Ok(id) => id,
         Err(err) => {
-            eprintln!("chisei-gateway work_unit object upsert failed: {err}");
+            warn!(error = %err, "chisei-gateway work_unit object upsert failed");
             return;
         }
     };
@@ -2404,7 +2408,7 @@ async fn link_work_unit_usage(
     {
         Ok(id) => id,
         Err(err) => {
-            eprintln!("chisei-gateway llm_call object create failed: {err}");
+            warn!(error = %err, "chisei-gateway llm_call object create failed");
             return;
         }
     };
@@ -2427,7 +2431,7 @@ async fn link_work_unit_usage(
         Err(err)
             if err.code() == tonic::Code::InvalidArgument
                 && err.message().contains("UNIQUE constraint failed") => {}
-        Err(err) => eprintln!("chisei-gateway work_unit usage link failed: {err}"),
+        Err(err) => warn!(error = %err, "chisei-gateway work_unit usage link failed"),
     }
 }
 
@@ -2567,7 +2571,7 @@ async fn record_gateway_event(
         && (err.code() != tonic::Code::InvalidArgument
             || !err.message().contains("UNIQUE constraint failed"))
     {
-        eprintln!("chisei-gateway audit target create failed: {err}");
+        error!(error = %err, "chisei-gateway audit target create failed");
         return;
     }
     let mut chisei = ChiseiServiceClient::new(channel);
@@ -2586,7 +2590,7 @@ async fn record_gateway_event(
         }))
         .await
     {
-        eprintln!("chisei-gateway audit decision record failed: {err}");
+        error!(error = %err, "chisei-gateway audit decision record failed");
     }
 }
 
@@ -3262,6 +3266,8 @@ mod tests {
     fn test_config() -> Config {
         Config {
             grpc_port: 0,
+            ops_port: None,
+            ops_bind: "127.0.0.1".into(),
             sekai_socket: None,
             db_path: ":memory:".into(),
             anthropic_api_key: Some("test-anthropic-key".into()),
