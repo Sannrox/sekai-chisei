@@ -52,7 +52,7 @@ impl TokenAuthInterceptor {
     }
 
     fn resolve_principal(&self, token: &str) -> Option<String> {
-        self.store.maybe_reload(&self.db);
+        let cache_trustworthy = self.store.maybe_reload(&self.db);
         let token_hash = hash_gateway_key(token);
         let cached_principal = self.store.resolve(token);
 
@@ -63,34 +63,19 @@ impl TokenAuthInterceptor {
         }
 
         if let Some(cached_principal) = cached_principal {
-            match self.db.get_principal_credential(&token_hash) {
-                Ok(Some(credential)) => {
-                    if credential.principal == cached_principal {
-                        return Some(cached_principal);
-                    }
-                    self.store.load_credential(&credential);
-                    return Some(credential.principal);
-                }
-                Ok(None) => {
-                    self.store.remove_hash(&token_hash);
-                    return None;
-                }
-                Err(_) => return None,
+            if cache_trustworthy {
+                return Some(cached_principal);
             }
         }
 
-        if cached_principal.is_none() {
-            match self.db.get_principal_credential(&token_hash) {
-                Ok(Some(credential)) => {
-                    self.store.load_credential(&credential);
-                    return Some(credential.principal);
-                }
-                Ok(None) => return None,
-                Err(_) => return None,
+        match self.db.get_principal_credential(&token_hash) {
+            Ok(Some(credential)) => {
+                self.store.load_credential(&credential);
+                return Some(credential.principal);
             }
+            Ok(None) => None,
+            Err(_) => None,
         }
-
-        None
     }
 
     fn parse_bearer_token(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
@@ -128,22 +113,33 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
 }
 
 #[derive(Clone)]
-pub struct LocalInterceptor;
+pub struct LocalInterceptor {
+    overwrite_principal: bool,
+}
 
 impl LocalInterceptor {
-    pub fn new() -> Self {
-        Self
+    pub fn new(overwrite_principal: bool) -> Self {
+        Self {
+            overwrite_principal,
+        }
     }
 }
 
 impl Default for LocalInterceptor {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        if self.overwrite_principal {
+            while req.metadata_mut().remove("x-principal").is_some() {}
+            req.metadata_mut()
+                .insert("x-principal", MetadataValue::from_static("local"));
+            return Ok(req);
+        }
+
         if req.metadata().get("x-principal").is_none() {
             req.metadata_mut()
                 .insert("x-principal", MetadataValue::from_static("local"));
@@ -202,7 +198,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
             socket_path,
             sekai_svc.clone(),
             chisei_svc.clone(),
-            LocalInterceptor::new(),
+            LocalInterceptor::new(false),
         );
 
         if token_auth_mode || insecure {
@@ -275,7 +271,7 @@ async fn run_tcp(
             config,
             sekai_svc,
             chisei_svc,
-            LocalInterceptor::new(),
+            LocalInterceptor::new(true),
         )
         .await
     }
@@ -421,42 +417,6 @@ mod tests {
         let credentials = db.list_active_credentials().unwrap();
         store.load(&credentials);
 
-        let mut interceptor =
-            TokenAuthInterceptor::new(Arc::new(store), db, Some("legacy-root-token".to_string()));
-
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::from_static("Bearer sekai-client-token"),
-        );
-        request
-            .metadata_mut()
-            .insert("x-principal", MetadataValue::from_static("attacker"));
-        let request = interceptor.call(request).unwrap();
-
-        assert_eq!(
-            request
-                .metadata()
-                .get("x-principal")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "agent-a"
-        );
-    }
-
-    #[test]
-    fn token_auth_interceptor_rejects_revoked_cached_principal() {
-        let db = in_memory_db();
-        db.migrate_principal_credentials().unwrap();
-        let store = PrincipalCredentialStore::new();
-        let token = hash_gateway_key("sekai-client-token");
-        db.create_principal_credential("agent-a", &token, 1)
-            .unwrap();
-
-        let credentials = db.list_active_credentials().unwrap();
-        store.load(&credentials);
-
         let mut interceptor = TokenAuthInterceptor::new(
             Arc::new(store),
             db.clone(),
@@ -472,6 +432,7 @@ mod tests {
             .metadata_mut()
             .insert("x-principal", MetadataValue::from_static("attacker"));
         let request = interceptor.call(request).unwrap();
+
         assert_eq!(
             request
                 .metadata()

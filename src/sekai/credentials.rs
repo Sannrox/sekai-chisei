@@ -13,6 +13,7 @@ const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = 5000;
 pub struct PrincipalCredentialStore {
     pub by_hash: RwLock<HashMap<String, String>>,
     pub last_reload_ms: AtomicI64,
+    pub last_data_version: AtomicI64,
 }
 
 impl PrincipalCredentialStore {
@@ -20,6 +21,7 @@ impl PrincipalCredentialStore {
         Self {
             by_hash: RwLock::new(HashMap::new()),
             last_reload_ms: AtomicI64::new(0),
+            last_data_version: AtomicI64::new(0),
         }
     }
 
@@ -52,28 +54,71 @@ impl PrincipalCredentialStore {
         self.resolve_hashed(&hash_gateway_key(token))
     }
 
-    pub fn maybe_reload(&self, db: &SekaiDb) {
+    pub fn maybe_reload(&self, db: &SekaiDb) -> bool {
+        if !self.refresh_on_principal_activity(db) {
+            return false;
+        }
+
         let now = chrono::Utc::now().timestamp_millis();
         let last = self.last_reload_ms.load(Ordering::Acquire);
         if now - last < CREDENTIAL_RELOAD_INTERVAL_MS {
-            return;
+            return true;
         }
         if self
             .last_reload_ms
             .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return;
+            return false;
         }
         match db.list_active_credentials() {
             Ok(credentials) => {
                 self.load(&credentials);
                 self.last_reload_ms.store(now, Ordering::Release);
+                true
             }
             Err(_) => {
                 self.last_reload_ms.store(last, Ordering::Release);
+                false
             }
         }
+    }
+
+    fn refresh_on_principal_activity(&self, db: &SekaiDb) -> bool {
+        if let Ok(activity_epoch) = db.principal_credentials_activity_epoch() {
+            let last_activity_epoch = self.last_data_version.load(Ordering::Acquire);
+            if activity_epoch != last_activity_epoch
+                && self
+                    .last_data_version
+                    .compare_exchange(
+                        last_activity_epoch,
+                        activity_epoch,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                match db.list_active_credentials() {
+                    Ok(credentials) => {
+                        self.load(&credentials);
+                        self.last_data_version
+                            .compare_exchange(
+                                last_activity_epoch,
+                                activity_epoch,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .ok();
+                        return true;
+                    }
+                    Err(_) => {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        false
     }
 
     pub fn has_any(&self) -> bool {
@@ -93,7 +138,7 @@ mod tests {
 
     fn test_db() -> SekaiDb {
         let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_principal_credentials();
+        db.migrate_principal_credentials().unwrap();
         db
     }
 

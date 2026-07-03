@@ -104,6 +104,22 @@ impl SekaiDb {
         .map_err(|error| error.to_string())
     }
 
+    pub fn principal_credentials_activity_epoch(&self) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(MAX(value), 0) FROM (
+                SELECT COALESCE(created, 0) AS value FROM sekai_principal_credentials
+                UNION ALL
+                SELECT COALESCE(rotated_at, 0) AS value FROM sekai_principal_credentials
+                UNION ALL
+                SELECT COALESCE(revoked_at, 0) AS value FROM sekai_principal_credentials
+            )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn create_principal_credential(
         &self,
         principal: &str,
@@ -573,7 +589,7 @@ mod tests {
     fn principal_credentials_round_trip() {
         let db = test_db();
         db.migrate_principal_credentials().unwrap();
-        let credential = db
+        let _credential = db
             .create_principal_credential("alice", "hash-alice", 1)
             .unwrap();
         let active = db.list_active_credentials().unwrap();
