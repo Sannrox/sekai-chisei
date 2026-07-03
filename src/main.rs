@@ -7,15 +7,22 @@ use tokio::signal;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
     println!("sekai-chisei v0.1.0");
-    println!(
-        "  grpc: {}:{}",
-        if config.auth_token.is_some() {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        },
-        config.grpc_port
-    );
+    if config.auth_token.is_some() || std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1" {
+        println!(
+            "  grpc: {}:{}",
+            if config.auth_token.is_some() {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            },
+            config.grpc_port
+        );
+    } else {
+        println!("  grpc: tcp disabled");
+    }
+    if let Some(socket_path) = &config.sekai_socket {
+        println!("  uds:  {}", socket_path);
+    }
     println!("  db:   {}", config.db_path);
     println!(
         "  llm:  anthropic={} openai={} ollama={}",
