@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
+use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use subtle::ConstantTimeEq;
 use tokio::net::UnixListener;
@@ -52,13 +53,35 @@ impl TokenAuthInterceptor {
 
     fn resolve_principal(&self, token: &str) -> Option<String> {
         self.store.maybe_reload(&self.db);
-        if let Some(principal) = self.store.resolve(token) {
+        let token_hash = hash_gateway_key(token);
+        let cached_principal = self.store.resolve(token);
+
+        match self.db.get_principal_credential(&token_hash) {
+            Ok(Some(credential)) => {
+                if cached_principal.as_deref() != Some(credential.principal.as_str()) {
+                    self.store.load_credential(&credential);
+                }
+                return Some(credential.principal);
+            }
+            Ok(None) => {
+                if cached_principal.is_some() {
+                    self.store.remove_hash(&token_hash);
+                }
+            }
+            Err(_) => {}
+        }
+
+        if let Some(principal) = cached_principal {
             return Some(principal);
         }
-        self.legacy_root_token
-            .as_ref()
-            .filter(|root| token.as_bytes().ct_eq(root.as_bytes()).into())
-            .map(|_| "root".to_string())
+
+        if let Some(principal) = self.legacy_root_token.as_ref() {
+            if token.as_bytes().ct_eq(principal.as_bytes()).into() {
+                return Some("root".to_string());
+            }
+        }
+
+        None
     }
 
     fn parse_bearer_token(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
@@ -148,28 +171,65 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
     db.migrate_principal_credentials()?;
+    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
 
     let credential_store = Arc::new(PrincipalCredentialStore::new());
     let active_credentials = db.list_active_credentials().unwrap_or_default();
     credential_store.load(&active_credentials);
 
     let token_auth_mode = config.auth_token.is_some() || credential_store.has_any();
+    let effective_token_auth_mode = token_auth_mode && !insecure;
+    if insecure && token_auth_mode {
+        eprintln!("SEKAI_INSECURE=1 disables token-auth mode for local development");
+    }
     if config.auth_token.is_some() {
         eprintln!("warning: SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`");
     }
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
-    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
 
     if let Some(socket_path) = config.sekai_socket.clone() {
+        if effective_token_auth_mode {
+            let interceptor = TokenAuthInterceptor::new(
+                credential_store.clone(),
+                db.clone(),
+                config.auth_token.clone(),
+            );
+            let uds_server = serve_uds(
+                socket_path,
+                sekai_svc.clone(),
+                chisei_svc.clone(),
+                interceptor,
+            );
+
+            if insecure {
+                let tcp_server = run_tcp(
+                    port,
+                    &config,
+                    sekai_svc,
+                    chisei_svc,
+                    effective_token_auth_mode,
+                    credential_store,
+                    db,
+                );
+                return tokio::select! {
+                    result = tcp_server => result,
+                    result = uds_server => result,
+                };
+            }
+
+            return uds_server.await;
+        }
+
+        let interceptor = LocalInterceptor::new();
         let uds_server = serve_uds(
             socket_path,
             sekai_svc.clone(),
             chisei_svc.clone(),
-            LocalInterceptor::new(),
+            interceptor,
         );
 
-        if token_auth_mode || insecure {
+        if insecure {
             let tcp_server = run_tcp(
                 port,
                 &config,
@@ -188,7 +248,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
         return uds_server.await;
     }
 
-    if !token_auth_mode && !insecure {
+    if !effective_token_auth_mode && !insecure {
         return Err(std::io::Error::other(
             "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
         )
@@ -200,7 +260,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
         &config,
         sekai_svc,
         chisei_svc,
-        token_auth_mode,
+        effective_token_auth_mode,
         credential_store,
         db,
     )
@@ -281,12 +341,15 @@ where
         .map_err(Into::into)
 }
 
-async fn serve_uds(
+async fn serve_uds<I>(
     socket_path: String,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
-    interceptor: LocalInterceptor,
-) -> Result<(), Box<dyn std::error::Error>> {
+    interceptor: I,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+{
     let path = Path::new(&socket_path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -340,4 +403,107 @@ fn build_services(
     }
 
     (sekai_svc, chisei_svc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::service::Interceptor;
+
+    fn in_memory_db() -> Arc<SekaiDb> {
+        Arc::new(SekaiDb::new(":memory:").unwrap())
+    }
+
+    fn base_config() -> Config {
+        let mut config = Config::from_env();
+        config.tls_cert = None;
+        config.tls_key = None;
+        config.allow_plaintext = false;
+        config
+    }
+
+    #[test]
+    fn token_auth_interceptor_enforces_missing_authorization() {
+        let db = in_memory_db();
+        let store = Arc::new(PrincipalCredentialStore::new());
+        let mut interceptor =
+            TokenAuthInterceptor::new(store, db, Some("legacy-root-token".to_string()));
+
+        let request = Request::new(());
+        assert!(interceptor.call(request).is_err());
+    }
+
+    #[test]
+    fn token_auth_interceptor_overwrites_client_principal() {
+        let db = in_memory_db();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("sekai-client-token");
+        db.create_principal_credential("agent-a", &token, 1)
+            .unwrap();
+
+        let credentials = db.list_active_credentials().unwrap();
+        store.load(&credentials);
+
+        let mut interceptor =
+            TokenAuthInterceptor::new(Arc::new(store), db, Some("legacy-root-token".to_string()));
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer sekai-client-token"),
+        );
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("attacker"));
+        let request = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "agent-a"
+        );
+    }
+
+    #[test]
+    fn token_auth_interceptor_supports_legacy_root_token() {
+        let db = in_memory_db();
+        let store = Arc::new(PrincipalCredentialStore::new());
+        let mut interceptor =
+            TokenAuthInterceptor::new(store, db, Some("legacy-root-token".to_string()));
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("legacy-root-token"),
+        );
+        let request = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "root"
+        );
+    }
+
+    #[test]
+    fn tls_policy_rejects_bind_without_certs() {
+        let config = base_config();
+        let err = tls_policy("0.0.0.0", &config).unwrap_err();
+        assert!(err.contains("SEKAI_TLS_CERT"));
+    }
+
+    #[test]
+    fn tls_policy_allows_plain_bind_with_plaintext_override() {
+        let mut config = base_config();
+        config.allow_plaintext = true;
+        assert!(tls_policy("0.0.0.0", &config).is_ok());
+    }
 }
