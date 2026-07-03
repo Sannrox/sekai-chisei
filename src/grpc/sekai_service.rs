@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
 use super::pb::sekai::sekai_service_server::SekaiService;
@@ -47,6 +48,14 @@ fn require_authenticated(principals: &[String]) -> Result<(), Status> {
         return Err(Status::unauthenticated("principal required"));
     }
     Ok(())
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn check_read(
@@ -1911,6 +1920,38 @@ impl SekaiService for SekaiServiceImpl {
             allowed: self.security.can_access(&inner.object_id, &refs),
         }))
     }
+    async fn record_decision(
+        &self,
+        req: Request<RecordDecisionRequest>,
+    ) -> Result<Response<RecordDecisionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let mut decision = req
+            .into_inner()
+            .decision
+            .ok_or_else(|| Status::invalid_argument("decision required"))?;
+        if decision.id.is_empty() {
+            decision.id = uuid::Uuid::new_v4().to_string();
+        }
+        if decision.timestamp <= 0 {
+            decision.timestamp = now_millis();
+        }
+        self.db
+            .record_decision(&audit::Decision {
+                id: decision.id.clone(),
+                timestamp: decision.timestamp,
+                actor: decision.actor.clone(),
+                action: decision.action.clone(),
+                reason: decision.reason.clone(),
+                evidence: decision.evidence.clone(),
+                target_id: decision.target_id.clone(),
+                outcome: decision.outcome.clone(),
+            })
+            .map_err(Status::internal)?;
+        Ok(Response::new(RecordDecisionResponse {
+            decision: Some(decision),
+        }))
+    }
     async fn list_decisions(
         &self,
         req: Request<ListDecisionsRequest>,
@@ -2226,6 +2267,27 @@ mod tests {
             .into_inner();
         assert!(access.allowed);
 
+        let recorded = svc
+            .record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: "".into(),
+                    timestamp: 0,
+                    actor: "tester".into(),
+                    action: "gateway.budget_denied".into(),
+                    reason: "budget exceeded".into(),
+                    evidence: HashMap::from([("user_id".into(), "agent:codex-app".into())]),
+                    target_id: "o1".into(),
+                    outcome: "denied".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert!(!recorded.id.is_empty());
+        assert!(recorded.timestamp > 0);
+
         let listed = svc
             .list_decisions(with_principal(ListDecisionsRequest {
                 actor: "tester".into(),
@@ -2236,7 +2298,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(listed.decisions.len(), 1);
+        assert_eq!(listed.decisions.len(), 2);
 
         let changes = svc
             .list_object_changes(with_principal(ListObjectChangesRequest {

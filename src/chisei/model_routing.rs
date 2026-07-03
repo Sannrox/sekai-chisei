@@ -326,6 +326,7 @@ mod tests {
     fn config() -> Config {
         Config {
             grpc_port: 50051,
+            sekai_socket: None,
             db_path: ":memory:".into(),
             anthropic_api_key: Some("anthropic".into()),
             openai_api_key: Some("openai".into()),

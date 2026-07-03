@@ -25,9 +25,9 @@ use std::collections::HashMap;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tonic::{Request, Status};
 
+use sekai_chisei::grpc::client::{GatewayClient, connect_sekai};
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
     ChatMessage, CheckBudgetRequest, ExecutePlanRequest, ExecutionInput, PipelineRequest,
@@ -64,8 +64,8 @@ impl Interceptor for DemoAuth {
     }
 }
 
-type Sekai = SekaiServiceClient<InterceptedService<Channel, DemoAuth>>;
-type Chisei = ChiseiServiceClient<InterceptedService<Channel, DemoAuth>>;
+type Sekai = SekaiServiceClient<InterceptedService<GatewayClient, DemoAuth>>;
+type Chisei = ChiseiServiceClient<InterceptedService<GatewayClient, DemoAuth>>;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -95,9 +95,11 @@ fn warn(label: &str, err: &Status) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
-    let endpoint = format!("http://127.0.0.1:{port}");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = std::env::var("SEKAI_SOCKET").unwrap_or_else(|_| {
+        let port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
+        format!("http://127.0.0.1:{port}")
+    });
     let auth = DemoAuth {
         token: std::env::var("SEKAI_AUTH_TOKEN").ok(),
         principal: "demo-client".to_string(),
@@ -114,9 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let channel = Channel::from_shared(endpoint.clone())?.connect().await?;
-    let mut sekai: Sekai = SekaiServiceClient::with_interceptor(channel.clone(), auth.clone());
-    let mut chisei: Chisei = ChiseiServiceClient::with_interceptor(channel, auth);
+    let channel = connect_sekai(&endpoint).await?;
+    let mut sekai: Sekai =
+        SekaiServiceClient::new(InterceptedService::new(channel.clone(), auth.clone()));
+    let mut chisei: Chisei = ChiseiServiceClient::new(InterceptedService::new(channel, auth));
 
     // Distinct ids per run so repeated invocations don't collide.
     let run = &uuid::Uuid::new_v4().to_string()[..8];
@@ -254,7 +257,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
 }
 
 /// Drives the chisei budget + decision pipeline.
-async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
+async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
     section("chisei · budget & decision pipeline");
 
     let user = "demo-user";
@@ -264,6 +267,10 @@ async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
             user_id: user.to_string(),
             max_tokens: 100_000,
             period_type: "daily".to_string(),
+            subject: String::new(),
+            project: String::new(),
+            agent: String::new(),
+            key_id: String::new(),
         })
         .await
     {
@@ -275,6 +282,10 @@ async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
         .check_budget(CheckBudgetRequest {
             user_id: user.to_string(),
             estimated_tokens: 5_000,
+            subject: String::new(),
+            project: String::new(),
+            agent: String::new(),
+            key_id: String::new(),
         })
         .await
     {
@@ -293,6 +304,10 @@ async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
         .record_usage(RecordUsageRequest {
             user_id: user.to_string(),
             tokens_used: 5_000,
+            subject: String::new(),
+            project: String::new(),
+            agent: String::new(),
+            key_id: String::new(),
         })
         .await
     {
@@ -309,6 +324,10 @@ async fn chisei_demo(chisei: &mut Chisei, namespace_id: &str) {
             namespace: "demo".to_string(),
             preferred_runtime: String::new(),
             preferred_model: String::new(),
+            subject: String::new(),
+            project: "demo".to_string(),
+            agent: "demo-client".to_string(),
+            key_id: String::new(),
         })
         .await
     {
