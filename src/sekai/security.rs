@@ -102,6 +102,17 @@ impl SecurityChecker {
             .any(|p| matches!(m.get(*p), Some(Role::Editor) | Some(Role::Admin)))
     }
 
+    pub fn can_admin(&self, object_id: &str, principals: &[&str]) -> bool {
+        let map = self.grants.read().unwrap();
+        let m = match map.get(object_id) {
+            Some(m) => m,
+            None => return false,
+        };
+        principals
+            .iter()
+            .any(|p| matches!(m.get(*p), Some(Role::Admin)))
+    }
+
     pub fn filter_objects<'a>(
         &self,
         objects: &'a [Object],
