@@ -1,8 +1,11 @@
 use std::env;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct Config {
     pub grpc_port: u16,
+    pub ops_port: Option<u16>,
+    pub ops_bind: String,
     pub sekai_socket: Option<String>,
     pub db_path: String,
     pub anthropic_api_key: Option<String>,
@@ -28,6 +31,8 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             grpc_port: env("GRPC_PORT", "50051").parse().unwrap_or(50051),
+            ops_port: optional_port("OPS_PORT", "9464"),
+            ops_bind: env("OPS_BIND", "127.0.0.1"),
             sekai_socket: socket_path("SEKAI_SOCKET", "./data/sekai.sock"),
             db_path: env("DB_PATH", "./data/sekai.db"),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
@@ -68,6 +73,26 @@ fn socket_path(key: &str, default: &str) -> Option<String> {
         Ok(value) if value.trim().is_empty() => None,
         Ok(value) => Some(value),
         Err(_) => Some(default.to_string()),
+    }
+}
+
+fn optional_port(key: &str, default: &str) -> Option<u16> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => match value.trim().parse() {
+            Ok(port) => Some(port),
+            Err(err) => {
+                warn!(
+                    key,
+                    value = %value,
+                    default,
+                    error = %err,
+                    "invalid port environment value; using default"
+                );
+                default.parse().ok()
+            }
+        },
+        Err(_) => default.parse().ok(),
     }
 }
 

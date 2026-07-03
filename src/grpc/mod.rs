@@ -23,13 +23,19 @@ use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
+use crate::obs::grpc_layer::MetricsLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
+use axum::response::IntoResponse;
+use std::convert::Infallible;
 use subtle::ConstantTimeEq;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
+use tonic::server::NamedService;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status, metadata::MetadataValue};
+use tonic_health::ServingStatus;
+use tonic_health::server::HealthReporter;
 
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
@@ -176,6 +182,9 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
     db.migrate_principal_credentials()?;
+    if let Some(ops_port) = config.ops_port {
+        crate::obs::ops::bind_and_spawn(&config.ops_bind, ops_port, db.clone()).await?;
+    }
     let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
 
     let credential_store = Arc::new(PrincipalCredentialStore::new());
@@ -185,13 +194,15 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
     let token_auth_mode = config.auth_token.is_some() || credential_store.has_any();
     let effective_token_auth_mode = token_auth_mode && !insecure;
     if insecure && token_auth_mode {
-        eprintln!("SEKAI_INSECURE=1 disables token-auth mode for local development");
+        tracing::warn!("SEKAI_INSECURE=1 disables token-auth mode for local development");
     }
     if config.auth_token.is_some() {
-        eprintln!("warning: SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`");
+        tracing::warn!("SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`");
     }
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    spawn_health_reporter(health_reporter, db.clone());
 
     if let Some(socket_path) = config.sekai_socket.clone() {
         let uds_server = serve_uds(
@@ -199,6 +210,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
             sekai_svc.clone(),
             chisei_svc.clone(),
             LocalInterceptor::new(false),
+            health_service.clone(),
         );
 
         if token_auth_mode || insecure {
@@ -210,6 +222,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
                 effective_token_auth_mode,
                 credential_store,
                 db,
+                health_service,
             );
             return tokio::select! {
                 result = tcp_server => result,
@@ -235,11 +248,13 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
         effective_token_auth_mode,
         credential_store,
         db,
+        health_service,
     )
     .await
 }
 
-async fn run_tcp(
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp<H>(
     port: u16,
     config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
@@ -247,7 +262,18 @@ async fn run_tcp(
     token_auth_mode: bool,
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<SekaiDb>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    health_service: H,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    H: tower::Service<http::Request<tonic::body::Body>, Error = Infallible>
+        + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    H::Response: IntoResponse,
+    H::Future: Send + 'static,
+{
     let bind_addr = if token_auth_mode {
         "0.0.0.0"
     } else {
@@ -262,6 +288,7 @@ async fn run_tcp(
             sekai_svc,
             chisei_svc,
             TokenAuthInterceptor::new(credential_store, db, config.auth_token.clone()),
+            health_service,
         )
         .await
     } else {
@@ -272,34 +299,45 @@ async fn run_tcp(
             sekai_svc,
             chisei_svc,
             LocalInterceptor::new(true),
+            health_service,
         )
         .await
     }
 }
 
 #[allow(clippy::future_not_send)]
-async fn serve_tcp_listener<I>(
+async fn serve_tcp_listener<I, H>(
     bind_addr: &str,
     port: u16,
     config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
     interceptor: I,
+    health_service: H,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+    H: tower::Service<http::Request<tonic::body::Body>, Error = Infallible>
+        + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    H::Response: IntoResponse,
+    H::Future: Send + 'static,
 {
     let maybe_tls = tls_policy(bind_addr, config).map_err(std::io::Error::other)?;
     let addr = format!("{}:{}", bind_addr, port).parse()?;
-    println!("gRPC server listening on {addr}");
+    tracing::info!(addr = %addr, "gRPC server listening");
 
-    let mut server = Server::builder();
+    let mut server = Server::builder().layer(MetricsLayer);
     if let Some((cert, key)) = maybe_tls {
         let identity = Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
         server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
     }
 
     server
+        .add_service(health_service)
         .add_service(InterceptedService::new(
             pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             interceptor.clone(),
@@ -313,14 +351,23 @@ where
         .map_err(Into::into)
 }
 
-async fn serve_uds<I>(
+async fn serve_uds<I, H>(
     socket_path: String,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
     interceptor: I,
+    health_service: H,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
+    H: tower::Service<http::Request<tonic::body::Body>, Error = Infallible>
+        + NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    H::Response: IntoResponse,
+    H::Future: Send + 'static,
 {
     let path = Path::new(&socket_path);
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -336,9 +383,11 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    println!("gRPC server listening on unix://{socket_path}");
+    tracing::info!(socket_path, "gRPC server listening on UDS");
 
     Ok(tonic::transport::Server::builder()
+        .layer(MetricsLayer)
+        .add_service(health_service)
         .add_service(InterceptedService::new(
             pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             interceptor.clone(),
@@ -367,14 +416,43 @@ fn build_services(
     ));
 
     if config.scoring_enabled {
-        println!(
-            "scoring job enabled (model={}, interval={}s, batch={})",
-            config.scoring_model, config.scoring_interval_secs, config.scoring_batch_size
+        tracing::info!(
+            model = %config.scoring_model,
+            interval_secs = config.scoring_interval_secs,
+            batch_size = config.scoring_batch_size,
+            "scoring job enabled"
         );
         tokio::spawn(chisei_svc.scoring_job().run_loop());
     }
 
     (sekai_svc, chisei_svc)
+}
+
+fn spawn_health_reporter(health_reporter: HealthReporter, db: Arc<SekaiDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            let ready = tokio::task::spawn_blocking({
+                let db = db.clone();
+                move || db.ping().is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            let status = if ready {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            health_reporter.set_service_status("", status).await;
+            health_reporter
+                .set_service_status("sekai.SekaiService", status)
+                .await;
+            health_reporter
+                .set_service_status("chisei.ChiseiService", status)
+                .await;
+            interval.tick().await;
+        }
+    });
 }
 
 #[cfg(test)]
