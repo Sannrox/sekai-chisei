@@ -12,11 +12,13 @@ use axum::routing::{any, post};
 use chrono::Utc;
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 
 use crate::gateway_keys::hash_gateway_key;
-use crate::grpc::client::connect_sekai;
+use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     CheckBudgetRequest, GatewayAuditEvent, PipelineRequest as ChiseiPipelineRequest,
@@ -95,8 +97,7 @@ impl GatewayConfig {
         let chisei_grpc_target = std::env::var("CHISEI_GRPC_URL")
             .or_else(|_| std::env::var("SEKAI_SOCKET"))
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| Some("./data/sekai.sock".to_string()));
+            .filter(|value| !value.trim().is_empty());
         let fail_closed = matches!(
             std::env::var("GATEWAY_GOVERNANCE_FAILURE").as_deref(),
             Ok("closed") | Ok("fail-closed") | Ok("1") | Ok("true")
@@ -263,7 +264,10 @@ fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
     let Some(expected) = runtime.admin_token.as_deref() else {
         return true;
     };
-    client_key(headers) == Some(expected)
+    let Some(token) = client_key(headers) else {
+        return false;
+    };
+    expected.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
 async fn proxy_gateway(
@@ -781,7 +785,11 @@ async fn policy_denied(
 }
 
 fn is_openai_compatible_model(model: &str) -> bool {
-    model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3")
+    let model = model.trim().to_ascii_lowercase();
+    if model.is_empty() || model.starts_with("claude") {
+        return false;
+    }
+    true
 }
 
 fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
@@ -1429,6 +1437,9 @@ async fn resolve_identity(
     state: &GatewayState,
 ) -> Result<IdentityContext, IdentityError> {
     let config = &state.config;
+    let Some(key) = client_key(headers) else {
+        return Err(IdentityError::MissingKey);
+    };
     if config.allow_auth_passthrough {
         if let Some(identity) = passthrough_identity(headers, &config.default_project) {
             return Ok(IdentityContext {
@@ -1437,10 +1448,6 @@ async fn resolve_identity(
             });
         }
     }
-
-    let Some(key) = client_key(headers) else {
-        return Err(IdentityError::MissingKey);
-    };
 
     if let Some(identity) = config.gateway_keys.get(key) {
         return Ok(IdentityContext {
@@ -2152,7 +2159,7 @@ async fn record_refusal_and_append(
 }
 
 async fn ensure_llm_calls_dataset(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
 ) -> Result<(), tonic::Status> {
     let columns = [
         "request_id",
@@ -2212,7 +2219,7 @@ async fn run_gateway_pipeline_observation(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
     context: &UsageContext,
-    chisei: &mut ChiseiServiceClient<tonic::transport::Channel>,
+    chisei: &mut ChiseiServiceClient<GatewayClient>,
 ) -> Option<GatewayPipelineObservation> {
     if !config.run_pipeline || context.pipeline_spec.trim().is_empty() {
         return None;
@@ -2259,7 +2266,7 @@ async fn record_sample_observation_if_needed(
     usage: Option<ResponseUsage>,
     response_observation: Option<&ResponseObservation>,
     pipeline_observation: Option<&GatewayPipelineObservation>,
-    chisei: &mut ChiseiServiceClient<tonic::transport::Channel>,
+    chisei: &mut ChiseiServiceClient<GatewayClient>,
 ) {
     let Some(pipeline_observation) = pipeline_observation else {
         return;
@@ -2332,7 +2339,7 @@ async fn record_gateway_pipeline_decision(
 }
 
 async fn link_work_unit_usage(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
     identity: &GatewayIdentity,
     context: &UsageContext,
     values: &HashMap<String, String>,
@@ -2401,7 +2408,7 @@ async fn link_work_unit_usage(
 }
 
 async fn ensure_gateway_object(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
     external_id: String,
     fallback_id: String,
     kind: &str,
@@ -2947,24 +2954,21 @@ async fn response_from_upstream(
         let identity = identity.clone();
         let context = context.clone();
         let mut upstream_stream = upstream.bytes_stream();
-        let stream = async_stream::stream! {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<_, reqwest::Error>>(32);
+        tokio::spawn(async move {
             let mut usage_tap = SseUsageTap::new();
             while let Some(chunk) = upstream_stream.next().await {
                 if let Ok(bytes) = &chunk {
                     usage_tap.push(bytes);
                 }
-                yield chunk;
+                if tx.send(chunk).await.is_err() {
+                    continue;
+                }
             }
             let (usage, observation) = usage_tap.finish();
-            record_usage_and_append(
-                &config,
-                &identity,
-                usage,
-                observation,
-                &context,
-                status,
-            ).await;
-        };
+            record_usage_and_append(&config, &identity, usage, observation, &context, status).await;
+        });
+        let stream = ReceiverStream::new(rx);
         return builder
             .body(Body::from_stream(stream))
             .unwrap_or_else(|err| {
@@ -3501,6 +3505,45 @@ mod tests {
         );
         assert_eq!(requests[0].x_api_key, None);
         assert_eq!(requests[0].chisei_agent, None);
+    }
+
+    #[tokio::test]
+    async fn openai_passthrough_rejects_requests_without_client_auth() {
+        let upstream_body = r#"{"id":"resp_1","object":"response"}"#;
+        let (upstream_base, requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: None,
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            anthropic_api_key: None,
+            chisei_grpc_target: None,
+            fail_closed: false,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: true,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .header(X_CHISEI_AGENT.as_str(), "codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5002,6 +5045,7 @@ mod tests {
         assert!(is_openai_compatible_model("gpt-5.5"));
         assert!(is_openai_compatible_model("o3-mini"));
         assert!(!is_openai_compatible_model("claude-sonnet-4"));
-        assert!(!is_openai_compatible_model("native-default"));
+        assert!(is_openai_compatible_model("native-default"));
+        assert!(is_openai_compatible_model("ollama/gpt-oss"));
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::grpc::client::GatewayClient;
 use chrono::Utc;
 use tonic::Request as GrpcRequest;
 
@@ -319,7 +320,7 @@ impl GatewayKeyCommand {
 }
 
 async fn gateway_key_object(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
     name: &str,
 ) -> Result<Object, Box<dyn std::error::Error + Send + Sync>> {
     let resp = sekai
@@ -333,7 +334,7 @@ async fn gateway_key_object(
 }
 
 async fn ensure_gateway_objects(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
     config: &GatewaySetupConfig,
 ) -> Result<(), tonic::Status> {
     let now = Utc::now().timestamp_millis();
@@ -520,7 +521,7 @@ async fn ensure_gateway_objects(
 }
 
 async fn upsert_object(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
     mut object: Object,
 ) -> Result<(), tonic::Status> {
     match sekai
@@ -554,7 +555,7 @@ async fn upsert_object(
 }
 
 async fn ensure_llm_calls_dataset(
-    sekai: &mut SekaiServiceClient<tonic::transport::Channel>,
+    sekai: &mut SekaiServiceClient<GatewayClient>,
 ) -> Result<(), tonic::Status> {
     let columns = [
         "request_id",
