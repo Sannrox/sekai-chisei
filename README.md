@@ -71,7 +71,11 @@ Configuration is read from environment variables:
 | `GRPC_PORT` | `50051` | gRPC listen port |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path for local gRPC; set empty to disable |
 | `DB_PATH` | `./data/sekai.db` | SQLite database path |
-| `SEKAI_AUTH_TOKEN` | unset | Enables authenticated mode — binds to `0.0.0.0`, requires `authorization: Bearer <token>` |
+| `SEKAI_AUTH_TOKEN` | unset | **Deprecated fallback:** maps all tokens to principal `root`; prefer `sekaictl credential ...` |
+| `SEKAI_TLS_CERT` | unset | Server TLS certificate (PEM); required for authenticated `0.0.0.0` binding unless `SEKAI_ALLOW_PLAINTEXT=1` |
+| `SEKAI_TLS_KEY` | unset | Server TLS private key (PEM); required with `SEKAI_TLS_CERT` |
+| `SEKAI_TLS_CA` | unset | Optional client trust anchor (PEM) for TLS custom CA validation |
+| `SEKAI_ALLOW_PLAINTEXT` | unset | Set to `1` to allow authenticated `0.0.0.0` bind without TLS |
 | `SEKAI_INSECURE` | unset | Set to `1` for local unauthenticated development |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama-compatible endpoint |
 | `NATIVE_LLM_URL` | unset | Native local LLM endpoint |
@@ -79,6 +83,15 @@ Configuration is read from environment variables:
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
 
 See [.env.example](.env.example) for a local template.
+
+### Authentication and transport
+
+For TCP mode, control-plane identity is verified from bearer token metadata:
+- create per-principal credentials via `sekaictl credential create <principal>` and set `SEKAI_AUTH_TOKEN` to that token for clients
+- use `sekaictl credential rotate <principal>` and `sekaictl credential revoke <principal>` for lifecycle
+- `SEKAI_AUTH_TOKEN` is a deprecated compatibility path and now maps to fixed principal `root`
+- `0.0.0.0` requires TLS via `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless `SEKAI_ALLOW_PLAINTEXT=1`
+- local UDS paths and `SEKAI_INSECURE=1` stay plaintext and keep self-asserted `x-principal` (defaults to `local` when absent)
 
 ## Codex Gateway Preview
 
@@ -108,7 +121,7 @@ Seed the Codex app project, agent, budget, model policy, graph metadata, and
 
 ```bash
 SEKAI_SOCKET=./data/sekai.sock \
-cargo run --bin chisei-gateway-setup -- key create codex-app \
+cargo run --bin sekaictl -- gateway setup \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key sk-chisei-codex-app \
@@ -216,7 +229,7 @@ the gateway should own provider credentials. Start the gateway with
 `scripts/chisei_gateway_live_clients.sh claude-key-smoke`.
 
 Virtual keys are stored only as SHA-256 hashes on Sekai `gateway_key` objects
-created by `chisei-gateway-setup`. With `SEKAI_SOCKET` or `CHISEI_GRPC_URL`
+created by `sekaictl gateway key create`. With `SEKAI_SOCKET` or `CHISEI_GRPC_URL`
 configured, the gateway authenticates presented keys by hashing them, checking a
 short in-memory cache, and looking up an active `gateway_key` object on cache
 miss or TTL expiry. Unknown keys are rejected.
@@ -234,17 +247,17 @@ queries continue to work.
 Manage hashed gateway keys through the setup helper:
 
 ```bash
-SEKAI_SOCKET=./data/sekai.sock cargo run --bin chisei-gateway-setup -- key create codex-app \
+SEKAI_SOCKET=./data/sekai.sock cargo run --bin sekaictl -- gateway key create codex-app \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key sk-chisei-codex-app \
   --budget 500000 \
   --allowed-model gpt-5.5
-SEKAI_SOCKET=./data/sekai.sock cargo run --bin chisei-gateway-setup -- key list
-SEKAI_SOCKET=./data/sekai.sock cargo run --bin chisei-gateway-setup -- key rotate \
+SEKAI_SOCKET=./data/sekai.sock cargo run --bin sekaictl -- gateway key list
+SEKAI_SOCKET=./data/sekai.sock cargo run --bin sekaictl -- gateway key rotate \
   --gateway-key-name codex-app \
   --gateway-key sk-chisei-codex-app-rotated
-SEKAI_SOCKET=./data/sekai.sock cargo run --bin chisei-gateway-setup -- key revoke \
+SEKAI_SOCKET=./data/sekai.sock cargo run --bin sekaictl -- gateway key revoke \
   --gateway-key-name codex-app
 ```
 
