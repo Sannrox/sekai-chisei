@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::eval::{self, EvalStore};
@@ -182,9 +183,9 @@ impl ScoringJob {
     pub async fn run_loop(self) {
         loop {
             match self.run_once().await {
-                Ok(n) if n > 0 => println!("scoring job: scored {n} sampled observation(s)"),
+                Ok(n) if n > 0 => info!(observations = n, "scoring job scored observations"),
                 Ok(_) => {}
-                Err(e) => eprintln!("scoring job error: {e}"),
+                Err(e) => error!(error = %e, "scoring job error"),
             }
             tokio::time::sleep(self.interval).await;
         }
@@ -276,9 +277,10 @@ impl ScoringJob {
             // remaining namespace groups); the row is simply re-scored on a later cycle.
             for obs in &scored_obs {
                 if let Err(e) = self.db.delete_observation(&obs.request_id) {
-                    eprintln!(
-                        "scoring job: failed to delete consumed observation {}: {e}",
-                        obs.request_id
+                    warn!(
+                        request_id = %obs.request_id,
+                        error = %e,
+                        "scoring job failed to delete consumed observation"
                     );
                 }
                 total_scored += 1;
@@ -289,9 +291,10 @@ impl ScoringJob {
         // likely a misconfigured SCORING_MODEL/credentials. Surface it so the condition (which
         // otherwise re-sends the same records and accrues cost silently) is visible, not silent.
         if total_scored == 0 {
-            eprintln!(
-                "scoring job: {pending} observation(s) pending but none scored this cycle — check SCORING_MODEL/credentials (model={})",
-                self.model
+            warn!(
+                pending,
+                model = %self.model,
+                "scoring job had pending observations but none scored this cycle; check SCORING_MODEL/credentials"
             );
         }
         Ok(total_scored)
@@ -308,10 +311,10 @@ impl ScoringJob {
         // in `run_once` surfaces sustained cases; an outage-aware transient dead-letter (parking,
         // not deleting) is part of the deferred follow-up noted at the module level.
         let JudgeError::Permanent(message) = err else {
-            eprintln!(
-                "scoring job: transient judge failure for {}, will retry: {}",
-                obs.request_id,
-                err.message()
+            warn!(
+                request_id = %obs.request_id,
+                error = %err.message(),
+                "scoring job transient judge failure; will retry"
             );
             return;
         };
@@ -322,9 +325,11 @@ impl ScoringJob {
             .bump_observation_attempts(&obs.request_id)
             .unwrap_or(0);
         if attempts >= MAX_JUDGE_ATTEMPTS {
-            eprintln!(
-                "scoring job: retiring {} after {attempts} judge failures: {message}",
-                obs.request_id
+            warn!(
+                request_id = %obs.request_id,
+                attempts,
+                error = %message,
+                "scoring job retiring observation after judge failures"
             );
             let mut evidence = std::collections::HashMap::new();
             evidence.insert("namespace".to_string(), namespace.to_string());
@@ -342,9 +347,11 @@ impl ScoringJob {
             });
             let _ = self.db.delete_observation(&obs.request_id);
         } else {
-            eprintln!(
-                "scoring job: record-specific judge failure for {} (attempt {attempts}), will retry: {message}",
-                obs.request_id
+            warn!(
+                request_id = %obs.request_id,
+                attempts,
+                error = %message,
+                "scoring job record-specific judge failure; will retry"
             );
         }
     }
@@ -416,7 +423,11 @@ impl ScoringJob {
                 // An empty namespace (or otherwise un-inferable) run still persists; it simply has no
                 // regression signal. Don't fail the whole batch over it.
                 Err(e) => {
-                    eprintln!("scoring job: skipped iteration for namespace {namespace:?}: {e}")
+                    warn!(
+                        namespace = %namespace,
+                        error = %e,
+                        "scoring job skipped iteration for namespace"
+                    );
                 }
             }
         }
