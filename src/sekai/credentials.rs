@@ -9,6 +9,10 @@ use crate::gateway_keys::hash_gateway_key;
 
 const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = 5000;
 
+fn in_progress_epoch(activity_epoch: i64) -> i64 {
+    -(activity_epoch + 1)
+}
+
 #[derive(Debug)]
 pub struct PrincipalCredentialStore {
     pub by_hash: RwLock<HashMap<String, String>>,
@@ -55,70 +59,65 @@ impl PrincipalCredentialStore {
     }
 
     pub fn maybe_reload(&self, db: &SekaiDb) -> bool {
-        if !self.refresh_on_principal_activity(db) {
+        let activity_epoch = match db.principal_credentials_activity_epoch() {
+            Ok(activity_epoch) => activity_epoch,
+            Err(_) => return false,
+        };
+        let last_activity_epoch = self.last_data_version.load(Ordering::Acquire);
+        if last_activity_epoch < 0 {
             return false;
         }
 
-        let now = chrono::Utc::now().timestamp_millis();
-        let last = self.last_reload_ms.load(Ordering::Acquire);
-        if now - last < CREDENTIAL_RELOAD_INTERVAL_MS {
-            return true;
+        let mut restore_reload_ms = None;
+        if activity_epoch == last_activity_epoch {
+            let now = chrono::Utc::now().timestamp_millis();
+            let last = self.last_reload_ms.load(Ordering::Acquire);
+            if now - last < CREDENTIAL_RELOAD_INTERVAL_MS {
+                return true;
+            }
+            restore_reload_ms = Some(last);
         }
         if self
-            .last_reload_ms
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .last_data_version
+            .compare_exchange(
+                last_activity_epoch,
+                in_progress_epoch(activity_epoch),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return false;
         }
-        match db.list_active_credentials() {
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let reload_result = db.list_active_credentials();
+        match reload_result {
             Ok(credentials) => {
                 self.load(&credentials);
-                self.last_reload_ms.store(now, Ordering::Release);
-                true
-            }
-            Err(_) => {
-                self.last_reload_ms.store(last, Ordering::Release);
-                false
-            }
-        }
-    }
-
-    fn refresh_on_principal_activity(&self, db: &SekaiDb) -> bool {
-        if let Ok(activity_epoch) = db.principal_credentials_activity_epoch() {
-            let last_activity_epoch = self.last_data_version.load(Ordering::Acquire);
-            if activity_epoch != last_activity_epoch
-                && self
-                    .last_data_version
-                    .compare_exchange(
-                        last_activity_epoch,
-                        activity_epoch,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                match db.list_active_credentials() {
-                    Ok(credentials) => {
-                        self.load(&credentials);
+                match db.principal_credentials_activity_epoch() {
+                    Ok(current_activity_epoch) if current_activity_epoch == activity_epoch => {
                         self.last_data_version
-                            .compare_exchange(
-                                last_activity_epoch,
-                                activity_epoch,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .ok();
-                        return true;
+                            .store(activity_epoch, Ordering::Release);
+                        self.last_reload_ms.store(now, Ordering::Release);
+                        true
                     }
-                    Err(_) => {
-                        return false;
+                    _ => {
+                        self.last_data_version
+                            .store(last_activity_epoch, Ordering::Release);
+                        false
                     }
                 }
             }
-            return true;
+            Err(_) => {
+                self.last_data_version
+                    .store(last_activity_epoch, Ordering::Release);
+                if let Some(last) = restore_reload_ms {
+                    self.last_reload_ms.store(last, Ordering::Release);
+                }
+                false
+            }
         }
-        false
     }
 
     pub fn has_any(&self) -> bool {
@@ -174,5 +173,51 @@ mod tests {
         store.maybe_reload(&db);
         assert_eq!(store.resolve("token-alice"), Some("alice".to_string()));
         assert!(store.has_any());
+    }
+
+    #[test]
+    fn maybe_reload_evicts_revoked_cached_records() {
+        let db = test_db();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("token-alice");
+        db.create_principal_credential("alice", &token, fixed_time(4))
+            .unwrap();
+
+        assert!(store.maybe_reload(&db));
+        assert_eq!(store.resolve("token-alice"), Some("alice".to_string()));
+
+        db.revoke_principal_credential("alice").unwrap();
+
+        assert!(store.maybe_reload(&db));
+        assert!(store.resolve("token-alice").is_none());
+    }
+
+    #[test]
+    fn maybe_reload_does_not_advance_epoch_after_failed_reload() {
+        let db = test_db();
+        let store = PrincipalCredentialStore::new();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE sekai_principal_credentials;
+                CREATE TABLE sekai_principal_credentials (
+                    id TEXT PRIMARY KEY,
+                    principal TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    created INTEGER NOT NULL,
+                    rotated_at INTEGER NOT NULL DEFAULT 0,
+                    revoked_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO sekai_principal_credentials
+                    (id, principal, token_hash, created, rotated_at, revoked_at)
+                VALUES
+                    ('credential-bad', 'alice', 'hash', 1000, 2000, 0);",
+            )
+            .unwrap();
+        }
+
+        assert!(!store.maybe_reload(&db));
+        assert_eq!(store.last_data_version.load(Ordering::Acquire), 0);
     }
 }
