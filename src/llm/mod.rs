@@ -4,6 +4,9 @@ pub mod openai;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::pin::Pin;
+
+use futures_util::{Stream, stream};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -45,9 +48,43 @@ pub struct ChatResponse {
     pub stop_reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatStreamChunk {
+    pub content_delta: String,
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub stop_reason: String,
+    pub done: bool,
+}
+
+impl ChatStreamChunk {
+    pub fn from_response(resp: ChatResponse) -> Self {
+        Self {
+            content_delta: resp.content.clone(),
+            content: resp.content,
+            tool_calls: resp.tool_calls,
+            input_tokens: resp.input_tokens,
+            output_tokens: resp.output_tokens,
+            stop_reason: resp.stop_reason,
+            done: true,
+        }
+    }
+}
+
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, String>> + Send>>;
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String>;
+
+    async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
+        let resp = self.chat(req).await?;
+        Ok(Box::pin(stream::once(async move {
+            Ok(ChatStreamChunk::from_response(resp))
+        })))
+    }
 }
 
 /// Resolve a model name to the appropriate provider.

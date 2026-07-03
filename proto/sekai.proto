@@ -245,6 +245,8 @@ message ListGrantsResponse { repeated Grant grants = 1; }
 message CheckAccessRequest { string object_id = 1; repeated string principals = 2; }
 message CheckAccessResponse { bool allowed = 1; }
 
+message RecordDecisionRequest { Decision decision = 1; }
+message RecordDecisionResponse { Decision decision = 1; }
 message ListDecisionsRequest { string actor = 1; string action = 2; int64 after = 3; int32 limit = 4; }
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
@@ -456,6 +458,7 @@ service SekaiService {
   rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
   rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
 
+  rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
 
