@@ -46,8 +46,12 @@ impl Config {
             leak_review_model: env::var("LEAK_REVIEW_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            tls_cert: env::var("SEKAI_TLS_CERT").ok().filter(|value| !value.trim().is_empty()),
-            tls_key: env::var("SEKAI_TLS_KEY").ok().filter(|value| !value.trim().is_empty()),
+            tls_cert: env::var("SEKAI_TLS_CERT")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            tls_key: env::var("SEKAI_TLS_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
         }
     }
