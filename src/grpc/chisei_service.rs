@@ -1,17 +1,22 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use tonic::{Request, Response, Status};
 
-use super::llm_service::{estimate_chat_request, execute_chat_request};
+use super::llm_service::{
+    estimate_chat_request, execute_chat_request, execute_chat_request_stream,
+};
 use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::pipeline as pipe;
-use crate::chisei::policy::PolicyResolver;
+use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
+use crate::domain;
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -27,11 +32,205 @@ pub struct ChiseiServiceImpl {
 
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
+const POLICY_KIND: &str = "policy";
+
+fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
+    let Ok(objects) = db.list_objects(&domain::ListFilter {
+        kind: Some(POLICY_KIND.to_string()),
+        ..Default::default()
+    }) else {
+        return;
+    };
+    for object in objects {
+        let Some(namespace) = object.properties.get("namespace") else {
+            continue;
+        };
+        let policy = policy_from_properties(&object.properties);
+        resolver.set_namespace_policy(namespace, policy);
+    }
+}
+
+fn policy_from_request(req: &SetNamespacePolicyRequest) -> Policy {
+    Policy {
+        allowed_runtimes: req.allowed_runtimes.clone(),
+        allowed_models: req.allowed_models.clone(),
+        default_runtime: req.default_runtime.clone(),
+        default_model: req.default_model.clone(),
+    }
+}
+
+fn policy_from_properties(properties: &HashMap<String, String>) -> Policy {
+    Policy {
+        allowed_runtimes: split_csv_property(properties.get("allowed_runtimes")),
+        allowed_models: split_csv_property(properties.get("allowed_models")),
+        default_runtime: properties
+            .get("default_runtime")
+            .cloned()
+            .unwrap_or_default(),
+        default_model: properties.get("default_model").cloned().unwrap_or_default(),
+    }
+}
+
+fn split_csv_property(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn record_evolve_task_on(
+    db: &SekaiDb,
+    evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
+    request_id: &str,
+    namespace: &str,
+    spec: &str,
+    original_spec: Option<&str>,
+    status: &str,
+    tokens_used: i32,
+) -> Result<(), String> {
+    if request_id.is_empty() {
+        return Ok(());
+    }
+    let mut history = evolve_history.lock().expect("evolve history poisoned");
+    let entry = history.entry(request_id.to_string()).or_insert_with(|| {
+        crate::chisei::evolve::TaskRecord {
+            id: request_id.to_string(),
+            spec: spec.to_string(),
+            status: status.to_string(),
+            namespace: namespace.to_string(),
+            tokens_used,
+            original_spec: original_spec.map(ToOwned::to_owned),
+            created: chrono::Utc::now().timestamp(),
+        }
+    });
+    entry.namespace = namespace.to_string();
+    entry.spec = spec.to_string();
+    entry.status = status.to_string();
+    entry.tokens_used = tokens_used;
+    entry.original_spec = original_spec.map(ToOwned::to_owned);
+    db.put_evolve_task(entry)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_streamed_execution(
+    db: &SekaiDb,
+    evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
+    request_id: &str,
+    namespace: &str,
+    enriched_spec: &str,
+    original_spec: Option<&str>,
+    resolved_model: &str,
+    sampled: bool,
+    sample_rate: f64,
+    sample_reason: &str,
+    scoring_enabled: bool,
+    response: &PlannedChatResponse,
+) -> Result<(), String> {
+    record_evolve_task_on(
+        db,
+        evolve_history,
+        request_id,
+        namespace,
+        enriched_spec,
+        original_spec,
+        "done",
+        response.input_tokens + response.output_tokens,
+    )?;
+    if sampled {
+        let mut evidence = HashMap::new();
+        evidence.insert("model".to_string(), resolved_model.to_string());
+        evidence.insert(
+            "input_tokens".to_string(),
+            response.input_tokens.to_string(),
+        );
+        evidence.insert(
+            "output_tokens".to_string(),
+            response.output_tokens.to_string(),
+        );
+        evidence.insert("stop_reason".to_string(), response.stop_reason.clone());
+        evidence.insert("sample_rate".to_string(), sample_rate.to_string());
+        let _ = db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.sampling".into(),
+            action: "sample_observed".into(),
+            reason: sample_reason.to_string(),
+            evidence,
+            target_id: request_id.to_string(),
+            outcome: "observed".into(),
+        });
+        if scoring_enabled {
+            let _ = db.put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                request_id: request_id.to_string(),
+                namespace: namespace.to_string(),
+                spec: enriched_spec.to_string(),
+                resolved_model: resolved_model.to_string(),
+                output_content: response.content.clone(),
+                sample_reason: sample_reason.to_string(),
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+                stop_reason: response.stop_reason.clone(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                scored: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let external_id = format!("policy:{namespace}");
+    let mut properties = HashMap::from([
+        ("namespace".to_string(), namespace.to_string()),
+        (
+            "allowed_runtimes".to_string(),
+            policy.allowed_runtimes.join(","),
+        ),
+        (
+            "allowed_models".to_string(),
+            policy.allowed_models.join(","),
+        ),
+        (
+            "default_runtime".to_string(),
+            policy.default_runtime.clone(),
+        ),
+        ("default_model".to_string(), policy.default_model.clone()),
+    ]);
+    properties.retain(|_, value| !value.is_empty());
+
+    if let Some(mut existing) = db.find_by_external_id(&external_id)? {
+        existing.name = namespace.to_string();
+        existing.namespace = namespace.to_string();
+        existing.properties = properties;
+        existing.updated = now;
+        db.update_object(&existing)
+    } else {
+        db.create_object(&domain::Object {
+            id: format!("policy-{namespace}"),
+            kind: POLICY_KIND.to_string(),
+            name: namespace.to_string(),
+            namespace: namespace.to_string(),
+            external_id,
+            properties,
+            created: now,
+            updated: now,
+        })
+    }
+}
 
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
         let _ = db.migrate_chisei();
         db.migrate_audit();
+        let policy = Arc::new(PolicyResolver::new());
+        load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -54,7 +253,7 @@ impl ChiseiServiceImpl {
         ));
         Self {
             budget: Arc::new(BudgetTracker::new()),
-            policy: Arc::new(PolicyResolver::new()),
+            policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
@@ -79,6 +278,8 @@ impl ChiseiServiceImpl {
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let _ = db.migrate_chisei();
         db.migrate_audit();
+        let policy = Arc::new(PolicyResolver::new());
+        load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::new());
         for suite in db.list_eval_suite_records().unwrap_or_default() {
             eval.create_suite(suite);
@@ -101,7 +302,7 @@ impl ChiseiServiceImpl {
         ));
         Self {
             budget,
-            policy: Arc::new(PolicyResolver::new()),
+            policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
@@ -524,28 +725,16 @@ impl ChiseiServiceImpl {
         status: &str,
         tokens_used: i32,
     ) -> Result<(), String> {
-        if request_id.is_empty() {
-            return Ok(());
-        }
-        let mut history = self.evolve_history.lock().expect("evolve history poisoned");
-        let entry = history.entry(request_id.to_string()).or_insert_with(|| {
-            crate::chisei::evolve::TaskRecord {
-                id: request_id.to_string(),
-                spec: spec.to_string(),
-                status: status.to_string(),
-                namespace: namespace.to_string(),
-                tokens_used,
-                original_spec: original_spec.map(ToOwned::to_owned),
-                created: chrono::Utc::now().timestamp(),
-            }
-        });
-        entry.namespace = namespace.to_string();
-        entry.spec = spec.to_string();
-        entry.status = status.to_string();
-        entry.tokens_used = tokens_used;
-        entry.original_spec = original_spec.map(ToOwned::to_owned);
-        self.db.put_evolve_task(entry)?;
-        Ok(())
+        record_evolve_task_on(
+            &self.db,
+            &self.evolve_history,
+            request_id,
+            namespace,
+            spec,
+            original_spec,
+            status,
+            tokens_used,
+        )
     }
 
     fn tracked_original_spec(
@@ -594,6 +783,55 @@ fn choose_preferred_model(
         }
     }
     recommended_model.to_string()
+}
+
+fn budget_subject(
+    subject: &str,
+    project: &str,
+    agent: &str,
+    key_id: &str,
+    legacy_user_id: &str,
+) -> Result<String, Status> {
+    if !subject.trim().is_empty() {
+        return Ok(subject.trim().to_string());
+    }
+    if !agent.trim().is_empty() {
+        return Ok(format!("agent:{}", agent.trim()));
+    }
+    if !project.trim().is_empty() {
+        return Ok(format!("project:{}", project.trim()));
+    }
+    if !key_id.trim().is_empty() {
+        return Ok(format!("gateway_key:{}", key_id.trim()));
+    }
+    if !legacy_user_id.trim().is_empty() {
+        return Ok(legacy_user_id.trim().to_string());
+    }
+    Err(Status::invalid_argument("budget subject required"))
+}
+
+fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
+    let mut scopes = Vec::new();
+    push_scope(&mut scopes, req.subject.trim());
+    if !req.agent.trim().is_empty() {
+        push_scope(&mut scopes, &format!("agent:{}", req.agent.trim()));
+    }
+    if !req.key_id.trim().is_empty() {
+        push_scope(&mut scopes, &format!("gateway_key:{}", req.key_id.trim()));
+    }
+    push_scope(&mut scopes, req.namespace.trim());
+    push_scope(&mut scopes, req.project.trim());
+    if !req.project.trim().is_empty() {
+        push_scope(&mut scopes, &format!("project:{}", req.project.trim()));
+    }
+    scopes
+}
+
+fn push_scope(scopes: &mut Vec<String>, scope: &str) {
+    if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
+        return;
+    }
+    scopes.push(scope.to_string());
 }
 
 fn prune_cached_plans(plans: &mut HashMap<String, ExecutionPlan>) {
@@ -710,13 +948,21 @@ fn eval_iteration_pb(iteration: crate::chisei::eval::Iteration) -> EvalIteration
 
 #[tonic::async_trait]
 impl ChiseiService for ChiseiServiceImpl {
+    type ExecutePlanStreamStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
+
     async fn check_budget(
         &self,
         req: Request<CheckBudgetRequest>,
     ) -> Result<Response<CheckBudgetResponse>, Status> {
         let r = req.into_inner();
-        let allowed = self.budget.check(&r.user_id, r.estimated_tokens).is_ok();
-        let u = self.budget.get_usage(&r.user_id);
+        let budget_subject =
+            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
+        let allowed = self
+            .budget
+            .check(&budget_subject, r.estimated_tokens)
+            .is_ok();
+        let u = self.budget.get_usage(&budget_subject);
         Ok(Response::new(CheckBudgetResponse {
             allowed,
             usage: Some(BudgetUsage {
@@ -734,8 +980,10 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RecordUsageRequest>,
     ) -> Result<Response<RecordUsageResponse>, Status> {
         let r = req.into_inner();
-        self.budget.record(&r.user_id, r.tokens_used);
-        let u = self.budget.get_usage(&r.user_id);
+        let budget_subject =
+            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
+        self.budget.record(&budget_subject, r.tokens_used);
+        let u = self.budget.get_usage(&budget_subject);
         Ok(Response::new(RecordUsageResponse {
             usage: Some(BudgetUsage {
                 user_id: u.user_id,
@@ -752,12 +1000,39 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<SetBudgetLimitRequest>,
     ) -> Result<Response<SetBudgetLimitResponse>, Status> {
         let r = req.into_inner();
+        let budget_subject =
+            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
         self.budget.set_limit(
-            &r.user_id,
+            &budget_subject,
             r.max_tokens,
             crate::chisei::budget::PeriodType::parse(&r.period_type),
         );
         Ok(Response::new(SetBudgetLimitResponse {}))
+    }
+
+    async fn set_namespace_policy(
+        &self,
+        req: Request<SetNamespacePolicyRequest>,
+    ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
+        let r = req.into_inner();
+        if r.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
+        }
+        let policy = policy_from_request(&r);
+        persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
+        self.policy.set_namespace_policy(&r.namespace, policy);
+        let (runtime, model) = self
+            .policy
+            .resolve(&r.namespace, &r.default_runtime, &r.default_model)
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(SetNamespacePolicyResponse {
+            resolution: Some(PolicyResolution {
+                runtime,
+                model,
+                eval_regressed: false,
+                eval_regression_reason: String::new(),
+            }),
+        }))
     }
 
     async fn resolve_policy(
@@ -765,17 +1040,51 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ResolvePolicyRequest>,
     ) -> Result<Response<ResolvePolicyResponse>, Status> {
         let r = req.into_inner();
-        let effective_policy = self.policy.effective_policy(&r.namespace);
-        let (runtime, model) = self
+        let scopes = policy_scopes(&r);
+        let (policy_scope, effective_policy) = self
             .policy
-            .resolve(&r.namespace, &r.preferred_runtime, &r.preferred_model)
-            .map_err(Status::invalid_argument)?;
+            .effective_policy_for_scopes(&scopes)
+            .map(|(scope, policy)| (scope, Some(policy)))
+            .unwrap_or_else(|| {
+                let fallback = if r.namespace.trim().is_empty() {
+                    r.project.trim().to_string()
+                } else {
+                    r.namespace.trim().to_string()
+                };
+                (fallback, None)
+            });
+        let regression_signal = self
+            .eval
+            .namespace_regression_signal(&policy_scope)
+            .filter(|signal| signal.regressed);
+        let preferred_model = regression_signal
+            .as_ref()
+            .and_then(|_| effective_policy.as_ref())
+            .map(|policy| policy.default_model.as_str())
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&r.preferred_model);
+        let (runtime, model) = if let Some(policy) = effective_policy.as_ref() {
+            self.policy
+                .apply_policy(policy, &r.preferred_runtime, preferred_model)
+                .map_err(Status::invalid_argument)?
+        } else {
+            self.policy
+                .resolve(&policy_scope, &r.preferred_runtime, preferred_model)
+                .map_err(Status::invalid_argument)?
+        };
         let model = self
             .resolve_live_model(&model, effective_policy.as_ref(), None)
             .await
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(ResolvePolicyResponse {
-            resolution: Some(PolicyResolution { runtime, model }),
+            resolution: Some(PolicyResolution {
+                runtime,
+                model,
+                eval_regressed: regression_signal.is_some(),
+                eval_regression_reason: regression_signal
+                    .map(|signal| signal.reason)
+                    .unwrap_or_default(),
+            }),
         }))
     }
 
@@ -829,6 +1138,94 @@ impl ChiseiService for ChiseiServiceImpl {
         _r: Request<ListPipelineRunsRequest>,
     ) -> Result<Response<ListPipelineRunsResponse>, Status> {
         Ok(Response::new(ListPipelineRunsResponse { runs: vec![] }))
+    }
+
+    async fn record_sample_observation(
+        &self,
+        req: Request<RecordSampleObservationRequest>,
+    ) -> Result<Response<RecordSampleObservationResponse>, Status> {
+        let observation = req
+            .into_inner()
+            .observation
+            .ok_or(Status::invalid_argument("observation required"))?;
+        if observation.request_id.trim().is_empty() {
+            return Err(Status::invalid_argument("request_id required"));
+        }
+        if observation.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
+        }
+        if observation.spec.trim().is_empty() {
+            return Err(Status::invalid_argument("spec required"));
+        }
+        if observation.output_content.trim().is_empty() {
+            return Err(Status::invalid_argument("output_content required"));
+        }
+        if !self.config.scoring_enabled {
+            return Ok(Response::new(RecordSampleObservationResponse {
+                recorded: false,
+            }));
+        }
+        self.db
+            .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                request_id: observation.request_id,
+                namespace: observation.namespace,
+                spec: observation.spec,
+                resolved_model: observation.resolved_model,
+                output_content: observation.output_content,
+                sample_reason: observation.sample_reason,
+                input_tokens: observation.input_tokens,
+                output_tokens: observation.output_tokens,
+                stop_reason: observation.stop_reason,
+                timestamp: observation.timestamp,
+                scored: false,
+            })
+            .map_err(Status::internal)?;
+        Ok(Response::new(RecordSampleObservationResponse {
+            recorded: true,
+        }))
+    }
+
+    async fn record_gateway_audit(
+        &self,
+        req: Request<RecordGatewayAuditRequest>,
+    ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
+        let mut event = req
+            .into_inner()
+            .event
+            .ok_or(Status::invalid_argument("event required"))?;
+        if event.actor.trim().is_empty() {
+            return Err(Status::invalid_argument("actor required"));
+        }
+        if event.action.trim().is_empty() {
+            return Err(Status::invalid_argument("action required"));
+        }
+        if event.outcome.trim().is_empty() {
+            return Err(Status::invalid_argument("outcome required"));
+        }
+        if event.id.trim().is_empty() {
+            event.id = uuid::Uuid::new_v4().to_string();
+        }
+        if event.timestamp <= 0 {
+            event.timestamp = chrono::Utc::now().timestamp_millis();
+        }
+        if event.target_id.trim().is_empty() {
+            event.target_id = "llm_calls".to_string();
+        }
+        self.db
+            .record_decision(&crate::sekai::audit::Decision {
+                id: event.id.clone(),
+                timestamp: event.timestamp,
+                actor: event.actor.clone(),
+                action: event.action.clone(),
+                reason: event.reason.clone(),
+                evidence: event.evidence.clone(),
+                target_id: event.target_id.clone(),
+                outcome: event.outcome.clone(),
+            })
+            .map_err(Status::internal)?;
+        Ok(Response::new(RecordGatewayAuditResponse {
+            event: Some(event),
+        }))
     }
 
     async fn plan_execution(
@@ -1022,6 +1419,229 @@ impl ChiseiService for ChiseiServiceImpl {
             }),
             executed_at: chrono::Utc::now().timestamp(),
         }))
+    }
+
+    async fn execute_plan_stream(
+        &self,
+        req: Request<ExecutePlanRequest>,
+    ) -> Result<Response<Self::ExecutePlanStreamStream>, Status> {
+        let requested_plan = req
+            .into_inner()
+            .plan
+            .ok_or(Status::invalid_argument("plan required"))?;
+        let plan = {
+            let mut plans = self
+                .planned_executions
+                .lock()
+                .expect("planned executions poisoned");
+            prune_cached_plans(&mut plans);
+            plans
+                .remove(&requested_plan.plan_id)
+                .ok_or(Status::not_found("execution plan not found"))?
+        };
+        if !plan.executable {
+            return Err(Status::failed_precondition(
+                "execution plan is not executable",
+            ));
+        }
+        let input = plan
+            .input
+            .clone()
+            .ok_or(Status::invalid_argument("plan input required"))?;
+        let namespace_hint = input.namespace.trim().to_string();
+        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
+        if crate::chisei::egress::is_external_provider(&provider)
+            && plan.egress_decisions.is_empty()
+        {
+            return Err(Status::failed_precondition(
+                "external execution plan missing egress decisions",
+            ));
+        }
+        if let Some(signal) = self
+            .eval
+            .namespace_regression_signal(&namespace_hint)
+            .filter(|signal| signal.regressed)
+        {
+            return Err(Status::failed_precondition(signal.reason));
+        }
+        let normalized_user_id = if input.user_id.is_empty() {
+            "default".to_string()
+        } else {
+            input.user_id.clone()
+        };
+        self.record_egress_audit(
+            "execute_context",
+            &input.request_id,
+            &provider,
+            &plan.resolved_model,
+            &plan.egress_decisions,
+        );
+        let llm_req = super::pb::llm::ChatRequest {
+            model: plan.resolved_model.clone(),
+            system: plan.prepared_system.clone(),
+            messages: plan
+                .prepared_messages
+                .iter()
+                .map(|m| super::pb::llm::Message {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    tool_call_id: m.tool_call_id.clone(),
+                    tool_calls: m
+                        .tool_calls
+                        .iter()
+                        .map(|tc| super::pb::llm::ToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            args_json: tc.args_json.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            tools: plan
+                .tools
+                .iter()
+                .map(|t| super::pb::llm::ToolDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema_json: t.input_schema_json.clone(),
+                })
+                .collect(),
+            max_tokens: plan.max_tokens,
+            user_id: Some(normalized_user_id),
+        };
+        let chat_stream =
+            execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await?;
+        let db = self.db.clone();
+        let evolve_history = self.evolve_history.clone();
+        let request_id = input.request_id.clone();
+        let enriched_spec = plan.enriched_spec.clone();
+        let original_spec =
+            self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec);
+        let resolved_model = plan.resolved_model.clone();
+        let sampled = plan.sampled;
+        let sample_rate = plan.sample_rate;
+        let sample_reason = plan.sample_reason.clone();
+        let scoring_enabled = self.config.scoring_enabled;
+
+        let stream = async_stream::stream! {
+            let mut content = String::new();
+            let mut tool_calls = Vec::new();
+            let mut input_tokens = 0;
+            let mut output_tokens = 0;
+            let mut stop_reason = String::new();
+            let mut finished = false;
+
+            futures_util::pin_mut!(chat_stream);
+            while let Some(next) = chat_stream.next().await {
+                let chunk = match next {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        yield Err(err);
+                        return;
+                    }
+                };
+                if !chunk.content.is_empty() {
+                    content = chunk.content.clone();
+                } else if !chunk.content_delta.is_empty() {
+                    content.push_str(&chunk.content_delta);
+                }
+                if !chunk.tool_calls.is_empty() {
+                    tool_calls = chunk.tool_calls.clone();
+                }
+                if chunk.input_tokens > 0 {
+                    input_tokens = chunk.input_tokens;
+                }
+                if chunk.output_tokens > 0 {
+                    output_tokens = chunk.output_tokens;
+                }
+                if !chunk.stop_reason.is_empty() {
+                    stop_reason = chunk.stop_reason.clone();
+                }
+                if chunk.done && !finished {
+                    finished = true;
+                    let response = PlannedChatResponse {
+                        content: content.clone(),
+                        tool_calls: tool_calls
+                            .iter()
+                            .map(|tc| ToolCall {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                args_json: tc.args_json.clone(),
+                            })
+                            .collect(),
+                        input_tokens,
+                        output_tokens,
+                        stop_reason: stop_reason.clone(),
+                        provider: provider.clone(),
+                    };
+                    let _ = finish_streamed_execution(
+                        &db,
+                        &evolve_history,
+                        &request_id,
+                        &namespace_hint,
+                        &enriched_spec,
+                        original_spec.as_deref(),
+                        &resolved_model,
+                        sampled,
+                        sample_rate,
+                        &sample_reason,
+                        scoring_enabled,
+                        &response,
+                    );
+                    yield Ok(ExecutePlanStreamEvent {
+                        content_delta: chunk.content_delta,
+                        response: Some(response),
+                        done: true,
+                        executed_at: chrono::Utc::now().timestamp(),
+                    });
+                } else {
+                    yield Ok(ExecutePlanStreamEvent {
+                        content_delta: chunk.content_delta,
+                        response: None,
+                        done: false,
+                        executed_at: 0,
+                    });
+                }
+            }
+            if !finished {
+                let response = PlannedChatResponse {
+                    content,
+                    tool_calls: tool_calls
+                        .into_iter()
+                        .map(|tc| ToolCall {
+                            id: tc.id,
+                            name: tc.name,
+                            args_json: tc.args_json,
+                        })
+                        .collect(),
+                    input_tokens,
+                    output_tokens,
+                    stop_reason,
+                    provider,
+                };
+                let _ = finish_streamed_execution(
+                    &db,
+                    &evolve_history,
+                    &request_id,
+                    &namespace_hint,
+                    &enriched_spec,
+                    original_spec.as_deref(),
+                    &resolved_model,
+                    sampled,
+                    sample_rate,
+                    &sample_reason,
+                    scoring_enabled,
+                    &response,
+                );
+                yield Ok(ExecutePlanStreamEvent {
+                    content_delta: String::new(),
+                    response: Some(response),
+                    done: true,
+                    executed_at: chrono::Utc::now().timestamp(),
+                });
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_affinity(
@@ -1554,6 +2174,7 @@ mod tests {
     fn config(db_path: &str) -> Config {
         Config {
             grpc_port: 0,
+            sekai_socket: None,
             db_path: db_path.to_string(),
             anthropic_api_key: None,
             openai_api_key: None,
@@ -1577,6 +2198,22 @@ mod tests {
     fn file_service(path: &str) -> ChiseiServiceImpl {
         let db = Arc::new(SekaiDb::new(path).unwrap());
         ChiseiServiceImpl::new(db, config(path))
+    }
+
+    fn resolve_policy_request(
+        namespace: &str,
+        preferred_runtime: &str,
+        preferred_model: &str,
+    ) -> ResolvePolicyRequest {
+        ResolvePolicyRequest {
+            namespace: namespace.into(),
+            preferred_runtime: preferred_runtime.into(),
+            preferred_model: preferred_model.into(),
+            subject: String::new(),
+            project: String::new(),
+            agent: String::new(),
+            key_id: String::new(),
+        }
     }
 
     async fn create_suite(svc: &ChiseiServiceImpl, namespace: &str) {
@@ -1614,6 +2251,250 @@ mod tests {
             }],
             timestamp,
         }
+    }
+
+    #[tokio::test]
+    async fn budget_rpcs_accept_gateway_subject_metadata() {
+        let svc = memory_service();
+        svc.set_budget_limit(Request::new(SetBudgetLimitRequest {
+            user_id: String::new(),
+            max_tokens: 10,
+            period_type: "day".into(),
+            subject: String::new(),
+            project: "sekai-chisei".into(),
+            agent: "codex-app".into(),
+            key_id: "codex-app".into(),
+        }))
+        .await
+        .unwrap();
+
+        let allowed = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 5,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(allowed.allowed);
+        assert_eq!(allowed.usage.unwrap().user_id, "agent:codex-app");
+
+        svc.record_usage(Request::new(RecordUsageRequest {
+            user_id: String::new(),
+            tokens_used: 8,
+            subject: String::new(),
+            project: "sekai-chisei".into(),
+            agent: "codex-app".into(),
+            key_id: "codex-app".into(),
+        }))
+        .await
+        .unwrap();
+
+        let denied = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.allowed);
+    }
+
+    #[tokio::test]
+    async fn record_gateway_audit_writes_decision_log() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
+        let response = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: String::new(),
+                    timestamp: 0,
+                    actor: "codex-app".into(),
+                    action: "gateway.model_rewrite".into(),
+                    reason: "policy resolved a different model".into(),
+                    evidence: HashMap::from([("request_id".into(), "req-1".into())]),
+                    target_id: String::new(),
+                    outcome: "routed".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .event
+            .unwrap();
+
+        assert!(!response.id.is_empty());
+        assert!(response.timestamp > 0);
+        assert_eq!(response.target_id, "llm_calls");
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.model_rewrite".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].actor, "codex-app");
+        assert_eq!(
+            decisions[0].evidence.get("request_id").map(String::as_str),
+            Some("req-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_namespace_policy_applies_to_resolve_policy() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["native-default".into()],
+            default_runtime: "openai".into(),
+            default_model: "native-default".into(),
+        }))
+        .await
+        .unwrap();
+
+        let resolved = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "openai",
+                "gpt-5.5",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolved.runtime, "openai");
+        assert_eq!(resolved.model, "native-default");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_prefers_agent_context_over_project_policy() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-mini".into()],
+            default_runtime: "native".into(),
+            default_model: "native-mini".into(),
+        }))
+        .await
+        .unwrap();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "agent:codex-app".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-default".into()],
+            default_runtime: "native".into(),
+            default_model: "native-default".into(),
+        }))
+        .await
+        .unwrap();
+
+        let mut request = resolve_policy_request("sekai-chisei", "native", "native-mini");
+        request.project = "sekai-chisei".into();
+        request.agent = "codex-app".into();
+        let resolved = svc
+            .resolve_policy(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolved.runtime, "native");
+        assert_eq!(resolved.model, "native-default");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_biases_to_default_model_when_namespace_regressed() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-default".into(), "native-cheap".into()],
+            default_runtime: "native".into(),
+            default_model: "native-default".into(),
+        }))
+        .await
+        .unwrap();
+        create_suite(&svc, "sekai-chisei").await;
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-1", "suite-1", 92, 100)),
+            changed_file: "sekai-chisei".into(),
+            diff_hash: "hash-a".into(),
+        }))
+        .await
+        .unwrap();
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-2", "suite-1", 60, 200)),
+            changed_file: "sekai-chisei".into(),
+            diff_hash: "hash-b".into(),
+        }))
+        .await
+        .unwrap();
+
+        let resolved = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "native",
+                "native-cheap",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolved.runtime, "native");
+        assert_eq!(resolved.model, "native-default");
+        assert!(resolved.eval_regressed);
+        assert!(resolved.eval_regression_reason.contains("sekai-chisei"));
+    }
+
+    #[tokio::test]
+    async fn namespace_policy_reloads_from_sekai_object_store() {
+        let path = std::env::temp_dir()
+            .join(format!("sekai-policy-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let svc = file_service(&path);
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["native-default".into()],
+            default_runtime: "openai".into(),
+            default_model: "native-default".into(),
+        }))
+        .await
+        .unwrap();
+        drop(svc);
+
+        let reloaded = file_service(&path);
+        let resolved = reloaded
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "openai",
+                "gpt-5.5",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolved.runtime, "openai");
+        assert_eq!(resolved.model, "native-default");
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1993,6 +2874,70 @@ mod tests {
             .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
             .await
             .expect_err("external plan without egress decisions should be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("missing egress decisions"));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_stream_rejects_external_plan_without_egress_decisions() {
+        let svc = memory_service();
+        let plan = ExecutionPlan {
+            plan_id: "stream-external-plan".into(),
+            input: Some(ExecutionInput {
+                request_id: "stream-external-plan".into(),
+                namespace: "sekai-chisei".into(),
+                spec: "do work".into(),
+                preferred_model: "gpt-5.5".into(),
+                preferred_runtime: "openai".into(),
+                task_type: String::new(),
+                priority: 0,
+                user_id: "user-1".into(),
+                estimated_tokens: 0,
+                messages: vec![],
+                tools: vec![],
+                system: String::new(),
+                max_tokens: 512,
+            }),
+            resolved_runtime: "openai".into(),
+            resolved_model: "gpt-5.5".into(),
+            enriched_spec: "do work".into(),
+            prepared_system: String::new(),
+            prepared_messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "do work".into(),
+                tool_call_id: String::new(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            budget: Some(BudgetVerdict {
+                allowed: true,
+                usage: None,
+                reason: String::new(),
+            }),
+            steps: vec![],
+            review_policy: None,
+            risk_score: 0.0,
+            low_success_namespace: false,
+            executable: true,
+            warnings: vec![],
+            max_tokens: 512,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            affinity_namespaces: vec![],
+            eval_regressed: false,
+            eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
+            egress_decisions: vec![],
+        };
+        svc.cache_plan(plan.clone());
+
+        let result = svc
+            .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+            .await;
+        let err = result
+            .err()
+            .expect("external stream plan without egress decisions should be rejected");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("missing egress decisions"));
     }
