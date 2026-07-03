@@ -3278,6 +3278,9 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
             leak_review_model: None,
+            tls_cert: None,
+            tls_key: None,
+            allow_plaintext: false,
         }
     }
 
