@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::llm;
 use crate::llm::ollama::InstalledModel;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub struct RoutingContext<'a> {
@@ -9,6 +10,8 @@ pub struct RoutingContext<'a> {
     pub route_bias: Option<&'a str>,
     pub config: &'a Config,
     pub ollama_models: &'a [InstalledModel],
+    pub safe_only: bool,
+    pub safe_providers: &'a HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -41,12 +44,12 @@ pub fn resolve_model(ctx: RoutingContext<'_>) -> Result<String, String> {
     }
 
     if let Some(name) = exact_available_ollama_name(ctx.requested, ctx.ollama_models) {
-        return Ok(format!("ollama/{name}"));
+        return safe_resolved(format!("ollama/{name}"), &ctx);
     }
 
     if let Some(name) = ctx.requested.strip_prefix("ollama/") {
         if has_available_model(name, ctx.ollama_models) {
-            return Ok(ctx.requested.to_string());
+            return safe_resolved(ctx.requested.to_string(), &ctx);
         }
         let fallback_alias = ctx.route_bias.unwrap_or("capable");
         let candidates = candidate_pool(&ctx);
@@ -62,6 +65,11 @@ pub fn resolve_model(ctx: RoutingContext<'_>) -> Result<String, String> {
 
 fn validate_or_fallback_provider_model(ctx: RoutingContext<'_>) -> Result<String, String> {
     let provider = llm::provider_name(ctx.requested);
+    if ctx.safe_only && !provider_is_safe(provider, &ctx) {
+        return Err(format!(
+            "provider {provider:?} is not safe for sensitive data"
+        ));
+    }
     if provider_is_available(provider, ctx.config) {
         return Ok(ctx.requested.to_string());
     }
@@ -164,12 +172,29 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
     if !provider_is_available(provider, ctx.config) {
         return None;
     }
+    if ctx.safe_only && !provider_is_safe(provider, ctx) {
+        return None;
+    }
 
     Some(Candidate {
         model: model.to_string(),
         cost_rank: named_model_cost_rank(model),
         capability_rank: named_model_capability_rank(model),
     })
+}
+
+fn safe_resolved(model: String, ctx: &RoutingContext<'_>) -> Result<String, String> {
+    let provider = llm::provider_name(&model);
+    if ctx.safe_only && !provider_is_safe(provider, ctx) {
+        return Err(format!(
+            "provider {provider:?} is not safe for sensitive data"
+        ));
+    }
+    Ok(model)
+}
+
+fn provider_is_safe(provider: &str, ctx: &RoutingContext<'_>) -> bool {
+    crate::chisei::privacy::provider_safe_to_send(provider, ctx.safe_providers)
 }
 
 fn choose_candidate(
@@ -339,6 +364,9 @@ mod tests {
             scoring_interval_secs: 60,
             scoring_model: "claude-opus-4-8".into(),
             scoring_batch_size: 16,
+            default_data_class: "unclassified".into(),
+            safe_egress_providers: vec![],
+            leak_review_model: None,
         }
     }
 
@@ -361,6 +389,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &available,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "gpt-4.1-mini");
@@ -376,6 +406,8 @@ mod tests {
             route_bias: Some("cheap"),
             config: &config,
             ollama_models: &available,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
@@ -391,6 +423,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &available,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
@@ -407,8 +441,48 @@ mod tests {
             route_bias: Some("capable"),
             config: &config,
             ollama_models: &available,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn safe_only_filters_external_candidates() {
+        let config = config();
+        let available = vec![model("llama3.2:latest", 3.2)];
+        let safe = std::collections::HashSet::from(["ollama".to_string()]);
+        let resolved = resolve_model(RoutingContext {
+            requested: "capable",
+            allowed_models: &[
+                "claude-sonnet-4-20250514".into(),
+                "ollama/llama3.2:latest".into(),
+            ],
+            route_bias: Some("capable"),
+            config: &config,
+            ollama_models: &available,
+            safe_only: true,
+            safe_providers: &safe,
+        })
+        .unwrap();
+        assert_eq!(resolved, "ollama/llama3.2:latest");
+    }
+
+    #[test]
+    fn safe_only_rejects_explicit_unsafe_provider() {
+        let config = config();
+        let safe = std::collections::HashSet::from(["ollama".to_string()]);
+        let err = resolve_model(RoutingContext {
+            requested: "gpt-4.1-mini",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            safe_only: true,
+            safe_providers: &safe,
+        })
+        .unwrap_err();
+        assert!(err.contains("not safe"));
     }
 }

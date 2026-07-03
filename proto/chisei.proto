@@ -16,6 +16,7 @@ message PolicyResolution {
   string model = 2;
   bool eval_regressed = 3;
   string eval_regression_reason = 4;
+  string data_class = 5;
 }
 
 message PipelineRequest {
@@ -26,6 +27,7 @@ message PipelineRequest {
   string runtime = 5;
   string task_type = 6;
   int32 priority = 7;
+  string task_class = 8;
 }
 
 message StepDecision {
@@ -89,6 +91,7 @@ message ExecutionInput {
   repeated ToolDef tools = 11;
   string system = 12;
   int32 max_tokens = 13;
+  string task_class = 14;
   reserved 15;
   reserved "agent_id";
 }
@@ -118,6 +121,7 @@ message ExecutionPlan {
   double sample_rate = 22;
   string sample_reason = 23;
   repeated EgressDecision egress_decisions = 24;
+  string task_class = 25;
 }
 
 message EgressDecision {
@@ -338,6 +342,7 @@ message SetNamespacePolicyRequest {
   repeated string allowed_models = 3;
   string default_runtime = 4;
   string default_model = 5;
+  string data_class = 6;
 }
 message SetNamespacePolicyResponse { PolicyResolution resolution = 1; }
 
@@ -349,8 +354,20 @@ message ResolvePolicyRequest {
   string project = 5;
   string agent = 6;
   string key_id = 7;
+  string task_class = 8;
+  string user_id = 9;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
+message CheckEgressRequest {
+  string namespace = 1;
+  string payload = 2;
+  string provider = 3;
+  string task_class = 4;
+}
+message CheckEgressResponse {
+  bool allowed = 1;
+  repeated EgressDecision findings = 2;
+}
 
 message RunPipelineRequest { PipelineRequest request = 1; }
 message RunPipelineResponse { PipelineRunResult result = 1; }
@@ -457,6 +474,7 @@ service ChiseiService {
   // Model Policy
   rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
   rpc ResolvePolicy(ResolvePolicyRequest) returns (ResolvePolicyResponse);
+  rpc CheckEgress(CheckEgressRequest) returns (CheckEgressResponse);
 
   // Pipeline
   rpc RunPipeline(RunPipelineRequest) returns (RunPipelineResponse);

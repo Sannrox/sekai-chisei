@@ -19,6 +19,7 @@ pub struct PipelineRequest {
     pub review_model: String,
     pub egress_records: Vec<egress::ContextEgressRecord>,
     pub external_egress: bool,
+    pub template_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +200,16 @@ impl Step for ObjectContextEnrichStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
+        if req.template_only {
+            return StepDecision {
+                step: String::new(),
+                action: "skipped".into(),
+                reasoning: "template_only sanitization contract".into(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            };
+        }
         let mut lines = Vec::new();
         let context_objects = resolve_context_objects(req, db);
         if context_objects.is_empty() {
@@ -421,6 +432,16 @@ impl Step for LearningsEnrichStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
+        if req.template_only {
+            return StepDecision {
+                step: String::new(),
+                action: "skipped".into(),
+                reasoning: "template_only sanitization contract".into(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            };
+        }
         let mut pitfalls = Vec::new();
         let mut found_context = false;
         for context in resolve_context_objects(req, db) {
@@ -509,6 +530,16 @@ impl Step for SpecEnrichStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
+        if req.template_only {
+            return StepDecision {
+                step: String::new(),
+                action: "skipped".into(),
+                reasoning: "template_only sanitization contract".into(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            };
+        }
         let mut hints = Vec::new();
         let mut found_context = false;
         for context in resolve_context_objects(req, db) {
@@ -872,6 +903,7 @@ mod tests {
             review_model: String::new(),
             egress_records: vec![],
             external_egress: true,
+            template_only: false,
         }
     }
 
@@ -1009,6 +1041,7 @@ mod tests {
             review_model: String::new(),
             egress_records: vec![],
             external_egress: true,
+            template_only: false,
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");
