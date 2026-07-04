@@ -331,7 +331,7 @@ impl SekaiDb {
         conn.query_row(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
             params![id],
-            |row| Ok(row_to_object(row)),
+            row_to_object,
         ).optional().map_err(|e| e.to_string())
     }
 
@@ -349,7 +349,7 @@ impl SekaiDb {
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![o.id],
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -378,7 +378,7 @@ impl SekaiDb {
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![id],
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -454,7 +454,7 @@ impl SekaiDb {
                     .map(|v| v.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .map_err(|e| e.to_string())?;
         let objects: Vec<Object> = rows
@@ -525,7 +525,7 @@ impl SekaiDb {
                     .map(|v| v.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .map_err(|e| e.to_string())?;
         let objects: Vec<Object> = rows
@@ -730,7 +730,7 @@ impl SekaiDb {
         conn.query_row(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE external_id = ?1",
             params![external_id],
-            |row| Ok(row_to_object(row)),
+            row_to_object,
         ).optional().map_err(|e| e.to_string())
     }
 
@@ -749,9 +749,7 @@ impl SekaiDb {
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE kind = ?1 AND json_extract(properties, ?2) = ?3"
         ).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![kind, json_path, value], |row| {
-                Ok(row_to_object(row))
-            })
+            .query_map(params![kind, json_path, value], row_to_object)
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -822,7 +820,7 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
         };
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            results.push(row_to_link(row));
+            results.push(row_to_link(row).map_err(|e| e.to_string())?);
         }
         Ok(results)
     }
@@ -848,19 +846,19 @@ impl SekaiDb {
     }
 }
 
-pub(crate) fn row_to_object(row: &rusqlite::Row) -> Object {
-    let props_str: String = row.get(5).unwrap_or_default();
+pub(crate) fn row_to_object(row: &rusqlite::Row) -> rusqlite::Result<Object> {
+    let props_str: String = row.get(5)?;
     let properties: HashMap<String, String> = serde_json::from_str(&props_str).unwrap_or_default();
-    Object {
-        id: row.get(0).unwrap(),
-        kind: row.get(1).unwrap(),
-        name: row.get(2).unwrap(),
-        namespace: row.get(3).unwrap_or_default(),
-        external_id: row.get(4).unwrap_or_default(),
+    Ok(Object {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        namespace: row.get(3)?,
+        external_id: row.get(4)?,
         properties,
-        created: row.get(6).unwrap(),
-        updated: row.get(7).unwrap(),
-    }
+        created: row.get(6)?,
+        updated: row.get(7)?,
+    })
 }
 
 struct ListQueryParts {
@@ -1116,14 +1114,14 @@ fn row_to_principal_credential(
     })
 }
 
-fn row_to_link(row: &rusqlite::Row) -> Link {
-    Link {
-        id: row.get(0).unwrap(),
-        from_id: row.get(1).unwrap(),
-        to_id: row.get(2).unwrap(),
-        relation: row.get(3).unwrap(),
-        created: row.get(4).unwrap(),
-    }
+fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        relation: row.get(3)?,
+        created: row.get(4)?,
+    })
 }
 
 #[cfg(test)]
@@ -1306,6 +1304,38 @@ mod tests {
 
         let found = db.find_by_external_id("namespace:alpha").unwrap();
         assert_eq!(found.unwrap().id, "r1");
+    }
+
+    #[test]
+    fn malformed_object_row_returns_error_without_poisoning_connection() {
+        let db = test_db();
+        db.create_object(&make_obj("good", "namespace", "good"))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sekai_objects
+                 (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    "bad",
+                    "namespace",
+                    "bad",
+                    "default",
+                    "namespace:bad",
+                    "{}",
+                    "not-an-integer",
+                    1000_i64,
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(db.get_object("bad").is_err());
+        assert!(db.find_by_external_id("namespace:bad").is_err());
+
+        let good = db.get_object("good").unwrap().unwrap();
+        assert_eq!(good.id, "good");
     }
 
     #[test]

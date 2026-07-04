@@ -114,11 +114,11 @@ impl SekaiDb {
         let mut results = Vec::new();
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let cols_str: String = row.get(2).unwrap_or_default();
+            let cols_str: String = row.get(2).map_err(|e| e.to_string())?;
             let cols: Vec<(String, String)> = serde_json::from_str(&cols_str).unwrap_or_default();
             results.push(Dataset {
-                id: row.get(0).unwrap(),
-                name: row.get(1).unwrap(),
+                id: row.get(0).map_err(|e| e.to_string())?,
+                name: row.get(1).map_err(|e| e.to_string())?,
                 columns: cols
                     .into_iter()
                     .map(|(n, t)| ColumnDef {
@@ -126,8 +126,8 @@ impl SekaiDb {
                         col_type: t,
                     })
                     .collect(),
-                object_id: row.get(3).unwrap_or_default(),
-                created: row.get(4).unwrap(),
+                object_id: row.get(3).map_err(|e| e.to_string())?,
+                created: row.get(4).map_err(|e| e.to_string())?,
             });
         }
         Ok(results)
@@ -165,7 +165,7 @@ impl SekaiDb {
         let mut results = Vec::new();
         let mut skipped = 0;
         while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
-            let data: String = row.get(0).unwrap();
+            let data: String = row.get(0).map_err(|e| e.to_string())?;
             let map: HashMap<String, String> = serde_json::from_str(&data).unwrap_or_default();
             if !matches_row_filters(&map, &q.filters) {
                 continue;
@@ -212,15 +212,15 @@ impl SekaiDb {
         let mut results = Vec::new();
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let filters_str: String = row.get(3).unwrap_or_default();
+            let filters_str: String = row.get(3).map_err(|e| e.to_string())?;
             let filters: Vec<(String, String, String)> =
                 serde_json::from_str(&filters_str).unwrap_or_default();
-            let cols_str: String = row.get(4).unwrap_or_default();
+            let cols_str: String = row.get(4).map_err(|e| e.to_string())?;
             let columns: Vec<String> = serde_json::from_str(&cols_str).unwrap_or_default();
             results.push(VirtualTable {
-                id: row.get(0).unwrap(),
-                name: row.get(1).unwrap(),
-                dataset_id: row.get(2).unwrap(),
+                id: row.get(0).map_err(|e| e.to_string())?,
+                name: row.get(1).map_err(|e| e.to_string())?,
+                dataset_id: row.get(2).map_err(|e| e.to_string())?,
                 filters: filters
                     .into_iter()
                     .map(|(c, o, v)| RowFilter {
@@ -230,7 +230,7 @@ impl SekaiDb {
                     })
                     .collect(),
                 columns,
-                created: row.get(5).unwrap(),
+                created: row.get(5).map_err(|e| e.to_string())?,
             });
         }
         Ok(results)

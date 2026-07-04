@@ -222,16 +222,16 @@ impl SekaiDb {
             .query(param_refs.as_slice())
             .map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let ev_str: String = row.get(5).unwrap_or_default();
+            let ev_str: String = row.get(5).map_err(|e| e.to_string())?;
             results.push(Decision {
-                id: row.get(0).unwrap(),
-                timestamp: row.get(1).unwrap(),
-                actor: row.get(2).unwrap(),
-                action: row.get(3).unwrap(),
-                reason: row.get(4).unwrap_or_default(),
+                id: row.get(0).map_err(|e| e.to_string())?,
+                timestamp: row.get(1).map_err(|e| e.to_string())?,
+                actor: row.get(2).map_err(|e| e.to_string())?,
+                action: row.get(3).map_err(|e| e.to_string())?,
+                reason: row.get(4).map_err(|e| e.to_string())?,
                 evidence: serde_json::from_str(&ev_str).unwrap_or_default(),
-                target_id: row.get(6).unwrap_or_default(),
-                outcome: row.get(7).unwrap_or_default(),
+                target_id: row.get(6).map_err(|e| e.to_string())?,
+                outcome: row.get(7).map_err(|e| e.to_string())?,
             });
         }
         Ok(results)
@@ -295,7 +295,7 @@ impl SekaiDb {
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![object.id],
-                |row| Ok(crate::db::sekai::row_to_object(row)),
+                crate::db::sekai::row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -339,7 +339,7 @@ impl SekaiDb {
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![id],
-                |row| Ok(crate::db::sekai::row_to_object(row)),
+                crate::db::sekai::row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -384,13 +384,13 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             results.push(ObjectChange {
-                id: row.get(0).unwrap(),
-                object_id: row.get(1).unwrap(),
-                field: row.get(2).unwrap(),
-                old_value: row.get(3).unwrap_or_default(),
-                new_value: row.get(4).unwrap_or_default(),
-                changed_by: row.get(5).unwrap_or_default(),
-                timestamp: row.get(6).unwrap(),
+                id: row.get(0).map_err(|e| e.to_string())?,
+                object_id: row.get(1).map_err(|e| e.to_string())?,
+                field: row.get(2).map_err(|e| e.to_string())?,
+                old_value: row.get(3).map_err(|e| e.to_string())?,
+                new_value: row.get(4).map_err(|e| e.to_string())?,
+                changed_by: row.get(5).map_err(|e| e.to_string())?,
+                timestamp: row.get(6).map_err(|e| e.to_string())?,
             });
         }
         Ok(results)
