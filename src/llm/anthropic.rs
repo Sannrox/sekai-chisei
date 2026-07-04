@@ -1,18 +1,37 @@
-use super::{ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, Provider, ToolCall};
+use super::{
+    ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts, Provider, ToolCall,
+    classify_reqwest_error,
+};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
 pub struct Anthropic {
     api_key: String,
+    base_url: String,
     client: Client,
+    timeouts: HttpTimeouts,
 }
 
 impl Anthropic {
     pub fn new(api_key: &str) -> Self {
+        Self::with_base_url_and_timeouts(
+            api_key,
+            "https://api.anthropic.com",
+            HttpTimeouts::from_env(),
+        )
+    }
+
+    pub(crate) fn with_base_url_and_timeouts(
+        api_key: &str,
+        base_url: &str,
+        timeouts: HttpTimeouts,
+    ) -> Self {
         Self {
             api_key: api_key.to_string(),
-            client: Client::new(),
+            base_url: base_url.to_string(),
+            client: timeouts.client(),
+            timeouts,
         }
     }
 }
@@ -22,19 +41,24 @@ impl Provider for Anthropic {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
         let body = messages_body(req, false);
 
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(url)
+            .timeout(self.timeouts.request_timeout)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| classify_reqwest_error("anthropic chat request", err))?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|err| classify_reqwest_error("anthropic chat response", err))?;
         if !status.is_success() {
             return Err(format!("anthropic {}: {}", status, text));
         }
@@ -71,20 +95,24 @@ impl Provider for Anthropic {
 
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
         let body = messages_body(req, true);
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| classify_reqwest_error("anthropic stream request", err))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| classify_reqwest_error("anthropic stream response", err))?;
             return Err(format!("anthropic {}: {}", status, text));
         }
 
@@ -102,7 +130,7 @@ impl Provider for Anthropic {
                 let bytes = match next {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        yield Err(err.to_string());
+                        yield Err(classify_reqwest_error("anthropic stream read", err));
                         return;
                     }
                 };
@@ -284,7 +312,49 @@ fn event_data_values(event: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_anthropic_sse_event;
+    use super::{Anthropic, parse_anthropic_sse_event};
+    use crate::llm::{ChatRequest, HttpTimeouts, Provider};
+    use axum::Router;
+    use axum::routing::post;
+    use std::time::Duration;
+
+    fn test_timeouts() -> HttpTimeouts {
+        HttpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+            pool_idle_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_millis(50),
+        }
+    }
+
+    fn test_chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "claude-sonnet-4-8".to_string(),
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 16,
+        }
+    }
+
+    async fn delayed_messages_response() -> axum::Json<serde_json::Value> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        axum::Json(serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn"
+        }))
+    }
+
+    async fn spawn_delayed_anthropic() -> String {
+        let app = Router::new().route("/v1/messages", post(delayed_messages_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn parses_messages_stream_delta_usage_and_stop() {
@@ -346,5 +416,18 @@ mod tests {
         assert_eq!(chunks[0].input_tokens, 11);
         assert_eq!(chunks[0].output_tokens, 3);
         assert_eq!(chunks[0].stop_reason, "end_turn");
+    }
+
+    #[tokio::test]
+    async fn unary_chat_times_out_against_slow_upstream() {
+        let base_url = spawn_delayed_anthropic().await;
+        let provider =
+            Anthropic::with_base_url_and_timeouts("test-key", &base_url, test_timeouts());
+        let err = tokio::time::timeout(Duration::from_secs(2), provider.chat(&test_chat_request()))
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(err.contains("timed out"), "{err}");
     }
 }

@@ -4,9 +4,90 @@ pub mod openai;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use std::pin::Pin;
+use std::time::Duration;
+use tracing::warn;
 
 use futures_util::{Stream, stream};
+
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpTimeouts {
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub pool_idle_timeout: Duration,
+    pub request_timeout: Duration,
+}
+
+impl HttpTimeouts {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            connect_timeout: duration_env(
+                "LLM_HTTP_CONNECT_TIMEOUT_SECS",
+                DEFAULT_CONNECT_TIMEOUT_SECS,
+            ),
+            read_timeout: duration_env("LLM_HTTP_READ_TIMEOUT_SECS", DEFAULT_READ_TIMEOUT_SECS),
+            pool_idle_timeout: duration_env(
+                "LLM_HTTP_POOL_IDLE_TIMEOUT_SECS",
+                DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+            ),
+            request_timeout: duration_env(
+                "LLM_HTTP_REQUEST_TIMEOUT_SECS",
+                DEFAULT_REQUEST_TIMEOUT_SECS,
+            ),
+        }
+    }
+
+    pub(crate) fn client(self) -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
+            .pool_idle_timeout(self.pool_idle_timeout)
+            .build()
+            .expect("valid reqwest timeout configuration")
+    }
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            read_timeout: Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS),
+            pool_idle_timeout: Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
+
+fn duration_env(key: &str, default_secs: u64) -> Duration {
+    match env::var(key) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            Ok(_) => {
+                warn!(key, default_secs, "zero timeout is invalid; using default");
+                Duration::from_secs(default_secs)
+            }
+            Err(err) => {
+                warn!(key, value = %value, default_secs, error = %err, "invalid timeout; using default");
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
+}
+
+pub(crate) fn classify_reqwest_error(context: &str, err: reqwest::Error) -> String {
+    if err.is_timeout() {
+        format!("{context} timed out: {err}")
+    } else {
+        format!("{context} failed: {err}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
