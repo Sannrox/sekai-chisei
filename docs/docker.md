@@ -16,8 +16,8 @@ A client request must include one of these keys via `Authorization: Bearer <key>
 
 `CHISEI_GATEWAY_ADMIN_TOKEN` protects the admin refresh endpoint (`/_chisei/admin/refresh`).
 
-Without any `chisei-gateway-setup` seed data, control-plane policy/budget enforcement is
-still in permissive default mode. Use `chisei-gateway-setup` (see below) to enable
+Without any `sekaictl gateway setup` seed data, control-plane policy/budget enforcement is
+still in permissive default mode. Use `sekaictl gateway setup` (see below) to enable
 governance and key rotation for your environment.
 
 Gateway traffic is served at `http://localhost:8080` by default and talks to the server through the shared UDS.
@@ -69,7 +69,7 @@ For TCP transport, set `SEKAI_AUTH_TOKEN` on server and gateway, point the gatew
 - Seed setup data:
 
 ```bash
-docker compose run --rm gateway chisei-gateway-setup --help
+docker compose run --rm gateway sekaictl gateway setup --help
 ```
 
 - Generate an attribution/report from shared state:
