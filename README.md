@@ -73,6 +73,7 @@ Configuration is read from environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | gRPC listen port |
+| `SEKAI_BIND` | unset | Optional gRPC TCP bind override. When unset, authenticated TCP binds `0.0.0.0` and insecure local TCP binds `127.0.0.1`. |
 | `OPS_PORT` | `9464` | HTTP ops listener port for `/metrics`, `/healthz`, and `/readyz`; set empty to disable |
 | `OPS_BIND` | `127.0.0.1` | HTTP ops listener bind address; use `0.0.0.0` when Kubernetes kubelet probes must reach the pod |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path for local gRPC; set empty to disable |
@@ -110,6 +111,7 @@ For TCP mode, control-plane identity is verified from bearer token metadata:
 - create per-principal credentials via `sekaictl credential create <principal>` and set `SEKAI_AUTH_TOKEN` to that token for clients
 - use `sekaictl credential rotate <principal>` and `sekaictl credential revoke <principal>` for lifecycle
 - `SEKAI_AUTH_TOKEN` is a deprecated compatibility path and now maps to fixed principal `root`
+- set `SEKAI_BIND` to make the TCP bind address explicit; when unset, authenticated TCP infers `0.0.0.0` and insecure local TCP infers `127.0.0.1`
 - `0.0.0.0` requires TLS via `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless `SEKAI_ALLOW_PLAINTEXT=1`
 - local UDS paths and `SEKAI_INSECURE=1` stay plaintext and keep self-asserted `x-principal` (defaults to `local` when absent)
 

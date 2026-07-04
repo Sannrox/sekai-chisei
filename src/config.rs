@@ -4,6 +4,7 @@ use tracing::warn;
 #[derive(Clone)]
 pub struct Config {
     pub grpc_port: u16,
+    pub sekai_bind: Option<String>,
     pub ops_port: Option<u16>,
     pub ops_bind: String,
     pub sekai_socket: Option<String>,
@@ -25,12 +26,22 @@ pub struct Config {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub allow_plaintext: bool,
+    pub insecure: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrpcTcpMode {
+    pub bind_addr: String,
+    pub token_auth_mode: bool,
+    pub auth_configured: bool,
+    pub bind_inferred_from_active_credentials: bool,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         Self {
             grpc_port: env("GRPC_PORT", "50051").parse().unwrap_or(50051),
+            sekai_bind: optional_env("SEKAI_BIND"),
             ops_port: optional_port("OPS_PORT", "9464"),
             ops_bind: env("OPS_BIND", "127.0.0.1"),
             sekai_socket: socket_path("SEKAI_SOCKET", "./data/sekai.sock"),
@@ -60,12 +71,43 @@ impl Config {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
+            insecure: env::var("SEKAI_INSECURE").unwrap_or_default() == "1",
+        }
+    }
+
+    pub fn grpc_tcp_mode(&self, active_credentials: bool) -> GrpcTcpMode {
+        let auth_configured = self.auth_token.is_some() || active_credentials;
+        let token_auth_mode = auth_configured && !self.insecure;
+        let inferred_bind_addr = if token_auth_mode {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let bind_addr = self
+            .sekai_bind
+            .clone()
+            .unwrap_or_else(|| inferred_bind_addr.to_string());
+        let bind_inferred_from_active_credentials =
+            self.sekai_bind.is_none() && token_auth_mode && active_credentials;
+
+        GrpcTcpMode {
+            bind_addr,
+            token_auth_mode,
+            auth_configured,
+            bind_inferred_from_active_credentials,
         }
     }
 }
 
 fn env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn socket_path(key: &str, default: &str) -> Option<String> {
@@ -104,4 +146,56 @@ fn csv_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        let mut config = Config::from_env();
+        config.sekai_bind = None;
+        config.auth_token = None;
+        config.insecure = false;
+        config
+    }
+
+    #[test]
+    fn grpc_tcp_mode_infers_public_bind_from_active_credentials() {
+        let config = test_config();
+
+        let mode = config.grpc_tcp_mode(true);
+
+        assert_eq!(mode.bind_addr, "0.0.0.0");
+        assert!(mode.token_auth_mode);
+        assert!(mode.auth_configured);
+        assert!(mode.bind_inferred_from_active_credentials);
+    }
+
+    #[test]
+    fn grpc_tcp_mode_explicit_bind_wins_without_changing_auth_mode() {
+        let mut config = test_config();
+        config.sekai_bind = Some("127.0.0.1".to_string());
+
+        let mode = config.grpc_tcp_mode(true);
+
+        assert_eq!(mode.bind_addr, "127.0.0.1");
+        assert!(mode.token_auth_mode);
+        assert!(mode.auth_configured);
+        assert!(!mode.bind_inferred_from_active_credentials);
+    }
+
+    #[test]
+    fn grpc_tcp_mode_insecure_disables_token_auth_and_keeps_local_bind() {
+        let mut config = test_config();
+        config.auth_token = Some("legacy-token".to_string());
+        config.insecure = true;
+
+        let mode = config.grpc_tcp_mode(true);
+
+        assert_eq!(mode.bind_addr, "127.0.0.1");
+        assert!(!mode.token_auth_mode);
+        assert!(mode.auth_configured);
+        assert!(!mode.bind_inferred_from_active_credentials);
+    }
 }

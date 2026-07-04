@@ -200,6 +200,7 @@ mod tests {
     fn safe_providers_always_include_ollama() {
         let config = Config {
             grpc_port: 50051,
+            sekai_bind: None,
             ops_port: None,
             ops_bind: "127.0.0.1".into(),
             db_path: ":memory:".into(),
@@ -221,6 +222,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             allow_plaintext: false,
+            insecure: false,
         };
         let safe = safe_providers(&config);
         assert!(provider_safe_to_send("ollama", &safe));
