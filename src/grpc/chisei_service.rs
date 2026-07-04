@@ -699,7 +699,7 @@ impl ChiseiServiceImpl {
     fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
         let mut rules = Vec::new();
         for ns in ["", namespace] {
-            let Ok(objects) = self.db.list_objects(&ListFilter {
+            let Ok(objects) = self.db.list_all_objects(&ListFilter {
                 kind: Some("leak_rule".into()),
                 namespace: Some(ns.to_string()),
                 ..Default::default()
@@ -737,7 +737,7 @@ impl ChiseiServiceImpl {
     fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
         let objects = self
             .db
-            .list_objects(&ListFilter {
+            .list_all_objects(&ListFilter {
                 namespace: Some(namespace.to_string()),
                 ..Default::default()
             })
@@ -1159,7 +1159,7 @@ fn prune_excess_plans(plans: &mut HashMap<String, ExecutionPlan>, protected_plan
 
 fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
     for kind in ["policy", "namespace_policy"] {
-        let Ok(objects) = db.list_objects(&ListFilter {
+        let Ok(objects) = db.list_all_objects(&ListFilter {
             kind: Some(kind.into()),
             ..Default::default()
         }) else {

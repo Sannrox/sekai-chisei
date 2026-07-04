@@ -49,7 +49,7 @@ pub fn record_snapshot(db: &SekaiDb, metrics: &CapacityMetrics) -> Result<(), St
 }
 
 pub fn latest_snapshots(db: &SekaiDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
-    let objs = db.list_objects(&crate::domain::ListFilter {
+    let objs = db.list_all_objects(&crate::domain::ListFilter {
         kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
         ..Default::default()
     })?;

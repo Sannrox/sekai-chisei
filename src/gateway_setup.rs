@@ -177,35 +177,49 @@ where
     let mut sekai = SekaiServiceClient::new(channel);
     match command.action {
         GatewayKeyAction::List { project } => {
-            let resp = sekai
-                .list_objects(gateway_request(ListObjectsRequest {
-                    filter: Some(ListFilter {
-                        kind: "gateway_key".to_string(),
-                        name: String::new(),
-                        namespace: project.unwrap_or_default(),
-                    }),
-                }))
-                .await?
-                .into_inner();
             println!("name\tproject\tagent\tstatus\tsecret_storage\tupdated");
-            for object in resp.objects {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    object.name,
-                    object.namespace,
-                    object.properties.get("agent").cloned().unwrap_or_default(),
-                    object
-                        .properties
-                        .get("status")
-                        .cloned()
-                        .unwrap_or_else(|| "active".to_string()),
-                    object
-                        .properties
-                        .get("secret_storage")
-                        .cloned()
-                        .unwrap_or_default(),
-                    object.updated
-                );
+            let namespace = project.unwrap_or_default();
+            let mut offset = 0;
+            loop {
+                let resp = sekai
+                    .list_objects(gateway_request(ListObjectsRequest {
+                        filter: Some(ListFilter {
+                            kind: "gateway_key".to_string(),
+                            name: String::new(),
+                            namespace: namespace.clone(),
+                            limit: 1000,
+                            offset,
+                            ..Default::default()
+                        }),
+                    }))
+                    .await?
+                    .into_inner();
+                for object in resp.objects.iter() {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        object.name,
+                        object.namespace,
+                        object.properties.get("agent").cloned().unwrap_or_default(),
+                        object
+                            .properties
+                            .get("status")
+                            .cloned()
+                            .unwrap_or_else(|| "active".to_string()),
+                        object
+                            .properties
+                            .get("secret_storage")
+                            .cloned()
+                            .unwrap_or_default(),
+                        object.updated
+                    );
+                }
+                if resp.objects.is_empty() {
+                    break;
+                }
+                if (offset + resp.objects.len() as i32) >= resp.total {
+                    break;
+                }
+                offset += 1000;
             }
         }
         GatewayKeyAction::Rotate { name, secret } => {

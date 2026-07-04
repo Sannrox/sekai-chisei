@@ -1,10 +1,14 @@
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::domain::{Direction, Link, ListFilter, Object};
+use crate::domain::{
+    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, ObjectSet, PropertyFilter,
+    is_valid_property_key,
+};
 
 pub struct SekaiDb {
     pub(crate) conn: Mutex<Connection>,
@@ -40,6 +44,8 @@ impl SekaiDb {
             conn: Mutex::new(conn),
         };
         db.migrate()?;
+        db.register_sql_helpers()?;
+        db.migrate_grants();
         Ok(db)
     }
 
@@ -66,10 +72,37 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_links_from ON sekai_links(from_id, relation);
-            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);",
+            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);
+            CREATE TABLE IF NOT EXISTS sekai_object_sets (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                filter TEXT NOT NULL,
+                owner_principal TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_object_sets_owner_name ON sekai_object_sets(owner_principal, name);",
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn register_sql_helpers(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.create_scalar_function(
+            "is_numeric_text",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let value: Option<String> = ctx.get(0).ok();
+                Ok(value
+                    .as_deref()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|v| v.is_finite())
+                    .unwrap_or(false))
+            },
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn migrate_principal_credentials(&self) -> Result<(), String> {
@@ -263,7 +296,8 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_principal_credential)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|row| row.ok()).collect())
+        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
+        parsed.map_err(|e| e.to_string())
     }
 
     pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
@@ -348,28 +382,335 @@ impl SekaiDb {
     }
 
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let mut effective_filter = filter.clone();
+        if effective_filter.limit <= 0 {
+            effective_filter.limit = MAX_LIST_LIMIT;
+        }
+        if effective_filter.offset < 0 {
+            effective_filter.offset = 0;
+        }
+        self.list_objects_with_total(&effective_filter)
+            .map(|(objects, _)| objects)
+    }
+
+    pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let mut effective_filter = filter.clone();
+        effective_filter.limit = i32::MAX;
+        self.list_objects_with_total(&effective_filter)
+            .map(|(objects, _)| objects)
+    }
+
+    pub fn list_objects_with_total(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        let base_param_count = query.where_param_count;
+        let order_sql = build_order_by_sql(
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
+        let effective_limit = if filter.limit == i32::MAX {
+            i32::MAX
+        } else if filter.limit <= 0 {
+            MAX_LIST_LIMIT
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        };
         let conn = self.conn.lock().unwrap();
-        let mut sql = "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE 1=1".to_string();
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
-        if let Some(k) = &filter.kind {
-            sql.push_str(&format!(" AND kind = ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(k.clone()));
+        let mut list_sql = format!(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}",
+            query.where_sql
+        );
+        if let Some(order_sql) = order_sql.as_deref() {
+            list_sql.push_str(order_sql);
         }
-        if let Some(n) = &filter.name {
-            sql.push_str(&format!(" AND name = ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(n.clone()));
-        }
-        if let Some(ns) = &filter.namespace {
-            sql.push_str(&format!(" AND namespace = ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(ns.clone()));
-        }
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        list_sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            query.params.len() + 1,
+            query.params.len() + 2
+        ));
+        query.params.push(Box::new(effective_limit));
+        query.params.push(Box::new(filter.offset.max(0)));
+        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| Ok(row_to_object(row)))
+            .query_map(
+                query
+                    .params
+                    .iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                |row| Ok(row_to_object(row)),
+            )
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let objects: Vec<Object> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let total = conn
+            .query_row(
+                &query.count_sql,
+                query
+                    .params
+                    .iter()
+                    .take(base_param_count)
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((objects, total.min(i32::MAX as i64) as i32))
+    }
+
+    pub fn list_objects_with_total_for_principals(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        // Keep visibility params and order-by params disjoint to avoid placeholder
+        // number collision for both list and count queries.
+        let (visibility_filter, mut visibility_params) =
+            build_visibility_filter(principals, query.params.len());
+        query.params.append(&mut visibility_params);
+        let order_sql = build_order_by_sql(
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
+        let (count_visibility_filter, count_visibility_params) =
+            build_visibility_filter_for_count_query(principals, query.where_param_count);
+        let effective_limit = if filter.limit == i32::MAX {
+            i32::MAX
+        } else if filter.limit <= 0 {
+            MAX_LIST_LIMIT
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        };
+        let mut list_sql = format!(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}",
+            query.where_sql, visibility_filter
+        );
+        if let Some(order_sql) = order_sql.as_deref() {
+            list_sql.push_str(order_sql);
+        }
+        list_sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            query.params.len() + 1,
+            query.params.len() + 2
+        ));
+        query.params.push(Box::new(effective_limit));
+        query.params.push(Box::new(filter.offset.max(0)));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                query
+                    .params
+                    .iter()
+                    .map(|v| v.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                |row| Ok(row_to_object(row)),
+            )
+            .map_err(|e| e.to_string())?;
+        let objects: Vec<Object> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut count_params: Vec<&dyn rusqlite::types::ToSql> = query
+            .params
+            .iter()
+            .take(query.where_param_count)
+            .map(|v| v.as_ref())
+            .collect();
+        count_params.extend(
+            count_visibility_params
+                .iter()
+                .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+        );
+        let total = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM sekai_objects{}{}",
+                    query.where_sql, count_visibility_filter
+                ),
+                count_params.as_slice(),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((objects, total.min(i32::MAX as i64) as i32))
+    }
+
+    pub fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let filter = serde_json::to_string(&set.filter).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO sekai_object_sets (id, name, description, filter, owner_principal, created) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                set.id,
+                set.name,
+                set.description,
+                filter,
+                set.owner_principal,
+                set.created,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE id = ?1",
+            params![id],
+            |row| {
+                let filter_json: String = row.get(3)?;
+                let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(ObjectSet {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    filter,
+                    owner_principal: row.get(4)?,
+                    created: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn list_object_sets(&self) -> Result<Vec<ObjectSet>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets ORDER BY created, id")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let filter_json: String = row.get(3)?;
+                let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(ObjectSet {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    filter,
+                    owner_principal: row.get(4)?,
+                    created: row.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
+        parsed.map_err(|e| e.to_string())
+    }
+
+    pub fn list_object_sets_for_principals(
+        &self,
+        principals: &[&str],
+    ) -> Result<Vec<ObjectSet>, String> {
+        if principals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let placeholders = principals
+            .iter()
+            .map(|principal| {
+                let idx = params.len() + 1;
+                params.push(Box::new((*principal).to_string()));
+                format!("?{idx}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE owner_principal IN ({placeholders}) ORDER BY created, id"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params
+                    .iter()
+                    .map(|p| p.as_ref() as &dyn rusqlite::types::ToSql)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                |row| {
+                    let filter_json: String = row.get(3)?;
+                    let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    Ok(ObjectSet {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        filter,
+                        owner_principal: row.get(4)?,
+                        created: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
+        parsed.map_err(|e| e.to_string())
+    }
+
+    pub fn delete_object_set(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute("DELETE FROM sekai_object_sets WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(removed > 0)
+    }
+
+    pub fn delete_object_set_for_principals(
+        &self,
+        id: &str,
+        principals: &[&str],
+    ) -> Result<bool, String> {
+        if principals.is_empty() {
+            return Ok(false);
+        }
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(id.to_string()));
+        let mut owner_placeholders = Vec::new();
+        for principal in principals {
+            let idx = params.len() + 1;
+            params.push(Box::new((*principal).to_string()));
+            owner_placeholders.push(format!("?{idx}"));
+        }
+        let owner_placeholders = owner_placeholders.join(",");
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute(
+                &format!(
+                    "DELETE FROM sekai_object_sets WHERE id = ?1 AND owner_principal IN ({owner_placeholders})"
+                ),
+                params
+                    .iter()
+                    .map(|p| p.as_ref() as &dyn rusqlite::types::ToSql)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(removed > 0)
     }
 
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, String> {
@@ -510,6 +851,245 @@ pub(crate) fn row_to_object(row: &rusqlite::Row) -> Object {
     }
 }
 
+struct ListQueryParts {
+    where_sql: String,
+    params: Vec<Box<dyn rusqlite::types::ToSql>>,
+    count_sql: String,
+    where_param_count: usize,
+}
+
+fn build_list_query(filter: &ListFilter) -> Result<ListQueryParts, String> {
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
+
+    if let Some(kind) = &filter.kind {
+        where_parts.push(format!("kind = ?{}", params.len() + 1));
+        params.push(Box::new(kind.clone()));
+    }
+    if let Some(name) = &filter.name {
+        where_parts.push(format!("name = ?{}", params.len() + 1));
+        params.push(Box::new(name.clone()));
+    }
+    if let Some(namespace) = &filter.namespace {
+        where_parts.push(format!("namespace = ?{}", params.len() + 1));
+        params.push(Box::new(namespace.clone()));
+    }
+
+    for property_filter in &filter.property_filters {
+        let condition = build_property_filter_condition(property_filter, &mut params)?;
+        where_parts.push(condition);
+    }
+
+    let where_sql = if where_parts.is_empty() {
+        " WHERE 1 = 1".to_string()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    let where_param_count = params.len();
+
+    let count_sql = format!("SELECT COUNT(*) FROM sekai_objects{}", where_sql);
+
+    Ok(ListQueryParts {
+        where_sql,
+        params,
+        count_sql,
+        where_param_count,
+    })
+}
+
+fn build_visibility_filter(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    build_visibility_filter_internal(principals, start_param)
+}
+
+fn build_visibility_filter_for_count_query(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    build_visibility_filter_internal(principals, start_param)
+}
+
+fn build_visibility_filter_internal(
+    principals: &[&str],
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let effective_principals: Vec<&str> = principals
+        .iter()
+        .copied()
+        .filter(|principal| !principal.is_empty() && principal != &"anonymous")
+        .collect();
+    if effective_principals.is_empty() {
+        return (
+            " AND NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id)"
+                .to_string(),
+            Vec::new(),
+        );
+    }
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let principal_placeholders = effective_principals
+        .iter()
+        .enumerate()
+        .map(|(idx, principal)| {
+            let param_idx = start_param + idx + 1;
+            params.push(Box::new((*principal).to_string()));
+            format!("?{param_idx}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    (
+        format!(
+            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({})))",
+            principal_placeholders
+        ),
+        params,
+    )
+}
+
+fn build_property_filter_condition(
+    filter: &PropertyFilter,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Result<String, String> {
+    if !is_valid_property_key(&filter.key) {
+        return Err("invalid property key".into());
+    }
+
+    let op = filter.op.to_lowercase();
+    let path = format!("$.{}", filter.key);
+    let mut make_path_expr = || {
+        let path_param = format!("?{}", params.len() + 1);
+        params.push(Box::new(path.clone()));
+        format!("json_extract(properties, {path_param})")
+    };
+
+    match op.as_str() {
+        "eq" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(filter.value.clone()));
+            Ok(format!("{path_expr} = {value_param}"))
+        }
+        "ne" | "neq" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(filter.value.clone()));
+            // ne/neq intentionally match only objects with an explicit property value and
+            // do not include rows where the JSON path resolves to NULL.
+            Ok(format!("{path_expr} != {value_param}"))
+        }
+        "contains" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(format!(
+                "%{}%",
+                escape_like_pattern(&filter.value)
+            )));
+            Ok(format!("{path_expr} LIKE {value_param} ESCAPE '\\'"))
+        }
+        "prefix" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            params.push(Box::new(format!("{}%", escape_like_pattern(&filter.value))));
+            Ok(format!("{path_expr} LIKE {value_param} ESCAPE '\\'"))
+        }
+        "in" => {
+            let values: Vec<&str> = filter
+                .value
+                .split(',')
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect();
+            if values.is_empty() {
+                return Ok("0 = 1".into());
+            }
+            let path_expr = make_path_expr();
+            let mut in_parts = Vec::new();
+            for value in values {
+                let value_param = format!("?{}", params.len() + 1);
+                in_parts.push(value_param);
+                params.push(Box::new(value.to_string()));
+            }
+            Ok(format!(
+                "{path_expr} IN ({})",
+                in_parts.into_iter().collect::<Vec<_>>().join(",")
+            ))
+        }
+        "gt" | "gte" | "lt" | "lte" => {
+            let path_expr = make_path_expr();
+            let value_param = format!("?{}", params.len() + 1);
+            let compare = match op.as_str() {
+                "gt" => ">",
+                "gte" => ">=",
+                "lt" => "<",
+                "lte" => "<=",
+                _ => unreachable!(),
+            };
+            params.push(Box::new(filter.value.clone()));
+            Ok(build_numeric_or_text_expr(
+                &path_expr,
+                &value_param,
+                compare,
+            ))
+        }
+        _ => Err(format!("unsupported property operator: {}", filter.op)),
+    }
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn build_numeric_or_text_expr(left_expr: &str, value_param: &str, compare: &str) -> String {
+    format!(
+        "((is_numeric_text({left_expr}) AND is_numeric_text({value_param}) AND CAST({left_expr} AS REAL) {compare} CAST({value_param} AS REAL)) OR ((NOT is_numeric_text({left_expr}) OR NOT is_numeric_text({value_param})) AND {left_expr} {compare} {value_param}))"
+    )
+}
+
+fn build_order_by_sql(
+    order_by: &str,
+    descending: bool,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> Result<Option<String>, String> {
+    if order_by.is_empty() {
+        return Ok(Some(" ORDER BY id ASC".to_string()));
+    }
+    let direction = if descending { "DESC" } else { "ASC" };
+    let order_sql = match order_by {
+        "name" => {
+            format!(" ORDER BY name {direction}, id ASC")
+        }
+        "created" => {
+            format!(" ORDER BY created {direction}, id ASC")
+        }
+        "updated" => {
+            format!(" ORDER BY updated {direction}, id ASC")
+        }
+        _ => {
+            if let Some(key) = order_by.strip_prefix("property:") {
+                if !is_valid_property_key(key) {
+                    return Err(format!("invalid property key: {key}"));
+                }
+                let path = format!("$.{key}");
+                let path_expr = format!("?{}", params.len() + 1);
+                params.push(Box::new(path));
+                let value_expr = format!("json_extract(properties, {path_expr})");
+                format!(
+                    " ORDER BY CASE WHEN {value_expr} IS NULL THEN 1 ELSE 0 END, CASE WHEN is_numeric_text({value_expr}) THEN 0 ELSE 1 END, CASE WHEN is_numeric_text({value_expr}) THEN CAST({value_expr} AS REAL) ELSE CAST(NULL AS REAL) END {direction}, CASE WHEN is_numeric_text({value_expr}) THEN '' ELSE {value_expr} END {direction}, id ASC"
+                )
+            } else {
+                return Err(format!("unsupported order_by: {order_by}"));
+            }
+        }
+    };
+    Ok(Some(order_sql))
+}
+
 fn row_to_principal_credential(
     row: &rusqlite::Row,
 ) -> Result<PrincipalCredential, rusqlite::Error> {
@@ -537,6 +1117,7 @@ fn row_to_link(row: &rusqlite::Row) -> Link {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sekai::security;
 
     fn test_db() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
@@ -553,6 +1134,12 @@ mod tests {
             created: 1000,
             updated: 1000,
         }
+    }
+
+    fn make_obj_with_property(id: &str, kind: &str, name: &str, key: &str, value: &str) -> Object {
+        let mut obj = make_obj(id, kind, name);
+        obj.properties.insert(key.into(), value.into());
+        obj
     }
 
     #[test]
@@ -602,6 +1189,78 @@ mod tests {
     }
 
     #[test]
+    fn list_objects_with_total_for_principals_orders_by_property_with_visibility_filter() {
+        let db = test_db();
+        db.migrate_grants();
+        db.create_object(&make_obj_with_property(
+            "alice-only",
+            "widget",
+            "widget-alice",
+            "tier",
+            "20",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "bob-only",
+            "widget",
+            "widget-bob",
+            "tier",
+            "30",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "public",
+            "widget",
+            "widget-public",
+            "tier",
+            "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "no-tier",
+            "widget",
+            "widget-no-tier",
+            "region",
+            "us",
+        ))
+        .unwrap();
+
+        db.create_grant(&security::Grant {
+            id: format!("grant-{}", Uuid::new_v4().simple()),
+            object_id: "alice-only".to_string(),
+            principal: "alice".to_string(),
+            role: security::Role::Viewer,
+            created: 1,
+        })
+        .unwrap();
+        db.create_grant(&security::Grant {
+            id: format!("grant-{}", Uuid::new_v4().simple()),
+            object_id: "bob-only".to_string(),
+            principal: "bob".to_string(),
+            role: security::Role::Viewer,
+            created: 1,
+        })
+        .unwrap();
+
+        let (ordered, total) = db
+            .list_objects_with_total_for_principals(
+                &ListFilter {
+                    kind: Some("widget".into()),
+                    order_by: "property:tier".into(),
+                    ..Default::default()
+                },
+                &["alice"],
+            )
+            .unwrap();
+
+        assert_eq!(total, 3);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, "public");
+        assert_eq!(ordered[1].id, "alice-only");
+        assert_eq!(ordered[2].id, "no-tier");
+    }
+
+    #[test]
     fn test_links() {
         let db = test_db();
         db.create_object(&make_obj("r1", "namespace", "my-namespace"))
@@ -641,6 +1300,333 @@ mod tests {
             .get_links("r1", "contains", &Direction::Outgoing)
             .unwrap();
         assert_eq!(links.len(), 0);
+    }
+
+    #[test]
+    fn list_objects_with_property_filters_and_ordering() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "a", "widget", "widget-a", "tier", "2",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b", "widget", "widget-b", "tier", "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "c", "widget", "widget-c", "tier", "4",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "widget", "widget-d", "region", "us",
+        ))
+        .unwrap();
+
+        let matches = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].id, "a");
+        assert_eq!(matches[1].id, "c");
+        assert_eq!(matches[2].id, "b");
+
+        let matches_desc = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(matches_desc.len(), 3);
+        assert_eq!(matches_desc[0].id, "b");
+        assert_eq!(matches_desc[1].id, "c");
+        assert_eq!(matches_desc[2].id, "a");
+
+        let total = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "tier".into(),
+                    op: "gt".into(),
+                    value: "1".into(),
+                }],
+                order_by: "property:tier".into(),
+                descending: false,
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(total, 3);
+
+        let missing_last = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("widget".into()),
+                order_by: "property:region".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(missing_last[0].id, "d");
+    }
+
+    #[test]
+    fn list_objects_filter_string_and_in_operators() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "y",
+            "component",
+            "b",
+            "status",
+            "done",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "z",
+            "component",
+            "c",
+            "status",
+            "blocked",
+        ))
+        .unwrap();
+
+        let all = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "in".into(),
+                    value: "todo,done".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|obj| obj.id == "x"));
+        assert!(all.iter().any(|obj| obj.id == "y"));
+
+        let count = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "contains".into(),
+                    value: "do".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn list_objects_property_filter_in_with_empty_values_returns_empty_without_error() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
+
+        let count = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "in".into(),
+                    value: ",  ,".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .1;
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn list_objects_contains_escapes_like_wildcards() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "a",
+            "component",
+            "a",
+            "status",
+            "a%b",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b",
+            "component",
+            "b",
+            "status",
+            "aXb",
+        ))
+        .unwrap();
+
+        let filtered = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "status".into(),
+                    op: "contains".into(),
+                    value: "a%b".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "a");
+    }
+
+    #[test]
+    fn list_all_objects_returns_all_matching_results() {
+        let db = test_db();
+        for i in 0..1105 {
+            db.create_object(&make_obj(
+                &format!("obj-{i}"),
+                "widget",
+                &format!("widget-{i}"),
+            ))
+            .unwrap();
+        }
+
+        let objects = db
+            .list_all_objects(&ListFilter {
+                kind: Some("widget".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(objects.len(), 1105);
+    }
+
+    #[test]
+    fn list_objects_combined_property_filters_and_pagination() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property("a", "service", "s-a", "tier", "10"))
+            .unwrap();
+        db.create_object(&make_obj_with_property("b", "service", "s-b", "tier", "20"))
+            .unwrap();
+        db.create_object(&make_obj_with_property("c", "service", "s-c", "tier", "20"))
+            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "service", "s-d", "status", "ready",
+        ))
+        .unwrap();
+
+        let filtered = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("service".into()),
+                property_filters: vec![
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "gte".into(),
+                        value: "10".into(),
+                    },
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "lte".into(),
+                        value: "20".into(),
+                    },
+                ],
+                order_by: "name".into(),
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|obj| obj.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let second_page = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("service".into()),
+                property_filters: vec![
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "gte".into(),
+                        value: "10".into(),
+                    },
+                    PropertyFilter {
+                        key: "tier".into(),
+                        op: "lte".into(),
+                        value: "20".into(),
+                    },
+                ],
+                order_by: "name".into(),
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let results = second_page.0;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "c");
+        assert_eq!(second_page.1, 3);
+    }
+
+    #[test]
+    fn list_objects_parameterized_values_are_safe() {
+        let db = test_db();
+        db.create_object(&make_obj_with_property(
+            "o1",
+            "component",
+            "safe",
+            "name",
+            "trusted",
+        ))
+        .unwrap();
+
+        let matches = db
+            .list_objects_with_total(&ListFilter {
+                kind: Some("component".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "name".into(),
+                    op: "eq".into(),
+                    value: "x'; DROP TABLE sekai_objects; --".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(matches.0.len(), 0);
+        assert_eq!(matches.1, 0);
     }
 
     #[test]
