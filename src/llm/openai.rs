@@ -1,4 +1,7 @@
-use super::{ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, Provider, ToolCall};
+use super::{
+    ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts, Provider, ToolCall,
+    classify_reqwest_error,
+};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -7,14 +10,24 @@ pub struct OpenAI {
     api_key: String,
     base_url: String,
     client: Client,
+    timeouts: HttpTimeouts,
 }
 
 impl OpenAI {
     pub fn new(api_key: &str, base_url: Option<&str>) -> Self {
+        Self::with_timeouts(api_key, base_url, HttpTimeouts::from_env())
+    }
+
+    pub(crate) fn with_timeouts(
+        api_key: &str,
+        base_url: Option<&str>,
+        timeouts: HttpTimeouts,
+    ) -> Self {
         Self {
             api_key: api_key.to_string(),
             base_url: base_url.unwrap_or("https://api.openai.com").to_string(),
-            client: Client::new(),
+            client: timeouts.client(),
+            timeouts,
         }
     }
 }
@@ -33,9 +46,17 @@ impl Provider for OpenAI {
             rb = rb.header("authorization", format!("Bearer {}", self.api_key));
         }
 
-        let resp = rb.json(&body).send().await.map_err(|e| e.to_string())?;
+        let resp = rb
+            .timeout(self.timeouts.request_timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error("openai chat request", err))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|err| classify_reqwest_error("openai chat response", err))?;
         if !status.is_success() {
             return Err(format!("openai {}: {}", status, text));
         }
@@ -82,10 +103,17 @@ impl Provider for OpenAI {
         if !self.api_key.is_empty() {
             rb = rb.header("authorization", format!("Bearer {}", self.api_key));
         }
-        let resp = rb.json(&body).send().await.map_err(|e| e.to_string())?;
+        let resp = rb
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error("openai stream request", err))?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| classify_reqwest_error("openai stream response", err))?;
             return Err(format!("openai {}: {}", status, text));
         }
 
@@ -103,7 +131,7 @@ impl Provider for OpenAI {
                 let bytes = match next {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        yield Err(err.to_string());
+                        yield Err(classify_reqwest_error("openai stream read", err));
                         return;
                     }
                 };
@@ -283,7 +311,48 @@ fn outbound_model_name(model: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{outbound_model_name, parse_openai_sse_event};
+    use super::{OpenAI, outbound_model_name, parse_openai_sse_event};
+    use crate::llm::{ChatRequest, HttpTimeouts, Provider};
+    use axum::Router;
+    use axum::routing::post;
+    use std::time::Duration;
+
+    fn test_timeouts() -> HttpTimeouts {
+        HttpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+            pool_idle_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_millis(50),
+        }
+    }
+
+    fn test_chat_request(model: &str) -> ChatRequest {
+        ChatRequest {
+            model: model.to_string(),
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 16,
+        }
+    }
+
+    async fn delayed_chat_response() -> axum::Json<serde_json::Value> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        axum::Json(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+    }
+
+    async fn spawn_delayed_openai() -> String {
+        let app = Router::new().route("/v1/chat/completions", post(delayed_chat_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn strips_ollama_prefix_for_openai_compatible_backends() {
@@ -342,5 +411,20 @@ mod tests {
         assert_eq!(chunks[0].content, "hello");
         assert_eq!(chunks[0].input_tokens, 7);
         assert_eq!(chunks[0].output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn unary_chat_times_out_against_slow_upstream() {
+        let base_url = spawn_delayed_openai().await;
+        let provider = OpenAI::with_timeouts("", Some(&base_url), test_timeouts());
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.chat(&test_chat_request("gpt-5.5")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(err.contains("timed out"), "{err}");
     }
 }
