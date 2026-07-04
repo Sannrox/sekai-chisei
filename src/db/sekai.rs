@@ -43,10 +43,22 @@ impl SekaiDb {
         let db = Self {
             conn: Mutex::new(conn),
         };
-        db.migrate()?;
+        db.migrate_all()?;
         db.register_sql_helpers()?;
-        db.migrate_grants();
         Ok(db)
+    }
+
+    pub(crate) fn migrate_all(&self) -> Result<(), String> {
+        self.migrate()?;
+        self.migrate_grants()?;
+        self.migrate_principal_credentials()?;
+        self.migrate_audit()?;
+        self.migrate_schema_types()?;
+        self.migrate_coordination()?;
+        self.migrate_datasets()?;
+        self.migrate_functions()?;
+        self.migrate_chisei()?;
+        Ok(())
     }
 
     fn migrate(&self) -> Result<(), String> {
@@ -105,7 +117,7 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
-    pub fn migrate_principal_credentials(&self) -> Result<(), String> {
+    pub(crate) fn migrate_principal_credentials(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
@@ -1118,9 +1130,117 @@ fn row_to_link(row: &rusqlite::Row) -> Link {
 mod tests {
     use super::*;
     use crate::sekai::security;
+    use std::path::PathBuf;
 
     fn test_db() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sekai-chisei-{name}-{}-{}.db",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    fn table_columns(db: &SekaiDb, table: &str) -> Vec<String> {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn migrate_all_upgrades_previous_schema_fixture() {
+        let path = temp_db_path("upgrade");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sekai_work_units (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    target_object_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    requested_spec TEXT NOT NULL DEFAULT '',
+                    scope_id TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    timeout_seconds INTEGER NOT NULL DEFAULT 0,
+                    heartbeat_ttl_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    admitted_at INTEGER NOT NULL DEFAULT 0,
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    finished_at INTEGER NOT NULL DEFAULT 0,
+                    last_heartbeat_at INTEGER NOT NULL DEFAULT 0,
+                    failure_reason TEXT NOT NULL DEFAULT '',
+                    cancel_reason TEXT NOT NULL DEFAULT '',
+                    owner_principal TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE chisei_eval_iterations (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    suite_id TEXT NOT NULL,
+                    changed_file TEXT NOT NULL,
+                    diff_hash TEXT NOT NULL,
+                    parent_iteration_id TEXT NOT NULL,
+                    baseline_run_id TEXT NOT NULL,
+                    candidate_run_id TEXT NOT NULL,
+                    delta REAL NOT NULL,
+                    regressed INTEGER NOT NULL,
+                    created INTEGER NOT NULL
+                );
+                CREATE TABLE chisei_sample_observations (
+                    request_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL DEFAULT '',
+                    spec TEXT NOT NULL DEFAULT '',
+                    resolved_model TEXT NOT NULL DEFAULT '',
+                    output_content TEXT NOT NULL DEFAULT '',
+                    sample_reason TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    stop_reason TEXT NOT NULL DEFAULT '',
+                    timestamp INTEGER NOT NULL,
+                    scored INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.migrate_all().unwrap();
+
+        let work_unit_columns = table_columns(&db, "sekai_work_units");
+        assert!(work_unit_columns.contains(&"creator_principal".to_string()));
+        assert!(work_unit_columns.contains(&"idempotency_key".to_string()));
+        assert!(work_unit_columns.contains(&"updated_at".to_string()));
+
+        let iteration_columns = table_columns(&db, "chisei_eval_iterations");
+        assert!(iteration_columns.contains(&"namespace".to_string()));
+
+        let observation_columns = table_columns(&db, "chisei_sample_observations");
+        assert!(observation_columns.contains(&"attempts".to_string()));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_fails_for_garbage_db_file() {
+        let path = temp_db_path("garbage");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let err = match SekaiDb::new(path.to_str().unwrap()) {
+            Ok(_) => panic!("garbage database unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(!err.trim().is_empty());
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn make_obj(id: &str, kind: &str, name: &str) -> Object {
@@ -1191,7 +1311,6 @@ mod tests {
     #[test]
     fn list_objects_with_total_for_principals_orders_by_property_with_visibility_filter() {
         let db = test_db();
-        db.migrate_grants();
         db.create_object(&make_obj_with_property(
             "alice-only",
             "widget",
@@ -1632,7 +1751,6 @@ mod tests {
     #[test]
     fn principal_credentials_round_trip() {
         let db = test_db();
-        db.migrate_principal_credentials().unwrap();
         let _credential = db
             .create_principal_credential("alice", "hash-alice", 1)
             .unwrap();

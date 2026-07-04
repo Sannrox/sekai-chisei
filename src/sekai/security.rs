@@ -126,7 +126,7 @@ impl SecurityChecker {
 }
 
 impl SekaiDb {
-    pub fn migrate_grants(&self) {
+    pub(crate) fn migrate_grants(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_grants (
@@ -138,7 +138,7 @@ impl SekaiDb {
             );
             CREATE INDEX IF NOT EXISTS idx_grants_object ON sekai_grants(object_id);",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())
     }
 
     pub fn create_grant(&self, grant: &Grant) -> Result<(), String> {
@@ -287,7 +287,6 @@ mod tests {
     #[test]
     fn test_grant_persistence() {
         let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_grants();
         let grant = Grant {
             id: "g1".into(),
             object_id: "obj-1".into(),

@@ -168,7 +168,7 @@ pub struct RequestDedup {
 }
 
 impl SekaiDb {
-    pub fn migrate_coordination(&self) {
+    pub(crate) fn migrate_coordination(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_contention_scopes (
@@ -210,8 +210,6 @@ impl SekaiDb {
             CREATE INDEX IF NOT EXISTS idx_work_units_scope_status_created ON sekai_work_units(scope_id, status, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_work_units_target_created ON sekai_work_units(target_object_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_work_units_owner_created ON sekai_work_units(owner_principal, created_at);
-            CREATE INDEX IF NOT EXISTS idx_work_units_creator_created ON sekai_work_units(creator_principal, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_work_units_idempotency ON sekai_work_units(idempotency_key) WHERE idempotency_key != '';
             CREATE TABLE IF NOT EXISTS sekai_reservations (
                 id TEXT PRIMARY KEY,
                 work_unit_id TEXT NOT NULL,
@@ -256,14 +254,25 @@ impl SekaiDb {
                 PRIMARY KEY (request_id, operation)
             );",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
         for migration in [
             "ALTER TABLE sekai_work_units ADD COLUMN creator_principal TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_work_units ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_work_units ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
         ] {
-            let _ = conn.execute(migration, []);
+            match conn.execute(migration, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(err) => return Err(err.to_string()),
+            }
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_work_units_creator_created ON sekai_work_units(creator_principal, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_work_units_idempotency ON sekai_work_units(idempotency_key) WHERE idempotency_key != '';",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn create_contention_scope(&self, scope: &ContentionScope) -> Result<(), String> {
@@ -1504,9 +1513,7 @@ mod tests {
     use super::*;
 
     fn db() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_coordination();
-        db
+        SekaiDb::new(":memory:").unwrap()
     }
 
     fn root_scope() -> ContentionScope {

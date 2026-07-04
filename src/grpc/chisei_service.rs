@@ -179,8 +179,6 @@ fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> R
 
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
-        let _ = db.migrate_chisei();
-        db.migrate_audit();
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::new());
@@ -230,8 +228,6 @@ impl ChiseiServiceImpl {
     }
 
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
-        let _ = db.migrate_chisei();
-        db.migrate_audit();
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::new());

@@ -6,7 +6,7 @@ use super::sekai::SekaiDb;
 use crate::chisei::{eval, evolve};
 
 impl SekaiDb {
-    pub fn migrate_chisei(&self) -> Result<(), String> {
+    pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisei_eval_suites (
