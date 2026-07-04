@@ -89,6 +89,10 @@ Configuration is read from environment variables:
 | `NATIVE_LLM_URL` | unset | Native local LLM endpoint |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
+| `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound LLM/gateway upstream TCP connect timeout |
+| `LLM_HTTP_READ_TIMEOUT_SECS` | `60` | Outbound LLM/gateway upstream idle-read timeout; protects streaming without imposing a total stream cap |
+| `LLM_HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | Outbound LLM/gateway upstream connection pool idle timeout |
+| `LLM_HTTP_REQUEST_TIMEOUT_SECS` | `120` | Total timeout for unary provider `chat()` calls; streaming and gateway passthrough paths do not use this total cap |
 
 See [.env.example](.env.example) for a local template.
 
