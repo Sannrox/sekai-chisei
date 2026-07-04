@@ -156,7 +156,6 @@ mod tests {
     #[test]
     fn test_create_object_action() {
         let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_audit();
         let exec = ActionExecutor::new();
         let params = HashMap::from([
             ("id".into(), "o1".into()),
@@ -179,7 +178,6 @@ mod tests {
     #[test]
     fn test_set_property_action() {
         let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_audit();
         db.create_object(&Object {
             id: "o1".into(),
             kind: "namespace".into(),
