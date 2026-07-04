@@ -31,6 +31,7 @@ use crate::grpc::pb::sekai::{
     AppendRowsRequest, ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest,
     Dataset, FindByExternalIdRequest, FindByPropertyRequest, Link, Object as SekaiObject, Row,
 };
+use crate::llm::{HttpTimeouts, classify_reqwest_error};
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -191,6 +192,7 @@ struct GatewayRuntime {
     key_cache: Arc<RwLock<HashMap<String, KeyCacheEntry>>>,
     key_cache_ttl: Duration,
     admin_token: Option<String>,
+    http_timeouts: HttpTimeouts,
 }
 
 impl GatewayRuntime {
@@ -206,6 +208,7 @@ impl GatewayRuntime {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
         )
+        .with_http_timeouts(HttpTimeouts::from_env())
     }
 
     fn new(key_cache_ttl: Duration, admin_token: Option<String>) -> Self {
@@ -213,7 +216,13 @@ impl GatewayRuntime {
             key_cache: Arc::new(RwLock::new(HashMap::new())),
             key_cache_ttl,
             admin_token,
+            http_timeouts: HttpTimeouts::default(),
         }
+    }
+
+    fn with_http_timeouts(mut self, http_timeouts: HttpTimeouts) -> Self {
+        self.http_timeouts = http_timeouts;
+        self
     }
 }
 
@@ -229,7 +238,7 @@ pub fn app(config: GatewayConfig) -> Router {
 
 fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
     let state = GatewayState {
-        client: reqwest::Client::new(),
+        client: runtime.http_timeouts.client(),
         config: Arc::new(config),
         runtime,
     };
@@ -457,7 +466,10 @@ async fn proxy_gateway(
         Err(err) => json_error(
             StatusCode::BAD_GATEWAY,
             "upstream_error",
-            &format!("OpenAI upstream request failed: {err}"),
+            &classify_reqwest_error(
+                &format!("{} upstream request", prepared.provider.runtime_name()),
+                err,
+            ),
         ),
     }
 }
@@ -3041,7 +3053,10 @@ async fn response_from_upstream(
         Err(err) => json_error(
             StatusCode::BAD_GATEWAY,
             "upstream_error",
-            &format!("failed to read upstream response: {err}"),
+            &classify_reqwest_error(
+                &format!("{} upstream response", context.provider.runtime_name()),
+                err,
+            ),
         ),
     }
 }
@@ -3166,6 +3181,7 @@ mod tests {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         response_body: &'static str,
         content_type: &'static str,
+        delay: Option<Duration>,
     }
 
     async fn fake_upstream(
@@ -3194,6 +3210,9 @@ mod tests {
                 .map(str::to_string),
             body: String::from_utf8(body.to_vec()).unwrap(),
         });
+        if let Some(delay) = state.delay {
+            tokio::time::sleep(delay).await;
+        }
 
         Response::builder()
             .status(StatusCode::OK)
@@ -3206,11 +3225,20 @@ mod tests {
         response_body: &'static str,
         content_type: &'static str,
     ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        spawn_fake_upstream_with_delay(response_body, content_type, None).await
+    }
+
+    async fn spawn_fake_upstream_with_delay(
+        response_body: &'static str,
+        content_type: &'static str,
+        delay: Option<Duration>,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = FakeUpstreamState {
             requests: requests.clone(),
             response_body,
             content_type,
+            delay,
         };
         let app = Router::new()
             .route("/{*path}", any(fake_upstream))
@@ -3244,6 +3272,35 @@ mod tests {
         spawn_gateway_with_config(config).await
     }
 
+    async fn spawn_gateway_with_timeouts(
+        openai_base_url: String,
+        http_timeouts: HttpTimeouts,
+    ) -> String {
+        let config = GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: None,
+            fail_closed: false,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        };
+        spawn_gateway_with_runtime(
+            config,
+            GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None)
+                .with_http_timeouts(http_timeouts),
+        )
+        .await
+    }
+
     async fn spawn_gateway_with_config(config: GatewayConfig) -> String {
         spawn_gateway_with_runtime(
             config,
@@ -3261,6 +3318,15 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}")
+    }
+
+    fn short_http_timeouts() -> HttpTimeouts {
+        HttpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_millis(50),
+            pool_idle_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(5),
+        }
     }
 
     fn test_config() -> Config {
@@ -3429,6 +3495,33 @@ mod tests {
             Some("Bearer real-openai-key")
         );
         assert!(requests[0].body.contains(r#""model":"gpt-5.5""#));
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_returns_gateway_error() {
+        let (upstream_base, _requests) = spawn_fake_upstream_with_delay(
+            r#"{"id":"resp_1","object":"response"}"#,
+            "application/json",
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+        let gateway_base = spawn_gateway_with_timeouts(upstream_base, short_http_timeouts()).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hello"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("upstream_error"), "{body}");
+        assert!(body.contains("timed out"), "{body}");
     }
 
     #[tokio::test]
