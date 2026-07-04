@@ -1,9 +1,9 @@
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
-use rusqlite::functions::FunctionFlags;
 
 use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, ObjectSet, PropertyFilter,
@@ -389,13 +389,15 @@ impl SekaiDb {
         if effective_filter.offset < 0 {
             effective_filter.offset = 0;
         }
-        self.list_objects_with_total(&effective_filter).map(|(objects, _)| objects)
+        self.list_objects_with_total(&effective_filter)
+            .map(|(objects, _)| objects)
     }
 
     pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         let mut effective_filter = filter.clone();
         effective_filter.limit = i32::MAX;
-        self.list_objects_with_total(&effective_filter).map(|(objects, _)| objects)
+        self.list_objects_with_total(&effective_filter)
+            .map(|(objects, _)| objects)
     }
 
     pub fn list_objects_with_total(
@@ -404,7 +406,11 @@ impl SekaiDb {
     ) -> Result<(Vec<Object>, i32), String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         let base_param_count = query.where_param_count;
-        let order_sql = build_order_by_sql(filter.order_by.as_str(), filter.descending, &mut query.params)?;
+        let order_sql = build_order_by_sql(
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
         let effective_limit = if filter.limit == i32::MAX {
             i32::MAX
         } else if filter.limit <= 0 {
@@ -427,9 +433,7 @@ impl SekaiDb {
         ));
         query.params.push(Box::new(effective_limit));
         query.params.push(Box::new(filter.offset.max(0)));
-        let mut stmt = conn
-            .prepare(&list_sql)
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
                 query
@@ -471,8 +475,12 @@ impl SekaiDb {
         let (visibility_filter, mut visibility_params) =
             build_visibility_filter(principals, query.params.len());
         query.params.append(&mut visibility_params);
-        let order_sql = build_order_by_sql(filter.order_by.as_str(), filter.descending, &mut query.params)?;
-        let (count_visibility_filter, mut count_visibility_params) =
+        let order_sql = build_order_by_sql(
+            filter.order_by.as_str(),
+            filter.descending,
+            &mut query.params,
+        )?;
+        let (count_visibility_filter, count_visibility_params) =
             build_visibility_filter_for_count_query(principals, query.where_param_count);
         let effective_limit = if filter.limit == i32::MAX {
             i32::MAX
@@ -496,9 +504,7 @@ impl SekaiDb {
         query.params.push(Box::new(effective_limit));
         query.params.push(Box::new(filter.offset.max(0)));
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&list_sql)
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
                 query
@@ -977,7 +983,10 @@ fn build_property_filter_condition(
         "contains" => {
             let path_expr = make_path_expr();
             let value_param = format!("?{}", params.len() + 1);
-            params.push(Box::new(format!("%{}%", escape_like_pattern(&filter.value))));
+            params.push(Box::new(format!(
+                "%{}%",
+                escape_like_pattern(&filter.value)
+            )));
             Ok(format!("{path_expr} LIKE {value_param} ESCAPE '\\'"))
         }
         "prefix" => {
@@ -1005,10 +1014,7 @@ fn build_property_filter_condition(
             }
             Ok(format!(
                 "{path_expr} IN ({})",
-                in_parts
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(",")
+                in_parts.into_iter().collect::<Vec<_>>().join(",")
             ))
         }
         "gt" | "gte" | "lt" | "lte" => {
@@ -1039,11 +1045,7 @@ fn escape_like_pattern(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn build_numeric_or_text_expr(
-    left_expr: &str,
-    value_param: &str,
-    compare: &str,
-) -> String {
+fn build_numeric_or_text_expr(left_expr: &str, value_param: &str, compare: &str) -> String {
     format!(
         "((is_numeric_text({left_expr}) AND is_numeric_text({value_param}) AND CAST({left_expr} AS REAL) {compare} CAST({value_param} AS REAL)) OR ((NOT is_numeric_text({left_expr}) OR NOT is_numeric_text({value_param})) AND {left_expr} {compare} {value_param}))"
     )
@@ -1134,13 +1136,7 @@ mod tests {
         }
     }
 
-    fn make_obj_with_property(
-        id: &str,
-        kind: &str,
-        name: &str,
-        key: &str,
-        value: &str,
-    ) -> Object {
+    fn make_obj_with_property(id: &str, kind: &str, name: &str, key: &str, value: &str) -> Object {
         let mut obj = make_obj(id, kind, name);
         obj.properties.insert(key.into(), value.into());
         obj
@@ -1196,14 +1192,38 @@ mod tests {
     fn list_objects_with_total_for_principals_orders_by_property_with_visibility_filter() {
         let db = test_db();
         db.migrate_grants();
-        db.create_object(&make_obj_with_property("alice-only", "widget", "widget-alice", "tier", "20"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("bob-only", "widget", "widget-bob", "tier", "30"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("public", "widget", "widget-public", "tier", "10"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("no-tier", "widget", "widget-no-tier", "region", "us"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "alice-only",
+            "widget",
+            "widget-alice",
+            "tier",
+            "20",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "bob-only",
+            "widget",
+            "widget-bob",
+            "tier",
+            "30",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "public",
+            "widget",
+            "widget-public",
+            "tier",
+            "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "no-tier",
+            "widget",
+            "widget-no-tier",
+            "region",
+            "us",
+        ))
+        .unwrap();
 
         db.create_grant(&security::Grant {
             id: format!("grant-{}", Uuid::new_v4().simple()),
@@ -1285,14 +1305,22 @@ mod tests {
     #[test]
     fn list_objects_with_property_filters_and_ordering() {
         let db = test_db();
-        db.create_object(&make_obj_with_property("a", "widget", "widget-a", "tier", "2"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("b", "widget", "widget-b", "tier", "10"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("c", "widget", "widget-c", "tier", "4"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("d", "widget", "widget-d", "region", "us"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "a", "widget", "widget-a", "tier", "2",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b", "widget", "widget-b", "tier", "10",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "c", "widget", "widget-c", "tier", "4",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "widget", "widget-d", "region", "us",
+        ))
+        .unwrap();
 
         let matches = db
             .list_objects_with_total(&ListFilter {
@@ -1362,12 +1390,30 @@ mod tests {
     #[test]
     fn list_objects_filter_string_and_in_operators() {
         let db = test_db();
-        db.create_object(&make_obj_with_property("x", "component", "a", "status", "todo"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("y", "component", "b", "status", "done"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("z", "component", "c", "status", "blocked"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "y",
+            "component",
+            "b",
+            "status",
+            "done",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "z",
+            "component",
+            "c",
+            "status",
+            "blocked",
+        ))
+        .unwrap();
 
         let all = db
             .list_objects_with_total(&ListFilter {
@@ -1403,8 +1449,14 @@ mod tests {
     #[test]
     fn list_objects_property_filter_in_with_empty_values_returns_empty_without_error() {
         let db = test_db();
-        db.create_object(&make_obj_with_property("x", "component", "a", "status", "todo"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "x",
+            "component",
+            "a",
+            "status",
+            "todo",
+        ))
+        .unwrap();
 
         let count = db
             .list_objects_with_total(&ListFilter {
@@ -1424,10 +1476,22 @@ mod tests {
     #[test]
     fn list_objects_contains_escapes_like_wildcards() {
         let db = test_db();
-        db.create_object(&make_obj_with_property("a", "component", "a", "status", "a%b"))
-            .unwrap();
-        db.create_object(&make_obj_with_property("b", "component", "b", "status", "aXb"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "a",
+            "component",
+            "a",
+            "status",
+            "a%b",
+        ))
+        .unwrap();
+        db.create_object(&make_obj_with_property(
+            "b",
+            "component",
+            "b",
+            "status",
+            "aXb",
+        ))
+        .unwrap();
 
         let filtered = db
             .list_objects_with_total(&ListFilter {
@@ -1475,8 +1539,10 @@ mod tests {
             .unwrap();
         db.create_object(&make_obj_with_property("c", "service", "s-c", "tier", "20"))
             .unwrap();
-        db.create_object(&make_obj_with_property("d", "service", "s-d", "status", "ready"))
-            .unwrap();
+        db.create_object(&make_obj_with_property(
+            "d", "service", "s-d", "status", "ready",
+        ))
+        .unwrap();
 
         let filtered = db
             .list_objects_with_total(&ListFilter {
@@ -1502,7 +1568,10 @@ mod tests {
             .0;
         assert_eq!(filtered.len(), 2);
         assert_eq!(
-            filtered.iter().map(|obj| obj.id.as_str()).collect::<Vec<_>>(),
+            filtered
+                .iter()
+                .map(|obj| obj.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
 

@@ -229,7 +229,7 @@ message DeleteObjectSetResponse {}
 message ResolveObjectSetRequest {
   string id = 1;
   int32 limit = 2;
-  int32 offset = 3;
+  optional int32 offset = 3;
 }
 
 message CreateLinkRequest { Link link = 1; }

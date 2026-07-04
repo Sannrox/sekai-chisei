@@ -354,10 +354,11 @@ fn to_proto_list_filter(filter: &domain::ListFilter) -> ListFilter {
     }
 }
 
-fn parse_set_filter_from_request(
-    input: &ObjectSet,
-) -> Result<domain::ListFilter, Status> {
-    let filter = input.filter.clone().ok_or(Status::invalid_argument("filter required"))?;
+fn parse_set_filter_from_request(input: &ObjectSet) -> Result<domain::ListFilter, Status> {
+    let filter = input
+        .filter
+        .clone()
+        .ok_or(Status::invalid_argument("filter required"))?;
     let mut property_filters = Vec::new();
     for pf in filter.property_filters {
         if !domain::is_valid_property_key(&pf.key) {
@@ -1159,13 +1160,18 @@ impl SekaiService for SekaiServiceImpl {
             return Err(Status::not_found("not found"));
         }
         let mut filter = set.filter.clone();
-        let (limit, offset) = read_limit_offset(inner.limit, inner.offset)?;
+        let (limit, _) = read_limit_offset(inner.limit, 0)?;
         if inner.limit > 0 {
             filter.limit = limit;
         } else if filter.limit <= 0 {
             filter.limit = limit;
         }
-        filter.offset = offset;
+        if let Some(offset) = inner.offset {
+            if offset < 0 {
+                return Err(Status::invalid_argument("offset must be >= 0"));
+            }
+            filter.offset = offset;
+        }
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let (objects, total) = self
             .db
@@ -4474,9 +4480,7 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest {
-                    filter: None,
-                },
+                ListObjectsRequest { filter: None },
                 "alice",
             ))
             .await
@@ -4593,7 +4597,7 @@ mod tests {
                 ResolveObjectSetRequest {
                     id: set_id.clone(),
                     limit: 10,
-                    offset: 0,
+                    offset: Some(0),
                 },
                 "alice",
             ))
@@ -4616,7 +4620,7 @@ mod tests {
                 ResolveObjectSetRequest {
                     id: set_id,
                     limit: 10,
-                    offset: 0,
+                    offset: Some(0),
                 },
                 "bob",
             ))
@@ -4665,7 +4669,7 @@ mod tests {
                 ResolveObjectSetRequest {
                     id: created.id,
                     limit: 10,
-                    offset: 0,
+                    offset: Some(0),
                 },
                 "alice",
             ))
@@ -4813,18 +4817,18 @@ mod tests {
                 },
                 "alice",
             ))
-                .await
-                .unwrap()
-                .into_inner()
-                .object_set
-                .unwrap();
+            .await
+            .unwrap()
+            .into_inner()
+            .object_set
+            .unwrap();
 
         let response = svc
             .resolve_object_set(with_named_principal(
                 ResolveObjectSetRequest {
                     id: created.id,
                     limit: 1,
-                    offset: 0,
+                    offset: Some(0),
                 },
                 "alice",
             ))
@@ -4834,5 +4838,76 @@ mod tests {
 
         assert_eq!(response.objects.len(), 1);
         assert_eq!(response.objects[0].id, "first");
+    }
+
+    #[tokio::test]
+    async fn resolve_object_set_omitted_offset_uses_stored_offset() {
+        let svc = service();
+        svc.db
+            .create_object(&Object {
+                id: "first".into(),
+                kind: "query-demo".into(),
+                name: "first".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "second".into(),
+                kind: "query-demo".into(),
+                name: "second".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 2,
+                updated: 2,
+            })
+            .unwrap();
+
+        let created = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "stored-offset-set".into(),
+                        description: "stored offset".into(),
+                        filter: Some(ListFilter {
+                            kind: "query-demo".into(),
+                            order_by: "name".into(),
+                            limit: 1,
+                            offset: 1,
+                            ..Default::default()
+                        }),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object_set
+            .unwrap();
+
+        let response = svc
+            .resolve_object_set(with_named_principal(
+                ResolveObjectSetRequest {
+                    id: created.id,
+                    limit: 1,
+                    offset: None,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.objects.len(), 1);
+        assert_eq!(response.objects[0].id, "second");
     }
 }
