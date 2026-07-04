@@ -14,6 +14,13 @@ pub const KIND_MODEL: &str = "model";
 pub const KIND_COMPONENT: &str = "component";
 pub const KIND_LEARNING: &str = "learning";
 
+pub const DEFAULT_LIST_LIMIT: i32 = 100;
+pub const MAX_LIST_LIMIT: i32 = 1000;
+
+pub fn is_valid_property_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 // --- Relations ---
 
 pub type Relation = String;
@@ -81,11 +88,36 @@ pub struct Link {
 
 // --- List Filter ---
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PropertyFilter {
+    pub key: String,
+    pub op: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ListFilter {
     pub kind: Option<String>,
     pub name: Option<String>,
     pub namespace: Option<String>,
+    pub property_filters: Vec<PropertyFilter>,
+    pub limit: i32,
+    pub offset: i32,
+    pub order_by: String,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObjectSet {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub filter: ListFilter,
+    pub owner_principal: String,
+    pub created: i64,
 }
 
 #[cfg(test)]
