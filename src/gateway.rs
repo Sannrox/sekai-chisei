@@ -2777,9 +2777,22 @@ fn body_looks_like_sse(body: &[u8]) -> bool {
         .any(|line| line.starts_with("data:") || line.starts_with("event:"))
 }
 
+/// Whether the tapped body has been identified as an SSE event stream. Event
+/// boundaries must only be drained once the stream positively looks like SSE:
+/// splitting a non-SSE body (e.g. pretty-printed JSON with a blank line) on
+/// `\n\n` would discard the fragments and lose usage at flush.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+enum SseTapMode {
+    #[default]
+    Undetected,
+    Sse,
+    Raw,
+}
+
 #[derive(Debug, Default)]
 struct SseUsageTap {
     pending: Vec<u8>,
+    mode: SseTapMode,
     usage: Option<ResponseUsage>,
     observation: ResponseObservation,
 }
@@ -2791,6 +2804,18 @@ impl SseUsageTap {
 
     fn push(&mut self, bytes: &[u8]) {
         self.pending.extend_from_slice(bytes);
+        if self.mode == SseTapMode::Undetected
+            && let Some(is_sse) = body_prefix_is_sse(&self.pending)
+        {
+            self.mode = if is_sse {
+                SseTapMode::Sse
+            } else {
+                SseTapMode::Raw
+            };
+        }
+        if self.mode != SseTapMode::Sse {
+            return;
+        }
         while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
             let event = self.pending.drain(..boundary).collect::<Vec<_>>();
             self.pending.drain(..separator_len);
@@ -2845,6 +2870,26 @@ impl SseUsageTap {
             self.observation.stop_reason = observation.stop_reason;
         }
     }
+}
+
+/// Decide from the first body bytes whether the stream is SSE. Returns None
+/// while the prefix is still too short to tell. SSE streams start with a
+/// field line (`data:`, `event:`, `id:`, `retry:`) or a `:` comment line.
+fn body_prefix_is_sse(bytes: &[u8]) -> Option<bool> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let prefix = &bytes[start..];
+    const SSE_FIELD_PREFIXES: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
+    let mut undecided = false;
+    for field in SSE_FIELD_PREFIXES {
+        if prefix.starts_with(field) {
+            return Some(true);
+        }
+        if field.starts_with(prefix) {
+            undecided = true;
+        }
+    }
+    if undecided { None } else { Some(false) }
 }
 
 fn find_sse_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -5355,7 +5400,9 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
 
     #[tokio::test]
     async fn json_body_without_content_type_streams_and_records_usage() {
-        let upstream_body = r#"{"id":"resp_1","object":"response","usage":{"input_tokens":8,"output_tokens":6,"total_tokens":14},"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}"#;
+        // The blank line between fields must survive the SSE usage tap: a
+        // non-SSE body split on event boundaries would lose its usage.
+        let upstream_body = "{\"id\":\"resp_1\",\"object\":\"response\",\n\n\"usage\":{\"input_tokens\":8,\"output_tokens\":6,\"total_tokens\":14},\n\n\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}";
         let (upstream_base, _requests) = spawn_fake_upstream(upstream_body, "").await;
         let (chisei_target, db) = spawn_control_plane().await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -5426,6 +5473,51 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         let (usage, observation) = extract_buffered_body_usage(b"neither json nor an event stream");
         assert_eq!(usage, None);
         assert_eq!(observation, None);
+    }
+
+    #[test]
+    fn sse_usage_tap_preserves_non_sse_bodies_with_blank_lines() {
+        let mut tap = SseUsageTap::new();
+        tap.push(b"{\"id\":\"resp_1\",\n\n\"usage\":{\"input_tokens\":8,");
+        tap.push(b"\"output_tokens\":6},\n\n\"object\":\"response\"}");
+        let (usage, _) = tap.finish();
+        assert_eq!(
+            usage,
+            Some(ResponseUsage {
+                input_tokens: 8,
+                output_tokens: 6,
+                total_tokens: 14,
+            })
+        );
+    }
+
+    #[test]
+    fn sse_usage_tap_detects_sse_after_leading_comment() {
+        let mut tap = SseUsageTap::new();
+        tap.push(b": keepalive\n\n");
+        tap.push(b"data: {\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}\n\n");
+        let (usage, _) = tap.finish();
+        assert_eq!(
+            usage,
+            Some(ResponseUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn body_prefix_is_sse_waits_for_enough_bytes() {
+        assert_eq!(body_prefix_is_sse(b""), None);
+        assert_eq!(body_prefix_is_sse(b"\n\n"), None);
+        assert_eq!(body_prefix_is_sse(b"dat"), None);
+        assert_eq!(body_prefix_is_sse(b"data:"), Some(true));
+        assert_eq!(body_prefix_is_sse(b"event: response.created"), Some(true));
+        assert_eq!(body_prefix_is_sse(b": comment"), Some(true));
+        assert_eq!(body_prefix_is_sse(b"\n\ndata: {}"), Some(true));
+        assert_eq!(body_prefix_is_sse(b"{\"id\":\"resp_1\"}"), Some(false));
+        assert_eq!(body_prefix_is_sse(b"plain text"), Some(false));
     }
 
     #[test]
