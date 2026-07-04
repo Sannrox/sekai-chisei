@@ -2820,10 +2820,18 @@ impl SseUsageTap {
             return;
         }
         let pending = std::mem::take(&mut self.pending);
-        if let Some(usage) = extract_sse_event_usage(&pending) {
+        // Non-SSE passthrough bodies (no Content-Type header) arrive here as
+        // one pending blob; fall back to whole-JSON extraction for those.
+        if let Some(usage) = extract_sse_event_usage(&pending).or_else(|| {
+            extract_response_usage(&pending)
+                .or_else(|| extract_nested_response_usage(&pending))
+                .or_else(|| extract_nested_message_usage(&pending))
+        }) {
             self.usage = Some(merge_usage(self.usage, usage));
         }
-        if let Some(observation) = extract_sse_event_observation(&pending) {
+        if let Some(observation) = extract_sse_event_observation(&pending)
+            .or_else(|| extract_response_observation(&pending))
+        {
             self.merge_observation(observation);
         }
     }
@@ -3001,11 +3009,17 @@ async fn response_from_upstream(
         }
     }
 
-    let is_stream = response_headers
+    let content_type = response_headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.starts_with("text/event-stream"))
-        .unwrap_or(false);
+        .filter(|value| !value.is_empty());
+    let declares_sse = content_type.is_some_and(|value| value.starts_with("text/event-stream"));
+    // The ChatGPT Codex backend (chatgpt.com/backend-api/codex) streams SSE
+    // without a Content-Type header. Passthrough responses with no declared
+    // content type stream through so clients keep incremental delivery; the
+    // usage tap recovers usage from whole-JSON bodies at flush.
+    let is_stream = declares_sse
+        || (content_type.is_none() && response_adapter == ResponseAdapter::Passthrough);
     if is_stream {
         if response_adapter != ResponseAdapter::Passthrough {
             return json_error(
@@ -3273,6 +3287,52 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}/v1"), requests)
+    }
+
+    /// Streams `chunks` as separate body frames with `delay` between them and
+    /// no Content-Type header, like the ChatGPT Codex backend.
+    async fn spawn_fake_chunked_upstream(
+        chunks: &'static [&'static str],
+        delay: Duration,
+    ) -> String {
+        let handler = move || async move {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<String, std::convert::Infallible>>(1);
+            tokio::spawn(async move {
+                for (index, chunk) in chunks.iter().enumerate() {
+                    if index > 0 {
+                        tokio::time::sleep(delay).await;
+                    }
+                    if tx.send(Ok(chunk.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .unwrap()
+        };
+        let app = Router::new().route("/{*path}", any(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// Usage recording for streamed responses happens in a background task
+    /// after the last chunk is delivered, so poll instead of asserting once.
+    async fn wait_for_llm_calls(db: &SekaiDb, count: usize) -> Vec<HashMap<String, String>> {
+        for _ in 0..100 {
+            let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
+            if rows.len() >= count {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        db.query_rows("llm_calls", &RowQuery::default()).unwrap()
     }
 
     async fn spawn_gateway(openai_base_url: String) -> String {
@@ -5226,12 +5286,113 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), CODEX_BACKEND_SSE);
 
-        let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
+        let rows = wait_for_llm_calls(&db, 1).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("agent").map(String::as_str), Some("codex-app"));
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("45"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("50"));
+    }
+
+    #[tokio::test]
+    async fn codex_backend_sse_without_content_type_streams_incrementally() {
+        const CHUNKS: &[&str] = &[
+            "event: response.created\n\
+             data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\",\"status\":\"in_progress\",\"usage\":null}}\n\n",
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",\"status\":\"completed\",\"usage\":{\"input_tokens\":45,\"output_tokens\":5,\"total_tokens\":50}}}\n\n",
+        ];
+        let upstream_base = spawn_fake_chunked_upstream(CHUNKS, Duration::from_millis(150)).await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let mut resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let first = resp.chunk().await.unwrap().unwrap();
+        let mut body = String::from_utf8(first.to_vec()).unwrap();
+        assert!(body.contains("response.created"));
+        assert!(
+            !body.contains("response.completed"),
+            "gateway buffered the SSE body instead of streaming it: {body}"
+        );
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert_eq!(body, CHUNKS.concat());
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("45"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("50"));
+    }
+
+    #[tokio::test]
+    async fn json_body_without_content_type_streams_and_records_usage() {
+        let upstream_body = r#"{"id":"resp_1","object":"response","usage":{"input_tokens":8,"output_tokens":6,"total_tokens":14},"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}"#;
+        let (upstream_base, _requests) = spawn_fake_upstream(upstream_body, "").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), upstream_body);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("8"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("6"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("14"));
     }
 
     #[test]
