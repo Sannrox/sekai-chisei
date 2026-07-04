@@ -14,7 +14,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "sekai-chisei starting");
 
-    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
     if config.auth_token.is_some() {
         tracing::warn!(
             "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
@@ -22,18 +21,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = Arc::new(SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?);
-    let token_auth_mode =
-        (config.auth_token.is_some() || !db.list_active_credentials()?.is_empty()) && !insecure;
+    let active_credentials = db.list_active_credentials()?;
+    let grpc_tcp_mode = config.grpc_tcp_mode(!active_credentials.is_empty());
 
-    if token_auth_mode {
+    if config.insecure && grpc_tcp_mode.auth_configured {
+        tracing::warn!("SEKAI_INSECURE=1 disables token-auth mode for local development");
+    }
+    if grpc_tcp_mode.bind_inferred_from_active_credentials {
+        tracing::warn!(
+            "binding 0.0.0.0 because active credentials exist; set SEKAI_BIND to make this explicit"
+        );
+    }
+
+    if grpc_tcp_mode.token_auth_mode {
         tracing::info!(
-            bind = "0.0.0.0",
+            bind = %grpc_tcp_mode.bind_addr,
             port = config.grpc_port,
             "gRPC TCP listener enabled"
         );
-    } else if insecure {
+    } else if config.insecure {
         tracing::info!(
-            bind = "127.0.0.1",
+            bind = %grpc_tcp_mode.bind_addr,
             port = config.grpc_port,
             "gRPC TCP listener enabled"
         );
@@ -56,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "LLM providers configured"
     );
 
-    let server = sekai_chisei::grpc::run(config.grpc_port, db);
+    let server = sekai_chisei::grpc::run(config, db, active_credentials, grpc_tcp_mode);
     let shutdown = async {
         signal::ctrl_c().await.ok();
         tracing::info!("shutting down");
