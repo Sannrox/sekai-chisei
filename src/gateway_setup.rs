@@ -776,11 +776,6 @@ mod tests {
 
     async fn spawn_control_plane() -> (String, Arc<SekaiDb>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        db.migrate_datasets();
-        db.migrate_functions();
-        db.migrate_grants();
-        db.migrate_audit();
-        let _ = db.migrate_chisei();
 
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), test_config());

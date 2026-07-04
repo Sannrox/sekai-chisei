@@ -21,15 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let db = Arc::new(SekaiDb::new(&config.db_path).expect("failed to open database"));
-    db.migrate_datasets();
-    db.migrate_functions();
-    db.migrate_audit();
-    db.migrate_schema_types()
-        .expect("failed to migrate schema types");
-    let _ = db.migrate_chisei();
-    db.migrate_principal_credentials()
-        .map_err(std::io::Error::other)?;
+    let db = Arc::new(SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?);
     let token_auth_mode =
         (config.auth_token.is_some() || !db.list_active_credentials()?.is_empty()) && !insecure;
 
@@ -89,8 +81,7 @@ fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(500);
 
-    let db = SekaiDb::new(&config.db_path).expect("failed to open database");
-    db.migrate_audit();
+    let db = SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?;
     let rows = sekai_chisei::gateway_report::egress_rows(&db, after, limit)?;
 
     match format {

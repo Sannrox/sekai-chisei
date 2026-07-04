@@ -25,10 +25,6 @@ pub struct SekaiServiceImpl {
 
 impl SekaiServiceImpl {
     pub fn new(db: Arc<SekaiDb>) -> Self {
-        db.migrate_coordination();
-        db.migrate_functions();
-        db.migrate_grants();
-        db.migrate_audit();
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
@@ -2642,10 +2638,6 @@ mod tests {
 
     fn service() -> SekaiServiceImpl {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        db.migrate_datasets();
-        db.migrate_functions();
-        db.migrate_grants();
-        db.migrate_audit();
         SekaiServiceImpl::new(db)
     }
 
@@ -3385,7 +3377,6 @@ mod tests {
     #[tokio::test]
     async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        db.migrate_schema_types().unwrap();
         {
             let conn = db.conn.lock().unwrap();
             conn.execute(
@@ -3463,6 +3454,7 @@ mod tests {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         {
             let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE sekai_object_types", []).unwrap();
             conn.execute(
                 "CREATE TABLE sekai_object_types (kind TEXT PRIMARY KEY)",
                 [],
@@ -3493,7 +3485,7 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             conn.execute("DROP TABLE sekai_object_types", []).unwrap();
         }
-        db.migrate_schema_types().unwrap();
+        db.migrate_all().unwrap();
         svc.create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
                 id: "loose-2".into(),
