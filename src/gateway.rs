@@ -2752,6 +2752,31 @@ fn merge_usage(existing: Option<ResponseUsage>, next: ResponseUsage) -> Response
     }
 }
 
+/// Extract usage from a fully buffered upstream body, falling back to SSE
+/// parsing when the body is an event stream rather than a single JSON
+/// document. The ChatGPT Codex backend (chatgpt.com/backend-api/codex) streams
+/// SSE without a Content-Type header, so its responses land in the buffered
+/// path instead of the streaming tap.
+fn extract_buffered_body_usage(
+    body: &[u8],
+) -> (Option<ResponseUsage>, Option<ResponseObservation>) {
+    let usage = extract_response_usage(body);
+    let observation = extract_response_observation(body);
+    if usage.is_some() || observation.is_some() || !body_looks_like_sse(body) {
+        return (usage, observation);
+    }
+    let mut tap = SseUsageTap::new();
+    tap.push(body);
+    tap.finish()
+}
+
+fn body_looks_like_sse(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .lines()
+        .take(32)
+        .any(|line| line.starts_with("data:") || line.starts_with("event:"))
+}
+
 #[derive(Debug, Default)]
 struct SseUsageTap {
     pending: Vec<u8>,
@@ -3021,8 +3046,7 @@ async fn response_from_upstream(
 
     match upstream.bytes().await {
         Ok(bytes) => {
-            let usage = extract_response_usage(&bytes);
-            let observation = extract_response_observation(&bytes);
+            let (usage, observation) = extract_buffered_body_usage(&bytes);
             record_usage_and_append(config, identity, usage, observation, &context, status).await;
             let body = match response_adapter {
                 ResponseAdapter::Passthrough => bytes.to_vec(),
@@ -3214,11 +3238,11 @@ mod tests {
             tokio::time::sleep(delay).await;
         }
 
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, state.content_type)
-            .body(Body::from(state.response_body))
-            .unwrap()
+        let mut builder = Response::builder().status(StatusCode::OK);
+        if !state.content_type.is_empty() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, state.content_type);
+        }
+        builder.body(Body::from(state.response_body)).unwrap()
     }
 
     async fn spawn_fake_upstream(
@@ -5156,6 +5180,91 @@ mod tests {
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("13"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("24"));
+    }
+
+    // Captured from chatgpt.com/backend-api/codex/responses: the ChatGPT Codex
+    // backend streams SSE with no Content-Type header, emits "usage": null on
+    // response.created, and carries real usage on response.completed.
+    const CODEX_BACKEND_SSE: &str = "event: response.created\n\
+data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_codex\",\"status\":\"in_progress\",\"usage\":null,\"tool_usage\":{\"image_gen\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0},\"web_search\":{\"num_requests\":0}}}}\n\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\":\"resp_codex\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":45,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":50},\"tool_usage\":{\"image_gen\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0},\"web_search\":{\"num_requests\":0}}}}\n\n";
+
+    #[tokio::test]
+    async fn codex_backend_sse_without_content_type_records_usage() {
+        let (upstream_base, _requests) = spawn_fake_upstream(CODEX_BACKEND_SSE, "").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), CODEX_BACKEND_SSE);
+
+        let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("agent").map(String::as_str), Some("codex-app"));
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("45"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("50"));
+    }
+
+    #[test]
+    fn buffered_body_usage_falls_back_to_sse_parsing() {
+        let (usage, observation) = extract_buffered_body_usage(CODEX_BACKEND_SSE.as_bytes());
+        assert_eq!(
+            usage,
+            Some(ResponseUsage {
+                input_tokens: 45,
+                output_tokens: 5,
+                total_tokens: 50,
+            })
+        );
+        assert!(
+            observation
+                .as_ref()
+                .is_some_and(|observation| observation.output_content.contains("hi"))
+        );
+
+        let json = br#"{"id":"resp_1","usage":{"input_tokens":8,"output_tokens":6}}"#;
+        let (usage, _) = extract_buffered_body_usage(json);
+        assert_eq!(
+            usage,
+            Some(ResponseUsage {
+                input_tokens: 8,
+                output_tokens: 6,
+                total_tokens: 14,
+            })
+        );
+
+        let (usage, observation) = extract_buffered_body_usage(b"neither json nor an event stream");
+        assert_eq!(usage, None);
+        assert_eq!(observation, None);
     }
 
     #[test]
