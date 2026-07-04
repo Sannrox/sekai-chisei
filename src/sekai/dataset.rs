@@ -44,7 +44,7 @@ pub struct VirtualTable {
 
 impl SekaiDb {
     pub(crate) fn migrate_datasets(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_datasets (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, columns TEXT NOT NULL,
@@ -65,7 +65,7 @@ impl SekaiDb {
     }
 
     pub fn create_dataset(&self, d: &Dataset) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let cols = serde_json::to_string(
             &d.columns
                 .iter()
@@ -79,7 +79,7 @@ impl SekaiDb {
     }
 
     pub fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id,name,columns,object_id,created FROM sekai_datasets WHERE id=?1",
             params![id],
@@ -107,7 +107,7 @@ impl SekaiDb {
     }
 
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id,name,columns,object_id,created FROM sekai_datasets")
             .map_err(|e| e.to_string())?;
@@ -138,7 +138,7 @@ impl SekaiDb {
         dataset_id: &str,
         rows: &[HashMap<String, String>],
     ) -> Result<i32, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut count = 0;
         for row in rows {
             let data = serde_json::to_string(row).unwrap();
@@ -157,7 +157,7 @@ impl SekaiDb {
         dataset_id: &str,
         q: &RowQuery,
     ) -> Result<Vec<HashMap<String, String>>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id = ?1")
             .map_err(|e| e.to_string())?;
@@ -190,7 +190,7 @@ impl SekaiDb {
     }
 
     pub fn create_virtual_table(&self, vt: &VirtualTable) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let filters = serde_json::to_string(
             &vt.filters
                 .iter()
@@ -205,7 +205,7 @@ impl SekaiDb {
     }
 
     pub fn list_virtual_tables(&self) -> Result<Vec<VirtualTable>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id,name,dataset_id,filters,columns,created FROM sekai_virtual_tables")
             .map_err(|e| e.to_string())?;

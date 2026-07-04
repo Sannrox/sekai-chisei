@@ -163,7 +163,7 @@ fn push_if_changed(
 
 impl SekaiDb {
     pub(crate) fn migrate_audit(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_decisions (
                 id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, actor TEXT NOT NULL,
@@ -181,7 +181,7 @@ impl SekaiDb {
     }
 
     pub fn record_decision(&self, d: &Decision) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let evidence = serde_json::to_string(&d.evidence).unwrap_or_default();
         conn.execute("INSERT INTO sekai_decisions (id,timestamp,actor,action,reason,evidence,target_id,outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![d.id, d.timestamp, d.actor, d.action, d.reason, evidence, d.target_id, d.outcome]).map_err(|e| e.to_string())?;
@@ -189,7 +189,7 @@ impl SekaiDb {
     }
 
     pub fn list_decisions(&self, f: &DecisionFilter) -> Result<Vec<Decision>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut sql = "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE 1=1".to_string();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(a) = &f.actor {
@@ -238,7 +238,7 @@ impl SekaiDb {
     }
 
     pub fn record_object_change(&self, c: &ObjectChange) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![c.id, c.object_id, c.field, c.old_value, c.new_value, c.changed_by, c.timestamp]).map_err(|e| e.to_string())?;
         Ok(())
@@ -248,7 +248,7 @@ impl SekaiDb {
         if changes.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         insert_object_changes(&tx, changes)?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -256,7 +256,7 @@ impl SekaiDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let props = serde_json::to_string(&object.properties).unwrap_or_default();
         tx.execute(
@@ -289,7 +289,7 @@ impl SekaiDb {
         object: &Object,
         actor: &str,
     ) -> Result<Option<Object>, String> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
             .query_row(
@@ -333,7 +333,7 @@ impl SekaiDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
             .query_row(
@@ -374,7 +374,7 @@ impl SekaiDb {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<ObjectChange>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let effective_limit = if limit > 0 { limit } else { 100 };
         let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -397,7 +397,7 @@ impl SekaiDb {
     }
 
     pub fn purge_old_records(&self, before: i64) -> Result<i32, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n1 = conn
             .execute(
                 "DELETE FROM sekai_decisions WHERE timestamp < ?1",
@@ -630,7 +630,7 @@ mod tests {
     fn record_object_diff_returns_insert_errors() {
         let db = SekaiDb::new(":memory:").unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn();
             conn.execute("DROP TABLE sekai_object_changes", []).unwrap();
         }
         let obj = object("o1", "api", "default", "ext-1", HashMap::new());

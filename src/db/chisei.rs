@@ -7,7 +7,7 @@ use crate::chisei::{eval, evolve};
 
 impl SekaiDb {
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisei_eval_suites (
                 id TEXT PRIMARY KEY,
@@ -183,7 +183,7 @@ impl SekaiDb {
     }
 
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let cases_json = serde_json::to_string(&suite.cases).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT OR REPLACE INTO chisei_eval_suites (id, name, description, cases_json) VALUES (?1, ?2, ?3, ?4)",
@@ -194,7 +194,7 @@ impl SekaiDb {
     }
 
     pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = ?1",
             params![id],
@@ -214,7 +214,7 @@ impl SekaiDb {
     }
 
     pub fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id, name, description, cases_json FROM chisei_eval_suites ORDER BY id")
             .map_err(|e| e.to_string())?;
@@ -234,7 +234,7 @@ impl SekaiDb {
     }
 
     pub fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let results_json = serde_json::to_string(&run.results).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT OR REPLACE INTO chisei_eval_runs (id, suite_id, config_ref, results_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -245,7 +245,7 @@ impl SekaiDb {
     }
 
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs WHERE id = ?1",
             params![id],
@@ -266,7 +266,7 @@ impl SekaiDb {
     }
 
     pub fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs WHERE suite_id = ?1 ORDER BY timestamp",
@@ -289,7 +289,7 @@ impl SekaiDb {
     }
 
     pub fn list_all_eval_run_records(&self) -> Result<Vec<eval::Run>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs ORDER BY timestamp",
@@ -315,7 +315,7 @@ impl SekaiDb {
     /// to bound the rows the scoring job's continuous per-cycle run emission would otherwise grow
     /// without limit. Scoped to a single suite id, so user-authored suites are never touched.
     pub fn prune_eval_runs_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM chisei_eval_runs WHERE suite_id = ?1 AND id NOT IN (
                 SELECT id FROM chisei_eval_runs WHERE suite_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2
@@ -328,7 +328,7 @@ impl SekaiDb {
 
     /// Keep only the newest `keep` iterations for a suite (newest by `created`), deleting the rest.
     pub fn prune_eval_iterations_for_suite(&self, suite_id: &str, keep: i64) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM chisei_eval_iterations WHERE suite_id = ?1 AND id NOT IN (
                 SELECT id FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created DESC, id DESC LIMIT ?2
@@ -340,7 +340,7 @@ impl SekaiDb {
     }
 
     pub fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
@@ -366,7 +366,7 @@ impl SekaiDb {
         &self,
         suite_id: &str,
     ) -> Result<Vec<eval::Iteration>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE suite_id = ?1 ORDER BY created, id",
@@ -394,7 +394,7 @@ impl SekaiDb {
     }
 
     pub fn list_all_eval_iteration_records(&self) -> Result<Vec<eval::Iteration>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations ORDER BY created, id",
@@ -425,7 +425,7 @@ impl SekaiDb {
         &self,
         changed_file: &str,
     ) -> Result<Option<eval::Iteration>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE changed_file = ?1 ORDER BY created DESC, id DESC LIMIT 1",
             params![changed_file],
@@ -451,7 +451,7 @@ impl SekaiDb {
     }
 
     pub fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let task_json = serde_json::to_string(task).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT OR REPLACE INTO chisei_evolve_tasks (id, task_json) VALUES (?1, ?2)",
@@ -462,7 +462,7 @@ impl SekaiDb {
     }
 
     pub fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let task_json = conn
             .query_row(
                 "SELECT task_json FROM chisei_evolve_tasks WHERE id = ?1",
@@ -477,7 +477,7 @@ impl SekaiDb {
     }
 
     pub fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT task_json FROM chisei_evolve_tasks ORDER BY id")
             .map_err(|e| e.to_string())?;
@@ -498,7 +498,7 @@ impl SekaiDb {
         request_id: &str,
         original_spec: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT OR REPLACE INTO chisei_evolve_enhancements (request_id, original_spec) VALUES (?1, ?2)",
             params![request_id, original_spec],
@@ -513,7 +513,7 @@ impl SekaiDb {
         &self,
         obs: &crate::chisei::scoring::SampleObservation,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO chisei_sample_observations
                 (request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored)
@@ -541,7 +541,7 @@ impl SekaiDb {
         limit: i32,
     ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
         let effective_limit = if limit > 0 { limit } else { 16 };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored
@@ -571,7 +571,7 @@ impl SekaiDb {
     /// Increment and return the judge-failure count for an observation, so the scoring job can
     /// retire records that fail deterministically instead of letting them occupy batch slots forever.
     pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE chisei_sample_observations SET attempts = attempts + 1 WHERE request_id = ?1",
             params![request_id],
@@ -589,7 +589,7 @@ impl SekaiDb {
     /// preserved durably in the eval run, iteration, and audit decision — so deleting it bounds
     /// table growth to the unscored backlog plus the in-flight batch.
     pub fn delete_observation(&self, request_id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM chisei_sample_observations WHERE request_id = ?1",
             params![request_id],
@@ -599,7 +599,7 @@ impl SekaiDb {
     }
 
     pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT request_id, original_spec FROM chisei_evolve_enhancements")
             .map_err(|e| e.to_string())?;

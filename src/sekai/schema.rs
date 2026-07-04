@@ -229,7 +229,7 @@ pub fn validate_object_type_definition(
 
 impl SekaiDb {
     pub(crate) fn migrate_schema_types(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_object_types (
                 kind TEXT PRIMARY KEY,
@@ -246,7 +246,7 @@ impl SekaiDb {
         let now = chrono::Utc::now().timestamp_millis();
         let properties_json =
             serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
              VALUES (?1, ?2, ?3, ?4, ?4)
@@ -266,7 +266,7 @@ impl SekaiDb {
     }
 
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let deleted = conn
             .execute(
                 "DELETE FROM sekai_object_types WHERE kind = ?1",
@@ -277,7 +277,7 @@ impl SekaiDb {
     }
 
     pub fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT kind, description, properties_json FROM sekai_object_types WHERE kind = ?1",
             params![kind],
@@ -303,7 +303,7 @@ impl SekaiDb {
     pub fn list_object_types_with_errors(
         &self,
     ) -> Result<(Vec<ObjectType>, HashMap<String, String>), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT kind, description, properties_json FROM sekai_object_types ORDER BY kind",
