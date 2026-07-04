@@ -53,6 +53,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
     let addr = free_local_addr();
     let config = Config {
         grpc_port: addr.port(),
+        sekai_bind: None,
         ops_port: None,
         ops_bind: "127.0.0.1".into(),
         sekai_socket: None,
@@ -74,6 +75,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         tls_cert: None,
         tls_key: None,
         allow_plaintext: false,
+        insecure: false,
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
@@ -158,6 +160,7 @@ async fn delegation_chain_keeps_private_context_local() {
     let addr = free_local_addr();
     let config = Config {
         grpc_port: addr.port(),
+        sekai_bind: None,
         ops_port: None,
         ops_bind: "127.0.0.1".into(),
         sekai_socket: None,
@@ -179,6 +182,7 @@ async fn delegation_chain_keeps_private_context_local() {
         tls_cert: None,
         tls_key: None,
         allow_plaintext: false,
+        insecure: false,
     };
     let local_model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));

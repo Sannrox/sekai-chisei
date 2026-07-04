@@ -20,8 +20,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::chisei::budget::BudgetTracker;
-use crate::config::Config;
-use crate::db::sekai::SekaiDb;
+use crate::config::{Config, GrpcTcpMode};
+use crate::db::sekai::{PrincipalCredential, SekaiDb};
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
@@ -179,25 +179,18 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
     }
 }
 
-pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env();
+pub async fn run(
+    config: Config,
+    db: Arc<SekaiDb>,
+    active_credentials: Vec<PrincipalCredential>,
+    tcp_mode: GrpcTcpMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ops_port) = config.ops_port {
         crate::obs::ops::bind_and_spawn(&config.ops_bind, ops_port, db.clone()).await?;
     }
-    let insecure = std::env::var("SEKAI_INSECURE").unwrap_or_default() == "1";
 
     let credential_store = Arc::new(PrincipalCredentialStore::new());
-    let active_credentials = db.list_active_credentials().unwrap_or_default();
     credential_store.load(&active_credentials);
-
-    let token_auth_mode = config.auth_token.is_some() || credential_store.has_any();
-    let effective_token_auth_mode = token_auth_mode && !insecure;
-    if insecure && token_auth_mode {
-        tracing::warn!("SEKAI_INSECURE=1 disables token-auth mode for local development");
-    }
-    if config.auth_token.is_some() {
-        tracing::warn!("SEKAI_AUTH_TOKEN is deprecated and now maps to fixed principal `root`");
-    }
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -212,13 +205,13 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
             health_service.clone(),
         );
 
-        if token_auth_mode || insecure {
+        if tcp_mode.auth_configured || config.insecure {
             let tcp_server = run_tcp(
-                port,
+                config.grpc_port,
                 &config,
                 sekai_svc,
                 chisei_svc,
-                effective_token_auth_mode,
+                &tcp_mode,
                 credential_store,
                 db,
                 health_service,
@@ -232,7 +225,7 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
         return uds_server.await;
     }
 
-    if !effective_token_auth_mode && !insecure {
+    if !tcp_mode.token_auth_mode && !config.insecure {
         return Err(std::io::Error::other(
             "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
         )
@@ -240,11 +233,11 @@ pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::
     }
 
     run_tcp(
-        port,
+        config.grpc_port,
         &config,
         sekai_svc,
         chisei_svc,
-        effective_token_auth_mode,
+        &tcp_mode,
         credential_store,
         db,
         health_service,
@@ -258,7 +251,7 @@ async fn run_tcp<H>(
     config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
-    token_auth_mode: bool,
+    tcp_mode: &GrpcTcpMode,
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<SekaiDb>,
     health_service: H,
@@ -273,13 +266,9 @@ where
     H::Response: IntoResponse,
     H::Future: Send + 'static,
 {
-    let bind_addr = if token_auth_mode {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    };
+    let bind_addr = tcp_mode.bind_addr.as_str();
 
-    if token_auth_mode {
+    if tcp_mode.token_auth_mode {
         serve_tcp_listener(
             bind_addr,
             port,
