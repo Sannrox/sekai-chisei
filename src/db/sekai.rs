@@ -423,8 +423,8 @@ impl SekaiDb {
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}",
             query.where_sql
         );
-        if let Some(order_sql) = &order_sql {
-            list_sql.push_str(&order_sql);
+        if let Some(order_sql) = order_sql.as_deref() {
+            list_sql.push_str(order_sql);
         }
         list_sql.push_str(&format!(
             " LIMIT ?{} OFFSET ?{}",
@@ -493,8 +493,8 @@ impl SekaiDb {
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}",
             query.where_sql, visibility_filter
         );
-        if let Some(order_sql) = &order_sql {
-            list_sql.push_str(&order_sql);
+        if let Some(order_sql) = order_sql.as_deref() {
+            list_sql.push_str(order_sql);
         }
         list_sql.push_str(&format!(
             " LIMIT ?{} OFFSET ?{}",

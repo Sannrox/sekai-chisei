@@ -1090,14 +1090,12 @@ impl SekaiService for SekaiServiceImpl {
             owner.as_str(),
         )?;
         self.db.create_object_set(&domain_set).map_err(|e| {
-            if e.starts_with("UNIQUE constraint failed:")
+            let duplicate_name = e.starts_with("UNIQUE constraint failed:")
                 && e.contains("sekai_object_sets.owner_principal")
-                && e.contains("sekai_object_sets.name")
-            {
-                Status::already_exists("object set already exists")
-            } else if e.starts_with("UNIQUE constraint failed:")
-                && e.contains("sekai_object_sets.id")
-            {
+                && e.contains("sekai_object_sets.name");
+            let duplicate_id =
+                e.starts_with("UNIQUE constraint failed:") && e.contains("sekai_object_sets.id");
+            if duplicate_name || duplicate_id {
                 Status::already_exists("object set already exists")
             } else {
                 Status::internal(e)
@@ -1161,9 +1159,7 @@ impl SekaiService for SekaiServiceImpl {
         }
         let mut filter = set.filter.clone();
         let (limit, _) = read_limit_offset(inner.limit, 0)?;
-        if inner.limit > 0 {
-            filter.limit = limit;
-        } else if filter.limit <= 0 {
+        if inner.limit > 0 || filter.limit <= 0 {
             filter.limit = limit;
         }
         if let Some(offset) = inner.offset {
@@ -4428,7 +4424,7 @@ mod tests {
     async fn list_objects_enforces_limit_and_returns_total() {
         let svc = service();
         for i in 0..1105 {
-            let object = Object {
+            let object = domain::Object {
                 id: format!("obj-{i}"),
                 kind: "query-demo".into(),
                 name: format!("object-{i}"),
@@ -4466,7 +4462,7 @@ mod tests {
     async fn list_objects_omits_filter_uses_defaults() {
         let svc = service();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "default-filter".into(),
                 kind: "query-demo".into(),
                 name: "default-filter".into(),
@@ -4519,7 +4515,7 @@ mod tests {
     async fn object_sets_resolve_like_inline_filter_and_owner_only_access() {
         let svc = service();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "owner-visible".into(),
                 kind: "query-demo".into(),
                 name: "owner-visible".into(),
@@ -4533,7 +4529,7 @@ mod tests {
         grant_object_role(&svc, "owner-visible", "alice", security::Role::Viewer);
 
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "other-visible".into(),
                 kind: "query-demo".into(),
                 name: "other-visible".into(),
@@ -4773,7 +4769,7 @@ mod tests {
     async fn resolve_object_set_offset_zero_overrides_stored_offset() {
         let svc = service();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "first".into(),
                 kind: "query-demo".into(),
                 name: "first".into(),
@@ -4785,7 +4781,7 @@ mod tests {
             })
             .unwrap();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "second".into(),
                 kind: "query-demo".into(),
                 name: "second".into(),
@@ -4844,7 +4840,7 @@ mod tests {
     async fn resolve_object_set_omitted_offset_uses_stored_offset() {
         let svc = service();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "first".into(),
                 kind: "query-demo".into(),
                 name: "first".into(),
@@ -4856,7 +4852,7 @@ mod tests {
             })
             .unwrap();
         svc.db
-            .create_object(&Object {
+            .create_object(&domain::Object {
                 id: "second".into(),
                 kind: "query-demo".into(),
                 name: "second".into(),
