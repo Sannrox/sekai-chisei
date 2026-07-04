@@ -114,7 +114,7 @@ where
                     kind: Some(step.kind.clone()),
                     ..Default::default()
                 };
-                let mut filtered = db.list_objects(&filter)?;
+                let mut filtered = db.list_all_objects(&filter)?;
                 if !step.property.is_empty() && !step.value.is_empty() {
                     let val = resolve_param(&step.value, params);
                     filtered.retain(|o| {
