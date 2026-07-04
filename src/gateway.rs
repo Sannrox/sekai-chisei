@@ -3296,11 +3296,6 @@ mod tests {
 
     async fn spawn_control_plane_with_config(config: Config) -> (String, Arc<SekaiDb>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        db.migrate_datasets();
-        db.migrate_functions();
-        db.migrate_grants();
-        db.migrate_audit();
-        let _ = db.migrate_chisei();
         for (agent, project, secret) in [
             ("codex-app", "default", "sk-chisei-codex-app"),
             ("claude-code", "default", "sk-chisei-claude-code"),

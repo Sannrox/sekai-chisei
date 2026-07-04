@@ -162,7 +162,7 @@ fn push_if_changed(
 }
 
 impl SekaiDb {
-    pub fn migrate_audit(&self) {
+    pub(crate) fn migrate_audit(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_decisions (
@@ -176,7 +176,8 @@ impl SekaiDb {
                 changed_by TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_changes_object ON sekai_object_changes(object_id);"
-        ).unwrap();
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn record_decision(&self, d: &Decision) -> Result<(), String> {
@@ -437,9 +438,7 @@ mod tests {
     use super::*;
 
     fn setup() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_audit();
-        db
+        SekaiDb::new(":memory:").unwrap()
     }
 
     fn object(
@@ -630,6 +629,10 @@ mod tests {
     #[test]
     fn record_object_diff_returns_insert_errors() {
         let db = SekaiDb::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE sekai_object_changes", []).unwrap();
+        }
         let obj = object("o1", "api", "default", "ext-1", HashMap::new());
 
         assert!(record_object_diff(&db, "tester", None, Some(&obj)).is_err());
