@@ -2690,6 +2690,7 @@ mod tests {
     fn config(db_path: &str) -> Config {
         Config {
             grpc_port: 0,
+            sekai_bind: None,
             ops_port: None,
             ops_bind: "127.0.0.1".into(),
             sekai_socket: None,
@@ -2711,6 +2712,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             allow_plaintext: false,
+            insecure: false,
         }
     }
 
