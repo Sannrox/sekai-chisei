@@ -760,8 +760,6 @@ mod tests {
 
     fn setup() -> (Arc<SekaiDb>, Arc<EvalStore>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        db.migrate_chisei().unwrap();
-        db.migrate_audit();
         (db, Arc::new(EvalStore::new()))
     }
 

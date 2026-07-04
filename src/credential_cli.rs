@@ -90,8 +90,6 @@ fn credential_db_path() -> String {
 pub fn create_credential(principal: &str) -> Result<String, String> {
     validate_principal(principal)?;
     let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.migrate_principal_credentials()
-        .map_err(|err| format!("migrate credentials: {err}"))?;
 
     if !db
         .list_credentials(Some(principal), Some("active"))?
@@ -119,8 +117,6 @@ pub fn create_credential(principal: &str) -> Result<String, String> {
 pub fn rotate_credential(principal: &str) -> Result<String, String> {
     validate_principal(principal)?;
     let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.migrate_principal_credentials()
-        .map_err(|err| format!("migrate credentials: {err}"))?;
 
     if db
         .list_credentials(Some(principal), Some("active"))?
@@ -142,8 +138,6 @@ pub fn rotate_credential(principal: &str) -> Result<String, String> {
 pub fn revoke_credential(principal: &str) -> Result<PrincipalCredential, String> {
     validate_principal(principal)?;
     let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.migrate_principal_credentials()
-        .map_err(|err| format!("migrate credentials: {err}"))?;
     db.revoke_principal_credential(principal)
         .map_err(|err| format!("revoke credential: {err}"))?
         .ok_or_else(|| format!("no active credential for {principal:?}"))
@@ -151,8 +145,6 @@ pub fn revoke_credential(principal: &str) -> Result<PrincipalCredential, String>
 
 pub fn list_credentials() -> Result<Vec<PrincipalCredential>, String> {
     let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.migrate_principal_credentials()
-        .map_err(|err| format!("migrate credentials: {err}"))?;
     db.list_credentials(None, None)
         .map_err(|err| format!("list credentials: {err}"))
 }

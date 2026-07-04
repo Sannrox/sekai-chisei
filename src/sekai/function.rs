@@ -203,7 +203,7 @@ fn resolve_param(value: &str, params: &HashMap<String, String>) -> String {
 }
 
 impl SekaiDb {
-    pub fn migrate_functions(&self) {
+    pub(crate) fn migrate_functions(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_functions (
@@ -214,7 +214,7 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())
     }
 
     pub fn create_function(&self, f: &Function) -> Result<(), String> {
@@ -538,7 +538,6 @@ mod tests {
     #[test]
     fn test_function_persistence() {
         let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_functions();
         let f = Function {
             name: "sum_tasks".into(),
             description: "sum task totals".into(),

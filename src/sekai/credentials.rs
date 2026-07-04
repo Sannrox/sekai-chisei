@@ -136,9 +136,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_principal_credentials().unwrap();
-        db
+        SekaiDb::new(":memory:").unwrap()
     }
 
     fn fixed_time(i: i64) -> i64 {

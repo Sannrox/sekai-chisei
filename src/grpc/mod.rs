@@ -181,7 +181,6 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 
 pub async fn run(port: u16, db: Arc<SekaiDb>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env();
-    db.migrate_principal_credentials()?;
     if let Some(ops_port) = config.ops_port {
         crate::obs::ops::bind_and_spawn(&config.ops_bind, ops_port, db.clone()).await?;
     }
@@ -486,7 +485,6 @@ mod tests {
     #[test]
     fn token_auth_interceptor_overwrites_client_principal() {
         let db = in_memory_db();
-        db.migrate_principal_credentials().unwrap();
         let store = PrincipalCredentialStore::new();
         let token = hash_gateway_key("sekai-client-token");
         db.create_principal_credential("agent-a", &token, 1)
