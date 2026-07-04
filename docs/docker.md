@@ -42,7 +42,7 @@ Use `docker compose down` to stop and keep the persisted data volume.
 | --- | --- | --- |
 | `SEKAI_AUTH_TOKEN` | unset | Enables gRPC TCP on the server (`0.0.0.0:50051`) and token auth for clients |
 | `GATEWAY_BIND` | `127.0.0.1:8788` | Gateway bind address. Override to `0.0.0.0:8080` for container exposure |
-| `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume |
+| `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume. File databases use SQLite WAL mode, so volume backups must include `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
 | `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
 | `CHISEI_GRPC_URL` | unset | Optional TCP override for gateway; defaults to `SEKAI_SOCKET` when unset |
 | `OPENAI_API_KEY` | unset | API key for OpenAI upstream |

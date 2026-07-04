@@ -76,7 +76,7 @@ Configuration is read from environment variables:
 | `OPS_PORT` | `9464` | HTTP ops listener port for `/metrics`, `/healthz`, and `/readyz`; set empty to disable |
 | `OPS_BIND` | `127.0.0.1` | HTTP ops listener bind address; use `0.0.0.0` when Kubernetes kubelet probes must reach the pod |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path for local gRPC; set empty to disable |
-| `DB_PATH` | `./data/sekai.db` | SQLite database path |
+| `DB_PATH` | `./data/sekai.db` | SQLite database path. The server uses WAL mode for file databases; backups must include the `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
 | `SEKAI_AUTH_TOKEN` | unset | **Deprecated fallback:** maps all tokens to principal `root`; prefer `sekaictl credential ...` |
 | `SEKAI_TLS_CERT` | unset | Server TLS certificate (PEM); required for authenticated `0.0.0.0` binding unless `SEKAI_ALLOW_PLAINTEXT=1` |
 | `SEKAI_TLS_KEY` | unset | Server TLS private key (PEM); required with `SEKAI_TLS_CERT` |
