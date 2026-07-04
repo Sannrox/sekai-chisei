@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p /out && \
     cp target/release/sekai-chisei \
        target/release/chisei-gateway \
-       target/release/chisei-gateway-setup /out/
+       target/release/sekaictl /out/
 
 FROM debian:bookworm-slim
 
