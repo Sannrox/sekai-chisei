@@ -93,3 +93,25 @@ jobs:
       - name: Verify sekaictl is packaged
         if: steps.docker-inputs.outputs.should_run == 'true'
         run: docker run --rm sekai-chisei-ci sekaictl --help
+
+  gateway-smoke:
+    name: Gateway Smoke
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build smoke binaries
+        run: cargo build --locked --bins
+
+      - name: Run gateway smoke
+        env:
+          CHISEI_GATEWAY_SMOKE_SKIP_BUILD: "1"
+        run: scripts/chisei_gateway_smoke.sh
