@@ -3905,9 +3905,7 @@ mod tests {
         .unwrap();
 
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute("UPDATE chisei_eval_iterations SET namespace = ''", [])
             .unwrap();
         drop(svc);

@@ -169,7 +169,7 @@ pub struct RequestDedup {
 
 impl SekaiDb {
     pub(crate) fn migrate_coordination(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_contention_scopes (
                 id TEXT PRIMARY KEY,
@@ -277,7 +277,7 @@ impl SekaiDb {
 
     pub fn create_contention_scope(&self, scope: &ContentionScope) -> Result<(), String> {
         validate_scope(scope)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_contention_scopes (id,name,parent_scope_id,max_concurrency,admission_policy,heartbeat_ttl_seconds,timeout_seconds,owner_principal,created,updated)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -300,7 +300,7 @@ impl SekaiDb {
 
     pub fn update_contention_scope(&self, scope: &ContentionScope) -> Result<(), String> {
         validate_scope(scope)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let count = conn
             .execute(
                 "UPDATE sekai_contention_scopes
@@ -326,7 +326,7 @@ impl SekaiDb {
     }
 
     pub fn get_contention_scope(&self, id: &str) -> Result<Option<ContentionScope>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id,name,parent_scope_id,max_concurrency,admission_policy,heartbeat_ttl_seconds,timeout_seconds,owner_principal,created,updated
              FROM sekai_contention_scopes WHERE id=?1",
@@ -338,7 +338,7 @@ impl SekaiDb {
     }
 
     pub fn list_contention_scopes(&self) -> Result<Vec<ContentionScope>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id,name,parent_scope_id,max_concurrency,admission_policy,heartbeat_ttl_seconds,timeout_seconds,owner_principal,created,updated
@@ -353,7 +353,7 @@ impl SekaiDb {
 
     pub fn create_work_unit(&self, work_unit: &WorkUnit) -> Result<(), String> {
         validate_work_unit(work_unit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_work_units
              (id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at)
@@ -387,7 +387,7 @@ impl SekaiDb {
     }
 
     pub fn get_work_unit(&self, id: &str) -> Result<Option<WorkUnit>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
              FROM sekai_work_units WHERE id=?1",
@@ -405,7 +405,7 @@ impl SekaiDb {
         if idempotency_key.is_empty() {
             return Ok(None);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
              FROM sekai_work_units WHERE idempotency_key=?1",
@@ -418,7 +418,7 @@ impl SekaiDb {
 
     pub fn update_work_unit(&self, work_unit: &WorkUnit) -> Result<(), String> {
         validate_work_unit(work_unit)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let count = conn
             .execute(
                 "UPDATE sekai_work_units
@@ -455,7 +455,7 @@ impl SekaiDb {
     }
 
     pub fn list_work_units(&self, filter: &WorkUnitFilter) -> Result<Vec<WorkUnit>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut sql = "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at FROM sekai_work_units WHERE 1=1".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
         if !filter.statuses.is_empty() {
@@ -543,7 +543,7 @@ impl SekaiDb {
     }
 
     pub fn create_reservation(&self, reservation: &Reservation) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_reservations
              (id,work_unit_id,scope_id,status,lease_owner,leased_at,expires_at,released_at,created_at)
@@ -568,7 +568,7 @@ impl SekaiDb {
         &self,
         filter: &ReservationFilter,
     ) -> Result<Vec<Reservation>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut sql = "SELECT id,work_unit_id,scope_id,status,lease_owner,leased_at,expires_at,released_at,created_at FROM sekai_reservations WHERE 1=1".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
         if let Some(work_unit_id) = &filter.work_unit_id {
@@ -594,7 +594,7 @@ impl SekaiDb {
     }
 
     pub fn append_run_event(&self, event: &RunEvent) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let evidence_json = serde_json::to_string(&event.evidence).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sekai_run_events (id,work_unit_id,event_type,message,evidence_json,created_at)
@@ -620,7 +620,7 @@ impl SekaiDb {
         if request_id.is_empty() {
             return Ok(None);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at
              FROM sekai_coordination_requests WHERE request_id = ?1 AND operation = ?2",
@@ -644,7 +644,7 @@ impl SekaiDb {
         if request.request_id.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sekai_coordination_requests
              (request_id,operation,principal,scope_id,work_unit_id,created_at)
@@ -670,7 +670,7 @@ impl SekaiDb {
         event_types: &[String],
         page_token: Option<&str>,
     ) -> Result<Vec<RunEvent>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut sql = "SELECT id,work_unit_id,event_type,message,evidence_json,created_at FROM sekai_run_events WHERE work_unit_id = ?1 AND created_at >= ?2".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(work_unit_id.to_string()), Box::new(after)];
@@ -717,7 +717,7 @@ impl SekaiDb {
         &self,
         record: &ReconciliationRecord,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_reconciliations (id,work_unit_id,reservation_id,reason,action,created_at)
              VALUES (?1,?2,?3,?4,?5,?6)",
@@ -740,7 +740,7 @@ impl SekaiDb {
         lease_owner: &str,
         now_ms: i64,
     ) -> Result<AdmissionResult, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -882,7 +882,7 @@ impl SekaiDb {
     }
 
     pub fn heartbeat_work_unit(&self, work_unit_id: &str, now_ms: i64) -> Result<WorkUnit, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -982,7 +982,7 @@ impl SekaiDb {
         work_unit_id: &str,
         now_ms: i64,
     ) -> Result<i32, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let count = conn
             .execute(
                 "UPDATE sekai_reservations
@@ -1004,7 +1004,7 @@ impl SekaiDb {
         now_ms: i64,
         filter: &ReconcileFilter,
     ) -> Result<ReconcileSummary, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut summary = ReconcileSummary::default();
 
         let mut sql = "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -1245,7 +1245,7 @@ impl SekaiDb {
         cancel_reason: &str,
         now_ms: i64,
     ) -> Result<WorkUnit, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at

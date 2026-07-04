@@ -204,7 +204,7 @@ fn resolve_param(value: &str, params: &HashMap<String, String>) -> String {
 
 impl SekaiDb {
     pub(crate) fn migrate_functions(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_functions (
                 name TEXT PRIMARY KEY,
@@ -219,7 +219,7 @@ impl SekaiDb {
 
     pub fn create_function(&self, f: &Function) -> Result<(), String> {
         validate_function(f)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let params_json = serde_json::to_string(
             &f.params
                 .iter()
@@ -255,7 +255,7 @@ impl SekaiDb {
     }
 
     pub fn get_function(&self, name: &str) -> Result<Option<Function>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT name,description,params,pipeline,created FROM sekai_functions WHERE name=?1",
             params![name],
@@ -304,7 +304,7 @@ impl SekaiDb {
     }
 
     pub fn list_functions(&self) -> Result<Vec<Function>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT name,description,params,pipeline,created FROM sekai_functions ORDER BY name")
             .map_err(|e| e.to_string())?;

@@ -1,7 +1,7 @@
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -11,7 +11,7 @@ use crate::domain::{
 };
 
 pub struct SekaiDb {
-    pub(crate) conn: Mutex<Connection>,
+    conn: Mutex<Connection>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,14 +38,35 @@ impl SekaiDb {
             .ok();
             Connection::open(path).map_err(|e| e.to_string())?
         };
-        conn.busy_timeout(Duration::from_secs(1))
+        conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
+        if path != ":memory:" {
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| e.to_string())?;
+        }
         let db = Self {
             conn: Mutex::new(conn),
         };
         db.migrate_all()?;
         db.register_sql_helpers()?;
         Ok(db)
+    }
+
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(poisoned) => {
+                crate::obs::metrics::record_db_lock_poisoned();
+                tracing::error!(
+                    "database connection lock was poisoned; recovering inner connection"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    pub fn db_lock_poisoned_total(&self) -> u64 {
+        crate::obs::metrics::db_lock_poisoned_total()
     }
 
     pub(crate) fn migrate_all(&self) -> Result<(), String> {
@@ -62,7 +83,7 @@ impl SekaiDb {
     }
 
     fn migrate(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_objects (
                 id TEXT PRIMARY KEY,
@@ -100,7 +121,7 @@ impl SekaiDb {
     }
 
     fn register_sql_helpers(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.create_scalar_function(
             "is_numeric_text",
             1,
@@ -118,7 +139,7 @@ impl SekaiDb {
     }
 
     pub(crate) fn migrate_principal_credentials(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
                 id TEXT PRIMARY KEY,
@@ -136,7 +157,7 @@ impl SekaiDb {
     }
 
     pub fn ping(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row("SELECT 1", [], |_| Ok(()))
             .map_err(|e| e.to_string())
     }
@@ -145,7 +166,7 @@ impl SekaiDb {
         &self,
         token_hash: &str,
     ) -> Result<Option<PrincipalCredential>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             params![token_hash],
@@ -156,7 +177,7 @@ impl SekaiDb {
     }
 
     pub fn principal_credentials_activity_epoch(&self) -> Result<i64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT COALESCE(MAX(value), 0) FROM (
                 SELECT COALESCE(created, 0) AS value FROM sekai_principal_credentials
@@ -178,7 +199,7 @@ impl SekaiDb {
         now: i64,
     ) -> Result<PrincipalCredential, String> {
         let id = format!("credential-{}", Uuid::new_v4().simple());
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
@@ -209,7 +230,7 @@ impl SekaiDb {
         token_hash: &str,
     ) -> Result<PrincipalCredential, String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
         let mut active_stmt = tx
@@ -260,7 +281,7 @@ impl SekaiDb {
         principal: &str,
     ) -> Result<Option<PrincipalCredential>, String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
@@ -291,7 +312,7 @@ impl SekaiDb {
         principal: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<PrincipalCredential>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE 1=1".to_string();
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(principal) = principal {
@@ -317,7 +338,7 @@ impl SekaiDb {
     }
 
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let props = serde_json::to_string(&o.properties).unwrap_or_default();
         conn.execute(
             "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -327,11 +348,11 @@ impl SekaiDb {
     }
 
     pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
             params![id],
-            |row| Ok(row_to_object(row)),
+            row_to_object,
         ).optional().map_err(|e| e.to_string())
     }
 
@@ -343,13 +364,13 @@ impl SekaiDb {
     }
 
     pub fn update_object_with_existing(&self, o: &Object) -> Result<Option<Object>, String> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![o.id],
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -372,13 +393,13 @@ impl SekaiDb {
     }
 
     pub fn delete_object_with_existing(&self, id: &str) -> Result<Option<Object>, String> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
             .query_row(
                 "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
                 params![id],
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -430,7 +451,7 @@ impl SekaiDb {
         } else {
             filter.limit.min(MAX_LIST_LIMIT)
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut list_sql = format!(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}",
             query.where_sql
@@ -454,7 +475,7 @@ impl SekaiDb {
                     .map(|v| v.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .map_err(|e| e.to_string())?;
         let objects: Vec<Object> = rows
@@ -515,7 +536,7 @@ impl SekaiDb {
         ));
         query.params.push(Box::new(effective_limit));
         query.params.push(Box::new(filter.offset.max(0)));
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
@@ -525,7 +546,7 @@ impl SekaiDb {
                     .map(|v| v.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
-                |row| Ok(row_to_object(row)),
+                row_to_object,
             )
             .map_err(|e| e.to_string())?;
         let objects: Vec<Object> = rows
@@ -556,7 +577,7 @@ impl SekaiDb {
     }
 
     pub fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let filter = serde_json::to_string(&set.filter).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sekai_object_sets (id, name, description, filter, owner_principal, created) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -574,7 +595,7 @@ impl SekaiDb {
     }
 
     pub fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE id = ?1",
             params![id],
@@ -602,7 +623,7 @@ impl SekaiDb {
     }
 
     pub fn list_object_sets(&self) -> Result<Vec<ObjectSet>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets ORDER BY created, id")
             .map_err(|e| e.to_string())?;
@@ -647,7 +668,7 @@ impl SekaiDb {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE owner_principal IN ({placeholders}) ORDER BY created, id"
@@ -685,7 +706,7 @@ impl SekaiDb {
     }
 
     pub fn delete_object_set(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let removed = conn
             .execute("DELETE FROM sekai_object_sets WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
@@ -709,7 +730,7 @@ impl SekaiDb {
             owner_placeholders.push(format!("?{idx}"));
         }
         let owner_placeholders = owner_placeholders.join(",");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let removed = conn
             .execute(
                 &format!(
@@ -726,11 +747,11 @@ impl SekaiDb {
     }
 
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE external_id = ?1",
             params![external_id],
-            |row| Ok(row_to_object(row)),
+            row_to_object,
         ).optional().map_err(|e| e.to_string())
     }
 
@@ -743,21 +764,19 @@ impl SekaiDb {
         if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err("invalid property key".into());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let json_path = format!("$.{}", key);
         let mut stmt = conn.prepare(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE kind = ?1 AND json_extract(properties, ?2) = ?3"
         ).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![kind, json_path, value], |row| {
-                Ok(row_to_object(row))
-            })
+            .query_map(params![kind, json_path, value], row_to_object)
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn create_link(&self, l: &Link) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
             params![l.id, l.from_id, l.to_id, l.relation, l.created],
@@ -766,14 +785,14 @@ impl SekaiDb {
     }
 
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn get_link(&self, id: &str) -> Result<Option<Link>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE id = ?1",
             params![id],
@@ -797,7 +816,7 @@ impl SekaiDb {
         relation: &str,
         dir: &Direction,
     ) -> Result<Vec<Link>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let col = match dir {
             Direction::Outgoing => "from_id",
             Direction::Incoming => "to_id",
@@ -822,7 +841,7 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
         };
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            results.push(row_to_link(row));
+            results.push(row_to_link(row).map_err(|e| e.to_string())?);
         }
         Ok(results)
     }
@@ -848,19 +867,19 @@ impl SekaiDb {
     }
 }
 
-pub(crate) fn row_to_object(row: &rusqlite::Row) -> Object {
-    let props_str: String = row.get(5).unwrap_or_default();
+pub(crate) fn row_to_object(row: &rusqlite::Row) -> rusqlite::Result<Object> {
+    let props_str: String = row.get(5)?;
     let properties: HashMap<String, String> = serde_json::from_str(&props_str).unwrap_or_default();
-    Object {
-        id: row.get(0).unwrap(),
-        kind: row.get(1).unwrap(),
-        name: row.get(2).unwrap(),
-        namespace: row.get(3).unwrap_or_default(),
-        external_id: row.get(4).unwrap_or_default(),
+    Ok(Object {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        namespace: row.get(3)?,
+        external_id: row.get(4)?,
         properties,
-        created: row.get(6).unwrap(),
-        updated: row.get(7).unwrap(),
-    }
+        created: row.get(6)?,
+        updated: row.get(7)?,
+    })
 }
 
 struct ListQueryParts {
@@ -1116,14 +1135,14 @@ fn row_to_principal_credential(
     })
 }
 
-fn row_to_link(row: &rusqlite::Row) -> Link {
-    Link {
-        id: row.get(0).unwrap(),
-        from_id: row.get(1).unwrap(),
-        to_id: row.get(2).unwrap(),
-        relation: row.get(3).unwrap(),
-        created: row.get(4).unwrap(),
-    }
+fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        relation: row.get(3)?,
+        created: row.get(4)?,
+    })
 }
 
 #[cfg(test)]
@@ -1145,7 +1164,7 @@ mod tests {
     }
 
     fn table_columns(db: &SekaiDb, table: &str) -> Vec<String> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn();
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
@@ -1243,6 +1262,29 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn file_database_uses_wal_and_five_second_busy_timeout() {
+        let path = temp_db_path("wal");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+
+        {
+            let conn = db.conn();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            let busy_timeout_ms: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            assert_eq!(busy_timeout_ms, 5000);
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     fn make_obj(id: &str, kind: &str, name: &str) -> Object {
         Object {
             id: id.into(),
@@ -1306,6 +1348,54 @@ mod tests {
 
         let found = db.find_by_external_id("namespace:alpha").unwrap();
         assert_eq!(found.unwrap().id, "r1");
+    }
+
+    #[test]
+    fn malformed_object_row_returns_error_without_poisoning_connection() {
+        let db = test_db();
+        db.create_object(&make_obj("good", "namespace", "good"))
+            .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO sekai_objects
+                 (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    "bad",
+                    "namespace",
+                    "bad",
+                    "default",
+                    "namespace:bad",
+                    "{}",
+                    "not-an-integer",
+                    1000_i64,
+                ),
+            )
+            .unwrap();
+        }
+
+        assert!(db.get_object("bad").is_err());
+        assert!(db.find_by_external_id("namespace:bad").is_err());
+
+        let good = db.get_object("good").unwrap().unwrap();
+        assert_eq!(good.id, "good");
+    }
+
+    #[test]
+    fn poisoned_connection_lock_recovers_and_counts() {
+        let db = test_db();
+        let before = db.db_lock_poisoned_total();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _conn = db.conn();
+            panic!("poison connection lock for test");
+        }));
+        assert!(poisoned.is_err());
+
+        db.ping().unwrap();
+        assert!(db.db_lock_poisoned_total() > before);
+        db.ping().unwrap();
     }
 
     #[test]
