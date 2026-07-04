@@ -113,6 +113,29 @@ For TCP mode, control-plane identity is verified from bearer token metadata:
 - `0.0.0.0` requires TLS via `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless `SEKAI_ALLOW_PLAINTEXT=1`
 - local UDS paths and `SEKAI_INSECURE=1` stay plaintext and keep self-asserted `x-principal` (defaults to `local` when absent)
 
+### Query and Object Sets
+
+`ListObjects` is the main object query surface. Its `ListFilter` can match by
+`kind`, exact `name`, exact `namespace`, and one or more property filters. Property
+filter keys may contain only ASCII letters, digits, and `_`; invalid keys are
+rejected before SQL is built. Supported property operators are `eq`, `ne`/`neq`,
+`gt`, `gte`, `lt`, `lte`, `contains`, `prefix`, and `in`. `contains` and
+`prefix` escape SQL wildcard characters, and `in` accepts comma-separated values.
+
+Pagination uses `limit` and `offset`. A missing or non-positive `limit` uses the
+default of 100, and requested limits are capped at 1000. Results can be ordered by
+`name`, `created`, `updated`, or `property:<key>` with optional `descending`.
+Every ordering uses `id ASC` as a deterministic tie-breaker.
+
+Object sets are named, per-principal saved `ListFilter`s. Use `CreateObjectSet`
+to store a filter, `ListObjectSets` to see the caller's sets, `ResolveObjectSet`
+to run the saved filter, and `DeleteObjectSet` to remove it. Resolves apply the
+same visibility rules as `ListObjects`: objects with no grants are visible, and
+granted objects are returned only when the caller has a matching principal. A
+resolve request can override the saved `limit`; `offset` is overridden only when
+the request explicitly sends it, so omitted `offset` keeps the saved filter's
+offset.
+
 ## Observability
 
 The server exposes unauthenticated health and Prometheus endpoints on the loopback
