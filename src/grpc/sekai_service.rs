@@ -4540,6 +4540,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_objects_rejects_invalid_property_key() {
+        let svc = service();
+        let err = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        kind: "query-demo".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "team.name".into(),
+                            op: "eq".into(),
+                            value: "backend".into(),
+                        }],
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn object_sets_resolve_like_inline_filter_and_owner_only_access() {
         let svc = service();
         svc.db
@@ -4782,6 +4805,35 @@ mod tests {
                         name: "  ".into(),
                         description: "blank".into(),
                         filter: Some(ListFilter::default()),
+                        owner_principal: String::new(),
+                        created: 0,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_object_set_rejects_invalid_property_key() {
+        let svc = service();
+        let err = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        id: String::new(),
+                        name: "invalid-key".into(),
+                        description: "invalid filter".into(),
+                        filter: Some(ListFilter {
+                            property_filters: vec![PropertyFilter {
+                                key: "team.name".into(),
+                                op: "eq".into(),
+                                value: "backend".into(),
+                            }],
+                            ..Default::default()
+                        }),
                         owner_principal: String::new(),
                         created: 0,
                     }),
