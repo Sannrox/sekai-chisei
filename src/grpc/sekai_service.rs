@@ -3159,9 +3159,7 @@ mod tests {
     async fn audit_insert_failure_rolls_back_create() {
         let svc = service();
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute("DROP TABLE sekai_object_changes", [])
             .unwrap();
 
@@ -3203,9 +3201,7 @@ mod tests {
         .await
         .unwrap();
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute("DROP TABLE sekai_object_changes", [])
             .unwrap();
 
@@ -3378,7 +3374,7 @@ mod tests {
     async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn();
             conn.execute(
                 "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
                  VALUES (?1, ?2, ?3, ?4, ?4)",
@@ -3453,7 +3449,7 @@ mod tests {
     async fn schema_table_read_failure_blocks_object_writes() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn();
             conn.execute("DROP TABLE sekai_object_types", []).unwrap();
             conn.execute(
                 "CREATE TABLE sekai_object_types (kind TEXT PRIMARY KEY)",
@@ -3482,7 +3478,7 @@ mod tests {
         assert!(err.message().contains("schema registry unavailable"));
 
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn();
             conn.execute("DROP TABLE sekai_object_types", []).unwrap();
         }
         db.migrate_all().unwrap();
@@ -3500,6 +3496,52 @@ mod tests {
         }))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_object_row_returns_internal_and_next_request_succeeds() {
+        let svc = service();
+        {
+            let conn = svc.db.conn();
+            conn.execute(
+                "INSERT INTO sekai_objects
+                 (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                ("good", "widget", "good", "", "", "{}", 1000_i64, 1000_i64),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sekai_objects
+                 (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    "bad",
+                    "widget",
+                    "bad",
+                    "",
+                    "",
+                    "{}",
+                    "not-an-integer",
+                    1000_i64,
+                ),
+            )
+            .unwrap();
+        }
+
+        let err = svc
+            .get_object(with_principal(GetObjectRequest { id: "bad".into() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+
+        let good = svc
+            .get_object(with_principal(GetObjectRequest { id: "good".into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(good.id, "good");
     }
 
     #[tokio::test]
@@ -4047,9 +4089,7 @@ mod tests {
         stale_candidate.updated_at = 1;
         svc.db.update_work_unit(&stale_candidate).unwrap();
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute(
                 "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
                 rusqlite::params!["wu-f1"],
@@ -4265,9 +4305,7 @@ mod tests {
         stale_candidate.updated_at = 1;
         svc.db.update_work_unit(&stale_candidate).unwrap();
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute(
                 "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
                 rusqlite::params!["wu-other"],
@@ -4377,9 +4415,7 @@ mod tests {
         stale_candidate.updated_at = 1;
         svc.db.update_work_unit(&stale_candidate).unwrap();
         svc.db
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .execute(
                 "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
                 rusqlite::params!["wu-mismatch"],

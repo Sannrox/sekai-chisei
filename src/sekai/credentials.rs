@@ -196,7 +196,7 @@ mod tests {
         let store = PrincipalCredentialStore::new();
 
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn();
             conn.execute_batch(
                 "DROP TABLE sekai_principal_credentials;
                 CREATE TABLE sekai_principal_credentials (

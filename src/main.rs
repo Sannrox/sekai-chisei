@@ -44,7 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(socket_path) = &config.sekai_socket {
         tracing::info!(socket_path, "gRPC UDS listener enabled");
     }
-    tracing::info!(db_path = %config.db_path, "database configured");
+    tracing::info!(
+        db_path = %config.db_path,
+        db_lock_poisoned_total = db.db_lock_poisoned_total(),
+        "database configured"
+    );
     tracing::info!(
         anthropic = config.anthropic_api_key.is_some(),
         openai = config.openai_api_key.is_some(),

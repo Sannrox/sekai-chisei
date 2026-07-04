@@ -127,7 +127,7 @@ impl SecurityChecker {
 
 impl SekaiDb {
     pub(crate) fn migrate_grants(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_grants (
                 id TEXT PRIMARY KEY,
@@ -142,7 +142,7 @@ impl SekaiDb {
     }
 
     pub fn create_grant(&self, grant: &Grant) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_grants (id,object_id,principal,role,created) VALUES (?1,?2,?3,?4,?5)",
             params![
@@ -160,7 +160,7 @@ impl SekaiDb {
     pub fn delete_grant(&self, id: &str) -> Result<Option<Grant>, String> {
         let existing = self.get_grant(id)?;
         if existing.is_some() {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn();
             conn.execute("DELETE FROM sekai_grants WHERE id = ?1", params![id])
                 .map_err(|e| e.to_string())?;
         }
@@ -168,7 +168,7 @@ impl SekaiDb {
     }
 
     pub fn get_grant(&self, id: &str) -> Result<Option<Grant>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.query_row(
             "SELECT id,object_id,principal,role,created FROM sekai_grants WHERE id=?1",
             params![id],
@@ -188,7 +188,7 @@ impl SekaiDb {
     }
 
     pub fn list_grants(&self, object_id: &str) -> Result<Vec<Grant>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id,object_id,principal,role,created FROM sekai_grants WHERE object_id=?1 ORDER BY created, id",
@@ -210,7 +210,7 @@ impl SekaiDb {
     }
 
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT id,object_id,principal,role,created FROM sekai_grants")
             .map_err(|e| e.to_string())?;
