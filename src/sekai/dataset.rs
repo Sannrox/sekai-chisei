@@ -43,7 +43,7 @@ pub struct VirtualTable {
 }
 
 impl SekaiDb {
-    pub fn migrate_datasets(&self) {
+    pub(crate) fn migrate_datasets(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_datasets (
@@ -61,7 +61,7 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );",
         )
-        .unwrap();
+        .map_err(|e| e.to_string())
     }
 
     pub fn create_dataset(&self, d: &Dataset) -> Result<(), String> {
@@ -278,9 +278,7 @@ mod tests {
     use super::*;
 
     fn setup() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.migrate_datasets();
-        db
+        SekaiDb::new(":memory:").unwrap()
     }
 
     #[test]

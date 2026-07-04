@@ -228,7 +228,7 @@ pub fn validate_object_type_definition(
 }
 
 impl SekaiDb {
-    pub fn migrate_schema_types(&self) -> Result<(), String> {
+    pub(crate) fn migrate_schema_types(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_object_types (
@@ -243,7 +243,6 @@ impl SekaiDb {
     }
 
     pub fn upsert_object_type(&self, object_type: &ObjectType) -> Result<(), String> {
-        self.migrate_schema_types()?;
         let now = chrono::Utc::now().timestamp_millis();
         let properties_json =
             serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
@@ -267,7 +266,6 @@ impl SekaiDb {
     }
 
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
-        self.migrate_schema_types()?;
         let conn = self.conn.lock().unwrap();
         let deleted = conn
             .execute(
@@ -279,7 +277,6 @@ impl SekaiDb {
     }
 
     pub fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, String> {
-        self.migrate_schema_types()?;
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT kind, description, properties_json FROM sekai_object_types WHERE kind = ?1",
@@ -306,7 +303,6 @@ impl SekaiDb {
     pub fn list_object_types_with_errors(
         &self,
     ) -> Result<(Vec<ObjectType>, HashMap<String, String>), String> {
-        self.migrate_schema_types()?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
