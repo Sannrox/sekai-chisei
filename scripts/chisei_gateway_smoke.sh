@@ -46,6 +46,26 @@ wait_for_http() {
   return 1
 }
 
+wait_for_http_or_exit() {
+  local url="$1"
+  local pid="$2"
+  local log="$3"
+  for _ in $(seq 1 600); do
+    if curl -sS -o /dev/null "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      echo "process $pid exited while waiting for $url" >&2
+      sed -n '1,120p' "$log" >&2 || true
+      return 1
+    fi
+    sleep 0.05
+  done
+  echo "timed out waiting for $url" >&2
+  sed -n '1,120p' "$log" >&2 || true
+  return 1
+}
+
 live_client_enabled() {
   local client="$1"
   case "${CHISEI_GATEWAY_SMOKE_LIVE_CLIENTS:-0}" in
@@ -221,6 +241,15 @@ PY
 
 cd "$ROOT"
 
+if [ "${CHISEI_GATEWAY_SMOKE_SKIP_BUILD:-0}" != "1" ]; then
+  cargo build --locked --bins
+fi
+
+BIN_DIR="${CHISEI_GATEWAY_SMOKE_BIN_DIR:-$ROOT/target/debug}"
+SEKAI_CHISEI_BIN="${SEKAI_CHISEI_BIN:-$BIN_DIR/sekai-chisei}"
+SEKAICTL_BIN="${SEKAICTL_BIN:-$BIN_DIR/sekaictl}"
+CHISEI_GATEWAY_BIN="${CHISEI_GATEWAY_BIN:-$BIN_DIR/chisei-gateway}"
+
 PROVIDER_REQUESTS="$TMPDIR/provider-requests.jsonl"
 PROVIDER_PORT_FILE="$TMPDIR/provider-port"
 python3 "$TMPDIR/fake_provider.py" "$PROVIDER_REQUESTS" "$PROVIDER_PORT_FILE" &
@@ -236,11 +265,11 @@ SEKAI_SOCKET="$SOCKET" \
 DB_PATH="$DB_PATH" \
 OPENAI_API_KEY="control-plane-openai-smoke-key" \
 ANTHROPIC_API_KEY="control-plane-anthropic-smoke-key" \
-cargo run --quiet --bin sekai-chisei >"$TMPDIR/sekai.log" 2>&1 &
+"$SEKAI_CHISEI_BIN" >"$TMPDIR/sekai.log" 2>&1 &
 PIDS+=("$!")
 wait_for_file "$SOCKET"
 
-SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin sekaictl -- gateway setup \
+SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" gateway setup \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key-name codex-app \
@@ -251,7 +280,7 @@ SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin sekaictl -- gateway setup \
   --default-model gpt-5.5 \
   --allowed-model gpt-5.5 >"$TMPDIR/setup-codex.log" 2>&1
 
-SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin sekaictl -- gateway setup \
+SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" gateway setup \
   --agent claude-code \
   --project default \
   --gateway-key-name claude-code \
@@ -271,19 +300,34 @@ SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin sekaictl -- gateway setup \
   --allowed-model opus \
   --allowed-model fable >"$TMPDIR/setup-claude.log" 2>&1
 
-GATEWAY_PORT="$(free_port)"
-SEKAI_SOCKET="$SOCKET" \
-GATEWAY_BIND="127.0.0.1:$GATEWAY_PORT" \
-CHISEI_OPENAI_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
-CHISEI_ANTHROPIC_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
-CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH=1 \
-CHISEI_GATEWAY_REWRITE_OPENAI_PASSTHROUGH_AUTH=1 \
-CHISEI_GATEWAY_PRICING="gpt-5.5=1:2,claude-sonnet-4-8=3:15,claude-sonnet-4-6=3:15" \
-OPENAI_API_KEY="real-openai-smoke-key" \
-ANTHROPIC_API_KEY="real-anthropic-smoke-key" \
-cargo run --quiet --bin chisei-gateway >"$TMPDIR/gateway.log" 2>&1 &
-PIDS+=("$!")
-wait_for_http "http://127.0.0.1:$GATEWAY_PORT/v1/responses"
+GATEWAY_PORT=""
+for attempt in $(seq 1 10); do
+  candidate_port="$(free_port)"
+  gateway_log="$TMPDIR/gateway-$attempt.log"
+  SEKAI_SOCKET="$SOCKET" \
+  GATEWAY_BIND="127.0.0.1:$candidate_port" \
+  CHISEI_OPENAI_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
+  CHISEI_ANTHROPIC_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
+  CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH=1 \
+  CHISEI_GATEWAY_REWRITE_OPENAI_PASSTHROUGH_AUTH=1 \
+  CHISEI_GATEWAY_PRICING="gpt-5.5=1:2,claude-sonnet-4-8=3:15,claude-sonnet-4-6=3:15" \
+  OPENAI_API_KEY="real-openai-smoke-key" \
+  ANTHROPIC_API_KEY="real-anthropic-smoke-key" \
+  "$CHISEI_GATEWAY_BIN" >"$gateway_log" 2>&1 &
+  gateway_pid="$!"
+  if wait_for_http_or_exit "http://127.0.0.1:$candidate_port/v1/responses" "$gateway_pid" "$gateway_log"; then
+    PIDS+=("$gateway_pid")
+    GATEWAY_PORT="$candidate_port"
+    cp "$gateway_log" "$TMPDIR/gateway.log"
+    break
+  fi
+  kill "$gateway_pid" >/dev/null 2>&1 || true
+  wait "$gateway_pid" >/dev/null 2>&1 || true
+done
+if [ -z "$GATEWAY_PORT" ]; then
+  echo "failed to start chisei-gateway after retrying candidate ports" >&2
+  exit 1
+fi
 
 curl -fsS "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
   -H "authorization: Bearer sk-chisei-codex-app" \
@@ -353,10 +397,10 @@ if live_client_enabled codex; then
   fi
 fi
 
-SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin chisei-gateway -- \
+SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
   report --by agent --since 24h >"$TMPDIR/report.txt"
 
-SEKAI_SOCKET="$SOCKET" cargo run --quiet --bin chisei-gateway -- \
+SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
   report --since 24h --html "$TMPDIR/dashboard.html" >"$TMPDIR/dashboard-command.txt"
 
 python3 - "$PROVIDER_REQUESTS" "$TMPDIR/report.txt" "$TMPDIR/dashboard.html" "$TMPDIR/openai-stream.sse" "$TMPDIR/anthropic-stream.sse" <<'PY'
