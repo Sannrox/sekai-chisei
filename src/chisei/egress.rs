@@ -1,4 +1,5 @@
 use crate::domain::Object;
+use crate::sekai::schema::{self, ObjectType};
 use std::collections::HashSet;
 
 pub const EXTERNAL_PROPERTIES_KEY: &str = "chisei.egress.external_properties";
@@ -50,11 +51,21 @@ pub fn filter_property(
     record: &mut ContextEgressRecord,
     external: bool,
 ) -> Option<String> {
+    filter_property_with_schema(obj, field, None, record, external)
+}
+
+pub fn filter_property_with_schema(
+    obj: &Object,
+    field: &str,
+    object_type: Option<&ObjectType>,
+    record: &mut ContextEgressRecord,
+    external: bool,
+) -> Option<String> {
     let value = obj
         .properties
         .get(field)
         .filter(|value| !value.is_empty())?;
-    if !external || allowed_external_properties(obj).contains(field) {
+    if !external || property_allows_external(obj, field, object_type) {
         record.included_fields.push(field.to_string());
         Some(value.clone())
     } else {
@@ -64,6 +75,19 @@ pub fn filter_property(
             .push(format!("{field} denied by default egress policy"));
         None
     }
+}
+
+fn property_allows_external(obj: &Object, field: &str, object_type: Option<&ObjectType>) -> bool {
+    if let Some(property) = object_type.and_then(|object_type| {
+        object_type
+            .properties
+            .iter()
+            .find(|property| property.name == field)
+    }) {
+        return !schema::is_restricted_property_classification(&property.classification)
+            && allowed_external_properties(obj).contains(field);
+    }
+    allowed_external_properties(obj).contains(field)
 }
 
 pub fn new_record(obj: &Object) -> ContextEgressRecord {
@@ -76,6 +100,7 @@ pub fn new_record(obj: &Object) -> ContextEgressRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
     use std::collections::HashMap;
 
     fn object(properties: HashMap<String, String>) -> Object {
@@ -130,5 +155,33 @@ mod tests {
             Some("bullish".into())
         );
         assert_eq!(record.included_fields, vec!["verdict"]);
+    }
+
+    #[test]
+    fn schema_public_properties_still_require_external_allowlist() {
+        let obj = object(HashMap::from([("verdict".into(), "bullish".into())]));
+        let object_type = ObjectType {
+            kind: "ticker".into(),
+            description: String::new(),
+            properties: vec![PropertyDef {
+                name: "verdict".into(),
+                prop_type: PropertyType::String,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+                classification: "public".into(),
+            }],
+            is_builtin: false,
+            implements: vec![],
+        };
+        let mut record = new_record(&obj);
+
+        assert_eq!(
+            filter_property_with_schema(&obj, "verdict", Some(&object_type), &mut record, true),
+            None
+        );
+        assert_eq!(record.redacted_fields, vec!["verdict"]);
     }
 }
