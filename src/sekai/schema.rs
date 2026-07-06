@@ -14,6 +14,7 @@ pub enum PropertyType {
     Timestamp,
     Link,
     Computed,
+    Struct,
 }
 
 impl PropertyType {
@@ -27,6 +28,7 @@ impl PropertyType {
             "timestamp" => Some(Self::Timestamp),
             "link" => Some(Self::Link),
             "computed" => Some(Self::Computed),
+            "struct" => Some(Self::Struct),
             _ => None,
         }
     }
@@ -41,8 +43,18 @@ impl PropertyType {
             Self::Timestamp => "timestamp",
             Self::Link => "link",
             Self::Computed => "computed",
+            Self::Struct => "struct",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructFieldDef {
+    pub name: String,
+    pub prop_type: PropertyType,
+    pub required: bool,
+    pub description: String,
+    pub enum_values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +68,8 @@ pub struct PropertyDef {
     pub compute_expr: String,
     #[serde(default = "default_property_classification")]
     pub classification: String,
+    #[serde(default)]
+    pub struct_fields: Vec<StructFieldDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +232,13 @@ impl SchemaRegistry {
                         pd.name, v
                     ));
                 }
+                PropertyType::Struct => {
+                    if let Err(error) =
+                        validate_struct_property_value(&pd.name, &pd.struct_fields, v)
+                    {
+                        errs.push(error);
+                    }
+                }
                 _ => {}
             }
         }
@@ -231,6 +252,105 @@ impl SchemaRegistry {
 
 fn is_valid_timestamp(value: &str) -> bool {
     value.parse::<i64>().is_ok() || chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+
+fn validate_struct_property_value(
+    property_name: &str,
+    fields: &[StructFieldDef],
+    value: &str,
+) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|_| format!("property {property_name}: expected struct JSON object"))?;
+    let Some(object) = parsed.as_object() else {
+        return Err(format!(
+            "property {property_name}: expected struct JSON object"
+        ));
+    };
+    let mut errors = Vec::new();
+    for field in fields {
+        let field_value = object.get(&field.name);
+        let empty = field_value
+            .map(|value| value.is_null() || value.as_str().is_some_and(str::is_empty))
+            .unwrap_or(true);
+        if field.required && empty {
+            errors.push(format!(
+                "property {property_name}.{}: missing required field",
+                field.name
+            ));
+            continue;
+        }
+        let Some(field_value) = field_value else {
+            continue;
+        };
+        if empty {
+            continue;
+        }
+        if let Err(error) = validate_struct_field_value(property_name, field, field_value) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn validate_struct_field_value(
+    property_name: &str,
+    field: &StructFieldDef,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let field_name = format!("{property_name}.{}", field.name);
+    match field.prop_type {
+        PropertyType::String => {
+            if !value.is_string() {
+                return Err(format!("property {field_name}: expected string"));
+            }
+        }
+        PropertyType::Enum => {
+            let Some(raw) = value.as_str() else {
+                return Err(format!("property {field_name}: expected enum string"));
+            };
+            if !field.enum_values.iter().any(|allowed| allowed == raw) {
+                return Err(format!(
+                    "property {field_name}: value {:?} not in {:?}",
+                    raw, field.enum_values
+                ));
+            }
+        }
+        PropertyType::Bool => {
+            if !value.is_boolean() {
+                return Err(format!("property {field_name}: expected bool"));
+            }
+        }
+        PropertyType::Int => {
+            if value.as_i64().is_none() {
+                return Err(format!("property {field_name}: expected int"));
+            }
+        }
+        PropertyType::Float => {
+            if !value.as_f64().is_some_and(f64::is_finite) {
+                return Err(format!("property {field_name}: expected float"));
+            }
+        }
+        PropertyType::Timestamp => {
+            let valid = value
+                .as_i64()
+                .map(|_| true)
+                .or_else(|| value.as_str().map(is_valid_timestamp))
+                .unwrap_or(false);
+            if !valid {
+                return Err(format!("property {field_name}: expected timestamp"));
+            }
+        }
+        PropertyType::Link | PropertyType::Computed | PropertyType::Struct => {
+            return Err(format!(
+                "property {field_name}: unsupported struct field type"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn default_property_classification() -> String {
@@ -345,7 +465,69 @@ fn prop_def(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef 
         link_kind: String::new(),
         compute_expr: String::new(),
         classification: default_property_classification(),
+        struct_fields: Vec::new(),
     }
+}
+
+fn validate_property_definition(property: &PropertyDef) -> Result<(), String> {
+    if property.name.trim().is_empty() {
+        return Err("property name required".into());
+    }
+    if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
+        return Err(format!("enum property {} requires values", property.name));
+    }
+    if !is_valid_property_classification(&property.classification) {
+        return Err(format!(
+            "property {} has invalid classification: {}",
+            property.name, property.classification
+        ));
+    }
+    if property.prop_type == PropertyType::Struct {
+        validate_struct_fields(&property.name, &property.struct_fields)?;
+    } else if !property.struct_fields.is_empty() {
+        return Err(format!(
+            "property {} declares struct_fields but is not struct",
+            property.name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_struct_fields(property_name: &str, fields: &[StructFieldDef]) -> Result<(), String> {
+    if fields.is_empty() {
+        return Err(format!("struct property {property_name} requires fields"));
+    }
+    let mut seen = HashSet::new();
+    for field in fields {
+        if field.name.trim().is_empty() {
+            return Err(format!(
+                "struct property {property_name} field name required"
+            ));
+        }
+        if !seen.insert(field.name.clone()) {
+            return Err(format!(
+                "struct property {property_name} has duplicate field: {}",
+                field.name
+            ));
+        }
+        match field.prop_type {
+            PropertyType::Enum if field.enum_values.is_empty() => {
+                return Err(format!(
+                    "struct property {property_name}.{} enum requires values",
+                    field.name
+                ));
+            }
+            PropertyType::Link | PropertyType::Computed | PropertyType::Struct => {
+                return Err(format!(
+                    "struct property {property_name}.{} has unsupported field type: {}",
+                    field.name,
+                    field.prop_type.as_str()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_object_type_definition(
@@ -368,20 +550,9 @@ pub fn validate_object_type_definition(
 
     let mut seen = HashSet::new();
     for property in &object_type.properties {
-        if property.name.trim().is_empty() {
-            return Err("property name required".into());
-        }
+        validate_property_definition(property)?;
         if !seen.insert(property.name.clone()) {
             return Err(format!("duplicate property: {}", property.name));
-        }
-        if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
-            return Err(format!("enum property {} requires values", property.name));
-        }
-        if !is_valid_property_classification(&property.classification) {
-            return Err(format!(
-                "property {} has invalid classification: {}",
-                property.name, property.classification
-            ));
         }
     }
     let mut implemented = HashSet::new();
@@ -419,6 +590,13 @@ pub fn validate_object_type_definition(
                     implemented_property.prop_type.as_str()
                 ));
             }
+            if interface_property.prop_type == PropertyType::Struct {
+                validate_struct_property_compatibility(
+                    interface_name,
+                    interface_property,
+                    implemented_property,
+                )?;
+            }
             if interface_property.required && !implemented_property.required {
                 return Err(format!(
                     "interface {interface_name} property {} must be required",
@@ -448,19 +626,47 @@ pub fn validate_interface_definition(
     }
     let mut seen = HashSet::new();
     for property in &interface.properties {
-        if property.name.trim().is_empty() {
-            return Err("property name required".into());
-        }
+        validate_property_definition(property)?;
         if !seen.insert(property.name.clone()) {
             return Err(format!("duplicate property: {}", property.name));
         }
-        if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
-            return Err(format!("enum property {} requires values", property.name));
-        }
-        if !is_valid_property_classification(&property.classification) {
+    }
+    Ok(())
+}
+
+fn validate_struct_property_compatibility(
+    interface_name: &str,
+    interface_property: &PropertyDef,
+    implemented_property: &PropertyDef,
+) -> Result<(), String> {
+    let implemented_fields = implemented_property
+        .struct_fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect::<HashMap<_, _>>();
+    for interface_field in &interface_property.struct_fields {
+        let Some(implemented_field) = implemented_fields.get(interface_field.name.as_str()) else {
+            if !interface_field.required {
+                continue;
+            }
             return Err(format!(
-                "property {} has invalid classification: {}",
-                property.name, property.classification
+                "interface {interface_name} property {} requires struct field {}",
+                interface_property.name, interface_field.name
+            ));
+        };
+        if implemented_field.prop_type != interface_field.prop_type {
+            return Err(format!(
+                "interface {interface_name} property {}.{} expects type {}, got {}",
+                interface_property.name,
+                interface_field.name,
+                interface_field.prop_type.as_str(),
+                implemented_field.prop_type.as_str()
+            ));
+        }
+        if interface_field.required && !implemented_field.required {
+            return Err(format!(
+                "interface {interface_name} property {}.{} must be required",
+                interface_property.name, interface_field.name
             ));
         }
     }
@@ -691,6 +897,7 @@ mod tests {
             link_kind: String::new(),
             compute_expr: String::new(),
             classification: default_property_classification(),
+            struct_fields: vec![],
         }
     }
 
@@ -704,6 +911,17 @@ mod tests {
             link_kind: String::new(),
             compute_expr: String::new(),
             classification: default_property_classification(),
+            struct_fields: vec![],
+        }
+    }
+
+    fn struct_field(name: &str, prop_type: PropertyType, required: bool) -> StructFieldDef {
+        StructFieldDef {
+            name: name.into(),
+            prop_type,
+            required,
+            description: String::new(),
+            enum_values: vec![],
         }
     }
 
@@ -846,6 +1064,78 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_struct_property_accepts_declared_fields() {
+        let mut reg = SchemaRegistry::new();
+        let mut generated = prop("generated", PropertyType::Struct, true);
+        generated.struct_fields = vec![
+            struct_field("value", PropertyType::String, true),
+            struct_field("confidence", PropertyType::Float, true),
+            struct_field("generated_at", PropertyType::Timestamp, false),
+        ];
+        reg.register(ObjectType {
+            kind: "insight".into(),
+            description: String::new(),
+            is_builtin: false,
+            implements: vec![],
+            properties: vec![generated],
+        });
+        let obj = Object {
+            id: "i1".into(),
+            kind: "insight".into(),
+            name: "insight".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties: HashMap::from([(
+                "generated".into(),
+                r#"{"value":"approve","confidence":0.92,"generated_at":"2026-07-06T12:00:00Z","extra":true}"#
+                    .into(),
+            )]),
+            created: 0,
+            updated: 0,
+        };
+
+        assert!(reg.validate(&obj).is_ok());
+    }
+
+    #[test]
+    fn test_validate_struct_property_rejects_invalid_json_missing_fields_and_type_mismatch() {
+        let mut reg = SchemaRegistry::new();
+        let mut generated = prop("generated", PropertyType::Struct, true);
+        generated.struct_fields = vec![
+            struct_field("value", PropertyType::String, true),
+            struct_field("confidence", PropertyType::Float, true),
+        ];
+        reg.register(ObjectType {
+            kind: "insight".into(),
+            description: String::new(),
+            is_builtin: false,
+            implements: vec![],
+            properties: vec![generated],
+        });
+        let mut obj = Object {
+            id: "i1".into(),
+            kind: "insight".into(),
+            name: "insight".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties: HashMap::from([("generated".into(), "not-json".into())]),
+            created: 0,
+            updated: 0,
+        };
+        assert!(reg.validate(&obj).unwrap_err().contains("expected struct"));
+
+        obj.properties
+            .insert("generated".into(), r#"{"value":"approve"}"#.into());
+        assert!(reg.validate(&obj).unwrap_err().contains("confidence"));
+
+        obj.properties.insert(
+            "generated".into(),
+            r#"{"value":"approve","confidence":"high"}"#.into(),
+        );
+        assert!(reg.validate(&obj).unwrap_err().contains("expected float"));
+    }
+
+    #[test]
     fn test_object_type_persistence_round_trip() {
         let db = SekaiDb::new(":memory:").unwrap();
         let object_type = ObjectType {
@@ -853,11 +1143,22 @@ mod tests {
             description: "A widget".into(),
             is_builtin: false,
             implements: vec!["Trackable".into()],
-            properties: vec![prop("name", PropertyType::String, true), {
-                let mut property = prop_enum("color", &["red", "blue"], false);
-                property.classification = "internal".into();
-                property
-            }],
+            properties: vec![
+                prop("name", PropertyType::String, true),
+                {
+                    let mut property = prop_enum("color", &["red", "blue"], false);
+                    property.classification = "internal".into();
+                    property
+                },
+                {
+                    let mut property = prop("generated", PropertyType::Struct, false);
+                    property.struct_fields = vec![
+                        struct_field("value", PropertyType::String, true),
+                        struct_field("confidence", PropertyType::Float, false),
+                    ];
+                    property
+                },
+            ],
         };
 
         db.upsert_interface(&InterfaceDef {
@@ -871,8 +1172,11 @@ mod tests {
         let listed = db.list_object_types().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, "widget");
-        assert_eq!(listed[0].properties.len(), 2);
+        assert_eq!(listed[0].properties.len(), 3);
         assert_eq!(listed[0].properties[1].classification, "internal");
+        assert_eq!(listed[0].properties[2].prop_type, PropertyType::Struct);
+        assert_eq!(listed[0].properties[2].struct_fields.len(), 2);
+        assert_eq!(listed[0].properties[2].struct_fields[0].name, "value");
         assert_eq!(listed[0].implements, vec!["Trackable"]);
 
         let interfaces = db.list_interfaces().unwrap();
