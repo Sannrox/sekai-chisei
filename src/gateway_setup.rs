@@ -24,6 +24,10 @@ pub struct GatewaySetupConfig {
     pub budget_tokens: i32,
     pub budget_period: String,
     pub allowed_models: Vec<String>,
+    /// Runtimes the namespace policy permits. Empty means "just `default_runtime`"
+    /// (the common single-provider case). Set to more than one to let a shared
+    /// namespace serve multiple provider families (e.g. openai + anthropic).
+    pub allowed_runtimes: Vec<String>,
     pub default_model: String,
     pub default_runtime: String,
 }
@@ -44,6 +48,7 @@ impl GatewaySetupConfig {
             budget_tokens: 500_000,
             budget_period: "day".to_string(),
             allowed_models: Vec::new(),
+            allowed_runtimes: Vec::new(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
         };
@@ -77,6 +82,10 @@ impl GatewaySetupConfig {
                 "--allowed-models" => {
                     config.allowed_models = split_csv(&next_arg(&mut args, &arg)?);
                 }
+                "--allowed-runtime" => config.allowed_runtimes.push(next_arg(&mut args, &arg)?),
+                "--allowed-runtimes" => {
+                    config.allowed_runtimes = split_csv(&next_arg(&mut args, &arg)?);
+                }
                 "--default-model" => config.default_model = next_arg(&mut args, &arg)?,
                 "--default-runtime" => config.default_runtime = next_arg(&mut args, &arg)?,
                 "--help" | "-h" => return Err(usage()),
@@ -107,6 +116,16 @@ impl GatewaySetupConfig {
         }
         Ok(())
     }
+
+    /// The runtimes the namespace policy should permit: the explicit
+    /// `allowed_runtimes` when set, otherwise just `default_runtime`.
+    fn effective_allowed_runtimes(&self) -> Vec<String> {
+        if self.allowed_runtimes.is_empty() {
+            vec![self.default_runtime.clone()]
+        } else {
+            self.allowed_runtimes.clone()
+        }
+    }
 }
 
 pub async fn run_setup(
@@ -132,7 +151,7 @@ pub async fn run_setup(
     chisei
         .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
             namespace: config.project.clone(),
-            allowed_runtimes: vec![config.default_runtime.clone()],
+            allowed_runtimes: config.effective_allowed_runtimes(),
             allowed_models: if config.allowed_models.is_empty() {
                 vec![config.default_model.clone()]
             } else {
@@ -447,7 +466,7 @@ async fn ensure_gateway_objects(
                 ("namespace".to_string(), config.project.clone()),
                 (
                     "allowed_runtimes".to_string(),
-                    config.default_runtime.clone(),
+                    config.effective_allowed_runtimes().join(","),
                 ),
                 (
                     "allowed_models".to_string(),
@@ -679,7 +698,7 @@ where
 }
 
 pub fn usage() -> String {
-    "Usage: sekaictl gateway setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       sekaictl gateway key <create|list|rotate|revoke> [options]\n\nRun `sekaictl gateway key --help` for gateway-key lifecycle commands.".to_string()
+    "Usage: sekaictl gateway setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>] [--allowed-runtime <runtime>]\n       sekaictl gateway key <create|list|rotate|revoke> [options]\n\nRun `sekaictl gateway key --help` for gateway-key lifecycle commands.".to_string()
 }
 
 pub fn key_usage() -> String {
@@ -808,6 +827,7 @@ mod tests {
             budget_tokens: 42,
             budget_period: "day".to_string(),
             allowed_models: vec!["gpt-5.5".to_string()],
+            allowed_runtimes: Vec::new(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
         })
