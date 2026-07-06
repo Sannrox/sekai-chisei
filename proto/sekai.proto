@@ -31,6 +31,7 @@ message ListFilter {
   int32 offset = 6;
   string order_by = 7;
   bool descending = 8;
+  repeated string interface_filter = 9;
 }
 
 message PropertyFilter {
@@ -47,6 +48,7 @@ message GraphQuery {
   int32 max_depth = 5;
   repeated string kind_filter = 6;
   map<string, string> property_filter = 7;
+  repeated string interface_filter = 8;
 }
 
 message GraphResult {
@@ -56,6 +58,14 @@ message GraphResult {
 
 message ObjectType {
   string kind = 1;
+  string description = 2;
+  repeated PropertyDef properties = 3;
+  bool is_builtin = 4;
+  repeated string implements = 5;
+}
+
+message InterfaceDef {
+  string name = 1;
   string description = 2;
   repeated PropertyDef properties = 3;
   bool is_builtin = 4;
@@ -273,6 +283,12 @@ message CreateSchemaTypeRequest { ObjectType type = 1; }
 message CreateSchemaTypeResponse { ObjectType type = 1; }
 message DeleteSchemaTypeRequest { string kind = 1; }
 message DeleteSchemaTypeResponse {}
+message ListInterfacesRequest {}
+message ListInterfacesResponse { repeated InterfaceDef interfaces = 1; }
+message CreateInterfaceRequest { InterfaceDef interface = 1; }
+message CreateInterfaceResponse { InterfaceDef interface = 1; }
+message DeleteInterfaceRequest { string name = 1; }
+message DeleteInterfaceResponse {}
 
 message ExecuteFunctionRequest { string name = 1; map<string, string> params = 2; }
 message ExecuteFunctionResponse { FunctionResult result = 1; }
@@ -514,6 +530,9 @@ service SekaiService {
   rpc ListSchemaTypes(ListSchemaTypesRequest) returns (ListSchemaTypesResponse);
   rpc CreateSchemaType(CreateSchemaTypeRequest) returns (CreateSchemaTypeResponse);
   rpc DeleteSchemaType(DeleteSchemaTypeRequest) returns (DeleteSchemaTypeResponse);
+  rpc ListInterfaces(ListInterfacesRequest) returns (ListInterfacesResponse);
+  rpc CreateInterface(CreateInterfaceRequest) returns (CreateInterfaceResponse);
+  rpc DeleteInterface(DeleteInterfaceRequest) returns (DeleteInterfaceResponse);
 
   rpc CreateFunction(CreateFunctionRequest) returns (CreateFunctionResponse);
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
