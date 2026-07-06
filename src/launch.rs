@@ -96,7 +96,7 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 }
 
 pub fn usage() -> String {
-    "Usage: sekaictl launch <agent> [--project <name>] [--model <model>] [--socket <path>] [--gateway-bind <addr>] [--budget <tokens>] [--budget-period <day|week|month>] [--no-app] [--keep-config]\n\nBrings up the local stack and opens the client app wired through the Chisei gateway:\n  1. loads ./.env into the environment for any unset variables\n  2. starts the sekai server on the Unix socket if it is not already running\n  3. seeds the agent project, gateway key, budget, and model policy (idempotent)\n  4. starts chisei-gateway if it is not already running: with OPENAI_API_KEY set it rewrites\n     Codex local-login auth for api.openai.com; without it, it forwards the Codex ChatGPT-plan\n     login to the ChatGPT backend unchanged\n  5. routes ~/.codex/config.toml through the gateway, opens the Codex app, and restores the\n     config when the app quits (skip the revert with --keep-config)\n\nExample: sekaictl launch codex-app".to_string()
+    "Usage: sekaictl launch <agent> [--project <name>] [--model <model>] [--socket <path>] [--gateway-bind <addr>] [--budget <tokens>] [--budget-period <day|week|month>] [--no-app] [--keep-config]\n\nBrings up the local stack and opens the client app wired through the Chisei gateway:\n  1. loads ./.env into the environment for any unset variables\n  2. starts the sekai server on the Unix socket if it is not already running\n  3. seeds the agent project, gateway key, budget, and model policy (idempotent)\n  4. starts chisei-gateway if it is not already running: with OPENAI_API_KEY set it rewrites\n     Codex local-login auth for api.openai.com; without it, it forwards the Codex ChatGPT-plan\n     login to the ChatGPT backend unchanged\n  5. routes ~/.codex/config.toml through the gateway (the app is set to model \"auto\" so the\n     gateway resolves the real model via chisei policy), opens the Codex app, and restores the\n     config when the app quits (skip the revert with --keep-config)\n\n--model sets the gateway's default model (what \"auto\" resolves to), not a fixed app model.\n\nExample: sekaictl launch codex-app".to_string()
 }
 
 /// Loads ./.env into the environment for any unset variables. Call before
@@ -134,7 +134,17 @@ async fn ensure_server(
         return Ok(());
     }
 
-    let mut envs = vec![("SEKAI_SOCKET".to_string(), config.socket.clone())];
+    let mut envs = vec![
+        ("SEKAI_SOCKET".to_string(), config.socket.clone()),
+        // The gateway supplies OpenAI upstream auth (ChatGPT-plan passthrough or a
+        // gateway-owned key), so the control plane must treat openai as available
+        // even without a local key — otherwise it rejects the resolved model and
+        // the gateway fails open, forwarding the unresolved "auto" upstream.
+        (
+            "CHISEI_GATEWAY_PROVIDED_PROVIDERS".to_string(),
+            "openai".to_string(),
+        ),
+    ];
     let auth_token = std::env::var("SEKAI_AUTH_TOKEN").unwrap_or_default();
     if auth_token.trim().is_empty() {
         envs.push(("SEKAI_INSECURE".to_string(), "1".to_string()));
@@ -305,7 +315,7 @@ fn open_codex_app(
     let status = Command::new("codex")
         .arg("app")
         .arg("-c")
-        .arg(format!("model=\"{}\"", config.model))
+        .arg(format!("model=\"{GATEWAY_AUTO_MODEL}\""))
         .arg("-c")
         .arg("model_provider=\"chisei\"")
         .arg("-c")
@@ -406,33 +416,58 @@ fn chisei_routed(content: &str) -> bool {
 const SAVED_PREFIX: &str = "#chisei-saved# ";
 const MANAGED_COMMENT: &str =
     "# Managed by `sekaictl launch codex-app`; reverted automatically when the app quits.";
+/// App-facing model. The app sends this placeholder; the gateway resolves it via
+/// chisei policy to the namespace `default_model` (set by `--model`) and rewrites
+/// the outgoing request. This is why the app never needs a model picker: model
+/// choice is a governed, server-side decision.
+const GATEWAY_AUTO_MODEL: &str = "auto";
 
-/// Sets `model_provider = "chisei"` at the top level (commenting out any
-/// existing top-level assignment so the revert can restore it) and appends the
-/// chisei provider stanza.
+/// Extracts the assignment key from a TOML line (the text before the first `=`),
+/// or `None` for comments, table headers, and blank lines.
+fn top_level_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return None;
+    }
+    let key = trimmed.split('=').next()?.trim();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Top-level keys `launch` takes over while the app is routed. Their originals
+/// are commented out with `SAVED_PREFIX` so the revert can restore them.
+const MANAGED_KEYS: &[&str] = &["model", "model_provider"];
+
+/// Sets `model = "auto"` and `model_provider = "chisei"` at the top level
+/// (commenting out any existing assignments so the revert can restore them) and
+/// appends the chisei provider stanza. The app then sends `auto` and the gateway
+/// resolves the real model.
 fn apply_chisei_config(content: &str, base_url: &str, agent: &str, project: &str) -> String {
-    let mut out = "model_provider = \"chisei\"\n".to_string();
+    let mut out = format!("model = \"{GATEWAY_AUTO_MODEL}\"\nmodel_provider = \"chisei\"\n");
     let mut in_top_level = true;
     for line in content.lines() {
         if line.trim_start().starts_with('[') {
             in_top_level = false;
         }
-        if in_top_level && line.trim_start().starts_with("model_provider") {
+        if in_top_level && top_level_key(line).is_some_and(|key| MANAGED_KEYS.contains(&key)) {
             out.push_str(SAVED_PREFIX);
         }
         out.push_str(line);
         out.push('\n');
     }
     out.push_str(&format!(
-        "\n{MANAGED_COMMENT}\n[model_providers.chisei]\nname = \"Chisei Gateway\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nhttp_headers = {{ \"x-chisei-agent\" = \"{agent}\", \"x-chisei-project\" = \"{project}\" }}\n"
+        "{MANAGED_COMMENT}\n[model_providers.chisei]\nname = \"Chisei Gateway\"\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nhttp_headers = {{ \"x-chisei-agent\" = \"{agent}\", \"x-chisei-project\" = \"{project}\" }}\n"
     ));
     out
 }
 
-/// Inverse of `apply_chisei_config`: drops the managed top-level assignment and
-/// provider table, and uncomments any saved-out original assignment. Lines the
-/// app added or changed while running are preserved.
+/// Inverse of `apply_chisei_config`: drops the managed top-level assignments and
+/// provider table, and uncomments any saved-out originals. Lines the app added or
+/// changed while running are preserved.
 fn strip_chisei_config(content: &str) -> String {
+    let managed_lines = [
+        format!("model = \"{GATEWAY_AUTO_MODEL}\""),
+        "model_provider = \"chisei\"".to_string(),
+    ];
     let mut out = String::new();
     let mut in_top_level = true;
     let mut in_chisei_table = false;
@@ -448,7 +483,7 @@ fn strip_chisei_config(content: &str) -> String {
         if in_chisei_table || line == MANAGED_COMMENT {
             continue;
         }
-        if in_top_level && trimmed == "model_provider = \"chisei\"" {
+        if in_top_level && managed_lines.iter().any(|managed| trimmed == managed) {
             continue;
         }
         if let Some(saved) = line.strip_prefix(SAVED_PREFIX) {
@@ -683,8 +718,10 @@ mod tests {
             "sekai-chisei",
         );
         assert!(chisei_routed(&updated));
-        assert!(updated.starts_with("model_provider = \"chisei\"\n"));
-        // The old top-level assignment is commented out; table-scoped keys are kept.
+        // The app is set to defer to the gateway via the "auto" model.
+        assert!(updated.starts_with("model = \"auto\"\nmodel_provider = \"chisei\"\n"));
+        // Old top-level assignments are commented out; table-scoped keys are kept.
+        assert!(updated.contains("#chisei-saved# model = \"gpt-5.5\""));
         assert!(updated.contains("#chisei-saved# model_provider = \"other\""));
         assert!(updated.contains("model_provider = \"keep-me\""));
         assert!(updated.contains("[model_providers.chisei]"));
@@ -713,7 +750,23 @@ mod tests {
         assert!(reverted.starts_with("model = \"gpt-5.5\"\nmodel_provider = \"other\"\n"));
         assert!(reverted.contains("[projects.\"/y\"]"));
         assert!(!reverted.contains("model_provider = \"chisei\""));
+        assert!(!reverted.contains("model = \"auto\""));
         assert!(!reverted.contains(SAVED_PREFIX));
+    }
+
+    #[test]
+    fn strip_restores_config_without_a_model_line() {
+        // A user config that never had a top-level model line round-trips cleanly.
+        let original = "model_provider = \"openai\"\n\n[features]\njs_repl = false\n";
+        let updated = apply_chisei_config(
+            original,
+            "http://127.0.0.1:8788/v1",
+            "codex-app",
+            "sekai-chisei",
+        );
+        assert!(updated.contains("#chisei-saved# model_provider = \"openai\""));
+        let reverted = strip_chisei_config(&updated);
+        assert_eq!(reverted, original);
     }
 
     #[test]
