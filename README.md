@@ -90,6 +90,7 @@ Configuration is read from environment variables:
 | `NATIVE_LLM_URL` | unset | Native local LLM endpoint |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
+| `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | unset | Comma-separated providers whose upstream auth is supplied by the gateway (e.g. `openai`); model routing treats them as available without a server-side key |
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound LLM/gateway upstream TCP connect timeout |
 | `LLM_HTTP_READ_TIMEOUT_SECS` | `60` | Outbound LLM/gateway upstream idle-read timeout; protects streaming without imposing a total stream cap |
 | `LLM_HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | Outbound LLM/gateway upstream connection pool idle timeout |
@@ -203,6 +204,16 @@ project, gateway key, budget, and model policy, starts `chisei-gateway` if
 needed, and opens the Codex app. Spawned services log to `./data/logs/`. Use
 `--no-app` to bring the stack up without launching Codex, and `--model`,
 `--project`, `--budget`, or `--gateway-bind` to adjust the defaults.
+
+The app is configured with `model = "auto"`: it sends `auto` and the gateway
+resolves the real model server-side via chisei policy (falling back to the
+namespace `default_model`) and rewrites the outgoing request. So model choice is
+a governed, gateway-side decision — the app needs no model picker, and `--model`
+sets that gateway default (what `auto` resolves to) rather than a fixed app
+model. Because the gateway supplies the OpenAI upstream auth, `launch` starts
+the server with `CHISEI_GATEWAY_PROVIDED_PROVIDERS=openai` so chisei treats
+`openai` as available even without a server-side key (otherwise it would reject
+the resolved model and the gateway would fail open, forwarding `auto`).
 
 The gateway upstream mode is picked automatically: with `OPENAI_API_KEY` set,
 Codex local-login auth is rewritten for `api.openai.com`; without it, the Codex
