@@ -1,5 +1,7 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, Object};
+use crate::sekai::function;
+use crate::sekai::schema::{PropertyType, SchemaRegistry};
 use std::collections::HashMap;
 
 type ComputeFn = Box<dyn Fn(&Object, &SekaiDb) -> Option<String> + Send + Sync>;
@@ -82,6 +84,117 @@ pub fn default_compute_registry() -> ComputeRegistry {
         }),
     );
     c
+}
+
+pub fn resolve_schema_computed_with_filter<F>(
+    obj: &mut Object,
+    db: &SekaiDb,
+    schema: &SchemaRegistry,
+    allow: F,
+) -> Result<(), String>
+where
+    F: Fn(&Object) -> bool,
+{
+    let Some(object_type) = schema.get(&obj.kind) else {
+        return Ok(());
+    };
+    let computed_properties = object_type
+        .properties
+        .iter()
+        .filter(|property| property.prop_type == PropertyType::Computed)
+        .collect::<Vec<_>>();
+    for property in &computed_properties {
+        obj.properties.remove(&property.name);
+    }
+    for property in computed_properties {
+        let value = if property.compute_expr.trim().is_empty() {
+            fallback_computed_value(obj, db, &property.name, &allow)?
+        } else {
+            function_computed_value(obj, db, &property.compute_expr, &property.name, &allow)?
+        };
+        if let Some(value) = value {
+            obj.properties.insert(property.name.clone(), value);
+        }
+    }
+    Ok(())
+}
+
+fn function_computed_value<F>(
+    obj: &Object,
+    db: &SekaiDb,
+    function_name: &str,
+    property_name: &str,
+    allow: &F,
+) -> Result<Option<String>, String>
+where
+    F: Fn(&Object) -> bool,
+{
+    let function = db
+        .get_function(function_name)?
+        .ok_or_else(|| format!("computed function not found: {function_name}"))?;
+    let params = HashMap::from([
+        ("object_id".to_string(), obj.id.clone()),
+        ("object_kind".to_string(), obj.kind.clone()),
+        ("object_name".to_string(), obj.name.clone()),
+        ("namespace".to_string(), obj.namespace.clone()),
+        ("external_id".to_string(), obj.external_id.clone()),
+    ]);
+    let result = function::execute_for_object_with_filter(db, &function, obj, &params, allow)?;
+    if let Some(value) = result.aggregates.get(property_name) {
+        return Ok(Some(value.clone()));
+    }
+    if let Some(value) = result.aggregates.get("value") {
+        return Ok(Some(value.clone()));
+    }
+    if result.aggregates.len() == 1 {
+        return Ok(result.aggregates.values().next().cloned());
+    }
+    Ok(None)
+}
+
+fn fallback_computed_value<F>(
+    obj: &Object,
+    db: &SekaiDb,
+    property_name: &str,
+    allow: &F,
+) -> Result<Option<String>, String>
+where
+    F: Fn(&Object) -> bool,
+{
+    match (obj.kind.as_str(), property_name) {
+        ("namespace", "component_count") => {
+            let linked = db.get_linked_objects(&obj.id, "contains", &Direction::Outgoing)?;
+            let count = linked
+                .iter()
+                .filter(|object| object.kind == KIND_COMPONENT && allow(object))
+                .count();
+            if count == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(count.to_string()))
+            }
+        }
+        (KIND_COMPONENT, "health") => {
+            let rate: i32 = obj
+                .properties
+                .get("success_rate")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let total: i32 = obj
+                .properties
+                .get("task_total")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if total == 0 {
+                Ok(Some("unknown".into()))
+            } else if rate >= 80 {
+                Ok(Some("healthy".into()))
+            } else {
+                Ok(Some("degraded".into()))
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

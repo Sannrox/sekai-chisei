@@ -11,7 +11,7 @@ use crate::domain;
 use crate::sekai::action::{self, ActionExecutor};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
-use crate::sekai::{audit, coordination, dataset, function, security};
+use crate::sekai::{audit, compute, coordination, dataset, function, security};
 use uuid::Uuid;
 
 pub struct SekaiServiceImpl {
@@ -86,6 +86,35 @@ impl SekaiServiceImpl {
             )));
         }
         Ok(())
+    }
+
+    fn resolve_computed_for_response(
+        &self,
+        mut object: domain::Object,
+        principals: &[String],
+    ) -> Result<domain::Object, Status> {
+        let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .clone();
+        compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
+            self.security.can_access(&candidate.id, &refs)
+        })
+        .map_err(Status::internal)?;
+        Ok(object)
+    }
+
+    fn resolve_computed_for_responses(
+        &self,
+        objects: Vec<domain::Object>,
+        principals: &[String],
+    ) -> Result<Vec<domain::Object>, Status> {
+        objects
+            .into_iter()
+            .map(|object| self.resolve_computed_for_response(object, principals))
+            .collect()
     }
 
     fn recover_schema_registry(&self) -> Result<(), Status> {
@@ -779,6 +808,29 @@ fn validate_action_type_against_schema(
         .map_err(Status::invalid_argument)
 }
 
+fn validate_computed_property_functions(
+    db: &SekaiDb,
+    object_type: &schema::ObjectType,
+) -> Result<(), Status> {
+    for property in &object_type.properties {
+        if property.prop_type != schema::PropertyType::Computed || property.compute_expr.is_empty()
+        {
+            continue;
+        }
+        if db
+            .get_function(&property.compute_expr)
+            .map_err(Status::internal)?
+            .is_none()
+        {
+            return Err(Status::invalid_argument(format!(
+                "computed property {} references unknown function {}",
+                property.name, property.compute_expr
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
     Dataset {
         id: d.id.clone(),
@@ -1221,6 +1273,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        let obj = self.resolve_computed_for_response(obj, &principals)?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -1280,6 +1333,7 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .list_objects_with_total_for_principals(&filter, &principal_refs)
             .map_err(Status::internal)?;
+        let objects = self.resolve_computed_for_responses(objects, &principals)?;
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -1297,6 +1351,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         check_read(&self.security, &obj.id, &principals)?;
+        let obj = self.resolve_computed_for_response(obj, &principals)?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -1313,8 +1368,10 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
         let filtered = self.security.filter_objects(&objs, &refs);
+        let filtered = self
+            .resolve_computed_for_responses(filtered.into_iter().cloned().collect(), &principals)?;
         Ok(Response::new(ListObjectsResponse {
-            objects: filtered.iter().map(|o| to_proto_obj(o)).collect(),
+            objects: filtered.iter().map(to_proto_obj).collect(),
             total: filtered.len() as i32,
         }))
     }
@@ -1415,6 +1472,7 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .list_objects_with_total_for_principals(&filter, &principal_refs)
             .map_err(Status::internal)?;
+        let objects = self.resolve_computed_for_responses(objects, &principals)?;
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -1469,6 +1527,7 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<GetLinkedObjectsRequest>,
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
+        let principals = caller_principals(&req);
         let r = req.into_inner();
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
@@ -1479,6 +1538,7 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_linked_objects(&r.object_id, &r.relation, &dir)
             .map_err(Status::internal)?;
+        let objs = self.resolve_computed_for_responses(objs, &principals)?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
         }))
@@ -1487,6 +1547,7 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
+        let principals = caller_principals(&req);
         let q = req
             .into_inner()
             .query
@@ -1509,8 +1570,10 @@ impl SekaiService for SekaiServiceImpl {
             .schema
             .read()
             .map_err(|_| Status::internal("schema registry unavailable"))?;
-        let res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
+        let mut res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
             .map_err(Status::internal)?;
+        drop(schema);
+        res.objects = self.resolve_computed_for_responses(res.objects, &principals)?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -1562,6 +1625,7 @@ impl SekaiService for SekaiServiceImpl {
             schema::validate_object_type_definition(&parsed, registry.get(&parsed.kind), &registry)
                 .map_err(Status::invalid_argument)?;
         }
+        validate_computed_property_functions(&self.db, &parsed)?;
         self.db
             .upsert_object_type(&parsed)
             .map_err(Status::internal)?;
@@ -4526,6 +4590,267 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(executed.result.unwrap().aggregates["total"], "5");
+    }
+
+    #[tokio::test]
+    async fn computed_property_resolves_from_function_without_persisting() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "count_children".into(),
+                description: "".into(),
+                params: vec![],
+                pipeline: vec![
+                    PipelineStep {
+                        op: "self".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "".into(),
+                        dir: "".into(),
+                        func: "".into(),
+                        field: "".into(),
+                        r#as: "".into(),
+                    },
+                    PipelineStep {
+                        op: "traverse".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "contains".into(),
+                        dir: "".into(),
+                        func: "".into(),
+                        field: "".into(),
+                        r#as: "".into(),
+                    },
+                    PipelineStep {
+                        op: "aggregate".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "".into(),
+                        dir: "".into(),
+                        func: "count".into(),
+                        field: "".into(),
+                        r#as: "child_count".into(),
+                    },
+                ],
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "cluster".into(),
+                description: "Cluster".into(),
+                properties: vec![PropertyDef {
+                    name: "child_count".into(),
+                    r#type: "computed".into(),
+                    required: false,
+                    description: "".into(),
+                    enum_values: vec![],
+                    link_kind: "".into(),
+                    compute_expr: "count_children".into(),
+                }],
+                is_builtin: false,
+                implements: vec![],
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "cluster-1".into(),
+                kind: "cluster".into(),
+                name: "cluster".into(),
+                namespace: "".into(),
+                external_id: "cluster:one".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "component-1".into(),
+                kind: "component".into(),
+                name: "component".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "cluster-component".into(),
+                from_id: "cluster-1".into(),
+                to_id: "component-1".into(),
+                relation: "contains".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let got = svc
+            .get_object(with_principal(GetObjectRequest {
+                id: "cluster-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(got.properties["child_count"], "1");
+
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "cluster".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects[0].properties["child_count"], "1");
+
+        let stored = svc.db.get_object("cluster-1").unwrap().unwrap();
+        assert!(!stored.properties.contains_key("child_count"));
+    }
+
+    #[tokio::test]
+    async fn schema_type_rejects_unknown_computed_function() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let err = svc
+            .create_schema_type(with_principal(CreateSchemaTypeRequest {
+                r#type: Some(ObjectType {
+                    kind: "cluster".into(),
+                    description: "Cluster".into(),
+                    properties: vec![PropertyDef {
+                        name: "child_count".into(),
+                        r#type: "computed".into(),
+                        required: false,
+                        description: "".into(),
+                        enum_values: vec![],
+                        link_kind: "".into(),
+                        compute_expr: "missing_function".into(),
+                    }],
+                    is_builtin: false,
+                    implements: vec![],
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("missing_function"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_computed_property_hides_stored_value() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "ambiguous_child_count".into(),
+                description: "".into(),
+                params: vec![],
+                pipeline: vec![
+                    PipelineStep {
+                        op: "self".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "".into(),
+                        dir: "".into(),
+                        func: "".into(),
+                        field: "".into(),
+                        r#as: "".into(),
+                    },
+                    PipelineStep {
+                        op: "aggregate".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "".into(),
+                        dir: "".into(),
+                        func: "count".into(),
+                        field: "".into(),
+                        r#as: "first".into(),
+                    },
+                    PipelineStep {
+                        op: "aggregate".into(),
+                        kind: "".into(),
+                        property: "".into(),
+                        value: "".into(),
+                        relation: "".into(),
+                        dir: "".into(),
+                        func: "count".into(),
+                        field: "".into(),
+                        r#as: "second".into(),
+                    },
+                ],
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "cluster".into(),
+                description: "Cluster".into(),
+                properties: vec![PropertyDef {
+                    name: "child_count".into(),
+                    r#type: "computed".into(),
+                    required: false,
+                    description: "".into(),
+                    enum_values: vec![],
+                    link_kind: "".into(),
+                    compute_expr: "ambiguous_child_count".into(),
+                }],
+                is_builtin: false,
+                implements: vec![],
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "cluster-spoofed".into(),
+                kind: "cluster".into(),
+                name: "cluster".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::from([("child_count".into(), "spoofed".into())]),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let got = svc
+            .get_object(with_principal(GetObjectRequest {
+                id: "cluster-spoofed".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert!(!got.properties.contains_key("child_count"));
+
+        let stored = svc.db.get_object("cluster-spoofed").unwrap().unwrap();
+        assert_eq!(stored.properties["child_count"], "spoofed");
     }
 
     #[tokio::test]

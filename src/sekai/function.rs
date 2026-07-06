@@ -74,6 +74,7 @@ pub fn validate_function(f: &Function) -> Result<(), String> {
                     return Err(format!("step {}: aggregate requires func", i));
                 }
             }
+            "self" => {}
             "transform" => {
                 if step.field.is_empty() {
                     return Err(format!("step {}: transform requires field", i));
@@ -104,11 +105,44 @@ pub fn execute_with_filter<F>(
 where
     F: Fn(&Object) -> bool,
 {
+    execute_with_source_and_filter(db, f, params, None, allow)
+}
+
+pub fn execute_for_object_with_filter<F>(
+    db: &SekaiDb,
+    f: &Function,
+    source: &Object,
+    params: &HashMap<String, String>,
+    allow: F,
+) -> Result<FunctionResult, String>
+where
+    F: Fn(&Object) -> bool,
+{
+    execute_with_source_and_filter(db, f, params, Some(source), allow)
+}
+
+fn execute_with_source_and_filter<F>(
+    db: &SekaiDb,
+    f: &Function,
+    params: &HashMap<String, String>,
+    source: Option<&Object>,
+    allow: F,
+) -> Result<FunctionResult, String>
+where
+    F: Fn(&Object) -> bool,
+{
     let mut objects: Vec<Object> = Vec::new();
     let mut result = FunctionResult::default();
 
     for step in &f.pipeline {
         match step.op.as_str() {
+            "self" => {
+                objects = source
+                    .filter(|object| allow(object))
+                    .cloned()
+                    .into_iter()
+                    .collect();
+            }
             "filter" => {
                 let filter = crate::domain::ListFilter {
                     kind: Some(step.kind.clone()),
@@ -462,6 +496,25 @@ mod tests {
         };
         let res = execute(&db, &f, &HashMap::new()).unwrap();
         assert_eq!(res.aggregates["count"], "2");
+
+        let f = Function {
+            name: "component_count".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                step("self", "", "", "", ""),
+                step("traverse", "", "contains", "", ""),
+                PipelineStep {
+                    alias: "component_count".into(),
+                    ..step("aggregate", "", "", "count", "")
+                },
+            ],
+        };
+        let source = db.get_object("r1").unwrap().unwrap();
+        let res =
+            execute_for_object_with_filter(&db, &f, &source, &HashMap::new(), |_| true).unwrap();
+        assert_eq!(res.aggregates["component_count"], "2");
     }
 
     #[test]
