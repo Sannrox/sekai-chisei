@@ -62,10 +62,21 @@ pub struct ObjectType {
     pub description: String,
     pub properties: Vec<PropertyDef>,
     pub is_builtin: bool,
+    pub implements: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceDef {
+    pub name: String,
+    pub description: String,
+    pub properties: Vec<PropertyDef>,
+    pub is_builtin: bool,
+}
+
+#[derive(Clone)]
 pub struct SchemaRegistry {
     types: HashMap<ObjectKind, ObjectType>,
+    interfaces: HashMap<String, InterfaceDef>,
 }
 
 impl Default for SchemaRegistry {
@@ -78,9 +89,13 @@ impl SchemaRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             types: HashMap::new(),
+            interfaces: HashMap::new(),
         };
         for object_type in builtin_object_types() {
             registry.register(object_type);
+        }
+        for interface in builtin_interfaces() {
+            registry.register_interface(interface);
         }
         registry
     }
@@ -89,12 +104,24 @@ impl SchemaRegistry {
         self.types.insert(ot.kind.clone(), ot);
     }
 
+    pub fn register_interface(&mut self, interface: InterfaceDef) {
+        self.interfaces.insert(interface.name.clone(), interface);
+    }
+
     pub fn remove(&mut self, kind: &str) {
         self.types.remove(kind);
     }
 
+    pub fn remove_interface(&mut self, name: &str) {
+        self.interfaces.remove(name);
+    }
+
     pub fn get(&self, kind: &str) -> Option<&ObjectType> {
         self.types.get(kind)
+    }
+
+    pub fn get_interface(&self, name: &str) -> Option<&InterfaceDef> {
+        self.interfaces.get(name)
     }
 
     pub fn all(&self) -> Vec<ObjectType> {
@@ -103,12 +130,43 @@ impl SchemaRegistry {
         types
     }
 
+    pub fn all_interfaces(&self) -> Vec<InterfaceDef> {
+        let mut interfaces: Vec<_> = self.interfaces.values().cloned().collect();
+        interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+        interfaces
+    }
+
     pub fn from_types(types: Vec<ObjectType>) -> Self {
+        Self::from_types_and_interfaces(types, Vec::new())
+    }
+
+    pub fn from_types_and_interfaces(
+        types: Vec<ObjectType>,
+        interfaces: Vec<InterfaceDef>,
+    ) -> Self {
         let mut registry = Self::new();
+        for interface in interfaces {
+            registry.register_interface(interface);
+        }
         for object_type in types {
             registry.register(object_type);
         }
         registry
+    }
+
+    pub fn kind_implements_all(&self, kind: &str, required: &[String]) -> bool {
+        if required.is_empty() {
+            return true;
+        }
+        let Some(object_type) = self.types.get(kind) else {
+            return false;
+        };
+        required.iter().all(|name| {
+            object_type
+                .implements
+                .iter()
+                .any(|implemented| implemented == name)
+        })
     }
 
     pub fn validate(&self, obj: &Object) -> Result<(), String> {
@@ -191,13 +249,79 @@ fn builtin_object_types() -> Vec<ObjectType> {
         description: description.to_string(),
         properties: Vec::new(),
         is_builtin: true,
+        implements: Vec::new(),
     })
     .collect()
+}
+
+fn builtin_interfaces() -> Vec<InterfaceDef> {
+    [
+        (
+            "Auditable",
+            "Object participates in audited control-plane activity.",
+            Vec::new(),
+        ),
+        (
+            "Budgeted",
+            "Object can be associated with budget accounting or cost control.",
+            vec![
+                prop_def("cost_center", PropertyType::String, false),
+                prop_def("budget_ref", PropertyType::String, false),
+            ],
+        ),
+        (
+            "Evaluable",
+            "Object can carry evaluation and baseline state.",
+            vec![
+                prop_def("last_eval", PropertyType::Timestamp, false),
+                prop_def("baseline", PropertyType::String, false),
+            ],
+        ),
+        (
+            "Governed",
+            "Object is governed by owner, policy, and status metadata.",
+            vec![
+                prop_def("owner", PropertyType::String, false),
+                prop_def("policy", PropertyType::String, false),
+                prop_def("status", PropertyType::String, false),
+            ],
+        ),
+        (
+            "RiskScored",
+            "Object exposes risk score context for policy and routing decisions.",
+            vec![
+                prop_def("risk_score", PropertyType::Float, false),
+                prop_def("risk_reason", PropertyType::String, false),
+                prop_def("risk_updated_at", PropertyType::Timestamp, false),
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, properties)| InterfaceDef {
+        name: name.to_string(),
+        description: description.to_string(),
+        properties,
+        is_builtin: true,
+    })
+    .collect()
+}
+
+fn prop_def(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef {
+    PropertyDef {
+        name: name.to_string(),
+        prop_type,
+        required,
+        description: String::new(),
+        enum_values: Vec::new(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+    }
 }
 
 pub fn validate_object_type_definition(
     object_type: &ObjectType,
     existing: Option<&ObjectType>,
+    registry: &SchemaRegistry,
 ) -> Result<(), String> {
     if object_type.kind.trim().is_empty() {
         return Err("kind required".into());
@@ -224,6 +348,74 @@ pub fn validate_object_type_definition(
             return Err(format!("enum property {} requires values", property.name));
         }
     }
+    let mut implemented = HashSet::new();
+    let property_by_name: HashMap<&str, &PropertyDef> = object_type
+        .properties
+        .iter()
+        .map(|property| (property.name.as_str(), property))
+        .collect();
+    for interface_name in &object_type.implements {
+        if interface_name.trim().is_empty() {
+            return Err("interface name required".into());
+        }
+        if !implemented.insert(interface_name.clone()) {
+            return Err(format!("duplicate interface: {interface_name}"));
+        }
+        let interface = registry
+            .get_interface(interface_name)
+            .ok_or_else(|| format!("unknown interface: {interface_name}"))?;
+        for interface_property in &interface.properties {
+            let Some(implemented_property) = property_by_name.get(interface_property.name.as_str())
+            else {
+                if !interface_property.required {
+                    continue;
+                }
+                return Err(format!(
+                    "interface {interface_name} requires property {}",
+                    interface_property.name
+                ));
+            };
+            if implemented_property.prop_type != interface_property.prop_type {
+                return Err(format!(
+                    "interface {interface_name} property {} expects type {}, got {}",
+                    interface_property.name,
+                    interface_property.prop_type.as_str(),
+                    implemented_property.prop_type.as_str()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_interface_definition(
+    interface: &InterfaceDef,
+    existing: Option<&InterfaceDef>,
+) -> Result<(), String> {
+    if interface.name.trim().is_empty() {
+        return Err("interface name required".into());
+    }
+    if interface.is_builtin {
+        return Err("builtin interfaces are code-owned".into());
+    }
+    if existing
+        .map(|existing| existing.is_builtin)
+        .unwrap_or(false)
+    {
+        return Err("cannot replace builtin interface".into());
+    }
+    let mut seen = HashSet::new();
+    for property in &interface.properties {
+        if property.name.trim().is_empty() {
+            return Err("property name required".into());
+        }
+        if !seen.insert(property.name.clone()) {
+            return Err(format!("duplicate property: {}", property.name));
+        }
+        if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
+            return Err(format!("enum property {} requires values", property.name));
+        }
+    }
     Ok(())
 }
 
@@ -235,29 +427,54 @@ impl SekaiDb {
                 kind TEXT PRIMARY KEY,
                 description TEXT NOT NULL DEFAULT '',
                 properties_json TEXT NOT NULL DEFAULT '[]',
+                implements_json TEXT NOT NULL DEFAULT '[]',
+                created INTEGER NOT NULL,
+                updated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_interfaces (
+                name TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                properties_json TEXT NOT NULL DEFAULT '[]',
                 created INTEGER NOT NULL,
                 updated INTEGER NOT NULL
             );",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        conn.execute(
+            "ALTER TABLE sekai_object_types ADD COLUMN implements_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn upsert_object_type(&self, object_type: &ObjectType) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         let properties_json =
             serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
+        let implements_json =
+            serde_json::to_string(&object_type.implements).map_err(|error| error.to_string())?;
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO sekai_object_types (kind, description, properties_json, implements_json, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(kind) DO UPDATE SET
                 description = excluded.description,
                 properties_json = excluded.properties_json,
+                implements_json = excluded.implements_json,
                 updated = excluded.updated",
             params![
                 object_type.kind,
                 object_type.description,
                 properties_json,
+                implements_json,
                 now
             ],
         )
@@ -279,7 +496,7 @@ impl SekaiDb {
     pub fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, String> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT kind, description, properties_json FROM sekai_object_types WHERE kind = ?1",
+            "SELECT kind, description, properties_json, implements_json FROM sekai_object_types WHERE kind = ?1",
             params![kind],
             row_to_object_type,
         )
@@ -306,7 +523,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT kind, description, properties_json FROM sekai_object_types ORDER BY kind",
+                "SELECT kind, description, properties_json, implements_json FROM sekai_object_types ORDER BY kind",
             )
             .map_err(|error| error.to_string())?;
         let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
@@ -316,29 +533,95 @@ impl SekaiDb {
             let kind: String = row.get(0).map_err(|error| error.to_string())?;
             let description: String = row.get(1).map_err(|error| error.to_string())?;
             let properties_json: String = row.get(2).map_err(|error| error.to_string())?;
-            match serde_json::from_str(&properties_json) {
-                Ok(properties) => types.push(ObjectType {
+            let implements_json: String = row.get(3).map_err(|error| error.to_string())?;
+            match (
+                serde_json::from_str(&properties_json),
+                serde_json::from_str(&implements_json),
+            ) {
+                (Ok(properties), Ok(implements)) => types.push(ObjectType {
                     kind,
                     description,
                     properties,
                     is_builtin: false,
+                    implements,
                 }),
-                Err(error) => {
+                (Err(error), _) | (_, Err(error)) => {
                     errors.insert(kind, error.to_string());
                 }
             }
         }
         Ok((types, errors))
     }
+
+    pub fn upsert_interface(&self, interface: &InterfaceDef) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let properties_json =
+            serde_json::to_string(&interface.properties).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO sekai_interfaces (name, description, properties_json, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                description = excluded.description,
+                properties_json = excluded.properties_json,
+                updated = excluded.updated",
+            params![interface.name, interface.description, properties_json, now],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_interface(&self, name: &str) -> Result<bool, String> {
+        let conn = self.conn();
+        let deleted = conn
+            .execute(
+                "DELETE FROM sekai_interfaces WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted > 0)
+    }
+
+    pub fn list_interfaces(&self) -> Result<Vec<InterfaceDef>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, description, properties_json FROM sekai_interfaces ORDER BY name",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], row_to_interface)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn row_to_object_type(row: &rusqlite::Row) -> Result<ObjectType, rusqlite::Error> {
     let properties_json: String = row.get(2)?;
+    let implements_json: String = row.get(3)?;
     let properties = serde_json::from_str(&properties_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let implements = serde_json::from_str(&implements_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(ObjectType {
         kind: row.get(0)?,
+        description: row.get(1)?,
+        properties,
+        is_builtin: false,
+        implements,
+    })
+}
+
+fn row_to_interface(row: &rusqlite::Row) -> Result<InterfaceDef, rusqlite::Error> {
+    let properties_json: String = row.get(2)?;
+    let properties = serde_json::from_str(&properties_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(InterfaceDef {
+        name: row.get(0)?,
         description: row.get(1)?,
         properties,
         is_builtin: false,
@@ -380,6 +663,7 @@ mod tests {
             kind: "widget".into(),
             description: "A widget".into(),
             is_builtin: false,
+            implements: vec![],
             properties: vec![
                 prop_enum("color", &["red", "blue"], false),
                 prop("name", PropertyType::String, true),
@@ -466,6 +750,7 @@ mod tests {
             kind: "measurement".into(),
             description: String::new(),
             is_builtin: false,
+            implements: vec![],
             properties: vec![prop("score", PropertyType::Float, true)],
         });
         let obj = Object {
@@ -488,6 +773,7 @@ mod tests {
             kind: "event".into(),
             description: String::new(),
             is_builtin: false,
+            implements: vec![],
             properties: vec![prop("at", PropertyType::Timestamp, true)],
         });
         let mut obj = Object {
@@ -516,22 +802,127 @@ mod tests {
             kind: "widget".into(),
             description: "A widget".into(),
             is_builtin: false,
+            implements: vec!["Trackable".into()],
             properties: vec![
                 prop("name", PropertyType::String, true),
                 prop_enum("color", &["red", "blue"], false),
             ],
         };
 
+        db.upsert_interface(&InterfaceDef {
+            name: "Trackable".into(),
+            description: "Trackable object".into(),
+            properties: vec![],
+            is_builtin: false,
+        })
+        .unwrap();
         db.upsert_object_type(&object_type).unwrap();
         let listed = db.list_object_types().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, "widget");
         assert_eq!(listed[0].properties.len(), 2);
+        assert_eq!(listed[0].implements, vec!["Trackable"]);
 
-        let registry = SchemaRegistry::from_types(listed);
+        let interfaces = db.list_interfaces().unwrap();
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name, "Trackable");
+
+        let registry = SchemaRegistry::from_types_and_interfaces(listed, interfaces);
         assert!(registry.get("widget").is_some());
+        assert!(registry.kind_implements_all("widget", &["Trackable".into()]));
 
         assert!(db.delete_object_type("widget").unwrap());
         assert!(db.list_object_types().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_validate_object_type_rejects_unknown_interface() {
+        let registry = SchemaRegistry::new();
+        let object_type = ObjectType {
+            kind: "widget".into(),
+            description: "A widget".into(),
+            is_builtin: false,
+            implements: vec!["Unknown".into()],
+            properties: vec![],
+        };
+        let err = validate_object_type_definition(&object_type, registry.get("widget"), &registry)
+            .unwrap_err();
+        assert!(err.contains("unknown interface"));
+    }
+
+    #[test]
+    fn test_validate_object_type_enforces_interface_properties() {
+        let mut registry = SchemaRegistry::new();
+        registry.register_interface(InterfaceDef {
+            name: "Risky".into(),
+            description: "Risk scored".into(),
+            is_builtin: false,
+            properties: vec![
+                prop("risk_score", PropertyType::Float, true),
+                prop("note", PropertyType::String, false),
+            ],
+        });
+        let missing = ObjectType {
+            kind: "widget".into(),
+            description: "A widget".into(),
+            is_builtin: false,
+            implements: vec!["Risky".into()],
+            properties: vec![],
+        };
+        let err = validate_object_type_definition(&missing, None, &registry).unwrap_err();
+        assert!(err.contains("risk_score"));
+
+        let wrong_type = ObjectType {
+            properties: vec![prop("risk_score", PropertyType::String, false)],
+            ..missing
+        };
+        let err = validate_object_type_definition(&wrong_type, None, &registry).unwrap_err();
+        assert!(err.contains("expects type float"));
+
+        let valid = ObjectType {
+            properties: vec![prop("risk_score", PropertyType::Float, false)],
+            ..wrong_type
+        };
+        assert!(validate_object_type_definition(&valid, None, &registry).is_ok());
+    }
+
+    #[test]
+    fn test_builtin_interfaces_are_code_owned() {
+        let registry = SchemaRegistry::new();
+        let builtin = registry.get_interface("RiskScored").unwrap().clone();
+        let err = validate_interface_definition(
+            &InterfaceDef {
+                is_builtin: false,
+                ..builtin
+            },
+            registry.get_interface("RiskScored"),
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot replace builtin interface"));
+    }
+
+    #[test]
+    fn test_legacy_object_type_rows_default_empty_implements() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        {
+            let conn = db.conn();
+            conn.execute_batch(
+                "DROP TABLE sekai_object_types;
+                 CREATE TABLE sekai_object_types (
+                    kind TEXT PRIMARY KEY,
+                    description TEXT NOT NULL DEFAULT '',
+                    properties_json TEXT NOT NULL DEFAULT '[]',
+                    created INTEGER NOT NULL,
+                    updated INTEGER NOT NULL
+                 );
+                 INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
+                 VALUES ('legacy', 'Legacy type', '[]', 1, 1);",
+            )
+            .unwrap();
+        }
+        db.migrate_schema_types().unwrap();
+        let listed = db.list_object_types().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].implements.is_empty());
     }
 }
