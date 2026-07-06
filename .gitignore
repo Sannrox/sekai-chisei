@@ -12,3 +12,4 @@ data/*.sqlite-*
 *.log
 __pycache__/
 *.pyc
+data/logs/
