@@ -172,6 +172,7 @@ mod tests {
                 link_kind: String::new(),
                 compute_expr: String::new(),
                 classification: "public".into(),
+                struct_fields: vec![],
             }],
             is_builtin: false,
             implements: vec![],
