@@ -3479,6 +3479,7 @@ mod tests {
             scoring_batch_size: 16,
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
+            gateway_provided_providers: vec![],
             leak_review_model: None,
             tls_cert: None,
             tls_key: None,
