@@ -54,6 +54,8 @@ pub struct PropertyDef {
     pub enum_values: Vec<String>,
     pub link_kind: String,
     pub compute_expr: String,
+    #[serde(default = "default_property_classification")]
+    pub classification: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +233,33 @@ fn is_valid_timestamp(value: &str) -> bool {
     value.parse::<i64>().is_ok() || chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
+pub fn default_property_classification() -> String {
+    "public".to_string()
+}
+
+pub fn normalize_property_classification(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "public"
+    } else {
+        trimmed
+    }
+}
+
+pub fn is_restricted_property_classification(value: &str) -> bool {
+    matches!(
+        normalize_property_classification(value),
+        "internal" | "sensitive"
+    )
+}
+
+fn is_valid_property_classification(value: &str) -> bool {
+    matches!(
+        normalize_property_classification(value),
+        "public" | "internal" | "sensitive"
+    )
+}
+
 fn builtin_object_types() -> Vec<ObjectType> {
     [
         ("agent", "Built-in agent object"),
@@ -315,6 +344,7 @@ fn prop_def(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef 
         enum_values: Vec::new(),
         link_kind: String::new(),
         compute_expr: String::new(),
+        classification: default_property_classification(),
     }
 }
 
@@ -346,6 +376,12 @@ pub fn validate_object_type_definition(
         }
         if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
             return Err(format!("enum property {} requires values", property.name));
+        }
+        if !is_valid_property_classification(&property.classification) {
+            return Err(format!(
+                "property {} has invalid classification: {}",
+                property.name, property.classification
+            ));
         }
     }
     let mut implemented = HashSet::new();
@@ -420,6 +456,12 @@ pub fn validate_interface_definition(
         }
         if property.prop_type == PropertyType::Enum && property.enum_values.is_empty() {
             return Err(format!("enum property {} requires values", property.name));
+        }
+        if !is_valid_property_classification(&property.classification) {
+            return Err(format!(
+                "property {} has invalid classification: {}",
+                property.name, property.classification
+            ));
         }
     }
     Ok(())
@@ -648,6 +690,7 @@ mod tests {
             enum_values: vec![],
             link_kind: String::new(),
             compute_expr: String::new(),
+            classification: default_property_classification(),
         }
     }
 
@@ -660,6 +703,7 @@ mod tests {
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             link_kind: String::new(),
             compute_expr: String::new(),
+            classification: default_property_classification(),
         }
     }
 
@@ -809,10 +853,11 @@ mod tests {
             description: "A widget".into(),
             is_builtin: false,
             implements: vec!["Trackable".into()],
-            properties: vec![
-                prop("name", PropertyType::String, true),
-                prop_enum("color", &["red", "blue"], false),
-            ],
+            properties: vec![prop("name", PropertyType::String, true), {
+                let mut property = prop_enum("color", &["red", "blue"], false);
+                property.classification = "internal".into();
+                property
+            }],
         };
 
         db.upsert_interface(&InterfaceDef {
@@ -827,6 +872,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, "widget");
         assert_eq!(listed[0].properties.len(), 2);
+        assert_eq!(listed[0].properties[1].classification, "internal");
         assert_eq!(listed[0].implements, vec!["Trackable"]);
 
         let interfaces = db.list_interfaces().unwrap();
@@ -854,6 +900,23 @@ mod tests {
         let err = validate_object_type_definition(&object_type, registry.get("widget"), &registry)
             .unwrap_err();
         assert!(err.contains("unknown interface"));
+    }
+
+    #[test]
+    fn test_validate_object_type_rejects_invalid_property_classification() {
+        let registry = SchemaRegistry::new();
+        let mut object_type = ObjectType {
+            kind: "widget".into(),
+            description: "A widget".into(),
+            is_builtin: false,
+            implements: vec![],
+            properties: vec![prop("secret", PropertyType::String, false)],
+        };
+        object_type.properties[0].classification = "private".into();
+
+        let err = validate_object_type_definition(&object_type, registry.get("widget"), &registry)
+            .unwrap_err();
+        assert!(err.contains("invalid classification"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
@@ -13,6 +14,8 @@ use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, compute, coordination, dataset, function, security};
 use uuid::Uuid;
+
+const REDACTED_VALUE: &str = "[redacted]";
 
 pub struct SekaiServiceImpl {
     db: Arc<SekaiDb>,
@@ -103,7 +106,12 @@ impl SekaiServiceImpl {
             self.security.can_access(&candidate.id, &refs)
         })
         .map_err(Status::internal)?;
-        Ok(object)
+        Ok(redact_restricted_properties(
+            object,
+            &schema,
+            &self.security,
+            principals,
+        ))
     }
 
     fn resolve_computed_for_responses(
@@ -190,6 +198,7 @@ fn now_millis() -> i64 {
 fn redact_action_evidence(
     params: &std::collections::HashMap<String, String>,
     sensitive_params: &std::collections::HashSet<String>,
+    schema_restricted_property: Option<bool>,
 ) -> std::collections::HashMap<String, String> {
     params
         .iter()
@@ -198,7 +207,9 @@ fn redact_action_evidence(
             let sensitive_property = params
                 .get("key")
                 .or_else(|| params.get("property"))
-                .map(|property| is_sensitive_name(property))
+                .map(|property| {
+                    schema_restricted_property.unwrap_or_else(|| is_sensitive_name(property))
+                })
                 .unwrap_or(false);
             let value = if is_sensitive_name(&lower)
                 || sensitive_params.contains(key)
@@ -217,11 +228,14 @@ fn redact_action_outcome(
     action: &str,
     params: &std::collections::HashMap<String, String>,
     outcome: &str,
+    schema_restricted_property: Option<bool>,
 ) -> String {
     if action == "set_property"
         && params
             .get("key")
-            .map(|property| is_sensitive_name(property))
+            .map(|property| {
+                schema_restricted_property.unwrap_or_else(|| is_sensitive_name(property))
+            })
             .unwrap_or(false)
     {
         return format!(
@@ -231,6 +245,24 @@ fn redact_action_outcome(
         );
     }
     outcome.to_string()
+}
+
+fn schema_restricted_action_property(
+    db: &SekaiDb,
+    schema: &schema::SchemaRegistry,
+    params: &std::collections::HashMap<String, String>,
+) -> Option<bool> {
+    let property_name = params.get("key").or_else(|| params.get("property"))?;
+    let object_id = params.get("id").or_else(|| params.get("object_id"))?;
+    let object = db.get_object(object_id).ok().flatten()?;
+    let object_type = schema.get(&object.kind)?;
+    let property = object_type
+        .properties
+        .iter()
+        .find(|property| property.name == *property_name)?;
+    Some(schema::is_restricted_property_classification(
+        &property.classification,
+    ))
 }
 
 fn is_sensitive_name(value: &str) -> bool {
@@ -612,6 +644,265 @@ fn to_proto_obj(o: &domain::Object) -> Object {
     }
 }
 
+fn can_read_restricted_properties(
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+) -> bool {
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+    {
+        return true;
+    }
+    let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    security.can_admin(&object.id, &refs)
+}
+
+fn redact_restricted_properties(
+    mut object: domain::Object,
+    schema: &schema::SchemaRegistry,
+    security: &SecurityChecker,
+    principals: &[String],
+) -> domain::Object {
+    if can_read_restricted_properties(security, &object, principals) {
+        return object;
+    }
+    let Some(object_type) = schema.get(&object.kind) else {
+        return object;
+    };
+    for property in &object_type.properties {
+        if schema::is_restricted_property_classification(&property.classification)
+            && object.properties.contains_key(&property.name)
+        {
+            object
+                .properties
+                .insert(property.name.clone(), REDACTED_VALUE.to_string());
+        }
+    }
+    object
+}
+
+fn restricted_property_names_for_kind(
+    schema: &schema::SchemaRegistry,
+    kind: &str,
+) -> std::collections::HashSet<String> {
+    if kind.is_empty() {
+        return schema
+            .all()
+            .iter()
+            .flat_map(|object_type| {
+                object_type
+                    .properties
+                    .iter()
+                    .filter(|property| {
+                        schema::is_restricted_property_classification(&property.classification)
+                    })
+                    .map(|property| property.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+    schema
+        .get(kind)
+        .map(|object_type| {
+            object_type
+                .properties
+                .iter()
+                .filter(|property| {
+                    schema::is_restricted_property_classification(&property.classification)
+                })
+                .map(|property| property.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn principals_can_query_restricted_properties(principals: &[String]) -> bool {
+    principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+}
+
+fn ensure_property_query_allowed(
+    schema: &schema::SchemaRegistry,
+    principals: &[String],
+    kind: &str,
+    properties: impl IntoIterator<Item = String>,
+) -> Result<(), Status> {
+    if principals_can_query_restricted_properties(principals) {
+        return Ok(());
+    }
+    let restricted = restricted_property_names_for_kind(schema, kind);
+    if restricted.is_empty() {
+        return Ok(());
+    }
+    if let Some(property) = properties
+        .into_iter()
+        .find(|property| restricted.contains(property))
+    {
+        return Err(Status::permission_denied(format!(
+            "restricted property filter denied: {property}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_list_filter_query_allowed(
+    schema: &schema::SchemaRegistry,
+    principals: &[String],
+    filter: &domain::ListFilter,
+) -> Result<(), Status> {
+    let mut queried_properties = filter
+        .property_filters
+        .iter()
+        .map(|property_filter| property_filter.key.clone())
+        .collect::<Vec<_>>();
+    if let Some(order_property) = queried_order_property(&filter.order_by) {
+        queried_properties.push(order_property);
+    }
+    ensure_property_query_allowed(
+        schema,
+        principals,
+        filter.kind.as_deref().unwrap_or_default(),
+        queried_properties,
+    )
+}
+
+fn queried_order_property(order_by: &str) -> Option<String> {
+    order_by
+        .strip_prefix("property:")
+        .filter(|property| !property.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn preserve_redacted_restricted_properties(
+    db: &SekaiDb,
+    schema: &schema::SchemaRegistry,
+    security: &SecurityChecker,
+    principals: &[String],
+    object: &mut domain::Object,
+) -> Result<(), Status> {
+    if can_read_restricted_properties(security, object, principals) {
+        return Ok(());
+    }
+    let Some(existing) = db.get_object(&object.id).map_err(Status::internal)? else {
+        return Ok(());
+    };
+    let mut restricted = restricted_property_names_for_kind(schema, &object.kind);
+    restricted.extend(restricted_property_names_for_kind(schema, &existing.kind));
+    if object.kind != existing.kind
+        && restricted
+            .iter()
+            .any(|property| existing.properties.contains_key(property))
+    {
+        return Err(Status::permission_denied(
+            "restricted property mutation denied",
+        ));
+    }
+    for property in restricted {
+        if let Some(existing_value) = existing.properties.get(&property) {
+            object.properties.insert(property, existing_value.clone());
+        } else {
+            object.properties.remove(&property);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_restricted_create_properties_allowed(
+    schema: &schema::SchemaRegistry,
+    security: &SecurityChecker,
+    principals: &[String],
+    object: &domain::Object,
+) -> Result<(), Status> {
+    if can_read_restricted_properties(security, object, principals) {
+        return Ok(());
+    }
+    let restricted = restricted_property_names_for_kind(schema, &object.kind);
+    if let Some(property) = restricted.into_iter().find(|property| {
+        object
+            .properties
+            .get(property)
+            .is_some_and(|value| !value.is_empty())
+    }) {
+        return Err(Status::permission_denied(format!(
+            "restricted property mutation denied: {property}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_function_allows_restricted_properties(
+    schema: &schema::SchemaRegistry,
+    principals: &[String],
+    function: &function::Function,
+) -> Result<(), Status> {
+    for step in &function.pipeline {
+        match step.op.as_str() {
+            "filter" if !step.property.is_empty() => {
+                ensure_property_query_allowed(
+                    schema,
+                    principals,
+                    &step.kind,
+                    [step.property.clone()],
+                )?;
+            }
+            "aggregate" | "transform" if !step.field.is_empty() => {
+                ensure_property_query_allowed(schema, principals, "", [step.field.clone()])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn redact_object_change_values(
+    change: audit::ObjectChange,
+    object_id: &str,
+    kind: &str,
+    schema: &schema::SchemaRegistry,
+    security: &SecurityChecker,
+    principals: &[String],
+) -> ObjectChange {
+    let object = domain::Object {
+        id: object_id.into(),
+        kind: kind.into(),
+        name: String::new(),
+        namespace: String::new(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: 0,
+        updated: 0,
+    };
+    let restricted = if can_read_restricted_properties(security, &object, principals) {
+        std::collections::HashSet::new()
+    } else {
+        restricted_property_names_for_kind(schema, kind)
+    };
+    let should_redact = change
+        .field
+        .strip_prefix("properties.")
+        .is_some_and(|property| restricted.contains(property));
+    ObjectChange {
+        id: change.id,
+        object_id: change.object_id,
+        field: change.field,
+        old_value: if should_redact {
+            REDACTED_VALUE.into()
+        } else {
+            change.old_value
+        },
+        new_value: if should_redact {
+            REDACTED_VALUE.into()
+        } else {
+            change.new_value
+        },
+        changed_by: change.changed_by,
+        timestamp: change.timestamp,
+    }
+}
+
 fn to_proto_link(l: &domain::Link) -> Link {
     Link {
         id: l.id.clone(),
@@ -671,6 +962,8 @@ fn to_proto_property_def(property: &schema::PropertyDef) -> PropertyDef {
         enum_values: property.enum_values.clone(),
         link_kind: property.link_kind.clone(),
         compute_expr: property.compute_expr.clone(),
+        classification: schema::normalize_property_classification(&property.classification)
+            .to_string(),
     }
 }
 
@@ -715,6 +1008,8 @@ fn from_proto_property_def(property: &PropertyDef) -> Result<schema::PropertyDef
         enum_values: property.enum_values.clone(),
         link_kind: property.link_kind.clone(),
         compute_expr: property.compute_expr.clone(),
+        classification: schema::normalize_property_classification(&property.classification)
+            .to_string(),
     })
 }
 
@@ -1250,16 +1545,28 @@ impl SekaiService for SekaiServiceImpl {
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
         self.require_schema_kind_loaded(&domain_obj.kind)?;
-        self.schema
+        let schema = self
+            .schema
             .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        schema
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
+        ensure_restricted_create_properties_allowed(
+            &schema,
+            &self.security,
+            &principals,
+            &domain_obj,
+        )?;
+        drop(schema);
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .create_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?;
-        Ok(Response::new(CreateObjectResponse { object: Some(obj) }))
+        let domain_obj = self.resolve_computed_for_response(domain_obj, &principals)?;
+        Ok(Response::new(CreateObjectResponse {
+            object: Some(to_proto_obj(&domain_obj)),
+        }))
     }
     async fn get_object(
         &self,
@@ -1291,19 +1598,32 @@ impl SekaiService for SekaiServiceImpl {
             return Err(Status::invalid_argument("id required"));
         }
         check_write(&self.security, &obj.id, &principals)?;
-        let domain_obj = from_proto_obj(&obj);
+        let mut domain_obj = from_proto_obj(&obj);
         self.require_schema_kind_loaded(&domain_obj.kind)?;
-        self.schema
+        let schema = self
+            .schema
             .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        preserve_redacted_restricted_properties(
+            &self.db,
+            &schema,
+            &self.security,
+            &principals,
+            &mut domain_obj,
+        )?;
+        schema
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
+        drop(schema);
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .update_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        Ok(Response::new(UpdateObjectResponse { object: Some(obj) }))
+        let domain_obj = self.resolve_computed_for_response(domain_obj, &principals)?;
+        Ok(Response::new(UpdateObjectResponse {
+            object: Some(to_proto_obj(&domain_obj)),
+        }))
     }
     async fn delete_object(
         &self,
@@ -1324,6 +1644,26 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            let mut queried_properties = filter
+                .property_filters
+                .iter()
+                .map(|property_filter| property_filter.key.clone())
+                .collect::<Vec<_>>();
+            if let Some(order_property) = queried_order_property(&filter.order_by) {
+                queried_properties.push(order_property);
+            }
+            ensure_property_query_allowed(
+                &schema,
+                &principals,
+                filter.kind.as_deref().unwrap_or_default(),
+                queried_properties,
+            )?;
+        }
         // The API now defaults paging at 100 rows when no limit is provided;
         // DB callers using list_objects(&filter) remain unchanged.
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1362,6 +1702,13 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
+        {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            ensure_property_query_allowed(&schema, &principals, &r.kind, [r.key.clone()])?;
+        }
         let objs = self
             .db
             .find_by_property(&r.kind, &r.key, &r.value)
@@ -1388,6 +1735,13 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::invalid_argument("object_set required"))?,
             owner.as_str(),
         )?;
+        {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            ensure_list_filter_query_allowed(&schema, &principals, &domain_set.filter)?;
+        }
         self.db.create_object_set(&domain_set).map_err(|e| {
             let duplicate_name = e.starts_with("UNIQUE constraint failed:")
                 && e.contains("sekai_object_sets.owner_principal")
@@ -1466,6 +1820,13 @@ impl SekaiService for SekaiServiceImpl {
                 return Err(Status::invalid_argument("offset must be >= 0"));
             }
             filter.offset = offset;
+        }
+        {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            ensure_list_filter_query_allowed(&schema, &principals, &filter)?;
         }
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let (objects, total) = self
@@ -1570,6 +1931,19 @@ impl SekaiService for SekaiServiceImpl {
             .schema
             .read()
             .map_err(|_| Status::internal("schema registry unavailable"))?;
+        let queried_properties = gq.property_filter.keys().cloned().collect::<Vec<_>>();
+        if gq.kind_filter.is_empty() {
+            ensure_property_query_allowed(&schema, &principals, "", queried_properties)?;
+        } else {
+            for kind in &gq.kind_filter {
+                ensure_property_query_allowed(
+                    &schema,
+                    &principals,
+                    kind,
+                    queried_properties.clone(),
+                )?;
+            }
+        }
         let mut res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
             .map_err(Status::internal)?;
         drop(schema);
@@ -1930,6 +2304,8 @@ impl SekaiService for SekaiServiceImpl {
         actions
             .validate_action_schema(&r.action, &schema)
             .map_err(Status::invalid_argument)?;
+        let schema_restricted_property =
+            schema_restricted_action_property(&self.db, &schema, &r.params);
         let msg = actions
             .execute(&self.db, &schema, &r.action, &r.params, &actor)
             .map_err(Status::invalid_argument)?;
@@ -1942,9 +2318,18 @@ impl SekaiService for SekaiServiceImpl {
                 actor,
                 action: r.action.clone(),
                 reason: "execute_action".into(),
-                evidence: redact_action_evidence(&r.params, &sensitive_params),
+                evidence: redact_action_evidence(
+                    &r.params,
+                    &sensitive_params,
+                    schema_restricted_property,
+                ),
                 target_id: target_ids.first().cloned().unwrap_or_default(),
-                outcome: redact_action_outcome(&r.action, &r.params, &msg),
+                outcome: redact_action_outcome(
+                    &r.action,
+                    &r.params,
+                    &msg,
+                    schema_restricted_property,
+                ),
             })
             .map_err(Status::internal)?;
         Ok(Response::new(ExecuteActionResponse {
@@ -1958,14 +2343,20 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<GetLineageRequest>,
     ) -> Result<Response<GetLineageResponse>, Status> {
+        let principals = caller_principals(&req);
         let r = req.into_inner();
         let res = crate::sekai::lineage::get_lineage(&self.db, &r.object_id, r.max_nodes as usize)
             .map_err(Status::internal)?;
+        let objects = self.resolve_computed_for_responses(
+            res.nodes.iter().map(|node| node.object.clone()).collect(),
+            &principals,
+        )?;
         let nodes = res
             .nodes
             .iter()
-            .map(|n| LineageNode {
-                object: Some(to_proto_obj(&n.object)),
+            .zip(objects.iter())
+            .map(|(n, object)| LineageNode {
+                object: Some(to_proto_obj(object)),
                 role: n.role.clone(),
                 ephemeral: n.ephemeral,
             })
@@ -2825,13 +3216,21 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("function not found"))?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
+        {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            ensure_function_allows_restricted_properties(&schema, &principals, &function)?;
+        }
         let result = function::execute_with_filter(&self.db, &function, &inner.params, |object| {
             self.security.can_access(&object.id, &refs)
         })
         .map_err(Status::invalid_argument)?;
+        let objects = self.resolve_computed_for_responses(result.objects, &principals)?;
         Ok(Response::new(ExecuteFunctionResponse {
             result: Some(FunctionResult {
-                objects: result.objects.iter().map(to_proto_obj).collect(),
+                objects: objects.iter().map(to_proto_obj).collect(),
                 aggregates: result.aggregates,
             }),
         }))
@@ -3167,19 +3566,48 @@ impl SekaiService for SekaiServiceImpl {
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         check_read(&self.security, &inner.object_id, &principals)?;
+        let object = self
+            .db
+            .get_object(&inner.object_id)
+            .map_err(Status::internal)?;
+        let object_kind = match object.as_ref() {
+            Some(object) => Some(object.kind.clone()),
+            None => self
+                .db
+                .object_change_kind(&inner.object_id)
+                .map_err(Status::internal)?,
+        };
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .clone();
         let changes = self
             .db
             .list_object_changes(&inner.object_id, inner.limit, inner.offset)
             .map_err(Status::internal)?
             .into_iter()
-            .map(|c| ObjectChange {
-                id: c.id,
-                object_id: c.object_id,
-                field: c.field,
-                old_value: c.old_value,
-                new_value: c.new_value,
-                changed_by: c.changed_by,
-                timestamp: c.timestamp,
+            .map(|change| {
+                if let Some(kind) = object_kind.as_deref() {
+                    redact_object_change_values(
+                        change,
+                        &inner.object_id,
+                        kind,
+                        &schema,
+                        &self.security,
+                        &principals,
+                    )
+                } else {
+                    ObjectChange {
+                        id: change.id,
+                        object_id: change.object_id,
+                        field: change.field,
+                        old_value: change.old_value,
+                        new_value: change.new_value,
+                        changed_by: change.changed_by,
+                        timestamp: change.timestamp,
+                    }
+                }
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
@@ -3221,6 +3649,7 @@ mod tests {
                     enum_values: vec![],
                     link_kind: "".into(),
                     compute_expr: "".into(),
+                    classification: "public".into(),
                 },
                 PropertyDef {
                     name: "color".into(),
@@ -3230,6 +3659,7 @@ mod tests {
                     enum_values: vec!["red".into(), "blue".into()],
                     link_kind: "".into(),
                     compute_expr: "".into(),
+                    classification: "public".into(),
                 },
             ],
             is_builtin: false,
@@ -3510,6 +3940,400 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_responses_redact_restricted_schema_properties() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "secret_note".into(),
+            r#type: "string".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+            classification: "sensitive".into(),
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        }))
+        .await
+        .unwrap();
+        let create_err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-denied",
+                    HashMap::from([
+                        ("name".into(), "spinner".into()),
+                        ("color".into(), "blue".into()),
+                        ("secret_note".into(), "launch code".into()),
+                    ]),
+                )),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(create_err.code(), tonic::Code::PermissionDenied);
+
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-secret",
+                    HashMap::from([
+                        ("name".into(), "spinner".into()),
+                        ("color".into(), "blue".into()),
+                        ("secret_note".into(), "launch code".into()),
+                    ]),
+                )),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let got = svc
+            .get_object(with_principal(GetObjectRequest {
+                id: "widget-secret".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(got.properties["name"], "spinner");
+        assert_eq!(got.properties["secret_note"], "[redacted]");
+
+        svc.create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "list_widgets".into(),
+                description: "".into(),
+                params: vec![],
+                pipeline: vec![PipelineStep {
+                    op: "filter".into(),
+                    kind: "widget".into(),
+                    property: "".into(),
+                    value: "".into(),
+                    relation: "".into(),
+                    dir: "".into(),
+                    func: "".into(),
+                    field: "".into(),
+                    r#as: "".into(),
+                }],
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        let function_result = svc
+            .execute_function(with_principal(ExecuteFunctionRequest {
+                name: "list_widgets".into(),
+                params: HashMap::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(
+            function_result.objects[0].properties["secret_note"],
+            "[redacted]"
+        );
+
+        svc.create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "filter_secret_widgets".into(),
+                description: "".into(),
+                params: vec![],
+                pipeline: vec![PipelineStep {
+                    op: "filter".into(),
+                    kind: "widget".into(),
+                    property: "secret_note".into(),
+                    value: "launch code".into(),
+                    relation: "".into(),
+                    dir: "".into(),
+                    func: "".into(),
+                    field: "".into(),
+                    r#as: "".into(),
+                }],
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        let function_err = svc
+            .execute_function(with_principal(ExecuteFunctionRequest {
+                name: "filter_secret_widgets".into(),
+                params: HashMap::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(function_err.code(), tonic::Code::PermissionDenied);
+
+        let lineage = svc
+            .get_lineage(with_principal(GetLineageRequest {
+                object_id: "widget-secret".into(),
+                max_nodes: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(
+            lineage.nodes[0].object.as_ref().unwrap().properties["secret_note"],
+            "[redacted]"
+        );
+
+        let find_err = svc
+            .find_by_property(with_principal(FindByPropertyRequest {
+                kind: "widget".into(),
+                key: "secret_note".into(),
+                value: "launch code".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(find_err.code(), tonic::Code::PermissionDenied);
+
+        let list_err = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "widget".into(),
+                    property_filters: vec![PropertyFilter {
+                        key: "secret_note".into(),
+                        op: "eq".into(),
+                        value: "launch code".into(),
+                    }],
+                    limit: 10,
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(list_err.code(), tonic::Code::PermissionDenied);
+
+        let object_set_err = svc
+            .create_object_set(with_principal(CreateObjectSetRequest {
+                object_set: Some(ObjectSet {
+                    id: "secret-set".into(),
+                    name: "secret set".into(),
+                    description: String::new(),
+                    filter: Some(ListFilter {
+                        kind: "widget".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "secret_note".into(),
+                            op: "eq".into(),
+                            value: "launch code".into(),
+                        }],
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    owner_principal: String::new(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(object_set_err.code(), tonic::Code::PermissionDenied);
+
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "widget".into(),
+                    limit: 10,
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects[0].properties["secret_note"], "[redacted]");
+
+        let mut update = got;
+        update.name = "renamed".into();
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(update),
+        }))
+        .await
+        .unwrap();
+        let stored = svc.db.get_object("widget-secret").unwrap().unwrap();
+        assert_eq!(stored.name, "renamed");
+        assert_eq!(stored.properties["secret_note"], "launch code");
+
+        let mut attempted_overwrite = stored.clone();
+        attempted_overwrite
+            .properties
+            .insert("secret_note".into(), "attacker code".into());
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(to_proto_obj(&attempted_overwrite)),
+        }))
+        .await
+        .unwrap();
+        let stored = svc.db.get_object("widget-secret").unwrap().unwrap();
+        assert_eq!(stored.properties["secret_note"], "launch code");
+
+        let mut changed_secret = stored.clone();
+        changed_secret
+            .properties
+            .insert("secret_note".into(), "rotated code".into());
+        svc.db
+            .update_object_with_audit(&changed_secret, "root")
+            .unwrap();
+        let changes = svc
+            .list_object_changes(with_principal(ListObjectChangesRequest {
+                object_id: "widget-secret".into(),
+                limit: 20,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+        let secret_change = changes
+            .iter()
+            .find(|change| change.field == "properties.secret_note")
+            .unwrap();
+        assert_eq!(secret_change.old_value, "[redacted]");
+        assert_eq!(secret_change.new_value, "[redacted]");
+
+        grant_object_role(&svc, "widget-secret", "tester", security::Role::Admin);
+        let admin_view = svc
+            .get_object(with_principal(GetObjectRequest {
+                id: "widget-secret".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(admin_view.properties["secret_note"], "rotated code");
+
+        grant_object_role(&svc, "widget-secret", "reader", security::Role::Viewer);
+        svc.delete_object(with_principal(DeleteObjectRequest {
+            id: "widget-secret".into(),
+        }))
+        .await
+        .unwrap();
+        let deleted_changes = svc
+            .list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: "widget-secret".into(),
+                    limit: 20,
+                    offset: 0,
+                },
+                "reader",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+        let deleted_secret_change = deleted_changes
+            .iter()
+            .find(|change| change.field == "properties.secret_note")
+            .unwrap();
+        assert_eq!(deleted_secret_change.old_value, "[redacted]");
+        assert_eq!(deleted_secret_change.new_value, "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn action_audit_prefers_schema_classification_over_name_heuristic() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "api_key_label".into(),
+            r#type: "string".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+            classification: "public".into(),
+        });
+        schema_type.properties.push(PropertyDef {
+            name: "secret_note".into(),
+            r#type: "string".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+            classification: "sensitive".into(),
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&domain::Object {
+                id: "widget-audit".into(),
+                kind: "widget".into(),
+                name: "widget".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::from([
+                    ("name".into(), "spinner".into()),
+                    ("color".into(), "blue".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "widget-audit".into()),
+                    ("key".into(), "api_key_label".into()),
+                    ("value".into(), "public alias".into()),
+                ]),
+                actor: "".into(),
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "widget-audit".into()),
+                    ("key".into(), "secret_note".into()),
+                    ("value".into(), "launch code".into()),
+                ]),
+                actor: "".into(),
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let public_decision = decisions
+            .iter()
+            .find(|decision| decision.outcome.contains("api_key_label"))
+            .unwrap();
+        let sensitive_decision = decisions
+            .iter()
+            .find(|decision| decision.outcome.contains("secret_note"))
+            .unwrap();
+        assert_eq!(public_decision.evidence["value"], "public alias");
+        assert_eq!(
+            public_decision.outcome,
+            "set widget-audit.api_key_label = public alias"
+        );
+        assert_eq!(sensitive_decision.evidence["value"], "[redacted]");
+        assert_eq!(
+            sensitive_decision.outcome,
+            "set widget-audit.secret_note = [redacted]"
+        );
+    }
+
+    #[tokio::test]
     async fn user_defined_action_type_round_trip_and_execute() {
         let svc = service();
         grant_schema_admin(&svc);
@@ -3622,6 +4446,7 @@ mod tests {
             enum_values: vec![],
             link_kind: "".into(),
             compute_expr: "".into(),
+            classification: "public".into(),
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -3908,6 +4733,7 @@ mod tests {
             enum_values: vec!["small".into(), "large".into()],
             link_kind: "".into(),
             compute_expr: "".into(),
+            classification: "public".into(),
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -4653,6 +5479,7 @@ mod tests {
                     enum_values: vec![],
                     link_kind: "".into(),
                     compute_expr: "count_children".into(),
+                    classification: "public".into(),
                 }],
                 is_builtin: false,
                 implements: vec![],
@@ -4744,6 +5571,7 @@ mod tests {
                         enum_values: vec![],
                         link_kind: "".into(),
                         compute_expr: "missing_function".into(),
+                        classification: "public".into(),
                     }],
                     is_builtin: false,
                     implements: vec![],
@@ -4816,6 +5644,7 @@ mod tests {
                     enum_values: vec![],
                     link_kind: "".into(),
                     compute_expr: "ambiguous_child_count".into(),
+                    classification: "public".into(),
                 }],
                 is_builtin: false,
                 implements: vec![],
@@ -5278,6 +6107,7 @@ mod tests {
                 enum_values: vec![],
                 link_kind: "".into(),
                 compute_expr: "".into(),
+                classification: "public".into(),
             }],
             is_builtin: false,
         };
@@ -5308,6 +6138,7 @@ mod tests {
             enum_values: vec![],
             link_kind: "".into(),
             compute_expr: "".into(),
+            classification: "public".into(),
         });
         let err = svc
             .create_schema_type(with_principal(CreateSchemaTypeRequest {
@@ -5328,6 +6159,7 @@ mod tests {
             enum_values: vec![],
             link_kind: "".into(),
             compute_expr: "".into(),
+            classification: "public".into(),
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(valid_type),
@@ -5349,6 +6181,7 @@ mod tests {
                             enum_values: vec![],
                             link_kind: "".into(),
                             compute_expr: "".into(),
+                            classification: "public".into(),
                         },
                         PropertyDef {
                             name: "second_tracking_id".into(),
@@ -5358,6 +6191,7 @@ mod tests {
                             enum_values: vec![],
                             link_kind: "".into(),
                             compute_expr: "".into(),
+                            classification: "public".into(),
                         },
                     ],
                     is_builtin: false,

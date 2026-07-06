@@ -1422,6 +1422,7 @@ mod tests {
                 enum_values: vec![],
                 link_kind: String::new(),
                 compute_expr: String::new(),
+                classification: crate::sekai::schema::default_property_classification(),
             }],
             is_builtin: false,
             implements: vec!["RiskScored".into(), "Governed".into()],
