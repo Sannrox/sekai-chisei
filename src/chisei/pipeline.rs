@@ -3,7 +3,8 @@ use crate::chisei::egress;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
-use std::collections::HashSet;
+use crate::sekai::schema::ObjectType;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct PipelineRequest {
@@ -184,6 +185,20 @@ fn risk_score_value(obj: &Object) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+fn filter_context_property(
+    db: &SekaiDb,
+    type_cache: &mut HashMap<String, Option<ObjectType>>,
+    obj: &Object,
+    field: &str,
+    record: &mut egress::ContextEgressRecord,
+    external: bool,
+) -> Option<String> {
+    let object_type = type_cache
+        .entry(obj.kind.clone())
+        .or_insert_with(|| db.get_object_type(&obj.kind).ok().flatten());
+    egress::filter_property_with_schema(obj, field, object_type.as_ref(), record, external)
+}
+
 fn collect_related_verdict_context(
     obj: &Object,
     db: &SekaiDb,
@@ -191,6 +206,7 @@ fn collect_related_verdict_context(
 ) -> (Vec<String>, Vec<egress::ContextEgressRecord>) {
     let mut lines = Vec::new();
     let mut records = Vec::new();
+    let mut type_cache = HashMap::new();
     let mut candidates = db
         .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
         .unwrap_or_default();
@@ -212,9 +228,14 @@ fn collect_related_verdict_context(
             continue;
         };
         let mut record = egress::new_record(&candidate);
-        let Some(verdict) =
-            egress::filter_property(&candidate, verdict_key, &mut record, external_egress)
-        else {
+        let Some(verdict) = filter_context_property(
+            db,
+            &mut type_cache,
+            &candidate,
+            verdict_key,
+            &mut record,
+            external_egress,
+        ) else {
             records.push(record);
             continue;
         };
@@ -265,6 +286,7 @@ impl Step for ObjectContextEnrichStep {
                 value: String::new(),
             };
         }
+        let mut type_cache = HashMap::new();
         for obj in context_objects {
             let mut egress_record = egress::new_record(&obj);
             let mut has_content = false;
@@ -273,9 +295,14 @@ impl Step for ObjectContextEnrichStep {
                 obj.properties
                     .get(**key)
                     .is_some_and(|value| !value.is_empty())
-            }) && let Some(verdict) =
-                egress::filter_property(&obj, verdict_key, &mut egress_record, req.external_egress)
-            {
+            }) && let Some(verdict) = filter_context_property(
+                db,
+                &mut type_cache,
+                &obj,
+                verdict_key,
+                &mut egress_record,
+                req.external_egress,
+            ) {
                 details.push(format!("prior_verdict: {}", verdict));
                 has_content = true;
             }
@@ -283,7 +310,9 @@ impl Step for ObjectContextEnrichStep {
                 obj.properties
                     .get(**key)
                     .is_some_and(|value| !value.is_empty())
-            }) && let Some(conviction) = egress::filter_property(
+            }) && let Some(conviction) = filter_context_property(
+                db,
+                &mut type_cache,
                 &obj,
                 conviction_key,
                 &mut egress_record,
@@ -294,8 +323,14 @@ impl Step for ObjectContextEnrichStep {
             }
             if obj.properties.get("score").is_some_and(|s| !s.is_empty())
                 && !details.iter().any(|d| d.contains("conviction"))
-                && let Some(score) =
-                    egress::filter_property(&obj, "score", &mut egress_record, req.external_egress)
+                && let Some(score) = filter_context_property(
+                    db,
+                    &mut type_cache,
+                    &obj,
+                    "score",
+                    &mut egress_record,
+                    req.external_egress,
+                )
             {
                 details.push(format!("score: {}", score));
                 has_content = true;
@@ -304,7 +339,9 @@ impl Step for ObjectContextEnrichStep {
                 .properties
                 .get("success_rate")
                 .is_some_and(|value| !value.is_empty())
-                && let Some(rate) = egress::filter_property(
+                && let Some(rate) = filter_context_property(
+                    db,
+                    &mut type_cache,
                     &obj,
                     "success_rate",
                     &mut egress_record,
@@ -319,7 +356,9 @@ impl Step for ObjectContextEnrichStep {
                     .properties
                     .get("risk_score")
                     .is_some_and(|value| !value.is_empty())
-                && let Some(score) = egress::filter_property(
+                && let Some(score) = filter_context_property(
+                    db,
+                    &mut type_cache,
                     &obj,
                     "risk_score",
                     &mut egress_record,
@@ -334,7 +373,9 @@ impl Step for ObjectContextEnrichStep {
                     .properties
                     .get("risk_reason")
                     .is_some_and(|value| !value.is_empty())
-                && let Some(reason) = egress::filter_property(
+                && let Some(reason) = filter_context_property(
+                    db,
+                    &mut type_cache,
                     &obj,
                     "risk_reason",
                     &mut egress_record,
@@ -352,13 +393,17 @@ impl Step for ObjectContextEnrichStep {
             for candidate in learnings {
                 if candidate.kind == KIND_LEARNING {
                     let mut learning_record = egress::new_record(&candidate);
-                    let title = egress::filter_property(
+                    let title = filter_context_property(
+                        db,
+                        &mut type_cache,
                         &candidate,
                         "title",
                         &mut learning_record,
                         req.external_egress,
                     );
-                    let prevention = egress::filter_property(
+                    let prevention = filter_context_property(
+                        db,
+                        &mut type_cache,
                         &candidate,
                         "prevention",
                         &mut learning_record,
@@ -517,6 +562,7 @@ impl Step for LearningsEnrichStep {
         }
         let mut pitfalls = Vec::new();
         let mut found_context = false;
+        let mut type_cache = HashMap::new();
         for context in resolve_context_objects(req, db) {
             found_context = true;
             let mut sources = vec![context.id.clone()];
@@ -536,13 +582,17 @@ impl Step for LearningsEnrichStep {
                         continue;
                     }
                     let mut learning_record = egress::new_record(&obj);
-                    let title = egress::filter_property(
+                    let title = filter_context_property(
+                        db,
+                        &mut type_cache,
                         &obj,
                         "title",
                         &mut learning_record,
                         req.external_egress,
                     );
-                    let prevention = egress::filter_property(
+                    let prevention = filter_context_property(
+                        db,
+                        &mut type_cache,
                         &obj,
                         "prevention",
                         &mut learning_record,
@@ -615,6 +665,7 @@ impl Step for SpecEnrichStep {
         }
         let mut hints = Vec::new();
         let mut found_context = false;
+        let mut type_cache = HashMap::new();
         for context in resolve_context_objects(req, db) {
             found_context = true;
             let components = db
@@ -625,7 +676,9 @@ impl Step for SpecEnrichStep {
                     continue;
                 }
                 let mut comp_record = egress::new_record(&comp);
-                let Some(safe_total) = egress::filter_property(
+                let Some(safe_total) = filter_context_property(
+                    db,
+                    &mut type_cache,
                     &comp,
                     "task_total",
                     &mut comp_record,
@@ -636,7 +689,9 @@ impl Step for SpecEnrichStep {
                     }
                     continue;
                 };
-                let Some(safe_rate) = egress::filter_property(
+                let Some(safe_rate) = filter_context_property(
+                    db,
+                    &mut type_cache,
                     &comp,
                     "success_rate",
                     &mut comp_record,
@@ -712,6 +767,7 @@ impl Step for RiskStep {
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
         let mut signals = Vec::new();
         let mut risk = 0.0f64;
+        let mut type_cache = HashMap::new();
         let snapshots = capacity::latest_snapshots(db, 24).unwrap_or_default();
         if snapshots.len() >= 3 {
             let latest = &snapshots[0];
@@ -746,7 +802,9 @@ impl Step for RiskStep {
                 .filter(|c| object_implements(db, c, INTERFACE_RISK_SCORED))
             {
                 let mut record = egress::new_record(candidate);
-                let exposed_score = egress::filter_property(
+                let exposed_score = filter_context_property(
+                    db,
+                    &mut type_cache,
                     candidate,
                     "risk_score",
                     &mut record,
@@ -1003,7 +1061,18 @@ mod tests {
             enum_values: vec![],
             link_kind: String::new(),
             compute_expr: String::new(),
+            classification: crate::sekai::schema::default_property_classification(),
         }
+    }
+
+    fn prop_with_classification(
+        name: &str,
+        prop_type: PropertyType,
+        classification: &str,
+    ) -> PropertyDef {
+        let mut property = prop(name, prop_type);
+        property.classification = classification.into();
+        property
     }
 
     fn register_object_type(
@@ -1233,6 +1302,54 @@ mod tests {
                 .prepared_spec
                 .contains("risk_reason: payment error spike")
         );
+    }
+
+    #[test]
+    fn test_object_context_prefers_schema_classification_over_legacy_allowlist() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![
+                prop_with_classification("risk_score", PropertyType::Float, "sensitive"),
+                prop("risk_reason", PropertyType::String),
+            ],
+        );
+        db.create_object(&Object {
+            id: "service-checkout".into(),
+            kind: "service".into(),
+            name: "checkout".into(),
+            namespace: "".into(),
+            external_id: "service:checkout".into(),
+            properties: HashMap::from([
+                ("risk_score".into(), "0.83".into()),
+                ("risk_reason".into(), "payment error spike".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "risk_score,risk_reason".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "service:checkout".into();
+        let result = p.run(&mut req, &db);
+
+        assert!(!result.prepared_spec.contains("risk_score: 0.83"));
+        assert!(
+            result
+                .prepared_spec
+                .contains("risk_reason: payment error spike")
+        );
+        assert!(result.egress_records.iter().any(|record| {
+            record.object_ref == "service:checkout"
+                && record.redacted_fields.contains(&"risk_score".to_string())
+        }));
     }
 
     #[test]
@@ -1558,7 +1675,11 @@ mod tests {
             &db,
             "service",
             vec![INTERFACE_RISK_SCORED],
-            vec![prop("risk_score", PropertyType::Float)],
+            vec![prop_with_classification(
+                "risk_score",
+                PropertyType::Float,
+                "sensitive",
+            )],
         );
         db.create_object(&Object {
             id: "namespace-alpha".into(),
@@ -1622,9 +1743,8 @@ mod tests {
         let result = p.run(&mut req, &db);
 
         assert_eq!(result.risk_score, 0.7);
-        assert!(result.warnings()[0].contains("1 high-risk object"));
         assert!(result.warnings()[0].contains("internal risk signal"));
-        assert!(!result.warnings()[0].contains("2 high-risk object"));
+        assert!(!result.warnings()[0].contains("high-risk object"));
         assert!(result.egress_records.iter().any(|record| {
             record.object_ref == "service:checkout"
                 && record.redacted_fields.contains(&"risk_score".to_string())
@@ -1638,7 +1758,11 @@ mod tests {
             &db,
             "service",
             vec![INTERFACE_RISK_SCORED],
-            vec![prop("risk_score", PropertyType::Float)],
+            vec![prop_with_classification(
+                "risk_score",
+                PropertyType::Float,
+                "sensitive",
+            )],
         );
         db.create_object(&Object {
             id: "service-checkout".into(),
