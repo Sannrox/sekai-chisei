@@ -74,6 +74,8 @@ const CONVICTION_KEYS: [&str; 4] = [
     "confidence",
     "confidence_score",
 ];
+const INTERFACE_EVALUABLE: &str = "Evaluable";
+const INTERFACE_RISK_SCORED: &str = "RiskScored";
 
 fn extract_object_context_refs(namespace: &str, spec: &str) -> Vec<(String, String)> {
     let mut refs = Vec::new();
@@ -139,6 +141,47 @@ fn resolve_context_objects(req: &PipelineRequest, db: &SekaiDb) -> Vec<crate::do
         }
     }
     objects
+}
+
+fn object_implements(db: &SekaiDb, obj: &Object, interface_name: &str) -> bool {
+    db.get_object_type(&obj.kind)
+        .ok()
+        .flatten()
+        .is_some_and(|object_type| {
+            object_type
+                .implements
+                .iter()
+                .any(|implemented| implemented == interface_name)
+        })
+}
+
+fn is_evaluable_context(db: &SekaiDb, obj: &Object) -> bool {
+    obj.kind == KIND_COMPONENT
+        || object_implements(db, obj, INTERFACE_EVALUABLE)
+        || object_implements(db, obj, INTERFACE_RISK_SCORED)
+}
+
+fn is_degraded_evaluable(db: &SekaiDb, obj: &Object, max_success_rate: i32) -> bool {
+    is_evaluable_context(db, obj)
+        && obj
+            .properties
+            .get("success_rate")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(100)
+            < max_success_rate
+        && obj
+            .properties
+            .get("task_total")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0)
+            >= 3
+}
+
+fn risk_score_value(obj: &Object) -> Option<f64> {
+    obj.properties
+        .get("risk_score")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
 fn collect_related_verdict_context(
@@ -269,6 +312,36 @@ impl Step for ObjectContextEnrichStep {
                 )
             {
                 details.push(format!("success_rate: {}", rate));
+                has_content = true;
+            }
+            if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+                && obj
+                    .properties
+                    .get("risk_score")
+                    .is_some_and(|value| !value.is_empty())
+                && let Some(score) = egress::filter_property(
+                    &obj,
+                    "risk_score",
+                    &mut egress_record,
+                    req.external_egress,
+                )
+            {
+                details.push(format!("risk_score: {}", score));
+                has_content = true;
+            }
+            if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+                && obj
+                    .properties
+                    .get("risk_reason")
+                    .is_some_and(|value| !value.is_empty())
+                && let Some(reason) = egress::filter_property(
+                    &obj,
+                    "risk_reason",
+                    &mut egress_record,
+                    req.external_egress,
+                )
+            {
+                details.push(format!("risk_reason: {}", reason));
                 has_content = true;
             }
 
@@ -548,7 +621,7 @@ impl Step for SpecEnrichStep {
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default();
             for comp in components {
-                if comp.kind != KIND_COMPONENT {
+                if !is_evaluable_context(db, &comp) {
                     continue;
                 }
                 let mut comp_record = egress::new_record(&comp);
@@ -580,15 +653,18 @@ impl Step for SpecEnrichStep {
                     if !req.external_egress || egress::include_identity(&comp) {
                         comp_record.included_fields.push("identity".into());
                         hints.push(format!(
-                            "component {} is degraded ({}% success)",
-                            comp.name, safe_rate
+                            "{} {} is degraded ({}% success)",
+                            comp.kind, comp.name, safe_rate
                         ));
                     } else {
                         comp_record.redacted_fields.push("identity".into());
                         comp_record
                             .reasons
                             .push("identity denied by default egress policy".into());
-                        hints.push(format!("component is degraded ({}% success)", safe_rate));
+                        hints.push(format!(
+                            "evaluable object is degraded ({}% success)",
+                            safe_rate
+                        ));
                     }
                     req.egress_records.push(comp_record);
                 }
@@ -657,22 +733,50 @@ impl Step for RiskStep {
                 .unwrap_or_default();
             let degraded = components
                 .iter()
-                .filter(|c| {
-                    c.kind == KIND_COMPONENT
-                        && c.properties
-                            .get("success_rate")
-                            .and_then(|v| v.parse::<i32>().ok())
-                            .unwrap_or(100)
-                            < 30
-                        && c.properties
-                            .get("task_total")
-                            .and_then(|v| v.parse::<i32>().ok())
-                            .unwrap_or(0)
-                            >= 3
-                })
+                .filter(|c| is_degraded_evaluable(db, c, 30))
                 .count();
             if degraded > 0 {
-                signals.push(format!("{degraded} degraded component(s) detected"));
+                signals.push(format!("{degraded} degraded evaluable object(s) detected"));
+                risk = risk.max(0.7);
+            }
+            let mut exposed_high_risk = 0usize;
+            let mut redacted_high_risk = 0usize;
+            for candidate in std::iter::once(&context)
+                .chain(components.iter())
+                .filter(|c| object_implements(db, c, INTERFACE_RISK_SCORED))
+            {
+                let mut record = egress::new_record(candidate);
+                let exposed_score = egress::filter_property(
+                    candidate,
+                    "risk_score",
+                    &mut record,
+                    req.external_egress,
+                );
+                let score_was_redacted = record
+                    .redacted_fields
+                    .iter()
+                    .any(|field| field == "risk_score");
+                if !record.included_fields.is_empty() || !record.redacted_fields.is_empty() {
+                    req.egress_records.push(record);
+                }
+                if risk_score_value(candidate).is_some_and(|score| score >= 0.7) {
+                    if exposed_score.is_none() && score_was_redacted {
+                        redacted_high_risk += 1;
+                    } else {
+                        exposed_high_risk += 1;
+                    }
+                }
+            }
+            if exposed_high_risk > 0 || redacted_high_risk > 0 {
+                if exposed_high_risk > 0 && redacted_high_risk > 0 {
+                    signals.push(format!(
+                        "{exposed_high_risk} high-risk object(s) detected; internal risk signal detected"
+                    ));
+                } else if exposed_high_risk > 0 {
+                    signals.push(format!("{exposed_high_risk} high-risk object(s) detected"));
+                } else {
+                    signals.push("internal risk signal detected".into());
+                }
                 risk = risk.max(0.7);
             }
         }
@@ -887,7 +991,36 @@ fn decode_review_policy(steps: &[StepDecision]) -> Option<ReviewPolicy> {
 mod tests {
     use super::*;
     use crate::domain::{Link, Object};
+    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
     use std::collections::HashMap;
+
+    fn prop(name: &str, prop_type: PropertyType) -> PropertyDef {
+        PropertyDef {
+            name: name.into(),
+            prop_type,
+            required: false,
+            description: String::new(),
+            enum_values: vec![],
+            link_kind: String::new(),
+            compute_expr: String::new(),
+        }
+    }
+
+    fn register_object_type(
+        db: &SekaiDb,
+        kind: &str,
+        implements: Vec<&str>,
+        properties: Vec<PropertyDef>,
+    ) {
+        db.upsert_object_type(&ObjectType {
+            kind: kind.into(),
+            description: format!("{kind} type"),
+            properties,
+            is_builtin: false,
+            implements: implements.into_iter().map(str::to_string).collect(),
+        })
+        .unwrap();
+    }
 
     fn make_req() -> PipelineRequest {
         PipelineRequest {
@@ -1054,6 +1187,51 @@ mod tests {
                 .egress_records
                 .iter()
                 .any(|record| record.redacted_fields.contains(&"identity".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_object_context_uses_risk_scored_interface() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![
+                prop("risk_score", PropertyType::Float),
+                prop("risk_reason", PropertyType::String),
+            ],
+        );
+        db.create_object(&Object {
+            id: "service-checkout".into(),
+            kind: "service".into(),
+            name: "checkout".into(),
+            namespace: "".into(),
+            external_id: "service:checkout".into(),
+            properties: HashMap::from([
+                ("risk_score".into(), "0.83".into()),
+                ("risk_reason".into(), "payment error spike".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "risk_score,risk_reason".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "service:checkout".into();
+        let result = p.run(&mut req, &db);
+
+        assert_eq!(result.steps[0].action, "enrich");
+        assert!(result.prepared_spec.contains("risk_score: 0.83"));
+        assert!(
+            result
+                .prepared_spec
+                .contains("risk_reason: payment error spike")
         );
     }
 
@@ -1242,6 +1420,248 @@ mod tests {
         assert!(result.egress_records.iter().any(|record| {
             record.object_ref == "component:secret-service"
                 && record.redacted_fields.contains(&"task_total".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_interface_backed_object_participates_in_degraded_routing() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_EVALUABLE],
+            vec![
+                prop("task_total", PropertyType::Int),
+                prop("success_rate", PropertyType::Int),
+            ],
+        );
+        db.create_object(&Object {
+            id: "namespace-alpha".into(),
+            kind: "namespace".into(),
+            name: "alpha".into(),
+            namespace: "".into(),
+            external_id: "namespace:alpha".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "service-checkout".into(),
+            kind: "service".into(),
+            name: "checkout".into(),
+            namespace: "".into(),
+            external_id: "service:checkout".into(),
+            properties: HashMap::from([
+                ("task_total".into(), "5".into()),
+                ("success_rate".into(), "20".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "contains-checkout".into(),
+            from_id: "namespace-alpha".into(),
+            to_id: "service-checkout".into(),
+            relation: REL_CONTAINS.into(),
+            created: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "namespace:alpha".into();
+        req.external_egress = false;
+        let result = p.run(&mut req, &db);
+
+        assert!(
+            result
+                .prepared_spec
+                .contains("service checkout is degraded")
+        );
+        assert_eq!(result.risk_score, 0.7);
+        assert!(result.warnings()[0].contains("degraded evaluable object"));
+    }
+
+    #[test]
+    fn test_redacted_interface_degradation_hint_uses_generic_label() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_EVALUABLE],
+            vec![
+                prop("task_total", PropertyType::Int),
+                prop("success_rate", PropertyType::Int),
+            ],
+        );
+        db.create_object(&Object {
+            id: "namespace-alpha".into(),
+            kind: "namespace".into(),
+            name: "alpha".into(),
+            namespace: "".into(),
+            external_id: "namespace:alpha".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "service-secret".into(),
+            kind: "service".into(),
+            name: "secret".into(),
+            namespace: "".into(),
+            external_id: "service:secret".into(),
+            properties: HashMap::from([
+                ("task_total".into(), "5".into()),
+                ("success_rate".into(), "20".into()),
+                (
+                    egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "task_total,success_rate".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "contains-secret-service".into(),
+            from_id: "namespace-alpha".into(),
+            to_id: "service-secret".into(),
+            relation: REL_CONTAINS.into(),
+            created: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "namespace:alpha".into();
+        let result = p.run(&mut req, &db);
+
+        assert!(
+            result
+                .prepared_spec
+                .contains("evaluable object is degraded (20% success)")
+        );
+        assert!(!result.prepared_spec.contains("component is degraded"));
+        assert!(result.egress_records.iter().any(|record| {
+            record.object_ref == "service:secret"
+                && record.redacted_fields.contains(&"identity".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_risk_scored_routing_respects_egress_policy() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![prop("risk_score", PropertyType::Float)],
+        );
+        db.create_object(&Object {
+            id: "namespace-alpha".into(),
+            kind: "namespace".into(),
+            name: "alpha".into(),
+            namespace: "".into(),
+            external_id: "namespace:alpha".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "service-checkout".into(),
+            kind: "service".into(),
+            name: "checkout".into(),
+            namespace: "".into(),
+            external_id: "service:checkout".into(),
+            properties: HashMap::from([("risk_score".into(), "0.91".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_object(&Object {
+            id: "service-billing".into(),
+            kind: "service".into(),
+            name: "billing".into(),
+            namespace: "".into(),
+            external_id: "service:billing".into(),
+            properties: HashMap::from([
+                ("risk_score".into(), "0.95".into()),
+                (
+                    "chisei.egress.external_properties".into(),
+                    "risk_score".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "contains-risk".into(),
+            from_id: "namespace-alpha".into(),
+            to_id: "service-checkout".into(),
+            relation: REL_CONTAINS.into(),
+            created: 0,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "contains-visible-risk".into(),
+            from_id: "namespace-alpha".into(),
+            to_id: "service-billing".into(),
+            relation: REL_CONTAINS.into(),
+            created: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "namespace:alpha".into();
+        let result = p.run(&mut req, &db);
+
+        assert_eq!(result.risk_score, 0.7);
+        assert!(result.warnings()[0].contains("1 high-risk object"));
+        assert!(result.warnings()[0].contains("internal risk signal"));
+        assert!(!result.warnings()[0].contains("2 high-risk object"));
+        assert!(result.egress_records.iter().any(|record| {
+            record.object_ref == "service:checkout"
+                && record.redacted_fields.contains(&"risk_score".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_direct_risk_scored_context_raises_pipeline_risk() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![prop("risk_score", PropertyType::Float)],
+        );
+        db.create_object(&Object {
+            id: "service-checkout".into(),
+            kind: "service".into(),
+            name: "checkout".into(),
+            namespace: "".into(),
+            external_id: "service:checkout".into(),
+            properties: HashMap::from([("risk_score".into(), "0.91".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+
+        let p = default_pipeline();
+        let mut req = make_req();
+        req.namespace = "service:checkout".into();
+        let result = p.run(&mut req, &db);
+
+        assert_eq!(result.risk_score, 0.7);
+        assert!(result.warnings()[0].contains("internal risk signal"));
+        assert!(result.egress_records.iter().any(|record| {
+            record.object_ref == "service:checkout"
+                && record.redacted_fields.contains(&"risk_score".to_string())
         }));
     }
 
