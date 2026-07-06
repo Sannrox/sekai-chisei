@@ -8,7 +8,7 @@ use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
 use crate::db::sekai::SekaiDb;
 use crate::domain;
-use crate::sekai::action::ActionExecutor;
+use crate::sekai::action::{self, ActionExecutor};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, coordination, dataset, function, security};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub struct SekaiServiceImpl {
     db: Arc<SekaiDb>,
-    actions: ActionExecutor,
+    actions: Arc<RwLock<ActionExecutor>>,
     security: Arc<SecurityChecker>,
     schema: Arc<RwLock<SchemaRegistry>>,
     schema_unavailable_error: Arc<RwLock<Option<String>>>,
@@ -28,6 +28,20 @@ impl SekaiServiceImpl {
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
+        let action_types = match db.list_action_types() {
+            Ok(action_types) => action_types,
+            Err(error) => {
+                tracing::error!(%error, "failed to load action types");
+                Vec::new()
+            }
+        };
+        let actions = match ActionExecutor::from_action_types(action_types) {
+            Ok(actions) => actions,
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize action registry");
+                ActionExecutor::new()
+            }
+        };
         let (types, schema_unavailable_error, schema_load_errors) =
             match db.list_object_types_with_errors() {
                 Ok((types, errors)) => {
@@ -45,7 +59,7 @@ impl SekaiServiceImpl {
         let schema = Arc::new(RwLock::new(registry));
         Self {
             db,
-            actions: ActionExecutor::new(),
+            actions: Arc::new(RwLock::new(actions)),
             security,
             schema,
             schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
@@ -134,6 +148,63 @@ fn now_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn redact_action_evidence(
+    params: &std::collections::HashMap<String, String>,
+    sensitive_params: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    params
+        .iter()
+        .map(|(key, value)| {
+            let lower = key.to_ascii_lowercase();
+            let sensitive_property = params
+                .get("key")
+                .or_else(|| params.get("property"))
+                .map(|property| is_sensitive_name(property))
+                .unwrap_or(false);
+            let value = if is_sensitive_name(&lower)
+                || sensitive_params.contains(key)
+                || ((lower == "value" || lower == "new_value") && sensitive_property)
+            {
+                "[redacted]".to_string()
+            } else {
+                value.clone()
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+fn redact_action_outcome(
+    action: &str,
+    params: &std::collections::HashMap<String, String>,
+    outcome: &str,
+) -> String {
+    if action == "set_property"
+        && params
+            .get("key")
+            .map(|property| is_sensitive_name(property))
+            .unwrap_or(false)
+    {
+        return format!(
+            "set {}.{} = [redacted]",
+            params.get("id").cloned().unwrap_or_default(),
+            params.get("key").cloned().unwrap_or_default()
+        );
+    }
+    outcome.to_string()
+}
+
+fn is_sensitive_name(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("key")
+        || lower.contains("password")
+        || lower.contains("passphrase")
+        || lower.contains("passwd")
+        || lower.contains("credential")
+}
+
 fn check_read(
     security: &SecurityChecker,
     object_id: &str,
@@ -173,6 +244,23 @@ fn check_schema_admin(
         return Ok(());
     }
     Err(Status::permission_denied("schema admin required"))
+}
+
+fn check_action_admin(
+    security: &SecurityChecker,
+    name: &str,
+    principals: &[String],
+) -> Result<(), Status> {
+    let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+        || security.can_admin("action", &refs)
+        || security.can_admin(&action_object_id(name), &refs)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("action admin required"))
 }
 
 fn principal_matches(owner_principal: &str, principals: &[String]) -> bool {
@@ -531,6 +619,88 @@ fn from_proto_property_def(property: &PropertyDef) -> Result<schema::PropertyDef
 
 fn schema_object_id(kind: &str) -> String {
     format!("schema:{kind}")
+}
+
+fn action_object_id(name: &str) -> String {
+    format!("action:{name}")
+}
+
+fn to_proto_action_type(action_type: &action::ActionTypeDef) -> ActionTypeDef {
+    ActionTypeDef {
+        name: action_type.name.clone(),
+        description: action_type.description.clone(),
+        params: action_type
+            .params
+            .iter()
+            .map(to_proto_action_param)
+            .collect(),
+        ops: action_type.ops.iter().map(to_proto_action_op).collect(),
+        target_kind: action_type.target_kind.clone(),
+        created: action_type.created,
+    }
+}
+
+fn to_proto_action_param(param: &action::ActionParamDef) -> ActionParamDef {
+    ActionParamDef {
+        name: param.name.clone(),
+        r#type: param.param_type.as_str().to_string(),
+        required: param.required,
+        enum_values: param.enum_values.clone(),
+    }
+}
+
+fn to_proto_action_op(op: &action::ActionOp) -> ActionOp {
+    ActionOp {
+        op: op.op.clone(),
+        property: op.property.clone(),
+        value_from: op.value_from.clone(),
+        relation: op.relation.clone(),
+    }
+}
+
+fn from_proto_action_type(action_type: &ActionTypeDef) -> Result<action::ActionTypeDef, Status> {
+    let params = action_type
+        .params
+        .iter()
+        .map(from_proto_action_param)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(action::ActionTypeDef {
+        name: action_type.name.clone(),
+        description: action_type.description.clone(),
+        params,
+        ops: action_type.ops.iter().map(from_proto_action_op).collect(),
+        target_kind: action_type.target_kind.clone(),
+        created: action_type.created,
+    })
+}
+
+fn from_proto_action_param(param: &ActionParamDef) -> Result<action::ActionParamDef, Status> {
+    let param_type = schema::PropertyType::parse(&param.r#type).ok_or_else(|| {
+        Status::invalid_argument(format!("unknown action param type: {}", param.r#type))
+    })?;
+    Ok(action::ActionParamDef {
+        name: param.name.clone(),
+        param_type,
+        required: param.required,
+        enum_values: param.enum_values.clone(),
+    })
+}
+
+fn from_proto_action_op(op: &ActionOp) -> action::ActionOp {
+    action::ActionOp {
+        op: op.op.clone(),
+        property: op.property.clone(),
+        value_from: op.value_from.clone(),
+        relation: op.relation.clone(),
+    }
+}
+
+fn validate_action_type_against_schema(
+    action_type: &action::ActionTypeDef,
+    schema: &SchemaRegistry,
+) -> Result<(), Status> {
+    action::validate_action_type_against_schema(action_type, schema)
+        .map_err(Status::invalid_argument)
 }
 
 fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
@@ -1364,6 +1534,100 @@ impl SekaiService for SekaiServiceImpl {
             .remove(&kind);
         Ok(Response::new(DeleteSchemaTypeResponse {}))
     }
+
+    async fn create_action_type(
+        &self,
+        req: Request<CreateActionTypeRequest>,
+    ) -> Result<Response<CreateActionTypeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let action_type = req
+            .into_inner()
+            .action_type
+            .ok_or(Status::invalid_argument("action_type required"))?;
+        let parsed = from_proto_action_type(&action_type)?;
+        check_action_admin(&self.security, &parsed.name, &principals)?;
+        {
+            action::validate_action_type_definition(
+                &parsed,
+                ActionExecutor::new().has_action(&parsed.name),
+            )
+            .map_err(Status::invalid_argument)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            validate_action_type_against_schema(&parsed, &schema)?;
+        }
+        let stored = self
+            .db
+            .upsert_action_type(&parsed)
+            .map_err(Status::internal)?;
+        self.actions
+            .write()
+            .map_err(|_| Status::internal("action registry unavailable"))?
+            .register_action_type(stored.clone())
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(CreateActionTypeResponse {
+            action_type: Some(to_proto_action_type(&stored)),
+        }))
+    }
+
+    async fn list_action_types(
+        &self,
+        req: Request<ListActionTypesRequest>,
+    ) -> Result<Response<ListActionTypesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let action_types = self
+            .actions
+            .read()
+            .map_err(|_| Status::internal("action registry unavailable"))?
+            .list_action_types()
+            .iter()
+            .filter(|action_type| {
+                check_read(
+                    &self.security,
+                    &action_object_id(&action_type.name),
+                    &principals,
+                )
+                .is_ok()
+            })
+            .map(to_proto_action_type)
+            .collect();
+        Ok(Response::new(ListActionTypesResponse { action_types }))
+    }
+
+    async fn delete_action_type(
+        &self,
+        req: Request<DeleteActionTypeRequest>,
+    ) -> Result<Response<DeleteActionTypeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("name required"));
+        }
+        check_action_admin(&self.security, &name, &principals)?;
+        if self
+            .actions
+            .read()
+            .map_err(|_| Status::internal("action registry unavailable"))?
+            .has_action(&name)
+            && ActionExecutor::new().has_action(&name)
+        {
+            return Err(Status::invalid_argument("cannot delete builtin action"));
+        }
+        self.db
+            .delete_action_type(&name)
+            .map_err(Status::internal)?;
+        self.actions
+            .write()
+            .map_err(|_| Status::internal("action registry unavailable"))?
+            .remove_action_type(&name);
+        Ok(Response::new(DeleteActionTypeResponse {}))
+    }
+
     async fn execute_action(
         &self,
         req: Request<ExecuteActionRequest>,
@@ -1373,24 +1637,55 @@ impl SekaiService for SekaiServiceImpl {
             .into_inner()
             .request
             .ok_or(Status::invalid_argument("request required"))?;
-        let target_ids = self
+        let actions = self
             .actions
+            .read()
+            .map_err(|_| Status::internal("action registry unavailable"))?;
+        let mask_missing_link = actions.masks_missing_link(&r.action);
+        let sensitive_params = actions.sensitive_param_names(&r.action);
+        let target_ids = actions
             .target_ids(&self.db, &r.action, &r.params)
             .map_err(|err| {
-                if r.action == "delete_link" && err == "link not found" {
+                if mask_missing_link && err == "link not found" {
                     Status::permission_denied("write denied")
                 } else {
                     Status::invalid_argument(err)
                 }
             })?;
-        for target_id in target_ids {
-            check_write(&self.security, &target_id, &principals)?;
+        for target_id in &target_ids {
+            check_write(&self.security, target_id, &principals)?;
+        }
+        let schema_kinds = actions
+            .schema_kinds(&self.db, &r.action, &r.params)
+            .map_err(Status::invalid_argument)?;
+        for kind in schema_kinds {
+            self.require_schema_kind_loaded(&kind)?;
         }
         let actor = principals.first().cloned().unwrap_or_default();
-        let msg = self
-            .actions
-            .execute(&self.db, &r.action, &r.params, &actor)
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        actions
+            .validate_action_schema(&r.action, &schema)
             .map_err(Status::invalid_argument)?;
+        let msg = actions
+            .execute(&self.db, &schema, &r.action, &r.params, &actor)
+            .map_err(Status::invalid_argument)?;
+        drop(actions);
+        drop(schema);
+        self.db
+            .record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now_millis(),
+                actor,
+                action: r.action.clone(),
+                reason: "execute_action".into(),
+                evidence: redact_action_evidence(&r.params, &sensitive_params),
+                target_id: target_ids.first().cloned().unwrap_or_default(),
+                outcome: redact_action_outcome(&r.action, &r.params, &msg),
+            })
+            .map_err(Status::internal)?;
         Ok(Response::new(ExecuteActionResponse {
             result: Some(ActionResult {
                 action: r.action,
@@ -2705,6 +3000,39 @@ mod tests {
         svc.security.add_grant(&grant);
     }
 
+    fn grant_action_admin(svc: &SekaiServiceImpl) {
+        let grant = security::Grant {
+            id: format!("action-admin-{}", uuid::Uuid::new_v4().simple()),
+            object_id: "action".into(),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+
+    fn assign_color_action() -> ActionTypeDef {
+        ActionTypeDef {
+            name: "assign_color".into(),
+            description: "Assign a widget color".into(),
+            params: vec![ActionParamDef {
+                name: "color".into(),
+                r#type: "enum".into(),
+                required: true,
+                enum_values: vec!["red".into(), "blue".into()],
+            }],
+            ops: vec![ActionOp {
+                op: "set_property".into(),
+                property: "color".into(),
+                value_from: "color".into(),
+                relation: "".into(),
+            }],
+            target_kind: "widget".into(),
+            created: 0,
+        }
+    }
+
     fn grant_object_role(
         svc: &SekaiServiceImpl,
         object_id: &str,
@@ -2791,6 +3119,971 @@ mod tests {
 
         let obj = svc.db.get_object("obj-1").unwrap().unwrap();
         assert_eq!(obj.properties["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn execute_action_records_decision_with_authenticated_actor() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "password".into()),
+                        ("value".into(), "secret-value".into()),
+                    ]),
+                    actor: "mallory".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].actor, "alice");
+        assert_eq!(decisions[0].target_id, "obj-1");
+        assert_eq!(decisions[0].reason, "execute_action");
+        assert_eq!(decisions[0].evidence["key"], "[redacted]");
+        assert_eq!(decisions[0].evidence["value"], "[redacted]");
+        assert_eq!(decisions[0].outcome, "set obj-1.password = [redacted]");
+    }
+
+    #[tokio::test]
+    async fn execute_action_set_property_respects_schema() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([
+                    ("name".into(), "spinner".into()),
+                    ("color".into(), "red".into()),
+                ]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "set_property".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("key".into(), "color".into()),
+                            ("value".into(), "green".into()),
+                        ]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("not in"));
+        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
+        assert_eq!(obj.properties["color"], "red");
+        assert!(
+            svc.db
+                .list_decisions(&audit::DecisionFilter {
+                    action: Some("set_property".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_action_create_object_accepts_schema_properties() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "create_object".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("kind".into(), "widget".into()),
+                        ("name".into(), "spinner".into()),
+                        ("color".into(), "blue".into()),
+                    ]),
+                    actor: "".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
+        assert_eq!(obj.properties["name"], "spinner");
+        assert_eq!(obj.properties["color"], "blue");
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_type_round_trip_and_execute() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        let created = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(assign_color_action()),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .action_type
+            .unwrap();
+        assert_eq!(created.name, "assign_color");
+        assert!(created.created > 0);
+
+        let listed = svc
+            .list_action_types(with_principal(ListActionTypesRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .action_types;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "assign_color");
+
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([
+                    ("name".into(), "spinner".into()),
+                    ("color".into(), "red".into()),
+                ]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "assign_color".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("color".into(), "blue".into()),
+                    ]),
+                    actor: "ignored".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
+        assert_eq!(obj.properties["color"], "blue");
+        let changes = svc.db.list_object_changes("widget-1", 10, 0).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "properties.color");
+        assert_eq!(changes[0].changed_by, "alice");
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("assign_color".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].actor, "alice");
+        assert_eq!(decisions[0].target_id, "widget-1");
+
+        svc.delete_action_type(with_principal(DeleteActionTypeRequest {
+            name: "assign_color".into(),
+        }))
+        .await
+        .unwrap();
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("color".into(), "red".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown action"));
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_redacts_password_fixed_property_params() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "password".into(),
+            r#type: "string".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(ActionTypeDef {
+                name: "set_password".into(),
+                description: "".into(),
+                params: vec![ActionParamDef {
+                    name: "value".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                }],
+                ops: vec![ActionOp {
+                    op: "set_property".into(),
+                    property: "password".into(),
+                    value_from: "value".into(),
+                    relation: "".into(),
+                }],
+                target_kind: "widget".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "spinner".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_password".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("value".into(), "secret-value".into()),
+                    ]),
+                    actor: "".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_password".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].evidence["value"], "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_validates_params_and_authorization() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(assign_color_action()),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "spinner".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        let missing = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color".into(),
+                        params: HashMap::from([("id".into(), "widget-1".into())]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+        assert!(missing.message().contains("missing required param: color"));
+
+        let bad_enum = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("color".into(), "green".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_enum.code(), tonic::Code::InvalidArgument);
+        assert!(bad_enum.message().contains("not in"));
+
+        let denied = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("color".into(), "blue".into()),
+                        ]),
+                        actor: "alice".into(),
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !svc.db
+                .get_object("widget-1")
+                .unwrap()
+                .unwrap()
+                .properties
+                .contains_key("color")
+        );
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_rejects_undeclared_property_at_definition() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        let mut action_type = assign_color_action();
+        action_type.ops[0].property = "undeclared".into();
+
+        let err = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(action_type),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("not declared"));
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_revalidates_against_current_schema() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(assign_color_action()),
+        }))
+        .await
+        .unwrap();
+        let mut changed_schema = widget_schema_type();
+        changed_schema
+            .properties
+            .retain(|property| property.name != "color");
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(changed_schema),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "spinner".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("color".into(), "blue".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("not declared"));
+        assert!(
+            !svc.db
+                .get_object("widget-1")
+                .unwrap()
+                .unwrap()
+                .properties
+                .contains_key("color")
+        );
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_rejects_undeclared_create_object_kind() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+
+        let err = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(ActionTypeDef {
+                    name: "spawn_typo".into(),
+                    description: "".into(),
+                    params: vec![ActionParamDef {
+                        name: "child_name".into(),
+                        r#type: "string".into(),
+                        required: true,
+                        enum_values: vec![],
+                    }],
+                    ops: vec![ActionOp {
+                        op: "create_object".into(),
+                        property: "widgte".into(),
+                        value_from: "child_name".into(),
+                        relation: "".into(),
+                    }],
+                    target_kind: "widget".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("not declared"));
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_rolls_back_when_later_op_fails_schema() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "size".into(),
+            r#type: "enum".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec!["small".into(), "large".into()],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        }))
+        .await
+        .unwrap();
+        let mut action_type = assign_color_action();
+        action_type.name = "assign_color_and_size".into();
+        action_type.params.push(ActionParamDef {
+            name: "size".into(),
+            r#type: "string".into(),
+            required: true,
+            enum_values: vec![],
+        });
+        action_type.ops.push(ActionOp {
+            op: "set_property".into(),
+            property: "size".into(),
+            value_from: "size".into(),
+            relation: "".into(),
+        });
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(action_type),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([
+                    ("name".into(), "spinner".into()),
+                    ("color".into(), "red".into()),
+                    ("size".into(), "small".into()),
+                ]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "assign_color_and_size".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("color".into(), "blue".into()),
+                            ("size".into(), "medium".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
+        assert_eq!(obj.properties["color"], "red");
+        assert_eq!(obj.properties["size"], "small");
+        assert!(
+            svc.db
+                .list_object_changes("widget-1", 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_creates_object_and_link_transactionally() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        let action_type = ActionTypeDef {
+            name: "spawn_child".into(),
+            description: "Create a child widget and link target to sibling".into(),
+            params: vec![
+                ActionParamDef {
+                    name: "child_name".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                },
+                ActionParamDef {
+                    name: "to_id".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                },
+            ],
+            ops: vec![
+                ActionOp {
+                    op: "create_object".into(),
+                    property: "widget".into(),
+                    value_from: "child_name".into(),
+                    relation: "".into(),
+                },
+                ActionOp {
+                    op: "create_link".into(),
+                    property: "to_id".into(),
+                    value_from: "".into(),
+                    relation: "relates_to".into(),
+                },
+            ],
+            target_kind: "widget".into(),
+            created: 0,
+        };
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(action_type),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "parent".into())]),
+            )))
+            .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-2",
+                HashMap::from([("name".into(), "sibling".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "widget-2", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "spawn_child".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("child_name".into(), "child".into()),
+                        ("to_id".into(), "widget-2".into()),
+                    ]),
+                    actor: "".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let children = svc.db.find_by_property("widget", "name", "child").unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].namespace, "");
+        assert!(svc.db.get_link("widget-1->widget-2").unwrap().is_some());
+        assert_eq!(
+            svc.db.list_object_changes(&children[0].id, 10, 0).unwrap()[0].changed_by,
+            "alice"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_create_link_requires_write_on_endpoint() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(ActionTypeDef {
+                name: "link_widget".into(),
+                description: "".into(),
+                params: vec![ActionParamDef {
+                    name: "to_id".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                }],
+                ops: vec![ActionOp {
+                    op: "create_link".into(),
+                    property: "to_id".into(),
+                    value_from: "".into(),
+                    relation: "relates_to".into(),
+                }],
+                target_kind: "widget".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "one".into())]),
+            )))
+            .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-2",
+                HashMap::from([("name".into(), "two".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "widget-2", "bob", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "link_widget".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("to_id".into(), "widget-2".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.get_link("widget-1->widget-2").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_deletes_link_only_when_authorized_for_both_endpoints() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(ActionTypeDef {
+                name: "unlink_widget".into(),
+                description: "".into(),
+                params: vec![ActionParamDef {
+                    name: "link_id".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                }],
+                ops: vec![ActionOp {
+                    op: "delete_link".into(),
+                    property: "".into(),
+                    value_from: "link_id".into(),
+                    relation: "".into(),
+                }],
+                target_kind: "widget".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "one".into())]),
+            )))
+            .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-2",
+                HashMap::from([("name".into(), "two".into())]),
+            )))
+            .unwrap();
+        svc.db
+            .create_link(&domain::Link {
+                id: "link-1".into(),
+                from_id: "widget-1".into(),
+                to_id: "widget-2".into(),
+                relation: "relates_to".into(),
+                created: 0,
+            })
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "widget-2", "alice", security::Role::Editor);
+
+        svc.execute_action(with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "unlink_widget".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("link_id".into(), "link-1".into()),
+                    ]),
+                    actor: "".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        assert!(svc.db.get_link("link-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_delete_link_hides_unknown_link() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(ActionTypeDef {
+                name: "unlink_widget".into(),
+                description: "".into(),
+                params: vec![ActionParamDef {
+                    name: "link_id".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    enum_values: vec![],
+                }],
+                ops: vec![ActionOp {
+                    op: "delete_link".into(),
+                    property: "".into(),
+                    value_from: "link_id".into(),
+                    relation: "".into(),
+                }],
+                target_kind: "widget".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "unlink_widget".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("link_id".into(), "missing-link".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.message(), "write denied");
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_rolls_back_created_object_when_later_link_fails() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(ActionTypeDef {
+                name: "spawn_then_link_missing".into(),
+                description: "".into(),
+                params: vec![
+                    ActionParamDef {
+                        name: "child_name".into(),
+                        r#type: "string".into(),
+                        required: true,
+                        enum_values: vec![],
+                    },
+                    ActionParamDef {
+                        name: "to_id".into(),
+                        r#type: "string".into(),
+                        required: true,
+                        enum_values: vec![],
+                    },
+                ],
+                ops: vec![
+                    ActionOp {
+                        op: "create_object".into(),
+                        property: "widget".into(),
+                        value_from: "child_name".into(),
+                        relation: "".into(),
+                    },
+                    ActionOp {
+                        op: "create_link".into(),
+                        property: "to_id".into(),
+                        value_from: "".into(),
+                        relation: "relates_to".into(),
+                    },
+                ],
+                target_kind: "widget".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-1",
+                HashMap::from([("name".into(), "parent".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
+        grant_object_role(&svc, "missing", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "spawn_then_link_missing".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-1".into()),
+                            ("child_name".into(), "child".into()),
+                            ("to_id".into(), "missing".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("object not found"));
+        assert!(
+            svc.db
+                .find_by_property("widget", "name", "child")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3443,6 +4736,82 @@ mod tests {
         }))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_defined_action_blocks_when_target_schema_failed_to_load() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        db.migrate_schema_types().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                ("broken", "Broken schema", "[", 1_i64),
+            )
+            .unwrap();
+        }
+        db.upsert_action_type(&action::ActionTypeDef {
+            name: "touch_broken".into(),
+            description: "".into(),
+            params: vec![action::ActionParamDef {
+                name: "value".into(),
+                param_type: schema::PropertyType::String,
+                required: true,
+                enum_values: vec![],
+            }],
+            ops: vec![action::ActionOp {
+                op: "set_property".into(),
+                property: "status".into(),
+                value_from: "value".into(),
+                relation: "".into(),
+            }],
+            target_kind: "broken".into(),
+            created: 1,
+        })
+        .unwrap();
+        let svc = SekaiServiceImpl::new(db.clone());
+        svc.db
+            .create_object(&domain::Object {
+                id: "broken-1".into(),
+                kind: "broken".into(),
+                name: "broken".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        grant_object_role(&svc, "broken-1", "alice", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "touch_broken".into(),
+                        params: HashMap::from([
+                            ("id".into(), "broken-1".into()),
+                            ("value".into(), "done".into()),
+                        ]),
+                        actor: "".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("broken"));
+        assert!(
+            !svc.db
+                .get_object("broken-1")
+                .unwrap()
+                .unwrap()
+                .properties
+                .contains_key("status")
+        );
     }
 
     #[tokio::test]

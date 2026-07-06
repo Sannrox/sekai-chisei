@@ -179,6 +179,29 @@ message ActionResult {
   string message = 2;
 }
 
+message ActionParamDef {
+  string name = 1;
+  string type = 2;
+  bool required = 3;
+  repeated string enum_values = 4;
+}
+
+message ActionOp {
+  string op = 1;
+  string property = 2;
+  string value_from = 3;
+  string relation = 4;
+}
+
+message ActionTypeDef {
+  string name = 1;
+  string description = 2;
+  repeated ActionParamDef params = 3;
+  repeated ActionOp ops = 4;
+  string target_kind = 5;
+  int64 created = 6;
+}
+
 message LineageNode {
   Object object = 1;
   string role = 2;
@@ -288,6 +311,13 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+
+message CreateActionTypeRequest { ActionTypeDef action_type = 1; }
+message CreateActionTypeResponse { ActionTypeDef action_type = 1; }
+message ListActionTypesRequest {}
+message ListActionTypesResponse { repeated ActionTypeDef action_types = 1; }
+message DeleteActionTypeRequest { string name = 1; }
+message DeleteActionTypeResponse {}
 
 message ExecuteActionRequest { ActionRequest request = 1; }
 message ExecuteActionResponse { ActionResult result = 1; }
@@ -505,6 +535,9 @@ service SekaiService {
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
 
+  rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
+  rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);
+  rpc DeleteActionType(DeleteActionTypeRequest) returns (DeleteActionTypeResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc GetLineage(GetLineageRequest) returns (GetLineageResponse);
 
