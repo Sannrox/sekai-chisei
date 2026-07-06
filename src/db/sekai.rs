@@ -74,6 +74,7 @@ impl SekaiDb {
         self.migrate_grants()?;
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
+        self.migrate_task_observations()?;
         self.migrate_schema_types()?;
         self.migrate_coordination()?;
         self.migrate_datasets()?;
@@ -1241,6 +1242,25 @@ mod tests {
                     stop_reason TEXT NOT NULL DEFAULT '',
                     timestamp INTEGER NOT NULL,
                     scored INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sekai_task_observations (
+                    request_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    component_id TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    packages_json TEXT NOT NULL DEFAULT '[]',
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (request_id, component_id)
+                );
+                CREATE TABLE sekai_task_observation_baselines (
+                    component_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    task_total INTEGER NOT NULL,
+                    task_succeeded INTEGER NOT NULL,
+                    consecutive_failures INTEGER NOT NULL,
+                    created INTEGER NOT NULL
                 );",
             )
             .unwrap();
@@ -1259,6 +1279,12 @@ mod tests {
 
         let observation_columns = table_columns(&db, "chisei_sample_observations");
         assert!(observation_columns.contains(&"attempts".to_string()));
+
+        let task_observation_columns = table_columns(&db, "sekai_task_observations");
+        assert!(task_observation_columns.contains(&"component_id".to_string()));
+
+        let baseline_columns = table_columns(&db, "sekai_task_observation_baselines");
+        assert!(baseline_columns.contains(&"task_succeeded".to_string()));
 
         drop(db);
         let _ = std::fs::remove_file(path);
