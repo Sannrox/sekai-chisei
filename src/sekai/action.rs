@@ -497,6 +497,13 @@ fn validate_param_value(param: &ActionParamDef, value: &str) -> Result<(), Strin
                 param.name, value
             ));
         }
+        PropertyType::Struct => {
+            let parsed: serde_json::Value = serde_json::from_str(value)
+                .map_err(|_| format!("param {}: expected struct JSON object", param.name))?;
+            if !parsed.is_object() {
+                return Err(format!("param {}: expected struct JSON object", param.name));
+            }
+        }
         _ => {}
     }
     Ok(())
