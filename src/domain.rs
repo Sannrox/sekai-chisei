@@ -103,6 +103,7 @@ pub struct ListFilter {
     pub name: Option<String>,
     pub namespace: Option<String>,
     pub property_filters: Vec<PropertyFilter>,
+    pub interface_filter: Vec<String>,
     pub limit: i32,
     pub offset: i32,
     pub order_by: String,
