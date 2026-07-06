@@ -964,6 +964,21 @@ fn to_proto_property_def(property: &schema::PropertyDef) -> PropertyDef {
         compute_expr: property.compute_expr.clone(),
         classification: schema::normalize_property_classification(&property.classification)
             .to_string(),
+        struct_fields: property
+            .struct_fields
+            .iter()
+            .map(to_proto_struct_field_def)
+            .collect(),
+    }
+}
+
+fn to_proto_struct_field_def(field: &schema::StructFieldDef) -> StructFieldDef {
+    StructFieldDef {
+        name: field.name.clone(),
+        r#type: field.prop_type.as_str().to_string(),
+        required: field.required,
+        description: field.description.clone(),
+        enum_values: field.enum_values.clone(),
     }
 }
 
@@ -1010,6 +1025,24 @@ fn from_proto_property_def(property: &PropertyDef) -> Result<schema::PropertyDef
         compute_expr: property.compute_expr.clone(),
         classification: schema::normalize_property_classification(&property.classification)
             .to_string(),
+        struct_fields: property
+            .struct_fields
+            .iter()
+            .map(from_proto_struct_field_def)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn from_proto_struct_field_def(field: &StructFieldDef) -> Result<schema::StructFieldDef, Status> {
+    let prop_type = schema::PropertyType::parse(&field.r#type).ok_or_else(|| {
+        Status::invalid_argument(format!("unknown struct field type: {}", field.r#type))
+    })?;
+    Ok(schema::StructFieldDef {
+        name: field.name.clone(),
+        prop_type,
+        required: field.required,
+        description: field.description.clone(),
+        enum_values: field.enum_values.clone(),
     })
 }
 
@@ -3650,6 +3683,7 @@ mod tests {
                     link_kind: "".into(),
                     compute_expr: "".into(),
                     classification: "public".into(),
+                    struct_fields: vec![],
                 },
                 PropertyDef {
                     name: "color".into(),
@@ -3660,6 +3694,7 @@ mod tests {
                     link_kind: "".into(),
                     compute_expr: "".into(),
                     classification: "public".into(),
+                    struct_fields: vec![],
                 },
             ],
             is_builtin: false,
@@ -3940,6 +3975,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn struct_property_round_trips_through_create_update_and_list() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "ai_result".into(),
+            r#type: "struct".into(),
+            required: false,
+            description: "AI generated compound value".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+            classification: "public".into(),
+            struct_fields: vec![
+                StructFieldDef {
+                    name: "value".into(),
+                    r#type: "string".into(),
+                    required: true,
+                    description: "".into(),
+                    enum_values: vec![],
+                },
+                StructFieldDef {
+                    name: "confidence".into(),
+                    r#type: "float".into(),
+                    required: true,
+                    description: "".into(),
+                    enum_values: vec![],
+                },
+                StructFieldDef {
+                    name: "generated_at".into(),
+                    r#type: "timestamp".into(),
+                    required: false,
+                    description: "".into(),
+                    enum_values: vec![],
+                },
+            ],
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        }))
+        .await
+        .unwrap();
+
+        let initial_value =
+            r#"{"value":"approve","confidence":0.91,"source_objects":["widget:1"]}"#;
+        let created = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-ai",
+                    HashMap::from([
+                        ("name".into(), "spinner".into()),
+                        ("color".into(), "blue".into()),
+                        ("ai_result".into(), initial_value.into()),
+                    ]),
+                )),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(created.properties["ai_result"], initial_value);
+
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "widget".into(),
+                    limit: 10,
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects[0].properties["ai_result"], initial_value);
+
+        let updated_value =
+            r#"{"value":"reject","confidence":0.12,"generated_at":"2026-07-06T12:00:00Z"}"#;
+        let mut updated = created;
+        updated
+            .properties
+            .insert("ai_result".into(), updated_value.into());
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(updated),
+        }))
+        .await
+        .unwrap();
+        let stored = svc.db.get_object("widget-ai").unwrap().unwrap();
+        assert_eq!(stored.properties["ai_result"], updated_value);
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-ai-invalid",
+                    HashMap::from([
+                        ("name".into(), "bad".into()),
+                        ("color".into(), "blue".into()),
+                        ("ai_result".into(), r#"{"value":"approve"}"#.into()),
+                    ]),
+                )),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("confidence"));
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-ai-type-mismatch",
+                    HashMap::from([
+                        ("name".into(), "bad".into()),
+                        ("color".into(), "blue".into()),
+                        (
+                            "ai_result".into(),
+                            r#"{"value":"approve","confidence":"high"}"#.into(),
+                        ),
+                    ]),
+                )),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("expected float"));
+    }
+
+    #[tokio::test]
     async fn object_responses_redact_restricted_schema_properties() {
         let svc = service();
         grant_schema_admin(&svc);
@@ -3953,6 +4115,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "sensitive".into(),
+            struct_fields: vec![],
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -4247,6 +4410,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "public".into(),
+            struct_fields: vec![],
         });
         schema_type.properties.push(PropertyDef {
             name: "secret_note".into(),
@@ -4257,6 +4421,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "sensitive".into(),
+            struct_fields: vec![],
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -4447,6 +4612,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "public".into(),
+            struct_fields: vec![],
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -4734,6 +4900,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "public".into(),
+            struct_fields: vec![],
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(schema_type),
@@ -5480,6 +5647,7 @@ mod tests {
                     link_kind: "".into(),
                     compute_expr: "count_children".into(),
                     classification: "public".into(),
+                    struct_fields: vec![],
                 }],
                 is_builtin: false,
                 implements: vec![],
@@ -5572,6 +5740,7 @@ mod tests {
                         link_kind: "".into(),
                         compute_expr: "missing_function".into(),
                         classification: "public".into(),
+                        struct_fields: vec![],
                     }],
                     is_builtin: false,
                     implements: vec![],
@@ -5645,6 +5814,7 @@ mod tests {
                     link_kind: "".into(),
                     compute_expr: "ambiguous_child_count".into(),
                     classification: "public".into(),
+                    struct_fields: vec![],
                 }],
                 is_builtin: false,
                 implements: vec![],
@@ -6108,6 +6278,7 @@ mod tests {
                 link_kind: "".into(),
                 compute_expr: "".into(),
                 classification: "public".into(),
+                struct_fields: vec![],
             }],
             is_builtin: false,
         };
@@ -6139,6 +6310,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "public".into(),
+            struct_fields: vec![],
         });
         let err = svc
             .create_schema_type(with_principal(CreateSchemaTypeRequest {
@@ -6160,6 +6332,7 @@ mod tests {
             link_kind: "".into(),
             compute_expr: "".into(),
             classification: "public".into(),
+            struct_fields: vec![],
         });
         svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
             r#type: Some(valid_type),
@@ -6182,6 +6355,7 @@ mod tests {
                             link_kind: "".into(),
                             compute_expr: "".into(),
                             classification: "public".into(),
+                            struct_fields: vec![],
                         },
                         PropertyDef {
                             name: "second_tracking_id".into(),
@@ -6192,6 +6366,7 @@ mod tests {
                             link_kind: "".into(),
                             compute_expr: "".into(),
                             classification: "public".into(),
+                            struct_fields: vec![],
                         },
                     ],
                     is_builtin: false,

@@ -1062,6 +1062,7 @@ mod tests {
             link_kind: String::new(),
             compute_expr: String::new(),
             classification: crate::sekai::schema::default_property_classification(),
+            struct_fields: vec![],
         }
     }
 
