@@ -35,6 +35,8 @@ pub const REL_DEPENDS_ON: &str = "depends_on";
 pub const REL_TARGETS: &str = "targets";
 pub const REL_EXECUTED: &str = "executed";
 pub const REL_USED_FOR: &str = "used_for";
+pub const REL_RELATION_SOURCE: &str = "relation_source";
+pub const REL_RELATION_TARGET: &str = "relation_target";
 
 pub fn valid_relation(r: &str) -> bool {
     matches!(
@@ -49,6 +51,8 @@ pub fn valid_relation(r: &str) -> bool {
             | REL_TARGETS
             | REL_EXECUTED
             | REL_USED_FOR
+            | REL_RELATION_SOURCE
+            | REL_RELATION_TARGET
     )
 }
 
@@ -161,6 +165,8 @@ mod tests {
     fn test_valid_relations() {
         assert!(valid_relation(REL_CONTAINS));
         assert!(valid_relation(REL_EXECUTED));
+        assert!(valid_relation(REL_RELATION_SOURCE));
+        assert!(valid_relation(REL_RELATION_TARGET));
         assert!(!valid_relation("invalid"));
     }
 }

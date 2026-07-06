@@ -12,6 +12,7 @@ pub mod lineage;
 pub mod observation;
 pub mod propagation;
 pub mod query;
+pub mod relation_object;
 pub mod schema;
 pub mod security;
 pub mod sentinel;
