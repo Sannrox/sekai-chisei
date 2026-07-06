@@ -272,6 +272,13 @@ fn named_model_capability_rank(model: &str) -> i32 {
 }
 
 fn provider_is_available(provider: &str, config: &Config) -> bool {
+    if config
+        .gateway_provided_providers
+        .iter()
+        .any(|p| p == provider)
+    {
+        return true;
+    }
     match provider {
         "anthropic" => config.anthropic_api_key.is_some(),
         "openai" => config.openai_api_key.is_some(),
@@ -369,6 +376,7 @@ mod tests {
             scoring_batch_size: 16,
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
+            gateway_provided_providers: vec![],
             leak_review_model: None,
             tls_cert: None,
             tls_key: None,
@@ -384,6 +392,47 @@ mod tests {
             context_length: 8192,
             capabilities: vec!["completion".into()],
         }
+    }
+
+    fn keyless_config() -> Config {
+        // ChatGPT-plan style: the control-plane server holds no provider keys.
+        let mut config = config();
+        config.openai_api_key = None;
+        config.anthropic_api_key = None;
+        config.native_llm_url = None;
+        config
+    }
+
+    #[test]
+    fn gateway_provided_provider_resolves_without_a_local_key() {
+        let mut config = keyless_config();
+        config.gateway_provided_providers = vec!["openai".into()];
+        let resolved = resolve_model(RoutingContext {
+            requested: "gpt-5.5",
+            allowed_models: &["gpt-5.5".into()],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "gpt-5.5");
+    }
+
+    #[test]
+    fn provider_unavailable_without_key_or_gateway_flag() {
+        let config = keyless_config();
+        let result = resolve_model(RoutingContext {
+            requested: "gpt-5.5",
+            allowed_models: &["gpt-5.5".into()],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        });
+        assert!(result.is_err());
     }
 
     #[test]
