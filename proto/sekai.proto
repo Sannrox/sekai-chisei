@@ -80,6 +80,15 @@ message PropertyDef {
   string link_kind = 6;
   string compute_expr = 7;
   string classification = 8;
+  repeated StructFieldDef struct_fields = 9;
+}
+
+message StructFieldDef {
+  string name = 1;
+  string type = 2;
+  bool required = 3;
+  string description = 4;
+  repeated string enum_values = 5;
 }
 
 message Function {
