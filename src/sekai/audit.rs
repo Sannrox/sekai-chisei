@@ -48,7 +48,7 @@ pub fn record_object_diff(
     Ok(count)
 }
 
-fn object_diff_changes(
+pub(crate) fn object_diff_changes(
     actor: &str,
     before: Option<&Object>,
     after: Option<&Object>,
@@ -414,7 +414,10 @@ impl SekaiDb {
     }
 }
 
-fn insert_object_changes(conn: &Connection, changes: &[ObjectChange]) -> Result<(), String> {
+pub(crate) fn insert_object_changes(
+    conn: &Connection,
+    changes: &[ObjectChange],
+) -> Result<(), String> {
     let mut stmt = conn
         .prepare("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)")
         .map_err(|e| e.to_string())?;
