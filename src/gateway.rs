@@ -51,6 +51,8 @@ pub struct GatewayConfig {
     pub openai_api_key: Option<String>,
     pub anthropic_base_url: String,
     pub anthropic_api_key: Option<String>,
+    pub ollama_base_url: String,
+    pub native_base_url: Option<String>,
     pub chisei_grpc_target: Option<String>,
     pub fail_closed: bool,
     pub default_project: String,
@@ -77,6 +79,17 @@ impl GatewayConfig {
             .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
             .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string());
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let ollama_base_url = std::env::var("CHISEI_OLLAMA_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                let base =
+                    std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+                format!("{}/v1", base.trim_end_matches('/'))
+            });
+        let native_base_url = std::env::var("NATIVE_LLM_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let allow_auth_passthrough = matches!(
             std::env::var("CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH").as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
@@ -140,6 +153,8 @@ impl GatewayConfig {
             openai_api_key,
             anthropic_base_url,
             anthropic_api_key,
+            ollama_base_url,
+            native_base_url,
             chisei_grpc_target,
             fail_closed,
             default_project,
@@ -297,7 +312,7 @@ async fn proxy_gateway(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Response<Body> {
-    let Some(upstream_target) = upstream_url(&state.config, &uri) else {
+    let Some((client_provider, _)) = upstream_path(&uri) else {
         return json_error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -339,7 +354,7 @@ async fn proxy_gateway(
     let started_ms = Utc::now().timestamp_millis();
     let preflight_context = UsageContext {
         request_id: request_id.clone(),
-        provider: upstream_target.provider,
+        provider: client_provider,
         requested_model: requested_model.clone(),
         resolved_model: None,
         work_unit_id: work_unit_id.clone(),
@@ -351,7 +366,7 @@ async fn proxy_gateway(
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_model.clone(),
-            resolved_provider: upstream_target.provider,
+            resolved_provider: client_provider,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -368,7 +383,7 @@ async fn proxy_gateway(
         let resolved = match resolve_policy_preflight(
             &state.config,
             &identity,
-            upstream_target.provider,
+            client_provider,
             &body,
             requested_model.as_deref(),
         )
@@ -384,7 +399,7 @@ async fn proxy_gateway(
         let egress = match apply_context_egress(
             &state.config,
             &identity,
-            upstream_target.provider,
+            client_provider,
             &resolved.body,
             requested_model.as_deref(),
             resolved.resolved_model.as_deref(),
@@ -400,7 +415,7 @@ async fn proxy_gateway(
         &state.config,
         &identity,
         &uri,
-        upstream_target.provider,
+        client_provider,
         resolved.resolved_provider,
         egress.body,
         resolved.resolved_model.as_deref(),
@@ -653,7 +668,7 @@ async fn resolve_policy_preflight(
                             "Chisei returned an empty policy resolution",
                         )
                     })?;
-                    let Some(resolved_provider) = ProviderKind::from_runtime(&resolution.runtime)
+                    let Some(runtime_provider) = ProviderKind::from_runtime(&resolution.runtime)
                     else {
                         return policy_denied(
                             config,
@@ -666,6 +681,14 @@ async fn resolve_policy_preflight(
                             ),
                         )
                         .await;
+                    };
+                    // Refine the backend from the resolved model within the OpenAI
+                    // family (openai vs ollama vs native), since policy carries a
+                    // coarse runtime. Anthropic stays as resolved by runtime.
+                    let resolved_provider = if runtime_provider.is_openai() {
+                        ProviderKind::from_model(&resolution.model)
+                    } else {
+                        runtime_provider
                     };
                     if !provider.same_family(resolved_provider) && !config.allow_cross_provider {
                         return policy_denied(
@@ -844,6 +867,24 @@ fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json
     serde_json::to_vec(&value)
 }
 
+/// Chisei names Ollama models `ollama/<name>`, but the Ollama API expects the
+/// bare `<name>`. Strip the prefix from the request body's model before
+/// forwarding to the Ollama backend. Returns the body unchanged if it can't be
+/// parsed or the model isn't prefixed.
+fn strip_ollama_model_prefix(body: &[u8]) -> Vec<u8> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    match value
+        .get("model")
+        .and_then(|model| model.as_str())
+        .and_then(|model| model.strip_prefix("ollama/"))
+    {
+        Some(stripped) => rewrite_request_model(body, stripped).unwrap_or_else(|_| body.to_vec()),
+        None => body.to_vec(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseAdapter {
     Passthrough,
@@ -868,9 +909,20 @@ async fn prepare_upstream_request(
     resolved_model: Option<&str>,
 ) -> Result<PreparedUpstreamRequest, Response<Body>> {
     if client_provider == resolved_provider || client_provider.same_family(resolved_provider) {
+        // Same wire family: pass through unchanged, but route to the *resolved*
+        // provider's backend so within-family routing (OpenAI vs Ollama vs native)
+        // reaches the right upstream. All of these speak the same wire natively.
+        let body = if matches!(
+            resolved_provider,
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama)
+        ) {
+            strip_ollama_model_prefix(&body)
+        } else {
+            body
+        };
         return Ok(PreparedUpstreamRequest {
-            provider: client_provider,
-            url: upstream_url_for_provider(config, uri, client_provider),
+            provider: resolved_provider,
+            url: upstream_url_for_provider(config, uri, resolved_provider),
             body,
             response_adapter: ResponseAdapter::Passthrough,
         });
@@ -979,10 +1031,12 @@ async fn prepare_upstream_request(
 }
 
 fn upstream_url_for_provider(config: &GatewayConfig, uri: &Uri, provider: ProviderKind) -> String {
-    upstream_url(config, uri)
-        .filter(|target| target.provider == provider)
-        .map(|target| target.url)
-        .unwrap_or_else(|| openai_chat_completions_url(config, uri))
+    // Keep the client's wire path but send it to the resolved provider's backend,
+    // so e.g. a Responses request resolved to an Ollama model hits the Ollama base.
+    match upstream_path(uri) {
+        Some((_, path)) => build_upstream_url(base_url_for_provider(config, provider), &path, uri),
+        None => openai_chat_completions_url(config, uri),
+    }
 }
 
 fn openai_chat_completions_url(config: &GatewayConfig, uri: &Uri) -> String {
@@ -1849,6 +1903,18 @@ impl ProviderKind {
         }
     }
 
+    /// Derives the concrete backend from a model name. Used to pick the upstream
+    /// per resolved model (e.g. `ollama/llama3.2` routes to the Ollama backend),
+    /// which is more reliable than the runtime string carried by policy.
+    fn from_model(model: &str) -> Self {
+        match crate::llm::provider_name(model) {
+            "anthropic" => Self::Anthropic,
+            "ollama" => Self::OpenAi(OpenAiRuntime::Ollama),
+            "native" => Self::OpenAi(OpenAiRuntime::Native),
+            _ => Self::OpenAi(OpenAiRuntime::OpenAi),
+        }
+    }
+
     fn runtime_name(self) -> &'static str {
         match self {
             Self::OpenAi(_) => "openai",
@@ -1875,84 +1941,64 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Clone)]
-struct UpstreamTarget {
-    provider: ProviderKind,
-    url: String,
+/// Base URL for a provider's backend. This is what makes per-model routing work:
+/// a request resolved to an Ollama or native model is sent to that backend
+/// instead of the OpenAI upstream.
+fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> &str {
+    match provider {
+        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => &config.openai_base_url,
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => &config.ollama_base_url,
+        ProviderKind::OpenAi(OpenAiRuntime::Native) => config
+            .native_base_url
+            .as_deref()
+            .unwrap_or(&config.openai_base_url),
+        ProviderKind::Anthropic => &config.anthropic_base_url,
+    }
 }
 
-fn upstream_url(config: &GatewayConfig, uri: &Uri) -> Option<UpstreamTarget> {
+/// Maps a client request path to (client provider by wire shape, upstream path).
+fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
     let path = uri.path();
-    let (provider, base_url, upstream_path) = if let Some(rest) = path.strip_prefix("/v1/responses")
-    {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/responses{rest}"),
-        )
+    let openai = ProviderKind::OpenAi(OpenAiRuntime::OpenAi);
+    let mapped = if let Some(rest) = path.strip_prefix("/v1/responses") {
+        (openai, format!("/responses{rest}"))
     } else if let Some(rest) = path.strip_prefix("/responses") {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/responses{rest}"),
-        )
+        (openai, format!("/responses{rest}"))
     } else if let Some(rest) = path.strip_prefix("/v1/chat/completions") {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/chat/completions{rest}"),
-        )
+        (openai, format!("/chat/completions{rest}"))
     } else if let Some(rest) = path.strip_prefix("/chat/completions") {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/chat/completions{rest}"),
-        )
+        (openai, format!("/chat/completions{rest}"))
     } else if let Some(rest) = path.strip_prefix("/v1/models") {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/models{rest}"),
-        )
+        (openai, format!("/models{rest}"))
     } else if let Some(rest) = path.strip_prefix("/models") {
-        (
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            config.openai_base_url.as_str(),
-            format!("/models{rest}"),
-        )
+        (openai, format!("/models{rest}"))
     } else if let Some(rest) = path.strip_prefix("/v1/messages/count_tokens") {
         (
             ProviderKind::Anthropic,
-            config.anthropic_base_url.as_str(),
             format!("/messages/count_tokens{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/messages/count_tokens") {
         (
             ProviderKind::Anthropic,
-            config.anthropic_base_url.as_str(),
             format!("/messages/count_tokens{rest}"),
         )
     } else if let Some(rest) = path.strip_prefix("/v1/messages") {
-        (
-            ProviderKind::Anthropic,
-            config.anthropic_base_url.as_str(),
-            format!("/messages{rest}"),
-        )
+        (ProviderKind::Anthropic, format!("/messages{rest}"))
     } else if let Some(rest) = path.strip_prefix("/messages") {
-        (
-            ProviderKind::Anthropic,
-            config.anthropic_base_url.as_str(),
-            format!("/messages{rest}"),
-        )
+        (ProviderKind::Anthropic, format!("/messages{rest}"))
     } else {
         return None;
     };
+    Some(mapped)
+}
+
+fn build_upstream_url(base_url: &str, upstream_path: &str, uri: &Uri) -> String {
     let mut url = format!("{}{}", base_url.trim_end_matches('/'), upstream_path);
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
     }
-    Some(UpstreamTarget { provider, url })
+    url
 }
 
 fn apply_provider_auth(
@@ -1961,7 +2007,9 @@ fn apply_provider_auth(
     provider: ProviderKind,
 ) -> Result<reqwest::RequestBuilder, Box<Response<Body>>> {
     match provider {
-        ProviderKind::OpenAi(_) => config
+        // Local backends (Ollama, native) need no upstream credential.
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama | OpenAiRuntime::Native) => Ok(upstream),
+        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => config
             .openai_api_key
             .as_ref()
             .map(|key| upstream.bearer_auth(key))
@@ -1992,7 +2040,7 @@ fn upstream_auth_mode(
     provider: ProviderKind,
 ) -> UpstreamAuthMode {
     if requested_mode == UpstreamAuthMode::Passthrough
-        && provider.is_openai()
+        && matches!(provider, ProviderKind::OpenAi(OpenAiRuntime::OpenAi))
         && config.rewrite_openai_passthrough_auth
         && config.openai_api_key.is_some()
     {
@@ -3209,6 +3257,97 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routing_config() -> GatewayConfig {
+        GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "https://openai.example/v1".to_string(),
+            openai_api_key: None,
+            anthropic_base_url: "https://anthropic.example".to_string(),
+            anthropic_api_key: None,
+            ollama_base_url: "http://localhost:11434/v1".to_string(),
+            native_base_url: Some("http://localhost:9999/v1".to_string()),
+            chisei_grpc_target: None,
+            fail_closed: false,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: true,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        }
+    }
+
+    #[test]
+    fn provider_kind_from_model_maps_backends() {
+        assert_eq!(
+            ProviderKind::from_model("gpt-5.5"),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi)
+        );
+        assert_eq!(
+            ProviderKind::from_model("ollama/llama3.2:latest"),
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama)
+        );
+        assert_eq!(
+            ProviderKind::from_model("claude-sonnet-4"),
+            ProviderKind::Anthropic
+        );
+    }
+
+    #[test]
+    fn per_model_routing_picks_backend_base_url() {
+        let config = routing_config();
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        // The same Responses wire path routes to different backends by provider.
+        assert_eq!(
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::OpenAi)),
+            "https://openai.example/v1/responses"
+        );
+        assert_eq!(
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Ollama)),
+            "http://localhost:11434/v1/responses"
+        );
+        assert_eq!(
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Native)),
+            "http://localhost:9999/v1/responses"
+        );
+    }
+
+    #[test]
+    fn strip_ollama_prefix_rewrites_model() {
+        let body = br#"{"model":"ollama/llama3.2:latest","input":"hi"}"#;
+        let out = strip_ollama_model_prefix(body);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "llama3.2:latest");
+        assert_eq!(v["input"], "hi");
+        // Non-ollama models are left untouched.
+        let gpt = br#"{"model":"gpt-5.5"}"#;
+        let out = strip_ollama_model_prefix(gpt);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "gpt-5.5");
+    }
+
+    #[test]
+    fn ollama_and_native_need_no_upstream_auth() {
+        let config = routing_config();
+        let client = reqwest::Client::new();
+        // No OPENAI_API_KEY set, but Ollama/native must still be allowed.
+        for provider in [
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+            ProviderKind::OpenAi(OpenAiRuntime::Native),
+        ] {
+            let req = client.post("http://localhost/x");
+            assert!(apply_provider_auth(req, &config, provider).is_ok());
+        }
+        // OpenAI still requires a key.
+        let req = client.post("http://localhost/x");
+        assert!(
+            apply_provider_auth(req, &config, ProviderKind::OpenAi(OpenAiRuntime::OpenAi)).is_err()
+        );
+    }
+
     use crate::config::Config;
     use crate::db::sekai::SekaiDb;
     use crate::grpc::chisei_service::ChiseiServiceImpl;
@@ -3386,6 +3525,8 @@ mod tests {
             openai_base_url,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3410,6 +3551,8 @@ mod tests {
             openai_base_url,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3724,6 +3867,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: None,
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3773,6 +3918,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: None,
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3812,6 +3959,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3865,6 +4014,8 @@ mod tests {
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
             openai_api_key: None,
             anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: None,
             fail_closed: false,
@@ -3921,6 +4072,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
             fail_closed: true,
@@ -3985,6 +4138,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
             fail_closed: true,
@@ -4075,6 +4230,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4140,6 +4297,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4192,6 +4351,8 @@ mod tests {
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4278,6 +4439,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4368,6 +4531,8 @@ mod tests {
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4420,6 +4585,8 @@ mod tests {
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4482,6 +4649,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: None,
             fail_closed: false,
@@ -4528,6 +4697,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
@@ -4586,6 +4757,8 @@ mod tests {
                 openai_base_url: upstream_base,
                 openai_api_key: Some("real-openai-key".to_string()),
                 anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+                ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+                native_base_url: None,
                 anthropic_api_key: Some("real-anthropic-key".to_string()),
                 chisei_grpc_target: Some(chisei_target),
                 fail_closed: true,
@@ -4682,6 +4855,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
             fail_closed: true,
@@ -4717,6 +4892,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
             fail_closed: true,
@@ -4781,6 +4958,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4863,6 +5042,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -4948,6 +5129,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -5052,6 +5235,8 @@ mod tests {
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -5114,6 +5299,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
             fail_closed: true,
@@ -5255,6 +5442,8 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -5307,6 +5496,8 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -5357,6 +5548,8 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,
@@ -5411,6 +5604,8 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
             fail_closed: true,

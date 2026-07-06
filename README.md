@@ -91,6 +91,7 @@ Configuration is read from environment variables:
 | `OPENAI_API_KEY` | unset | OpenAI API key |
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | unset | Comma-separated providers whose upstream auth is supplied by the gateway (e.g. `openai`); model routing treats them as available without a server-side key |
+| `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models; defaults to `http://localhost:11434/v1` |
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound LLM/gateway upstream TCP connect timeout |
 | `LLM_HTTP_READ_TIMEOUT_SECS` | `60` | Outbound LLM/gateway upstream idle-read timeout; protects streaming without imposing a total stream cap |
 | `LLM_HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | Outbound LLM/gateway upstream connection pool idle timeout |
@@ -214,6 +215,29 @@ model. Because the gateway supplies the OpenAI upstream auth, `launch` starts
 the server with `CHISEI_GATEWAY_PROVIDED_PROVIDERS=openai` so chisei treats
 `openai` as available even without a server-side key (otherwise it would reject
 the resolved model and the gateway would fail open, forwarding `auto`).
+
+### Per-model backend routing
+
+The gateway picks its upstream from the *resolved model*, not the request shape,
+so one endpoint fronts multiple backends:
+
+- `gpt-*` / codex models → OpenAI (or the ChatGPT backend in passthrough mode)
+- `claude-*` → Anthropic
+- `ollama/<name>` → a local Ollama backend (`CHISEI_OLLAMA_BASE_URL`, default
+  `http://localhost:11434/v1`); the gateway strips the `ollama/` prefix and sends
+  no upstream auth
+- everything else → the native endpoint (`NATIVE_LLM_URL`)
+
+Ollama implements the OpenAI Responses API natively, so no wire translation is
+needed. Point the gateway default at a local model to route the app there with
+no app changes:
+
+```bash
+sekaictl launch codex-app --model ollama/llama3.2:latest
+```
+
+The app still just sends `auto`; chisei resolves it to the Ollama model and the
+gateway routes to your local backend, governed and metered like any other call.
 
 The gateway upstream mode is picked automatically: with `OPENAI_API_KEY` set,
 Codex local-login auth is rewritten for `api.openai.com`; without it, the Codex
