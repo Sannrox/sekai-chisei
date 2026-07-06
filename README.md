@@ -216,6 +216,92 @@ the server with `CHISEI_GATEWAY_PROVIDED_PROVIDERS=openai` so chisei treats
 `openai` as available even without a server-side key (otherwise it would reject
 the resolved model and the gateway would fail open, forwarding `auto`).
 
+### Claude Code
+
+```bash
+cargo run --bin sekaictl -- launch claude-code
+```
+
+Claude Code is a second first-class client, wired through the same gateway for
+the same governance (identity, budget, model policy, audit) as Codex — it
+exercises the gateway's Anthropic Messages surface (`/v1/messages`,
+`/v1/messages/count_tokens`). Unlike the Codex desktop app, Claude Code is a CLI
+configured entirely by **environment variables**, so there is no config file to
+rewrite or revert: `launch claude-code` spawns `claude` with
+
+- `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` — the gateway host root, **with no
+  `/v1` suffix** (Claude Code appends `/v1/messages` itself),
+- `ANTHROPIC_MODEL` (default `claude-sonnet-4-6`, override with `--model`) and
+  `ANTHROPIC_SMALL_FAST_MODEL` (`claude-haiku-4-5`) — both are seeded into the
+  namespace policy's `allowed_models` so Claude Code's background requests are
+  not denied,
+- plus one auth env var that depends on the upstream mode (below).
+
+The env is process-scoped and vanishes when `claude` exits; nothing is left to
+restore. The server is started with `CHISEI_GATEWAY_PROVIDED_PROVIDERS=anthropic`
+so chisei treats `anthropic` as available.
+
+**Two upstream modes, picked automatically from the environment** (symmetric to
+the Codex OpenAI/ChatGPT-plan split):
+
+- **API-key mode** — `ANTHROPIC_API_KEY` is set. Claude Code is given
+  `ANTHROPIC_AUTH_TOKEN=sk-chisei-claude-code` (the seeded virtual key); the
+  gateway resolves that to the agent and swaps in its own `ANTHROPIC_API_KEY`
+  upstream for `api.anthropic.com`. Sanctioned, pay-per-token.
+- **Subscription passthrough** — no `ANTHROPIC_API_KEY`. `ANTHROPIC_AUTH_TOKEN`
+  is left unset so Claude Code keeps its own subscription OAuth token
+  (`sk-ant-oat-*`); the gateway forwards that `Authorization` header **verbatim**
+  to `api.anthropic.com` and derives identity/attribution from `x-chisei-agent`
+  / `x-chisei-project`, which the launcher passes via `ANTHROPIC_CUSTOM_HEADERS`
+  and the gateway strips before forwarding upstream. This rides your Claude
+  Pro/Max subscription with no API key and no per-token cost. Note that
+  third-party proxying of subscription OAuth is a gray area under Anthropic's
+  terms — the gateway forwards the request untampered (only its own `x-chisei-*`
+  headers are stripped) to avoid revocation, but use it with that caveat in mind.
+
+If a gateway started only for Codex is already running on the port, it is not
+configured for `claude-code`; `launch` warns when it reuses a live gateway.
+
+`launch claude-code` pins the gateway's `CHISEI_ANTHROPIC_BASE_URL` to
+`https://api.anthropic.com/v1` (respecting an explicit override). This matters
+because the gateway otherwise falls back to `ANTHROPIC_BASE_URL` for its *own*
+upstream — but that variable is what points clients at the gateway and is often
+already exported (frequently as `https://api.anthropic.com`, with no `/v1`).
+Since the gateway strips `/v1` from the request path before re-appending it to
+the base, a `/v1`-less upstream misroutes every call to `…/messages` and
+Anthropic rejects it as "model may not exist." Pinning avoids that footgun.
+
+### One shared gateway for every client
+
+The gateway routes upstream by *resolved model*, so a single process fronts both
+provider families at once — you run one gateway and start apps against it
+separately. Every `launch` brings the shared stack up (or reuses it) configured
+for all clients, so which app you launch first doesn't matter:
+
+- the server starts with `CHISEI_GATEWAY_PROVIDED_PROVIDERS=openai,anthropic`;
+- the gateway is configured with both upstreams (ChatGPT-plan or `OPENAI_API_KEY`
+  rewrite for OpenAI; subscription passthrough or `ANTHROPIC_API_KEY` for
+  Anthropic — each auto-selected from the environment, sharing one
+  auth-passthrough flag);
+- the shared `sekai-chisei` namespace policy is seeded as a **union**: it allows
+  both runtimes and every client's models, with the `auto` default kept
+  OpenAI-family (what Codex sends). Launching one client therefore never clobbers
+  the other's policy.
+
+```bash
+# bring the shared gateway up without opening an app, then start clients:
+cargo run --bin sekaictl -- launch codex-app --no-app
+cargo run --bin sekaictl -- launch claude-code   # reuses the gateway, opens Claude Code
+cargo run --bin sekaictl -- launch codex-app      # reuses the gateway, opens Codex
+```
+
+Each `launch` seeds its own agent, key, and budget but the same union policy, so
+you can leave one gateway running and start either client against it at any time.
+(If you launch Codex with a custom `--model`, that becomes the namespace `auto`
+target; a later `claude-code` launch resets it to `gpt-5.5` — relaunch Codex, or
+give the clients separate `--project` namespaces, if you need a non-default Codex
+auto model to persist.)
+
 ### Per-model backend routing
 
 The gateway picks its upstream from the *resolved model*, not the request shape,
