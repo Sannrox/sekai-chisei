@@ -382,15 +382,42 @@ fn is_valid_property_classification(value: &str) -> bool {
 
 fn builtin_object_types() -> Vec<ObjectType> {
     [
-        ("agent", "Built-in agent object"),
-        ("asset", "Built-in asset object"),
-        ("budget", "Built-in budget object"),
-        ("component", "Built-in component object"),
-        ("gateway_key", "Built-in gateway key object"),
-        ("namespace", "Built-in namespace object"),
-        ("policy", "Built-in policy object"),
-        ("project", "Built-in project object"),
-        ("ticker", "Built-in ticker object"),
+        (
+            "agent",
+            "Actor identity for a human, service, or automation that performs control-plane work.",
+        ),
+        (
+            "asset",
+            "Generic resource or artifact tracked by the graph when a more specific schema kind is not available.",
+        ),
+        (
+            "budget",
+            "Cost-control record used to account for spending limits, pressure, or allocation scope.",
+        ),
+        (
+            "component",
+            "Runnable or observable unit within a namespace, such as a service, model endpoint, or workflow step.",
+        ),
+        (
+            "gateway_key",
+            "Credential record for gateway access, routing policy, and usage attribution.",
+        ),
+        (
+            "namespace",
+            "Control-plane boundary for policies, budgets, routing hints, and related operational objects.",
+        ),
+        (
+            "policy",
+            "Policy record that configures routing, privacy, budget, or governance behavior for a scope.",
+        ),
+        (
+            "project",
+            "Work organization scope used for planning and attribution; namespaces remain the runtime boundary.",
+        ),
+        (
+            "ticker",
+            "Market symbol or tracked financial instrument used as object context.",
+        ),
     ]
     .into_iter()
     .map(|(kind, description)| ObjectType {
@@ -407,41 +434,91 @@ fn builtin_interfaces() -> Vec<InterfaceDef> {
     [
         (
             "Auditable",
-            "Object participates in audited control-plane activity.",
+            "Capability marker for objects that participate in audited control-plane activity.",
             Vec::new(),
         ),
         (
             "Budgeted",
-            "Object can be associated with budget accounting or cost control.",
+            "Capability for objects associated with budget accounting or cost control.",
             vec![
-                prop_def("cost_center", PropertyType::String, false),
-                prop_def("budget_ref", PropertyType::String, false),
+                prop_def_desc(
+                    "cost_center",
+                    PropertyType::String,
+                    false,
+                    "Accounting label or organizational cost center for budget attribution.",
+                ),
+                prop_def_desc(
+                    "budget_ref",
+                    PropertyType::String,
+                    false,
+                    "Reference to the budget object or external budget system governing this object.",
+                ),
             ],
         ),
         (
             "Evaluable",
-            "Object can carry evaluation and baseline state.",
+            "Capability for objects that carry evaluation and baseline state.",
             vec![
-                prop_def("last_eval", PropertyType::Timestamp, false),
-                prop_def("baseline", PropertyType::String, false),
+                prop_def_desc(
+                    "last_eval",
+                    PropertyType::Timestamp,
+                    false,
+                    "Time when the most recent evaluation was recorded.",
+                ),
+                prop_def_desc(
+                    "baseline",
+                    PropertyType::String,
+                    false,
+                    "Named or serialized baseline used when comparing evaluation results.",
+                ),
             ],
         ),
         (
             "Governed",
-            "Object is governed by owner, policy, and status metadata.",
+            "Capability for objects governed by owner, policy, and lifecycle status metadata.",
             vec![
-                prop_def("owner", PropertyType::String, false),
-                prop_def("policy", PropertyType::String, false),
-                prop_def("status", PropertyType::String, false),
+                prop_def_desc(
+                    "owner",
+                    PropertyType::String,
+                    false,
+                    "Responsible principal, team, or service for governance decisions.",
+                ),
+                prop_def_desc(
+                    "policy",
+                    PropertyType::String,
+                    false,
+                    "Policy identifier or scope that governs this object.",
+                ),
+                prop_def_desc(
+                    "status",
+                    PropertyType::String,
+                    false,
+                    "Lifecycle or governance state, such as active, deprecated, or blocked.",
+                ),
             ],
         ),
         (
             "RiskScored",
-            "Object exposes risk score context for policy and routing decisions.",
+            "Capability for objects that expose risk context for policy and routing decisions.",
             vec![
-                prop_def("risk_score", PropertyType::Float, false),
-                prop_def("risk_reason", PropertyType::String, false),
-                prop_def("risk_updated_at", PropertyType::Timestamp, false),
+                prop_def_desc(
+                    "risk_score",
+                    PropertyType::Float,
+                    false,
+                    "Numeric risk score used by policy or routing logic.",
+                ),
+                prop_def_desc(
+                    "risk_reason",
+                    PropertyType::String,
+                    false,
+                    "Human-readable explanation for the current risk score.",
+                ),
+                prop_def_desc(
+                    "risk_updated_at",
+                    PropertyType::Timestamp,
+                    false,
+                    "Time when risk metadata was last refreshed.",
+                ),
             ],
         ),
     ]
@@ -455,12 +532,17 @@ fn builtin_interfaces() -> Vec<InterfaceDef> {
     .collect()
 }
 
-fn prop_def(name: &str, prop_type: PropertyType, required: bool) -> PropertyDef {
+fn prop_def_desc(
+    name: &str,
+    prop_type: PropertyType,
+    required: bool,
+    description: &str,
+) -> PropertyDef {
     PropertyDef {
         name: name.to_string(),
         prop_type,
         required,
-        description: String::new(),
+        description: description.to_string(),
         enum_values: Vec::new(),
         link_kind: String::new(),
         compute_expr: String::new(),
@@ -1280,6 +1362,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("cannot replace builtin interface"));
+    }
+
+    #[test]
+    fn test_builtin_object_type_descriptions_explain_semantics() {
+        let registry = SchemaRegistry::new();
+        for object_type in registry.all().into_iter().filter(|t| t.is_builtin) {
+            assert!(
+                !object_type.description.trim().is_empty(),
+                "{} description is empty",
+                object_type.kind
+            );
+            assert!(
+                !object_type.description.starts_with("Built-in "),
+                "{} description is still placeholder-like",
+                object_type.kind
+            );
+        }
+
+        let asset = registry.get("asset").unwrap().description.as_str();
+        let namespace = registry.get("namespace").unwrap().description.as_str();
+        let project = registry.get("project").unwrap().description.as_str();
+        let component = registry.get("component").unwrap().description.as_str();
+        assert!(asset.contains("Generic resource"));
+        assert!(namespace.contains("Control-plane boundary"));
+        assert!(project.contains("namespaces remain the runtime boundary"));
+        assert!(component.contains("Runnable or observable unit"));
+    }
+
+    #[test]
+    fn test_builtin_interface_properties_have_descriptions() {
+        let registry = SchemaRegistry::new();
+        for interface in registry
+            .all_interfaces()
+            .into_iter()
+            .filter(|i| i.is_builtin)
+        {
+            assert!(
+                !interface.description.trim().is_empty(),
+                "{} description is empty",
+                interface.name
+            );
+            for property in &interface.properties {
+                assert!(
+                    !property.description.trim().is_empty(),
+                    "{}.{} description is empty",
+                    interface.name,
+                    property.name
+                );
+            }
+        }
     }
 
     #[test]
