@@ -191,6 +191,39 @@ for external provider calls. Allowed object fields are injected into supported
 OpenAI Responses, Chat Completions, and Anthropic Messages payload shapes, while
 denied fields are counted in audit but not forwarded.
 
+### One-command launch
+
+```bash
+cargo run --bin sekaictl -- launch codex-app
+```
+
+`sekaictl launch` reads `./.env` for any unset variables, starts the sekai
+server on the Unix socket if it is not already running, seeds the codex-app
+project, gateway key, budget, and model policy, starts `chisei-gateway` if
+needed, and opens the Codex app. Spawned services log to `./data/logs/`. Use
+`--no-app` to bring the stack up without launching Codex, and `--model`,
+`--project`, `--budget`, or `--gateway-bind` to adjust the defaults.
+
+The gateway upstream mode is picked automatically: with `OPENAI_API_KEY` set,
+Codex local-login auth is rewritten for `api.openai.com`; without it, the Codex
+ChatGPT-plan OAuth login and `chatgpt-account-id` header are forwarded
+unchanged to `https://chatgpt.com/backend-api/codex`, so a ChatGPT subscription
+works through the gateway with no API key.
+
+Codex CLI runs honor per-invocation provider overrides, but the desktop app
+does not: only the user-level `~/.codex/config.toml` routes app traffic.
+`sekaictl launch codex-app` therefore manages that file for the lifetime of the
+app — it sets `model_provider = "chisei"` plus the provider stanza (commenting
+out any existing top-level provider choice), waits in the foreground, and
+strips its changes again when the app quits or on Ctrl-C, preserving edits the
+app made in the meantime and self-healing on the next run if a previous launch
+crashed. Pass `--keep-config` to leave the routing in place instead.
+
+Note that Codex scopes chat history by provider: while routed through the
+gateway the desktop app shows a separate `chisei` conversation list, and your
+normal `openai` conversations reappear once the config is reverted. The steps
+below are the manual equivalent of what `launch` automates.
+
 Seed the Codex app project, agent, budget, model policy, graph metadata, and
 `llm_calls` dataset:
 

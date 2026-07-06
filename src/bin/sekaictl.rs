@@ -6,6 +6,7 @@ use sekai_chisei::gateway_report::{GatewayReportConfig, report_usage, run_report
 use sekai_chisei::gateway_setup::{
     GatewaySetupConfig, key_usage, run_gateway_key_command, run_setup, usage as setup_usage,
 };
+use sekai_chisei::launch::{LaunchConfig, run_launch, usage as launch_usage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18,6 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match args[0].as_str() {
         "credential" => run_credential_command(args.into_iter().skip(1).collect()).await,
         "gateway" => run_gateway_command(args.into_iter().skip(1).collect()).await,
+        "launch" => {
+            sekai_chisei::launch::load_local_env();
+            let config = LaunchConfig::from_env_and_args(args.into_iter().skip(1))
+                .map_err(std::io::Error::other)?;
+            run_launch(config).await
+        }
         other => {
             eprintln!("unknown command {other:?}");
             print_root_usage();
@@ -111,13 +118,15 @@ async fn run_gateway_command(
 }
 
 fn print_root_usage() {
-    println!("Usage: sekaictl <credential|gateway> ...\n");
+    println!("Usage: sekaictl <credential|gateway|launch> ...\n");
     println!("Credential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
     println!("  sekaictl gateway setup [...]");
     println!("  sekaictl gateway key [create|list|rotate|revoke] [...]");
     println!("  sekaictl gateway report [...]");
+    println!("\nLaunch commands:");
+    println!("  {}", launch_usage());
 }
 
 fn print_gateway_usage() {
