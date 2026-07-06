@@ -55,7 +55,14 @@ impl SekaiServiceImpl {
                     (Vec::new(), Some(error), std::collections::HashMap::new())
                 }
             };
-        let registry = SchemaRegistry::from_types(types);
+        let interfaces = match db.list_interfaces() {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                tracing::error!(%error, "failed to load interfaces");
+                Vec::new()
+            }
+        };
+        let registry = SchemaRegistry::from_types_and_interfaces(types, interfaces);
         let schema = Arc::new(RwLock::new(registry));
         Self {
             db,
@@ -91,8 +98,11 @@ impl SekaiServiceImpl {
             return Ok(());
         }
 
-        match self.db.list_object_types_with_errors() {
-            Ok((types, errors)) => {
+        match (
+            self.db.list_object_types_with_errors(),
+            self.db.list_interfaces(),
+        ) {
+            (Ok((types, errors)), Ok(interfaces)) => {
                 for (kind, error) in &errors {
                     tracing::error!(kind, %error, "failed to load schema type");
                 }
@@ -100,7 +110,7 @@ impl SekaiServiceImpl {
                     .schema
                     .write()
                     .map_err(|_| Status::internal("schema registry unavailable"))? =
-                    SchemaRegistry::from_types(types);
+                    SchemaRegistry::from_types_and_interfaces(types, interfaces);
                 *self
                     .schema_load_errors
                     .write()
@@ -111,7 +121,7 @@ impl SekaiServiceImpl {
                     .map_err(|_| Status::internal("schema registry unavailable"))? = None;
                 Ok(())
             }
-            Err(error) => {
+            (Err(error), _) | (_, Err(error)) => {
                 *self
                     .schema_unavailable_error
                     .write()
@@ -244,6 +254,23 @@ fn check_schema_admin(
         return Ok(());
     }
     Err(Status::permission_denied("schema admin required"))
+}
+
+fn check_interface_admin(
+    security: &SecurityChecker,
+    name: &str,
+    principals: &[String],
+) -> Result<(), Status> {
+    let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+        || security.can_admin("schema", &refs)
+        || security.can_admin(&interface_object_id(name), &refs)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("interface admin required"))
 }
 
 fn check_action_admin(
@@ -381,6 +408,7 @@ fn parse_list_filter(f: ListFilter) -> Result<domain::ListFilter, Status> {
             value: pf.value,
         });
     }
+    let interface_filter = parse_interface_filter(f.interface_filter)?;
     let order_by = parse_order_by(&f.order_by)?;
     Ok(domain::ListFilter {
         kind: if f.kind.is_empty() {
@@ -399,6 +427,7 @@ fn parse_list_filter(f: ListFilter) -> Result<domain::ListFilter, Status> {
             Some(f.namespace)
         },
         property_filters,
+        interface_filter,
         limit,
         offset,
         order_by,
@@ -435,6 +464,7 @@ fn to_proto_list_filter(filter: &domain::ListFilter) -> ListFilter {
         offset: filter.offset,
         order_by: filter.order_by.clone(),
         descending: filter.descending,
+        interface_filter: filter.interface_filter.clone(),
     }
 }
 
@@ -454,6 +484,7 @@ fn parse_set_filter_from_request(input: &ObjectSet) -> Result<domain::ListFilter
             value: pf.value,
         });
     }
+    let interface_filter = parse_interface_filter(filter.interface_filter)?;
     if filter.offset < 0 {
         return Err(Status::invalid_argument("offset must be >= 0"));
     }
@@ -475,6 +506,7 @@ fn parse_set_filter_from_request(input: &ObjectSet) -> Result<domain::ListFilter
             Some(filter.namespace)
         },
         property_filters,
+        interface_filter,
         // Keep zero/negative input as "use runtime request default" for resolves.
         // Callers should treat persisted ObjectSet filters as declarative query
         // descriptors, not already-paginated result sets.
@@ -487,6 +519,17 @@ fn parse_set_filter_from_request(input: &ObjectSet) -> Result<domain::ListFilter
         order_by,
         descending: filter.descending,
     })
+}
+
+fn parse_interface_filter(interface_filter: Vec<String>) -> Result<Vec<String>, Status> {
+    let mut parsed = Vec::new();
+    for interface_name in interface_filter {
+        if interface_name.trim().is_empty() {
+            return Err(Status::invalid_argument("interface name required"));
+        }
+        parsed.push(interface_name);
+    }
+    Ok(parsed)
 }
 
 fn to_domain_object_set(
@@ -573,6 +616,20 @@ fn to_proto_schema_type(object_type: &schema::ObjectType) -> ObjectType {
             .map(to_proto_property_def)
             .collect(),
         is_builtin: object_type.is_builtin,
+        implements: object_type.implements.clone(),
+    }
+}
+
+fn to_proto_interface(interface: &schema::InterfaceDef) -> InterfaceDef {
+    InterfaceDef {
+        name: interface.name.clone(),
+        description: interface.description.clone(),
+        properties: interface
+            .properties
+            .iter()
+            .map(to_proto_property_def)
+            .collect(),
+        is_builtin: interface.is_builtin,
     }
 }
 
@@ -599,6 +656,21 @@ fn from_proto_schema_type(object_type: &ObjectType) -> Result<schema::ObjectType
         description: object_type.description.clone(),
         properties,
         is_builtin: object_type.is_builtin,
+        implements: object_type.implements.clone(),
+    })
+}
+
+fn from_proto_interface(interface: &InterfaceDef) -> Result<schema::InterfaceDef, Status> {
+    let properties = interface
+        .properties
+        .iter()
+        .map(from_proto_property_def)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(schema::InterfaceDef {
+        name: interface.name.clone(),
+        description: interface.description.clone(),
+        properties,
+        is_builtin: interface.is_builtin,
     })
 }
 
@@ -619,6 +691,10 @@ fn from_proto_property_def(property: &PropertyDef) -> Result<schema::PropertyDef
 
 fn schema_object_id(kind: &str) -> String {
     format!("schema:{kind}")
+}
+
+fn interface_object_id(name: &str) -> String {
+    format!("interface:{name}")
 }
 
 fn action_object_id(name: &str) -> String {
@@ -1426,9 +1502,15 @@ impl SekaiService for SekaiServiceImpl {
             },
             max_depth: q.max_depth,
             kind_filter: q.kind_filter,
+            interface_filter: q.interface_filter,
             property_filter: q.property_filter,
         };
-        let res = crate::sekai::query::traverse(&self.db, &gq).map_err(Status::internal)?;
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        let res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
+            .map_err(Status::internal)?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -1477,7 +1559,7 @@ impl SekaiService for SekaiServiceImpl {
                 .schema
                 .read()
                 .map_err(|_| Status::internal("schema registry unavailable"))?;
-            schema::validate_object_type_definition(&parsed, registry.get(&parsed.kind))
+            schema::validate_object_type_definition(&parsed, registry.get(&parsed.kind), &registry)
                 .map_err(Status::invalid_argument)?;
         }
         self.db
@@ -1533,6 +1615,121 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .remove(&kind);
         Ok(Response::new(DeleteSchemaTypeResponse {}))
+    }
+
+    async fn list_interfaces(
+        &self,
+        req: Request<ListInterfacesRequest>,
+    ) -> Result<Response<ListInterfacesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let interfaces = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .all_interfaces()
+            .iter()
+            .filter(|interface| {
+                check_read(
+                    &self.security,
+                    &interface_object_id(&interface.name),
+                    &principals,
+                )
+                .is_ok()
+            })
+            .map(to_proto_interface)
+            .collect();
+        Ok(Response::new(ListInterfacesResponse { interfaces }))
+    }
+
+    async fn create_interface(
+        &self,
+        req: Request<CreateInterfaceRequest>,
+    ) -> Result<Response<CreateInterfaceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let interface = req
+            .into_inner()
+            .interface
+            .ok_or(Status::invalid_argument("interface required"))?;
+        let parsed = from_proto_interface(&interface)?;
+        check_interface_admin(&self.security, &parsed.name, &principals)?;
+        {
+            let registry = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            schema::validate_interface_definition(&parsed, registry.get_interface(&parsed.name))
+                .map_err(Status::invalid_argument)?;
+            let mut updated_registry = registry.clone();
+            updated_registry.register_interface(parsed.clone());
+            for object_type in updated_registry.all() {
+                if object_type
+                    .implements
+                    .iter()
+                    .any(|interface| interface == &parsed.name)
+                {
+                    schema::validate_object_type_definition(
+                        &object_type,
+                        updated_registry.get(&object_type.kind),
+                        &updated_registry,
+                    )
+                    .map_err(Status::invalid_argument)?;
+                }
+            }
+        }
+        self.db
+            .upsert_interface(&parsed)
+            .map_err(Status::internal)?;
+        self.schema
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .register_interface(parsed.clone());
+        Ok(Response::new(CreateInterfaceResponse {
+            interface: Some(to_proto_interface(&parsed)),
+        }))
+    }
+
+    async fn delete_interface(
+        &self,
+        req: Request<DeleteInterfaceRequest>,
+    ) -> Result<Response<DeleteInterfaceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("interface name required"));
+        }
+        check_interface_admin(&self.security, &name, &principals)?;
+        {
+            let registry = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            if registry
+                .get_interface(&name)
+                .map(|interface| interface.is_builtin)
+                .unwrap_or(false)
+            {
+                return Err(Status::invalid_argument("cannot delete builtin interface"));
+            }
+            if registry.all().iter().any(|object_type| {
+                object_type
+                    .implements
+                    .iter()
+                    .any(|interface| interface == &name)
+            }) {
+                return Err(Status::failed_precondition(
+                    "cannot delete interface while schema types implement it",
+                ));
+            }
+        }
+        self.db.delete_interface(&name).map_err(Status::internal)?;
+        self.schema
+            .write()
+            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .remove_interface(&name);
+        Ok(Response::new(DeleteInterfaceResponse {}))
     }
 
     async fn create_action_type(
@@ -2972,6 +3169,7 @@ mod tests {
                 },
             ],
             is_builtin: false,
+            implements: vec![],
         }
     }
 
@@ -4664,6 +4862,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interface_rpcs_enforce_auth_and_admin() {
+        let svc = service();
+        let err = svc
+            .list_interfaces(Request::new(ListInterfacesRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        let interface = InterfaceDef {
+            name: "Trackable".into(),
+            description: "Trackable object".into(),
+            properties: vec![],
+            is_builtin: false,
+        };
+        let err = svc
+            .create_interface(with_principal(CreateInterfaceRequest {
+                interface: Some(interface.clone()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        grant_object_role(&svc, "schema:Trackable", "tester", security::Role::Admin);
+        let err = svc
+            .create_interface(with_principal(CreateInterfaceRequest {
+                interface: Some(interface.clone()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        grant_object_role(&svc, "interface:Trackable", "tester", security::Role::Admin);
+        let created = svc
+            .create_interface(with_principal(CreateInterfaceRequest {
+                interface: Some(interface),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .interface
+            .unwrap();
+        assert_eq!(created.name, "Trackable");
+
+        let listed = svc
+            .list_interfaces(with_principal(ListInterfacesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            listed
+                .interfaces
+                .iter()
+                .any(|interface| interface.name == "Trackable" && !interface.is_builtin)
+        );
+
+        svc.delete_interface(with_principal(DeleteInterfaceRequest {
+            name: "Trackable".into(),
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_interface_rejects_builtin() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let err = svc
+            .delete_interface(with_principal(DeleteInterfaceRequest {
+                name: "RiskScored".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("builtin"));
+    }
+
+    #[tokio::test]
+    async fn schema_type_implements_interface_and_list_filters_by_interface() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        let interface = InterfaceDef {
+            name: "Trackable".into(),
+            description: "Trackable object".into(),
+            properties: vec![PropertyDef {
+                name: "tracking_id".into(),
+                r#type: "string".into(),
+                required: true,
+                description: "".into(),
+                enum_values: vec![],
+                link_kind: "".into(),
+                compute_expr: "".into(),
+            }],
+            is_builtin: false,
+        };
+        svc.create_interface(with_principal(CreateInterfaceRequest {
+            interface: Some(interface),
+        }))
+        .await
+        .unwrap();
+
+        let mut invalid_type = widget_schema_type();
+        invalid_type.implements = vec!["Trackable".into()];
+        let err = svc
+            .create_schema_type(with_principal(CreateSchemaTypeRequest {
+                r#type: Some(invalid_type),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("tracking_id"));
+
+        let mut optional_required_property = widget_schema_type();
+        optional_required_property.implements = vec!["Trackable".into()];
+        optional_required_property.properties.push(PropertyDef {
+            name: "tracking_id".into(),
+            r#type: "string".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+        });
+        let err = svc
+            .create_schema_type(with_principal(CreateSchemaTypeRequest {
+                r#type: Some(optional_required_property),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must be required"));
+
+        let mut valid_type = widget_schema_type();
+        valid_type.implements = vec!["Trackable".into()];
+        valid_type.properties.push(PropertyDef {
+            name: "tracking_id".into(),
+            r#type: "string".into(),
+            required: true,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+        });
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(valid_type),
+        }))
+        .await
+        .unwrap();
+
+        let incompatible_update = svc
+            .create_interface(with_principal(CreateInterfaceRequest {
+                interface: Some(InterfaceDef {
+                    name: "Trackable".into(),
+                    description: "Trackable object".into(),
+                    properties: vec![
+                        PropertyDef {
+                            name: "tracking_id".into(),
+                            r#type: "string".into(),
+                            required: true,
+                            description: "".into(),
+                            enum_values: vec![],
+                            link_kind: "".into(),
+                            compute_expr: "".into(),
+                        },
+                        PropertyDef {
+                            name: "second_tracking_id".into(),
+                            r#type: "string".into(),
+                            required: true,
+                            description: "".into(),
+                            enum_values: vec![],
+                            link_kind: "".into(),
+                            compute_expr: "".into(),
+                        },
+                    ],
+                    is_builtin: false,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(incompatible_update.code(), tonic::Code::InvalidArgument);
+        assert!(incompatible_update.message().contains("second_tracking_id"));
+
+        let delete_referenced = svc
+            .delete_interface(with_principal(DeleteInterfaceRequest {
+                name: "Trackable".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(delete_referenced.code(), tonic::Code::FailedPrecondition);
+
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(widget_object(
+                "tracked",
+                HashMap::from([
+                    ("name".into(), "tracked".into()),
+                    ("tracking_id".into(), "trk-1".into()),
+                ]),
+            )),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: "loose-2".into(),
+                kind: "loose".into(),
+                name: "loose".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    interface_filter: vec!["Trackable".into()],
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.total, 1);
+        assert_eq!(listed.objects[0].id, "tracked");
+    }
+
+    #[tokio::test]
     async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         {
@@ -4717,6 +5145,7 @@ mod tests {
                 description: "Repaired".into(),
                 properties: vec![],
                 is_builtin: false,
+                implements: vec![],
             }),
         }))
         .await
