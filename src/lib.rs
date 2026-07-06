@@ -8,6 +8,7 @@ pub mod gateway_keys;
 pub mod gateway_report;
 pub mod gateway_setup;
 pub mod grpc;
+pub mod launch;
 pub mod llm;
 pub mod obs;
 pub mod sekai;
