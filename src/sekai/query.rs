@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
+use crate::sekai::schema::SchemaRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_DEPTH: i32 = 10;
@@ -12,6 +13,7 @@ pub struct GraphQuery {
     pub direction: Direction,
     pub max_depth: i32,
     pub kind_filter: Vec<String>,
+    pub interface_filter: Vec<String>,
     pub property_filter: HashMap<String, String>,
 }
 
@@ -21,7 +23,11 @@ pub struct GraphResult {
     pub links: Vec<Link>,
 }
 
-pub fn traverse(db: &SekaiDb, q: &GraphQuery) -> Result<GraphResult, String> {
+pub fn traverse(
+    db: &SekaiDb,
+    q: &GraphQuery,
+    schema: Option<&SchemaRegistry>,
+) -> Result<GraphResult, String> {
     let start_id = if !q.start_id.is_empty() {
         q.start_id.clone()
     } else if !q.start_external_id.is_empty() {
@@ -65,7 +71,13 @@ pub fn traverse(db: &SekaiDb, q: &GraphQuery) -> Result<GraphResult, String> {
 
                     if let Some(obj) = db.get_object(target)? {
                         next.push_back(target.clone());
-                        if matches_filters(&obj, &kind_set, &q.property_filter) {
+                        if matches_filters(
+                            &obj,
+                            &kind_set,
+                            &q.interface_filter,
+                            &q.property_filter,
+                            schema,
+                        ) {
                             result.objects.push(obj);
                             result.links.push(link);
                         }
@@ -84,9 +96,18 @@ pub fn traverse(db: &SekaiDb, q: &GraphQuery) -> Result<GraphResult, String> {
 fn matches_filters(
     obj: &Object,
     kind_set: &HashSet<&str>,
+    interface_filter: &[String],
     prop_filter: &HashMap<String, String>,
+    schema: Option<&SchemaRegistry>,
 ) -> bool {
     if !kind_set.is_empty() && !kind_set.contains(obj.kind.as_str()) {
+        return false;
+    }
+    if !interface_filter.is_empty()
+        && !schema
+            .map(|schema| schema.kind_implements_all(&obj.kind, interface_filter))
+            .unwrap_or(false)
+    {
         return false;
     }
     for (k, v) in prop_filter {
@@ -101,6 +122,9 @@ fn matches_filters(
 mod tests {
     use super::*;
     use crate::domain::KIND_COMPONENT;
+    use crate::sekai::schema::{
+        InterfaceDef, ObjectType, PropertyDef, PropertyType, SchemaRegistry,
+    };
 
     fn setup() -> SekaiDb {
         let db = SekaiDb::new(":memory:").unwrap();
@@ -184,7 +208,7 @@ mod tests {
             max_depth: 1,
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 2); // comp1, comp2
     }
 
@@ -196,7 +220,7 @@ mod tests {
             max_depth: 2,
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 3); // comp1, comp2, file1
     }
 
@@ -209,7 +233,7 @@ mod tests {
             kind_filter: vec![KIND_COMPONENT.into()],
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 2); // only components
     }
 
@@ -222,7 +246,7 @@ mod tests {
             property_filter: HashMap::from([("language".into(), "rust".into())]),
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 1);
         assert_eq!(res.objects[0].name, "comp1");
     }
@@ -235,7 +259,7 @@ mod tests {
             max_depth: 1,
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 2);
     }
 
@@ -248,7 +272,44 @@ mod tests {
             relations: vec!["owns".into()],
             ..Default::default()
         };
-        let res = traverse(&db, &q).unwrap();
+        let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 0); // no "owns" links
+    }
+
+    #[test]
+    fn test_interface_filter() {
+        let db = setup();
+        let mut schema = SchemaRegistry::new();
+        schema.register_interface(InterfaceDef {
+            name: "RiskScored".into(),
+            description: "Risk scored".into(),
+            properties: vec![],
+            is_builtin: false,
+        });
+        schema.register(ObjectType {
+            kind: KIND_COMPONENT.into(),
+            description: "Component".into(),
+            properties: vec![PropertyDef {
+                name: "language".into(),
+                prop_type: PropertyType::String,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+            }],
+            is_builtin: false,
+            implements: vec!["RiskScored".into()],
+        });
+        let q = GraphQuery {
+            start_id: "r1".into(),
+            max_depth: 2,
+            interface_filter: vec!["RiskScored".into()],
+            property_filter: HashMap::from([("language".into(), "rust".into())]),
+            ..Default::default()
+        };
+        let res = traverse(&db, &q, Some(&schema)).unwrap();
+        assert_eq!(res.objects.len(), 1);
+        assert_eq!(res.objects[0].id, "c1");
     }
 }

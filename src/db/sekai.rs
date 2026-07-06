@@ -912,6 +912,21 @@ fn build_list_query(filter: &ListFilter) -> Result<ListQueryParts, String> {
         where_parts.push(condition);
     }
 
+    for interface_name in &filter.interface_filter {
+        where_parts.push(format!(
+            "EXISTS (
+                SELECT 1 FROM sekai_object_types
+                WHERE sekai_object_types.kind = sekai_objects.kind
+                  AND EXISTS (
+                    SELECT 1 FROM json_each(sekai_object_types.implements_json)
+                    WHERE json_each.value = ?{}
+                  )
+            )",
+            params.len() + 1
+        ));
+        params.push(Box::new(interface_name.clone()));
+    }
+
     let where_sql = if where_parts.is_empty() {
         " WHERE 1 = 1".to_string()
     } else {
@@ -1349,6 +1364,72 @@ mod tests {
 
         let found = db.find_by_external_id("namespace:alpha").unwrap();
         assert_eq!(found.unwrap().id, "r1");
+    }
+
+    #[test]
+    fn test_list_objects_filters_by_interface() {
+        use crate::sekai::schema::{InterfaceDef, ObjectType, PropertyDef, PropertyType};
+
+        let db = test_db();
+        db.upsert_interface(&InterfaceDef {
+            name: "RiskScored".into(),
+            description: "Risk scored".into(),
+            properties: vec![],
+            is_builtin: false,
+        })
+        .unwrap();
+        db.upsert_interface(&InterfaceDef {
+            name: "Governed".into(),
+            description: "Governed".into(),
+            properties: vec![],
+            is_builtin: false,
+        })
+        .unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "model".into(),
+            description: "Model".into(),
+            properties: vec![PropertyDef {
+                name: "risk_score".into(),
+                prop_type: PropertyType::Float,
+                required: false,
+                description: String::new(),
+                enum_values: vec![],
+                link_kind: String::new(),
+                compute_expr: String::new(),
+            }],
+            is_builtin: false,
+            implements: vec!["RiskScored".into(), "Governed".into()],
+        })
+        .unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "component".into(),
+            description: "Component".into(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec!["Governed".into()],
+        })
+        .unwrap();
+        db.create_object(&make_obj("m1", "model", "model")).unwrap();
+        db.create_object(&make_obj("c1", "component", "component"))
+            .unwrap();
+
+        let (objects, total) = db
+            .list_objects_with_total(&ListFilter {
+                interface_filter: vec!["RiskScored".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(objects[0].id, "m1");
+
+        let (objects, total) = db
+            .list_objects_with_total(&ListFilter {
+                interface_filter: vec!["RiskScored".into(), "Governed".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(objects[0].id, "m1");
     }
 
     #[test]
