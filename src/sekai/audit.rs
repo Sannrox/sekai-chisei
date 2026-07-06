@@ -396,6 +396,34 @@ impl SekaiDb {
         Ok(results)
     }
 
+    pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        let marker = conn
+            .query_row(
+                "SELECT field, old_value, new_value FROM sekai_object_changes
+                 WHERE object_id = ?1 AND field IN ('_created', '_deleted')
+                 ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+                params![object_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(marker.and_then(|(field, old_value, new_value)| {
+            let value = if field == "_deleted" {
+                old_value
+            } else {
+                new_value
+            };
+            value.split_once('/').map(|(kind, _)| kind.to_string())
+        }))
+    }
+
     pub fn purge_old_records(&self, before: i64) -> Result<i32, String> {
         let conn = self.conn();
         let n1 = conn

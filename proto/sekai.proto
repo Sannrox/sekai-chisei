@@ -79,6 +79,7 @@ message PropertyDef {
   repeated string enum_values = 5;
   string link_kind = 6;
   string compute_expr = 7;
+  string classification = 8;
 }
 
 message Function {
