@@ -1589,6 +1589,19 @@ fn inject_gateway_context(
     };
 
     if provider == ProviderKind::Anthropic {
+        // When a `cache_control` breakpoint is present, prefer appending the
+        // context after the entire cached prefix — the end of the final message
+        // when it is a `user` turn — so no cached block changes. If the last
+        // turn is an assistant prefill (which must not be mutated) or is
+        // otherwise not appendable, fall through to system injection below: that
+        // still delivers the context and preserves the system-level cache,
+        // though a message-level cache entry may be rebuilt, as there is no
+        // fully cache-safe slot in that case.
+        if anthropic_has_cache_control(object)
+            && append_context_to_last_anthropic_message(object, &context)
+        {
+            return serde_json::to_vec(&value).map(Some);
+        }
         if object.contains_key("system") {
             match object.get_mut("system") {
                 Some(serde_json::Value::String(system)) => {
@@ -1642,6 +1655,85 @@ fn inject_gateway_context(
     }
 
     Ok(None)
+}
+
+/// Whether an Anthropic request carries a `cache_control` breakpoint at a valid
+/// position: a tool definition, a `system` content block, or a `messages`
+/// content block. Used to keep object-context injection from mutating the
+/// cached prefix. Only the top level of each of these blocks is inspected, so a
+/// tool `input_schema` property that happens to be named `cache_control` does
+/// not false-positive.
+fn anthropic_has_cache_control(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let tools_have = object
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tools| tools.iter().any(block_has_cache_control));
+    // A string `system` cannot carry a breakpoint; only array blocks can.
+    let system_has = object
+        .get("system")
+        .and_then(|value| value.as_array())
+        .is_some_and(|blocks| blocks.iter().any(block_has_cache_control));
+    let messages_have = object
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .is_some_and(|blocks| blocks.iter().any(block_has_cache_control))
+            })
+        });
+    tools_have || system_has || messages_have
+}
+
+fn block_has_cache_control(block: &serde_json::Value) -> bool {
+    block
+        .as_object()
+        .is_some_and(|map| map.contains_key("cache_control"))
+}
+
+/// Append the object context as a trailing text block on the final Anthropic
+/// message, so it lands strictly after the entire cached prefix. A string
+/// `content` is promoted to a two-element block array that preserves the
+/// original text. Only appends when the final message is a `user` turn: an
+/// assistant-last message is a prefill the model continues from, so mutating it
+/// would corrupt the generated output; callers fall back to system injection in
+/// that case. Returns false when there is no user message to append to.
+fn append_context_to_last_anthropic_message(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> bool {
+    let Some(last) = object
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())
+        .and_then(|messages| messages.last_mut())
+        .and_then(|message| message.as_object_mut())
+    else {
+        return false;
+    };
+    // Never mutate a non-user turn (e.g. an assistant prefill).
+    if last.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return false;
+    }
+    match last.get_mut("content") {
+        Some(serde_json::Value::Array(items)) => {
+            items.push(serde_json::json!({"type": "text", "text": context}));
+            true
+        }
+        Some(serde_json::Value::String(text)) => {
+            let existing = std::mem::take(text);
+            last.insert(
+                "content".to_string(),
+                serde_json::json!([
+                    {"type": "text", "text": existing},
+                    {"type": "text", "text": context},
+                ]),
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn extract_gateway_object_refs(project: &str, body: &[u8]) -> Vec<String> {
@@ -7048,6 +7140,157 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(value["model"], "gpt-5.5-mini");
         assert_eq!(value["input"], "hello");
+    }
+
+    #[test]
+    fn rewrite_request_model_preserves_cache_control_prefix() {
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"big cached prefix","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"hi"}]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let rewritten = rewrite_request_model(body, "claude-opus-4-8").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        // Only the model changes; the cached system prefix is byte-for-byte
+        // identical (deep-equal, and identical when re-serialized).
+        assert_eq!(value["model"], "claude-opus-4-8");
+        assert_eq!(value["system"], original["system"]);
+        assert_eq!(value["messages"], original["messages"]);
+        assert_eq!(
+            serde_json::to_vec(&value["system"]).unwrap(),
+            serde_json::to_vec(&original["system"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn inject_context_preserves_anthropic_cache_control_prefix() {
+        // System array carries the cache_control breakpoint; the client also
+        // marks the last message. Injection must not touch either.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"tooling + rules","cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"earlier","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"ok"},
+                {"role":"user","content":"analyze ticker:{MSFT}"}
+            ]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+
+        // The cached prefix (system + all earlier messages) is unchanged.
+        assert_eq!(value["system"], original["system"]);
+        let messages = value["messages"].as_array().unwrap();
+        let original_messages = original["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), original_messages.len());
+        assert_eq!(messages[0], original_messages[0]);
+        assert_eq!(messages[1], original_messages[1]);
+
+        // The context is appended to the final message, after its original
+        // text, and carries no cache_control (uncached suffix).
+        let last_content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(last_content[0]["text"], "analyze ticker:{MSFT}");
+        assert_eq!(last_content.len(), 2);
+        assert!(
+            last_content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("score: 0.91")
+        );
+        assert!(last_content[1].get("cache_control").is_none());
+        // No new leading system was inserted before the cached messages.
+        assert_eq!(
+            value["system"].as_array().unwrap().len(),
+            original["system"].as_array().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn inject_context_without_cache_control_still_uses_system() {
+        // Regression: without a cache_control breakpoint the existing
+        // system-injection behavior is preserved.
+        let body = br#"{"model":"claude-sonnet-4-8","messages":[{"role":"user","content":"hi"}]}"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        // The user message is untouched.
+        assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn inject_context_does_not_mutate_assistant_prefill() {
+        // Last message is an assistant prefill; appending context to it would
+        // corrupt the model's continuation. With a cache_control breakpoint
+        // present, the context must go to the system array instead, leaving the
+        // prefill byte-identical.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"cached rules","cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":"analyze ticker:{MSFT}"},
+                {"role":"assistant","content":"{"}
+            ]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+
+        // The assistant prefill and the user message are untouched.
+        assert_eq!(value["messages"], original["messages"]);
+        // Context lands on the system array (still cache-safe: appended after
+        // the system breakpoint), not on the prefill.
+        let system = value["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0], original["system"][0]);
+        assert!(system[1]["text"].as_str().unwrap().contains("score: 0.91"));
+        assert!(system[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn inject_context_still_delivered_for_prefill_without_system() {
+        // cache_control on a message, an assistant prefill last, and no system:
+        // there is no fully cache-safe slot, but the governed context must still
+        // be delivered (not silently dropped).
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"analyze ticker:{MSFT}","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"{"}
+            ]
+        }"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        // Delivered via a new system; the prefill is untouched.
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        assert_eq!(value["messages"][1]["content"], "{");
+    }
+
+    #[test]
+    fn cache_control_detection_ignores_tool_schema_properties() {
+        // A tool input schema with a property literally named `cache_control`
+        // must not be treated as a prompt-cache breakpoint.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "tools":[{"name":"t","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],
+            "messages":[{"role":"user","content":"analyze ticker:{MSFT}"}]
+        }"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        // No real breakpoint, so the normal system-injection path is used.
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        assert_eq!(value["messages"][0]["content"], "analyze ticker:{MSFT}");
     }
 
     #[test]
