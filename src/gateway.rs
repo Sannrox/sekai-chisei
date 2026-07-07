@@ -2938,6 +2938,14 @@ struct ResponseUsage {
     input_tokens: i32,
     output_tokens: i32,
     total_tokens: i32,
+    /// Prompt tokens served from the provider's prompt cache at the discounted
+    /// cache-read rate. Anthropic reports these as `cache_read_input_tokens`;
+    /// OpenAI reports them under `usage.prompt_tokens_details.cached_tokens`.
+    cache_read_input_tokens: i32,
+    /// Prompt tokens written into the provider's prompt cache on this call
+    /// (Anthropic `cache_creation_input_tokens`). Billed at the normal (or
+    /// cache-write) input rate; tracked for reporting completeness.
+    cache_creation_input_tokens: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2974,11 +2982,25 @@ fn extract_response_usage(body: &[u8]) -> Option<ResponseUsage> {
         .get("total_tokens")
         .and_then(|value| value.as_i64())
         .unwrap_or(input_tokens + output_tokens);
+    // Anthropic reports cache tokens as siblings of `input_tokens`; OpenAI nests
+    // the cache-read count under `prompt_tokens_details.cached_tokens`. Absent
+    // fields stay 0, so non-caching providers and responses are unchanged.
+    let cache_read_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
 
     Some(ResponseUsage {
         input_tokens: clamp_i64_to_i32(input_tokens),
         output_tokens: clamp_i64_to_i32(output_tokens),
         total_tokens: clamp_i64_to_i32(total_tokens),
+        cache_read_input_tokens: clamp_i64_to_i32(cache_read_input_tokens),
+        cache_creation_input_tokens: clamp_i64_to_i32(cache_creation_input_tokens),
     })
 }
 
@@ -3064,10 +3086,22 @@ fn merge_usage(existing: Option<ResponseUsage>, next: ResponseUsage) -> Response
         } else {
             input_tokens.saturating_add(output_tokens)
         };
+    let cache_read_input_tokens = if next.cache_read_input_tokens > 0 {
+        next.cache_read_input_tokens
+    } else {
+        existing.cache_read_input_tokens
+    };
+    let cache_creation_input_tokens = if next.cache_creation_input_tokens > 0 {
+        next.cache_creation_input_tokens
+    } else {
+        existing.cache_creation_input_tokens
+    };
     ResponseUsage {
         input_tokens,
         output_tokens,
         total_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
     }
 }
 
@@ -6520,6 +6554,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 45,
                 output_tokens: 5,
                 total_tokens: 50,
+                ..Default::default()
             })
         );
         assert!(
@@ -6536,12 +6571,78 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 8,
                 output_tokens: 6,
                 total_tokens: 14,
+                ..Default::default()
             })
         );
 
         let (usage, observation) = extract_buffered_body_usage(b"neither json nor an event stream");
         assert_eq!(usage, None);
         assert_eq!(observation, None);
+    }
+
+    #[test]
+    fn extract_response_usage_parses_anthropic_cache_tokens() {
+        let body = br#"{"type":"message","usage":{"input_tokens":10,"cache_read_input_tokens":120,"cache_creation_input_tokens":30,"output_tokens":7}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 120);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+    }
+
+    #[test]
+    fn extract_response_usage_parses_openai_cached_tokens() {
+        let body = br#"{"usage":{"prompt_tokens":200,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":150}}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, 150);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn extract_response_usage_defaults_cache_tokens_to_zero() {
+        let body = br#"{"usage":{"input_tokens":8,"output_tokens":6}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn sse_usage_tap_captures_anthropic_cache_tokens() {
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":120,\"cache_creation_input_tokens\":30,\"output_tokens\":1}}}\n\n",
+        );
+        tap.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":25}}\n\n",
+        );
+        let (usage, _) = tap.finish();
+        let usage = usage.expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cache_read_input_tokens, 120);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+    }
+
+    #[test]
+    fn merge_usage_carries_cache_tokens_from_earlier_event() {
+        let start = ResponseUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            total_tokens: 11,
+            cache_read_input_tokens: 120,
+            cache_creation_input_tokens: 30,
+        };
+        let delta = ResponseUsage {
+            output_tokens: 25,
+            ..Default::default()
+        };
+        let merged = merge_usage(Some(start), delta);
+        assert_eq!(merged.input_tokens, 10);
+        assert_eq!(merged.output_tokens, 25);
+        assert_eq!(merged.cache_read_input_tokens, 120);
+        assert_eq!(merged.cache_creation_input_tokens, 30);
     }
 
     #[test]
@@ -6556,6 +6657,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 8,
                 output_tokens: 6,
                 total_tokens: 14,
+                ..Default::default()
             })
         );
     }
@@ -6572,6 +6674,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 3,
                 output_tokens: 2,
                 total_tokens: 5,
+                ..Default::default()
             })
         );
     }
