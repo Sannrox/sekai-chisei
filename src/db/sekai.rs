@@ -508,19 +508,24 @@ impl SekaiDb {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         // Static (no-bind) exclusion of internal governance kinds so pagination
         // and totals are computed over the visible set. Kinds are internal
-        // constants; the alphanumeric/underscore guard keeps this injection-safe.
-        let kind_exclusion = {
+        // constants; a non-conforming kind fails the query closed rather than
+        // being silently dropped (which would re-open the read-surface leak).
+        let kind_exclusion = if excluded_kinds.is_empty() {
+            String::new()
+        } else {
+            for kind in excluded_kinds {
+                if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err(format!(
+                        "unsafe excluded kind {kind:?}: only ASCII alphanumeric and '_' allowed"
+                    ));
+                }
+            }
             let quoted = excluded_kinds
                 .iter()
-                .filter(|kind| kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
                 .map(|kind| format!("'{kind}'"))
                 .collect::<Vec<_>>()
                 .join(",");
-            if quoted.is_empty() {
-                String::new()
-            } else {
-                format!(" AND kind NOT IN ({quoted})")
-            }
+            format!(" AND kind NOT IN ({quoted})")
         };
         // Keep visibility params and order-by params disjoint to avoid placeholder
         // number collision for both list and count queries.

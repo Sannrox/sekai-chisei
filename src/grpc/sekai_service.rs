@@ -10015,4 +10015,17 @@ mod tests {
         assert_eq!(resolved.objects.len(), 0);
         assert_eq!(resolved.total, 0);
     }
+
+    #[test]
+    fn reserved_governance_kinds_are_exclusion_safe() {
+        // Every reserved kind must be ASCII alphanumeric/underscore so the
+        // static SQL exclusion covers it; a kind with special characters would
+        // fail the query closed rather than silently re-opening the leak.
+        for kind in RESERVED_GOVERNANCE_KINDS {
+            assert!(
+                !kind.is_empty() && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "reserved governance kind {kind:?} is not exclusion-safe"
+            );
+        }
+    }
 }
