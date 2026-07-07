@@ -75,9 +75,15 @@ impl GatewayConfig {
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
         let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
-        let anthropic_base_url = std::env::var("CHISEI_ANTHROPIC_BASE_URL")
-            .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
-            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string());
+        // Resolve the gateway's own Anthropic upstream from CHISEI_ANTHROPIC_BASE_URL
+        // then the built-in default only. ANTHROPIC_BASE_URL is intentionally NOT a
+        // fallback here: it is the *client*-facing variable that points clients at
+        // the gateway, commonly set to `https://api.anthropic.com` with no `/v1`.
+        // Using it as the gateway's upstream misroutes calls to `…/messages`.
+        let anthropic_base_url = normalize_anthropic_base_url(
+            &std::env::var("CHISEI_ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
+        );
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let ollama_base_url = std::env::var("CHISEI_OLLAMA_BASE_URL")
             .ok()
@@ -1941,6 +1947,24 @@ impl ProviderKind {
     }
 }
 
+/// Normalizes a gateway Anthropic upstream base URL so it ends in `/v1`.
+///
+/// `upstream_path` strips the leading `/v1` from the client path and
+/// `build_upstream_url` re-appends the base, so the effective base must carry
+/// the `/v1` segment. A base like `https://api.anthropic.com` (no `/v1`) would
+/// otherwise misroute every call to `…/messages`, which Anthropic rejects.
+fn normalize_anthropic_base_url(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return DEFAULT_ANTHROPIC_BASE_URL.to_string();
+    }
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
 /// Base URL for a provider's backend. This is what makes per-model routing work:
 /// a request resolved to an Ollama or native model is sent to that backend
 /// instead of the OpenAI upstream.
@@ -3320,6 +3344,45 @@ mod tests {
                 "Content-Type should forward in {mode:?} mode"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_base_url_normalizes_to_v1() {
+        // A base without /v1 gains it; one that already has /v1 is unchanged;
+        // trailing slashes and blank input are handled.
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com/"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            normalize_anthropic_base_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            normalize_anthropic_base_url("  "),
+            DEFAULT_ANTHROPIC_BASE_URL
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_route_targets_v1_after_normalization() {
+        // The client path /v1/messages strips to /messages and re-appends the
+        // base, so a normalized base must yield …/v1/messages.
+        let mut config = routing_config();
+        config.anthropic_base_url = normalize_anthropic_base_url("https://api.anthropic.com");
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        assert_eq!(
+            upstream_url_for_provider(&config, &uri, ProviderKind::Anthropic),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
