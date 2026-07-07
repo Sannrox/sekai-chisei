@@ -195,7 +195,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "content": [{"type": "text", "text": "chisei gateway claude smoke ok"}],
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
-                "usage": {"input_tokens": 5, "output_tokens": 3},
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 10,
+                },
             }
         elif self.path.startswith("/v1/chat/completions"):
             payload = {
@@ -310,7 +315,7 @@ for attempt in $(seq 1 10); do
   CHISEI_ANTHROPIC_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
   CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH=1 \
   CHISEI_GATEWAY_REWRITE_OPENAI_PASSTHROUGH_AUTH=1 \
-  CHISEI_GATEWAY_PRICING="gpt-5.5=1:2,claude-sonnet-4-8=3:15,claude-sonnet-4-6=3:15" \
+  CHISEI_GATEWAY_PRICING="gpt-5.5=1:2,claude-sonnet-4-8=3:15:0.3,claude-sonnet-4-6=3:15:0.3" \
   OPENAI_API_KEY="real-openai-smoke-key" \
   ANTHROPIC_API_KEY="real-anthropic-smoke-key" \
   "$CHISEI_GATEWAY_BIN" >"$gateway_log" 2>&1 &
@@ -435,6 +440,11 @@ report = open(report_path, encoding="utf-8").read()
 assert "codex-app" in report, report
 assert "claude-code" in report, report
 assert "est_cost_usd" in report, report
+# Cache reporting: the Anthropic call reported 40 cache-read tokens priced at
+# a discounted rate (3 -> 0.3 usd/1M), saving 40 * 2.7 usd/1M = $0.000108.
+assert "cache_reads" in report, report
+assert "cache_saved_usd" in report, report
+assert "0.000108" in report, report
 
 dashboard = open(dashboard_path, encoding="utf-8").read()
 assert "Chisei Gateway Usage" in dashboard, dashboard
@@ -442,6 +452,9 @@ assert "By Agent" in dashboard, dashboard
 assert "Estimated cost" in dashboard, dashboard
 assert "codex-app" in dashboard, dashboard
 assert "claude-code" in dashboard, dashboard
+assert "Cache reads" in dashboard, dashboard
+assert "Cache savings" in dashboard, dashboard
+assert "0.000108" in dashboard, dashboard
 PY
 
 if live_client_enabled claude; then

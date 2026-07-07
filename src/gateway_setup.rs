@@ -728,6 +728,10 @@ async fn ensure_llm_calls_dataset(
         "total_tokens",
         "cost_usd_micros",
         "cost_usd",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_savings_usd_micros",
+        "cache_savings_usd",
     ]
     .into_iter()
     .map(|name| ColumnDef {
