@@ -107,29 +107,18 @@ fn anthropic_upstream_mode() -> AnthropicUpstream {
     }
 }
 
-/// Extra env for the `chisei-gateway` child on the Anthropic path. `existing_base`
-/// is the current `CHISEI_ANTHROPIC_BASE_URL` value (`None`/blank if unset).
+/// Extra env for the `chisei-gateway` child on the Anthropic path.
 ///
-/// Pins `CHISEI_ANTHROPIC_BASE_URL` unless the operator already set it: the
-/// gateway otherwise falls back to `ANTHROPIC_BASE_URL` for its own upstream, but
-/// that var is what points *clients* (including the `claude` child this launcher
-/// spawns) at the gateway and is commonly already set in the environment — often
-/// to `https://api.anthropic.com` with no `/v1`. The gateway strips `/v1` from the
-/// request path and re-appends it to the base, so a `/v1`-less base misroutes
-/// every request to `…/messages` (a 404 Claude Code surfaces as "model may not
-/// exist"). In passthrough mode it also enables auth passthrough so the client's
+/// The gateway now resolves its own Anthropic upstream robustly: it reads only
+/// `CHISEI_ANTHROPIC_BASE_URL` (no `ANTHROPIC_BASE_URL` fallback) and normalizes
+/// the base to end in `/v1`. So the launcher no longer needs to pin the base URL
+/// to sidestep the old footgun where the gateway fell back to the client-facing
+/// `ANTHROPIC_BASE_URL` (often `https://api.anthropic.com` with no `/v1`, which
+/// misrouted every request to `…/messages`). The only Anthropic-specific env the
+/// launcher still adds is auth passthrough in subscription mode, so the client's
 /// subscription OAuth token is forwarded upstream instead of being replaced.
-fn anthropic_gateway_env(
-    mode: AnthropicUpstream,
-    existing_base: Option<&str>,
-) -> Vec<(String, String)> {
+fn anthropic_gateway_env(mode: AnthropicUpstream) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    if existing_base.map(str::trim).unwrap_or("").is_empty() {
-        env.push((
-            "CHISEI_ANTHROPIC_BASE_URL".to_string(),
-            "https://api.anthropic.com/v1".to_string(),
-        ));
-    }
     if mode == AnthropicUpstream::SubscriptionPassthrough {
         env.push((
             "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH".to_string(),
@@ -324,6 +313,7 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
             allowed_runtimes: Vec::new(),
             default_model: config.model.clone(),
             default_runtime: "openai".to_string(),
+            merge_into_existing: false,
         })
         .await;
     };
@@ -334,6 +324,11 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
     // later without its seed clobbering this one's policy. The namespace default
     // (used only for Codex's `auto`) stays OpenAI-family — the launched Codex
     // model when launching codex-app, else gpt-5.5.
+    //
+    // Only Codex owns the `auto` default, so a non-OpenAI (claude-code) launch
+    // merges into the existing policy: it unions the allowed lists but preserves
+    // whatever default_model/default_runtime a prior Codex launch set, instead of
+    // resetting `auto` back to gpt-5.5.
     let (default_runtime, default_model) = namespace_default(kind, &config.model);
     run_setup(GatewaySetupConfig {
         chisei_grpc_target: config.socket.clone(),
@@ -347,6 +342,7 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
         allowed_runtimes: union_allowed_runtimes(),
         default_model,
         default_runtime,
+        merge_into_existing: kind != AgentKind::OpenAi,
     })
     .await
 }
@@ -434,10 +430,7 @@ async fn ensure_gateway(
                 }
             }
             AgentKind::Anthropic => {
-                envs.extend(anthropic_gateway_env(
-                    anthropic_mode,
-                    std::env::var("CHISEI_ANTHROPIC_BASE_URL").ok().as_deref(),
-                ));
+                envs.extend(anthropic_gateway_env(anthropic_mode));
                 match anthropic_mode {
                     AnthropicUpstream::ApiKey => {
                         println!("  anthropic: ANTHROPIC_API_KEY upstream for api.anthropic.com")
@@ -1143,54 +1136,25 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_gateway_env_pins_base_url_when_unset() {
+    fn anthropic_gateway_env_enables_passthrough_only_in_subscription_mode() {
         let get = |env: &[(String, String)], key: &str| {
             env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
         };
 
-        // Passthrough, no operator base: pin the /v1 base AND enable passthrough.
-        let env = anthropic_gateway_env(AnthropicUpstream::SubscriptionPassthrough, None);
-        assert_eq!(
-            get(&env, "CHISEI_ANTHROPIC_BASE_URL").as_deref(),
-            Some("https://api.anthropic.com/v1")
-        );
+        // Subscription passthrough: enable auth passthrough. The base URL is no
+        // longer pinned — the gateway normalizes its own upstream to /v1 and does
+        // not fall back to ANTHROPIC_BASE_URL, so the pin is redundant.
+        let env = anthropic_gateway_env(AnthropicUpstream::SubscriptionPassthrough);
         assert_eq!(
             get(&env, "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH").as_deref(),
             Some("1")
         );
+        assert_eq!(get(&env, "CHISEI_ANTHROPIC_BASE_URL"), None);
 
-        // API-key mode: pin the base, but do NOT enable passthrough.
-        let env = anthropic_gateway_env(AnthropicUpstream::ApiKey, None);
-        assert_eq!(
-            get(&env, "CHISEI_ANTHROPIC_BASE_URL").as_deref(),
-            Some("https://api.anthropic.com/v1")
-        );
+        // API-key mode: neither the base pin nor auth passthrough.
+        let env = anthropic_gateway_env(AnthropicUpstream::ApiKey);
         assert_eq!(get(&env, "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH"), None);
-
-        // Blank counts as unset (so an empty inherited value still gets pinned).
-        let env = anthropic_gateway_env(AnthropicUpstream::ApiKey, Some("  "));
-        assert_eq!(
-            get(&env, "CHISEI_ANTHROPIC_BASE_URL").as_deref(),
-            Some("https://api.anthropic.com/v1")
-        );
-    }
-
-    #[test]
-    fn anthropic_gateway_env_respects_operator_base_url() {
-        // An explicit CHISEI_ANTHROPIC_BASE_URL is left untouched (not overridden).
-        let env = anthropic_gateway_env(
-            AnthropicUpstream::SubscriptionPassthrough,
-            Some("https://my-proxy.internal/v1"),
-        );
-        assert!(
-            !env.iter().any(|(k, _)| k == "CHISEI_ANTHROPIC_BASE_URL"),
-            "must not override an operator-provided base URL"
-        );
-        // Passthrough is still enabled.
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH" && v == "1")
-        );
+        assert_eq!(get(&env, "CHISEI_ANTHROPIC_BASE_URL"), None);
     }
 
     #[test]
@@ -1291,7 +1255,6 @@ mod tests {
             .into_iter()
             .chain(anthropic_gateway_env(
                 AnthropicUpstream::SubscriptionPassthrough,
-                None,
             ))
             .collect();
         let deduped = dedup_env(combined);
@@ -1300,10 +1263,11 @@ mod tests {
             .filter(|(k, _)| k == "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH")
             .count();
         assert_eq!(passthrough, 1, "shared passthrough flag must appear once");
-        // Both provider-specific bases survive.
+        // The OpenAI ChatGPT-backend base survives; the Anthropic base is no
+        // longer emitted by the launcher (the gateway normalizes its own).
         assert!(deduped.iter().any(|(k, _)| k == "CHISEI_OPENAI_BASE_URL"));
         assert!(
-            deduped
+            !deduped
                 .iter()
                 .any(|(k, _)| k == "CHISEI_ANTHROPIC_BASE_URL")
         );
