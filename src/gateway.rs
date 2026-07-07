@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, post};
@@ -3193,7 +3193,16 @@ async fn response_from_upstream(
 }
 
 fn should_forward_request_header(name: &HeaderName, auth_mode: UpstreamAuthMode) -> bool {
-    if is_hop_by_hop(name) || name == HOST || name == CONTENT_LENGTH || is_chisei_header(name) {
+    if is_hop_by_hop(name)
+        || name == HOST
+        || name == CONTENT_LENGTH
+        || name == ACCEPT_ENCODING
+        || is_chisei_header(name)
+    {
+        // Strip Accept-Encoding so upstreams return identity-encoded bodies the
+        // gateway's usage parser (extract_response_usage / SseUsageTap) can read.
+        // The reqwest client is built without decompression features, so a
+        // compressed upstream body would otherwise parse as zero usage tokens.
         return false;
     }
     if auth_mode == UpstreamAuthMode::GatewayKey && (name == AUTHORIZATION || name == X_API_KEY) {
@@ -3297,6 +3306,23 @@ mod tests {
     }
 
     #[test]
+    fn strips_accept_encoding_on_upstream_requests() {
+        // Accept-Encoding must be stripped in both auth modes so upstreams
+        // return identity-encoded bodies the usage parser can read.
+        for mode in [UpstreamAuthMode::GatewayKey, UpstreamAuthMode::Passthrough] {
+            assert!(
+                !should_forward_request_header(&ACCEPT_ENCODING, mode),
+                "Accept-Encoding should be stripped in {mode:?} mode"
+            );
+            // A normal content header still forwards.
+            assert!(
+                should_forward_request_header(&CONTENT_TYPE, mode),
+                "Content-Type should forward in {mode:?} mode"
+            );
+        }
+    }
+
+    #[test]
     fn per_model_routing_picks_backend_base_url() {
         let config = routing_config();
         let uri: Uri = "/v1/responses".parse().unwrap();
@@ -3374,6 +3400,7 @@ mod tests {
         authorization: Option<String>,
         x_api_key: Option<String>,
         chisei_agent: Option<String>,
+        accept_encoding: Option<String>,
         body: String,
     }
 
@@ -3428,6 +3455,10 @@ mod tests {
                 .map(str::to_string),
             chisei_agent: headers
                 .get(X_CHISEI_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            accept_encoding: headers
+                .get(ACCEPT_ENCODING)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
             body: String::from_utf8(body.to_vec()).unwrap(),
@@ -4055,6 +4086,136 @@ mod tests {
         );
         assert_eq!(requests[0].x_api_key, None);
         assert_eq!(requests[0].chisei_agent, None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_proxy_records_usage_and_strips_accept_encoding() {
+        // Non-streaming Anthropic shape: usage lands on the llm_calls row, and
+        // the gateway must strip the client's Accept-Encoding so the upstream
+        // body comes back identity-encoded (parseable) rather than compressed.
+        let upstream_body = r#"{
+            "id":"msg_1",
+            "type":"message",
+            "usage":{"input_tokens":8,"output_tokens":6}
+        }"#;
+        let (upstream_base, requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: None,
+            anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target.clone()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .bearer_auth("sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            // Claude Code advertises compression; the gateway must strip it.
+            .header(ACCEPT_ENCODING.as_str(), "gzip, deflate, br, zstd")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/messages");
+            // Regression: Accept-Encoding must not reach the upstream.
+            assert_eq!(requests[0].accept_encoding, None);
+        }
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("agent").map(String::as_str),
+            Some("claude-code")
+        );
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("8"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("6"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("14"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_streaming_records_usage() {
+        // Streaming Anthropic shape (what Claude Code always sends): usage is
+        // split across message_start (input_tokens) and message_delta
+        // (output_tokens) and folded via merge_usage.
+        let sse = "event: message_start\n\
+                   data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n\
+                   event: content_block_delta\n\
+                   data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                   event: message_delta\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+                   event: message_stop\n\
+                   data: {\"type\":\"message_stop\"}\n\n";
+        let (upstream_base, _requests) = spawn_fake_upstream(sse, "text/event-stream").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: None,
+            anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target.clone()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .bearer_auth("sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), sse);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("7"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("18"));
     }
 
     #[tokio::test]
