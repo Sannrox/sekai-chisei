@@ -179,6 +179,10 @@ impl GatewayConfig {
 pub struct ModelPricing {
     pub input_usd_micros_per_million: i64,
     pub output_usd_micros_per_million: i64,
+    /// Discounted rate for prompt tokens served from the provider's cache.
+    /// Defaults to `input_usd_micros_per_million` when the pricing entry omits
+    /// the optional third field, so uncached traffic is priced unchanged.
+    pub cached_input_usd_micros_per_million: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1585,6 +1589,19 @@ fn inject_gateway_context(
     };
 
     if provider == ProviderKind::Anthropic {
+        // When a `cache_control` breakpoint is present, prefer appending the
+        // context after the entire cached prefix — the end of the final message
+        // when it is a `user` turn — so no cached block changes. If the last
+        // turn is an assistant prefill (which must not be mutated) or is
+        // otherwise not appendable, fall through to system injection below: that
+        // still delivers the context and preserves the system-level cache,
+        // though a message-level cache entry may be rebuilt, as there is no
+        // fully cache-safe slot in that case.
+        if anthropic_has_cache_control(object)
+            && append_context_to_last_anthropic_message(object, &context)
+        {
+            return serde_json::to_vec(&value).map(Some);
+        }
         if object.contains_key("system") {
             match object.get_mut("system") {
                 Some(serde_json::Value::String(system)) => {
@@ -1638,6 +1655,85 @@ fn inject_gateway_context(
     }
 
     Ok(None)
+}
+
+/// Whether an Anthropic request carries a `cache_control` breakpoint at a valid
+/// position: a tool definition, a `system` content block, or a `messages`
+/// content block. Used to keep object-context injection from mutating the
+/// cached prefix. Only the top level of each of these blocks is inspected, so a
+/// tool `input_schema` property that happens to be named `cache_control` does
+/// not false-positive.
+fn anthropic_has_cache_control(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let tools_have = object
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tools| tools.iter().any(block_has_cache_control));
+    // A string `system` cannot carry a breakpoint; only array blocks can.
+    let system_has = object
+        .get("system")
+        .and_then(|value| value.as_array())
+        .is_some_and(|blocks| blocks.iter().any(block_has_cache_control));
+    let messages_have = object
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .is_some_and(|blocks| blocks.iter().any(block_has_cache_control))
+            })
+        });
+    tools_have || system_has || messages_have
+}
+
+fn block_has_cache_control(block: &serde_json::Value) -> bool {
+    block
+        .as_object()
+        .is_some_and(|map| map.contains_key("cache_control"))
+}
+
+/// Append the object context as a trailing text block on the final Anthropic
+/// message, so it lands strictly after the entire cached prefix. A string
+/// `content` is promoted to a two-element block array that preserves the
+/// original text. Only appends when the final message is a `user` turn: an
+/// assistant-last message is a prefill the model continues from, so mutating it
+/// would corrupt the generated output; callers fall back to system injection in
+/// that case. Returns false when there is no user message to append to.
+fn append_context_to_last_anthropic_message(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> bool {
+    let Some(last) = object
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())
+        .and_then(|messages| messages.last_mut())
+        .and_then(|message| message.as_object_mut())
+    else {
+        return false;
+    };
+    // Never mutate a non-user turn (e.g. an assistant prefill).
+    if last.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return false;
+    }
+    match last.get_mut("content") {
+        Some(serde_json::Value::Array(items)) => {
+            items.push(serde_json::json!({"type": "text", "text": context}));
+            true
+        }
+        Some(serde_json::Value::String(text)) => {
+            let existing = std::mem::take(text);
+            last.insert(
+                "content".to_string(),
+                serde_json::json!([
+                    {"type": "text", "text": existing},
+                    {"type": "text", "text": context},
+                ]),
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn extract_gateway_object_refs(project: &str, body: &[u8]) -> Vec<String> {
@@ -2059,16 +2155,28 @@ fn parse_pricing_table(
         if model.is_empty() {
             return Err("invalid gateway pricing entry with empty model".into());
         }
-        let (input, output) = rates.split_once(':').ok_or_else(|| {
-            format!(
-                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m"
+        let rate_parts = rates.split(':').map(str::trim).collect::<Vec<_>>();
+        if rate_parts.len() < 2 || rate_parts.len() > 3 {
+            return Err(format!(
+                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m[:cached_input_usd_per_1m]"
             )
-        })?;
+            .into());
+        }
+        let input_usd_micros_per_million = parse_usd_micros(rate_parts[0])?;
+        let output_usd_micros_per_million = parse_usd_micros(rate_parts[1])?;
+        // The cached-input rate is optional; when omitted, cache reads are
+        // priced at the normal input rate so existing 2-field configs are
+        // unchanged.
+        let cached_input_usd_micros_per_million = match rate_parts.get(2) {
+            Some(cached) => parse_usd_micros(cached)?,
+            None => input_usd_micros_per_million,
+        };
         pricing.insert(
             model.to_string(),
             ModelPricing {
-                input_usd_micros_per_million: parse_usd_micros(input.trim())?,
-                output_usd_micros_per_million: parse_usd_micros(output.trim())?,
+                input_usd_micros_per_million,
+                output_usd_micros_per_million,
+                cached_input_usd_micros_per_million,
             },
         );
     }
@@ -2110,21 +2218,91 @@ fn estimate_cost_usd_micros(
     context: &UsageContext,
     usage: &ResponseUsage,
 ) -> Option<i64> {
-    let pricing = context
+    let (model, pricing) = lookup_model_pricing(config, context)?;
+    cost_for_model(model, pricing, usage)
+}
+
+/// Dollar savings attributable to prompt caching on this call: the cache-read
+/// tokens priced at the full input rate minus the discounted cached rate.
+/// Provider-independent, since it only measures the rate delta on the
+/// cache-read tokens. Returns `None` when no pricing is configured.
+fn estimate_cache_savings_usd_micros(
+    config: &GatewayConfig,
+    context: &UsageContext,
+    usage: &ResponseUsage,
+) -> Option<i64> {
+    let (_model, pricing) = lookup_model_pricing(config, context)?;
+    cache_savings_for_pricing(pricing, usage)
+}
+
+/// Resolve the pricing entry for a usage context, preferring the resolved model
+/// and falling back to the requested model. Returns the model name alongside
+/// its pricing so callers can apply provider-specific token semantics.
+fn lookup_model_pricing<'c>(
+    config: &'c GatewayConfig,
+    context: &'c UsageContext,
+) -> Option<(&'c str, &'c ModelPricing)> {
+    context
         .resolved_model
         .as_ref()
-        .and_then(|model| config.pricing.get(model))
+        .and_then(|model| {
+            config
+                .pricing
+                .get(model)
+                .map(|pricing| (model.as_str(), pricing))
+        })
         .or_else(|| {
-            context
-                .requested_model
-                .as_ref()
-                .and_then(|model| config.pricing.get(model))
-        })?;
-    let input =
-        (usage.input_tokens as i128).checked_mul(pricing.input_usd_micros_per_million as i128)?;
-    let output =
-        (usage.output_tokens as i128).checked_mul(pricing.output_usd_micros_per_million as i128)?;
-    let total = input.checked_add(output)?.checked_div(1_000_000)?;
+            context.requested_model.as_ref().and_then(|model| {
+                config
+                    .pricing
+                    .get(model)
+                    .map(|pricing| (model.as_str(), pricing))
+            })
+        })
+}
+
+fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
+    let cache_read = usage.cache_read_input_tokens.max(0) as i128;
+    let rate_delta = (pricing.input_usd_micros_per_million
+        - pricing.cached_input_usd_micros_per_million)
+        .max(0) as i128;
+    let savings = cache_read.checked_mul(rate_delta)?.checked_div(1_000_000)?;
+    i64::try_from(savings).ok()
+}
+
+/// Pure cost math for a resolved model/pricing pair, split out so it can be
+/// tested without constructing a full gateway config/context.
+fn cost_for_model(model: &str, pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
+    let cache_read = usage.cache_read_input_tokens.max(0) as i128;
+    let cache_creation = usage.cache_creation_input_tokens.max(0) as i128;
+    // Anthropic reports `input_tokens` as the uncached count, with cache tokens
+    // tracked separately, so the uncached portion is `input_tokens` as-is.
+    // OpenAI reports cached tokens as a subset of `prompt_tokens`, so the
+    // uncached portion must subtract the cache-read count to avoid billing it
+    // twice.
+    let input_tokens = usage.input_tokens.max(0) as i128;
+    let uncached_input = if crate::llm::provider_name(model) == "anthropic" {
+        input_tokens
+    } else {
+        (input_tokens - cache_read).max(0)
+    };
+
+    let input_rate = pricing.input_usd_micros_per_million as i128;
+    let output_rate = pricing.output_usd_micros_per_million as i128;
+    let cached_rate = pricing.cached_input_usd_micros_per_million as i128;
+
+    // Cache reads bill at the discounted cached rate; cache-creation (write)
+    // tokens bill at the normal input rate.
+    let input_cost = uncached_input.checked_mul(input_rate)?;
+    let cache_read_cost = cache_read.checked_mul(cached_rate)?;
+    let cache_creation_cost = cache_creation.checked_mul(input_rate)?;
+    let output_cost = (usage.output_tokens.max(0) as i128).checked_mul(output_rate)?;
+
+    let total = input_cost
+        .checked_add(cache_read_cost)?
+        .checked_add(cache_creation_cost)?
+        .checked_add(output_cost)?
+        .checked_div(1_000_000)?;
     i64::try_from(total).ok()
 }
 
@@ -2408,9 +2586,30 @@ async fn record_usage_and_append(
                 values.insert("input_tokens".to_string(), usage.input_tokens.to_string());
                 values.insert("output_tokens".to_string(), usage.output_tokens.to_string());
                 values.insert("total_tokens".to_string(), usage.total_tokens.to_string());
+                // Cache-token counts are recorded only when present, so
+                // non-caching calls keep the row shape unchanged.
+                if usage.cache_read_input_tokens > 0 {
+                    values.insert(
+                        "cache_read_input_tokens".to_string(),
+                        usage.cache_read_input_tokens.to_string(),
+                    );
+                }
+                if usage.cache_creation_input_tokens > 0 {
+                    values.insert(
+                        "cache_creation_input_tokens".to_string(),
+                        usage.cache_creation_input_tokens.to_string(),
+                    );
+                }
                 if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
                     values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
                     values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
+                }
+                if usage.cache_read_input_tokens > 0
+                    && let Some(savings) =
+                        estimate_cache_savings_usd_micros(config, context, &usage)
+                {
+                    values.insert("cache_savings_usd_micros".to_string(), savings.to_string());
+                    values.insert("cache_savings_usd".to_string(), format_usd_micros(savings));
                 }
             }
 
@@ -2938,6 +3137,14 @@ struct ResponseUsage {
     input_tokens: i32,
     output_tokens: i32,
     total_tokens: i32,
+    /// Prompt tokens served from the provider's prompt cache at the discounted
+    /// cache-read rate. Anthropic reports these as `cache_read_input_tokens`;
+    /// OpenAI reports them under `usage.prompt_tokens_details.cached_tokens`.
+    cache_read_input_tokens: i32,
+    /// Prompt tokens written into the provider's prompt cache on this call
+    /// (Anthropic `cache_creation_input_tokens`). Billed at the normal (or
+    /// cache-write) input rate; tracked for reporting completeness.
+    cache_creation_input_tokens: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2974,11 +3181,25 @@ fn extract_response_usage(body: &[u8]) -> Option<ResponseUsage> {
         .get("total_tokens")
         .and_then(|value| value.as_i64())
         .unwrap_or(input_tokens + output_tokens);
+    // Anthropic reports cache tokens as siblings of `input_tokens`; OpenAI nests
+    // the cache-read count under `prompt_tokens_details.cached_tokens`. Absent
+    // fields stay 0, so non-caching providers and responses are unchanged.
+    let cache_read_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
 
     Some(ResponseUsage {
         input_tokens: clamp_i64_to_i32(input_tokens),
         output_tokens: clamp_i64_to_i32(output_tokens),
         total_tokens: clamp_i64_to_i32(total_tokens),
+        cache_read_input_tokens: clamp_i64_to_i32(cache_read_input_tokens),
+        cache_creation_input_tokens: clamp_i64_to_i32(cache_creation_input_tokens),
     })
 }
 
@@ -3064,10 +3285,22 @@ fn merge_usage(existing: Option<ResponseUsage>, next: ResponseUsage) -> Response
         } else {
             input_tokens.saturating_add(output_tokens)
         };
+    let cache_read_input_tokens = if next.cache_read_input_tokens > 0 {
+        next.cache_read_input_tokens
+    } else {
+        existing.cache_read_input_tokens
+    };
+    let cache_creation_input_tokens = if next.cache_creation_input_tokens > 0 {
+        next.cache_creation_input_tokens
+    } else {
+        existing.cache_creation_input_tokens
+    };
     ResponseUsage {
         input_tokens,
         output_tokens,
         total_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
     }
 }
 
@@ -3774,6 +4007,8 @@ mod tests {
             Some(&ModelPricing {
                 input_usd_micros_per_million: 1_250_000,
                 output_usd_micros_per_million: 10_000_000,
+                // 2-field entry defaults the cached rate to the input rate.
+                cached_input_usd_micros_per_million: 1_250_000,
             })
         );
         assert_eq!(
@@ -3781,9 +4016,85 @@ mod tests {
             Some(&ModelPricing {
                 input_usd_micros_per_million: 3_000_000,
                 output_usd_micros_per_million: 15_000_001,
+                cached_input_usd_micros_per_million: 3_000_000,
             })
         );
         assert!(parse_pricing_table("gpt-5.5=1").is_err());
+    }
+
+    #[test]
+    fn parses_gateway_pricing_table_with_cached_rate() {
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3").unwrap();
+        assert_eq!(
+            pricing.get("claude-sonnet-4-6"),
+            Some(&ModelPricing {
+                input_usd_micros_per_million: 3_000_000,
+                output_usd_micros_per_million: 15_000_000,
+                cached_input_usd_micros_per_million: 300_000,
+            })
+        );
+        // Too many rate fields is rejected.
+        assert!(parse_pricing_table("gpt-5.5=1:2:3:4").is_err());
+    }
+
+    #[test]
+    fn estimate_cost_bills_cache_reads_at_discounted_rate() {
+        // 10x cheaper cache reads: input 3 usd/1M, cached 0.3 usd/1M.
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3").unwrap();
+        let pricing = pricing.get("claude-sonnet-4-6").unwrap();
+
+        // Anthropic: input_tokens is the uncached count; cache tokens separate.
+        let fresh = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            total_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let cached = ResponseUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        };
+        let fresh_cost = cost_for_model("claude-sonnet-4-6", pricing, &fresh).unwrap();
+        let cached_cost = cost_for_model("claude-sonnet-4-6", pricing, &cached).unwrap();
+        assert_eq!(fresh_cost, 3_000_000);
+        assert_eq!(cached_cost, 300_000);
+        assert!(cached_cost < fresh_cost);
+    }
+
+    #[test]
+    fn estimate_cost_excludes_openai_cached_tokens_from_input() {
+        // OpenAI reports cached tokens as a subset of prompt_tokens, so the
+        // uncached portion must exclude them.
+        let pricing = parse_pricing_table("gpt-5.5=1:10:0.1").unwrap();
+        let pricing = pricing.get("gpt-5.5").unwrap();
+        let usage = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            total_tokens: 1_000_000,
+            cache_read_input_tokens: 800_000,
+            cache_creation_input_tokens: 0,
+        };
+        // 200k uncached * 1 + 800k cached * 0.1 = 200000 + 80000 micros.
+        let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
+        assert_eq!(cost, 280_000);
+    }
+
+    #[test]
+    fn estimate_cost_matches_legacy_when_no_cache_tokens() {
+        // Back-compat: with zero cache tokens the cost equals input*in + out*out.
+        let pricing = parse_pricing_table("gpt-5.5=1.25:10").unwrap();
+        let pricing = pricing.get("gpt-5.5").unwrap();
+        let usage = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            total_tokens: 1_500_000,
+            ..Default::default()
+        };
+        let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
+        assert_eq!(cost, 1_250_000 + 5_000_000);
     }
 
     #[derive(Clone)]
@@ -4995,6 +5306,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_cache_creation_and_savings_are_recorded_on_llm_call() {
+        // Anthropic reports input_tokens as the uncached count, with cache-read
+        // and cache-creation tokens tracked separately.
+        let upstream_body = r#"{
+            "id":"msg_1",
+            "type":"message",
+            "usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":5}
+        }"#;
+        let (upstream_base, _requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        // input 3 usd/1M, output 15 usd/1M, cached 0.3 usd/1M.
+        let pricing = HashMap::from([(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_usd_micros_per_million: 3_000_000,
+                output_usd_micros_per_million: 15_000_000,
+                cached_input_usd_micros_per_million: 300_000,
+            },
+        )]);
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing,
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("10"));
+        assert_eq!(
+            rows[0].get("cache_read_input_tokens").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            rows[0]
+                .get("cache_creation_input_tokens")
+                .map(String::as_str),
+            Some("20")
+        );
+        // Anthropic cost: 10 uncached*3 + 100 cache-read*0.3 + 20 cache-write*3
+        // + 5 output*15 = 30 + 30 + 60 + 75 = 195 micros.
+        assert_eq!(
+            rows[0].get("cost_usd_micros").map(String::as_str),
+            Some("195")
+        );
+        // Savings: 100 cache-read tokens * (3 - 0.3) usd/1M = 270 micros.
+        assert_eq!(
+            rows[0].get("cache_savings_usd_micros").map(String::as_str),
+            Some("270")
+        );
+    }
+
+    #[tokio::test]
     async fn anthropic_messages_can_translate_to_openai_chat_when_policy_routes_cross_provider() {
         let upstream_body = r#"{
             "id":"chatcmpl_1",
@@ -6165,6 +6558,7 @@ mod tests {
             ModelPricing {
                 input_usd_micros_per_million: 1_000_000,
                 output_usd_micros_per_million: 2_000_000,
+                cached_input_usd_micros_per_million: 1_000_000,
             },
         )]);
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -6212,6 +6606,10 @@ mod tests {
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("7"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("12"));
+        // No cache tokens in this response, so the cache keys are omitted.
+        assert_eq!(rows[0].get("cache_read_input_tokens"), None);
+        assert_eq!(rows[0].get("cache_creation_input_tokens"), None);
+        assert_eq!(rows[0].get("cache_savings_usd_micros"), None);
         assert_eq!(
             rows[0].get("cost_usd_micros").map(String::as_str),
             Some("17")
@@ -6300,6 +6698,82 @@ mod tests {
         assert_eq!(observations[0].namespace, "default");
         assert_eq!(observations[0].output_content, "gateway sampled answer");
         assert_eq!(observations[0].sample_reason, "base");
+    }
+
+    #[tokio::test]
+    async fn cache_tokens_and_savings_are_recorded_on_llm_call() {
+        // OpenAI reports cached tokens as a subset of prompt/input tokens.
+        let upstream_body = r#"{
+            "id":"resp_1",
+            "object":"response",
+            "output":[{"type":"message","content":[{"type":"output_text","text":"cached answer"}]}],
+            "usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}
+        }"#;
+        let (upstream_base, _requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        // input 1 usd/1M, output 2 usd/1M, cached 0.1 usd/1M.
+        let pricing = HashMap::from([(
+            "gpt-5.5".to_string(),
+            ModelPricing {
+                input_usd_micros_per_million: 1_000_000,
+                output_usd_micros_per_million: 2_000_000,
+                cached_input_usd_micros_per_million: 100_000,
+            },
+        )]);
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target.clone()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing,
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("100"));
+        assert_eq!(
+            rows[0].get("cache_read_input_tokens").map(String::as_str),
+            Some("80")
+        );
+        // No cache-creation tokens in this response.
+        assert_eq!(rows[0].get("cache_creation_input_tokens"), None);
+        // Cost = 20 uncached * 1 + 80 cached * 0.1 + 5 output * 2 = 38 micros.
+        assert_eq!(
+            rows[0].get("cost_usd_micros").map(String::as_str),
+            Some("38")
+        );
+        // Savings = 80 cache-read tokens * (1 - 0.1) usd/1M = 72 micros.
+        assert_eq!(
+            rows[0].get("cache_savings_usd_micros").map(String::as_str),
+            Some("72")
+        );
+        assert_eq!(
+            rows[0].get("cache_savings_usd").map(String::as_str),
+            Some("0.000072")
+        );
     }
 
     #[tokio::test]
@@ -6520,6 +6994,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 45,
                 output_tokens: 5,
                 total_tokens: 50,
+                ..Default::default()
             })
         );
         assert!(
@@ -6536,12 +7011,78 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 8,
                 output_tokens: 6,
                 total_tokens: 14,
+                ..Default::default()
             })
         );
 
         let (usage, observation) = extract_buffered_body_usage(b"neither json nor an event stream");
         assert_eq!(usage, None);
         assert_eq!(observation, None);
+    }
+
+    #[test]
+    fn extract_response_usage_parses_anthropic_cache_tokens() {
+        let body = br#"{"type":"message","usage":{"input_tokens":10,"cache_read_input_tokens":120,"cache_creation_input_tokens":30,"output_tokens":7}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 120);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+    }
+
+    #[test]
+    fn extract_response_usage_parses_openai_cached_tokens() {
+        let body = br#"{"usage":{"prompt_tokens":200,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":150}}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, 150);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn extract_response_usage_defaults_cache_tokens_to_zero() {
+        let body = br#"{"usage":{"input_tokens":8,"output_tokens":6}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn sse_usage_tap_captures_anthropic_cache_tokens() {
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":120,\"cache_creation_input_tokens\":30,\"output_tokens\":1}}}\n\n",
+        );
+        tap.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":25}}\n\n",
+        );
+        let (usage, _) = tap.finish();
+        let usage = usage.expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cache_read_input_tokens, 120);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+    }
+
+    #[test]
+    fn merge_usage_carries_cache_tokens_from_earlier_event() {
+        let start = ResponseUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            total_tokens: 11,
+            cache_read_input_tokens: 120,
+            cache_creation_input_tokens: 30,
+        };
+        let delta = ResponseUsage {
+            output_tokens: 25,
+            ..Default::default()
+        };
+        let merged = merge_usage(Some(start), delta);
+        assert_eq!(merged.input_tokens, 10);
+        assert_eq!(merged.output_tokens, 25);
+        assert_eq!(merged.cache_read_input_tokens, 120);
+        assert_eq!(merged.cache_creation_input_tokens, 30);
     }
 
     #[test]
@@ -6556,6 +7097,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 8,
                 output_tokens: 6,
                 total_tokens: 14,
+                ..Default::default()
             })
         );
     }
@@ -6572,6 +7114,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 3,
                 output_tokens: 2,
                 total_tokens: 5,
+                ..Default::default()
             })
         );
     }
@@ -6597,6 +7140,157 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(value["model"], "gpt-5.5-mini");
         assert_eq!(value["input"], "hello");
+    }
+
+    #[test]
+    fn rewrite_request_model_preserves_cache_control_prefix() {
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"big cached prefix","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"hi"}]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let rewritten = rewrite_request_model(body, "claude-opus-4-8").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        // Only the model changes; the cached system prefix is byte-for-byte
+        // identical (deep-equal, and identical when re-serialized).
+        assert_eq!(value["model"], "claude-opus-4-8");
+        assert_eq!(value["system"], original["system"]);
+        assert_eq!(value["messages"], original["messages"]);
+        assert_eq!(
+            serde_json::to_vec(&value["system"]).unwrap(),
+            serde_json::to_vec(&original["system"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn inject_context_preserves_anthropic_cache_control_prefix() {
+        // System array carries the cache_control breakpoint; the client also
+        // marks the last message. Injection must not touch either.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"tooling + rules","cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"earlier","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"ok"},
+                {"role":"user","content":"analyze ticker:{MSFT}"}
+            ]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+
+        // The cached prefix (system + all earlier messages) is unchanged.
+        assert_eq!(value["system"], original["system"]);
+        let messages = value["messages"].as_array().unwrap();
+        let original_messages = original["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), original_messages.len());
+        assert_eq!(messages[0], original_messages[0]);
+        assert_eq!(messages[1], original_messages[1]);
+
+        // The context is appended to the final message, after its original
+        // text, and carries no cache_control (uncached suffix).
+        let last_content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(last_content[0]["text"], "analyze ticker:{MSFT}");
+        assert_eq!(last_content.len(), 2);
+        assert!(
+            last_content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("score: 0.91")
+        );
+        assert!(last_content[1].get("cache_control").is_none());
+        // No new leading system was inserted before the cached messages.
+        assert_eq!(
+            value["system"].as_array().unwrap().len(),
+            original["system"].as_array().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn inject_context_without_cache_control_still_uses_system() {
+        // Regression: without a cache_control breakpoint the existing
+        // system-injection behavior is preserved.
+        let body = br#"{"model":"claude-sonnet-4-8","messages":[{"role":"user","content":"hi"}]}"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        // The user message is untouched.
+        assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn inject_context_does_not_mutate_assistant_prefill() {
+        // Last message is an assistant prefill; appending context to it would
+        // corrupt the model's continuation. With a cache_control breakpoint
+        // present, the context must go to the system array instead, leaving the
+        // prefill byte-identical.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "system":[{"type":"text","text":"cached rules","cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":"analyze ticker:{MSFT}"},
+                {"role":"assistant","content":"{"}
+            ]
+        }"#;
+        let original: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+
+        // The assistant prefill and the user message are untouched.
+        assert_eq!(value["messages"], original["messages"]);
+        // Context lands on the system array (still cache-safe: appended after
+        // the system breakpoint), not on the prefill.
+        let system = value["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0], original["system"][0]);
+        assert!(system[1]["text"].as_str().unwrap().contains("score: 0.91"));
+        assert!(system[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn inject_context_still_delivered_for_prefill_without_system() {
+        // cache_control on a message, an assistant prefill last, and no system:
+        // there is no fully cache-safe slot, but the governed context must still
+        // be delivered (not silently dropped).
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"analyze ticker:{MSFT}","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"{"}
+            ]
+        }"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        // Delivered via a new system; the prefill is untouched.
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        assert_eq!(value["messages"][1]["content"], "{");
+    }
+
+    #[test]
+    fn cache_control_detection_ignores_tool_schema_properties() {
+        // A tool input schema with a property literally named `cache_control`
+        // must not be treated as a prompt-cache breakpoint.
+        let body = br#"{
+            "model":"claude-sonnet-4-8",
+            "tools":[{"name":"t","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],
+            "messages":[{"role":"user","content":"analyze ticker:{MSFT}"}]
+        }"#;
+        let injected = inject_gateway_context(ProviderKind::Anthropic, body, "score: 0.91")
+            .unwrap()
+            .expect("context injected");
+        let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        // No real breakpoint, so the normal system-injection path is used.
+        assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
+        assert_eq!(value["messages"][0]["content"], "analyze ticker:{MSFT}");
     }
 
     #[test]
