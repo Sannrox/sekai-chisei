@@ -262,14 +262,16 @@ the Codex OpenAI/ChatGPT-plan split):
 If a gateway started only for Codex is already running on the port, it is not
 configured for `claude-code`; `launch` warns when it reuses a live gateway.
 
-`launch claude-code` pins the gateway's `CHISEI_ANTHROPIC_BASE_URL` to
-`https://api.anthropic.com/v1` (respecting an explicit override). This matters
-because the gateway otherwise falls back to `ANTHROPIC_BASE_URL` for its *own*
-upstream — but that variable is what points clients at the gateway and is often
-already exported (frequently as `https://api.anthropic.com`, with no `/v1`).
-Since the gateway strips `/v1` from the request path before re-appending it to
-the base, a `/v1`-less upstream misroutes every call to `…/messages` and
-Anthropic rejects it as "model may not exist." Pinning avoids that footgun.
+The gateway resolves its *own* Anthropic upstream from
+`CHISEI_ANTHROPIC_BASE_URL` (defaulting to `https://api.anthropic.com/v1`) and
+normalizes it to end in `/v1`. It deliberately does **not** fall back to
+`ANTHROPIC_BASE_URL`: that variable is what points *clients* at the gateway and
+is commonly set to `https://api.anthropic.com` with no `/v1`. Since the gateway
+strips `/v1` from the request path before re-appending it to the base, reusing a
+`/v1`-less client variable as the upstream would misroute every call to
+`…/messages` (which Anthropic rejects as "model may not exist"). Because the
+gateway is robust on its own, `launch claude-code` no longer needs to pin the
+base URL; an explicit `CHISEI_ANTHROPIC_BASE_URL` override is still honored.
 
 ### One shared gateway for every client
 
@@ -297,10 +299,12 @@ cargo run --bin sekaictl -- launch codex-app      # reuses the gateway, opens Co
 
 Each `launch` seeds its own agent, key, and budget but the same union policy, so
 you can leave one gateway running and start either client against it at any time.
-(If you launch Codex with a custom `--model`, that becomes the namespace `auto`
-target; a later `claude-code` launch resets it to `gpt-5.5` — relaunch Codex, or
-give the clients separate `--project` namespaces, if you need a non-default Codex
-auto model to persist.)
+Only Codex owns the namespace `auto` default, so a `claude-code` launch **merges**
+into the existing policy: it unions its runtimes and models into `allowed_*` but
+preserves whatever `default_model`/`default_runtime` a prior Codex launch set. So
+if you launch Codex with a custom `--model`, that becomes the namespace `auto`
+target and a later `claude-code` launch no longer resets it. (A fresh namespace
+with no prior policy falls back to the launching client's own defaults.)
 
 ### Per-model backend routing
 
@@ -536,11 +540,19 @@ service mirrors this through `ChatStream` for OpenAI-compatible and Anthropic
 SSE providers.
 
 Set `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER=1` to opt in to lossy cross-provider
-routing. The first bridge translates non-streaming Anthropic `/v1/messages`
-requests to OpenAI-compatible `/v1/chat/completions` when policy resolves an
-OpenAI/Ollama-compatible model, then maps the chat response back to Anthropic's
-message shape. Streaming and tool-call translation stay denied instead of being
-silently approximated.
+routing. The bridge translates Anthropic `/v1/messages` requests to
+OpenAI-compatible `/v1/chat/completions` when policy resolves an
+OpenAI/Ollama/native model, routing to the *resolved* provider's backend (for
+`ollama/*` it strips the prefix and sends no upstream auth). Both non-streaming
+and streaming requests are supported: non-streaming maps the chat response back
+to Anthropic's message shape, while streaming re-emits the upstream chat SSE as
+Anthropic Messages events (`message_start` / `content_block_delta` /
+`message_delta` / `message_stop`). Usage is metered by tapping the upstream
+OpenAI stream, so budgets still decrement; the client-facing `message_start`
+reports `input_tokens: 0` because OpenAI sends usage only in its trailing chunk.
+The client's Anthropic credential is never forwarded to the resolved provider —
+the gateway applies that provider's own auth instead. Tool-call streams stay
+denied rather than silently dropping the tool schema.
 
 Estimated cost is recorded only when you provide a static pricing table. The
 format is `model=input_usd_per_1m_tokens:output_usd_per_1m_tokens`; for example:
