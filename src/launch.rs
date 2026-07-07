@@ -313,6 +313,7 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
             allowed_runtimes: Vec::new(),
             default_model: config.model.clone(),
             default_runtime: "openai".to_string(),
+            merge_into_existing: false,
         })
         .await;
     };
@@ -323,6 +324,11 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
     // later without its seed clobbering this one's policy. The namespace default
     // (used only for Codex's `auto`) stays OpenAI-family — the launched Codex
     // model when launching codex-app, else gpt-5.5.
+    //
+    // Only Codex owns the `auto` default, so a non-OpenAI (claude-code) launch
+    // merges into the existing policy: it unions the allowed lists but preserves
+    // whatever default_model/default_runtime a prior Codex launch set, instead of
+    // resetting `auto` back to gpt-5.5.
     let (default_runtime, default_model) = namespace_default(kind, &config.model);
     run_setup(GatewaySetupConfig {
         chisei_grpc_target: config.socket.clone(),
@@ -336,6 +342,7 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
         allowed_runtimes: union_allowed_runtimes(),
         default_model,
         default_runtime,
+        merge_into_existing: kind != AgentKind::OpenAi,
     })
     .await
 }
