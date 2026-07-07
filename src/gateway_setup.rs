@@ -718,6 +718,7 @@ async fn ensure_llm_calls_dataset(
         "pipeline_sampled",
         "sample_reason",
         "sample_rate",
+        "route_bias",
         "status",
         "error_type",
         "refusal_reason",
