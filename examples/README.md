@@ -60,6 +60,24 @@ ollama pull llama3.2
 If the model is not reachable, the step reports the error and the demo still
 finishes.
 
+## governed_tool_use
+
+[governed_tool_use.rs](governed_tool_use.rs) demonstrates Plan 9's governed
+tool-use bridge: it maps a model tool-call to an `ExecuteAction` request — the
+single enforcement point — so the call is policy-checked, dry-run-able,
+held-for-approval, budget-limited, and audited before any graph mutation.
+
+```bash
+SEKAI_INSECURE=1 cargo run          # server in one terminal
+cargo run --example governed_tool_use   # demo in another
+```
+
+It seeds a target object, sets an action policy (allow writes, require approval
+for destructive ops), then runs tool-calls through `ExecuteAction`: a write is
+dry-run and executed, a destructive `delete_link` is held for approval, and the
+pending approvals are listed. In `SEKAI_INSECURE=1` mode the `local` principal is
+an admin, so setting policy and listing approvals succeed.
+
 ## delegation
 
 [delegation.rs](delegation.rs) sketches the privacy-preserving delegation chain:
