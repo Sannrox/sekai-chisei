@@ -3842,6 +3842,32 @@ mod tests {
         spawn_fake_upstream_with_delay(response_body, content_type, None).await
     }
 
+    /// Serves an Ollama `/api/tags` listing so the control-plane resolver can
+    /// validate an `ollama/<model>` without a live Ollama server (otherwise
+    /// resolution is environment-dependent: it passes only where Ollama runs).
+    async fn spawn_fake_ollama_tags(model: &str) -> String {
+        let body = format!(r#"{{"models":[{{"name":"{model}"}}]}}"#);
+        let app = Router::new().route(
+            "/api/tags",
+            any(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     async fn spawn_fake_upstream_with_delay(
         response_body: &'static str,
         content_type: &'static str,
@@ -5235,8 +5261,15 @@ mod tests {
         }"#;
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
-        let (chisei_target, _db) = spawn_control_plane().await;
-        seed_cross_provider_policy(&chisei_target, "ollama/llama3.2:latest", "ollama").await;
+        // Point the control-plane resolver's Ollama listing at a fake /api/tags
+        // so the model resolves without a live Ollama server (CI has none). A
+        // distinctive name that a real local Ollama would not have guarantees
+        // this test exercises the fake listing, not an ambient Ollama install.
+        let ollama_tags = spawn_fake_ollama_tags("ci-fake-ollama:latest").await;
+        let mut cp_config = test_config();
+        cp_config.ollama_url = ollama_tags;
+        let (chisei_target, _db) = spawn_control_plane_with_config(cp_config).await;
+        seed_cross_provider_policy(&chisei_target, "ollama/ci-fake-ollama:latest", "ollama").await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             // OpenAI base points nowhere; the request must go to the Ollama base.
@@ -5284,7 +5317,7 @@ mod tests {
         assert_eq!(requests[0].x_api_key, None);
         // The ollama/ prefix is stripped from the resolved model.
         let translated: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
-        assert_eq!(translated["model"], "llama3.2:latest");
+        assert_eq!(translated["model"], "ci-fake-ollama:latest");
     }
 
     #[tokio::test]
