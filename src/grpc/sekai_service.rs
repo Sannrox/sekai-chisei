@@ -1161,13 +1161,14 @@ fn action_object_id(name: &str) -> String {
 /// only through their dedicated RPCs + server-internal DB paths. Exposing them
 /// via CRUD would leak held params and let callers forge policy or tamper with
 /// blast-radius counters.
+const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
+    action_policy::ACTION_POLICY_KIND,
+    action_policy::BLAST_RADIUS_KIND,
+    action_approval::ACTION_APPROVAL_KIND,
+];
+
 fn is_reserved_governance_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        action_policy::ACTION_POLICY_KIND
-            | action_policy::BLAST_RADIUS_KIND
-            | action_approval::ACTION_APPROVAL_KIND
-    )
+    RESERVED_GOVERNANCE_KINDS.contains(&kind)
 }
 
 /// Resolve the namespace used for action-policy scope resolution: prefer the
@@ -1953,22 +1954,16 @@ impl SekaiService for SekaiServiceImpl {
         // consistently across callers.
         let (objects, total) = self
             .db
-            .list_objects_with_total_for_principals(&filter, &principal_refs)
+            .list_objects_with_total_for_principals(
+                &filter,
+                &principal_refs,
+                RESERVED_GOVERNANCE_KINDS,
+            )
             .map_err(Status::internal)?;
         let objects = self.resolve_computed_for_responses(objects, &principals)?;
-        // Exclude any internal governance objects that a broad (kindless) query
-        // might otherwise surface.
-        let filtered_out = objects
-            .iter()
-            .filter(|o| is_reserved_governance_kind(&o.kind))
-            .count() as i32;
-        let objects: Vec<_> = objects
-            .into_iter()
-            .filter(|o| !is_reserved_governance_kind(&o.kind))
-            .collect();
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
-            total: (total - filtered_out).max(0),
+            total,
         }))
     }
     async fn find_by_external_id(
@@ -2036,6 +2031,16 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::invalid_argument("object_set required"))?,
             owner.as_str(),
         )?;
+        if domain_set
+            .filter
+            .kind
+            .as_deref()
+            .is_some_and(is_reserved_governance_kind)
+        {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
         {
             let schema = self
                 .schema
@@ -2132,7 +2137,11 @@ impl SekaiService for SekaiServiceImpl {
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let (objects, total) = self
             .db
-            .list_objects_with_total_for_principals(&filter, &principal_refs)
+            .list_objects_with_total_for_principals(
+                &filter,
+                &principal_refs,
+                RESERVED_GOVERNANCE_KINDS,
+            )
             .map_err(Status::internal)?;
         let objects = self.resolve_computed_for_responses(objects, &principals)?;
         Ok(Response::new(ListObjectsResponse {
@@ -9939,5 +9948,71 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn object_sets_cannot_read_or_target_reserved_governance_kinds() {
+        let svc = service();
+        // A held approval object carrying a secret param.
+        let approval = action_approval::ActionApproval::pending(
+            "tester",
+            "rotate_key",
+            HashMap::from([
+                ("id".to_string(), "obj-1".to_string()),
+                ("api_key".to_string(), "super-secret".to_string()),
+            ]),
+            "wu-1",
+            "agent:tester",
+            "destructive",
+            "obj-1",
+            0,
+        );
+        svc.db.create_action_approval(&approval).unwrap();
+
+        // CreateObjectSet must reject a saved filter targeting a reserved kind.
+        let err = svc
+            .create_object_set(with_principal(CreateObjectSetRequest {
+                object_set: Some(ObjectSet {
+                    id: "leaky-set".into(),
+                    name: "leaky".into(),
+                    description: String::new(),
+                    filter: Some(ListFilter {
+                        kind: "action_approval".into(),
+                        ..Default::default()
+                    }),
+                    owner_principal: "tester".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // Even a set persisted out-of-band (e.g. legacy) resolves to nothing,
+        // because the visibility query now excludes reserved kinds.
+        svc.db
+            .create_object_set(&domain::ObjectSet {
+                id: "legacy-leaky-set".into(),
+                name: "legacy".into(),
+                description: String::new(),
+                filter: domain::ListFilter {
+                    kind: Some("action_approval".into()),
+                    ..Default::default()
+                },
+                owner_principal: "tester".into(),
+                created: 0,
+            })
+            .unwrap();
+        let resolved = svc
+            .resolve_object_set(with_principal(ResolveObjectSetRequest {
+                id: "legacy-leaky-set".into(),
+                limit: 10,
+                offset: Some(0),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resolved.objects.len(), 0);
+        assert_eq!(resolved.total, 0);
     }
 }
