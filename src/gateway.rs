@@ -2126,7 +2126,31 @@ fn estimate_cost_usd_micros(
     context: &UsageContext,
     usage: &ResponseUsage,
 ) -> Option<i64> {
-    let (model, pricing) = context
+    let (model, pricing) = lookup_model_pricing(config, context)?;
+    cost_for_model(model, pricing, usage)
+}
+
+/// Dollar savings attributable to prompt caching on this call: the cache-read
+/// tokens priced at the full input rate minus the discounted cached rate.
+/// Provider-independent, since it only measures the rate delta on the
+/// cache-read tokens. Returns `None` when no pricing is configured.
+fn estimate_cache_savings_usd_micros(
+    config: &GatewayConfig,
+    context: &UsageContext,
+    usage: &ResponseUsage,
+) -> Option<i64> {
+    let (_model, pricing) = lookup_model_pricing(config, context)?;
+    cache_savings_for_pricing(pricing, usage)
+}
+
+/// Resolve the pricing entry for a usage context, preferring the resolved model
+/// and falling back to the requested model. Returns the model name alongside
+/// its pricing so callers can apply provider-specific token semantics.
+fn lookup_model_pricing<'c>(
+    config: &'c GatewayConfig,
+    context: &'c UsageContext,
+) -> Option<(&'c str, &'c ModelPricing)> {
+    context
         .resolved_model
         .as_ref()
         .and_then(|model| {
@@ -2142,8 +2166,16 @@ fn estimate_cost_usd_micros(
                     .get(model)
                     .map(|pricing| (model.as_str(), pricing))
             })
-        })?;
-    cost_for_model(model, pricing, usage)
+        })
+}
+
+fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
+    let cache_read = usage.cache_read_input_tokens.max(0) as i128;
+    let rate_delta = (pricing.input_usd_micros_per_million
+        - pricing.cached_input_usd_micros_per_million)
+        .max(0) as i128;
+    let savings = cache_read.checked_mul(rate_delta)?.checked_div(1_000_000)?;
+    i64::try_from(savings).ok()
 }
 
 /// Pure cost math for a resolved model/pricing pair, split out so it can be
@@ -2462,9 +2494,30 @@ async fn record_usage_and_append(
                 values.insert("input_tokens".to_string(), usage.input_tokens.to_string());
                 values.insert("output_tokens".to_string(), usage.output_tokens.to_string());
                 values.insert("total_tokens".to_string(), usage.total_tokens.to_string());
+                // Cache-token counts are recorded only when present, so
+                // non-caching calls keep the row shape unchanged.
+                if usage.cache_read_input_tokens > 0 {
+                    values.insert(
+                        "cache_read_input_tokens".to_string(),
+                        usage.cache_read_input_tokens.to_string(),
+                    );
+                }
+                if usage.cache_creation_input_tokens > 0 {
+                    values.insert(
+                        "cache_creation_input_tokens".to_string(),
+                        usage.cache_creation_input_tokens.to_string(),
+                    );
+                }
                 if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
                     values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
                     values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
+                }
+                if usage.cache_read_input_tokens > 0
+                    && let Some(savings) =
+                        estimate_cache_savings_usd_micros(config, context, &usage)
+                {
+                    values.insert("cache_savings_usd_micros".to_string(), savings.to_string());
+                    values.insert("cache_savings_usd".to_string(), format_usd_micros(savings));
                 }
             }
 
@@ -5161,6 +5214,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_cache_creation_and_savings_are_recorded_on_llm_call() {
+        // Anthropic reports input_tokens as the uncached count, with cache-read
+        // and cache-creation tokens tracked separately.
+        let upstream_body = r#"{
+            "id":"msg_1",
+            "type":"message",
+            "usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":5}
+        }"#;
+        let (upstream_base, _requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        // input 3 usd/1M, output 15 usd/1M, cached 0.3 usd/1M.
+        let pricing = HashMap::from([(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_usd_micros_per_million: 3_000_000,
+                output_usd_micros_per_million: 15_000_000,
+                cached_input_usd_micros_per_million: 300_000,
+            },
+        )]);
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing,
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("10"));
+        assert_eq!(
+            rows[0].get("cache_read_input_tokens").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            rows[0]
+                .get("cache_creation_input_tokens")
+                .map(String::as_str),
+            Some("20")
+        );
+        // Anthropic cost: 10 uncached*3 + 100 cache-read*0.3 + 20 cache-write*3
+        // + 5 output*15 = 30 + 30 + 60 + 75 = 195 micros.
+        assert_eq!(
+            rows[0].get("cost_usd_micros").map(String::as_str),
+            Some("195")
+        );
+        // Savings: 100 cache-read tokens * (3 - 0.3) usd/1M = 270 micros.
+        assert_eq!(
+            rows[0].get("cache_savings_usd_micros").map(String::as_str),
+            Some("270")
+        );
+    }
+
+    #[tokio::test]
     async fn anthropic_messages_can_translate_to_openai_chat_when_policy_routes_cross_provider() {
         let upstream_body = r#"{
             "id":"chatcmpl_1",
@@ -6379,6 +6514,10 @@ mod tests {
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("7"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("12"));
+        // No cache tokens in this response, so the cache keys are omitted.
+        assert_eq!(rows[0].get("cache_read_input_tokens"), None);
+        assert_eq!(rows[0].get("cache_creation_input_tokens"), None);
+        assert_eq!(rows[0].get("cache_savings_usd_micros"), None);
         assert_eq!(
             rows[0].get("cost_usd_micros").map(String::as_str),
             Some("17")
@@ -6467,6 +6606,82 @@ mod tests {
         assert_eq!(observations[0].namespace, "default");
         assert_eq!(observations[0].output_content, "gateway sampled answer");
         assert_eq!(observations[0].sample_reason, "base");
+    }
+
+    #[tokio::test]
+    async fn cache_tokens_and_savings_are_recorded_on_llm_call() {
+        // OpenAI reports cached tokens as a subset of prompt/input tokens.
+        let upstream_body = r#"{
+            "id":"resp_1",
+            "object":"response",
+            "output":[{"type":"message","content":[{"type":"output_text","text":"cached answer"}]}],
+            "usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}
+        }"#;
+        let (upstream_base, _requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        // input 1 usd/1M, output 2 usd/1M, cached 0.1 usd/1M.
+        let pricing = HashMap::from([(
+            "gpt-5.5".to_string(),
+            ModelPricing {
+                input_usd_micros_per_million: 1_000_000,
+                output_usd_micros_per_million: 2_000_000,
+                cached_input_usd_micros_per_million: 100_000,
+            },
+        )]);
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target.clone()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing,
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("100"));
+        assert_eq!(
+            rows[0].get("cache_read_input_tokens").map(String::as_str),
+            Some("80")
+        );
+        // No cache-creation tokens in this response.
+        assert_eq!(rows[0].get("cache_creation_input_tokens"), None);
+        // Cost = 20 uncached * 1 + 80 cached * 0.1 + 5 output * 2 = 38 micros.
+        assert_eq!(
+            rows[0].get("cost_usd_micros").map(String::as_str),
+            Some("38")
+        );
+        // Savings = 80 cache-read tokens * (1 - 0.1) usd/1M = 72 micros.
+        assert_eq!(
+            rows[0].get("cache_savings_usd_micros").map(String::as_str),
+            Some("72")
+        );
+        assert_eq!(
+            rows[0].get("cache_savings_usd").map(String::as_str),
+            Some("0.000072")
+        );
     }
 
     #[tokio::test]
