@@ -42,6 +42,7 @@ const X_CHISEI_AGENT: HeaderName = HeaderName::from_static("x-chisei-agent");
 const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project");
 const X_CHISEI_WORK_UNIT: HeaderName = HeaderName::from_static("x-chisei-work-unit");
 const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id");
+const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Clone)]
@@ -390,12 +391,14 @@ async fn proxy_gateway(
                 .await;
             return rejection.response();
         }
+        let task_class = resolve_task_class(&headers, requested_model.as_deref());
         let resolved = match resolve_policy_preflight(
             &state.config,
             &identity,
             client_provider,
             &body,
             requested_model.as_deref(),
+            &task_class,
         )
         .await
         {
@@ -647,6 +650,7 @@ async fn resolve_policy_preflight(
     provider: ProviderKind,
     body: &[u8],
     requested_model: Option<&str>,
+    task_class: &str,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         return Ok(PolicyPreflight {
@@ -673,7 +677,7 @@ async fn resolve_policy_preflight(
                 project: identity.project.clone(),
                 agent: identity.agent.clone(),
                 key_id: identity.key_id.clone(),
-                task_class: String::new(),
+                task_class: task_class.to_string(),
                 user_id: String::new(),
             });
             match client.resolve_policy(req).await {
@@ -2072,6 +2076,31 @@ fn passthrough_identity(headers: &HeaderMap, default_project: &str) -> Option<Ga
 
 fn gateway_work_unit_id(headers: &HeaderMap) -> Option<&str> {
     header_str(headers, &X_CHISEI_WORK_UNIT).or_else(|| header_str(headers, &X_CHISEI_TASK_ID))
+}
+
+/// Resolve the routing task class for a request. An explicit
+/// `x-chisei-task-class` header wins; otherwise a coarse heuristic classifies
+/// small/fast models (the background tier clients use for cheap side work) as
+/// `background` and everything else as `primary`. The value is advisory input
+/// to policy tiering — the control plane decides whether a class may route to a
+/// cheaper model, defaulting unknown classes to the capable tier.
+fn resolve_task_class(headers: &HeaderMap, requested_model: Option<&str>) -> String {
+    if let Some(explicit) = header_str(headers, &X_CHISEI_TASK_CLASS) {
+        return explicit.to_ascii_lowercase();
+    }
+    match requested_model {
+        Some(model) if is_small_fast_model(model) => "background".to_string(),
+        _ => "primary".to_string(),
+    }
+}
+
+/// Whether a model name looks like a small/fast/background-tier model. Used only
+/// as a fallback classifier when the client sends no explicit task class.
+fn is_small_fast_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    ["haiku", "mini", "nano", "flash", "small", "fast"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
@@ -7130,6 +7159,34 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(body_prefix_is_sse(b"\n\ndata: {}"), Some(true));
         assert_eq!(body_prefix_is_sse(b"{\"id\":\"resp_1\"}"), Some(false));
         assert_eq!(body_prefix_is_sse(b"plain text"), Some(false));
+    }
+
+    #[test]
+    fn resolve_task_class_uses_header_then_small_fast_heuristic() {
+        // Explicit header wins and is normalized to lowercase.
+        let mut headers = HeaderMap::new();
+        headers.insert(X_CHISEI_TASK_CLASS, "Background".parse().unwrap());
+        assert_eq!(
+            resolve_task_class(&headers, Some("gpt-5.5")),
+            "background".to_string()
+        );
+
+        // No header: small/fast models classify as background.
+        let empty = HeaderMap::new();
+        assert_eq!(
+            resolve_task_class(&empty, Some("claude-haiku-4-5")),
+            "background".to_string()
+        );
+        assert_eq!(
+            resolve_task_class(&empty, Some("gpt-5.5-mini")),
+            "background".to_string()
+        );
+        // Primary/reasoning models (and unknown) default to primary.
+        assert_eq!(
+            resolve_task_class(&empty, Some("gpt-5.5")),
+            "primary".to_string()
+        );
+        assert_eq!(resolve_task_class(&empty, None), "primary".to_string());
     }
 
     #[test]
