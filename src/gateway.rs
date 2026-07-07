@@ -372,12 +372,14 @@ async fn proxy_gateway(
         pipeline_spec: pipeline_spec.clone(),
         request_bytes,
         started_ms,
+        route_bias: None,
     };
     let (resolved, egress) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_model.clone(),
             resolved_provider: client_provider,
+            route_bias: None,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -493,6 +495,7 @@ async fn proxy_gateway(
                     pipeline_spec,
                     request_bytes,
                     started_ms,
+                    route_bias: resolved.route_bias,
                 },
                 prepared.response_adapter,
             )
@@ -519,6 +522,7 @@ struct UsageContext {
     pipeline_spec: String,
     request_bytes: usize,
     started_ms: i64,
+    route_bias: Option<String>,
 }
 
 #[derive(Debug)]
@@ -637,6 +641,7 @@ struct PolicyPreflight {
     body: Vec<u8>,
     resolved_model: Option<String>,
     resolved_provider: ProviderKind,
+    route_bias: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -657,6 +662,7 @@ async fn resolve_policy_preflight(
             body: body.to_vec(),
             resolved_model: None,
             resolved_provider: provider,
+            route_bias: None,
         });
     };
     let Some(target) = &config.chisei_grpc_target else {
@@ -664,6 +670,7 @@ async fn resolve_policy_preflight(
             body: body.to_vec(),
             resolved_model: Some(requested_model.to_string()),
             resolved_provider: provider,
+            route_bias: None,
         });
     };
     match connect_sekai(target).await {
@@ -787,6 +794,7 @@ async fn resolve_policy_preflight(
                         body: next_body,
                         resolved_model: Some(resolution.model),
                         resolved_provider,
+                        route_bias: Some(resolution.route_bias).filter(|bias| !bias.is_empty()),
                     })
                 }
                 Err(err) if err.code() == tonic::Code::InvalidArgument => {
@@ -806,6 +814,7 @@ async fn resolve_policy_preflight(
                         body: body.to_vec(),
                         resolved_model: Some(requested_model.to_string()),
                         resolved_provider: provider,
+                        route_bias: None,
                     })
                 }
             }
@@ -821,6 +830,7 @@ async fn resolve_policy_preflight(
                 body: body.to_vec(),
                 resolved_model: Some(requested_model.to_string()),
                 resolved_provider: provider,
+                route_bias: None,
             })
         }
     }
@@ -2596,6 +2606,13 @@ async fn record_usage_and_append(
             }
             if let Some(work_unit_id) = &context.work_unit_id {
                 values.insert("work_unit_id".to_string(), work_unit_id.clone());
+            }
+            if let Some(route_bias) = context
+                .route_bias
+                .as_deref()
+                .filter(|bias| !bias.is_empty())
+            {
+                values.insert("route_bias".to_string(), route_bias.to_string());
             }
             if let Some(observation) = &pipeline_observation {
                 values.insert(
