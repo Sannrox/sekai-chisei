@@ -1155,6 +1155,21 @@ fn action_object_id(name: &str) -> String {
     format!("action:{name}")
 }
 
+/// Internal governance object kinds that must never be created, mutated, read,
+/// or listed through the generic object CRUD RPCs. They hold policy, held-action
+/// params (potentially sensitive), and blast-radius counters, and are managed
+/// only through their dedicated RPCs + server-internal DB paths. Exposing them
+/// via CRUD would leak held params and let callers forge policy or tamper with
+/// blast-radius counters.
+fn is_reserved_governance_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        action_policy::ACTION_POLICY_KIND
+            | action_policy::BLAST_RADIUS_KIND
+            | action_approval::ACTION_APPROVAL_KIND
+    )
+}
+
 /// Resolve the namespace used for action-policy scope resolution: prefer the
 /// namespace of an existing target object, falling back to a `namespace` param
 /// (used by `create_object` before the object exists).
@@ -1771,6 +1786,11 @@ impl SekaiService for SekaiServiceImpl {
         }
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
+        if is_reserved_governance_kind(&domain_obj.kind) {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
         self.require_schema_kind_loaded(&domain_obj.kind)?;
         let schema = self
             .schema
@@ -1807,6 +1827,9 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        if is_reserved_governance_kind(&obj.kind) {
+            return Err(Status::not_found("not found"));
+        }
         let obj = self.resolve_computed_for_response(obj, &principals)?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
@@ -1826,6 +1849,17 @@ impl SekaiService for SekaiServiceImpl {
         }
         check_write(&self.security, &obj.id, &principals)?;
         let mut domain_obj = from_proto_obj(&obj);
+        if is_reserved_governance_kind(&domain_obj.kind)
+            || self
+                .db
+                .get_object(&obj.id)
+                .map_err(Status::internal)?
+                .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
+        {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
         self.require_schema_kind_loaded(&domain_obj.kind)?;
         let schema = self
             .schema
@@ -1859,6 +1893,16 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         let id = req.into_inner().id;
         check_write(&self.security, &id, &principals)?;
+        if self
+            .db
+            .get_object(&id)
+            .map_err(Status::internal)?
+            .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
+        {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .delete_object_with_audit(&id, actor)
@@ -1871,6 +1915,17 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        // Never expose internal governance objects through generic listing.
+        if filter
+            .kind
+            .as_deref()
+            .is_some_and(is_reserved_governance_kind)
+        {
+            return Ok(Response::new(ListObjectsResponse {
+                objects: Vec::new(),
+                total: 0,
+            }));
+        }
         {
             let schema = self
                 .schema
@@ -1901,9 +1956,19 @@ impl SekaiService for SekaiServiceImpl {
             .list_objects_with_total_for_principals(&filter, &principal_refs)
             .map_err(Status::internal)?;
         let objects = self.resolve_computed_for_responses(objects, &principals)?;
+        // Exclude any internal governance objects that a broad (kindless) query
+        // might otherwise surface.
+        let filtered_out = objects
+            .iter()
+            .filter(|o| is_reserved_governance_kind(&o.kind))
+            .count() as i32;
+        let objects: Vec<_> = objects
+            .into_iter()
+            .filter(|o| !is_reserved_governance_kind(&o.kind))
+            .collect();
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
-            total,
+            total: (total - filtered_out).max(0),
         }))
     }
     async fn find_by_external_id(
@@ -1917,6 +1982,9 @@ impl SekaiService for SekaiServiceImpl {
             .find_by_external_id(&external_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        if is_reserved_governance_kind(&obj.kind) {
+            return Err(Status::not_found("not found"));
+        }
         check_read(&self.security, &obj.id, &principals)?;
         let obj = self.resolve_computed_for_response(obj, &principals)?;
         Ok(Response::new(GetObjectResponse {
@@ -1929,6 +1997,12 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
+        if is_reserved_governance_kind(&r.kind) {
+            return Ok(Response::new(ListObjectsResponse {
+                objects: Vec::new(),
+                total: 0,
+            }));
+        }
         {
             let schema = self
                 .schema
@@ -2872,10 +2946,11 @@ impl SekaiService for SekaiServiceImpl {
                 .map_err(|_| Status::internal("action registry unavailable"))?;
             actions.action_risk_class(&approval.action)
         };
-        if let Some(policy) = self
+        let resolved_policy = self
             .db
             .resolve_action_policy(&approval.actor, &namespace)
-            .map_err(Status::internal)?
+            .map_err(Status::internal)?;
+        if let Some(policy) = &resolved_policy
             && policy.decide(&approval.action, action_risk) == ActionDecision::Deny
         {
             self.db
@@ -2898,6 +2973,54 @@ impl SekaiService for SekaiServiceImpl {
             ));
         }
 
+        // Resumed actions must still be metered like the direct path: enforce
+        // per-work-unit blast-radius caps and the action-class budget so
+        // approval is not a governance bypass (Plan 9, Phase C).
+        let (op_mutations, op_deletes) = {
+            let actions = self
+                .actions
+                .read()
+                .map_err(|_| Status::internal("action registry unavailable"))?;
+            actions.action_op_counts(&approval.action, &approval.params)
+        };
+        let blast_caps = resolved_policy.as_ref().and_then(|policy| {
+            match (
+                policy.max_mutations_per_work_unit,
+                policy.max_deletes_per_work_unit,
+            ) {
+                (None, None) => None,
+                caps => Some(caps),
+            }
+        });
+        if !approval.work_unit.is_empty()
+            && let Some((max_mutations, max_deletes)) = blast_caps
+        {
+            let (used_mutations, used_deletes) = self
+                .db
+                .get_blast_radius(&approval.work_unit)
+                .map_err(Status::internal)?;
+            let exceeds = |cap: Option<u32>, used: u32, add: u32| {
+                cap.is_some_and(|cap| used.saturating_add(add) > cap)
+            };
+            if exceeds(max_deletes, used_deletes, op_deletes)
+                || exceeds(max_mutations, used_mutations, op_mutations)
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "blast-radius cap exceeded for work unit {}",
+                    approval.work_unit
+                )));
+            }
+        }
+        let budget_subject = format!("action:{}", action_risk.as_str());
+        if let Some(budget) = &self.budget
+            && budget.check(&budget_subject, 1).is_err()
+        {
+            return Err(Status::resource_exhausted(format!(
+                "action budget exhausted for {}",
+                budget_subject
+            )));
+        }
+
         // Resume the effect, re-checking write access for the original proposer.
         let proposer = vec![approval.actor.clone()];
         let msg = self.run_action_effect(
@@ -2906,6 +3029,19 @@ impl SekaiService for SekaiServiceImpl {
             &approval.actor,
             &proposer,
         )?;
+
+        // Record the effect against blast-radius counters and the action budget.
+        if !approval.work_unit.is_empty()
+            && blast_caps.is_some()
+            && (op_mutations > 0 || op_deletes > 0)
+        {
+            let _ = self
+                .db
+                .add_blast_radius(&approval.work_unit, op_mutations, op_deletes);
+        }
+        if let Some(budget) = &self.budget {
+            budget.record(&budget_subject, 1);
+        }
 
         approval.status = action_approval::ApprovalStatus::Approved;
         approval.decided_by = principals.first().cloned().unwrap_or_default();
@@ -9606,5 +9742,202 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(svc.db.get_link("obj-1->obj-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reserved_governance_objects_are_hidden_from_generic_crud() {
+        let svc = service();
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy::allow_all("agent:tester"))
+            .unwrap();
+
+        // CreateObject cannot forge a governance kind (policy escalation guard).
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: "forged".into(),
+                    kind: "action_policy".into(),
+                    name: "forged".into(),
+                    namespace: String::new(),
+                    external_id: "action_policy:agent:tester".into(),
+                    properties: HashMap::from([("default_decision".into(), "allow".into())]),
+                    created: 0,
+                    updated: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // find_by_external_id hides the governance object.
+        let err = svc
+            .find_by_external_id(with_principal(FindByExternalIdRequest {
+                external_id: "action_policy:agent:tester".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // ListObjects filtered by the reserved kind returns nothing.
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "action_policy".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects.len(), 0);
+        assert_eq!(listed.total, 0);
+    }
+
+    #[tokio::test]
+    async fn held_approval_params_not_readable_via_get_object() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let result = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("api_key".into(), "super-secret".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "done".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let approval_id = result.approval_id;
+        assert!(!approval_id.is_empty());
+
+        // The stored approval object (raw params incl. the secret) is not
+        // reachable through the generic GetObject RPC.
+        let err = svc
+            .get_object(with_principal(GetObjectRequest {
+                id: approval_id.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // Nor via a broad ListObjects for the reserved kind.
+        let listed = svc
+            .list_objects(with_principal(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: "action_approval".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn blast_radius_object_not_writable_via_update_object() {
+        let svc = service();
+        svc.db.add_blast_radius("wu-1", 1, 0).unwrap();
+        let err = svc
+            .update_object(with_principal(UpdateObjectRequest {
+                object: Some(Object {
+                    id: "blast-radius-wu-1".into(),
+                    kind: "widget".into(),
+                    name: "tamper".into(),
+                    namespace: String::new(),
+                    external_id: String::new(),
+                    properties: HashMap::from([("mutations".into(), "0".into())]),
+                    created: 0,
+                    updated: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(svc.db.get_blast_radius("wu-1").unwrap(), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn approved_action_is_metered_against_blast_radius() {
+        let svc = service();
+        grant_action_admin(&svc);
+        seed_domain_object(&svc, "obj-1");
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: Some(1),
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for value in ["a", "b"] {
+            let mut req = Request::new(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), value.to_string()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            });
+            req.metadata_mut().insert(
+                "x-principal",
+                tonic::metadata::MetadataValue::try_from("tester").unwrap(),
+            );
+            req.metadata_mut().insert(
+                "x-chisei-work-unit",
+                tonic::metadata::MetadataValue::try_from("wu-1").unwrap(),
+            );
+            let result = svc
+                .execute_action(req)
+                .await
+                .unwrap()
+                .into_inner()
+                .result
+                .unwrap();
+            ids.push(result.approval_id);
+        }
+
+        // First approval executes and consumes the single-mutation cap.
+        svc.approve_action(with_principal(ApproveActionRequest {
+            approval_id: ids[0].clone(),
+        }))
+        .await
+        .unwrap();
+
+        // Second approval is hard-stopped by the per-work-unit blast-radius cap.
+        let err = svc
+            .approve_action(with_principal(ApproveActionRequest {
+                approval_id: ids[1].clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 }
