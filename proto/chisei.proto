@@ -17,6 +17,9 @@ message PolicyResolution {
   bool eval_regressed = 3;
   string eval_regression_reason = 4;
   string data_class = 5;
+  // Cost-tier bias applied for this resolution ("cheap" when a bulk task class
+  // was routed to a cheaper model; empty for the default capable tier).
+  string route_bias = 6;
 }
 
 message PipelineRequest {

@@ -241,7 +241,7 @@ fn ollama_capability_rank(model: &InstalledModel) -> i32 {
         }
 }
 
-fn named_model_cost_rank(model: &str) -> i32 {
+pub fn named_model_cost_rank(model: &str) -> i32 {
     let lower = model.to_ascii_lowercase();
     if lower.contains("nano") {
         1
