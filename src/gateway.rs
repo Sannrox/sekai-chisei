@@ -1484,11 +1484,9 @@ async fn apply_context_egress(
         });
     };
     let mut sekai = SekaiServiceClient::new(channel);
-    let mut included_count = 0usize;
     let mut redacted_count = 0usize;
     let mut decisions = 0usize;
-    let mut object_refs = Vec::new();
-    let mut context_lines = Vec::new();
+    let mut injectable: Vec<InjectableObject> = Vec::new();
 
     for external_id in refs {
         let object = match sekai
@@ -1516,23 +1514,26 @@ async fn apply_context_egress(
         if record.included_fields.is_empty() && record.redacted_fields.is_empty() {
             continue;
         }
+        decisions += 1;
+        redacted_count += record.redacted_fields.len();
         if !included_fields.is_empty() {
-            if crate::chisei::egress::include_identity(&domain_object) {
-                context_lines.push(format!(
+            let line = if crate::chisei::egress::include_identity(&domain_object) {
+                format!(
                     "object {} ({}) [{}] {}",
                     domain_object.kind,
                     domain_object.name,
                     domain_object.external_id,
                     included_fields.join(", ")
-                ));
+                )
             } else {
-                context_lines.push(format!("object context {}", included_fields.join(", ")));
-            }
+                format!("object context {}", included_fields.join(", "))
+            };
+            injectable.push(InjectableObject {
+                line,
+                included_fields: record.included_fields.len(),
+                object_ref: record.object_ref,
+            });
         }
-        included_count += record.included_fields.len();
-        redacted_count += record.redacted_fields.len();
-        decisions += 1;
-        object_refs.push(record.object_ref);
     }
 
     if decisions == 0 {
@@ -1541,10 +1542,25 @@ async fn apply_context_egress(
         });
     }
     let mut rewritten = false;
-    let next_body = if context_lines.is_empty() {
+    // Bound the injected object context so precision-injection never balloons
+    // the prompt or drowns the model in low-signal context. Drops are reflected
+    // in the audit so the egress record matches what was actually forwarded.
+    let (kept, dropped_objects) = cap_injectable_objects(injectable, max_object_context_chars());
+    let included_count: usize = kept.iter().map(|object| object.included_fields).sum();
+    let object_refs: Vec<String> = kept
+        .iter()
+        .map(|object| object.object_ref.clone())
+        .collect();
+    let injected_context = kept
+        .iter()
+        .map(|object| object.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let injected_context_chars = injected_context.chars().count();
+    let next_body = if injected_context.is_empty() {
         body.to_vec()
     } else {
-        match inject_gateway_context(provider, body, &context_lines.join("\n")) {
+        match inject_gateway_context(provider, body, &injected_context) {
             Ok(Some(next_body)) => {
                 rewritten = true;
                 next_body
@@ -1585,6 +1601,14 @@ async fn apply_context_egress(
             ("redacted_count".to_string(), redacted_count.to_string()),
             ("object_refs".to_string(), object_refs.join(",")),
             ("payload_rewritten".to_string(), rewritten.to_string()),
+            (
+                "injected_context_chars".to_string(),
+                injected_context_chars.to_string(),
+            ),
+            (
+                "dropped_object_context".to_string(),
+                dropped_objects.to_string(),
+            ),
         ]),
     )
     .await;
@@ -3630,6 +3654,63 @@ fn collect_gateway_spec_text(value: &serde_json::Value, parts: &mut Vec<String>)
 fn truncate_gateway_spec(value: &str) -> String {
     const MAX_GATEWAY_SPEC_CHARS: usize = 4000;
     value.chars().take(MAX_GATEWAY_SPEC_CHARS).collect()
+}
+
+/// Maximum characters of governed object context the gateway will inject into a
+/// request, read from `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` (default 4000).
+/// Bounds precision-injection so it never balloons the prompt (which would
+/// defeat the cost goal) or drown the model in low-signal context.
+fn max_object_context_chars() -> usize {
+    const DEFAULT_MAX_OBJECT_CONTEXT_CHARS: usize = 4000;
+    std::env::var("CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_OBJECT_CONTEXT_CHARS)
+}
+
+/// An object's governed context prepared for injection, with the audit
+/// metadata needed to reconcile the egress record with what was actually
+/// forwarded.
+struct InjectableObject {
+    line: String,
+    included_fields: usize,
+    object_ref: String,
+}
+
+/// Keep whole object contexts in order until the character budget is reached;
+/// drop the rest. Returns the kept objects and the number dropped, so injection
+/// stays bounded and the drop is auditable. Whole lines are preserved where
+/// possible; a single first object whose line is larger than the budget is
+/// truncated so the total never exceeds `max_chars`.
+fn cap_injectable_objects(
+    objects: Vec<InjectableObject>,
+    max_chars: usize,
+) -> (Vec<InjectableObject>, usize) {
+    let mut kept: Vec<InjectableObject> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+    for mut object in objects {
+        if kept.is_empty() {
+            // Always inject at least one object's context, hard-truncating it
+            // to the budget in the rare case it exceeds the cap on its own.
+            if object.line.chars().count() > max_chars {
+                object.line = object.line.chars().take(max_chars).collect();
+            }
+            used = object.line.chars().count();
+            kept.push(object);
+            continue;
+        }
+        // Account for the "\n" separator between kept lines.
+        let projected = used + 1 + object.line.chars().count();
+        if projected <= max_chars {
+            used = projected;
+            kept.push(object);
+        } else {
+            dropped += 1;
+        }
+    }
+    (kept, dropped)
 }
 
 fn clamp_i64_to_i32(value: i64) -> i32 {
@@ -7204,6 +7285,42 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             "primary".to_string()
         );
         assert_eq!(resolve_task_class(&empty, None), "primary".to_string());
+    }
+
+    #[test]
+    fn cap_injectable_objects_bounds_by_char_budget() {
+        let obj = |line: &str| InjectableObject {
+            line: line.to_string(),
+            included_fields: 1,
+            object_ref: line.to_string(),
+        };
+        // Two 10-char lines fit in a 25-char budget (10 + 1 separator + 10 = 21).
+        let (kept, dropped) =
+            cap_injectable_objects(vec![obj(&"a".repeat(10)), obj(&"b".repeat(10))], 25);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped, 0);
+
+        // A tighter budget drops the second object.
+        let (kept, dropped) =
+            cap_injectable_objects(vec![obj(&"a".repeat(10)), obj(&"b".repeat(10))], 15);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, "a".repeat(10));
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn cap_injectable_objects_truncates_oversized_first_line() {
+        // A single object whose line is larger than the budget is truncated so
+        // the total is always bounded, but at least one object is injected.
+        let objects = vec![InjectableObject {
+            line: "x".repeat(100),
+            included_fields: 2,
+            object_ref: "obj:1".to_string(),
+        }];
+        let (kept, dropped) = cap_injectable_objects(objects, 20);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line.chars().count(), 20);
+        assert_eq!(dropped, 0);
     }
 
     #[test]

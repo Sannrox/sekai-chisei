@@ -191,7 +191,10 @@ Referenced Sekai
 objects such as `ticker:{AAPL}` produce object-context egress audit decisions
 for external provider calls. Allowed object fields are injected into supported
 OpenAI Responses, Chat Completions, and Anthropic Messages payload shapes, while
-denied fields are counted in audit but not forwarded.
+denied fields are counted in audit but not forwarded. Injected object context is
+bounded to `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` characters (default 4000) so
+precision-injection never balloons the prompt; the egress audit records the
+injected character count and how many object contexts were dropped by the cap.
 
 ### One-command launch
 
