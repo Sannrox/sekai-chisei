@@ -10,6 +10,8 @@ use super::pb::sekai::*;
 use crate::db::sekai::SekaiDb;
 use crate::domain;
 use crate::sekai::action::{self, ActionExecutor};
+use crate::sekai::action_approval;
+use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, compute, coordination, dataset, function, security};
@@ -24,6 +26,7 @@ pub struct SekaiServiceImpl {
     schema: Arc<RwLock<SchemaRegistry>>,
     schema_unavailable_error: Arc<RwLock<Option<String>>>,
     schema_load_errors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
 }
 
 impl SekaiServiceImpl {
@@ -74,7 +77,19 @@ impl SekaiServiceImpl {
             schema,
             schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
             schema_load_errors: Arc::new(RwLock::new(schema_load_errors)),
+            budget: None,
         }
+    }
+
+    /// Construct sharing a chisei budget tracker so governed actions can be
+    /// metered against action-class budgets (Plan 9, Phase C).
+    pub fn with_budget(
+        db: Arc<SekaiDb>,
+        budget: Arc<crate::chisei::budget::BudgetTracker>,
+    ) -> Self {
+        let mut svc = Self::new(db);
+        svc.budget = Some(budget);
+        svc
     }
 
     fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
@@ -89,6 +104,79 @@ impl SekaiServiceImpl {
             )));
         }
         Ok(())
+    }
+
+    /// Execute an action's effect (target auth + schema validation + mutation +
+    /// audit) without policy gating. Used to resume an approved held action.
+    /// `principals` are the identities re-checked for write access at execution
+    /// time. Returns the executor's success message.
+    fn run_action_effect(
+        &self,
+        action_name: &str,
+        params: &HashMap<String, String>,
+        actor: &str,
+        principals: &[String],
+    ) -> Result<String, Status> {
+        let actions = self
+            .actions
+            .read()
+            .map_err(|_| Status::internal("action registry unavailable"))?;
+        let mask_missing_link = actions.masks_missing_link(action_name);
+        let sensitive_params = actions.sensitive_param_names(action_name);
+        let target_ids = actions
+            .target_ids(&self.db, action_name, params)
+            .map_err(|err| {
+                if mask_missing_link && err == "link not found" {
+                    Status::permission_denied("write denied")
+                } else {
+                    Status::invalid_argument(err)
+                }
+            })?;
+        for target_id in &target_ids {
+            check_write(&self.security, target_id, principals)?;
+        }
+        let schema_kinds = actions
+            .schema_kinds(&self.db, action_name, params)
+            .map_err(Status::invalid_argument)?;
+        for kind in schema_kinds {
+            self.require_schema_kind_loaded(&kind)?;
+        }
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        actions
+            .validate_action_schema(action_name, &schema)
+            .map_err(Status::invalid_argument)?;
+        let schema_restricted_property =
+            schema_restricted_action_property(&self.db, &schema, params);
+        let msg = actions
+            .execute(&self.db, &schema, action_name, params, actor)
+            .map_err(Status::invalid_argument)?;
+        drop(actions);
+        drop(schema);
+        self.db
+            .record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now_millis(),
+                actor: actor.to_string(),
+                action: action_name.to_string(),
+                reason: "execute_action".into(),
+                evidence: redact_action_evidence(
+                    params,
+                    &sensitive_params,
+                    schema_restricted_property,
+                ),
+                target_id: target_ids.first().cloned().unwrap_or_default(),
+                outcome: redact_action_outcome(
+                    action_name,
+                    params,
+                    &msg,
+                    schema_restricted_property,
+                ),
+            })
+            .map_err(Status::internal)?;
+        Ok(msg)
     }
 
     fn resolve_computed_for_response(
@@ -178,6 +266,15 @@ fn caller_principals(req: &Request<impl std::any::Any>) -> Vec<String> {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_else(|| vec!["anonymous".to_string()])
+}
+
+fn work_unit_from_metadata(req: &Request<impl std::any::Any>) -> String {
+    req.metadata()
+        .get("x-chisei-work-unit")
+        .or_else(|| req.metadata().get("x-chisei-task-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn require_authenticated(principals: &[String]) -> Result<(), Status> {
@@ -1056,6 +1153,103 @@ fn interface_object_id(name: &str) -> String {
 
 fn action_object_id(name: &str) -> String {
     format!("action:{name}")
+}
+
+/// Resolve the namespace used for action-policy scope resolution: prefer the
+/// namespace of an existing target object, falling back to a `namespace` param
+/// (used by `create_object` before the object exists).
+fn action_policy_namespace(
+    db: &SekaiDb,
+    target_ids: &[String],
+    params: &std::collections::HashMap<String, String>,
+) -> String {
+    for id in target_ids {
+        if let Ok(Some(object)) = db.get_object(id)
+            && !object.namespace.trim().is_empty()
+        {
+            return object.namespace;
+        }
+    }
+    params
+        .get("namespace")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn to_proto_action_approval(approval: &action_approval::ActionApproval) -> ActionApproval {
+    ActionApproval {
+        id: approval.id.clone(),
+        status: approval.status.as_str().to_string(),
+        actor: approval.actor.clone(),
+        action: approval.action.clone(),
+        params: approval.redacted_params(),
+        work_unit: approval.work_unit.clone(),
+        policy_scope: approval.policy_scope.clone(),
+        risk_class: approval.risk_class.clone(),
+        target_id: approval.target_id.clone(),
+        created: approval.created,
+        updated: approval.updated,
+        decided_by: approval.decided_by.clone(),
+        outcome: approval.outcome.clone(),
+    }
+}
+
+fn to_proto_action_policy(policy: &action_policy::ActionPolicy) -> ActionPolicy {
+    ActionPolicy {
+        scope: policy.scope.clone(),
+        default_decision: policy.default_decision.as_str().to_string(),
+        action_overrides: policy
+            .action_overrides
+            .iter()
+            .map(|(name, decision)| (name.clone(), decision.as_str().to_string()))
+            .collect(),
+        risk_overrides: policy
+            .risk_overrides
+            .iter()
+            .map(|(risk, decision)| (risk.as_str().to_string(), decision.as_str().to_string()))
+            .collect(),
+        max_mutations_per_work_unit: policy.max_mutations_per_work_unit.unwrap_or(0),
+        max_deletes_per_work_unit: policy.max_deletes_per_work_unit.unwrap_or(0),
+    }
+}
+
+fn from_proto_action_policy(policy: &ActionPolicy) -> Result<action_policy::ActionPolicy, Status> {
+    let scope = policy.scope.trim();
+    if scope.is_empty() {
+        return Err(Status::invalid_argument("policy scope required"));
+    }
+    let default_decision = if policy.default_decision.trim().is_empty() {
+        ActionDecision::Allow
+    } else {
+        ActionDecision::parse(&policy.default_decision)
+            .ok_or_else(|| Status::invalid_argument("invalid default_decision"))?
+    };
+    let mut action_overrides = HashMap::new();
+    for (name, decision) in &policy.action_overrides {
+        let decision = ActionDecision::parse(decision).ok_or_else(|| {
+            Status::invalid_argument(format!("invalid decision for action {name}"))
+        })?;
+        action_overrides.insert(name.clone(), decision);
+    }
+    let mut risk_overrides = HashMap::new();
+    for (risk, decision) in &policy.risk_overrides {
+        let parsed_risk = action::RiskClass::parse(risk)
+            .ok_or_else(|| Status::invalid_argument(format!("invalid risk class {risk}")))?;
+        let decision = ActionDecision::parse(decision)
+            .ok_or_else(|| Status::invalid_argument(format!("invalid decision for risk {risk}")))?;
+        risk_overrides.insert(parsed_risk, decision);
+    }
+    Ok(action_policy::ActionPolicy {
+        scope: scope.to_string(),
+        default_decision,
+        action_overrides,
+        risk_overrides,
+        max_mutations_per_work_unit: (policy.max_mutations_per_work_unit > 0)
+            .then_some(policy.max_mutations_per_work_unit),
+        max_deletes_per_work_unit: (policy.max_deletes_per_work_unit > 0)
+            .then_some(policy.max_deletes_per_work_unit),
+    })
 }
 
 fn to_proto_action_type(action_type: &action::ActionTypeDef) -> ActionTypeDef {
@@ -2301,8 +2495,10 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ExecuteActionRequest>,
     ) -> Result<Response<ExecuteActionResponse>, Status> {
         let principals = caller_principals(&req);
-        let r = req
-            .into_inner()
+        let work_unit = work_unit_from_metadata(&req);
+        let inner = req.into_inner();
+        let dry_run = inner.dry_run;
+        let r = inner
             .request
             .ok_or(Status::invalid_argument("request required"))?;
         let actions = self
@@ -2323,13 +2519,215 @@ impl SekaiService for SekaiServiceImpl {
         for target_id in &target_ids {
             check_write(&self.security, target_id, &principals)?;
         }
+        let actor = principals.first().cloned().unwrap_or_default();
+        // Governed-action policy gate (Plan 9, Phase A). Resolved by
+        // agent-then-namespace scope; no policy == allow (backward compatible).
+        let action_risk = actions.action_risk_class(&r.action);
+        let policy_namespace = action_policy_namespace(&self.db, &target_ids, &r.params);
+        let resolved_policy = self
+            .db
+            .resolve_action_policy(&actor, &policy_namespace)
+            .map_err(Status::internal)?;
+        let (decision, policy_scope) = match &resolved_policy {
+            Some(policy) => (policy.decide(&r.action, action_risk), policy.scope.clone()),
+            None => (ActionDecision::Allow, String::new()),
+        };
+
+        // Dry-run (Plan 9, Phase B): report the planned ops and the resolved
+        // decision without executing or erroring, leaving the graph untouched.
+        if dry_run {
+            let planned_ops = actions
+                .planned_ops(&r.action, &r.params)
+                .map_err(Status::invalid_argument)?;
+            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
+            evidence.insert("risk_class".into(), action_risk.as_str().into());
+            evidence.insert("decision".into(), decision.as_str().into());
+            evidence.insert("dry_run".into(), "true".into());
+            if !policy_scope.is_empty() {
+                evidence.insert("policy_scope".into(), policy_scope.clone());
+            }
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: actor.clone(),
+                    action: r.action.clone(),
+                    reason: "execute_action_dry_run".into(),
+                    evidence,
+                    target_id: target_ids.first().cloned().unwrap_or_default(),
+                    outcome: format!(
+                        "dry-run: {} planned op(s), decision={}",
+                        planned_ops.len(),
+                        decision.as_str()
+                    ),
+                })
+                .map_err(Status::internal)?;
+            return Ok(Response::new(ExecuteActionResponse {
+                result: Some(ActionResult {
+                    action: r.action,
+                    message: format!("dry run: {} planned op(s)", planned_ops.len()),
+                    dry_run: true,
+                    planned_ops,
+                    decision: decision.as_str().into(),
+                    approval_id: String::new(),
+                }),
+            }));
+        }
+
+        if decision == ActionDecision::RequireApproval {
+            // Phase B: hold the action for out-of-band approval instead of
+            // executing. Persist the exact params so it can be resumed.
+            let approval = action_approval::ActionApproval::pending(
+                actor.clone(),
+                r.action.clone(),
+                r.params.clone(),
+                work_unit.clone(),
+                policy_scope.clone(),
+                action_risk.as_str(),
+                target_ids.first().cloned().unwrap_or_default(),
+                now_millis(),
+            );
+            self.db
+                .create_action_approval(&approval)
+                .map_err(Status::internal)?;
+            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
+            evidence.insert("risk_class".into(), action_risk.as_str().into());
+            evidence.insert("policy_scope".into(), policy_scope.clone());
+            evidence.insert("decision".into(), decision.as_str().into());
+            evidence.insert("approval_id".into(), approval.id.clone());
+            if !work_unit.is_empty() {
+                evidence.insert("work_unit".into(), work_unit.clone());
+            }
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: actor.clone(),
+                    action: r.action.clone(),
+                    reason: "action_approval_pending".into(),
+                    evidence,
+                    target_id: target_ids.first().cloned().unwrap_or_default(),
+                    outcome: format!("held for approval: {}", approval.id),
+                })
+                .map_err(Status::internal)?;
+            return Ok(Response::new(ExecuteActionResponse {
+                result: Some(ActionResult {
+                    action: r.action,
+                    message: format!("action held for approval: {}", approval.id),
+                    dry_run: false,
+                    planned_ops: Vec::new(),
+                    decision: decision.as_str().into(),
+                    approval_id: approval.id,
+                }),
+            }));
+        }
+
+        if decision == ActionDecision::Deny {
+            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
+            evidence.insert("risk_class".into(), action_risk.as_str().into());
+            evidence.insert("policy_scope".into(), policy_scope.clone());
+            evidence.insert("decision".into(), decision.as_str().into());
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: actor.clone(),
+                    action: r.action.clone(),
+                    reason: "action_policy_denied".into(),
+                    evidence,
+                    target_id: target_ids.first().cloned().unwrap_or_default(),
+                    outcome: format!("{} by action policy {}", decision.as_str(), policy_scope),
+                })
+                .map_err(Status::internal)?;
+            return Err(Status::permission_denied(format!(
+                "action {} denied by policy",
+                r.action
+            )));
+        }
+
+        // Blast-radius caps (Plan 9, Phase C): hard-stop runaway loops by
+        // capping mutations/deletes per work unit. Only enforced when a policy
+        // sets a cap and the call carries a work-unit attribution.
+        let blast_caps = resolved_policy.as_ref().and_then(|policy| {
+            match (
+                policy.max_mutations_per_work_unit,
+                policy.max_deletes_per_work_unit,
+            ) {
+                (None, None) => None,
+                caps => Some(caps),
+            }
+        });
+        let (op_mutations, op_deletes) = actions.action_op_counts(&r.action, &r.params);
+        if !work_unit.is_empty()
+            && let Some((max_mutations, max_deletes)) = blast_caps
+        {
+            let (used_mutations, used_deletes) = self
+                .db
+                .get_blast_radius(&work_unit)
+                .map_err(Status::internal)?;
+            let exceeds = |cap: Option<u32>, used: u32, add: u32| {
+                cap.is_some_and(|cap| used.saturating_add(add) > cap)
+            };
+            if exceeds(max_deletes, used_deletes, op_deletes)
+                || exceeds(max_mutations, used_mutations, op_mutations)
+            {
+                let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
+                evidence.insert("risk_class".into(), action_risk.as_str().into());
+                evidence.insert("policy_scope".into(), policy_scope.clone());
+                evidence.insert("work_unit".into(), work_unit.clone());
+                evidence.insert("used_mutations".into(), used_mutations.to_string());
+                evidence.insert("used_deletes".into(), used_deletes.to_string());
+                self.db
+                    .record_decision(&audit::Decision {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: now_millis(),
+                        actor: actor.clone(),
+                        action: r.action.clone(),
+                        reason: "action_blast_radius_exceeded".into(),
+                        evidence,
+                        target_id: target_ids.first().cloned().unwrap_or_default(),
+                        outcome: format!("blast-radius cap exceeded for work unit {}", work_unit),
+                    })
+                    .map_err(Status::internal)?;
+                return Err(Status::resource_exhausted(format!(
+                    "blast-radius cap exceeded for work unit {}",
+                    work_unit
+                )));
+            }
+        }
+
+        // Action-class budget (Plan 9, Phase C): meter effectful actions against
+        // a chisei budget subject `action:<risk_class>`. No limit == allow.
+        let budget_subject = format!("action:{}", action_risk.as_str());
+        if let Some(budget) = &self.budget
+            && let Err(err) = budget.check(&budget_subject, 1)
+        {
+            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
+            evidence.insert("risk_class".into(), action_risk.as_str().into());
+            evidence.insert("budget_subject".into(), budget_subject.clone());
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: actor.clone(),
+                    action: r.action.clone(),
+                    reason: "action_budget_exceeded".into(),
+                    evidence,
+                    target_id: target_ids.first().cloned().unwrap_or_default(),
+                    outcome: err,
+                })
+                .map_err(Status::internal)?;
+            return Err(Status::resource_exhausted(format!(
+                "action budget exhausted for {}",
+                budget_subject
+            )));
+        }
         let schema_kinds = actions
             .schema_kinds(&self.db, &r.action, &r.params)
             .map_err(Status::invalid_argument)?;
         for kind in schema_kinds {
             self.require_schema_kind_loaded(&kind)?;
         }
-        let actor = principals.first().cloned().unwrap_or_default();
         let schema = self
             .schema
             .read()
@@ -2365,13 +2763,254 @@ impl SekaiService for SekaiServiceImpl {
                 ),
             })
             .map_err(Status::internal)?;
+        // Record the effect against the work unit's blast-radius counters.
+        if !work_unit.is_empty() && blast_caps.is_some() && (op_mutations > 0 || op_deletes > 0) {
+            let _ = self
+                .db
+                .add_blast_radius(&work_unit, op_mutations, op_deletes);
+        }
+        // Record action-class budget usage (one unit per executed action).
+        if let Some(budget) = &self.budget {
+            budget.record(&budget_subject, 1);
+        }
         Ok(Response::new(ExecuteActionResponse {
             result: Some(ActionResult {
                 action: r.action,
                 message: msg,
+                dry_run: false,
+                planned_ops: Vec::new(),
+                decision: decision.as_str().into(),
+                approval_id: String::new(),
             }),
         }))
     }
+    async fn set_action_policy(
+        &self,
+        req: Request<SetActionPolicyRequest>,
+    ) -> Result<Response<SetActionPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let policy = req
+            .into_inner()
+            .policy
+            .ok_or(Status::invalid_argument("policy required"))?;
+        let domain_policy = from_proto_action_policy(&policy)?;
+        check_action_admin(&self.security, &domain_policy.scope, &principals)?;
+        self.db
+            .upsert_action_policy(&domain_policy)
+            .map_err(Status::internal)?;
+        Ok(Response::new(SetActionPolicyResponse {
+            policy: Some(to_proto_action_policy(&domain_policy)),
+        }))
+    }
+
+    async fn get_action_policy(
+        &self,
+        req: Request<GetActionPolicyRequest>,
+    ) -> Result<Response<GetActionPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        let r = req.into_inner();
+        check_action_admin(&self.security, &r.scope, &principals)?;
+        let policy = self
+            .db
+            .get_action_policy(&r.scope)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetActionPolicyResponse {
+            policy: policy.map(|policy| to_proto_action_policy(&policy)),
+        }))
+    }
+
+    async fn list_action_policies(
+        &self,
+        req: Request<ListActionPoliciesRequest>,
+    ) -> Result<Response<ListActionPoliciesResponse>, Status> {
+        let principals = caller_principals(&req);
+        check_action_admin(&self.security, "", &principals)?;
+        let policies = self.db.list_action_policies().map_err(Status::internal)?;
+        Ok(Response::new(ListActionPoliciesResponse {
+            policies: policies.iter().map(to_proto_action_policy).collect(),
+        }))
+    }
+
+    async fn approve_action(
+        &self,
+        req: Request<ApproveActionRequest>,
+    ) -> Result<Response<ApproveActionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let r = req.into_inner();
+        let mut approval = self
+            .db
+            .get_action_approval(&r.approval_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("approval not found"))?;
+        check_action_admin(&self.security, &approval.policy_scope, &principals)?;
+        if approval.status != action_approval::ApprovalStatus::Pending {
+            return Err(Status::failed_precondition(format!(
+                "approval {} is already {}",
+                approval.id,
+                approval.status.as_str()
+            )));
+        }
+        let approver = principals.first().cloned().unwrap_or_default();
+
+        // Re-check policy at execution time: a tightened policy that now denies
+        // the action must block the resume even though it was approved.
+        let target_ids = {
+            let actions = self
+                .actions
+                .read()
+                .map_err(|_| Status::internal("action registry unavailable"))?;
+            actions
+                .target_ids(&self.db, &approval.action, &approval.params)
+                .unwrap_or_default()
+        };
+        let namespace = action_policy_namespace(&self.db, &target_ids, &approval.params);
+        let action_risk = {
+            let actions = self
+                .actions
+                .read()
+                .map_err(|_| Status::internal("action registry unavailable"))?;
+            actions.action_risk_class(&approval.action)
+        };
+        if let Some(policy) = self
+            .db
+            .resolve_action_policy(&approval.actor, &namespace)
+            .map_err(Status::internal)?
+            && policy.decide(&approval.action, action_risk) == ActionDecision::Deny
+        {
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: approver,
+                    action: approval.action.clone(),
+                    reason: "action_approval_policy_denied".into(),
+                    evidence: HashMap::from([
+                        ("approval_id".into(), approval.id.clone()),
+                        ("policy_scope".into(), policy.scope.clone()),
+                    ]),
+                    target_id: approval.target_id.clone(),
+                    outcome: "policy now denies the held action".into(),
+                })
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "action policy now denies this approval",
+            ));
+        }
+
+        // Resume the effect, re-checking write access for the original proposer.
+        let proposer = vec![approval.actor.clone()];
+        let msg = self.run_action_effect(
+            &approval.action,
+            &approval.params,
+            &approval.actor,
+            &proposer,
+        )?;
+
+        approval.status = action_approval::ApprovalStatus::Approved;
+        approval.decided_by = principals.first().cloned().unwrap_or_default();
+        approval.outcome = msg.clone();
+        approval.updated = now_millis();
+        self.db
+            .update_action_approval(&approval)
+            .map_err(Status::internal)?;
+        self.db
+            .record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now_millis(),
+                actor: approval.decided_by.clone(),
+                action: approval.action.clone(),
+                reason: "action_approval_approved".into(),
+                evidence: HashMap::from([("approval_id".into(), approval.id.clone())]),
+                target_id: approval.target_id.clone(),
+                outcome: msg.clone(),
+            })
+            .map_err(Status::internal)?;
+
+        Ok(Response::new(ApproveActionResponse {
+            result: Some(ActionResult {
+                action: approval.action.clone(),
+                message: msg,
+                dry_run: false,
+                planned_ops: Vec::new(),
+                decision: "approved".into(),
+                approval_id: approval.id.clone(),
+            }),
+            approval: Some(to_proto_action_approval(&approval)),
+        }))
+    }
+
+    async fn deny_action(
+        &self,
+        req: Request<DenyActionRequest>,
+    ) -> Result<Response<DenyActionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let r = req.into_inner();
+        let mut approval = self
+            .db
+            .get_action_approval(&r.approval_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("approval not found"))?;
+        check_action_admin(&self.security, &approval.policy_scope, &principals)?;
+        if approval.status != action_approval::ApprovalStatus::Pending {
+            return Err(Status::failed_precondition(format!(
+                "approval {} is already {}",
+                approval.id,
+                approval.status.as_str()
+            )));
+        }
+        approval.status = action_approval::ApprovalStatus::Denied;
+        approval.decided_by = principals.first().cloned().unwrap_or_default();
+        approval.outcome = if r.reason.trim().is_empty() {
+            "denied".to_string()
+        } else {
+            r.reason.trim().to_string()
+        };
+        approval.updated = now_millis();
+        self.db
+            .update_action_approval(&approval)
+            .map_err(Status::internal)?;
+        self.db
+            .record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now_millis(),
+                actor: approval.decided_by.clone(),
+                action: approval.action.clone(),
+                reason: "action_approval_denied".into(),
+                evidence: HashMap::from([("approval_id".into(), approval.id.clone())]),
+                target_id: approval.target_id.clone(),
+                outcome: approval.outcome.clone(),
+            })
+            .map_err(Status::internal)?;
+        Ok(Response::new(DenyActionResponse {
+            approval: Some(to_proto_action_approval(&approval)),
+        }))
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        req: Request<ListPendingApprovalsRequest>,
+    ) -> Result<Response<ListPendingApprovalsResponse>, Status> {
+        let principals = caller_principals(&req);
+        check_action_admin(&self.security, "", &principals)?;
+        let r = req.into_inner();
+        let status = match r.status.trim().to_ascii_lowercase().as_str() {
+            "" | "pending" => Some(action_approval::ApprovalStatus::Pending),
+            "all" => None,
+            other => Some(
+                action_approval::ApprovalStatus::parse(other)
+                    .ok_or_else(|| Status::invalid_argument("invalid status filter"))?,
+            ),
+        };
+        let approvals = self
+            .db
+            .list_action_approvals(status)
+            .map_err(Status::internal)?;
+        Ok(Response::new(ListPendingApprovalsResponse {
+            approvals: approvals.iter().map(to_proto_action_approval).collect(),
+        }))
+    }
+
     async fn get_lineage(
         &self,
         req: Request<GetLineageRequest>,
@@ -3810,6 +4449,7 @@ mod tests {
                         ]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "bob",
             ))
@@ -3838,6 +4478,7 @@ mod tests {
                     ]),
                     actor: "bob".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -3865,6 +4506,7 @@ mod tests {
                     ]),
                     actor: "mallory".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -3919,6 +4561,7 @@ mod tests {
                         ]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -3963,6 +4606,7 @@ mod tests {
                     ]),
                     actor: "".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -4454,6 +5098,7 @@ mod tests {
                 ]),
                 actor: "".into(),
             }),
+            dry_run: false,
         }))
         .await
         .unwrap();
@@ -4467,6 +5112,7 @@ mod tests {
                 ]),
                 actor: "".into(),
             }),
+            dry_run: false,
         }))
         .await
         .unwrap();
@@ -4549,6 +5195,7 @@ mod tests {
                     ]),
                     actor: "ignored".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -4588,6 +5235,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -4659,6 +5307,7 @@ mod tests {
                     ]),
                     actor: "".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -4707,6 +5356,7 @@ mod tests {
                         params: HashMap::from([("id".into(), "widget-1".into())]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -4726,6 +5376,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -4745,6 +5396,7 @@ mod tests {
                         ]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "bob",
             ))
@@ -4828,6 +5480,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -4950,6 +5603,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5043,6 +5697,7 @@ mod tests {
                     ]),
                     actor: "".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -5117,6 +5772,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5193,6 +5849,7 @@ mod tests {
                     ]),
                     actor: "".into(),
                 }),
+                dry_run: false,
             },
             "alice",
         ))
@@ -5246,6 +5903,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5325,6 +5983,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5357,6 +6016,7 @@ mod tests {
                     ]),
                     actor: "".into(),
                 }),
+                dry_run: false,
             },
             "local",
         ))
@@ -5387,6 +6047,7 @@ mod tests {
                         ]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5422,6 +6083,7 @@ mod tests {
                         params: HashMap::from([("id".into(), "link-1".into())]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -5445,6 +6107,7 @@ mod tests {
                         params: HashMap::from([("id".into(), "missing-link".into())]),
                         actor: "alice".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -6559,6 +7222,7 @@ mod tests {
                         ]),
                         actor: "".into(),
                     }),
+                    dry_run: false,
                 },
                 "alice",
             ))
@@ -8117,5 +8781,830 @@ mod tests {
 
         assert_eq!(response.objects.len(), 1);
         assert_eq!(response.objects[0].id, "second");
+    }
+
+    #[tokio::test]
+    async fn action_policy_set_get_list_round_trip() {
+        let svc = service();
+        grant_action_admin(&svc);
+
+        let policy = ActionPolicy {
+            scope: "agent:codex-app".into(),
+            default_decision: "allow".into(),
+            action_overrides: HashMap::from([("delete_link".to_string(), "deny".to_string())]),
+            risk_overrides: HashMap::from([(
+                "destructive".to_string(),
+                "require_approval".to_string(),
+            )]),
+            max_mutations_per_work_unit: 0,
+            max_deletes_per_work_unit: 5,
+        };
+
+        let stored = svc
+            .set_action_policy(with_principal(SetActionPolicyRequest {
+                policy: Some(policy.clone()),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .policy
+            .unwrap();
+        assert_eq!(stored.scope, "agent:codex-app");
+        assert_eq!(stored.action_overrides.get("delete_link").unwrap(), "deny");
+
+        let fetched = svc
+            .get_action_policy(with_principal(GetActionPolicyRequest {
+                scope: "agent:codex-app".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .policy
+            .unwrap();
+        assert_eq!(fetched.default_decision, "allow");
+        assert_eq!(
+            fetched.risk_overrides.get("destructive").unwrap(),
+            "require_approval"
+        );
+        assert_eq!(fetched.max_deletes_per_work_unit, 5);
+
+        let listed = svc
+            .list_action_policies(with_principal(ListActionPoliciesRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .policies;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].scope, "agent:codex-app");
+    }
+
+    #[tokio::test]
+    async fn action_policy_set_requires_action_admin() {
+        let svc = service();
+        // No action-admin grant for "tester".
+        let err = svc
+            .set_action_policy(with_principal(SetActionPolicyRequest {
+                policy: Some(ActionPolicy {
+                    scope: "agent:codex-app".into(),
+                    default_decision: "deny".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // Nothing was persisted.
+        assert!(
+            svc.db
+                .get_action_policy("agent:codex-app")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn action_policy_set_rejects_invalid_decision() {
+        let svc = service();
+        grant_action_admin(&svc);
+        let err = svc
+            .set_action_policy(with_principal(SetActionPolicyRequest {
+                policy: Some(ActionPolicy {
+                    scope: "agent:codex-app".into(),
+                    default_decision: "maybe".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_action_denied_by_policy_is_blocked_and_audited() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        // Deny destructive ops for this agent scope.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::from([(
+                    action::RiskClass::Destructive,
+                    action_policy::ActionDecision::Deny,
+                )]),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        // Create a link then attempt to delete it (destructive).
+        svc.db
+            .create_link(&domain::Link {
+                id: "obj-1->obj-1".into(),
+                from_id: "obj-1".into(),
+                to_id: "obj-1".into(),
+                relation: "self".into(),
+                created: 0,
+            })
+            .unwrap();
+
+        let err = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "delete_link".into(),
+                    params: HashMap::from([("id".into(), "obj-1->obj-1".into())]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // Link still exists (no mutation).
+        assert!(svc.db.get_link("obj-1->obj-1").unwrap().is_some());
+
+        // Denial was audited.
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("delete_link".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].reason, "action_policy_denied");
+        assert_eq!(decisions[0].evidence["risk_class"], "destructive");
+        assert_eq!(decisions[0].evidence["decision"], "deny");
+        assert_eq!(decisions[0].evidence["policy_scope"], "agent:tester");
+    }
+
+    #[tokio::test]
+    async fn execute_action_allowed_by_policy_executes() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        // Deny only destructive; writes (set_property) are allowed.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::from([(
+                    action::RiskClass::Destructive,
+                    action_policy::ActionDecision::Deny,
+                )]),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "done".into()),
+                ]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn execute_action_without_policy_is_allowed_backward_compatible() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        // A deny-all policy for a *different* agent must not affect this caller.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:someone-else".into(),
+                default_decision: action_policy::ActionDecision::Deny,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "done".into()),
+                ]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn execute_action_require_approval_holds_and_returns_pending() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        let mut req = Request::new(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "done".into()),
+                ]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        });
+        req.metadata_mut().insert(
+            "x-principal",
+            tonic::metadata::MetadataValue::try_from("tester").unwrap(),
+        );
+        req.metadata_mut().insert(
+            "x-chisei-work-unit",
+            tonic::metadata::MetadataValue::try_from("wu-1").unwrap(),
+        );
+
+        let result = svc
+            .execute_action(req)
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(result.decision, "require_approval");
+        assert!(!result.approval_id.is_empty());
+
+        // No mutation happened.
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+
+        // A pending approval was persisted with work-unit + exact params.
+        let pending = svc
+            .db
+            .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, result.approval_id);
+        assert_eq!(pending[0].action, "set_property");
+        assert_eq!(pending[0].work_unit, "wu-1");
+        assert_eq!(pending[0].params["value"], "done");
+
+        // The hold was audited.
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].reason, "action_approval_pending");
+    }
+
+    #[tokio::test]
+    async fn execute_action_dry_run_reports_plan_without_mutating() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+
+        let result = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "done".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+
+        assert!(result.dry_run);
+        assert_eq!(result.decision, "allow");
+        assert_eq!(result.planned_ops, vec!["set_property obj-1.status"]);
+
+        // No mutation happened.
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+
+        // A dry-run decision was audited.
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].reason, "execute_action_dry_run");
+        assert_eq!(decisions[0].evidence["dry_run"], "true");
+    }
+
+    #[tokio::test]
+    async fn execute_action_dry_run_surfaces_deny_without_erroring() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Deny,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        // Dry-run returns the plan + decision even though the policy denies.
+        let result = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "done".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(result.dry_run);
+        assert_eq!(result.decision, "deny");
+        assert_eq!(result.planned_ops.len(), 1);
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+    }
+
+    fn hold_set_property(svc: &SekaiServiceImpl) -> String {
+        // Set a require-approval policy and hold a set_property action.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let approval = action_approval::ActionApproval::pending(
+            "tester",
+            "set_property",
+            HashMap::from([
+                ("id".to_string(), "obj-1".to_string()),
+                ("key".to_string(), "status".to_string()),
+                ("value".to_string(), "done".to_string()),
+            ]),
+            "wu-1",
+            "agent:tester",
+            "write",
+            "obj-1",
+            1000,
+        );
+        svc.db.create_action_approval(&approval).unwrap();
+        approval.id
+    }
+
+    #[tokio::test]
+    async fn approve_action_resumes_execution_and_audits() {
+        let svc = service();
+        grant_action_admin(&svc);
+        seed_domain_object(&svc, "obj-1");
+        let id = hold_set_property(&svc);
+
+        let response = svc
+            .approve_action(with_principal(ApproveActionRequest {
+                approval_id: id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.result.unwrap().decision, "approved");
+        assert_eq!(response.approval.unwrap().status, "approved");
+
+        // The held action executed.
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "done");
+
+        // Approval recorded + no longer pending.
+        assert!(
+            svc.db
+                .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
+                .unwrap()
+                .is_empty()
+        );
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.reason == "action_approval_approved")
+        );
+        assert!(decisions.iter().any(|d| d.reason == "execute_action"));
+    }
+
+    #[tokio::test]
+    async fn deny_action_drops_hold_without_executing() {
+        let svc = service();
+        grant_action_admin(&svc);
+        seed_domain_object(&svc, "obj-1");
+        let id = hold_set_property(&svc);
+
+        let approval = svc
+            .deny_action(with_principal(DenyActionRequest {
+                approval_id: id,
+                reason: "not now".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .approval
+            .unwrap();
+        assert_eq!(approval.status, "denied");
+        assert_eq!(approval.outcome, "not now");
+
+        // No mutation.
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+    }
+
+    #[tokio::test]
+    async fn approve_action_rechecks_policy_and_blocks_when_now_denied() {
+        let svc = service();
+        grant_action_admin(&svc);
+        seed_domain_object(&svc, "obj-1");
+        let id = hold_set_property(&svc);
+
+        // Tighten the policy to deny before approving.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Deny,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        let err = svc
+            .approve_action(with_principal(ApproveActionRequest { approval_id: id }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Still not executed.
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert!(!obj.properties.contains_key("status"));
+    }
+
+    #[tokio::test]
+    async fn approve_action_requires_admin() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        let id = hold_set_property(&svc);
+        let err = svc
+            .approve_action(with_principal(ApproveActionRequest { approval_id: id }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn list_pending_approvals_filters_by_status() {
+        let svc = service();
+        grant_action_admin(&svc);
+        seed_domain_object(&svc, "obj-1");
+        let id = hold_set_property(&svc);
+
+        let pending = svc
+            .list_pending_approvals(with_principal(ListPendingApprovalsRequest {
+                status: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .approvals;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        // Sensitive params would be redacted; here plain values pass through.
+        assert_eq!(pending[0].params["value"], "done");
+    }
+
+    fn work_unit_request(
+        action: &str,
+        params: HashMap<String, String>,
+        wu: &str,
+    ) -> Request<ExecuteActionRequest> {
+        let mut req = Request::new(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: action.into(),
+                params,
+                actor: String::new(),
+            }),
+            dry_run: false,
+        });
+        req.metadata_mut().insert(
+            "x-principal",
+            tonic::metadata::MetadataValue::try_from("tester").unwrap(),
+        );
+        req.metadata_mut().insert(
+            "x-chisei-work-unit",
+            tonic::metadata::MetadataValue::try_from(wu).unwrap(),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn blast_radius_delete_cap_hard_stops_after_limit() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        // Allow everything but cap deletes at 1 per work unit.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: Some(1),
+            })
+            .unwrap();
+        for link_id in ["obj-1->a", "obj-1->b"] {
+            svc.db
+                .create_link(&domain::Link {
+                    id: link_id.into(),
+                    from_id: "obj-1".into(),
+                    to_id: "obj-1".into(),
+                    relation: "self".into(),
+                    created: 0,
+                })
+                .unwrap();
+        }
+
+        // First delete within cap succeeds.
+        svc.execute_action(work_unit_request(
+            "delete_link",
+            HashMap::from([("id".into(), "obj-1->a".into())]),
+            "wu-1",
+        ))
+        .await
+        .unwrap();
+
+        // Second delete exceeds the cap and is hard-stopped.
+        let err = svc
+            .execute_action(work_unit_request(
+                "delete_link",
+                HashMap::from([("id".into(), "obj-1->b".into())]),
+                "wu-1",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        // The second link still exists.
+        assert!(svc.db.get_link("obj-1->b").unwrap().is_some());
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("delete_link".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.reason == "action_blast_radius_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn blast_radius_counters_are_scoped_per_work_unit() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: Some(1),
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        // First mutation on wu-1 succeeds.
+        svc.execute_action(work_unit_request(
+            "set_property",
+            HashMap::from([
+                ("id".into(), "obj-1".into()),
+                ("key".into(), "status".into()),
+                ("value".into(), "a".into()),
+            ]),
+            "wu-1",
+        ))
+        .await
+        .unwrap();
+
+        // Second mutation on wu-1 exceeds the cap.
+        let err = svc
+            .execute_action(work_unit_request(
+                "set_property",
+                HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "b".into()),
+                ]),
+                "wu-1",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // A different work unit has its own counter and succeeds.
+        svc.execute_action(work_unit_request(
+            "set_property",
+            HashMap::from([
+                ("id".into(), "obj-1".into()),
+                ("key".into(), "status".into()),
+                ("value".into(), "c".into()),
+            ]),
+            "wu-2",
+        ))
+        .await
+        .unwrap();
+        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
+        assert_eq!(obj.properties["status"], "c");
+    }
+
+    #[tokio::test]
+    async fn action_class_budget_denies_when_exhausted() {
+        use crate::chisei::budget::{BudgetTracker, PeriodType};
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let budget = Arc::new(BudgetTracker::new());
+        // Allow 1 write action, then deny.
+        budget.set_limit("action:write", 1, PeriodType::Daily);
+        let svc = SekaiServiceImpl::with_budget(db, budget.clone());
+        seed_domain_object(&svc, "obj-1");
+
+        // First write consumes the budget.
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "a".into()),
+                ]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+
+        // Second write is denied by the exhausted budget.
+        let err = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "set_property".into(),
+                    params: HashMap::from([
+                        ("id".into(), "obj-1".into()),
+                        ("key".into(), "status".into()),
+                        ("value".into(), "b".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // Usage reflects exactly one recorded action.
+        assert_eq!(budget.get_usage("action:write").tokens_used, 1);
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.reason == "action_budget_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_tool_call_is_policy_checked_via_execute_action() {
+        use crate::sekai::tool_bridge::ToolCall;
+
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        // Deny destructive tool-calls for this agent.
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::from([(
+                    action::RiskClass::Destructive,
+                    action_policy::ActionDecision::Deny,
+                )]),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        svc.db
+            .create_link(&domain::Link {
+                id: "obj-1->obj-1".into(),
+                from_id: "obj-1".into(),
+                to_id: "obj-1".into(),
+                relation: "self".into(),
+                created: 0,
+            })
+            .unwrap();
+
+        // An allowed write tool-call funnels through ExecuteAction and runs.
+        let write_call = ToolCall::from_json_arguments(
+            "set_property",
+            r#"{"id":"obj-1","key":"status","value":"done"}"#,
+        )
+        .unwrap();
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: write_call.action_name().to_string(),
+                params: write_call.to_action_params().unwrap(),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.db.get_object("obj-1").unwrap().unwrap().properties["status"],
+            "done"
+        );
+
+        // A destructive tool-call is denied by policy at the same boundary.
+        let delete_call =
+            ToolCall::from_json_arguments("delete_link", r#"{"id":"obj-1->obj-1"}"#).unwrap();
+        let err = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: delete_call.action_name().to_string(),
+                    params: delete_call.to_action_params().unwrap(),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.get_link("obj-1->obj-1").unwrap().is_some());
     }
 }
