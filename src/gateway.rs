@@ -42,6 +42,7 @@ const X_CHISEI_AGENT: HeaderName = HeaderName::from_static("x-chisei-agent");
 const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project");
 const X_CHISEI_WORK_UNIT: HeaderName = HeaderName::from_static("x-chisei-work-unit");
 const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id");
+const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Clone)]
@@ -371,12 +372,14 @@ async fn proxy_gateway(
         pipeline_spec: pipeline_spec.clone(),
         request_bytes,
         started_ms,
+        route_bias: None,
     };
     let (resolved, egress) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_model.clone(),
             resolved_provider: client_provider,
+            route_bias: None,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -390,12 +393,14 @@ async fn proxy_gateway(
                 .await;
             return rejection.response();
         }
+        let task_class = resolve_task_class(&headers, requested_model.as_deref());
         let resolved = match resolve_policy_preflight(
             &state.config,
             &identity,
             client_provider,
             &body,
             requested_model.as_deref(),
+            &task_class,
         )
         .await
         {
@@ -490,6 +495,7 @@ async fn proxy_gateway(
                     pipeline_spec,
                     request_bytes,
                     started_ms,
+                    route_bias: resolved.route_bias,
                 },
                 prepared.response_adapter,
             )
@@ -516,6 +522,7 @@ struct UsageContext {
     pipeline_spec: String,
     request_bytes: usize,
     started_ms: i64,
+    route_bias: Option<String>,
 }
 
 #[derive(Debug)]
@@ -634,6 +641,7 @@ struct PolicyPreflight {
     body: Vec<u8>,
     resolved_model: Option<String>,
     resolved_provider: ProviderKind,
+    route_bias: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,12 +655,14 @@ async fn resolve_policy_preflight(
     provider: ProviderKind,
     body: &[u8],
     requested_model: Option<&str>,
+    task_class: &str,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         return Ok(PolicyPreflight {
             body: body.to_vec(),
             resolved_model: None,
             resolved_provider: provider,
+            route_bias: None,
         });
     };
     let Some(target) = &config.chisei_grpc_target else {
@@ -660,6 +670,7 @@ async fn resolve_policy_preflight(
             body: body.to_vec(),
             resolved_model: Some(requested_model.to_string()),
             resolved_provider: provider,
+            route_bias: None,
         });
     };
     match connect_sekai(target).await {
@@ -673,7 +684,7 @@ async fn resolve_policy_preflight(
                 project: identity.project.clone(),
                 agent: identity.agent.clone(),
                 key_id: identity.key_id.clone(),
-                task_class: String::new(),
+                task_class: task_class.to_string(),
                 user_id: String::new(),
             });
             match client.resolve_policy(req).await {
@@ -783,6 +794,7 @@ async fn resolve_policy_preflight(
                         body: next_body,
                         resolved_model: Some(resolution.model),
                         resolved_provider,
+                        route_bias: Some(resolution.route_bias).filter(|bias| !bias.is_empty()),
                     })
                 }
                 Err(err) if err.code() == tonic::Code::InvalidArgument => {
@@ -802,6 +814,7 @@ async fn resolve_policy_preflight(
                         body: body.to_vec(),
                         resolved_model: Some(requested_model.to_string()),
                         resolved_provider: provider,
+                        route_bias: None,
                     })
                 }
             }
@@ -817,6 +830,7 @@ async fn resolve_policy_preflight(
                 body: body.to_vec(),
                 resolved_model: Some(requested_model.to_string()),
                 resolved_provider: provider,
+                route_bias: None,
             })
         }
     }
@@ -2074,6 +2088,31 @@ fn gateway_work_unit_id(headers: &HeaderMap) -> Option<&str> {
     header_str(headers, &X_CHISEI_WORK_UNIT).or_else(|| header_str(headers, &X_CHISEI_TASK_ID))
 }
 
+/// Resolve the routing task class for a request. An explicit
+/// `x-chisei-task-class` header wins; otherwise a coarse heuristic classifies
+/// small/fast models (the background tier clients use for cheap side work) as
+/// `background` and everything else as `primary`. The value is advisory input
+/// to policy tiering — the control plane decides whether a class may route to a
+/// cheaper model, defaulting unknown classes to the capable tier.
+fn resolve_task_class(headers: &HeaderMap, requested_model: Option<&str>) -> String {
+    if let Some(explicit) = header_str(headers, &X_CHISEI_TASK_CLASS) {
+        return explicit.to_ascii_lowercase();
+    }
+    match requested_model {
+        Some(model) if is_small_fast_model(model) => "background".to_string(),
+        _ => "primary".to_string(),
+    }
+}
+
+/// Whether a model name looks like a small/fast/background-tier model. Used only
+/// as a fallback classifier when the client sends no explicit task class.
+fn is_small_fast_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    ["haiku", "mini", "nano", "flash", "small", "fast"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
     headers
         .get(name)
@@ -2567,6 +2606,13 @@ async fn record_usage_and_append(
             }
             if let Some(work_unit_id) = &context.work_unit_id {
                 values.insert("work_unit_id".to_string(), work_unit_id.clone());
+            }
+            if let Some(route_bias) = context
+                .route_bias
+                .as_deref()
+                .filter(|bias| !bias.is_empty())
+            {
+                values.insert("route_bias".to_string(), route_bias.to_string());
             }
             if let Some(observation) = &pipeline_observation {
                 values.insert(
@@ -7130,6 +7176,34 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(body_prefix_is_sse(b"\n\ndata: {}"), Some(true));
         assert_eq!(body_prefix_is_sse(b"{\"id\":\"resp_1\"}"), Some(false));
         assert_eq!(body_prefix_is_sse(b"plain text"), Some(false));
+    }
+
+    #[test]
+    fn resolve_task_class_uses_header_then_small_fast_heuristic() {
+        // Explicit header wins and is normalized to lowercase.
+        let mut headers = HeaderMap::new();
+        headers.insert(X_CHISEI_TASK_CLASS, "Background".parse().unwrap());
+        assert_eq!(
+            resolve_task_class(&headers, Some("gpt-5.5")),
+            "background".to_string()
+        );
+
+        // No header: small/fast models classify as background.
+        let empty = HeaderMap::new();
+        assert_eq!(
+            resolve_task_class(&empty, Some("claude-haiku-4-5")),
+            "background".to_string()
+        );
+        assert_eq!(
+            resolve_task_class(&empty, Some("gpt-5.5-mini")),
+            "background".to_string()
+        );
+        // Primary/reasoning models (and unknown) default to primary.
+        assert_eq!(
+            resolve_task_class(&empty, Some("gpt-5.5")),
+            "primary".to_string()
+        );
+        assert_eq!(resolve_task_class(&empty, None), "primary".to_string());
     }
 
     #[test]

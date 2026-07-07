@@ -1117,6 +1117,32 @@ fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
     scopes
 }
 
+/// Map a request's task class to a cost-tier route bias. Only explicit bulk
+/// task classes route to the cheaper tier, and only while no eval regression is
+/// active for the scope — a regression fails safe back to the capable tier.
+/// Unknown or primary classes never bias to cheap.
+fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option<&'static str> {
+    if eval_regressed {
+        return None;
+    }
+    match task_class.trim().to_ascii_lowercase().as_str() {
+        "background" | "bulk" | "batch" | "small_fast" | "small-fast" => Some("cheap"),
+        _ => None,
+    }
+}
+
+/// Whether a runtime supports automatic cheap-tier routing. Limited to the
+/// hosted providers whose model tiers are reliably ordered by
+/// `named_model_cost_rank` (the metric the demotion gate compares). Ollama and
+/// native models are excluded: their cost depends on installed parameter size,
+/// not the model name, so the name-based gate cannot tell tiers apart and would
+/// silently discard the cheaper choice. Cost tiering for those runtimes is a
+/// follow-up. This also guards against non-provider runtimes (e.g. the "kiro"
+/// default) producing a bogus alias or a runtime/model mismatch.
+fn is_known_provider_runtime(runtime: &str) -> bool {
+    matches!(runtime.trim(), "openai" | "anthropic")
+}
+
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
         return;
@@ -1439,6 +1465,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 data_class: policy_data_class,
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
+                route_bias: String::new(),
             }),
         }))
     }
@@ -1485,7 +1512,9 @@ impl ChiseiService for ChiseiServiceImpl {
         let task_class = TaskClass::parse(&r.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
         let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
-        let model = self
+        // Resolve the capable-tier model first; this is the baseline the request
+        // would get with no cost tiering.
+        let capable_model = self
             .resolve_live_model(
                 &model,
                 effective_policy.as_ref(),
@@ -1505,6 +1534,41 @@ impl ChiseiService for ChiseiServiceImpl {
                 }
             })?;
 
+        // Eval-gated cost tiering: only explicit bulk task classes route to the
+        // cheaper tier, and only while no eval regression is active for the
+        // scope. Everything else (primary/unknown) stays on the capable tier.
+        // A bare "cheap" is rejected by apply_policy, so the cheaper tier is
+        // selected via the provider-scoped "{runtime}/cheap" alias, which only
+        // resolves for a recognized provider family. Cheap resolution is
+        // best-effort: any failure falls back to the capable model.
+        let wants_cheap =
+            cheap_route_bias(&r.task_class, regression_signal.is_some()) == Some("cheap");
+        let cheap_model = if wants_cheap && is_known_provider_runtime(&runtime) {
+            self.resolve_live_model(
+                &format!("{}/cheap", runtime.trim()),
+                effective_policy.as_ref(),
+                Some("cheap"),
+                safe_only,
+                &safe_providers,
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+        // Record the cheap bias only when it produced an actual demotion to a
+        // strictly cheaper cost tier, so the audited route_bias reflects
+        // realized cost reductions rather than intent or equal-cost swaps.
+        let (model, route_bias) = match cheap_model {
+            Some(cheap)
+                if crate::chisei::model_routing::named_model_cost_rank(&cheap)
+                    < crate::chisei::model_routing::named_model_cost_rank(&capable_model) =>
+            {
+                (cheap, Some("cheap"))
+            }
+            _ => (capable_model, None),
+        };
+
         let provider = crate::llm::provider_name(&model);
         if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
             return Err(Status::permission_denied(
@@ -1521,6 +1585,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     .map(|signal| signal.reason)
                     .unwrap_or_default(),
                 data_class: data_class.as_str().into(),
+                route_bias: route_bias.unwrap_or_default().to_string(),
             }),
         }))
     }
@@ -2687,6 +2752,167 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
+    #[test]
+    fn cheap_route_bias_only_for_bulk_classes_and_not_when_regressed() {
+        // Explicit bulk classes route to the cheaper tier.
+        for class in [
+            "background",
+            "bulk",
+            "batch",
+            "small_fast",
+            "small-fast",
+            "Background",
+        ] {
+            assert_eq!(cheap_route_bias(class, false), Some("cheap"), "{class}");
+        }
+        // Primary/unknown/empty never route cheap (fail safe to capable).
+        for class in ["primary", "reasoning", "", "unknown"] {
+            assert_eq!(cheap_route_bias(class, false), None, "{class}");
+        }
+        // An active eval regression reverts every class to the capable tier.
+        assert_eq!(cheap_route_bias("background", true), None);
+        assert_eq!(cheap_route_bias("bulk", true), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        // Treat openai as available without a key so routing can resolve.
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+
+        // Primary work stays on the capable default model, no bias.
+        let mut primary = resolve_policy_request("proj", "openai", "gpt-5.5");
+        primary.task_class = "primary".into();
+        let resolution = svc
+            .resolve_policy(Request::new(primary))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolution.model, "gpt-5.5");
+        assert_eq!(resolution.route_bias, "");
+
+        // Bulk/background work routes to the cheaper allowed model and records
+        // the cheap bias.
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5");
+        background.task_class = "background".into();
+        let resolution = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolution.model, "gpt-5.5-mini");
+        assert_eq!(resolution.route_bias, "cheap");
+        assert_eq!(resolution.runtime, "openai");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_records_no_bias_when_no_cheaper_model_exists() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        // Only one allowed model, so the cheap tier resolves to the same model.
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5");
+        background.task_class = "background".into();
+        let resolution = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        // No actual demotion happened, so no cheap bias is recorded.
+        assert_eq!(resolution.model, "gpt-5.5");
+        assert_eq!(resolution.route_bias, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_records_no_bias_for_equal_cost_models() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        // Both allowed models are the same cost tier ("mini"), so the cheap
+        // alias finds nothing strictly cheaper than the capable default.
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5-mini".into(), "gpt-4.1-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5-mini".into(),
+                data_class: String::new(),
+            },
+        );
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5-mini");
+        background.task_class = "background".into();
+        let resolution = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        // Capable default is kept; no equal-cost swap is recorded as a demotion.
+        assert_eq!(resolution.model, "gpt-5.5-mini");
+        assert_eq!(resolution.route_bias, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_skips_cheap_routing_for_native_runtime() {
+        // native/ollama runtimes are excluded from automatic cheap tiering
+        // (their cost tiers are not name-rankable), so a bulk task class stays
+        // on the capable tier with no bias even without an eval regression.
+        let svc = memory_service();
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["native".into()],
+                allowed_models: vec!["native-default".into(), "native-cheap".into()],
+                default_runtime: "native".into(),
+                default_model: "native-default".into(),
+                data_class: String::new(),
+            },
+        );
+        let mut background = resolve_policy_request("proj", "native", "native-default");
+        background.task_class = "background".into();
+        let resolution = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolution.model, "native-default");
+        assert_eq!(resolution.route_bias, "");
+    }
+
     fn config(db_path: &str) -> Config {
         Config {
             grpc_port: 0,
@@ -2992,6 +3218,52 @@ mod tests {
         assert_eq!(resolved.model, "native-default");
         assert!(resolved.eval_regressed);
         assert!(resolved.eval_regression_reason.contains("sekai-chisei"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_reverts_bulk_class_to_capable_when_namespace_regressed() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-default".into(), "native-cheap".into()],
+            default_runtime: "native".into(),
+            default_model: "native-default".into(),
+            data_class: String::new(),
+        }))
+        .await
+        .unwrap();
+        create_suite(&svc, "sekai-chisei").await;
+        // Two runs with a score drop mark the namespace as regressed.
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-1", "suite-1", 92, 100)),
+            changed_file: "sekai-chisei".into(),
+            diff_hash: "hash-a".into(),
+        }))
+        .await
+        .unwrap();
+        svc.create_eval_run(Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("run-2", "suite-1", 60, 200)),
+            changed_file: "sekai-chisei".into(),
+            diff_hash: "hash-b".into(),
+        }))
+        .await
+        .unwrap();
+
+        // A bulk task class would normally route cheap, but the active
+        // regression forces it back to the capable default tier with no bias.
+        let mut background = resolve_policy_request("sekai-chisei", "native", "native-cheap");
+        background.task_class = "background".into();
+        let resolved = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolved.model, "native-default");
+        assert_eq!(resolved.route_bias, "");
+        assert!(resolved.eval_regressed);
     }
 
     #[tokio::test]
