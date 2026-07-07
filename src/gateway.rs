@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -452,14 +452,21 @@ async fn proxy_gateway(
         identity_context.upstream_auth,
         prepared.provider,
     );
-    if upstream_auth_mode == UpstreamAuthMode::GatewayKey {
+    // Cross-provider requests were translated to a different provider family, so
+    // the client's credential (e.g. an Anthropic subscription token) must never
+    // be forwarded to the resolved upstream. Apply the resolved provider's own
+    // gateway auth instead (a no-op for Ollama/native) and strip client auth
+    // headers below regardless of the passthrough mode.
+    if prepared.cross_provider || upstream_auth_mode == UpstreamAuthMode::GatewayKey {
         upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
             Ok(upstream) => upstream,
             Err(response) => return *response,
         };
     }
     for (name, value) in headers.iter() {
-        if should_forward_request_header(name, upstream_auth_mode) {
+        let strip_client_auth =
+            prepared.cross_provider && (name == AUTHORIZATION || name == X_API_KEY);
+        if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
             upstream = upstream.header(name, value);
         }
     }
@@ -895,6 +902,10 @@ fn strip_ollama_model_prefix(body: &[u8]) -> Vec<u8> {
 enum ResponseAdapter {
     Passthrough,
     OpenAiChatToAnthropicMessage,
+    /// Translate an OpenAI-compatible chat-completions SSE stream into an
+    /// Anthropic Messages SSE stream (message_start / content_block_* /
+    /// message_delta / message_stop).
+    OpenAiChatStreamToAnthropicMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -903,6 +914,10 @@ struct PreparedUpstreamRequest {
     url: String,
     body: Vec<u8>,
     response_adapter: ResponseAdapter,
+    /// True when the request was translated across provider families (client
+    /// provider differs from the resolved upstream provider). The client's
+    /// credential must not be forwarded to a different provider's upstream.
+    cross_provider: bool,
 }
 
 async fn prepare_upstream_request(
@@ -931,15 +946,18 @@ async fn prepare_upstream_request(
             url: upstream_url_for_provider(config, uri, resolved_provider),
             body,
             response_adapter: ResponseAdapter::Passthrough,
+            cross_provider: false,
         });
     }
     if client_provider == ProviderKind::Anthropic
         && resolved_provider.is_openai()
         && is_anthropic_messages_path(uri.path())
     {
-        if request_stream_enabled(&body) {
-            let reason =
-                "cross-provider Anthropic to OpenAI streaming translation is not supported";
+        let streaming = request_stream_enabled(&body);
+        // Tool-call translation is not modeled, so deny tool-using streams rather
+        // than silently dropping the tool schema.
+        if streaming && anthropic_request_has_tools(&body) {
+            let reason = "cross-provider Anthropic to OpenAI streaming translation with tools is not supported";
             record_gateway_decision(
                 config,
                 identity,
@@ -971,7 +989,7 @@ async fn prepare_upstream_request(
                 "cross-provider translation requires a resolved model",
             )
         })?;
-        let translated =
+        let mut translated =
             anthropic_messages_to_openai_chat(&body, resolved_model).map_err(|err| {
                 json_error(
                     StatusCode::BAD_REQUEST,
@@ -979,6 +997,25 @@ async fn prepare_upstream_request(
                     &format!("failed to translate Anthropic request to OpenAI: {err}"),
                 )
             })?;
+        // Ask the OpenAI-compatible upstream to stream (with usage) so we can
+        // re-emit Anthropic streaming events and still meter tokens.
+        if streaming {
+            translated = enable_openai_stream(&translated).unwrap_or(translated);
+        }
+        // Route to the *resolved* OpenAI-family backend (OpenAI, Ollama, or
+        // native), not hardcoded OpenAI. Ollama uses the OpenAI-compatible chat
+        // surface with the `ollama/` model prefix stripped and no upstream auth.
+        if matches!(
+            resolved_provider,
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama)
+        ) {
+            translated = strip_ollama_model_prefix(&translated);
+        }
+        let response_adapter = if streaming {
+            ResponseAdapter::OpenAiChatStreamToAnthropicMessage
+        } else {
+            ResponseAdapter::OpenAiChatToAnthropicMessage
+        };
         record_gateway_decision(
             config,
             identity,
@@ -995,15 +1032,17 @@ async fn prepare_upstream_request(
                     resolved_provider.runtime_name().to_string(),
                 ),
                 ("resolved_model".to_string(), resolved_model.to_string()),
+                ("streaming".to_string(), streaming.to_string()),
                 ("project".to_string(), identity.project.clone()),
             ]),
         )
         .await;
         return Ok(PreparedUpstreamRequest {
-            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            url: openai_chat_completions_url(config, uri),
+            provider: resolved_provider,
+            url: chat_completions_url_for_provider(config, uri, resolved_provider),
             body: translated,
-            response_adapter: ResponseAdapter::OpenAiChatToAnthropicMessage,
+            response_adapter,
+            cross_provider: true,
         });
     }
     let reason = format!(
@@ -1046,15 +1085,53 @@ fn upstream_url_for_provider(config: &GatewayConfig, uri: &Uri, provider: Provid
 }
 
 fn openai_chat_completions_url(config: &GatewayConfig, uri: &Uri) -> String {
+    chat_completions_url_for_provider(config, uri, ProviderKind::OpenAi(OpenAiRuntime::OpenAi))
+}
+
+/// Chat-completions URL for a specific OpenAI-family backend (OpenAI, Ollama, or
+/// native), so cross-provider translation routes to the *resolved* provider
+/// instead of always OpenAI.
+fn chat_completions_url_for_provider(
+    config: &GatewayConfig,
+    uri: &Uri,
+    provider: ProviderKind,
+) -> String {
     let mut url = format!(
         "{}/chat/completions",
-        config.openai_base_url.trim_end_matches('/')
+        base_url_for_provider(config, provider).trim_end_matches('/')
     );
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
     }
     url
+}
+
+/// Whether an Anthropic Messages request carries a non-empty `tools` array.
+fn anthropic_request_has_tools(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("tools")
+                .and_then(|tools| tools.as_array())
+                .map(|tools| !tools.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Sets `stream: true` and requests streamed usage on an OpenAI-compatible chat
+/// request body so the upstream emits incremental deltas plus a usage chunk.
+fn enable_openai_stream(body: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_slice(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stream".to_string(), serde_json::Value::Bool(true));
+        object.insert(
+            "stream_options".to_string(),
+            serde_json::json!({"include_usage": true}),
+        );
+    }
+    serde_json::to_vec(&value)
 }
 
 fn is_anthropic_messages_path(path: &str) -> bool {
@@ -1192,6 +1269,176 @@ fn openai_chat_to_anthropic_message(
             "output_tokens": output_tokens
         }
     }))
+}
+
+/// Incrementally translates an OpenAI-compatible chat-completions SSE stream
+/// into an Anthropic Messages SSE stream. Feed upstream bytes via `push` (which
+/// returns any Anthropic events ready to forward) and call `finish` at end of
+/// stream to emit the closing events.
+///
+/// Client-facing token fidelity note: `message_start.usage.input_tokens` is
+/// emitted as 0 because OpenAI reports usage only in its trailing chunk, after
+/// `message_start` must already have been flushed to keep the stream responsive.
+/// The trailing `completion_tokens` is captured and surfaced on the closing
+/// `message_delta`. Server-side metering is unaffected: the gateway taps the
+/// upstream OpenAI stream (which carries both prompt and completion tokens)
+/// separately for `RecordUsage`.
+struct AnthropicMessageStreamTranslator {
+    pending: Vec<u8>,
+    model: String,
+    message_id: String,
+    started: bool,
+    finished: bool,
+    stop_reason: String,
+    output_tokens: i64,
+}
+
+impl AnthropicMessageStreamTranslator {
+    fn new(model: String) -> Self {
+        Self {
+            pending: Vec::new(),
+            model,
+            message_id: "msg_chisei_stream".to_string(),
+            started: false,
+            finished: false,
+            stop_reason: "end_turn".to_string(),
+            output_tokens: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
+            let event = self.pending.drain(..boundary).collect::<Vec<_>>();
+            self.pending.drain(..separator_len);
+            self.translate_event(&event, &mut out);
+        }
+        out
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            let event = std::mem::take(&mut self.pending);
+            self.translate_event(&event, &mut out);
+        }
+        self.emit_close(&mut out);
+        out
+    }
+
+    fn translate_event(&mut self, event: &[u8], out: &mut Vec<u8>) {
+        let Some(data) = extract_sse_data(event) else {
+            return;
+        };
+        if data.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return;
+        };
+        // OpenAI streams usage in a trailing chunk (with stream_options) that has
+        // an empty choices array; carry completion_tokens to the client's
+        // message_delta so its own token accounting is non-zero.
+        if let Some(completion_tokens) = value
+            .pointer("/usage/completion_tokens")
+            .and_then(|value| value.as_i64())
+        {
+            self.output_tokens = completion_tokens;
+        }
+        if let Some(choice) = value.pointer("/choices/0") {
+            if let Some(text) = choice
+                .pointer("/delta/content")
+                .and_then(|value| value.as_str())
+                && !text.is_empty()
+            {
+                self.ensure_started(out);
+                push_anthropic_event(
+                    out,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                );
+            }
+            if let Some(reason) = choice.get("finish_reason").and_then(|value| value.as_str()) {
+                self.stop_reason = match reason {
+                    "length" => "max_tokens",
+                    "tool_calls" | "function_call" => "tool_use",
+                    _ => "end_turn",
+                }
+                .to_string();
+            }
+        }
+    }
+
+    fn ensure_started(&mut self, out: &mut Vec<u8>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        push_anthropic_event(
+            out,
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        );
+        push_anthropic_event(
+            out,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        );
+    }
+
+    fn emit_close(&mut self, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // Always emit a well-formed message even for an empty stream.
+        self.ensure_started(out);
+        push_anthropic_event(
+            out,
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": 0}),
+        );
+        push_anthropic_event(
+            out,
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": self.stop_reason, "stop_sequence": null},
+                "usage": {"output_tokens": self.output_tokens}
+            }),
+        );
+        push_anthropic_event(
+            out,
+            "message_stop",
+            &serde_json::json!({"type": "message_stop"}),
+        );
+    }
+}
+
+/// Appends one Anthropic SSE event (`event:`/`data:` lines) to `out`.
+fn push_anthropic_event(out: &mut Vec<u8>, event: &str, data: &serde_json::Value) {
+    out.extend_from_slice(format!("event: {event}\ndata: {data}\n\n").as_bytes());
 }
 
 async fn apply_context_egress(
@@ -3135,29 +3382,75 @@ async fn response_from_upstream(
     // without a Content-Type header. Passthrough responses with no declared
     // content type stream through so clients keep incremental delivery; the
     // usage tap recovers usage from whole-JSON bodies at flush.
+    // A declared SSE content type streams. A missing content type only streams
+    // for Passthrough (the ChatGPT Codex backend omits it); cross-provider
+    // translation requires a declared SSE stream, so a non-SSE JSON body without
+    // a content type falls through to the buffered translator below instead of
+    // being swallowed into an empty translated message.
     let is_stream = declares_sse
         || (content_type.is_none() && response_adapter == ResponseAdapter::Passthrough);
     if is_stream {
-        if response_adapter != ResponseAdapter::Passthrough {
+        // The buffered cross-provider adapter cannot translate a live stream.
+        if response_adapter == ResponseAdapter::OpenAiChatToAnthropicMessage {
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "unsupported_cross_provider_stream",
                 "cross-provider streaming response translation is not supported",
             );
         }
+        let translate = response_adapter == ResponseAdapter::OpenAiChatStreamToAnthropicMessage;
         let config = config.clone();
         let identity = identity.clone();
         let context = context.clone();
+        let model = context.resolved_model.clone().unwrap_or_default();
         let mut upstream_stream = upstream.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<_, reqwest::Error>>(32);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(32);
         tokio::spawn(async move {
             let mut usage_tap = SseUsageTap::new();
+            let mut translator = translate.then(|| AnthropicMessageStreamTranslator::new(model));
+            let mut aborted = false;
+            let mut client_gone = false;
             while let Some(chunk) = upstream_stream.next().await {
-                if let Ok(bytes) = &chunk {
-                    usage_tap.push(bytes);
+                match chunk {
+                    Ok(bytes) => {
+                        // Always tap the upstream (OpenAI) bytes for usage, even
+                        // after the client disconnects: OpenAI reports token
+                        // counts only in the trailing chunk, so we must keep
+                        // draining to meter interrupted streams accurately.
+                        usage_tap.push(&bytes);
+                        if client_gone {
+                            continue;
+                        }
+                        let outgoing = match translator.as_mut() {
+                            Some(translator) => Bytes::from(translator.push(&bytes)),
+                            None => bytes,
+                        };
+                        if outgoing.is_empty() {
+                            continue;
+                        }
+                        if tx.send(Ok(outgoing)).await.is_err() {
+                            client_gone = true;
+                        }
+                    }
+                    Err(err) => {
+                        if !client_gone {
+                            let _ = tx.send(Err(err)).await;
+                        }
+                        aborted = true;
+                        break;
+                    }
                 }
-                if tx.send(chunk).await.is_err() {
-                    continue;
+            }
+            // Only emit the Anthropic closing events on a clean end of stream to
+            // a still-connected client; after an upstream error or client
+            // disconnect the client stream is already terminated.
+            if let Some(translator) = translator
+                && !aborted
+                && !client_gone
+            {
+                let tail = translator.finish();
+                if !tail.is_empty() {
+                    let _ = tx.send(Ok(Bytes::from(tail))).await;
                 }
             }
             let (usage, observation) = usage_tap.finish();
@@ -3181,7 +3474,12 @@ async fn response_from_upstream(
             record_usage_and_append(config, identity, usage, observation, &context, status).await;
             let body = match response_adapter {
                 ResponseAdapter::Passthrough => bytes.to_vec(),
-                ResponseAdapter::OpenAiChatToAnthropicMessage => {
+                // Both cross-provider adapters map a buffered OpenAI chat body to
+                // a single Anthropic message. The streaming adapter only lands
+                // here when the upstream ignored our stream request and returned
+                // a whole JSON body.
+                ResponseAdapter::OpenAiChatToAnthropicMessage
+                | ResponseAdapter::OpenAiChatStreamToAnthropicMessage => {
                     match openai_chat_to_anthropic_message(
                         &bytes,
                         context.resolved_model.as_deref(),
@@ -4738,6 +5036,288 @@ mod tests {
             .unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].outcome, "translated");
+    }
+
+    /// Seeds a cross-provider namespace policy: Anthropic client models allowed,
+    /// but `auto`/default resolves to an OpenAI-family model so the gateway
+    /// translates. Returns nothing; caller drives the gateway.
+    async fn seed_cross_provider_policy(target: &str, default_model: &str, runtime: &str) {
+        let channel = connect_sekai(target).await.unwrap();
+        ChiseiServiceClient::new(channel)
+            .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
+                namespace: "default".to_string(),
+                allowed_runtimes: vec![runtime.to_string()],
+                allowed_models: vec![default_model.to_string()],
+                default_runtime: runtime.to_string(),
+                default_model: default_model.to_string(),
+                data_class: String::new(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_streaming_translates_to_openai_chat_stream_cross_provider() {
+        // Upstream OpenAI-compatible chat SSE stream.
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"translated\"}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" ok\"},\"finish_reason\":null}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n\
+                   data: [DONE]\n\n";
+        let (upstream_base, requests) = spawn_fake_upstream(sse, "text/event-stream").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        seed_cross_provider_policy(&chisei_target, "gpt-5.5", "openai").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: true,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = resp.text().await.unwrap();
+        // Client receives well-formed Anthropic Messages SSE events.
+        assert!(body.contains("event: message_start"), "{body}");
+        assert!(body.contains("event: content_block_start"), "{body}");
+        assert!(body.contains("event: content_block_delta"), "{body}");
+        assert!(body.contains("\"text\":\"translated\""), "{body}");
+        assert!(body.contains("\"text\":\" ok\""), "{body}");
+        assert!(body.contains("event: message_delta"), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
+        // Client-facing usage carries the upstream completion tokens, not zero.
+        assert!(body.contains("\"output_tokens\":4"), "{body}");
+
+        // Upstream got a streaming chat-completions request.
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/chat/completions");
+            let translated: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+            assert_eq!(translated["model"], "gpt-5.5");
+            assert_eq!(translated["stream"], true);
+        }
+
+        // Usage is metered from the tapped upstream OpenAI stream.
+        let rows = wait_for_llm_calls(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
+        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_streaming_with_tools_is_denied_cross_provider() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream("data: [DONE]\n\n", "text/event-stream").await;
+        let (chisei_target, _db) = spawn_control_plane().await;
+        seed_cross_provider_policy(&chisei_target, "gpt-5.5", "openai").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: true,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "stream": true,
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "unsupported_cross_provider_stream");
+        // Nothing was forwarded upstream.
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anthropic_non_streaming_routes_to_resolved_ollama_backend() {
+        // Cross-provider resolved to an Ollama model: route to the Ollama base,
+        // strip the ollama/ prefix, and send no upstream auth.
+        let upstream_body = r#"{
+            "id":"chatcmpl_1",
+            "object":"chat.completion",
+            "model":"llama3.2:latest",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"local ok"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}
+        }"#;
+        let (upstream_base, requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _db) = spawn_control_plane().await;
+        seed_cross_provider_policy(&chisei_target, "ollama/llama3.2:latest", "ollama").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            // OpenAI base points nowhere; the request must go to the Ollama base.
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: upstream_base,
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: true,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["text"], "local ok");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v1/chat/completions");
+        // Ollama gets no upstream auth.
+        assert_eq!(requests[0].authorization, None);
+        assert_eq!(requests[0].x_api_key, None);
+        // The ollama/ prefix is stripped from the resolved model.
+        let translated: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(translated["model"], "llama3.2:latest");
+    }
+
+    #[tokio::test]
+    async fn cross_provider_passthrough_strips_client_anthropic_credential() {
+        // Security: in passthrough mode a client presents its own Anthropic
+        // credential. When policy routes cross-provider to OpenAI, that credential
+        // must NOT be forwarded to api.openai.com; the gateway applies its own
+        // OpenAI key instead.
+        let upstream_body = r#"{
+            "id":"chatcmpl_1",
+            "object":"chat.completion",
+            "model":"gpt-5.5",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+        }"#;
+        let (upstream_base, requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _db) = spawn_control_plane().await;
+        seed_cross_provider_policy(&chisei_target, "gpt-5.5", "openai").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            // Passthrough mode, no OpenAI rewrite: the client credential would be
+            // forwarded verbatim if not for the cross-provider stripping.
+            allow_auth_passthrough: true,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: true,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .bearer_auth("sk-ant-oat-client-subscription-secret")
+            .header(X_CHISEI_AGENT.as_str(), "claude-code")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        // The upstream got the gateway's OpenAI key, never the client's token.
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer real-openai-key")
+        );
+        assert_ne!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk-ant-oat-client-subscription-secret")
+        );
+        assert_eq!(requests[0].x_api_key, None);
     }
 
     #[tokio::test]
