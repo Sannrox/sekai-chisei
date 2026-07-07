@@ -503,8 +503,30 @@ impl SekaiDb {
         &self,
         filter: &ListFilter,
         principals: &[&str],
+        excluded_kinds: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
+        // Static (no-bind) exclusion of internal governance kinds so pagination
+        // and totals are computed over the visible set. Kinds are internal
+        // constants; a non-conforming kind fails the query closed rather than
+        // being silently dropped (which would re-open the read-surface leak).
+        let kind_exclusion = if excluded_kinds.is_empty() {
+            String::new()
+        } else {
+            for kind in excluded_kinds {
+                if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err(format!(
+                        "unsafe excluded kind {kind:?}: only ASCII alphanumeric and '_' allowed"
+                    ));
+                }
+            }
+            let quoted = excluded_kinds
+                .iter()
+                .map(|kind| format!("'{kind}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(" AND kind NOT IN ({quoted})")
+        };
         // Keep visibility params and order-by params disjoint to avoid placeholder
         // number collision for both list and count queries.
         let (visibility_filter, mut visibility_params) =
@@ -525,8 +547,8 @@ impl SekaiDb {
             filter.limit.min(MAX_LIST_LIMIT)
         };
         let mut list_sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}",
-            query.where_sql, visibility_filter
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}",
+            query.where_sql, visibility_filter, kind_exclusion
         );
         if let Some(order_sql) = order_sql.as_deref() {
             list_sql.push_str(order_sql);
@@ -568,8 +590,8 @@ impl SekaiDb {
         let total = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM sekai_objects{}{}",
-                    query.where_sql, count_visibility_filter
+                    "SELECT COUNT(*) FROM sekai_objects{}{}{}",
+                    query.where_sql, count_visibility_filter, kind_exclusion
                 ),
                 count_params.as_slice(),
                 |row| row.get::<_, i64>(0),
@@ -1569,6 +1591,7 @@ mod tests {
                     ..Default::default()
                 },
                 &["alice"],
+                &[],
             )
             .unwrap();
 

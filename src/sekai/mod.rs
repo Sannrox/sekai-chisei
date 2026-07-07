@@ -1,4 +1,6 @@
 pub mod action;
+pub mod action_approval;
+pub mod action_policy;
 pub mod audit;
 pub mod capacity;
 pub mod compute;
@@ -17,3 +19,4 @@ pub mod schema;
 pub mod security;
 pub mod sentinel;
 pub mod skillextract;
+pub mod tool_bridge;
