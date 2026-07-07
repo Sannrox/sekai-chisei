@@ -36,6 +36,46 @@ pub struct ActionOp {
     pub relation: String,
 }
 
+/// Risk classification for an action or op, ordered least to most dangerous.
+/// The ordering is meaningful: an action type's class is the maximum over its
+/// ops, and policy can gate by class (e.g. deny everything at or above `Write`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RiskClass {
+    Read,
+    Write,
+    Destructive,
+}
+
+impl RiskClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RiskClass::Read => "read",
+            RiskClass::Write => "write",
+            RiskClass::Destructive => "destructive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(RiskClass::Read),
+            "write" => Some(RiskClass::Write),
+            "destructive" => Some(RiskClass::Destructive),
+            _ => None,
+        }
+    }
+}
+
+/// Risk class for a single graph op. Unknown ops are treated as `Destructive`
+/// so newly added effectful ops fail safe under a restrictive policy until they
+/// are explicitly classified.
+pub fn op_risk_class(op: &str) -> RiskClass {
+    match op {
+        "delete_link" | "delete_object" => RiskClass::Destructive,
+        "create_object" | "set_property" | "create_link" => RiskClass::Write,
+        _ => RiskClass::Destructive,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionTypeDef {
     pub name: String,
@@ -83,6 +123,103 @@ impl ActionExecutor {
         let mut action_types: Vec<_> = self.action_types.values().cloned().collect();
         action_types.sort_by(|a, b| a.name.cmp(&b.name));
         action_types
+    }
+
+    /// Risk class of an action by name. Builtin action names are op names, so
+    /// they map directly; user-defined action types take the maximum class over
+    /// their ops. Unknown actions are treated as `Destructive` (fail safe).
+    pub fn action_risk_class(&self, action: &str) -> RiskClass {
+        if self.registry.contains_key(action) {
+            return op_risk_class(action);
+        }
+        if let Some(action_type) = self.action_types.get(action) {
+            return action_type
+                .ops
+                .iter()
+                .map(|op| op_risk_class(&op.op))
+                .max()
+                .unwrap_or(RiskClass::Write);
+        }
+        RiskClass::Destructive
+    }
+
+    /// Human-readable description of the ops an action would perform, in order.
+    /// Used by dry-run; describes op shape without leaking property values.
+    pub fn planned_ops(
+        &self,
+        action: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        let get = |key: &str| params.get(key).cloned().unwrap_or_default();
+        if self.registry.contains_key(action) {
+            let describe = match action {
+                "create_object" => {
+                    format!("create_object kind={} id={}", get("kind"), get("id"))
+                }
+                "set_property" => format!("set_property {}.{}", get("id"), get("key")),
+                "create_link" => format!(
+                    "create_link {}->{} ({})",
+                    get("from_id"),
+                    get("to_id"),
+                    get("relation")
+                ),
+                "delete_link" => format!("delete_link {}", get("id")),
+                other => other.to_string(),
+            };
+            return Ok(vec![describe]);
+        }
+        let action_type = self
+            .action_types
+            .get(action)
+            .ok_or_else(|| format!("unknown action: {}", action))?;
+        Ok(action_type
+            .ops
+            .iter()
+            .map(|op| match op.op.as_str() {
+                "set_property" => {
+                    format!("set_property {} <- param {}", op.property, op.value_from)
+                }
+                "create_object" => {
+                    format!(
+                        "create_object kind={} name <- param {}",
+                        op.property, op.value_from
+                    )
+                }
+                "create_link" => {
+                    format!(
+                        "create_link relation={} to <- param {}",
+                        op.relation, op.property
+                    )
+                }
+                "delete_link" => format!("delete_link <- param {}", op.value_from),
+                other => other.to_string(),
+            })
+            .collect())
+    }
+
+    /// Count the graph effects an action would contribute, as
+    /// `(mutations, deletes)`. Mutations are object/link writes
+    /// (create_object/set_property/create_link); deletes are link removals.
+    /// Used for per-work-unit blast-radius caps.
+    pub fn action_op_counts(&self, action: &str, _params: &HashMap<String, String>) -> (u32, u32) {
+        let count_op = |op: &str| -> (u32, u32) {
+            match op {
+                "delete_link" | "delete_object" => (0, 1),
+                "create_object" | "set_property" | "create_link" => (1, 0),
+                _ => (1, 0),
+            }
+        };
+        if self.registry.contains_key(action) {
+            return count_op(action);
+        }
+        match self.action_types.get(action) {
+            Some(action_type) => action_type.ops.iter().fold((0, 0), |(m, d), op| {
+                let (om, od) = count_op(&op.op);
+                (m + om, d + od)
+            }),
+            // Unknown action: treat as a single mutation (fail safe toward counting).
+            None => (1, 0),
+        }
     }
 
     pub fn masks_missing_link(&self, action: &str) -> bool {
@@ -887,5 +1024,98 @@ mod tests {
             exec.execute(&db, &schema, "create_object", &params, "user")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_op_risk_class_mapping() {
+        assert_eq!(op_risk_class("delete_link"), RiskClass::Destructive);
+        assert_eq!(op_risk_class("delete_object"), RiskClass::Destructive);
+        assert_eq!(op_risk_class("set_property"), RiskClass::Write);
+        assert_eq!(op_risk_class("create_object"), RiskClass::Write);
+        assert_eq!(op_risk_class("create_link"), RiskClass::Write);
+        // Unknown ops fail safe as Destructive.
+        assert_eq!(op_risk_class("teleport"), RiskClass::Destructive);
+    }
+
+    #[test]
+    fn test_risk_class_ordering_and_parse() {
+        assert!(RiskClass::Read < RiskClass::Write);
+        assert!(RiskClass::Write < RiskClass::Destructive);
+        assert_eq!(RiskClass::parse("READ"), Some(RiskClass::Read));
+        assert_eq!(
+            RiskClass::parse(" destructive "),
+            Some(RiskClass::Destructive)
+        );
+        assert_eq!(RiskClass::parse("nonsense"), None);
+        assert_eq!(RiskClass::Destructive.as_str(), "destructive");
+    }
+
+    #[test]
+    fn test_builtin_action_risk_class() {
+        let exec = ActionExecutor::new();
+        assert_eq!(
+            exec.action_risk_class("delete_link"),
+            RiskClass::Destructive
+        );
+        assert_eq!(exec.action_risk_class("set_property"), RiskClass::Write);
+        assert_eq!(exec.action_risk_class("create_object"), RiskClass::Write);
+        assert_eq!(exec.action_risk_class("create_link"), RiskClass::Write);
+        // Unknown action names fail safe as Destructive.
+        assert_eq!(exec.action_risk_class("mystery"), RiskClass::Destructive);
+    }
+
+    #[test]
+    fn test_action_type_risk_class_is_max_over_ops() {
+        let write_only = ActionTypeDef {
+            name: "recolor".into(),
+            description: String::new(),
+            params: vec![ActionParamDef {
+                name: "color".into(),
+                param_type: PropertyType::String,
+                required: true,
+                enum_values: vec![],
+            }],
+            ops: vec![ActionOp {
+                op: "set_property".into(),
+                property: "color".into(),
+                value_from: "color".into(),
+                relation: String::new(),
+            }],
+            target_kind: "widget".into(),
+            created: 0,
+        };
+        let destructive = ActionTypeDef {
+            name: "detach".into(),
+            description: String::new(),
+            params: vec![ActionParamDef {
+                name: "link".into(),
+                param_type: PropertyType::String,
+                required: true,
+                enum_values: vec![],
+            }],
+            ops: vec![
+                ActionOp {
+                    op: "set_property".into(),
+                    property: "color".into(),
+                    value_from: "link".into(),
+                    relation: String::new(),
+                },
+                ActionOp {
+                    op: "delete_link".into(),
+                    property: String::new(),
+                    value_from: "link".into(),
+                    relation: String::new(),
+                },
+            ],
+            target_kind: "widget".into(),
+            created: 0,
+        };
+        let mut exec = ActionExecutor::new();
+        exec.action_types
+            .insert(write_only.name.clone(), write_only);
+        exec.action_types
+            .insert(destructive.name.clone(), destructive);
+        assert_eq!(exec.action_risk_class("recolor"), RiskClass::Write);
+        assert_eq!(exec.action_risk_class("detach"), RiskClass::Destructive);
     }
 }

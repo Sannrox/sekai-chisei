@@ -19,6 +19,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match args[0].as_str() {
         "credential" => run_credential_command(args.into_iter().skip(1).collect()).await,
         "gateway" => run_gateway_command(args.into_iter().skip(1).collect()).await,
+        "action" => {
+            sekai_chisei::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
+        }
         "launch" => {
             sekai_chisei::launch::load_local_env();
             let config = LaunchConfig::from_env_and_args(args.into_iter().skip(1))
@@ -118,7 +121,7 @@ async fn run_gateway_command(
 }
 
 fn print_root_usage() {
-    println!("Usage: sekaictl <credential|gateway|launch> ...\n");
+    println!("Usage: sekaictl <credential|gateway|launch|action> ...\n");
     println!("Credential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
@@ -127,6 +130,8 @@ fn print_root_usage() {
     println!("  sekaictl gateway report [...]");
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
+    println!("\nGoverned action commands:");
+    println!("{}", sekai_chisei::action_cli::usage());
 }
 
 fn print_gateway_usage() {

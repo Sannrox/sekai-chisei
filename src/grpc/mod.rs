@@ -396,7 +396,10 @@ fn build_services(
     Arc<chisei_service::ChiseiServiceImpl>,
 ) {
     let budget = Arc::new(BudgetTracker::new());
-    let sekai_svc = Arc::new(sekai_service::SekaiServiceImpl::new(db.clone()));
+    let sekai_svc = Arc::new(sekai_service::SekaiServiceImpl::with_budget(
+        db.clone(),
+        budget.clone(),
+    ));
     let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
         db,
         config.clone(),
