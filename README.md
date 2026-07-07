@@ -140,6 +140,45 @@ resolve request can override the saved `limit`; `offset` is overridden only when
 the request explicitly sends it, so omitted `offset` keeps the saved filter's
 offset.
 
+## Governed actions and tool-use
+
+Beyond governing model *calls*, `sekai` governs the *effects* agents produce —
+the graph mutations behind their tool-calls — at the `ExecuteAction` boundary
+(Plan 9). A per-scope **action policy** decides `allow` / `deny` /
+`require_approval` for each action, keyed by action name or by op **risk class**
+(`read` / `write` / `destructive`). Policies resolve **agent-then-namespace**
+(`agent:<principal>` first, then the object namespace); with no policy, actions
+are allowed (backward compatible). Every decision is written to the audit log.
+
+- **Dry-run**: send `ExecuteActionRequest.dry_run = true` to get the ops an
+  action *would* perform plus the resolved policy decision, with no mutation.
+- **Approval holds**: `require_approval` actions are held as `action_approval`
+  records (capturing the proposer, work-unit, and exact params) instead of
+  executing. Approve/deny them out-of-band; approval re-checks policy and write
+  access before resuming.
+- **Blast-radius caps**: a policy can cap mutations/deletes per work unit
+  (`x-chisei-work-unit`), hard-stopping runaway loops with `ResourceExhausted`.
+- **Action-class budgets**: executed actions are metered against chisei budget
+  subject `action:<risk_class>`; set a limit with `SetBudgetLimit` to rate-limit
+  a class.
+- **Tool-use bridge**: an agent runs a model tool-call by mapping it to an
+  `ExecuteAction` call (see `examples/governed_tool_use.rs`), so the tool-call is
+  policy-checked, budgeted, and audited. Only `ExecuteAction` is governed by this
+  layer; the lower-level CRUD RPCs remain gated by object access control + audit,
+  so effectful tool-calls should route through `ExecuteAction`.
+
+Manage policy and approvals from the CLI:
+
+```bash
+sekaictl action policy set --scope agent:codex-app \
+  --default allow --risk destructive=require_approval --max-deletes 20
+sekaictl action policy get --scope agent:codex-app
+sekaictl action policy list
+sekaictl action approvals list
+sekaictl action approvals approve --id <approval_id>
+sekaictl action approvals deny --id <approval_id> --reason "not now"
+```
+
 ## Observability
 
 The server exposes unauthenticated health and Prometheus endpoints on the loopback

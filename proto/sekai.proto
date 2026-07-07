@@ -197,6 +197,10 @@ message ActionRequest {
 message ActionResult {
   string action = 1;
   string message = 2;
+  bool dry_run = 3;              // set when the call was a dry run (no mutation)
+  repeated string planned_ops = 4; // ops that would run, in order
+  string decision = 5;          // resolved policy decision: allow|deny|require_approval
+  string approval_id = 6;       // set when the action was held for approval (Phase B)
 }
 
 message ActionParamDef {
@@ -345,8 +349,60 @@ message ListActionTypesResponse { repeated ActionTypeDef action_types = 1; }
 message DeleteActionTypeRequest { string name = 1; }
 message DeleteActionTypeResponse {}
 
-message ExecuteActionRequest { ActionRequest request = 1; }
+message ExecuteActionRequest {
+  ActionRequest request = 1;
+  bool dry_run = 2; // when true, plan and policy-check without mutating
+}
 message ExecuteActionResponse { ActionResult result = 1; }
+
+// --- Governed action policy (Plan 9) ---
+message ActionPolicy {
+  string scope = 1;                          // e.g. "agent:codex-app" or a namespace
+  string default_decision = 2;               // allow | deny | require_approval
+  map<string, string> action_overrides = 3;  // action name -> decision
+  map<string, string> risk_overrides = 4;    // read|write|destructive -> decision
+  uint32 max_mutations_per_work_unit = 5;    // 0 == unlimited
+  uint32 max_deletes_per_work_unit = 6;      // 0 == unlimited
+}
+
+message SetActionPolicyRequest { ActionPolicy policy = 1; }
+message SetActionPolicyResponse { ActionPolicy policy = 1; }
+message GetActionPolicyRequest { string scope = 1; }
+message GetActionPolicyResponse { ActionPolicy policy = 1; }
+message ListActionPoliciesRequest {}
+message ListActionPoliciesResponse { repeated ActionPolicy policies = 1; }
+
+// --- Governed action approvals (Plan 9, Phase B) ---
+message ActionApproval {
+  string id = 1;
+  string status = 2;                 // pending | approved | denied
+  string actor = 3;                  // proposing principal
+  string action = 4;
+  map<string, string> params = 5;    // redacted for display
+  string work_unit = 6;
+  string policy_scope = 7;
+  string risk_class = 8;
+  string target_id = 9;
+  int64 created = 10;
+  int64 updated = 11;
+  string decided_by = 12;
+  string outcome = 13;
+}
+
+message ApproveActionRequest { string approval_id = 1; }
+message ApproveActionResponse {
+  ActionResult result = 1;
+  ActionApproval approval = 2;
+}
+message DenyActionRequest {
+  string approval_id = 1;
+  string reason = 2;
+}
+message DenyActionResponse { ActionApproval approval = 1; }
+message ListPendingApprovalsRequest {
+  string status = 1; // "" or "pending" for pending only, "all" for every status, or a specific status
+}
+message ListPendingApprovalsResponse { repeated ActionApproval approvals = 1; }
 
 message GetLineageRequest { string object_id = 1; int32 max_nodes = 2; }
 message GetLineageResponse { LineageResult result = 1; }
@@ -568,6 +624,12 @@ service SekaiService {
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);
   rpc DeleteActionType(DeleteActionTypeRequest) returns (DeleteActionTypeResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
+  rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
+  rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);
+  rpc ListActionPolicies(ListActionPoliciesRequest) returns (ListActionPoliciesResponse);
+  rpc ApproveAction(ApproveActionRequest) returns (ApproveActionResponse);
+  rpc DenyAction(DenyActionRequest) returns (DenyActionResponse);
+  rpc ListPendingApprovals(ListPendingApprovalsRequest) returns (ListPendingApprovalsResponse);
   rpc GetLineage(GetLineageRequest) returns (GetLineageResponse);
 
   rpc CreateContentionScope(CreateContentionScopeRequest) returns (CreateContentionScopeResponse);

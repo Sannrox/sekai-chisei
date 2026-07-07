@@ -1,3 +1,4 @@
+pub mod action_cli;
 pub mod chisei;
 pub mod config;
 pub mod credential_cli;
