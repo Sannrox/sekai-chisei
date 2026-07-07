@@ -30,6 +30,13 @@ pub struct GatewaySetupConfig {
     pub allowed_runtimes: Vec<String>,
     pub default_model: String,
     pub default_runtime: String,
+    /// When true, merge into any existing namespace policy instead of
+    /// overwriting it: union `allowed_models`/`allowed_runtimes` with the
+    /// stored policy and preserve its `default_model`/`default_runtime` (falling
+    /// back to this config's defaults only when no policy exists yet). Used so a
+    /// second client's launch (e.g. `claude-code` after `codex-app`) does not
+    /// clobber the shared namespace `auto` default the first client set.
+    pub merge_into_existing: bool,
 }
 
 impl GatewaySetupConfig {
@@ -51,6 +58,7 @@ impl GatewaySetupConfig {
             allowed_runtimes: Vec::new(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
+            merge_into_existing: false,
         };
 
         let mut args = args.into_iter();
@@ -88,6 +96,7 @@ impl GatewaySetupConfig {
                 }
                 "--default-model" => config.default_model = next_arg(&mut args, &arg)?,
                 "--default-runtime" => config.default_runtime = next_arg(&mut args, &arg)?,
+                "--merge-policy" => config.merge_into_existing = true,
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown argument {other:?}\n\n{}", usage())),
             }
@@ -135,7 +144,48 @@ pub async fn run_setup(
     let mut sekai = SekaiServiceClient::new(channel.clone());
     let mut chisei = ChiseiServiceClient::new(channel);
 
-    ensure_gateway_objects(&mut sekai, &config).await?;
+    // Resolve the effective namespace policy BEFORE seeding graph objects.
+    // `ensure_gateway_objects` also writes the `policy:<project>` graph object,
+    // so the merge must happen first or that write would clobber the existing
+    // policy before we could read it. When merging, union the allowed lists with
+    // the stored policy and preserve its default_model/default_runtime so a
+    // second client's launch does not reset the shared `auto` default.
+    let desired_allowed_models = if config.allowed_models.is_empty() {
+        vec![config.default_model.clone()]
+    } else {
+        config.allowed_models.clone()
+    };
+    let desired_allowed_runtimes = config.effective_allowed_runtimes();
+    let (allowed_models, allowed_runtimes, default_model, default_runtime) = match (
+        config.merge_into_existing,
+        fetch_existing_policy(&mut sekai, &config).await?,
+    ) {
+        (true, Some(existing)) => (
+            csv_union(&existing.allowed_models, &desired_allowed_models),
+            csv_union(&existing.allowed_runtimes, &desired_allowed_runtimes),
+            first_non_empty(&existing.default_model, &config.default_model),
+            first_non_empty(&existing.default_runtime, &config.default_runtime),
+        ),
+        _ => (
+            desired_allowed_models,
+            desired_allowed_runtimes,
+            config.default_model.clone(),
+            config.default_runtime.clone(),
+        ),
+    };
+
+    // A config carrying the resolved policy so the graph policy object and the
+    // chisei namespace policy are seeded from the same values.
+    let resolved_config = GatewaySetupConfig {
+        allowed_models: allowed_models.clone(),
+        allowed_runtimes: allowed_runtimes.clone(),
+        default_model: default_model.clone(),
+        default_runtime: default_runtime.clone(),
+        merge_into_existing: false,
+        ..config.clone()
+    };
+
+    ensure_gateway_objects(&mut sekai, &resolved_config).await?;
     ensure_llm_calls_dataset(&mut sekai).await?;
     chisei
         .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
@@ -148,17 +198,14 @@ pub async fn run_setup(
             key_id: config.gateway_key_name.clone(),
         }))
         .await?;
+
     chisei
         .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
             namespace: config.project.clone(),
-            allowed_runtimes: config.effective_allowed_runtimes(),
-            allowed_models: if config.allowed_models.is_empty() {
-                vec![config.default_model.clone()]
-            } else {
-                config.allowed_models.clone()
-            },
-            default_runtime: config.default_runtime.clone(),
-            default_model: config.default_model.clone(),
+            allowed_runtimes,
+            allowed_models,
+            default_runtime: default_runtime.clone(),
+            default_model: default_model.clone(),
             data_class: String::new(),
         }))
         .await?;
@@ -173,8 +220,74 @@ pub async fn run_setup(
         "  budget: {} tokens per {}",
         config.budget_tokens, config.budget_period
     );
-    println!("  default model: {}", config.default_model);
+    println!("  default model: {default_model}");
     Ok(())
+}
+
+/// Existing namespace policy fields read back from the stored `policy:<ns>`
+/// object for merge-into-existing seeding.
+struct ExistingNamespacePolicy {
+    allowed_models: Vec<String>,
+    allowed_runtimes: Vec<String>,
+    default_model: String,
+    default_runtime: String,
+}
+
+/// Reads the stored namespace policy object (`external_id = policy:<namespace>`)
+/// if one exists. Returns `None` when the namespace has no policy yet.
+///
+/// This graph object is the persistent source of truth for the namespace policy:
+/// `chisei_service::persist_namespace_policy` writes this exact object on every
+/// `set_namespace_policy`, `ensure_gateway_objects` writes the same object, and
+/// the in-memory `PolicyResolver` that governs `auto` resolution is loaded from
+/// it at startup. So the two writers never diverge and reading the graph object
+/// is equivalent to reading chisei's authoritative namespace policy.
+async fn fetch_existing_policy(
+    sekai: &mut SekaiServiceClient<GatewayClient>,
+    config: &GatewaySetupConfig,
+) -> Result<Option<ExistingNamespacePolicy>, Box<dyn std::error::Error + Send + Sync>> {
+    let namespace = &config.project;
+    let resp = match sekai
+        .find_by_external_id(gateway_request(FindByExternalIdRequest {
+            external_id: format!("policy:{namespace}"),
+        }))
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) if err.code() == tonic::Code::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let Some(object) = resp.into_inner().object else {
+        return Ok(None);
+    };
+    let prop = |key: &str| object.properties.get(key).cloned().unwrap_or_default();
+    Ok(Some(ExistingNamespacePolicy {
+        allowed_models: split_csv(&prop("allowed_models")),
+        allowed_runtimes: split_csv(&prop("allowed_runtimes")),
+        default_model: prop("default_model"),
+        default_runtime: prop("default_runtime"),
+    }))
+}
+
+/// Order-preserving union of two string lists (existing first, then new).
+fn csv_union(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in existing.iter().chain(incoming.iter()) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !out.iter().any(|item| item == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// Returns `primary` when it is non-empty, otherwise `fallback`.
+fn first_non_empty(primary: &str, fallback: &str) -> String {
+    if primary.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        primary.to_string()
+    }
 }
 
 pub async fn run_gateway_key_command<I>(
@@ -830,6 +943,7 @@ mod tests {
             allowed_runtimes: Vec::new(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
+            merge_into_existing: false,
         })
         .await
         .unwrap();
@@ -1044,5 +1158,136 @@ mod tests {
             Some(hash_gateway_key("sk-chisei-worker-one").as_str())
         );
         assert!(db.get_dataset("llm_calls").unwrap().is_some());
+    }
+
+    fn setup_config(
+        target: &str,
+        agent: &str,
+        default_model: &str,
+        default_runtime: &str,
+        allowed: &[&str],
+        merge: bool,
+    ) -> GatewaySetupConfig {
+        GatewaySetupConfig {
+            chisei_grpc_target: target.to_string(),
+            agent: agent.to_string(),
+            project: "sekai-chisei".to_string(),
+            gateway_key_name: agent.to_string(),
+            gateway_key_secret: format!("sk-chisei-{agent}"),
+            budget_tokens: 1000,
+            budget_period: "day".to_string(),
+            allowed_models: allowed.iter().map(|m| m.to_string()).collect(),
+            allowed_runtimes: Vec::new(),
+            default_model: default_model.to_string(),
+            default_runtime: default_runtime.to_string(),
+            merge_into_existing: merge,
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_policy_preserves_existing_default_and_unions_allowed() {
+        let (target, db) = spawn_control_plane().await;
+
+        // Codex seeds first with a custom default and its own runtime/models.
+        run_setup(setup_config(
+            &target,
+            "codex-app",
+            "gpt-6",
+            "openai",
+            &["gpt-6", "gpt-5.5"],
+            false,
+        ))
+        .await
+        .unwrap();
+
+        // Sanity: codex persisted gpt-6 before the claude launch runs.
+        let after_codex = db
+            .find_by_external_id("policy:sekai-chisei")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_codex
+                .properties
+                .get("default_model")
+                .map(String::as_str),
+            Some("gpt-6")
+        );
+
+        // Claude launches later with merge: it must NOT reset the auto default,
+        // only add its own runtime/models to the allowed union.
+        run_setup(setup_config(
+            &target,
+            "claude-code",
+            "gpt-5.5",
+            "anthropic",
+            &["claude-sonnet-4-6", "claude-haiku-4-5"],
+            true,
+        ))
+        .await
+        .unwrap();
+
+        let policy = db
+            .find_by_external_id("policy:sekai-chisei")
+            .unwrap()
+            .unwrap();
+        // Preserved Codex default, not reset to the claude launch's gpt-5.5 arg.
+        assert_eq!(
+            policy.properties.get("default_model").map(String::as_str),
+            Some("gpt-6")
+        );
+        assert_eq!(
+            policy.properties.get("default_runtime").map(String::as_str),
+            Some("openai")
+        );
+        // Allowed models are the union of both launches.
+        let allowed = policy
+            .properties
+            .get("allowed_models")
+            .map(String::as_str)
+            .unwrap_or_default();
+        for model in ["gpt-6", "gpt-5.5", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            assert!(
+                allowed.contains(model),
+                "allowed {allowed:?} missing {model}"
+            );
+        }
+        // Allowed runtimes union both provider families.
+        let runtimes = policy
+            .properties
+            .get("allowed_runtimes")
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(runtimes.contains("openai"), "runtimes {runtimes:?}");
+        assert!(runtimes.contains("anthropic"), "runtimes {runtimes:?}");
+    }
+
+    #[tokio::test]
+    async fn merge_policy_on_fresh_namespace_uses_config_defaults() {
+        let (target, db) = spawn_control_plane().await;
+
+        // No existing policy: merge falls back to this config's own defaults.
+        run_setup(setup_config(
+            &target,
+            "claude-code",
+            "claude-sonnet-4-6",
+            "anthropic",
+            &["claude-sonnet-4-6"],
+            true,
+        ))
+        .await
+        .unwrap();
+
+        let policy = db
+            .find_by_external_id("policy:sekai-chisei")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy.properties.get("default_model").map(String::as_str),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            policy.properties.get("default_runtime").map(String::as_str),
+            Some("anthropic")
+        );
     }
 }
