@@ -179,6 +179,10 @@ impl GatewayConfig {
 pub struct ModelPricing {
     pub input_usd_micros_per_million: i64,
     pub output_usd_micros_per_million: i64,
+    /// Discounted rate for prompt tokens served from the provider's cache.
+    /// Defaults to `input_usd_micros_per_million` when the pricing entry omits
+    /// the optional third field, so uncached traffic is priced unchanged.
+    pub cached_input_usd_micros_per_million: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2059,16 +2063,28 @@ fn parse_pricing_table(
         if model.is_empty() {
             return Err("invalid gateway pricing entry with empty model".into());
         }
-        let (input, output) = rates.split_once(':').ok_or_else(|| {
-            format!(
-                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m"
+        let rate_parts = rates.split(':').map(str::trim).collect::<Vec<_>>();
+        if rate_parts.len() < 2 || rate_parts.len() > 3 {
+            return Err(format!(
+                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m[:cached_input_usd_per_1m]"
             )
-        })?;
+            .into());
+        }
+        let input_usd_micros_per_million = parse_usd_micros(rate_parts[0])?;
+        let output_usd_micros_per_million = parse_usd_micros(rate_parts[1])?;
+        // The cached-input rate is optional; when omitted, cache reads are
+        // priced at the normal input rate so existing 2-field configs are
+        // unchanged.
+        let cached_input_usd_micros_per_million = match rate_parts.get(2) {
+            Some(cached) => parse_usd_micros(cached)?,
+            None => input_usd_micros_per_million,
+        };
         pricing.insert(
             model.to_string(),
             ModelPricing {
-                input_usd_micros_per_million: parse_usd_micros(input.trim())?,
-                output_usd_micros_per_million: parse_usd_micros(output.trim())?,
+                input_usd_micros_per_million,
+                output_usd_micros_per_million,
+                cached_input_usd_micros_per_million,
             },
         );
     }
@@ -2110,21 +2126,59 @@ fn estimate_cost_usd_micros(
     context: &UsageContext,
     usage: &ResponseUsage,
 ) -> Option<i64> {
-    let pricing = context
+    let (model, pricing) = context
         .resolved_model
         .as_ref()
-        .and_then(|model| config.pricing.get(model))
+        .and_then(|model| {
+            config
+                .pricing
+                .get(model)
+                .map(|pricing| (model.as_str(), pricing))
+        })
         .or_else(|| {
-            context
-                .requested_model
-                .as_ref()
-                .and_then(|model| config.pricing.get(model))
+            context.requested_model.as_ref().and_then(|model| {
+                config
+                    .pricing
+                    .get(model)
+                    .map(|pricing| (model.as_str(), pricing))
+            })
         })?;
-    let input =
-        (usage.input_tokens as i128).checked_mul(pricing.input_usd_micros_per_million as i128)?;
-    let output =
-        (usage.output_tokens as i128).checked_mul(pricing.output_usd_micros_per_million as i128)?;
-    let total = input.checked_add(output)?.checked_div(1_000_000)?;
+    cost_for_model(model, pricing, usage)
+}
+
+/// Pure cost math for a resolved model/pricing pair, split out so it can be
+/// tested without constructing a full gateway config/context.
+fn cost_for_model(model: &str, pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
+    let cache_read = usage.cache_read_input_tokens.max(0) as i128;
+    let cache_creation = usage.cache_creation_input_tokens.max(0) as i128;
+    // Anthropic reports `input_tokens` as the uncached count, with cache tokens
+    // tracked separately, so the uncached portion is `input_tokens` as-is.
+    // OpenAI reports cached tokens as a subset of `prompt_tokens`, so the
+    // uncached portion must subtract the cache-read count to avoid billing it
+    // twice.
+    let input_tokens = usage.input_tokens.max(0) as i128;
+    let uncached_input = if crate::llm::provider_name(model) == "anthropic" {
+        input_tokens
+    } else {
+        (input_tokens - cache_read).max(0)
+    };
+
+    let input_rate = pricing.input_usd_micros_per_million as i128;
+    let output_rate = pricing.output_usd_micros_per_million as i128;
+    let cached_rate = pricing.cached_input_usd_micros_per_million as i128;
+
+    // Cache reads bill at the discounted cached rate; cache-creation (write)
+    // tokens bill at the normal input rate.
+    let input_cost = uncached_input.checked_mul(input_rate)?;
+    let cache_read_cost = cache_read.checked_mul(cached_rate)?;
+    let cache_creation_cost = cache_creation.checked_mul(input_rate)?;
+    let output_cost = (usage.output_tokens.max(0) as i128).checked_mul(output_rate)?;
+
+    let total = input_cost
+        .checked_add(cache_read_cost)?
+        .checked_add(cache_creation_cost)?
+        .checked_add(output_cost)?
+        .checked_div(1_000_000)?;
     i64::try_from(total).ok()
 }
 
@@ -3808,6 +3862,8 @@ mod tests {
             Some(&ModelPricing {
                 input_usd_micros_per_million: 1_250_000,
                 output_usd_micros_per_million: 10_000_000,
+                // 2-field entry defaults the cached rate to the input rate.
+                cached_input_usd_micros_per_million: 1_250_000,
             })
         );
         assert_eq!(
@@ -3815,9 +3871,85 @@ mod tests {
             Some(&ModelPricing {
                 input_usd_micros_per_million: 3_000_000,
                 output_usd_micros_per_million: 15_000_001,
+                cached_input_usd_micros_per_million: 3_000_000,
             })
         );
         assert!(parse_pricing_table("gpt-5.5=1").is_err());
+    }
+
+    #[test]
+    fn parses_gateway_pricing_table_with_cached_rate() {
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3").unwrap();
+        assert_eq!(
+            pricing.get("claude-sonnet-4-6"),
+            Some(&ModelPricing {
+                input_usd_micros_per_million: 3_000_000,
+                output_usd_micros_per_million: 15_000_000,
+                cached_input_usd_micros_per_million: 300_000,
+            })
+        );
+        // Too many rate fields is rejected.
+        assert!(parse_pricing_table("gpt-5.5=1:2:3:4").is_err());
+    }
+
+    #[test]
+    fn estimate_cost_bills_cache_reads_at_discounted_rate() {
+        // 10x cheaper cache reads: input 3 usd/1M, cached 0.3 usd/1M.
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3").unwrap();
+        let pricing = pricing.get("claude-sonnet-4-6").unwrap();
+
+        // Anthropic: input_tokens is the uncached count; cache tokens separate.
+        let fresh = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            total_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let cached = ResponseUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+        };
+        let fresh_cost = cost_for_model("claude-sonnet-4-6", pricing, &fresh).unwrap();
+        let cached_cost = cost_for_model("claude-sonnet-4-6", pricing, &cached).unwrap();
+        assert_eq!(fresh_cost, 3_000_000);
+        assert_eq!(cached_cost, 300_000);
+        assert!(cached_cost < fresh_cost);
+    }
+
+    #[test]
+    fn estimate_cost_excludes_openai_cached_tokens_from_input() {
+        // OpenAI reports cached tokens as a subset of prompt_tokens, so the
+        // uncached portion must exclude them.
+        let pricing = parse_pricing_table("gpt-5.5=1:10:0.1").unwrap();
+        let pricing = pricing.get("gpt-5.5").unwrap();
+        let usage = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            total_tokens: 1_000_000,
+            cache_read_input_tokens: 800_000,
+            cache_creation_input_tokens: 0,
+        };
+        // 200k uncached * 1 + 800k cached * 0.1 = 200000 + 80000 micros.
+        let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
+        assert_eq!(cost, 280_000);
+    }
+
+    #[test]
+    fn estimate_cost_matches_legacy_when_no_cache_tokens() {
+        // Back-compat: with zero cache tokens the cost equals input*in + out*out.
+        let pricing = parse_pricing_table("gpt-5.5=1.25:10").unwrap();
+        let pricing = pricing.get("gpt-5.5").unwrap();
+        let usage = ResponseUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            total_tokens: 1_500_000,
+            ..Default::default()
+        };
+        let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
+        assert_eq!(cost, 1_250_000 + 5_000_000);
     }
 
     #[derive(Clone)]
@@ -6199,6 +6331,7 @@ mod tests {
             ModelPricing {
                 input_usd_micros_per_million: 1_000_000,
                 output_usd_micros_per_million: 2_000_000,
+                cached_input_usd_micros_per_million: 1_000_000,
             },
         )]);
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
