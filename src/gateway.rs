@@ -4068,7 +4068,43 @@ mod tests {
                 .unwrap();
         });
 
-        (format!("http://{addr}"), db)
+        // Wait until the spawned gRPC server actually serves an RPC before
+        // returning. Otherwise a fail-closed gateway started next can race the
+        // server's readiness and 503 on its first ResolvePolicy (flaky under
+        // CI parallelism). Any served response — success or an application-level
+        // status — proves the server is accepting requests; only transport-level
+        // errors mean not-ready-yet.
+        let target = format!("http://{addr}");
+        for _ in 0..250 {
+            if let Ok(channel) = connect_sekai(&target).await {
+                let served = ChiseiServiceClient::new(channel)
+                    .resolve_policy(GrpcRequest::new(ResolvePolicyRequest {
+                        namespace: "__readiness_probe__".to_string(),
+                        preferred_runtime: "openai".to_string(),
+                        preferred_model: "gpt-5.5".to_string(),
+                        subject: String::new(),
+                        project: String::new(),
+                        agent: String::new(),
+                        key_id: String::new(),
+                        task_class: String::new(),
+                        user_id: String::new(),
+                    }))
+                    .await
+                    .map(|_| true)
+                    .unwrap_or_else(|status| {
+                        !matches!(
+                            status.code(),
+                            tonic::Code::Unavailable | tonic::Code::Unknown
+                        )
+                    });
+                if served {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        (target, db)
     }
 
     async fn seed_regressed_namespace(target: &str, namespace: &str) {
