@@ -115,6 +115,8 @@ pub struct GatewayReportRow {
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub cost_usd_micros: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_savings_usd_micros: i64,
 }
 
 pub async fn run_report(
@@ -145,6 +147,10 @@ pub async fn run_report(
                     "total_tokens".to_string(),
                     "cost_usd_micros".to_string(),
                     "cost_usd".to_string(),
+                    "cache_read_input_tokens".to_string(),
+                    "cache_creation_input_tokens".to_string(),
+                    "cache_savings_usd_micros".to_string(),
+                    "cache_savings_usd".to_string(),
                 ],
                 limit: config.limit,
                 offset: 0,
@@ -249,6 +255,8 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
         summary.output_tokens += parse_i64(row.values.get("output_tokens"));
         summary.total_tokens += parse_i64(row.values.get("total_tokens"));
         summary.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
+        summary.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
+        summary.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
     }
     let mut summaries = groups.into_values().collect::<Vec<_>>();
     summaries.sort_by(|a, b| {
@@ -278,24 +286,28 @@ fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
 
 fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
     println!(
-        "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14}",
+        "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
         group_by.label(),
         "calls",
         "input_tokens",
         "output_tokens",
         "total_tokens",
-        "est_cost_usd"
+        "est_cost_usd",
+        "cache_reads",
+        "cache_saved_usd"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(126));
     for row in rows {
         println!(
-            "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14}",
+            "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
             truncate(&row.group, 24),
             row.calls,
             row.input_tokens,
             row.output_tokens,
             row.total_tokens,
-            format_usd_micros(row.cost_usd_micros)
+            format_usd_micros(row.cost_usd_micros),
+            row.cache_read_input_tokens,
+            format_usd_micros(row.cache_savings_usd_micros)
         );
     }
 }
@@ -312,6 +324,8 @@ pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
             total.output_tokens += parse_i64(row.values.get("output_tokens"));
             total.total_tokens += parse_i64(row.values.get("total_tokens"));
             total.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
+            total.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
+            total.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
             total
         });
     format!(
@@ -373,6 +387,11 @@ fn render_metric_cards(total: &GatewayReportRow) -> String {
             "Estimated cost",
             format!("${}", format_usd_micros(total.cost_usd_micros)),
         ),
+        ("Cache reads", total.cache_read_input_tokens.to_string()),
+        (
+            "Cache savings",
+            format!("${}", format_usd_micros(total.cache_savings_usd_micros)),
+        ),
     ]
     .into_iter()
     .map(|(label, value)| {
@@ -397,14 +416,16 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
                 0
             };
             format!(
-                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td></tr>"#,
+                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
                 group = html_escape(&row.group),
                 width = width,
                 calls = row.calls,
                 input = row.input_tokens,
                 output = row.output_tokens,
                 total = row.total_tokens,
-                cost = format_usd_micros(row.cost_usd_micros)
+                cost = format_usd_micros(row.cost_usd_micros),
+                cache_reads = row.cache_read_input_tokens,
+                cache_saved = format_usd_micros(row.cache_savings_usd_micros)
             )
         })
         .collect::<Vec<_>>()
@@ -413,7 +434,7 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
         r#"<section>
 <h2>{title}</h2>
 <table>
-<thead><tr><th>{first_column}</th><th>calls</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th></tr></thead>
+<thead><tr><th>{first_column}</th><th>calls</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
 <tbody>
 {body}
 </tbody>
@@ -566,6 +587,7 @@ mod tests {
                     output_tokens: 7,
                     total_tokens: 24,
                     cost_usd_micros: 31,
+                    ..Default::default()
                 },
                 GatewayReportRow {
                     group: "claude-opus-4-8".to_string(),
@@ -574,6 +596,7 @@ mod tests {
                     output_tokens: 2,
                     total_tokens: 7,
                     cost_usd_micros: 21,
+                    ..Default::default()
                 },
             ]
         );
@@ -590,6 +613,43 @@ mod tests {
     }
 
     #[test]
+    fn summarize_rows_aggregates_cache_reads_and_savings() {
+        let rows = vec![
+            row([
+                ("agent", "claude-code"),
+                ("input_tokens", "10"),
+                ("output_tokens", "5"),
+                ("total_tokens", "15"),
+                ("cost_usd_micros", "40"),
+                ("cache_read_input_tokens", "100"),
+                ("cache_savings_usd_micros", "270"),
+            ]),
+            row([
+                ("agent", "claude-code"),
+                ("input_tokens", "8"),
+                ("output_tokens", "2"),
+                ("total_tokens", "10"),
+                ("cost_usd_micros", "20"),
+                ("cache_read_input_tokens", "50"),
+                ("cache_savings_usd_micros", "130"),
+            ]),
+            // A row without cache tokens contributes zero to the cache columns.
+            row([
+                ("agent", "claude-code"),
+                ("input_tokens", "4"),
+                ("output_tokens", "1"),
+                ("total_tokens", "5"),
+                ("cost_usd_micros", "12"),
+            ]),
+        ];
+        let report = summarize_rows(rows, ReportGroupBy::Agent);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].calls, 3);
+        assert_eq!(report[0].cache_read_input_tokens, 150);
+        assert_eq!(report[0].cache_savings_usd_micros, 400);
+    }
+
+    #[test]
     fn dashboard_renders_all_groupings_and_escapes_values() {
         let html = render_dashboard(
             &[
@@ -601,6 +661,8 @@ mod tests {
                     ("output_tokens", "5"),
                     ("total_tokens", "15"),
                     ("cost_usd_micros", "25"),
+                    ("cache_read_input_tokens", "100"),
+                    ("cache_savings_usd_micros", "270"),
                 ]),
                 row([
                     ("project", "danger<&>"),
@@ -624,5 +686,11 @@ mod tests {
         assert!(html.contains("codex-app"));
         assert!(html.contains("danger&lt;&amp;&gt;"));
         assert!(!html.contains("danger<&>"));
+        // Cache reporting is surfaced.
+        assert!(html.contains("Cache reads"));
+        assert!(html.contains("Cache savings"));
+        assert!(html.contains("cache reads"));
+        // Total cache savings across rows: $0.000270.
+        assert!(html.contains("$0.000270"));
     }
 }
