@@ -30,6 +30,7 @@ pub struct ObjectChange {
 pub struct DecisionFilter {
     pub actor: Option<String>,
     pub action: Option<String>,
+    pub target_id: Option<String>,
     pub after: i64,
     pub limit: i32,
     pub offset: i32,
@@ -175,7 +176,8 @@ impl SekaiDb {
                 old_value TEXT NOT NULL DEFAULT '', new_value TEXT NOT NULL DEFAULT '',
                 changed_by TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_changes_object ON sekai_object_changes(object_id);"
+            CREATE INDEX IF NOT EXISTS idx_changes_object ON sekai_object_changes(object_id);
+            CREATE INDEX IF NOT EXISTS idx_decisions_target ON sekai_decisions(target_id, timestamp);"
         )
         .map_err(|e| e.to_string())
     }
@@ -199,6 +201,10 @@ impl SekaiDb {
         if let Some(a) = &f.action {
             sql.push_str(" AND action = ?");
             params.push(Box::new(a.clone()));
+        }
+        if let Some(t) = &f.target_id {
+            sql.push_str(" AND target_id = ?");
+            params.push(Box::new(t.clone()));
         }
         if f.after > 0 {
             sql.push_str(" AND timestamp > ?");

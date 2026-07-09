@@ -97,8 +97,7 @@ pub trait Judge: Send + Sync {
 /// Synthetic suite id namespace for sampled observations of a namespace.
 const SUITE_PREFIX: &str = "sampling-";
 
-/// The synthetic eval suite id a namespace's sampled observations score into. Shared with
-/// `chisei::promotion`, so proposal logic can find the same suite this job writes to.
+/// The synthetic eval suite id a namespace's sampled observations score into.
 pub fn sampling_suite_id(namespace: &str) -> String {
     format!("{SUITE_PREFIX}{namespace}")
 }
@@ -455,7 +454,7 @@ impl ScoringJob {
         // Always record the scored run as an audit decision (the durable, queryable outcome),
         // whether or not it was large enough to drive a regression signal. Per-task-class pass
         // rates are rolled up here (not into separate suites/iterations — see the grouping note in
-        // `run_once`) so downstream proposal logic (Plan 11 Phase B) can read a task-class-scoped
+        // `run_once`) so downstream proposal logic (`chisei::promotion`) can read a task-class-scoped
         // signal without splitting the regression-driving artifact itself.
         let mut evidence = std::collections::HashMap::new();
         evidence.insert("namespace".to_string(), namespace.to_string());
