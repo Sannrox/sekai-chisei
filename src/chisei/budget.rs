@@ -94,7 +94,9 @@ impl BudgetTracker {
     ) -> Result<(), String> {
         self.db
             .budget_set_limit(scope_id, metric, max_tokens as i64, period.as_str())
-            .inspect_err(|err| tracing::error!(error = %err, scope_id, "failed to persist budget limit"))
+            .inspect_err(
+                |err| tracing::error!(error = %err, scope_id, "failed to persist budget limit"),
+            )
     }
 
     pub fn check(&self, scope_id: &str, estimated: i32) -> Result<(), String> {
@@ -132,15 +134,12 @@ impl BudgetTracker {
         self.adjust_with_metric(scope_id, reserved, actual, METRIC_TOKENS)
     }
 
-    pub fn adjust_with_metric(
-        &self,
-        scope_id: &str,
-        reserved: i32,
-        actual: i32,
-        metric: &str,
-    ) {
+    pub fn adjust_with_metric(&self, scope_id: &str, reserved: i32, actual: i32, metric: &str) {
         let delta = actual as i64 - reserved as i64;
-        if let Err(err) = self.db.budget_adjust_chain(scope_id, metric, delta, now_ms()) {
+        if let Err(err) = self
+            .db
+            .budget_adjust_chain(scope_id, metric, delta, now_ms())
+        {
             tracing::error!(error = %err, scope_id, "failed to adjust budget usage");
         }
     }
@@ -229,7 +228,8 @@ mod tests {
         // Project-level pool of 100 shared across agents; agent's own cap is
         // generous (500) but the project ancestor is nearly exhausted.
         t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
-        t.set_limit("project:p/agent:a", 500, PeriodType::Daily).unwrap();
+        t.set_limit("project:p/agent:a", 500, PeriodType::Daily)
+            .unwrap();
         t.record("project:p/agent:a", 90);
         // Agent-level check alone would allow (90+20=110 <= 500) but the
         // project ancestor (90+20=110 > 100) must reject it.
@@ -241,27 +241,30 @@ mod tests {
     #[test]
     fn checks_and_records_against_flat_agent_scope() {
         let t = tracker();
-        t.set_limit("agent:codex-app", 100, PeriodType::Daily).unwrap();
+        t.set_limit("agent:codex-app", 100, PeriodType::Daily)
+            .unwrap();
         t.set_limit("project:p", 500, PeriodType::Daily).unwrap();
         t.record("project:p/agent:codex-app", 90);
         assert_eq!(t.get_usage("agent:codex-app").tokens_used, 90);
         assert_eq!(t.get_usage("project:p").tokens_used, 90);
         assert!(t.check("project:p/agent:codex-app", 5).is_ok());
-        assert!(t.check_and_reserve("project:p/agent:codex-app", 11).is_err());
+        assert!(
+            t.check_and_reserve("project:p/agent:codex-app", 11)
+                .is_err()
+        );
     }
 
     #[test]
     fn chain_deducts_at_every_level() {
         let t = tracker();
         t.set_limit("project:p", 1000, PeriodType::Daily).unwrap();
-        t.set_limit("project:p/agent:a", 1000, PeriodType::Daily).unwrap();
-        t.check_and_reserve("project:p/agent:a/work_unit:w", 40).unwrap();
+        t.set_limit("project:p/agent:a", 1000, PeriodType::Daily)
+            .unwrap();
+        t.check_and_reserve("project:p/agent:a/work_unit:w", 40)
+            .unwrap();
         assert_eq!(t.get_usage("project:p").tokens_used, 40);
         assert_eq!(t.get_usage("project:p/agent:a").tokens_used, 40);
-        assert_eq!(
-            t.get_usage("project:p/agent:a/work_unit:w").tokens_used,
-            40
-        );
+        assert_eq!(t.get_usage("project:p/agent:a/work_unit:w").tokens_used, 40);
     }
 
     #[test]
