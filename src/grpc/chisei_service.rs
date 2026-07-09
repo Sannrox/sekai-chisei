@@ -12,10 +12,12 @@ use super::llm_service::{
 use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
+use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
+use crate::chisei::promotion::CandidateStore;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::sekai::SekaiDb;
@@ -29,6 +31,8 @@ pub struct ChiseiServiceImpl {
     planned_executions: Arc<Mutex<HashMap<String, ExecutionPlan>>>,
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
+    candidates: Arc<CandidateStore>,
+    active_promotions: Arc<ActivePromotions>,
     db: Arc<SekaiDb>,
     config: Config,
 }
@@ -49,6 +53,7 @@ struct FinishStreamedExecution<'a> {
     sample_rate: f64,
     sample_reason: &'a str,
     scoring_enabled: bool,
+    task_class: &'a str,
     response: &'a PlannedChatResponse,
 }
 
@@ -146,6 +151,7 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
                         stop_reason: execution.response.stop_reason.clone(),
                         timestamp: chrono::Utc::now().timestamp_millis(),
                         scored: false,
+                        task_class: execution.task_class.to_string(),
                     });
         }
     }
@@ -212,6 +218,8 @@ impl ChiseiServiceImpl {
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             evolve_enhancements,
+            candidates: Arc::new(CandidateStore::new()),
+            active_promotions: Arc::new(ActivePromotions::new()),
             db,
             config,
         }
@@ -226,6 +234,20 @@ impl ChiseiServiceImpl {
             self.config.clone(),
             self.budget.clone(),
         )
+    }
+
+    /// This service's live candidate store, for propose/gate/promote workflows that need to share
+    /// its DB and in-memory `EvalStore` (e.g. a periodic promotion-controller driver, or direct
+    /// RPC-triggered promotion).
+    pub fn candidate_store(&self) -> Arc<CandidateStore> {
+        self.candidates.clone()
+    }
+
+    /// This service's live active-promotions registry — the same one `resolve_policy` consults,
+    /// so promotions/rollbacks driven through `candidate_store()` have a real, immediate effect on
+    /// live routing.
+    pub fn active_promotions(&self) -> Arc<ActivePromotions> {
+        self.active_promotions.clone()
     }
 
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
@@ -261,6 +283,8 @@ impl ChiseiServiceImpl {
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             evolve_enhancements,
+            candidates: Arc::new(CandidateStore::new()),
+            active_promotions: Arc::new(ActivePromotions::new()),
             db,
             config,
         }
@@ -1593,8 +1617,27 @@ impl ChiseiService for ChiseiServiceImpl {
         // selected via the provider-scoped "{runtime}/cheap" alias, which only
         // resolves for a recognized provider family. Cheap resolution is
         // best-effort: any failure falls back to the capable model.
-        let wants_cheap =
-            cheap_route_bias(&r.task_class, regression_signal.is_some()) == Some("cheap");
+        //
+        // A promoted "capable" revert (chisei::controller) overrides the static heuristic even
+        // when it would otherwise say cheap: it's evidence-backed (gated against held eval
+        // history, not just the live per-request signal) and stays active until an operator or a
+        // later promotion clears it, covering gaps the live regression check alone can't (e.g. a
+        // regressed iteration since pruned). Promotions are written under the candidate's raw
+        // namespace (from sampled observations), which may differ from `policy_scope` (the first
+        // *matching policy* scope - subject/agent/gateway-key rank ahead of namespace); check both
+        // so a subject/agent-scoped policy doesn't silently hide the override. Normalize the class
+        // the same way promotion/scoring do (trim + lowercase) - the override is keyed by the
+        // normalized class, but `cheap_route_bias` below normalizes internally, so an unnormalized
+        // lookup here would miss the override for non-canonical casing/whitespace.
+        let normalized_task_class = crate::chisei::scoring::normalize_task_class(&r.task_class);
+        let capable_override_active = self
+            .active_promotions
+            .capable_override_active(&policy_scope, &normalized_task_class)
+            || self
+                .active_promotions
+                .capable_override_active(&r.namespace, &normalized_task_class);
+        let wants_cheap = !capable_override_active
+            && cheap_route_bias(&r.task_class, regression_signal.is_some()) == Some("cheap");
         let cheap_model = if wants_cheap && is_known_provider_runtime(&runtime) {
             self.resolve_live_model(
                 &format!("{}/cheap", runtime.trim()),
@@ -1773,6 +1816,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 stop_reason: observation.stop_reason,
                 timestamp: observation.timestamp,
                 scored: false,
+                task_class: crate::chisei::scoring::normalize_task_class(&observation.task_class),
             })
             .map_err(Status::internal)?;
         Ok(Response::new(RecordSampleObservationResponse {
@@ -2028,6 +2072,12 @@ impl ChiseiService for ChiseiServiceImpl {
                             stop_reason: chat.stop_reason.clone(),
                             timestamp: chrono::Utc::now().timestamp_millis(),
                             scored: false,
+                            // NOTE: `plan.task_class` holds the *privacy* class ("private"/
+                            // "template_only" — see `plan_from_input`), not the routing/cost-tier
+                            // class; the raw caller-supplied routing class lives on `input`.
+                            task_class: crate::chisei::scoring::normalize_task_class(
+                                &input.task_class,
+                            ),
                         });
             }
         }
@@ -2153,6 +2203,9 @@ impl ChiseiService for ChiseiServiceImpl {
         let sample_rate = plan.sample_rate;
         let sample_reason = plan.sample_reason.clone();
         let scoring_enabled = self.config.scoring_enabled;
+        // `plan.task_class` holds the *privacy* class here (see `plan_from_input`); the routing/
+        // cost-tier class the caller supplied is on the original `input`.
+        let task_class = crate::chisei::scoring::normalize_task_class(&input.task_class);
 
         let stream = async_stream::stream! {
             let mut content = String::new();
@@ -2217,6 +2270,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         sample_rate,
                         sample_reason: &sample_reason,
                         scoring_enabled,
+                        task_class: &task_class,
                         response: &response,
                     };
                     let _ = finish_streamed_execution(&execution);
@@ -2263,6 +2317,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     sample_rate,
                     sample_reason: &sample_reason,
                     scoring_enabled,
+                    task_class: &task_class,
                     response: &response,
                 };
                 let _ = finish_streamed_execution(&execution);
@@ -2890,6 +2945,66 @@ mod tests {
         assert_eq!(resolution.model, "gpt-5.5-mini");
         assert_eq!(resolution.route_bias, "cheap");
         assert_eq!(resolution.runtime, "openai");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_respects_a_promoted_capable_override() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+
+        // Promote a "capable" revert for (proj, background) directly through the service's own
+        // candidate store/active-promotions registry, exactly as a promotion controller would.
+        let candidate = crate::chisei::promotion::Candidate {
+            id: "candidate-1".into(),
+            kind: crate::chisei::promotion::KIND_ROUTING_BIAS.to_string(),
+            namespace: "proj".into(),
+            task_class: "background".into(),
+            payload: serde_json::to_string(&crate::chisei::promotion::RoutingBiasPayload {
+                bias: "capable".into(),
+            })
+            .unwrap(),
+            rationale: "test".into(),
+            status: crate::chisei::promotion::STATUS_GATE_PASSED.to_string(),
+            source_ref: "test".into(),
+            created: 1,
+        };
+        svc.candidate_store().upsert(candidate.clone());
+        crate::chisei::controller::promote_candidate(
+            &svc.candidate_store(),
+            &svc.active_promotions(),
+            &svc.db,
+            &candidate.id,
+        )
+        .expect("gate_passed candidate should promote");
+
+        // Without the override, background would route to the cheaper model (as the sibling test
+        // above confirms); the active "capable" promotion must force the capable model instead.
+        // Non-canonical casing/whitespace on the request's task_class must still hit the
+        // (normalized) override - `cheap_route_bias` normalizes internally, so an unnormalized
+        // lookup here would otherwise miss the override and route cheap right past it.
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5");
+        background.task_class = " Background ".into();
+        let resolution = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolution.model, "gpt-5.5");
+        assert_eq!(resolution.route_bias, "");
     }
 
     #[tokio::test]

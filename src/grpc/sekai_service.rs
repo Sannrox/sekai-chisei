@@ -4365,6 +4365,7 @@ impl SekaiService for SekaiServiceImpl {
                 .list_decisions(&audit::DecisionFilter {
                     actor: actor_filter.clone(),
                     action: action_filter.clone(),
+                    target_id: None,
                     after: inner.after,
                     limit: batch_size as i32,
                     offset,
