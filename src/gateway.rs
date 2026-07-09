@@ -366,6 +366,9 @@ async fn proxy_gateway(
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
     let started_ms = Utc::now().timestamp_millis();
+    // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
+    // even under `no_preflight`, where the routing-only call below is skipped.
+    let task_class = resolve_task_class(&headers, requested_model.as_deref());
     let preflight_context = UsageContext {
         request_id: request_id.clone(),
         provider: client_provider,
@@ -376,6 +379,7 @@ async fn proxy_gateway(
         request_bytes,
         started_ms,
         route_bias: None,
+        task_class: task_class.clone(),
     };
     let (resolved, egress) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
@@ -401,7 +405,6 @@ async fn proxy_gateway(
                 .await;
             return rejection.response();
         }
-        let task_class = resolve_task_class(&headers, requested_model.as_deref());
         let resolved = match resolve_policy_preflight(
             &state.config,
             &identity,
@@ -504,6 +507,7 @@ async fn proxy_gateway(
                     request_bytes,
                     started_ms,
                     route_bias: resolved.route_bias,
+                    task_class,
                 },
                 prepared.response_adapter,
             )
@@ -531,6 +535,7 @@ struct UsageContext {
     request_bytes: usize,
     started_ms: i64,
     route_bias: Option<String>,
+    task_class: String,
 }
 
 #[derive(Debug)]
@@ -2561,10 +2566,9 @@ fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
         )
     } else if let Some(rest) = path.strip_prefix("/v1/messages") {
         (ProviderKind::Anthropic, format!("/messages{rest}"))
-    } else if let Some(rest) = path.strip_prefix("/messages") {
-        (ProviderKind::Anthropic, format!("/messages{rest}"))
     } else {
-        return None;
+        let rest = path.strip_prefix("/messages")?;
+        (ProviderKind::Anthropic, format!("/messages{rest}"))
     };
     Some(mapped)
 }
@@ -3010,6 +3014,7 @@ async fn record_sample_observation_if_needed(
                 output_tokens: usage.output_tokens,
                 stop_reason: response_observation.stop_reason.clone(),
                 timestamp: Utc::now().timestamp_millis(),
+                task_class: context.task_class.clone(),
             }),
         }))
         .await
