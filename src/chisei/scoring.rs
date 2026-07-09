@@ -45,6 +45,12 @@ pub struct SampleObservation {
     pub stop_reason: String,
     pub timestamp: i64,
     pub scored: bool,
+    /// Routing/cost-tier task class (e.g. `background`, `primary`, `bulk`) resolved at execute
+    /// time. Empty for observations recorded before this field existed or where no class was
+    /// resolved. Lets Phase A verdicts be sliced by task-class alongside namespace + model,
+    /// matching how Plan 8B routing bias decisions are keyed.
+    #[serde(default)]
+    pub task_class: String,
 }
 
 /// Structured verdict the judge produces for a single observation.
@@ -90,6 +96,12 @@ pub trait Judge: Send + Sync {
 
 /// Synthetic suite id namespace for sampled observations of a namespace.
 const SUITE_PREFIX: &str = "sampling-";
+
+/// The synthetic eval suite id a namespace's sampled observations score into. Shared with
+/// `chisei::promotion`, so proposal logic can find the same suite this job writes to.
+pub fn sampling_suite_id(namespace: &str) -> String {
+    format!("{SUITE_PREFIX}{namespace}")
+}
 /// LLM-judge score (0..=100) at or above which an observation passes on the judge axis.
 const PASS_THRESHOLD: i32 = 60;
 /// Bound on the stored output snippet so run JSON stays compact.
@@ -200,6 +212,14 @@ impl ScoringJob {
         }
 
         let pending = observations.len();
+        // Grouped by namespace only: one suite/run/iteration per namespace per cycle, exactly as
+        // before task_class existed. task_class is tracked per-observation (see below) and rolled
+        // up into the audit evidence, but must not change suite/iteration topology — splitting the
+        // regression-driving artifact per class would let `namespace_regression_signal` (which
+        // returns a single "latest iteration for this namespace") pick between same-cycle
+        // per-class iterations arbitrarily, masking whichever class scored second, and would starve
+        // `MIN_OBS_FOR_REGRESSION` for namespaces whose combined batch is only reached by mixing
+        // classes.
         let mut by_namespace: BTreeMap<String, Vec<SampleObservation>> = BTreeMap::new();
         for obs in observations {
             by_namespace
@@ -366,7 +386,7 @@ impl ScoringJob {
         group: &[&SampleObservation],
         results: Vec<eval::CaseResult>,
     ) -> Result<(), String> {
-        let suite_id = format!("{SUITE_PREFIX}{namespace}");
+        let suite_id = sampling_suite_id(namespace);
         let changed_file = format!("sampling/{namespace}");
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -433,12 +453,19 @@ impl ScoringJob {
         }
 
         // Always record the scored run as an audit decision (the durable, queryable outcome),
-        // whether or not it was large enough to drive a regression signal.
+        // whether or not it was large enough to drive a regression signal. Per-task-class pass
+        // rates are rolled up here (not into separate suites/iterations — see the grouping note in
+        // `run_once`) so downstream proposal logic (Plan 11 Phase B) can read a task-class-scoped
+        // signal without splitting the regression-driving artifact itself.
         let mut evidence = std::collections::HashMap::new();
         evidence.insert("namespace".to_string(), namespace.to_string());
         evidence.insert("run_id".to_string(), run.id.clone());
         evidence.insert("model".to_string(), self.model.clone());
         evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
+        evidence.insert(
+            "task_class_breakdown".to_string(),
+            task_class_breakdown_json(group, &run.results),
+        );
         if let Some(delta) = delta {
             evidence.insert("delta".to_string(), format!("{delta:.1}"));
             evidence.insert("regressed".to_string(), regressed.to_string());
@@ -668,6 +695,37 @@ fn verdict_from_args(args: &serde_json::Value) -> Option<JudgeVerdict> {
     })
 }
 
+/// Trim + lowercase, matching the normalization `gateway::resolve_task_class` and
+/// `chisei_service::cheap_route_bias` already apply when reading this field, so case/whitespace
+/// variants of the same class (e.g. `"Primary"` vs `"primary"`) roll up together instead of
+/// fragmenting the breakdown.
+pub(crate) fn normalize_task_class(task_class: &str) -> String {
+    task_class.trim().to_ascii_lowercase()
+}
+
+#[derive(Serialize)]
+struct ClassCount {
+    pass: u64,
+    total: u64,
+}
+
+/// Per-task-class pass/total counts for one scored batch, as a compact JSON object
+/// (`{"primary":{"pass":6,"total":6}}`), for audit-evidence purposes only — this never affects
+/// suite/iteration identity or the regression signal (see the grouping note in `run_once`).
+fn task_class_breakdown_json(group: &[&SampleObservation], results: &[eval::CaseResult]) -> String {
+    let mut counts: BTreeMap<String, ClassCount> = BTreeMap::new();
+    for (obs, result) in group.iter().zip(results.iter()) {
+        let entry = counts
+            .entry(normalize_task_class(&obs.task_class))
+            .or_insert(ClassCount { pass: 0, total: 0 });
+        entry.total += 1;
+        if result.passed {
+            entry.pass += 1;
+        }
+    }
+    serde_json::to_string(&counts).unwrap_or_default()
+}
+
 fn status_from_stop_reason(stop_reason: &str) -> String {
     match stop_reason {
         "end_turn" | "stop" | "" => "ok".to_string(),
@@ -768,6 +826,17 @@ mod tests {
     }
 
     fn observe_with_output(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64, output: &str) {
+        observe_with_task_class(db, request_id, namespace, "", ts, output);
+    }
+
+    fn observe_with_task_class(
+        db: &SekaiDb,
+        request_id: &str,
+        namespace: &str,
+        task_class: &str,
+        ts: i64,
+        output: &str,
+    ) {
         db.put_sample_observation(&SampleObservation {
             request_id: request_id.into(),
             namespace: namespace.into(),
@@ -780,6 +849,7 @@ mod tests {
             stop_reason: "end_turn".into(),
             timestamp: ts,
             scored: false,
+            task_class: task_class.into(),
         })
         .unwrap();
     }
@@ -788,6 +858,27 @@ mod tests {
     fn observe_batch(db: &SekaiDb, namespace: &str, base: &str, count: usize, ts_base: i64) {
         for i in 0..count {
             observe(db, &format!("{base}-{i}"), namespace, ts_base + i as i64);
+        }
+    }
+
+    /// Seed `count` observations for a namespace + task_class with distinct ids/timestamps.
+    fn observe_batch_with_task_class(
+        db: &SekaiDb,
+        namespace: &str,
+        task_class: &str,
+        base: &str,
+        count: usize,
+        ts_base: i64,
+    ) {
+        for i in 0..count {
+            observe_with_task_class(
+                db,
+                &format!("{base}-{i}"),
+                namespace,
+                task_class,
+                ts_base + i as i64,
+                "here is the thing",
+            );
         }
     }
 
@@ -1085,6 +1176,46 @@ mod tests {
         // No tool call and prose content → Transient (model/config-shaped; must not delete data).
         let err = parse_verdict(&resp("I think this looks pretty good!", vec![])).unwrap_err();
         assert!(matches!(err, JudgeError::Transient(_)));
+    }
+
+    #[tokio::test]
+    async fn task_classes_within_a_namespace_score_into_one_run_with_a_breakdown() {
+        let (db, eval) = setup();
+        observe_batch_with_task_class(&db, "acme", "background", "bg", MIN_OBS_FOR_REGRESSION, 100);
+        observe_batch_with_task_class(&db, "acme", "primary", "pr", MIN_OBS_FOR_REGRESSION, 200);
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval.clone(),
+            Arc::new(StubJudge {
+                score: 90,
+                passed: true,
+            }),
+            32,
+            "claude-opus-4-8",
+        );
+        let scored = job.run_once().await.unwrap();
+        assert_eq!(scored, MIN_OBS_FOR_REGRESSION * 2);
+
+        // Both classes score into the single per-namespace suite/run (topology is unaffected by
+        // task_class)...
+        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].results.len(), MIN_OBS_FOR_REGRESSION * 2);
+        assert!(!eval.namespace_regression_signal("acme").unwrap().regressed);
+
+        // ...but the audit decision still carries a per-task-class breakdown.
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("scored".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        let breakdown = decisions[0].evidence.get("task_class_breakdown").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(breakdown).unwrap();
+        assert_eq!(parsed["background"]["total"], MIN_OBS_FOR_REGRESSION);
+        assert_eq!(parsed["primary"]["total"], MIN_OBS_FOR_REGRESSION);
     }
 
     #[tokio::test]

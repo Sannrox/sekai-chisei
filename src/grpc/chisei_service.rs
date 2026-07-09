@@ -49,6 +49,7 @@ struct FinishStreamedExecution<'a> {
     sample_rate: f64,
     sample_reason: &'a str,
     scoring_enabled: bool,
+    task_class: &'a str,
     response: &'a PlannedChatResponse,
 }
 
@@ -146,6 +147,7 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
                         stop_reason: execution.response.stop_reason.clone(),
                         timestamp: chrono::Utc::now().timestamp_millis(),
                         scored: false,
+                        task_class: execution.task_class.to_string(),
                     });
         }
     }
@@ -1773,6 +1775,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 stop_reason: observation.stop_reason,
                 timestamp: observation.timestamp,
                 scored: false,
+                task_class: crate::chisei::scoring::normalize_task_class(&observation.task_class),
             })
             .map_err(Status::internal)?;
         Ok(Response::new(RecordSampleObservationResponse {
@@ -2028,6 +2031,12 @@ impl ChiseiService for ChiseiServiceImpl {
                             stop_reason: chat.stop_reason.clone(),
                             timestamp: chrono::Utc::now().timestamp_millis(),
                             scored: false,
+                            // NOTE: `plan.task_class` holds the *privacy* class ("private"/
+                            // "template_only" — see `plan_from_input`), not the routing/cost-tier
+                            // class; the raw caller-supplied routing class lives on `input`.
+                            task_class: crate::chisei::scoring::normalize_task_class(
+                                &input.task_class,
+                            ),
                         });
             }
         }
@@ -2153,6 +2162,9 @@ impl ChiseiService for ChiseiServiceImpl {
         let sample_rate = plan.sample_rate;
         let sample_reason = plan.sample_reason.clone();
         let scoring_enabled = self.config.scoring_enabled;
+        // `plan.task_class` holds the *privacy* class here (see `plan_from_input`); the routing/
+        // cost-tier class the caller supplied is on the original `input`.
+        let task_class = crate::chisei::scoring::normalize_task_class(&input.task_class);
 
         let stream = async_stream::stream! {
             let mut content = String::new();
@@ -2217,6 +2229,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         sample_rate,
                         sample_reason: &sample_reason,
                         scoring_enabled,
+                        task_class: &task_class,
                         response: &response,
                     };
                     let _ = finish_streamed_execution(&execution);
@@ -2263,6 +2276,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     sample_rate,
                     sample_reason: &sample_reason,
                     scoring_enabled,
+                    task_class: &task_class,
                     response: &response,
                 };
                 let _ = finish_streamed_execution(&execution);
