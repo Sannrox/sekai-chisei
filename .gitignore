@@ -13,3 +13,4 @@ data/*.sqlite-*
 __pycache__/
 *.pyc
 data/logs/
+docs/plans/
