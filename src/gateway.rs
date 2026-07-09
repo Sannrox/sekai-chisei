@@ -30,7 +30,8 @@ use crate::grpc::pb::chisei::{
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     AppendRowsRequest, ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest,
-    Dataset, FindByExternalIdRequest, FindByPropertyRequest, Link, Object as SekaiObject, Row,
+    Dataset, FindByExternalIdRequest, FindByPropertyRequest, Link, ListSchemaTypesRequest,
+    Object as SekaiObject, Row,
 };
 use crate::llm::{HttpTimeouts, classify_reqwest_error};
 
@@ -197,6 +198,16 @@ pub struct GatewayIdentity {
     pub tier: String,
 }
 
+impl GatewayIdentity {
+    fn context_principal(&self) -> &str {
+        if self.key_id.is_empty() {
+            "gateway-passthrough"
+        } else {
+            &self.user_id
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpstreamAuthMode {
     GatewayKey,
@@ -360,6 +371,16 @@ async fn proxy_gateway(
             );
         }
     };
+    let (body, context_request) = match extract_gateway_context_request(&body) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid chisei_context: {err}"),
+            );
+        }
+    };
     let request_bytes = body.len();
     let requested_model = extract_request_model(&body);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -381,6 +402,13 @@ async fn proxy_gateway(
         route_bias: None,
         task_class: task_class.clone(),
     };
+    if state.config.no_preflight && context_request.is_some() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "explicit governed context is unavailable while preflight is disabled",
+        );
+    }
     let (resolved, egress) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
@@ -427,6 +455,7 @@ async fn proxy_gateway(
             &identity,
             client_provider,
             &resolved.body,
+            context_request.as_ref(),
             requested_model.as_deref(),
             resolved.resolved_model.as_deref(),
         )
@@ -695,6 +724,34 @@ struct PolicyPreflight {
 #[derive(Debug, Clone)]
 struct ContextEgressPreflight {
     body: Vec<u8>,
+}
+
+const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
+const MAX_CONTEXT_FIELDS_PER_OBJECT: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayContextRequest {
+    objects: Vec<GatewayContextObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayContextObject {
+    external_id: String,
+    fields: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayContextRequest {
+    objects: Vec<RawGatewayContextObject>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayContextObject {
+    #[serde(rename = "ref")]
+    external_id: String,
+    fields: Vec<String>,
 }
 
 async fn resolve_policy_preflight(
@@ -1512,70 +1569,200 @@ async fn apply_context_egress(
     identity: &GatewayIdentity,
     provider: ProviderKind,
     body: &[u8],
+    context_request: Option<&GatewayContextRequest>,
     requested_model: Option<&str>,
     resolved_model: Option<&str>,
 ) -> Result<ContextEgressPreflight, Response<Body>> {
     let Some(target) = &config.chisei_grpc_target else {
+        if context_request.is_some() {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_unavailable",
+                "explicit governed context requires a configured control plane",
+            ));
+        }
         return Ok(ContextEgressPreflight {
             body: body.to_vec(),
         });
     };
-    let refs = extract_gateway_object_refs(&identity.project, body);
-    if refs.is_empty() {
+    let selections = context_request
+        .map(|request| request.objects.clone())
+        .unwrap_or_else(|| {
+            extract_gateway_object_refs(&identity.project, body)
+                .into_iter()
+                .map(|external_id| GatewayContextObject {
+                    external_id,
+                    fields: Vec::new(),
+                })
+                .collect()
+        });
+    if selections.is_empty() {
         return Ok(ContextEgressPreflight {
             body: body.to_vec(),
         });
     }
-    let Ok(channel) = connect_sekai(target).await else {
-        return Ok(ContextEgressPreflight {
-            body: body.to_vec(),
-        });
+    let channel = match connect_sekai(target).await {
+        Ok(channel) => channel,
+        Err(error) if context_request.is_some() || config.fail_closed => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_unavailable",
+                &format!("failed to resolve governed context: {error}"),
+            ));
+        }
+        Err(_) => {
+            return Ok(ContextEgressPreflight {
+                body: body.to_vec(),
+            });
+        }
     };
     let mut sekai = SekaiServiceClient::new(channel);
+    let restricted_fields = match sekai
+        .list_schema_types(gateway_request(ListSchemaTypesRequest {}))
+        .await
+    {
+        Ok(response) => restricted_gateway_fields(response.into_inner().types),
+        Err(status) if context_request.is_some() || config.fail_closed => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_unavailable",
+                &format!("failed to resolve context schema: {status}"),
+            ));
+        }
+        Err(_) => {
+            return Ok(ContextEgressPreflight {
+                body: body.to_vec(),
+            });
+        }
+    };
     let mut redacted_count = 0usize;
     let mut decisions = 0usize;
+    let mut requested_field_count = 0usize;
+    let mut missing_field_count = 0usize;
+    let mut omitted_field_count = 0usize;
+    let mut eligible_context_chars = 0usize;
     let mut injectable: Vec<InjectableObject> = Vec::new();
 
-    for external_id in refs {
+    for selection in selections {
         let object = match sekai
-            .find_by_external_id(gateway_request(FindByExternalIdRequest {
-                external_id: external_id.clone(),
-            }))
+            .find_by_external_id(
+                principal_request(
+                    FindByExternalIdRequest {
+                        external_id: selection.external_id.clone(),
+                    },
+                    identity.context_principal(),
+                )
+                .map_err(|status| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_unavailable",
+                        &format!("failed to authorize governed context: {status}"),
+                    )
+                })?,
+            )
             .await
         {
             Ok(resp) => resp.into_inner().object,
+            Err(status) if context_request.is_some() => {
+                let (status_code, code) = if status.code() == tonic::Code::NotFound {
+                    (StatusCode::NOT_FOUND, "context_not_found")
+                } else if status.code() == tonic::Code::PermissionDenied {
+                    (StatusCode::FORBIDDEN, "context_denied")
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, "governance_unavailable")
+                };
+                return Err(json_error(
+                    status_code,
+                    code,
+                    &format!("failed to resolve explicit governed context: {status}"),
+                ));
+            }
             Err(_) => None,
         };
+        if object.is_none() && context_request.is_some() {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "context_not_found",
+                "explicit governed context object was not found",
+            ));
+        }
         let Some(object) = object else {
             continue;
         };
         let domain_object = domain_object_from_proto(&object);
+        let object_restricted_fields = match restricted_fields.get(&domain_object.kind) {
+            Some(fields) => Some(fields),
+            None if context_request.is_some() => {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    &format!(
+                        "schema metadata unavailable for explicit context kind {}",
+                        domain_object.kind
+                    ),
+                ));
+            }
+            None => None,
+        };
+        let eligible_fields = gateway_egress_fields(&domain_object);
+        let requested_fields = if selection.fields.is_empty() {
+            eligible_fields.clone()
+        } else {
+            selection
+                .fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        };
+        let selected_field_count = requested_fields.len();
+        requested_field_count += requested_fields.len();
+        omitted_field_count += eligible_fields
+            .iter()
+            .filter(|field| !requested_fields.contains(field))
+            .count();
+
+        let mut eligible_record = crate::chisei::egress::new_record(&domain_object);
+        let eligible_values = eligible_fields
+            .iter()
+            .filter_map(|field| {
+                filter_gateway_context_property(
+                    &domain_object,
+                    field,
+                    object_restricted_fields,
+                    &mut eligible_record,
+                )
+                .map(|value| format!("{field}: {value}"))
+            })
+            .collect::<Vec<_>>();
+        if !eligible_values.is_empty() {
+            let eligible_line = format_gateway_object_context(&domain_object, &eligible_values);
+            if eligible_context_chars > 0 {
+                eligible_context_chars += 1;
+            }
+            eligible_context_chars += eligible_line.chars().count();
+        }
+
         let mut record = crate::chisei::egress::new_record(&domain_object);
         let mut included_fields = Vec::new();
-        for field in gateway_egress_fields(&domain_object) {
-            if let Some(value) =
-                crate::chisei::egress::filter_property(&domain_object, field, &mut record, true)
-            {
+        for field in requested_fields {
+            if let Some(value) = filter_gateway_context_property(
+                &domain_object,
+                field,
+                object_restricted_fields,
+                &mut record,
+            ) {
                 included_fields.push(format!("{field}: {value}"));
             }
         }
+        missing_field_count += selected_field_count
+            .saturating_sub(record.included_fields.len() + record.redacted_fields.len());
         if record.included_fields.is_empty() && record.redacted_fields.is_empty() {
             continue;
         }
         decisions += 1;
         redacted_count += record.redacted_fields.len();
         if !included_fields.is_empty() {
-            let line = if crate::chisei::egress::include_identity(&domain_object) {
-                format!(
-                    "object {} ({}) [{}] {}",
-                    domain_object.kind,
-                    domain_object.name,
-                    domain_object.external_id,
-                    included_fields.join(", ")
-                )
-            } else {
-                format!("object context {}", included_fields.join(", "))
-            };
+            let line = format_gateway_object_context(&domain_object, &included_fields);
             injectable.push(InjectableObject {
                 line,
                 included_fields: record.included_fields.len(),
@@ -1584,7 +1771,7 @@ async fn apply_context_egress(
         }
     }
 
-    if decisions == 0 {
+    if decisions == 0 && missing_field_count == 0 {
         return Ok(ContextEgressPreflight {
             body: body.to_vec(),
         });
@@ -1605,6 +1792,9 @@ async fn apply_context_egress(
         .collect::<Vec<_>>()
         .join("\n");
     let injected_context_chars = injected_context.chars().count();
+    let estimated_tokens_avoided = eligible_context_chars
+        .saturating_sub(injected_context_chars)
+        .div_ceil(4);
     let next_body = if injected_context.is_empty() {
         body.to_vec()
     } else {
@@ -1631,6 +1821,8 @@ async fn apply_context_egress(
         "context egress policy applied",
         if redacted_count > 0 {
             "redacted"
+        } else if decisions == 0 {
+            "empty"
         } else {
             "included"
         },
@@ -1657,10 +1849,78 @@ async fn apply_context_egress(
                 "dropped_object_context".to_string(),
                 dropped_objects.to_string(),
             ),
+            (
+                "context_selection".to_string(),
+                if context_request.is_some() {
+                    "explicit"
+                } else {
+                    "legacy"
+                }
+                .to_string(),
+            ),
+            (
+                "requested_field_count".to_string(),
+                requested_field_count.to_string(),
+            ),
+            (
+                "omitted_field_count".to_string(),
+                omitted_field_count.to_string(),
+            ),
+            (
+                "missing_field_count".to_string(),
+                missing_field_count.to_string(),
+            ),
+            (
+                "eligible_context_chars".to_string(),
+                eligible_context_chars.to_string(),
+            ),
+            (
+                "estimated_tokens_avoided".to_string(),
+                estimated_tokens_avoided.to_string(),
+            ),
         ]),
     )
     .await;
     Ok(ContextEgressPreflight { body: next_body })
+}
+
+fn restricted_gateway_fields(
+    types: Vec<crate::grpc::pb::sekai::ObjectType>,
+) -> HashMap<String, std::collections::HashSet<String>> {
+    types
+        .into_iter()
+        .map(|object_type| {
+            let fields = object_type
+                .properties
+                .into_iter()
+                .filter(|property| {
+                    crate::sekai::schema::is_restricted_property_classification(
+                        &property.classification,
+                    )
+                })
+                .map(|property| property.name)
+                .collect();
+            (object_type.kind, fields)
+        })
+        .collect()
+}
+
+fn filter_gateway_context_property(
+    object: &crate::domain::Object,
+    field: &str,
+    restricted_fields: Option<&std::collections::HashSet<String>>,
+    record: &mut crate::chisei::egress::ContextEgressRecord,
+) -> Option<String> {
+    if restricted_fields.is_some_and(|restricted| restricted.contains(field))
+        && object.properties.contains_key(field)
+    {
+        record.redacted_fields.push(field.to_string());
+        record
+            .reasons
+            .push(format!("{field} denied by schema classification"));
+        return None;
+    }
+    crate::chisei::egress::filter_property(object, field, record, true)
 }
 
 fn inject_gateway_context(
@@ -1822,6 +2082,89 @@ fn append_context_to_last_anthropic_message(
     }
 }
 
+fn extract_gateway_context_request(
+    body: &[u8],
+) -> Result<(Vec<u8>, Option<GatewayContextRequest>), String> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok((body.to_vec(), None));
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok((body.to_vec(), None));
+    };
+    let Some(raw_context) = object.remove("chisei_context") else {
+        return Ok((body.to_vec(), None));
+    };
+    let raw: RawGatewayContextRequest =
+        serde_json::from_value(raw_context).map_err(|error| error.to_string())?;
+    if raw.objects.is_empty() {
+        return Err("objects must not be empty".to_string());
+    }
+    if raw.objects.len() > MAX_CONTEXT_OBJECT_SELECTORS {
+        return Err(format!(
+            "at most {MAX_CONTEXT_OBJECT_SELECTORS} objects may be selected"
+        ));
+    }
+
+    let mut objects: Vec<GatewayContextObject> = Vec::new();
+    let mut by_ref = HashMap::<String, usize>::new();
+    for selector in raw.objects {
+        let (kind, value) = parse_exact_gateway_object_ref(&selector.external_id)
+            .ok_or_else(|| format!("invalid object ref {:?}", selector.external_id))?;
+        if selector.fields.is_empty() {
+            return Err(format!(
+                "object ref {kind}:{value} must select at least one field"
+            ));
+        }
+        if selector.fields.len() > MAX_CONTEXT_FIELDS_PER_OBJECT {
+            return Err(format!(
+                "object ref {kind}:{value} selects more than {MAX_CONTEXT_FIELDS_PER_OBJECT} fields"
+            ));
+        }
+        let external_id = format!("{kind}:{value}");
+        let mut fields = Vec::new();
+        let mut seen_fields = std::collections::HashSet::new();
+        for field in selector.fields {
+            let field = field.trim();
+            if !crate::domain::is_valid_property_key(field) {
+                return Err(format!("invalid property field {field:?}"));
+            }
+            if seen_fields.insert(field.to_string()) {
+                fields.push(field.to_string());
+            }
+        }
+        if let Some(index) = by_ref.get(&external_id).copied() {
+            let existing = &mut objects[index].fields;
+            for field in fields {
+                if existing.contains(&field) {
+                    continue;
+                }
+                if existing.len() >= MAX_CONTEXT_FIELDS_PER_OBJECT {
+                    return Err(format!(
+                        "object ref {external_id} selects more than {MAX_CONTEXT_FIELDS_PER_OBJECT} fields"
+                    ));
+                }
+                existing.push(field);
+            }
+        } else {
+            by_ref.insert(external_id.clone(), objects.len());
+            objects.push(GatewayContextObject {
+                external_id,
+                fields,
+            });
+        }
+    }
+
+    let body = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok((body, Some(GatewayContextRequest { objects })))
+}
+
+fn parse_exact_gateway_object_ref(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    let parsed = parse_gateway_object_ref(trimmed)?;
+    let canonical = format!("{}:{}", parsed.0, parsed.1);
+    (canonical == trimmed).then_some(parsed)
+}
+
 fn extract_gateway_object_refs(project: &str, body: &[u8]) -> Vec<String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Vec::new();
@@ -1913,6 +2256,23 @@ fn gateway_egress_fields(object: &crate::domain::Object) -> Vec<&str> {
                 .is_some_and(|value| !value.is_empty())
         })
         .collect()
+}
+
+fn format_gateway_object_context(
+    object: &crate::domain::Object,
+    included_fields: &[String],
+) -> String {
+    if crate::chisei::egress::include_identity(object) {
+        format!(
+            "object {} ({}) [{}] {}",
+            object.kind,
+            object.name,
+            object.external_id,
+            included_fields.join(", ")
+        )
+    } else {
+        format!("object context {}", included_fields.join(", "))
+    }
 }
 
 fn domain_object_from_proto(object: &SekaiObject) -> crate::domain::Object {
@@ -3293,6 +3653,14 @@ fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     request
 }
 
+fn principal_request<T>(message: T, principal: &str) -> Result<GrpcRequest<T>, tonic::Status> {
+    let mut request = GrpcRequest::new(message);
+    let principal = tonic::metadata::MetadataValue::try_from(principal)
+        .map_err(|_| tonic::Status::internal("invalid authenticated gateway principal"))?;
+    request.metadata_mut().insert("x-principal", principal);
+    Ok(request)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ResponseUsage {
     input_tokens: i32,
@@ -4610,6 +4978,13 @@ mod tests {
             });
         }
 
+        spawn_control_plane_from_db(config, db).await
+    }
+
+    async fn spawn_control_plane_from_db(
+        config: Config,
+        db: Arc<SekaiDb>,
+    ) -> (String, Arc<SekaiDb>) {
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6413,10 +6788,26 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let explicit = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hello",
+                "chisei_context": {
+                    "objects": [{"ref": "ticker:AAPL", "fields": ["score"]}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(explicit.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn no_preflight_skips_unavailable_control_plane_checks() {
+    async fn no_preflight_still_forwards_requests_without_governed_context() {
         let (upstream_base, requests) =
             spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -6452,7 +6843,10 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
-            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hello"
+            }))
             .send()
             .await
             .unwrap();
@@ -6464,6 +6858,58 @@ mod tests {
             requests[0].authorization.as_deref(),
             Some("Bearer real-openai-key")
         );
+    }
+
+    #[tokio::test]
+    async fn no_preflight_rejects_explicit_governed_context() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::from([(
+                "sk-chisei-codex-app".to_string(),
+                GatewayIdentity {
+                    agent: "codex-app".to_string(),
+                    project: "default".to_string(),
+                    user_id: "agent:codex-app".to_string(),
+                    key_id: "codex-app".to_string(),
+                    tier: DEFAULT_GATEWAY_TIER.to_string(),
+                },
+            )]),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: true,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hello",
+                "chisei_context": {
+                    "objects": [{"ref": "ticker:AAPL", "fields": ["score"]}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6737,6 +7183,293 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_context_missing_object_maps_to_not_found() {
+        let (chisei_target, db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        config.fail_closed = true;
+        let identity = GatewayIdentity {
+            agent: "codex-app".into(),
+            project: "default".into(),
+            user_id: "agent:codex-app".into(),
+            key_id: "codex-app".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        let request = GatewayContextRequest {
+            objects: vec![GatewayContextObject {
+                external_id: "ticker:missing".into(),
+                fields: vec!["score".into()],
+            }],
+        };
+
+        let response = apply_context_egress(
+            &config,
+            &identity,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            br#"{"model":"gpt-5.5","input":"analyze"}"#,
+            Some(&request),
+            Some("gpt-5.5"),
+            Some("gpt-5.5"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        db.create_object(&crate::domain::Object {
+            id: "untyped-object".into(),
+            kind: "untyped_context".into(),
+            name: "untyped".into(),
+            namespace: "default".into(),
+            external_id: "untyped_context:one".into(),
+            properties: HashMap::from([
+                ("note".into(), "must not fail open".into()),
+                (
+                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "note".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let untyped_request = GatewayContextRequest {
+            objects: vec![GatewayContextObject {
+                external_id: "untyped_context:one".into(),
+                fields: vec!["note".into()],
+            }],
+        };
+        let response = apply_context_egress(
+            &config,
+            &identity,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            br#"{"model":"gpt-5.5","input":"analyze"}"#,
+            Some(&untyped_request),
+            Some("gpt-5.5"),
+            Some("gpt-5.5"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn explicit_context_manifest_injects_only_selected_fields() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
+        let (chisei_target, db) = spawn_control_plane().await;
+        db.create_object(&crate::domain::Object {
+            id: "ticker-aapl".to_string(),
+            kind: "ticker".to_string(),
+            name: "AAPL".to_string(),
+            namespace: "sekai-chisei".to_string(),
+            external_id: "ticker:AAPL".to_string(),
+            properties: HashMap::from([
+                ("verdict".to_string(), "bullish".to_string()),
+                ("score".to_string(), "0.82".to_string()),
+                ("secret_note".to_string(), "do not forward".to_string()),
+                (
+                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    "score,verdict".to_string(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "sekai-chisei".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "analyze the selected context",
+                "chisei_context": {
+                    "objects": [{"ref": "ticker:AAPL", "fields": ["score", "secret_note"]}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let forwarded: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+            assert!(forwarded.get("chisei_context").is_none());
+            let forwarded_input = forwarded["input"].as_str().unwrap();
+            assert!(forwarded_input.contains("score: 0.82"));
+            assert!(!forwarded_input.contains("bullish"));
+            assert!(!forwarded_input.contains("do not forward"));
+        }
+
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.egress".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        let evidence = &decisions[0].evidence;
+        assert_eq!(
+            evidence.get("context_selection").map(String::as_str),
+            Some("explicit")
+        );
+        assert_eq!(
+            evidence.get("requested_field_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            evidence.get("omitted_field_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            evidence.get("redacted_count").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(decisions[0].outcome, "redacted");
+        assert!(
+            evidence
+                .get("estimated_tokens_avoided")
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|value| value > 0)
+        );
+
+        let missing = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "analyze a missing field",
+                "chisei_context": {
+                    "objects": [{"ref": "ticker:AAPL", "fields": ["missing_field"]}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::OK);
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.egress".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let missing_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision
+                    .evidence
+                    .get("missing_field_count")
+                    .map(String::as_str)
+                    == Some("1")
+            })
+            .expect("missing field selection must be audited");
+        assert_eq!(missing_decision.outcome, "empty");
+        assert_eq!(missing_decision.evidence["payload_rewritten"], "false");
+    }
+
+    #[tokio::test]
+    async fn explicit_context_manifest_enforces_the_authenticated_callers_acl() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        db.create_object(&crate::domain::Object {
+            id: "private-ticker".to_string(),
+            kind: "ticker".to_string(),
+            name: "PRIVATE".to_string(),
+            namespace: "sekai-chisei".to_string(),
+            external_id: "ticker:PRIVATE".to_string(),
+            properties: HashMap::from([
+                ("score".to_string(), "0.99".to_string()),
+                (
+                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    "score".to_string(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.create_grant(&crate::sekai::security::Grant {
+            id: "private-ticker-grant".to_string(),
+            object_id: "private-ticker".to_string(),
+            principal: "agent:other".to_string(),
+            role: crate::sekai::security::Role::Viewer,
+            created: 0,
+        })
+        .unwrap();
+        let (chisei_target, _) = spawn_control_plane_from_db(test_config(), db).await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "sekai-chisei".to_string(),
+            gateway_keys: HashMap::from([(
+                "caller-key".to_string(),
+                GatewayIdentity {
+                    agent: "codex-app".to_string(),
+                    project: "sekai-chisei".to_string(),
+                    user_id: "agent:codex-app".to_string(),
+                    key_id: "codex-app".to_string(),
+                    tier: DEFAULT_GATEWAY_TIER.to_string(),
+                },
+            )]),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("caller-key")
+            .json(&serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "analyze private context",
+                "chisei_context": {
+                    "objects": [{"ref": "ticker:PRIVATE", "fields": ["score"]}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7405,6 +8138,121 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(body_prefix_is_sse(b"\n\ndata: {}"), Some(true));
         assert_eq!(body_prefix_is_sse(b"{\"id\":\"resp_1\"}"), Some(false));
         assert_eq!(body_prefix_is_sse(b"plain text"), Some(false));
+    }
+
+    #[test]
+    fn context_manifest_is_removed_and_duplicate_refs_are_merged() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-5.5",
+            "input": "analyze",
+            "chisei_context": {
+                "objects": [
+                    {"ref": "ticker:AAPL", "fields": ["score", "score"]},
+                    {"ref": "ticker:AAPL", "fields": ["verdict"]}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let (cleaned, request) = extract_gateway_context_request(&body).unwrap();
+        let cleaned: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        assert!(cleaned.get("chisei_context").is_none());
+        assert_eq!(cleaned["input"], "analyze");
+        assert_eq!(
+            request.unwrap().objects,
+            vec![GatewayContextObject {
+                external_id: "ticker:AAPL".into(),
+                fields: vec!["score".into(), "verdict".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn context_manifest_rejects_implicit_or_empty_field_selection() {
+        let missing_fields = br#"{
+            "model":"gpt-5.5",
+            "chisei_context":{"objects":[{"ref":"ticker:AAPL","fields":[]}]}
+        }"#;
+        assert!(
+            extract_gateway_context_request(missing_fields)
+                .unwrap_err()
+                .contains("at least one field")
+        );
+
+        let malformed_ref = br#"{
+            "model":"gpt-5.5",
+            "chisei_context":{"objects":[{"ref":"ticker:{AAPL}","fields":["score"]}]}
+        }"#;
+        assert!(
+            extract_gateway_context_request(malformed_ref)
+                .unwrap_err()
+                .contains("invalid object ref")
+        );
+    }
+
+    #[test]
+    fn context_manifest_enforces_field_cap_after_duplicate_ref_merge() {
+        let first_fields = (0..MAX_CONTEXT_FIELDS_PER_OBJECT)
+            .map(|index| format!("field_{index}"))
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-5.5",
+            "chisei_context": {
+                "objects": [
+                    {"ref": "ticker:AAPL", "fields": first_fields},
+                    {"ref": "ticker:AAPL", "fields": ["one_more_field"]}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert!(
+            extract_gateway_context_request(&body)
+                .unwrap_err()
+                .contains("selects more than 32 fields")
+        );
+    }
+
+    #[test]
+    fn schema_restricted_context_field_stays_redacted_when_allowlisted() {
+        let object = crate::domain::Object {
+            id: "account-1".into(),
+            kind: "account".into(),
+            name: "account".into(),
+            namespace: "default".into(),
+            external_id: "account:1".into(),
+            properties: HashMap::from([
+                ("secret_note".into(), "do not forward".into()),
+                (
+                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "secret_note".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        };
+        let restricted = restricted_gateway_fields(vec![crate::grpc::pb::sekai::ObjectType {
+            kind: "account".into(),
+            properties: vec![crate::grpc::pb::sekai::PropertyDef {
+                name: "secret_note".into(),
+                classification: "sensitive".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        let mut record = crate::chisei::egress::new_record(&object);
+
+        assert_eq!(
+            filter_gateway_context_property(
+                &object,
+                "secret_note",
+                restricted.get("account"),
+                &mut record,
+            ),
+            None
+        );
+        assert_eq!(record.redacted_fields, vec!["secret_note"]);
+        assert!(record.reasons[0].contains("schema classification"));
     }
 
     #[test]

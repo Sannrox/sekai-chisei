@@ -235,6 +235,28 @@ bounded to `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` characters (default 4000) s
 precision-injection never balloons the prompt; the egress audit records the
 injected character count and how many object contexts were dropped by the cap.
 
+Clients that can shape the raw provider request may select exact governed fields
+with a top-level `chisei_context` manifest. The gateway removes this control
+field before forwarding and injects only fields that are both selected and
+permitted by egress policy:
+
+```json
+{
+  "model": "gpt-5.5",
+  "input": "Analyze the selected evidence.",
+  "chisei_context": {
+    "objects": [
+      { "ref": "ticker:AAPL", "fields": ["score", "confidence"] }
+    ]
+  }
+}
+```
+
+The audit distinguishes explicit from legacy text-reference selection and
+records requested and omitted fields, eligible versus injected characters, and
+an estimated avoided-input-token count. Empty field lists are rejected so an
+explicit selector cannot silently fall back to broad context.
+
 ### One-command launch
 
 ```bash
