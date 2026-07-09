@@ -17,6 +17,7 @@ use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::config::Config;
+use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::sekai::SekaiDb;
 use crate::domain::{ListFilter, Object};
 
@@ -204,7 +205,7 @@ impl ChiseiServiceImpl {
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         Self {
-            budget: Arc::new(BudgetTracker::new()),
+            budget: Arc::new(BudgetTracker::new(db.clone())),
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
@@ -398,9 +399,11 @@ impl ChiseiServiceImpl {
         let estimated_tokens = estimate_chat_request(&estimate_req);
         let allowed = self
             .budget
-            .check(&normalized_user_id, estimated_tokens)
+            .check_with_metric(&normalized_user_id, estimated_tokens, METRIC_TOKENS)
             .is_ok();
-        let usage = self.budget.get_usage(&normalized_user_id);
+        let usage = self
+            .budget
+            .get_usage_with_metric(&normalized_user_id, METRIC_TOKENS);
         let budget_reason = if allowed {
             String::new()
         } else {
@@ -1075,21 +1078,44 @@ fn choose_preferred_model(
     recommended_model.to_string()
 }
 
+fn budget_metric(metric: &str) -> &'static str {
+    if metric.trim().eq_ignore_ascii_case(METRIC_REQUESTS) {
+        METRIC_REQUESTS
+    } else {
+        METRIC_TOKENS
+    }
+}
+
+/// Builds the budget scope id for a request. An explicit `subject` bypasses
+/// hierarchy construction entirely (kept for legacy/direct callers and any
+/// caller that wants a flat, non-nested scope) and chains only through the
+/// unset `global` root. Otherwise the scope is built from whichever of
+/// project/agent/work_unit are present, in that nesting order, so that
+/// `CheckBudget`/`RecordUsage` walk and deduct the whole ancestor chain
+/// (project -> agent -> work_unit) atomically — see `db::chisei_budget`.
 fn budget_subject(
     subject: &str,
     project: &str,
     agent: &str,
     key_id: &str,
+    work_unit: &str,
     legacy_user_id: &str,
 ) -> Result<String, Status> {
     if !subject.trim().is_empty() {
         return Ok(subject.trim().to_string());
     }
-    if !agent.trim().is_empty() {
-        return Ok(format!("agent:{}", agent.trim()));
-    }
+    let mut segments = Vec::new();
     if !project.trim().is_empty() {
-        return Ok(format!("project:{}", project.trim()));
+        segments.push(format!("project:{}", project.trim()));
+    }
+    if !agent.trim().is_empty() {
+        segments.push(format!("agent:{}", agent.trim()));
+    }
+    if !work_unit.trim().is_empty() {
+        segments.push(format!("work_unit:{}", work_unit.trim()));
+    }
+    if !segments.is_empty() {
+        return Ok(segments.join("/"));
     }
     if !key_id.trim().is_empty() {
         return Ok(format!("gateway_key:{}", key_id.trim()));
@@ -1388,13 +1414,20 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<CheckBudgetRequest>,
     ) -> Result<Response<CheckBudgetResponse>, Status> {
         let r = req.into_inner();
-        let budget_subject =
-            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
+        let metric = budget_metric(&r.metric);
+        let budget_subject = budget_subject(
+            &r.subject,
+            &r.project,
+            &r.agent,
+            &r.key_id,
+            &r.work_unit,
+            &r.user_id,
+        )?;
         let allowed = self
             .budget
-            .check(&budget_subject, r.estimated_tokens)
+            .check_with_metric(&budget_subject, r.estimated_tokens, metric)
             .is_ok();
-        let u = self.budget.get_usage(&budget_subject);
+        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(CheckBudgetResponse {
             allowed,
             usage: Some(BudgetUsage {
@@ -1412,10 +1445,18 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RecordUsageRequest>,
     ) -> Result<Response<RecordUsageResponse>, Status> {
         let r = req.into_inner();
-        let budget_subject =
-            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
-        self.budget.record(&budget_subject, r.tokens_used);
-        let u = self.budget.get_usage(&budget_subject);
+        let metric = budget_metric(&r.metric);
+        let budget_subject = budget_subject(
+            &r.subject,
+            &r.project,
+            &r.agent,
+            &r.key_id,
+            &r.work_unit,
+            &r.user_id,
+        )?;
+        self.budget
+            .record_with_metric(&budget_subject, r.tokens_used, metric);
+        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(RecordUsageResponse {
             usage: Some(BudgetUsage {
                 user_id: u.user_id,
@@ -1432,10 +1473,18 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<SetBudgetLimitRequest>,
     ) -> Result<Response<SetBudgetLimitResponse>, Status> {
         let r = req.into_inner();
-        let budget_subject =
-            budget_subject(&r.subject, &r.project, &r.agent, &r.key_id, &r.user_id)?;
-        self.budget.set_limit(
+        let metric = budget_metric(&r.metric);
+        let budget_subject = budget_subject(
+            &r.subject,
+            &r.project,
+            &r.agent,
+            &r.key_id,
+            &r.work_unit,
+            &r.user_id,
+        )?;
+        self.budget.set_limit_with_metric(
             &budget_subject,
+            metric,
             r.max_tokens,
             crate::chisei::budget::PeriodType::parse(&r.period_type),
         );
@@ -3019,6 +3068,8 @@ mod tests {
             project: "sekai-chisei".into(),
             agent: "codex-app".into(),
             key_id: "codex-app".into(),
+            work_unit: String::new(),
+            metric: String::new(),
         }))
         .await
         .unwrap();
@@ -3031,12 +3082,17 @@ mod tests {
                 project: "sekai-chisei".into(),
                 agent: "codex-app".into(),
                 key_id: "codex-app".into(),
+                work_unit: String::new(),
+                metric: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(allowed.allowed);
-        assert_eq!(allowed.usage.unwrap().user_id, "agent:codex-app");
+        assert_eq!(
+            allowed.usage.unwrap().user_id,
+            "project:sekai-chisei/agent:codex-app"
+        );
 
         svc.record_usage(Request::new(RecordUsageRequest {
             user_id: String::new(),
@@ -3045,6 +3101,8 @@ mod tests {
             project: "sekai-chisei".into(),
             agent: "codex-app".into(),
             key_id: "codex-app".into(),
+            work_unit: String::new(),
+            metric: String::new(),
         }))
         .await
         .unwrap();
@@ -3057,6 +3115,8 @@ mod tests {
                 project: "sekai-chisei".into(),
                 agent: "codex-app".into(),
                 key_id: "codex-app".into(),
+                work_unit: String::new(),
+                metric: String::new(),
             }))
             .await
             .unwrap()

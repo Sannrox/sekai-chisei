@@ -309,11 +309,15 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
             gateway_key_secret: default_virtual_key(&config.agent),
             budget_tokens: config.budget_tokens,
             budget_period: config.budget_period.clone(),
+            request_budget: None,
+            request_budget_period: "day".to_string(),
             allowed_models: Vec::new(),
             allowed_runtimes: Vec::new(),
+            tier: "standard".to_string(),
             default_model: config.model.clone(),
             default_runtime: "openai".to_string(),
             merge_into_existing: false,
+            policy_scopes: Vec::new(),
         })
         .await;
     };
@@ -338,11 +342,15 @@ async fn seed_agent(config: &LaunchConfig) -> Result<(), Box<dyn std::error::Err
         gateway_key_secret: default_virtual_key(kind.agent_name()),
         budget_tokens: config.budget_tokens,
         budget_period: config.budget_period.clone(),
+        request_budget: None,
+        request_budget_period: "day".to_string(),
         allowed_models: union_allowed_models(&config.model),
         allowed_runtimes: union_allowed_runtimes(),
+        tier: "standard".to_string(),
         default_model,
         default_runtime,
         merge_into_existing: kind != AgentKind::OpenAi,
+        policy_scopes: Vec::new(),
     })
     .await
 }
@@ -555,7 +563,7 @@ async fn launch_codex_app(
 
     println!("verify traffic with:");
     println!(
-        "  SEKAI_SOCKET={} sekaictl gateway report --by agent --since 10m",
+        "  SEKAI_SOCKET={} sekaictl gateway report --by agent-within-project --since 10m",
         config.socket
     );
 
@@ -703,7 +711,7 @@ async fn launch_claude_code(
 
     println!("verify traffic with:");
     println!(
-        "  SEKAI_SOCKET={} sekaictl gateway report --by agent --since 10m",
+        "  SEKAI_SOCKET={} sekaictl gateway report --by work-unit --since 10m",
         config.socket
     );
     Ok(())

@@ -1193,6 +1193,21 @@ fn action_policy_namespace(
         .unwrap_or_default()
 }
 
+fn action_budget_subject(
+    action_risk: &str,
+    namespace: &str,
+    actor: &str,
+) -> String {
+    let base = format!("action:{action_risk}");
+    if namespace.trim().is_empty() {
+        return base;
+    }
+    if actor.trim().is_empty() {
+        return format!("{base}/project:{}", namespace.trim());
+    }
+    format!("{base}/project:{}/agent:{}", namespace.trim(), actor.trim())
+}
+
 fn to_proto_action_approval(approval: &action_approval::ActionApproval) -> ActionApproval {
     ActionApproval {
         id: approval.id.clone(),
@@ -2609,7 +2624,7 @@ impl SekaiService for SekaiServiceImpl {
         let policy_namespace = action_policy_namespace(&self.db, &target_ids, &r.params);
         let resolved_policy = self
             .db
-            .resolve_action_policy(&actor, &policy_namespace)
+            .resolve_action_policy(&actor, &policy_namespace, &policy_namespace)
             .map_err(Status::internal)?;
         let (decision, policy_scope) = match &resolved_policy {
             Some(policy) => (policy.decide(&r.action, action_risk), policy.scope.clone()),
@@ -2779,9 +2794,10 @@ impl SekaiService for SekaiServiceImpl {
             }
         }
 
-        // Action-class budget (Plan 9, Phase C): meter effectful actions against
-        // a chisei budget subject `action:<risk_class>`. No limit == allow.
-        let budget_subject = format!("action:{}", action_risk.as_str());
+        // Action-class budget (Plan 10, Phase A): meter effectful actions against
+        // a hierarchical `action:<risk_class>` scope rooted at project and then
+        // actor. No limit == allow.
+        let budget_subject = action_budget_subject(action_risk.as_str(), &policy_namespace, &actor);
         if let Some(budget) = &self.budget
             && let Err(err) = budget.check(&budget_subject, 1)
         {
@@ -2957,7 +2973,7 @@ impl SekaiService for SekaiServiceImpl {
         };
         let resolved_policy = self
             .db
-            .resolve_action_policy(&approval.actor, &namespace)
+            .resolve_action_policy(&approval.actor, &namespace, &namespace)
             .map_err(Status::internal)?;
         if let Some(policy) = &resolved_policy
             && policy.decide(&approval.action, action_risk) == ActionDecision::Deny
@@ -3020,10 +3036,27 @@ impl SekaiService for SekaiServiceImpl {
                 )));
             }
         }
-        let budget_subject = format!("action:{}", action_risk.as_str());
+        let budget_subject = action_budget_subject(action_risk.as_str(), &namespace, &approval.actor);
         if let Some(budget) = &self.budget
             && budget.check(&budget_subject, 1).is_err()
         {
+            let mut evidence = HashMap::from([(
+                "budget_subject".to_string(),
+                budget_subject.clone(),
+            )]);
+            evidence.insert("risk_class".to_string(), action_risk.as_str().into());
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now_millis(),
+                    actor: approver,
+                    action: approval.action.clone(),
+                    reason: "action_budget_exceeded".into(),
+                    evidence,
+                    target_id: approval.target_id.clone(),
+                    outcome: format!("action budget exhausted for {budget_subject}"),
+                })
+                .map_err(Status::internal)?;
             return Err(Status::resource_exhausted(format!(
                 "action budget exhausted for {}",
                 budget_subject
@@ -9627,7 +9660,7 @@ mod tests {
     async fn action_class_budget_denies_when_exhausted() {
         use crate::chisei::budget::{BudgetTracker, PeriodType};
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        let budget = Arc::new(BudgetTracker::new());
+        let budget = Arc::new(BudgetTracker::new(db.clone()));
         // Allow 1 write action, then deny.
         budget.set_limit("action:write", 1, PeriodType::Daily);
         let svc = SekaiServiceImpl::with_budget(db, budget.clone());

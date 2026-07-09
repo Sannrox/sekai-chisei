@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
+
+use crate::db::chisei_budget::METRIC_REQUESTS;
 
 use crate::grpc::client::GatewayClient;
 use chrono::Utc;
@@ -23,11 +26,14 @@ pub struct GatewaySetupConfig {
     pub gateway_key_secret: String,
     pub budget_tokens: i32,
     pub budget_period: String,
+    pub request_budget: Option<i32>,
+    pub request_budget_period: String,
     pub allowed_models: Vec<String>,
     /// Runtimes the namespace policy permits. Empty means "just `default_runtime`"
     /// (the common single-provider case). Set to more than one to let a shared
     /// namespace serve multiple provider families (e.g. openai + anthropic).
     pub allowed_runtimes: Vec<String>,
+    pub tier: String,
     pub default_model: String,
     pub default_runtime: String,
     /// When true, merge into any existing namespace policy instead of
@@ -37,6 +43,11 @@ pub struct GatewaySetupConfig {
     /// second client's launch (e.g. `claude-code` after `codex-app`) does not
     /// clobber the shared namespace `auto` default the first client set.
     pub merge_into_existing: bool,
+    /// Optional scope identifiers for additional policy rows to seed in addition
+    /// to the project scope. Common examples are `agent:<name>` and
+    /// `gateway_key:<name>`, which then participate in the policy-scopes chain
+    /// used by `ResolvePolicy`.
+    pub policy_scopes: Vec<String>,
 }
 
 impl GatewaySetupConfig {
@@ -54,11 +65,15 @@ impl GatewaySetupConfig {
             gateway_key_secret: default_virtual_key("codex-app"),
             budget_tokens: 500_000,
             budget_period: "day".to_string(),
+            request_budget: None,
+            request_budget_period: "day".to_string(),
             allowed_models: Vec::new(),
             allowed_runtimes: Vec::new(),
+            tier: "standard".to_string(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
             merge_into_existing: false,
+            policy_scopes: Vec::new(),
         };
 
         let mut args = args.into_iter();
@@ -86,14 +101,24 @@ impl GatewaySetupConfig {
                         .map_err(|_| format!("{arg} must be an integer"))?;
                 }
                 "--budget-period" => config.budget_period = next_arg(&mut args, &arg)?,
+                "--request-budget" => {
+                    config.request_budget = Some(
+                        next_arg(&mut args, &arg)?
+                            .parse()
+                            .map_err(|_| format!("{arg} must be an integer"))?,
+                    );
+                }
+                "--request-budget-period" => config.request_budget_period = next_arg(&mut args, &arg)?,
                 "--allowed-model" => config.allowed_models.push(next_arg(&mut args, &arg)?),
                 "--allowed-models" => {
                     config.allowed_models = split_csv(&next_arg(&mut args, &arg)?);
                 }
+                "--scope-policy" => config.policy_scopes.push(next_arg(&mut args, &arg)?),
                 "--allowed-runtime" => config.allowed_runtimes.push(next_arg(&mut args, &arg)?),
                 "--allowed-runtimes" => {
                     config.allowed_runtimes = split_csv(&next_arg(&mut args, &arg)?);
                 }
+                "--tier" => config.tier = next_arg(&mut args, &arg)?,
                 "--default-model" => config.default_model = next_arg(&mut args, &arg)?,
                 "--default-runtime" => config.default_runtime = next_arg(&mut args, &arg)?,
                 "--merge-policy" => config.merge_into_existing = true,
@@ -114,6 +139,7 @@ impl GatewaySetupConfig {
             ("gateway_key_secret", &self.gateway_key_secret),
             ("default_model", &self.default_model),
             ("default_runtime", &self.default_runtime),
+            ("tier", &self.tier),
             ("chisei_grpc_target", &self.chisei_grpc_target),
         ] {
             if value.trim().is_empty() {
@@ -122,6 +148,17 @@ impl GatewaySetupConfig {
         }
         if self.budget_tokens <= 0 {
             return Err("budget_tokens must be positive".to_string());
+        }
+        if self.request_budget.is_some_and(|request_budget| request_budget <= 0) {
+            return Err("request_budget must be positive".to_string());
+        }
+        if self.request_budget_period.trim().is_empty() {
+            return Err("request_budget_period must not be empty".to_string());
+        }
+        for scope in &self.policy_scopes {
+            if scope.trim().is_empty() {
+                return Err("policy scope must not be empty".to_string());
+            }
         }
         Ok(())
     }
@@ -156,6 +193,10 @@ pub async fn run_setup(
         config.allowed_models.clone()
     };
     let desired_allowed_runtimes = config.effective_allowed_runtimes();
+    let scope_allowed_models = desired_allowed_models.clone();
+    let scope_allowed_runtimes = desired_allowed_runtimes.clone();
+    let scope_default_model = config.default_model.clone();
+    let scope_default_runtime = config.default_runtime.clone();
     let (allowed_models, allowed_runtimes, default_model, default_runtime) = match (
         config.merge_into_existing,
         fetch_existing_policy(&mut sekai, &config).await?,
@@ -192,12 +233,52 @@ pub async fn run_setup(
             user_id: format!("agent:{}", config.agent),
             max_tokens: config.budget_tokens,
             period_type: config.budget_period.clone(),
-            subject: format!("agent:{}", config.agent),
+            // Leave `subject` empty so the server seeds the limit at the
+            // same project/agent scope the gateway's request path checks
+            // against (`project:{project}/agent:{agent}`), rather than a
+            // flat scope the real hierarchy chain never visits.
+            subject: String::new(),
             project: config.project.clone(),
             agent: config.agent.clone(),
             key_id: config.gateway_key_name.clone(),
+            work_unit: String::new(),
+            metric: String::new(),
         }))
         .await?;
+
+    if let Some(request_budget) = config.request_budget {
+        chisei
+            .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
+                user_id: String::new(),
+                max_tokens: request_budget,
+                period_type: config.request_budget_period.clone(),
+                // Project-scoped request quota first so the project-level cap
+                // is enforced for all agents in this namespace.
+                subject: format!("project:{}", config.project),
+                project: config.project.clone(),
+                agent: String::new(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                metric: METRIC_REQUESTS.to_string(),
+            }))
+            .await?;
+
+        // Agent-pair request quota for this agent; combined with the project cap
+        // this creates a true shared-cap + per-agent rate limiter.
+        chisei
+            .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
+                user_id: String::new(),
+                max_tokens: request_budget,
+                period_type: config.request_budget_period.clone(),
+                subject: String::new(),
+                project: config.project.clone(),
+                agent: config.agent.clone(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                metric: METRIC_REQUESTS.to_string(),
+            }))
+            .await?;
+    }
 
     chisei
         .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
@@ -210,16 +291,45 @@ pub async fn run_setup(
         }))
         .await?;
 
+    let mut policy_scopes: HashSet<String> = config.policy_scopes.into_iter().collect();
+    let resolved_policy_scopes = resolved_config.policy_scopes.clone();
+    policy_scopes.remove(&config.project);
+    for scope in policy_scopes {
+        chisei
+            .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
+                namespace: scope.clone(),
+                allowed_runtimes: scope_allowed_runtimes.clone(),
+                allowed_models: scope_allowed_models.clone(),
+                default_runtime: scope_default_runtime.clone(),
+                default_model: scope_default_model.clone(),
+                data_class: String::new(),
+            }))
+            .await?;
+    }
+
     println!("seeded chisei gateway setup");
     println!("  agent: {}", config.agent);
     println!("  project: {}", config.project);
     println!("  user_id: agent:{}", config.agent);
+    println!("  tier: {}", config.tier);
     println!("  gateway key name: {}", config.gateway_key_name);
     println!("  virtual key: {}", config.gateway_key_secret);
     println!(
         "  budget: {} tokens per {}",
         config.budget_tokens, config.budget_period
     );
+    if let Some(request_budget) = config.request_budget {
+        println!(
+            "  request budget: {} requests per {}",
+            request_budget, config.request_budget_period
+        );
+    }
+    if !resolved_policy_scopes.is_empty() {
+        println!(
+            "  additional policy scopes: {}",
+            resolved_policy_scopes.join(", ")
+        );
+    }
     println!("  default model: {default_model}");
     Ok(())
 }
@@ -309,7 +419,7 @@ where
     let mut sekai = SekaiServiceClient::new(channel);
     match command.action {
         GatewayKeyAction::List { project } => {
-            println!("name\tproject\tagent\tstatus\tsecret_storage\tupdated");
+            println!("name\tproject\ttier\tagent\tstatus\tsecret_storage\tupdated");
             let namespace = project.unwrap_or_default();
             let mut offset = 0;
             loop {
@@ -328,9 +438,15 @@ where
                     .into_inner();
                 for object in resp.objects.iter() {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         object.name,
                         object.namespace,
+                        object
+                            .properties
+                            .get("tier")
+                            .filter(|value| !value.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| "standard".to_string()),
                         object.properties.get("agent").cloned().unwrap_or_default(),
                         object
                             .properties
@@ -376,7 +492,11 @@ where
                 }))
                 .await?;
             println!("rotated gateway key {name}");
-            println!("run `chisei-gateway refresh` to clear running gateway key caches");
+            if let Err(err) = refresh_gateway_cache("rotate", &name).await {
+                eprintln!("warning: rotated {name} but failed to refresh gateway key cache: {err}");
+            } else {
+                println!("refreshed gateway key cache");
+            }
         }
         GatewayKeyAction::Revoke { name } => {
             let mut object = gateway_key_object(&mut sekai, &name).await?;
@@ -394,9 +514,39 @@ where
                 }))
                 .await?;
             println!("revoked gateway key {name}");
-            println!("run `chisei-gateway refresh` to clear running gateway key caches");
+            if let Err(err) = refresh_gateway_cache("revoke", &name).await {
+                eprintln!("warning: revoked {name} but failed to refresh gateway key cache: {err}");
+            } else {
+                println!("refreshed gateway key cache");
+            }
         }
     }
+    Ok(())
+}
+
+async fn refresh_gateway_cache(
+    action: &str,
+    key_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut url = env::var("CHISEI_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
+    url = url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let endpoint = format!("{url}/_chisei/admin/refresh");
+
+    let mut request = reqwest::Client::new().post(endpoint);
+    if let Ok(token) = env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
+        && !token.trim().is_empty()
+    {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("gateway refresh for {action} of key {key_name} failed with {status}: {body}").into());
+    }
+
     Ok(())
 }
 
@@ -538,6 +688,7 @@ async fn ensure_gateway_objects(
                 ("agent".to_string(), config.agent.clone()),
                 ("project".to_string(), config.project.clone()),
                 ("status".to_string(), "active".to_string()),
+                ("tier".to_string(), config.tier.clone()),
                 (
                     "key_hash".to_string(),
                     hash_gateway_key(&config.gateway_key_secret),
@@ -816,11 +967,11 @@ where
 }
 
 pub fn usage() -> String {
-    "Usage: sekaictl gateway setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>] [--allowed-runtime <runtime>]\n       sekaictl gateway key <create|list|rotate|revoke> [options]\n\nRun `sekaictl gateway key --help` for gateway-key lifecycle commands.".to_string()
+    "Usage: sekaictl gateway setup [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--request-budget <requests>] [--request-budget-period <day|week|month>] [--scope-policy <scope>] [--tier <standard|background|heavy>] [--default-model <model>] [--allowed-model <model>] [--allowed-runtimes <list>] [--allowed-runtime <runtime>] [--default-runtime <runtime>] [--allowed-models <list>]\n       sekaictl gateway key <create|list|rotate|revoke> [options]\n\nRun `sekaictl gateway key --help` for gateway-key lifecycle commands.".to_string()
 }
 
 pub fn key_usage() -> String {
-    "Usage: sekaictl gateway key create [<name>] [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--default-model <model>] [--allowed-model <model>]\n       sekaictl gateway key list [--target <grpc-url>] [--project <name>]\n       sekaictl gateway key rotate [--target <grpc-url>] --gateway-key-name <name> --gateway-key <new-secret>\n       sekaictl gateway key revoke [--target <grpc-url>] --gateway-key-name <name>".to_string()
+    "Usage: sekaictl gateway key create [<name>] [--target <grpc-url>] [--agent <name>] [--project <name>] [--gateway-key-name <name>] [--gateway-key <secret>] [--budget <tokens>] [--budget-period <day|week|month>] [--request-budget <requests>] [--request-budget-period <day|week|month>] [--scope-policy <scope>] [--tier <standard|background|heavy>] [--default-model <model>] [--allowed-model <model>] [--default-runtime <runtime>] [--allowed-runtimes <list>] [--allowed-runtime <runtime>] [--allowed-models <list>]\n       sekaictl gateway key list [--target <grpc-url>] [--project <name>]\n       sekaictl gateway key rotate [--target <grpc-url>] --gateway-key-name <name> --gateway-key <new-secret>\n       sekaictl gateway key revoke [--target <grpc-url>] --gateway-key-name <name>".to_string()
 }
 
 #[cfg(test)]
@@ -852,6 +1003,12 @@ mod tests {
             "sk-chisei-test".to_string(),
             "--allowed-model".to_string(),
             "gpt-5.5".to_string(),
+            "--request-budget".to_string(),
+            "7".to_string(),
+            "--request-budget-period".to_string(),
+            "week".to_string(),
+            "--scope-policy".to_string(),
+            "agent:codex-app".to_string(),
         ])
         .unwrap();
 
@@ -861,6 +1018,9 @@ mod tests {
         assert_eq!(config.gateway_key_secret, "sk-chisei-test");
         assert_eq!(config.budget_tokens, 42);
         assert_eq!(config.allowed_models, vec!["gpt-5.5"]);
+        assert_eq!(config.request_budget, Some(7));
+        assert_eq!(config.request_budget_period, "week");
+        assert_eq!(config.policy_scopes, vec!["agent:codex-app"]);
     }
 
     #[test]
@@ -944,11 +1104,15 @@ mod tests {
             gateway_key_secret: "sk-chisei-codex-app".to_string(),
             budget_tokens: 42,
             budget_period: "day".to_string(),
+            request_budget: Some(7),
+            request_budget_period: "day".to_string(),
             allowed_models: vec!["gpt-5.5".to_string()],
             allowed_runtimes: Vec::new(),
+            tier: "standard".to_string(),
             default_model: "gpt-5.5".to_string(),
             default_runtime: "openai".to_string(),
             merge_into_existing: false,
+            policy_scopes: Vec::new(),
         })
         .await
         .unwrap();
@@ -1043,10 +1207,12 @@ mod tests {
             .check_budget(GrpcRequest::new(CheckBudgetRequest {
                 user_id: "agent:codex-app".to_string(),
                 estimated_tokens: 43,
-                subject: "agent:codex-app".to_string(),
+                subject: String::new(),
                 project: "sekai-chisei".to_string(),
                 agent: "codex-app".to_string(),
                 key_id: "codex-app".to_string(),
+                work_unit: String::new(),
+                metric: String::new(),
             }))
             .await
             .unwrap()
@@ -1071,6 +1237,23 @@ mod tests {
             .resolution
             .unwrap();
         assert_eq!(resolved.model, "gpt-5.5");
+
+        let request_budget_project =
+            db.budget_usage(
+                "project:sekai-chisei",
+                "requests",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+        let request_budget_agent =
+            db.budget_usage(
+                "project:sekai-chisei/agent:codex-app",
+                "requests",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+        assert_eq!(request_budget_project.1, 7);
+        assert_eq!(request_budget_agent.1, 7);
 
         run_gateway_key_command([
             "rotate".to_string(),
@@ -1128,6 +1311,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_policy_flag_creates_scoped_policy_row() {
+        let (target, db) = spawn_control_plane().await;
+        run_setup(GatewaySetupConfig {
+            chisei_grpc_target: target.clone(),
+            agent: "codex-app".to_string(),
+            project: "sekai-chisei".to_string(),
+            gateway_key_name: "codex-app".to_string(),
+            gateway_key_secret: "sk-chisei-codex-app".to_string(),
+            budget_tokens: 1000,
+            budget_period: "day".to_string(),
+            request_budget: None,
+            request_budget_period: "day".to_string(),
+            allowed_models: vec!["gpt-5.5".to_string()],
+            allowed_runtimes: Vec::new(),
+            tier: "standard".to_string(),
+            default_model: "gpt-5.5".to_string(),
+            default_runtime: "openai".to_string(),
+            merge_into_existing: false,
+            policy_scopes: vec!["agent:codex-app".to_string()],
+        })
+        .await
+        .unwrap();
+
+        let scoped = db
+            .find_by_external_id("policy:agent:codex-app")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scoped.properties.get("namespace").map(String::as_str),
+            Some("agent:codex-app")
+        );
+        assert_eq!(
+            scoped.properties.get("default_model").map(String::as_str),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[tokio::test]
     async fn key_create_seeds_gateway_setup() {
         let (target, db) = spawn_control_plane().await;
         run_gateway_key_command([
@@ -1181,11 +1402,15 @@ mod tests {
             gateway_key_secret: format!("sk-chisei-{agent}"),
             budget_tokens: 1000,
             budget_period: "day".to_string(),
+            request_budget: None,
+            request_budget_period: "day".to_string(),
             allowed_models: allowed.iter().map(|m| m.to_string()).collect(),
             allowed_runtimes: Vec::new(),
+            tier: "standard".to_string(),
             default_model: default_model.to_string(),
             default_runtime: default_runtime.to_string(),
             merge_into_existing: merge,
+            policy_scopes: Vec::new(),
         }
     }
 
