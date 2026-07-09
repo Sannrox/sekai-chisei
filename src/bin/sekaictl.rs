@@ -61,6 +61,24 @@ async fn run_credential_command(
         CredentialCommand::Revoke { principal } => {
             revoke_credential(&principal).map_err(std::io::Error::other)?;
         }
+        CredentialCommand::BulkCreate { principals } => {
+            for principal in principals {
+                let token = create_credential(&principal).map_err(std::io::Error::other)?;
+                println!("{principal}\t{token}");
+            }
+        }
+        CredentialCommand::BulkRotate { principals } => {
+            for principal in principals {
+                let token = rotate_credential(&principal).map_err(std::io::Error::other)?;
+                println!("{principal}\t{token}");
+            }
+        }
+        CredentialCommand::BulkRevoke { principals } => {
+            for principal in principals {
+                revoke_credential(&principal).map_err(std::io::Error::other)?;
+                println!("{principal}\trevoked");
+            }
+        }
         CredentialCommand::List => {
             let credentials = list_credentials().map_err(std::io::Error::other)?;
             println!("principal\tstatus\tcreated\trotated_at");

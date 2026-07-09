@@ -181,13 +181,16 @@ fn parse_optional_u32(value: Option<&String>) -> Option<u32> {
         .filter(|value| *value > 0)
 }
 
-/// Candidate scopes for an action, most specific first: `agent:<actor>` then
-/// the object namespace (when present). Enforcement tries each in order and
-/// uses the first policy found.
-pub fn candidate_scopes(actor: &str, namespace: &str) -> Vec<String> {
+/// Candidate scopes for an action, most specific first: actor, then project
+/// (`project:<project>` when present), then namespace (legacy format).
+/// Enforcement tries each in order and uses the first policy found.
+pub fn candidate_scopes(actor: &str, namespace: &str, project: &str) -> Vec<String> {
     let mut scopes = Vec::new();
     if !actor.trim().is_empty() {
         scopes.push(format!("agent:{}", actor.trim()));
+    }
+    if !project.trim().is_empty() {
+        scopes.push(format!("project:{}", project.trim()));
     }
     if !namespace.trim().is_empty() {
         scopes.push(namespace.trim().to_string());
@@ -266,15 +269,17 @@ impl SekaiDb {
         Ok(policies)
     }
 
-    /// Resolve the effective policy for an actor/namespace, honoring
-    /// agent-then-namespace precedence. Returns `None` when no policy applies
-    /// (caller treats that as allow-all for backward compatibility).
+    /// Resolve the effective policy for an actor/namespace/project, honoring
+    /// agent-then-project-then-namespace precedence. Returns `None` when no
+    /// policy applies (caller treats that as allow-all for backward
+    /// compatibility).
     pub fn resolve_action_policy(
         &self,
         actor: &str,
         namespace: &str,
+        project: &str,
     ) -> Result<Option<ActionPolicy>, String> {
-        for scope in candidate_scopes(actor, namespace) {
+        for scope in candidate_scopes(actor, namespace, project) {
             if let Some(policy) = self.get_action_policy(&scope)? {
                 return Ok(Some(policy));
             }
@@ -426,14 +431,25 @@ mod tests {
     #[test]
     fn candidate_scopes_prefers_agent_then_namespace() {
         assert_eq!(
-            candidate_scopes("codex-app", "sekai-chisei"),
-            vec!["agent:codex-app".to_string(), "sekai-chisei".to_string()]
+            candidate_scopes("codex-app", "sekai-chisei", "sekai-chisei"),
+            vec![
+                "agent:codex-app".to_string(),
+                "project:sekai-chisei".to_string(),
+                "sekai-chisei".to_string()
+            ]
         );
         assert_eq!(
-            candidate_scopes("", "sekai-chisei"),
-            vec!["sekai-chisei".to_string()]
+            candidate_scopes("", "sekai-chisei", "sekai-chisei"),
+            vec!["project:sekai-chisei".to_string(), "sekai-chisei".to_string()]
         );
-        assert!(candidate_scopes("", "").is_empty());
+        assert_eq!(
+            candidate_scopes("", "", "sekai-chisei"),
+            vec!["project:sekai-chisei".to_string()]
+        );
+        assert_eq!(
+            candidate_scopes("", "", ""),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -454,14 +470,14 @@ mod tests {
 
         // Agent scope wins over namespace when both exist.
         let resolved = db
-            .resolve_action_policy("codex-app", "sekai-chisei")
+            .resolve_action_policy("codex-app", "sekai-chisei", "sekai-chisei")
             .unwrap()
             .unwrap();
         assert_eq!(resolved.scope, "agent:codex-app");
 
         // Falls back to namespace when no agent policy exists.
         let resolved = db
-            .resolve_action_policy("other-agent", "sekai-chisei")
+            .resolve_action_policy("other-agent", "sekai-chisei", "sekai-chisei")
             .unwrap()
             .unwrap();
         assert_eq!(resolved.scope, "sekai-chisei");
@@ -469,7 +485,7 @@ mod tests {
 
         // No policy at all -> None (allow-all).
         assert!(
-            db.resolve_action_policy("nobody", "unknown-ns")
+            db.resolve_action_policy("nobody", "unknown-ns", "unknown-ns")
                 .unwrap()
                 .is_none()
         );
