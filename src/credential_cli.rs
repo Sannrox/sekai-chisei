@@ -266,8 +266,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_credential_command(["bulk".to_string(), "revoke".to_string(), "agent-a".to_string()])
-                .unwrap(),
+            parse_credential_command([
+                "bulk".to_string(),
+                "revoke".to_string(),
+                "agent-a".to_string()
+            ])
+            .unwrap(),
             CredentialCommand::BulkRevoke {
                 principals: vec!["agent-a".to_string()]
             }

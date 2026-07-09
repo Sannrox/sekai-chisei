@@ -108,7 +108,9 @@ impl GatewaySetupConfig {
                             .map_err(|_| format!("{arg} must be an integer"))?,
                     );
                 }
-                "--request-budget-period" => config.request_budget_period = next_arg(&mut args, &arg)?,
+                "--request-budget-period" => {
+                    config.request_budget_period = next_arg(&mut args, &arg)?
+                }
                 "--allowed-model" => config.allowed_models.push(next_arg(&mut args, &arg)?),
                 "--allowed-models" => {
                     config.allowed_models = split_csv(&next_arg(&mut args, &arg)?);
@@ -149,7 +151,10 @@ impl GatewaySetupConfig {
         if self.budget_tokens <= 0 {
             return Err("budget_tokens must be positive".to_string());
         }
-        if self.request_budget.is_some_and(|request_budget| request_budget <= 0) {
+        if self
+            .request_budget
+            .is_some_and(|request_budget| request_budget <= 0)
+        {
             return Err("request_budget must be positive".to_string());
         }
         if self.request_budget_period.trim().is_empty() {
@@ -528,9 +533,12 @@ async fn refresh_gateway_cache(
     action: &str,
     key_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut url = env::var("CHISEI_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
-    url = url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let mut url =
+        env::var("CHISEI_GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
+    url = url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
     let endpoint = format!("{url}/_chisei/admin/refresh");
 
     let mut request = reqwest::Client::new().post(endpoint);
@@ -544,7 +552,10 @@ async fn refresh_gateway_cache(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("gateway refresh for {action} of key {key_name} failed with {status}: {body}").into());
+        return Err(format!(
+            "gateway refresh for {action} of key {key_name} failed with {status}: {body}"
+        )
+        .into());
     }
 
     Ok(())
@@ -1238,15 +1249,15 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.model, "gpt-5.5");
 
-        let request_budget_project =
-            db.budget_usage(
+        let request_budget_project = db
+            .budget_usage(
                 "project:sekai-chisei",
                 "requests",
                 chrono::Utc::now().timestamp_millis(),
             )
             .unwrap();
-        let request_budget_agent =
-            db.budget_usage(
+        let request_budget_agent = db
+            .budget_usage(
                 "project:sekai-chisei/agent:codex-app",
                 "requests",
                 chrono::Utc::now().timestamp_millis(),
