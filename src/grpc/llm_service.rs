@@ -10,6 +10,7 @@ use super::pb::llm::llm_service_server::LlmService;
 use super::pb::llm::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
+use crate::db::sekai::SekaiDb;
 use crate::llm;
 
 pub struct LlmServiceImpl {
@@ -19,9 +20,9 @@ pub struct LlmServiceImpl {
 
 impl LlmServiceImpl {
     #[allow(dead_code)]
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, db: Arc<SekaiDb>) -> Self {
         Self {
-            budget: Arc::new(BudgetTracker::new()),
+            budget: Arc::new(BudgetTracker::new(db)),
             config,
         }
     }

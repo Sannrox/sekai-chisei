@@ -80,6 +80,8 @@ pub enum ReportGroupBy {
     Project,
     Agent,
     Model,
+    WorkUnit,
+    AgentWithinProject,
 }
 
 impl ReportGroupBy {
@@ -88,6 +90,8 @@ impl ReportGroupBy {
             Self::Project => "project",
             Self::Agent => "agent",
             Self::Model => "model",
+            Self::WorkUnit => "work_unit",
+            Self::AgentWithinProject => "agent/project",
         }
     }
 }
@@ -100,8 +104,10 @@ impl std::str::FromStr for ReportGroupBy {
             "project" => Ok(Self::Project),
             "agent" => Ok(Self::Agent),
             "model" => Ok(Self::Model),
+            "work-unit" | "work_unit" => Ok(Self::WorkUnit),
+            "agent-within-project" | "agent_within_project" => Ok(Self::AgentWithinProject),
             other => Err(format!(
-                "unsupported report group {other:?}; expected project, agent, or model"
+                "unsupported report group {other:?}; expected project, agent, model, work-unit, or agent-within-project"
             )),
         }
     }
@@ -277,6 +283,17 @@ fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
             .get("resolved_model")
             .filter(|model| !model.is_empty())
             .or_else(|| row.values.get("model")),
+        ReportGroupBy::WorkUnit => row.values.get("work_unit_id"),
+        ReportGroupBy::AgentWithinProject => {
+            let project = row.values.get("project").filter(|value| !value.is_empty());
+            let agent = row.values.get("agent").filter(|value| !value.is_empty());
+            return match (project, agent) {
+                (Some(project), Some(agent)) => format!("{project}/{agent}"),
+                (Some(project), None) => project.clone(),
+                (None, Some(agent)) => agent.clone(),
+                (None, None) => "(unknown)".to_string(),
+            };
+        }
     };
     value
         .filter(|value| !value.is_empty())
@@ -316,6 +333,8 @@ pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
     let by_project = summarize_rows(rows.to_vec(), ReportGroupBy::Project);
     let by_agent = summarize_rows(rows.to_vec(), ReportGroupBy::Agent);
     let by_model = summarize_rows(rows.to_vec(), ReportGroupBy::Model);
+    let by_work_unit = summarize_rows(rows.to_vec(), ReportGroupBy::WorkUnit);
+    let by_agent_within_project = summarize_rows(rows.to_vec(), ReportGroupBy::AgentWithinProject);
     let totals = rows
         .iter()
         .fold(GatewayReportRow::default(), |mut total, row| {
@@ -365,6 +384,8 @@ tr:last-child td {{ border-bottom:0; }}
 {project}
 {agent}
 {model}
+{work_unit}
+{agent_within_project}
 </main>
 </body>
 </html>
@@ -374,6 +395,12 @@ tr:last-child td {{ border-bottom:0; }}
         project = render_section("By Project", "project", &by_project),
         agent = render_section("By Agent", "agent", &by_agent),
         model = render_section("By Model", "model", &by_model),
+        work_unit = render_section("By Work Unit", "work_unit", &by_work_unit),
+        agent_within_project = render_section(
+            "By Agent (within project)",
+            "agent/project",
+            &by_agent_within_project
+        ),
     )
 }
 
@@ -508,7 +535,7 @@ fn gateway_request<T>(message: T) -> GrpcRequest<T> {
 }
 
 pub fn report_usage() -> String {
-    "Usage: chisei-gateway report [--target <grpc-url>] [--by <project|agent|model>] [--since <30m|24h|7d>] [--limit <rows>] [--html <path>]".to_string()
+    "Usage: chisei-gateway report [--target <grpc-url>] [--by <project|agent|model|work-unit|agent-within-project>] [--since <30m|24h|7d>] [--limit <rows>] [--html <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -535,6 +562,28 @@ mod tests {
         assert_eq!(config.limit, 25);
         assert_eq!(config.html_output, None);
         assert!(config.since_ms <= Utc::now().timestamp_millis());
+    }
+
+    #[test]
+    fn parses_work_unit_report_args() {
+        let config = GatewayReportConfig::from_env_and_args([
+            "--by".to_string(),
+            "work-unit".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.group_by, ReportGroupBy::WorkUnit);
+    }
+
+    #[test]
+    fn parses_agent_within_project_report_args() {
+        let config = GatewayReportConfig::from_env_and_args([
+            "--by".to_string(),
+            "agent-within-project".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(config.group_by, ReportGroupBy::AgentWithinProject);
     }
 
     #[test]
@@ -650,12 +699,120 @@ mod tests {
     }
 
     #[test]
+    fn summarize_rows_by_work_unit() {
+        let rows = vec![
+            row([
+                ("work_unit_id", "wu-a"),
+                ("input_tokens", "10"),
+                ("output_tokens", "5"),
+                ("total_tokens", "15"),
+                ("cost_usd_micros", "25"),
+            ]),
+            row([
+                ("work_unit_id", "wu-b"),
+                ("input_tokens", "7"),
+                ("output_tokens", "3"),
+                ("total_tokens", "10"),
+                ("cost_usd_micros", "15"),
+            ]),
+            row([
+                ("work_unit_id", "wu-a"),
+                ("input_tokens", "8"),
+                ("output_tokens", "3"),
+                ("total_tokens", "11"),
+                ("cost_usd_micros", "12"),
+            ]),
+        ];
+
+        let report = summarize_rows(rows, ReportGroupBy::WorkUnit);
+        assert_eq!(
+            report,
+            vec![
+                GatewayReportRow {
+                    group: "wu-a".to_string(),
+                    calls: 2,
+                    input_tokens: 18,
+                    output_tokens: 8,
+                    total_tokens: 26,
+                    cost_usd_micros: 37,
+                    ..Default::default()
+                },
+                GatewayReportRow {
+                    group: "wu-b".to_string(),
+                    calls: 1,
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    total_tokens: 10,
+                    cost_usd_micros: 15,
+                    ..Default::default()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_rows_by_agent_within_project() {
+        let rows = vec![
+            row([
+                ("project", "sekai-chisei"),
+                ("agent", "claude-code"),
+                ("input_tokens", "9"),
+                ("output_tokens", "2"),
+                ("total_tokens", "11"),
+                ("cost_usd_micros", "8"),
+            ]),
+            row([
+                ("project", "sekai-chisei"),
+                ("agent", "claude-code"),
+                ("input_tokens", "7"),
+                ("output_tokens", "1"),
+                ("total_tokens", "8"),
+                ("cost_usd_micros", "5"),
+            ]),
+            row([
+                ("project", "sekai-chisei"),
+                ("agent", "codex-app"),
+                ("input_tokens", "5"),
+                ("output_tokens", "2"),
+                ("total_tokens", "7"),
+                ("cost_usd_micros", "14"),
+            ]),
+        ];
+
+        let report = summarize_rows(rows, ReportGroupBy::AgentWithinProject);
+        assert_eq!(
+            report,
+            vec![
+                GatewayReportRow {
+                    group: "sekai-chisei/claude-code".to_string(),
+                    calls: 2,
+                    input_tokens: 16,
+                    output_tokens: 3,
+                    total_tokens: 19,
+                    cost_usd_micros: 13,
+                    ..Default::default()
+                },
+                GatewayReportRow {
+                    group: "sekai-chisei/codex-app".to_string(),
+                    calls: 1,
+                    input_tokens: 5,
+                    output_tokens: 2,
+                    total_tokens: 7,
+                    cost_usd_micros: 14,
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn dashboard_renders_all_groupings_and_escapes_values() {
         let html = render_dashboard(
             &[
                 row([
                     ("project", "sekai-chisei"),
                     ("agent", "codex-app"),
+                    ("work_unit_id", "wu-main"),
                     ("model", "gpt-5.5"),
                     ("input_tokens", "10"),
                     ("output_tokens", "5"),
@@ -667,6 +824,7 @@ mod tests {
                 row([
                     ("project", "danger<&>"),
                     ("agent", "claude-code"),
+                    ("work_unit_id", "wu-main"),
                     ("model", "claude-sonnet-4-8"),
                     ("input_tokens", "7"),
                     ("output_tokens", "3"),
@@ -681,6 +839,8 @@ mod tests {
         assert!(html.contains("By Project"));
         assert!(html.contains("By Agent"));
         assert!(html.contains("By Model"));
+        assert!(html.contains("By Work Unit"));
+        assert!(html.contains("By Agent (within project)"));
         assert!(html.contains("Estimated cost"));
         assert!(html.contains("$0.000040"));
         assert!(html.contains("codex-app"));

@@ -317,6 +317,13 @@ message CheckBudgetRequest {
   string project = 4;
   string agent = 5;
   string key_id = 6;
+  // Leaf scope under project/agent in the budget hierarchy chain
+  // (project -> agent -> work_unit). Ignored when `subject` is set.
+  string work_unit = 7;
+  // Optional metric selector for this limit check. Supported values:
+  // - "tokens" (default): compare against token usage
+  // - "requests": compare against request counts
+  string metric = 8;
 }
 message CheckBudgetResponse { bool allowed = 1; BudgetUsage usage = 2; }
 message RecordUsageRequest {
@@ -326,6 +333,11 @@ message RecordUsageRequest {
   string project = 4;
   string agent = 5;
   string key_id = 6;
+  string work_unit = 7;
+  // Optional metric selector for this usage delta.
+  // Uses the same unit field name `tokens_used` for backwards compatibility.
+  // Supported values: "tokens" (default) and "requests".
+  string metric = 8;
 }
 message RecordUsageResponse { BudgetUsage usage = 1; }
 message SetBudgetLimitRequest {
@@ -336,6 +348,10 @@ message SetBudgetLimitRequest {
   string project = 5;
   string agent = 6;
   string key_id = 7;
+  string work_unit = 8;
+  // Optional metric selector to set a scoped budget for a specific metric.
+  // Supported values: "tokens" (default) and "requests".
+  string metric = 9;
 }
 message SetBudgetLimitResponse {}
 
