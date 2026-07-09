@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod budget;
+pub mod controller;
 pub mod egress;
 pub mod eval;
 pub mod evolve;
