@@ -32,7 +32,17 @@ pub(crate) fn scope_chain(scope_id: &str) -> Vec<String> {
             acc.push('/');
         }
         acc.push_str(segment);
-        chain.push(acc.clone());
+        if !chain.contains(&acc) {
+            chain.push(acc.clone());
+        }
+        if let Some((kind, id)) = segment.split_once(':')
+            && kind == "agent"
+        {
+            let flat_scope = format!("{kind}:{id}");
+            if !chain.contains(&flat_scope) {
+                chain.push(flat_scope);
+            }
+        }
     }
     chain
 }
@@ -51,11 +61,13 @@ pub(crate) fn parent_scope_id(scope_id: &str) -> String {
 fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
     let now = chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_default();
     let date = now.date_naive();
-    let start_date = if period_type == "weekly" {
-        let days_from_monday = date.weekday().num_days_from_monday() as i64;
-        date - chrono::Duration::days(days_from_monday)
-    } else {
-        date
+    let start_date = match period_type {
+        "weekly" => {
+            let days_from_monday = date.weekday().num_days_from_monday() as i64;
+            date - chrono::Duration::days(days_from_monday)
+        }
+        "monthly" => date.with_day(1).unwrap_or(date),
+        _ => date,
     };
     start_date
         .and_hms_opt(0, 0, 0)

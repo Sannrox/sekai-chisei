@@ -7,31 +7,34 @@ use crate::db::sekai::SekaiDb;
 pub enum PeriodType {
     Daily,
     Weekly,
-}
-
-impl std::str::FromStr for PeriodType {
-    type Err = std::convert::Infallible;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(if s == "weekly" {
-            Self::Weekly
-        } else {
-            Self::Daily
-        })
-    }
+    Monthly,
 }
 
 impl PeriodType {
+    /// Parse untrusted period type inputs. Unknown values return `Err` so callers
+    /// can surface a clear invalid-argument rejection.
+    pub fn parse_strict(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "day" | "days" | "daily" => Ok(Self::Daily),
+            "week" | "weeks" | "weekly" => Ok(Self::Weekly),
+            "month" | "months" | "monthly" => Ok(Self::Monthly),
+            value => Err(format!("unsupported period type '{value}'")),
+        }
+    }
+
     pub fn parse(s: &str) -> Self {
-        if s == "weekly" {
-            Self::Weekly
-        } else {
-            Self::Daily
+        match s.trim().to_ascii_lowercase().as_str() {
+            "week" | "weeks" | "weekly" => Self::Weekly,
+            "month" | "months" | "monthly" => Self::Monthly,
+            "day" | "days" | "daily" => Self::Daily,
+            _ => Self::Daily,
         }
     }
     pub fn as_str(&self) -> &str {
         match self {
             Self::Daily => "daily",
             Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
         }
     }
 }
@@ -73,17 +76,25 @@ impl BudgetTracker {
         Self { db }
     }
 
-    pub fn set_limit(&self, scope_id: &str, max_tokens: i32, period: PeriodType) {
+    pub fn set_limit(
+        &self,
+        scope_id: &str,
+        max_tokens: i32,
+        period: PeriodType,
+    ) -> Result<(), String> {
         self.set_limit_with_metric(scope_id, METRIC_TOKENS, max_tokens, period)
     }
 
-    pub fn set_limit_with_metric(&self, scope_id: &str, metric: &str, max_tokens: i32, period: PeriodType) {
-        if let Err(err) =
-            self.db
-                .budget_set_limit(scope_id, metric, max_tokens as i64, period.as_str())
-        {
-            tracing::error!(error = %err, scope_id, "failed to persist budget limit");
-        }
+    pub fn set_limit_with_metric(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_tokens: i32,
+        period: PeriodType,
+    ) -> Result<(), String> {
+        self.db
+            .budget_set_limit(scope_id, metric, max_tokens as i64, period.as_str())
+            .inspect_err(|err| tracing::error!(error = %err, scope_id, "failed to persist budget limit"))
     }
 
     pub fn check(&self, scope_id: &str, estimated: i32) -> Result<(), String> {
@@ -189,7 +200,7 @@ mod tests {
     #[test]
     fn test_budget_check_and_record() {
         let t = tracker();
-        t.set_limit("alice", 1000, PeriodType::Daily);
+        t.set_limit("alice", 1000, PeriodType::Daily).unwrap();
         assert!(t.check("alice", 500).is_ok());
         t.record("alice", 800);
         assert!(t.check("alice", 300).is_err());
@@ -205,7 +216,7 @@ mod tests {
     #[test]
     fn test_pressure() {
         let t = tracker();
-        t.set_limit("ns1:alice", 100, PeriodType::Daily);
+        t.set_limit("ns1:alice", 100, PeriodType::Daily).unwrap();
         t.record("ns1:alice", 75);
         assert_eq!(t.namespace_pressure("ns1"), PressureLevel::Moderate);
         t.record("ns1:alice", 20);
@@ -217,8 +228,8 @@ mod tests {
         let t = tracker();
         // Project-level pool of 100 shared across agents; agent's own cap is
         // generous (500) but the project ancestor is nearly exhausted.
-        t.set_limit("project:p", 100, PeriodType::Daily);
-        t.set_limit("project:p/agent:a", 500, PeriodType::Daily);
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
+        t.set_limit("project:p/agent:a", 500, PeriodType::Daily).unwrap();
         t.record("project:p/agent:a", 90);
         // Agent-level check alone would allow (90+20=110 <= 500) but the
         // project ancestor (90+20=110 > 100) must reject it.
@@ -230,8 +241,8 @@ mod tests {
     #[test]
     fn chain_deducts_at_every_level() {
         let t = tracker();
-        t.set_limit("project:p", 1000, PeriodType::Daily);
-        t.set_limit("project:p/agent:a", 1000, PeriodType::Daily);
+        t.set_limit("project:p", 1000, PeriodType::Daily).unwrap();
+        t.set_limit("project:p/agent:a", 1000, PeriodType::Daily).unwrap();
         t.check_and_reserve("project:p/agent:a/work_unit:w", 40).unwrap();
         assert_eq!(t.get_usage("project:p").tokens_used, 40);
         assert_eq!(t.get_usage("project:p/agent:a").tokens_used, 40);
@@ -248,7 +259,7 @@ mod tests {
         t.record("project:p/agent:a", 30);
         // Now cap the project after the fact — it should already see the 30
         // recorded while unbounded, and reject a request that would exceed it.
-        t.set_limit("project:p", 40, PeriodType::Daily);
+        t.set_limit("project:p", 40, PeriodType::Daily).unwrap();
         assert!(t.check_and_reserve("project:p/agent:a", 20).is_err());
         assert!(t.check_and_reserve("project:p/agent:a", 5).is_ok());
     }
@@ -257,7 +268,7 @@ mod tests {
     fn concurrent_reservations_never_over_admit_shared_parent() {
         use std::thread;
         let t = Arc::new(tracker());
-        t.set_limit("project:p", 100, PeriodType::Daily);
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
         let mut handles = Vec::new();
         for i in 0..20 {
             let t = t.clone();

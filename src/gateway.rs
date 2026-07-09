@@ -655,18 +655,13 @@ async fn check_budget_preflight(
                                 ))
                             }
                         }
-                        Err(err) => {
+                            Err(err) => {
                             governance_error(
                                 config,
                                 identity,
                                 &format!("CheckBudget failed: {err}"),
                             )
-                            .await;
-                            Err(GatewayRejection::json(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "chisei_unavailable",
-                                "failed to check budget",
-                            ))
+                            .await
                         }
                     }
                 }
@@ -676,12 +671,7 @@ async fn check_budget_preflight(
                         identity,
                         &format!("failed to connect to Chisei control plane: {err}"),
                     )
-                    .await;
-                    Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "chisei_unavailable",
-                        "failed to check budget",
-                    ))
+                    .await
                 }
             }
         }
@@ -2275,11 +2265,7 @@ fn parse_gateway_keys(
             None | Some("") => DEFAULT_GATEWAY_TIER,
             Some(value) => value,
         };
-        let key_id = if agent.is_empty() {
-            return Err(format!("invalid GATEWAY_KEYS entry {entry:?}; empty agent").into());
-        } else {
-            agent.to_string()
-        };
+        let key_id = agent.to_string();
         keys.insert(
             key.to_string(),
             GatewayIdentity {
@@ -3256,6 +3242,9 @@ async fn record_gateway_decision(
     evidence
         .entry("project".to_string())
         .or_insert_with(|| identity.project.clone());
+    evidence
+        .entry("tier".to_string())
+        .or_insert_with(|| identity.tier.clone());
     if !identity.key_id.is_empty() {
         evidence
             .entry("key_id".to_string())
