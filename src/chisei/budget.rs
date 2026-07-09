@@ -239,6 +239,18 @@ mod tests {
     }
 
     #[test]
+    fn checks_and_records_against_flat_agent_scope() {
+        let t = tracker();
+        t.set_limit("agent:codex-app", 100, PeriodType::Daily).unwrap();
+        t.set_limit("project:p", 500, PeriodType::Daily).unwrap();
+        t.record("project:p/agent:codex-app", 90);
+        assert_eq!(t.get_usage("agent:codex-app").tokens_used, 90);
+        assert_eq!(t.get_usage("project:p").tokens_used, 90);
+        assert!(t.check("project:p/agent:codex-app", 5).is_ok());
+        assert!(t.check_and_reserve("project:p/agent:codex-app", 11).is_err());
+    }
+
+    #[test]
     fn chain_deducts_at_every_level() {
         let t = tracker();
         t.set_limit("project:p", 1000, PeriodType::Daily).unwrap();
@@ -250,6 +262,22 @@ mod tests {
             t.get_usage("project:p/agent:a/work_unit:w").tokens_used,
             40
         );
+    }
+
+    #[test]
+    fn parse_strict_period_type_accepts_aliases_and_rejects_unknown() {
+        assert!(PeriodType::parse_strict("day").is_ok());
+        assert!(PeriodType::parse_strict("Week").is_ok());
+        assert!(PeriodType::parse_strict("monthly").is_ok());
+        assert!(PeriodType::parse_strict("months").is_ok());
+        assert!(PeriodType::parse_strict("").is_ok());
+        assert!(PeriodType::parse_strict("fiscal").is_err());
+    }
+
+    #[test]
+    fn parse_period_type_defaults_untrusted_to_daily() {
+        assert!(matches!(PeriodType::parse("fiscal"), PeriodType::Daily));
+        assert!(matches!(PeriodType::parse("yearly"), PeriodType::Daily));
     }
 
     #[test]

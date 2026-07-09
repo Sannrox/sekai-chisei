@@ -2831,6 +2831,25 @@ mod tests {
         assert_eq!(cheap_route_bias("bulk", true), None);
     }
 
+    #[test]
+    fn budget_metric_accepts_tokens_and_requests_case_insensitive() {
+        assert_eq!(budget_metric("").unwrap(), METRIC_TOKENS);
+        assert_eq!(budget_metric("tokens").unwrap(), METRIC_TOKENS);
+        assert_eq!(budget_metric("Tokens").unwrap(), METRIC_TOKENS);
+        assert_eq!(budget_metric("requests").unwrap(), METRIC_REQUESTS);
+        assert_eq!(budget_metric("REQUESTS").unwrap(), METRIC_REQUESTS);
+    }
+
+    #[test]
+    fn budget_metric_rejects_unknown_values() {
+        let err = budget_metric("characters").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("unsupported budget metric; use tokens or requests")
+        );
+    }
+
     #[tokio::test]
     async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());

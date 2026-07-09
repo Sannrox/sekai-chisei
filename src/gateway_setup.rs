@@ -235,8 +235,8 @@ pub async fn run_setup(
             period_type: config.budget_period.clone(),
             // Leave `subject` empty so the server seeds the limit at the
             // same project/agent scope the gateway's request path checks
-            // against (`project:{project}/agent:{agent}`), rather than a
-            // flat scope the real hierarchy chain never visits.
+            // against (`project:{project}/agent:{agent}`), while allowing
+            // the chain's additional flat `agent:{agent}` enforcement.
             subject: String::new(),
             project: config.project.clone(),
             agent: config.agent.clone(),
