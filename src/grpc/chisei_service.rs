@@ -1489,12 +1489,7 @@ impl ChiseiService for ChiseiServiceImpl {
             &r.user_id,
         )?;
         self.budget
-            .set_limit_with_metric(
-                &budget_subject,
-                metric,
-                r.max_tokens,
-                period,
-            )
+            .set_limit_with_metric(&budget_subject, metric, r.max_tokens, period)
             .map_err(Status::internal)?;
         Ok(Response::new(SetBudgetLimitResponse {}))
     }

@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 use tracing::{error, info, warn};
 
+use crate::db::chisei_budget::METRIC_REQUESTS;
 use crate::gateway_keys::hash_gateway_key;
 use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -26,7 +27,6 @@ use crate::grpc::pb::chisei::{
     RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
     ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
 };
-use crate::db::chisei_budget::METRIC_REQUESTS;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     AppendRowsRequest, ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest,
@@ -599,77 +599,69 @@ async fn check_budget_preflight(
         metric: String::new(),
     };
 
-    let check_budget = |req: CheckBudgetRequest| {
-        async move {
-            match connect_sekai(target).await {
-                Ok(channel) => {
-                    let mut client = ChiseiServiceClient::new(channel);
-                    let estimated_tokens = req.estimated_tokens;
-                    let budget_subject = audit_budget_subject(&req);
-                    match client.check_budget(GrpcRequest::new(req)).await {
-                        Ok(resp) => {
-                            let resp = resp.into_inner();
-                            if resp.allowed {
-                                Ok(())
-                            } else {
-                                let usage = resp.usage;
-                                let message = usage
-                                    .map(|usage| {
-                                        format!(
-                                            "budget exceeded for {}: used {} + estimated {} > {}",
-                                            usage.user_id,
-                                            usage.tokens_used,
-                                            estimated_tokens,
-                                            usage.max_tokens
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "budget exceeded".to_string());
-                                record_gateway_decision(
-                                    config,
-                                    identity,
-                                    "gateway.budget_denied",
-                                    &message,
-                                    "denied",
-                                    {
-                                        let mut evidence = HashMap::from([(
-                                            "estimated_tokens".to_string(),
-                                            estimated_tokens.to_string(),
-                                        )]);
-                                        if let Some(budget_subject) = budget_subject {
-                                            evidence.insert(
-                                                "budget_subject".to_string(),
-                                                budget_subject,
-                                            );
-                                        }
-                                        evidence
-                                    },
-                                )
-                                .await;
-                                Err(GatewayRejection::json(
-                                    StatusCode::TOO_MANY_REQUESTS,
-                                    "budget_exceeded",
-                                    message,
-                                ))
-                            }
-                        }
-                            Err(err) => {
-                            governance_error(
+    let check_budget = |req: CheckBudgetRequest| async move {
+        match connect_sekai(target).await {
+            Ok(channel) => {
+                let mut client = ChiseiServiceClient::new(channel);
+                let estimated_tokens = req.estimated_tokens;
+                let budget_subject = audit_budget_subject(&req);
+                match client.check_budget(GrpcRequest::new(req)).await {
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+                        if resp.allowed {
+                            Ok(())
+                        } else {
+                            let usage = resp.usage;
+                            let message = usage
+                                .map(|usage| {
+                                    format!(
+                                        "budget exceeded for {}: used {} + estimated {} > {}",
+                                        usage.user_id,
+                                        usage.tokens_used,
+                                        estimated_tokens,
+                                        usage.max_tokens
+                                    )
+                                })
+                                .unwrap_or_else(|| "budget exceeded".to_string());
+                            record_gateway_decision(
                                 config,
                                 identity,
-                                &format!("CheckBudget failed: {err}"),
+                                "gateway.budget_denied",
+                                &message,
+                                "denied",
+                                {
+                                    let mut evidence = HashMap::from([(
+                                        "estimated_tokens".to_string(),
+                                        estimated_tokens.to_string(),
+                                    )]);
+                                    if let Some(budget_subject) = budget_subject {
+                                        evidence
+                                            .insert("budget_subject".to_string(), budget_subject);
+                                    }
+                                    evidence
+                                },
                             )
-                            .await
+                            .await;
+                            Err(GatewayRejection::json(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "budget_exceeded",
+                                message,
+                            ))
                         }
                     }
+                    Err(err) => {
+                        governance_error(config, identity, &format!("CheckBudget failed: {err}"))
+                            .await
+                    }
                 }
-                Err(err) => {
-                    governance_error(
-                        config,
-                        identity,
-                        &format!("failed to connect to Chisei control plane: {err}"),
-                    )
-                    .await
-                }
+            }
+            Err(err) => {
+                governance_error(
+                    config,
+                    identity,
+                    &format!("failed to connect to Chisei control plane: {err}"),
+                )
+                .await
             }
         }
     };
@@ -2228,9 +2220,7 @@ fn parse_gateway_keys(
         .filter(|s| !s.is_empty())
     {
         let (key, value) = entry.split_once('=').ok_or_else(|| {
-            format!(
-                "invalid GATEWAY_KEYS entry {entry:?}; expected key=agent:project[:tier]"
-            )
+            format!("invalid GATEWAY_KEYS entry {entry:?}; expected key=agent:project[:tier]")
         })?;
         let key = key.trim();
         if key.is_empty() {
@@ -2241,10 +2231,10 @@ fn parse_gateway_keys(
         let project = parts.next().map(str::trim);
         let tier = parts.next().map(str::trim);
         if parts.next().is_some() {
-            return Err(
-                format!("invalid GATEWAY_KEYS entry {entry:?}; expected key=agent:project[:tier]")
-                    .into(),
-            );
+            return Err(format!(
+                "invalid GATEWAY_KEYS entry {entry:?}; expected key=agent:project[:tier]"
+            )
+            .into());
         }
         if agent.is_empty() {
             return Err(format!("invalid GATEWAY_KEYS entry {entry:?}; empty agent").into());
@@ -2254,9 +2244,7 @@ fn parse_gateway_keys(
             Some(value) => value,
         };
         if project.is_empty() {
-            return Err(
-                format!("invalid GATEWAY_KEYS entry {entry:?}; empty project").into(),
-            );
+            return Err(format!("invalid GATEWAY_KEYS entry {entry:?}; empty project").into());
         }
         let tier = match tier {
             None | Some("") => DEFAULT_GATEWAY_TIER,
@@ -6567,19 +6555,19 @@ mod tests {
 
         let channel = connect_sekai(&chisei_target).await.unwrap();
         ChiseiServiceClient::new(channel)
-                .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
-                    user_id: "project:default".to_string(),
-                    max_tokens: 1,
-                    period_type: "day".to_string(),
-                    subject: "project:default".to_string(),
-                    project: "default".to_string(),
-                    agent: String::new(),
-                    key_id: String::new(),
-                    work_unit: String::new(),
-                    metric: String::new(),
-                }))
-                .await
-                .unwrap();
+            .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
+                user_id: "project:default".to_string(),
+                max_tokens: 1,
+                period_type: "day".to_string(),
+                subject: "project:default".to_string(),
+                project: "default".to_string(),
+                agent: String::new(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                metric: String::new(),
+            }))
+            .await
+            .unwrap();
 
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

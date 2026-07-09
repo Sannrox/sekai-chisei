@@ -1193,11 +1193,7 @@ fn action_policy_namespace(
         .unwrap_or_default()
 }
 
-fn action_budget_subject(
-    action_risk: &str,
-    namespace: &str,
-    actor: &str,
-) -> String {
+fn action_budget_subject(action_risk: &str, namespace: &str, actor: &str) -> String {
     let base = format!("action:{action_risk}");
     if namespace.trim().is_empty() {
         return base;
@@ -3036,14 +3032,13 @@ impl SekaiService for SekaiServiceImpl {
                 )));
             }
         }
-        let budget_subject = action_budget_subject(action_risk.as_str(), &namespace, &approval.actor);
+        let budget_subject =
+            action_budget_subject(action_risk.as_str(), &namespace, &approval.actor);
         if let Some(budget) = &self.budget
             && budget.check(&budget_subject, 1).is_err()
         {
-            let mut evidence = HashMap::from([(
-                "budget_subject".to_string(),
-                budget_subject.clone(),
-            )]);
+            let mut evidence =
+                HashMap::from([("budget_subject".to_string(), budget_subject.clone())]);
             evidence.insert("risk_class".to_string(), action_risk.as_str().into());
             self.db
                 .record_decision(&audit::Decision {
@@ -9662,7 +9657,9 @@ mod tests {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         let budget = Arc::new(BudgetTracker::new(db.clone()));
         // Allow 1 write action, then deny.
-        budget.set_limit("action:write", 1, PeriodType::Daily).unwrap();
+        budget
+            .set_limit("action:write", 1, PeriodType::Daily)
+            .unwrap();
         let svc = SekaiServiceImpl::with_budget(db, budget.clone());
         seed_domain_object(&svc, "obj-1");
 

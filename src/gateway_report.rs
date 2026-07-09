@@ -566,11 +566,9 @@ mod tests {
 
     #[test]
     fn parses_work_unit_report_args() {
-        let config = GatewayReportConfig::from_env_and_args([
-            "--by".to_string(),
-            "work-unit".to_string(),
-        ])
-        .unwrap();
+        let config =
+            GatewayReportConfig::from_env_and_args(["--by".to_string(), "work-unit".to_string()])
+                .unwrap();
 
         assert_eq!(config.group_by, ReportGroupBy::WorkUnit);
     }
