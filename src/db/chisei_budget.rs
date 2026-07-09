@@ -17,10 +17,10 @@ pub const GLOBAL_SCOPE: &str = "global";
 ///
 /// Scope ids are constructed (not stored) as `/`-joined segments, e.g.
 /// `project:p/agent:a/work_unit:w`. The chain for that id is
-/// `["global", "project:p", "project:p/agent:a", "project:p/agent:a/work_unit:w"]`.
+/// `["global", "project:p", "project:p/agent:a", "agent:a", "project:p/agent:a/work_unit:w"]`.
 /// A flat, single-segment scope id (e.g. a legacy explicit `subject`) chains
-/// through `global` only, so it behaves exactly as it did before hierarchy
-/// existed unless someone sets a limit on `global` itself.
+/// through `global` only. For `agent` segments we additionally append a flat
+/// `agent:<id>` scope so both scoped and flat `agent:` limits apply.
 pub(crate) fn scope_chain(scope_id: &str) -> Vec<String> {
     if scope_id.is_empty() || scope_id == GLOBAL_SCOPE {
         return vec![GLOBAL_SCOPE.to_string()];
@@ -35,10 +35,10 @@ pub(crate) fn scope_chain(scope_id: &str) -> Vec<String> {
         if !chain.contains(&acc) {
             chain.push(acc.clone());
         }
-        if let Some((kind, id)) = segment.split_once(':')
+        if let Some((kind, _)) = segment.split_once(':')
             && kind == "agent"
         {
-            let flat_scope = format!("{kind}:{id}");
+            let flat_scope = segment.to_string();
             if !chain.contains(&flat_scope) {
                 chain.push(flat_scope);
             }
@@ -360,5 +360,40 @@ impl SekaiDb {
             worst = worst.max(level);
         }
         Ok(worst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn scope_chain_includes_flat_agent_scope() {
+        let chain = scope_chain("project:sekai/agent:codex-app/work_unit:wu-1");
+        assert_eq!(
+            chain,
+            vec![
+                "global".to_string(),
+                "project:sekai".to_string(),
+                "project:sekai/agent:codex-app".to_string(),
+                "agent:codex-app".to_string(),
+                "project:sekai/agent:codex-app/work_unit:wu-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn monthly_period_starts_at_first_of_month() {
+        let now_ms = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 30, 12, 30, 0)
+            .unwrap()
+            .timestamp_millis();
+        let actual = period_start_ms("monthly", now_ms);
+        let expected = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(actual, expected);
     }
 }

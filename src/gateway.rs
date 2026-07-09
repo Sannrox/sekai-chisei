@@ -6380,6 +6380,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_open_does_not_block_budget_preflight_when_control_plane_is_unavailable() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
+            fail_closed: false,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::from([(
+                "sk-chisei-codex-app".to_string(),
+                GatewayIdentity {
+                    agent: "codex-app".to_string(),
+                    project: "default".to_string(),
+                    user_id: "agent:codex-app".to_string(),
+                    key_id: "codex-app".to_string(),
+                    tier: DEFAULT_GATEWAY_TIER.to_string(),
+                },
+            )]),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn no_preflight_skips_unavailable_control_plane_checks() {
         let (upstream_base, requests) =
             spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
