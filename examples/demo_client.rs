@@ -276,6 +276,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             project: String::new(),
             agent: String::new(),
             key_id: String::new(),
+            metric: String::new(),
+            work_unit: String::new(),
         })
         .await
     {
@@ -291,6 +293,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             project: String::new(),
             agent: String::new(),
             key_id: String::new(),
+            metric: String::new(),
+            work_unit: String::new(),
         })
         .await
     {
@@ -313,6 +317,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             project: String::new(),
             agent: String::new(),
             key_id: String::new(),
+            metric: String::new(),
+            work_unit: String::new(),
         })
         .await
     {

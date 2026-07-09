@@ -81,6 +81,7 @@ impl SekaiDb {
         self.migrate_functions()?;
         self.migrate_chisei()?;
         self.migrate_action_types()?;
+        self.migrate_budget()?;
         Ok(())
     }
 

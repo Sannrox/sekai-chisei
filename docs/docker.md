@@ -75,5 +75,5 @@ docker compose run --rm gateway sekaictl gateway setup --help
 - Generate an attribution/report from shared state:
 
 ```bash
-docker compose run --rm gateway chisei-gateway report --by agent --since 24h
+docker compose run --rm gateway chisei-gateway report --by work-unit --since 24h
 ```

@@ -10,11 +10,22 @@ pub enum CredentialCommand {
     Create { principal: String },
     Rotate { principal: String },
     Revoke { principal: String },
+    BulkCreate { principals: Vec<String> },
+    BulkRotate { principals: Vec<String> },
+    BulkRevoke { principals: Vec<String> },
     List,
 }
 
 pub fn usage() -> &'static str {
-    "Usage: sekaictl credential create <principal>\n       sekaictl credential rotate <principal>\n       sekaictl credential revoke <principal>\n       sekaictl credential list"
+    concat!(
+        "Usage: sekaictl credential create <principal>\n",
+        "       sekaictl credential rotate <principal>\n",
+        "       sekaictl credential revoke <principal>\n",
+        "       sekaictl credential bulk create <principal...>\n",
+        "       sekaictl credential bulk rotate <principal...>\n",
+        "       sekaictl credential bulk revoke <principal...>\n",
+        "       sekaictl credential list"
+    )
 }
 
 pub fn parse_credential_command<I>(args: I) -> Result<CredentialCommand, String>
@@ -52,6 +63,20 @@ where
             validate_principal(&principal)?;
             Ok(CredentialCommand::Revoke { principal })
         }
+        "bulk" => {
+            let action = args
+                .next()
+                .ok_or_else(|| "credential bulk requires create|rotate|revoke".to_string())?;
+            let principals = parse_principal_list(args)?;
+            match action.as_str() {
+                "create" => Ok(CredentialCommand::BulkCreate { principals }),
+                "rotate" => Ok(CredentialCommand::BulkRotate { principals }),
+                "revoke" => Ok(CredentialCommand::BulkRevoke { principals }),
+                _ => Err(format!(
+                    "credential bulk requires create|rotate|revoke, got {action:?}"
+                )),
+            }
+        }
         "list" => {
             ensure_no_more_args(args)?;
             Ok(CredentialCommand::List)
@@ -67,6 +92,25 @@ where
     args.next()
         .map(|_| "unexpected trailing arguments".to_string())
         .map_or(Ok(()), Err)
+}
+
+fn parse_principal_list<I>(args: I) -> Result<Vec<String>, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut principals = Vec::new();
+    for principal in args {
+        let principal = principal.trim().to_string();
+        if principal.is_empty() {
+            return Err("principal must not be empty".to_string());
+        }
+        validate_principal(&principal)?;
+        principals.push(principal);
+    }
+    if principals.is_empty() {
+        return Err("credential bulk requires at least one principal".to_string());
+    }
+    Ok(principals)
 }
 
 fn validate_principal(principal: &str) -> Result<(), String> {
@@ -193,6 +237,40 @@ mod tests {
         assert_eq!(
             parse_credential_command(["list".to_string()]).unwrap(),
             CredentialCommand::List
+        );
+    }
+
+    #[test]
+    fn parse_bulk_create_rotate_revoke() {
+        assert_eq!(
+            parse_credential_command([
+                "bulk".to_string(),
+                "create".to_string(),
+                "agent-a".to_string(),
+                "agent-b".to_string(),
+            ])
+            .unwrap(),
+            CredentialCommand::BulkCreate {
+                principals: vec!["agent-a".to_string(), "agent-b".to_string()]
+            }
+        );
+        assert_eq!(
+            parse_credential_command([
+                "bulk".to_string(),
+                "rotate".to_string(),
+                "agent-a".to_string(),
+            ])
+            .unwrap(),
+            CredentialCommand::BulkRotate {
+                principals: vec!["agent-a".to_string()]
+            }
+        );
+        assert_eq!(
+            parse_credential_command(["bulk".to_string(), "revoke".to_string(), "agent-a".to_string()])
+                .unwrap(),
+            CredentialCommand::BulkRevoke {
+                principals: vec!["agent-a".to_string()]
+            }
         );
     }
 }
