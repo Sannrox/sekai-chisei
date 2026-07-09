@@ -1,0 +1,35 @@
+# tenkai product manifest for sekai-chisei itself.
+#
+# Deploys a *workload* instance (separate from the control-plane instance
+# tenkai talks to): gRPC on 50052, ops/healthz on 9465, data in a named
+# volume. Runs on Apple `container`; commands are self-contained (no repo
+# checkout needed), so this manifest can be published straight from a git tag.
+#
+# Release flow: bump product.version and the image tag together, commit, tag
+# the repo `v<version>` — the release workflow pushes the image to GHCR.
+
+[product]
+name = "sekai-chisei"
+version = "0.1.2"
+description = "sekai-chisei control plane (workload instance via Apple container)"
+
+[deploy]
+workdir = "."
+install = """
+set -e
+IMG=ghcr.io/sannrox/sekai-chisei:0.1.2
+container image pull "$IMG" || container image inspect "$IMG" >/dev/null 2>&1
+container volume create sekai-chisei-prod-data >/dev/null 2>&1 || true
+container run --rm --user root -v sekai-chisei-prod-data:/data "$IMG" chown -R sekai /data
+container rm -f sekai-chisei-prod >/dev/null 2>&1 || true
+# Plaintext on 0.0.0.0 is confined to the container VM; ports publish to localhost only.
+container run -d --name sekai-chisei-prod -p 50052:50051 -p 9465:9464 -e SEKAI_INSECURE=1 -e SEKAI_BIND=0.0.0.0 -e SEKAI_ALLOW_PLAINTEXT=1 -e OPS_BIND=0.0.0.0 -v sekai-chisei-prod-data:/data "$IMG"
+"""
+uninstall = "container rm -f sekai-chisei-prod"
+health = """
+for i in $(seq 1 15); do
+  curl -sf http://127.0.0.1:9465/healthz >/dev/null 2>&1 && exit 0
+  sleep 1
+done
+exit 1
+"""
