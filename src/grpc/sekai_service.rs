@@ -9662,7 +9662,7 @@ mod tests {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         let budget = Arc::new(BudgetTracker::new(db.clone()));
         // Allow 1 write action, then deny.
-        budget.set_limit("action:write", 1, PeriodType::Daily);
+        budget.set_limit("action:write", 1, PeriodType::Daily).unwrap();
         let svc = SekaiServiceImpl::with_budget(db, budget.clone());
         seed_domain_object(&svc, "obj-1");
 
