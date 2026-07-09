@@ -440,16 +440,16 @@ mod tests {
         );
         assert_eq!(
             candidate_scopes("", "sekai-chisei", "sekai-chisei"),
-            vec!["project:sekai-chisei".to_string(), "sekai-chisei".to_string()]
+            vec![
+                "project:sekai-chisei".to_string(),
+                "sekai-chisei".to_string()
+            ]
         );
         assert_eq!(
             candidate_scopes("", "", "sekai-chisei"),
             vec!["project:sekai-chisei".to_string()]
         );
-        assert_eq!(
-            candidate_scopes("", "", ""),
-            Vec::<String>::new()
-        );
+        assert_eq!(candidate_scopes("", "", ""), Vec::<String>::new());
     }
 
     #[test]
