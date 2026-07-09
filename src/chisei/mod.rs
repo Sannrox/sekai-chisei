@@ -1,11 +1,14 @@
 pub mod affinity;
 pub mod budget;
+pub mod controller;
 pub mod egress;
 pub mod eval;
 pub mod evolve;
+pub mod gate;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;
 pub mod privacy;
+pub mod promotion;
 pub mod sampling;
 pub mod scoring;
