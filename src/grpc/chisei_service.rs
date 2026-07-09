@@ -1078,11 +1078,15 @@ fn choose_preferred_model(
     recommended_model.to_string()
 }
 
-fn budget_metric(metric: &str) -> &'static str {
+fn budget_metric(metric: &str) -> Result<&'static str, Status> {
     if metric.trim().eq_ignore_ascii_case(METRIC_REQUESTS) {
-        METRIC_REQUESTS
+        Ok(METRIC_REQUESTS)
+    } else if metric.trim().is_empty() || metric.trim().eq_ignore_ascii_case(METRIC_TOKENS) {
+        Ok(METRIC_TOKENS)
     } else {
-        METRIC_TOKENS
+        Err(Status::invalid_argument(
+            "unsupported budget metric; use tokens or requests",
+        ))
     }
 }
 
@@ -1414,7 +1418,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<CheckBudgetRequest>,
     ) -> Result<Response<CheckBudgetResponse>, Status> {
         let r = req.into_inner();
-        let metric = budget_metric(&r.metric);
+        let metric = budget_metric(&r.metric)?;
         let budget_subject = budget_subject(
             &r.subject,
             &r.project,
@@ -1445,7 +1449,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RecordUsageRequest>,
     ) -> Result<Response<RecordUsageResponse>, Status> {
         let r = req.into_inner();
-        let metric = budget_metric(&r.metric);
+        let metric = budget_metric(&r.metric)?;
         let budget_subject = budget_subject(
             &r.subject,
             &r.project,
@@ -1473,7 +1477,9 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<SetBudgetLimitRequest>,
     ) -> Result<Response<SetBudgetLimitResponse>, Status> {
         let r = req.into_inner();
-        let metric = budget_metric(&r.metric);
+        let metric = budget_metric(&r.metric)?;
+        let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
+            .map_err(|error| Status::invalid_argument(error))?;
         let budget_subject = budget_subject(
             &r.subject,
             &r.project,
@@ -1482,12 +1488,14 @@ impl ChiseiService for ChiseiServiceImpl {
             &r.work_unit,
             &r.user_id,
         )?;
-        self.budget.set_limit_with_metric(
-            &budget_subject,
-            metric,
-            r.max_tokens,
-            crate::chisei::budget::PeriodType::parse(&r.period_type),
-        );
+        self.budget
+            .set_limit_with_metric(
+                &budget_subject,
+                metric,
+                r.max_tokens,
+                period,
+            )
+            .map_err(|error| Status::internal(error))?;
         Ok(Response::new(SetBudgetLimitResponse {}))
     }
 
