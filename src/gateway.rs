@@ -2566,10 +2566,9 @@ fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
         )
     } else if let Some(rest) = path.strip_prefix("/v1/messages") {
         (ProviderKind::Anthropic, format!("/messages{rest}"))
-    } else if let Some(rest) = path.strip_prefix("/messages") {
-        (ProviderKind::Anthropic, format!("/messages{rest}"))
     } else {
-        return None;
+        let rest = path.strip_prefix("/messages")?;
+        (ProviderKind::Anthropic, format!("/messages{rest}"))
     };
     Some(mapped)
 }
