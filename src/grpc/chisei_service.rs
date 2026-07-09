@@ -1479,7 +1479,7 @@ impl ChiseiService for ChiseiServiceImpl {
         let r = req.into_inner();
         let metric = budget_metric(&r.metric)?;
         let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
-            .map_err(|error| Status::invalid_argument(error))?;
+            .map_err(Status::invalid_argument)?;
         let budget_subject = budget_subject(
             &r.subject,
             &r.project,
@@ -1495,7 +1495,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 r.max_tokens,
                 period,
             )
-            .map_err(|error| Status::internal(error))?;
+            .map_err(Status::internal)?;
         Ok(Response::new(SetBudgetLimitResponse {}))
     }
 

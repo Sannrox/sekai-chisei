@@ -600,9 +600,6 @@ async fn check_budget_preflight(
     };
 
     let check_budget = |req: CheckBudgetRequest| {
-        let config = config;
-        let identity = identity;
-        let target = target;
         async move {
             match connect_sekai(target).await {
                 Ok(channel) => {
