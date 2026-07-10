@@ -876,6 +876,7 @@ async fn resolve_policy_preflight(
                 key_id: identity.key_id.clone(),
                 task_class: task_class.to_string(),
                 user_id: String::new(),
+                expected_calls: 1,
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
@@ -3646,10 +3647,15 @@ async fn record_usage_and_append(
             }
             let pipeline_observation =
                 run_gateway_pipeline_observation(config, identity, context, &mut chisei).await;
+            let portfolio_cost_usd_micros = usage
+                .as_ref()
+                .and_then(|usage| estimate_cost_usd_micros(config, context, usage))
+                .unwrap_or(0);
             record_sample_observation_if_needed(
                 identity,
                 context,
                 usage,
+                portfolio_cost_usd_micros,
                 response_observation.as_ref(),
                 pipeline_observation.as_ref(),
                 &mut chisei,
@@ -3942,6 +3948,7 @@ async fn record_sample_observation_if_needed(
     identity: &GatewayIdentity,
     context: &UsageContext,
     usage: Option<ResponseUsage>,
+    cost_usd_micros: i64,
     response_observation: Option<&ResponseObservation>,
     pipeline_observation: Option<&GatewayPipelineObservation>,
     chisei: &mut ChiseiServiceClient<GatewayClient>,
@@ -3978,6 +3985,7 @@ async fn record_sample_observation_if_needed(
                 stop_reason: response_observation.stop_reason.clone(),
                 timestamp: Utc::now().timestamp_millis(),
                 task_class: context.task_class.clone(),
+                cost_usd_micros,
             }),
         }))
         .await
@@ -5621,6 +5629,7 @@ mod tests {
                         key_id: String::new(),
                         task_class: String::new(),
                         user_id: String::new(),
+                        expected_calls: 1,
                     }))
                     .await
                     .map(|_| true)
