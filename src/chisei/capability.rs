@@ -524,6 +524,13 @@ pub fn register_capability(
             "registering actor is required".to_string(),
         ));
     }
+    let namespace = proposal.namespace.trim().to_string();
+    let task_class = normalize_task_class(&proposal.task_class);
+    if namespace.is_empty() || task_class.is_empty() {
+        return Err(CapabilityRegistryError::InvalidAuthorization(
+            "namespace and task class are required".to_string(),
+        ));
+    }
 
     let mut conn = db.conn();
     let tx = conn.transaction().map_err(registry_storage)?;
@@ -537,7 +544,7 @@ pub fn register_capability(
             .map_err(registry_storage)?;
         let rows = statement
             .query_map(
-                params![KIND_CAPABILITY, proposal.namespace, proposal.task_class],
+                params![KIND_CAPABILITY, namespace, task_class],
                 crate::db::sekai::row_to_object,
             )
             .map_err(registry_storage)?;
@@ -575,10 +582,10 @@ pub fn register_capability(
     let capability = CapabilityVersion {
         id: format!(
             "capability-{}-v{version}",
-            group_key_hash(&proposal.namespace, &proposal.task_class)
+            group_key_hash(&namespace, &task_class)
         ),
-        namespace: proposal.namespace.clone(),
-        task_class: proposal.task_class.clone(),
+        namespace,
+        task_class,
         version,
         status: CAPABILITY_ACTIVE.to_string(),
         proposal: proposal.clone(),
@@ -1038,8 +1045,15 @@ mod tests {
         db: &SekaiDb,
         now: i64,
     ) -> (CapabilityProposal, CapabilityLaunchAuthorization) {
+        authorize_proposal(db, proposal_at(now), now)
+    }
+
+    fn authorize_proposal(
+        db: &SekaiDb,
+        mut proposal: CapabilityProposal,
+        now: i64,
+    ) -> (CapabilityProposal, CapabilityLaunchAuthorization) {
         let eval = EvalStore::new();
-        let mut proposal = proposal_at(now);
         review_capability_proposal(
             db,
             &mut proposal,
@@ -1429,6 +1443,33 @@ mod tests {
         assert_eq!(lineage.from_id, version_2.id);
         assert_eq!(lineage.to_id, version_1.id);
         assert_eq!(lineage.relation, REL_DEPENDS_ON);
+    }
+
+    #[test]
+    fn registry_versions_canonical_namespace_and_task_class_keys() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut raw_proposal = proposal_at(100);
+        raw_proposal.namespace = " acme ".to_string();
+        raw_proposal.task_class = "Code   Review".to_string();
+        let (proposal_v1, authorization_v1) = authorize_proposal(&db, raw_proposal, 100);
+        let version_1 =
+            register_capability(&db, &proposal_v1, &authorization_v1, "human:registrar", 200)
+                .unwrap();
+
+        let mut canonical_proposal = proposal_at(300);
+        canonical_proposal.task_class = "code_review".to_string();
+        let (proposal_v2, authorization_v2) = authorize_proposal(&db, canonical_proposal, 300);
+        let version_2 =
+            register_capability(&db, &proposal_v2, &authorization_v2, "human:registrar", 400)
+                .unwrap();
+
+        assert_eq!(version_1.namespace, "acme");
+        assert_eq!(version_1.task_class, "code_review");
+        assert_eq!(version_2.version, 2);
+        let versions = list_capability_versions(&db, " acme ", "Code Review").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].status, CAPABILITY_SUPERSEDED);
+        assert_eq!(versions[1].status, CAPABILITY_ACTIVE);
     }
 
     #[test]
