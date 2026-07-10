@@ -315,14 +315,14 @@ fn maximize_value_indices(choices: &[Choice], budget: i64) -> Result<Vec<usize>,
         let mut next = Vec::new();
         for state in &states {
             for (index, candidate) in candidates.iter().enumerate() {
-                let candidate_cost = candidate
-                    .cost_usd_micros
-                    .checked_mul(demand.expected_calls)
-                    .ok_or_else(|| "portfolio allocation cost overflow".to_string())?;
-                let cost = state
-                    .cost
-                    .checked_add(candidate_cost)
-                    .ok_or_else(|| "portfolio allocation cost overflow".to_string())?;
+                let Some(candidate_cost) =
+                    candidate.cost_usd_micros.checked_mul(demand.expected_calls)
+                else {
+                    continue;
+                };
+                let Some(cost) = state.cost.checked_add(candidate_cost) else {
+                    continue;
+                };
                 if cost > budget {
                     continue;
                 }
@@ -649,6 +649,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("overflow"));
+    }
+
+    #[test]
+    fn finite_budget_skips_candidates_whose_total_cost_overflows() {
+        let store = store();
+        for (model, quality, cost) in [("affordable", 80.0, 1), ("overflowing", 100.0, i64::MAX)] {
+            store
+                .record(&observation("acme", "primary", model, quality, cost, 1, 1))
+                .unwrap();
+        }
+        let mut objective = objective(ObjectiveMode::MaximizeValue, 10);
+        objective.min_samples = 1;
+        let plan = store
+            .allocate(
+                &objective,
+                &[TaskDemand {
+                    task_class: "primary".into(),
+                    expected_calls: 2,
+                    quality_bar: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(plan.allocations[0].model, "affordable");
+        assert_eq!(plan.total_cost_usd_micros, 2);
     }
 
     #[test]
