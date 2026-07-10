@@ -162,9 +162,21 @@ impl SchemaRegistry {
     ) -> Self {
         let mut registry = Self::new();
         for interface in interfaces {
+            if registry
+                .get_interface(&interface.name)
+                .is_some_and(|existing| existing.is_builtin)
+            {
+                continue;
+            }
             registry.register_interface(interface);
         }
         for object_type in types {
+            if registry
+                .get(&object_type.kind)
+                .is_some_and(|existing| existing.is_builtin)
+            {
+                continue;
+            }
             registry.register(object_type);
         }
         registry
@@ -381,7 +393,7 @@ fn is_valid_property_classification(value: &str) -> bool {
 }
 
 fn builtin_object_types() -> Vec<ObjectType> {
-    [
+    let mut types = [
         (
             "agent",
             "Actor identity for a human, service, or automation that performs control-plane work.",
@@ -427,7 +439,98 @@ fn builtin_object_types() -> Vec<ObjectType> {
         is_builtin: true,
         implements: Vec::new(),
     })
-    .collect()
+    .collect::<Vec<_>>();
+    types.push(ObjectType {
+        kind: crate::domain::KIND_LEARNING.to_string(),
+        description:
+            "Governed memory derived from an evaluated task outcome and linked to its graph target."
+                .to_string(),
+        properties: vec![
+            classified_prop_def(
+                "title",
+                PropertyType::String,
+                true,
+                "Concise description of the learning.",
+                "sensitive",
+                &[],
+            ),
+            classified_prop_def(
+                "prevention",
+                PropertyType::String,
+                true,
+                "Concise guidance that prevents the observed failure or preserves the successful pattern.",
+                "sensitive",
+                &[],
+            ),
+            classified_prop_def(
+                "reasoning",
+                PropertyType::String,
+                false,
+                "Evaluation rationale supporting the learning.",
+                "sensitive",
+                &[],
+            ),
+            classified_prop_def(
+                "source_request_id",
+                PropertyType::String,
+                false,
+                "Request identifier from which the learning was derived.",
+                "sensitive",
+                &[],
+            ),
+            classified_prop_def(
+                "score",
+                PropertyType::Int,
+                false,
+                "Evaluation score from zero through one hundred.",
+                "internal",
+                &[],
+            ),
+            classified_prop_def(
+                "passed",
+                PropertyType::Bool,
+                false,
+                "Whether the evaluated task outcome passed its gate.",
+                "internal",
+                &[],
+            ),
+            classified_prop_def(
+                "task_class",
+                PropertyType::String,
+                false,
+                "Routing or workload class of the source task.",
+                "internal",
+                &[],
+            ),
+            classified_prop_def(
+                "model",
+                PropertyType::String,
+                false,
+                "Model that produced the evaluated outcome.",
+                "internal",
+                &[],
+            ),
+            classified_prop_def(
+                "producer",
+                PropertyType::String,
+                false,
+                "Principal or subsystem that produced the learning.",
+                "internal",
+                &[],
+            ),
+            classified_prop_def(
+                "status",
+                PropertyType::Enum,
+                false,
+                "Lifecycle state used by retrieval and promotion gates.",
+                "internal",
+                &["candidate", "active", "superseded", "rejected"],
+            ),
+        ],
+        is_builtin: true,
+        implements: vec!["Auditable".to_string()],
+    });
+    types
 }
 
 fn builtin_interfaces() -> Vec<InterfaceDef> {
@@ -547,6 +650,30 @@ fn prop_def_desc(
         link_kind: String::new(),
         compute_expr: String::new(),
         classification: default_property_classification(),
+        struct_fields: Vec::new(),
+    }
+}
+
+fn classified_prop_def(
+    name: &str,
+    prop_type: PropertyType,
+    required: bool,
+    description: &str,
+    classification: &str,
+    enum_values: &[&str],
+) -> PropertyDef {
+    PropertyDef {
+        name: name.to_string(),
+        prop_type,
+        required,
+        description: description.to_string(),
+        enum_values: enum_values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+        classification: classification.to_string(),
         struct_fields: Vec::new(),
     }
 }
@@ -1356,12 +1483,24 @@ mod tests {
         let err = validate_interface_definition(
             &InterfaceDef {
                 is_builtin: false,
-                ..builtin
+                ..builtin.clone()
             },
             registry.get_interface("RiskScored"),
         )
         .unwrap_err();
         assert!(err.contains("cannot replace builtin interface"));
+
+        let reloaded = SchemaRegistry::from_types_and_interfaces(
+            Vec::new(),
+            vec![InterfaceDef {
+                description: "persisted override".into(),
+                is_builtin: false,
+                ..builtin
+            }],
+        );
+        let restored = reloaded.get_interface("RiskScored").unwrap();
+        assert!(restored.is_builtin);
+        assert_ne!(restored.description, "persisted override");
     }
 
     #[test]
@@ -1388,6 +1527,90 @@ mod tests {
         assert!(namespace.contains("Control-plane boundary"));
         assert!(project.contains("namespaces remain the runtime boundary"));
         assert!(component.contains("Runnable or observable unit"));
+    }
+
+    #[test]
+    fn test_builtin_learning_schema_is_typed_and_conservatively_classified() {
+        let registry = SchemaRegistry::from_types(vec![ObjectType {
+            kind: crate::domain::KIND_LEARNING.into(),
+            description: "persisted override".into(),
+            properties: Vec::new(),
+            is_builtin: false,
+            implements: Vec::new(),
+        }]);
+        let learning = registry.get(crate::domain::KIND_LEARNING).unwrap();
+        assert!(learning.is_builtin);
+        assert_ne!(learning.description, "persisted override");
+        assert_eq!(learning.implements, vec!["Auditable"]);
+
+        let properties = learning
+            .properties
+            .iter()
+            .map(|property| (property.name.as_str(), property))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(properties.len(), 10);
+        for name in ["title", "prevention", "reasoning", "source_request_id"] {
+            assert_eq!(properties[name].classification, "sensitive");
+        }
+        for name in [
+            "score",
+            "passed",
+            "task_class",
+            "model",
+            "producer",
+            "status",
+        ] {
+            assert_eq!(properties[name].classification, "internal");
+        }
+        assert_eq!(properties["score"].prop_type, PropertyType::Int);
+        assert_eq!(properties["passed"].prop_type, PropertyType::Bool);
+        assert_eq!(properties["status"].prop_type, PropertyType::Enum);
+        assert_eq!(
+            properties["status"].enum_values,
+            vec!["candidate", "active", "superseded", "rejected"]
+        );
+
+        let object = Object {
+            id: "learning-1".into(),
+            kind: crate::domain::KIND_LEARNING.into(),
+            name: "Validate retries".into(),
+            namespace: "payments".into(),
+            external_id: "learning-1".into(),
+            properties: HashMap::from([
+                ("title".into(), "Validate retries".into()),
+                ("prevention".into(), "Check the prior record".into()),
+                ("reasoning".into(), "A side effect repeated".into()),
+                ("source_request_id".into(), "request-1".into()),
+                ("score".into(), "72".into()),
+                ("passed".into(), "false".into()),
+                ("task_class".into(), "reasoning".into()),
+                ("model".into(), "judge-model".into()),
+                ("producer".into(), "scoring-job".into()),
+                ("status".into(), "candidate".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        };
+        assert!(registry.validate(&object).is_ok());
+    }
+
+    #[test]
+    fn test_builtin_learning_schema_accepts_legacy_learning_properties() {
+        let registry = SchemaRegistry::new();
+        let legacy = Object {
+            id: "learning-legacy".into(),
+            kind: crate::domain::KIND_LEARNING.into(),
+            name: "Legacy learning".into(),
+            namespace: "payments".into(),
+            external_id: "learning-legacy".into(),
+            properties: HashMap::from([
+                ("title".into(), "Legacy learning".into()),
+                ("prevention".into(), "Check prior records".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        };
+        assert!(registry.validate(&legacy).is_ok());
     }
 
     #[test]

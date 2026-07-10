@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +8,7 @@ use tonic::{Request, Response, Status};
 
 use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
+use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::sekai::SekaiDb;
 use crate::domain;
 use crate::sekai::action::{self, ActionExecutor};
@@ -14,7 +16,7 @@ use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
-use crate::sekai::{audit, compute, coordination, dataset, function, security};
+use crate::sekai::{audit, compute, coordination, dataset, function, retrieval, security};
 use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "[redacted]";
@@ -150,11 +152,32 @@ impl SekaiServiceImpl {
             .map_err(Status::invalid_argument)?;
         let schema_restricted_property =
             schema_restricted_action_property(&self.db, &schema, params);
-        let msg = actions
-            .execute(&self.db, &schema, action_name, params, actor)
-            .map_err(Status::invalid_argument)?;
+        let provisional_learning_grant = (action_name
+            == crate::sekai::learning::RECORD_LEARNING_ACTION)
+            .then(|| security::Grant {
+                id: String::new(),
+                object_id: params.get("id").cloned().unwrap_or_default(),
+                principal: actor.to_string(),
+                role: security::Role::Admin,
+                created: now_millis(),
+            })
+            .filter(|grant| !grant.object_id.is_empty());
+        if let Some(grant) = &provisional_learning_grant {
+            self.security.add_grant(grant);
+        }
+        let msg = match actions.execute(&self.db, &schema, action_name, params, actor) {
+            Ok(msg) => msg,
+            Err(error) => {
+                if let Some(grant) = &provisional_learning_grant {
+                    self.security
+                        .remove_grant(&grant.object_id, &grant.principal);
+                }
+                return Err(Status::invalid_argument(error));
+            }
+        };
         drop(actions);
         drop(schema);
+        self.refresh_security_after_action(action_name, params, actor)?;
         self.db
             .record_decision(&audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -179,6 +202,31 @@ impl SekaiServiceImpl {
         Ok(msg)
     }
 
+    fn refresh_security_after_action(
+        &self,
+        action_name: &str,
+        params: &HashMap<String, String>,
+        actor: &str,
+    ) -> Result<(), Status> {
+        if action_name != crate::sekai::learning::RECORD_LEARNING_ACTION {
+            return Ok(());
+        }
+        let learning_id = params
+            .get("id")
+            .ok_or_else(|| Status::internal("record_learning id missing after execution"))?;
+        let grants = self.db.list_grants(learning_id).map_err(Status::internal)?;
+        if grants.is_empty() {
+            return Err(Status::internal(
+                "record_learning completed without a learning ACL",
+            ));
+        }
+        self.security.remove_grant(learning_id, actor);
+        for grant in &grants {
+            self.security.add_grant(grant);
+        }
+        Ok(())
+    }
+
     fn resolve_computed_for_response(
         &self,
         mut object: domain::Object,
@@ -191,7 +239,8 @@ impl SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .clone();
         compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
-            self.security.can_access(&candidate.id, &refs)
+            !is_reserved_governance_kind(&candidate.kind)
+                && self.security.can_access(&candidate.id, &refs)
         })
         .map_err(Status::internal)?;
         Ok(redact_restricted_properties(
@@ -1180,10 +1229,21 @@ fn action_policy_namespace(
     params: &std::collections::HashMap<String, String>,
 ) -> String {
     for id in target_ids {
-        if let Ok(Some(object)) = db.get_object(id)
-            && !object.namespace.trim().is_empty()
-        {
-            return object.namespace;
+        if let Ok(Some(object)) = db.get_object(id) {
+            if object.kind == "namespace" {
+                let namespace = object
+                    .external_id
+                    .strip_prefix("namespace:")
+                    .map(str::trim)
+                    .filter(|namespace| !namespace.is_empty())
+                    .unwrap_or_else(|| object.name.trim());
+                if !namespace.is_empty() {
+                    return namespace.to_string();
+                }
+            }
+            if !object.namespace.trim().is_empty() {
+                return object.namespace;
+            }
         }
     }
     params
@@ -1782,6 +1842,36 @@ fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
     })
 }
 
+fn from_proto_context_root(root: ContextRoot) -> Result<retrieval::RetrievalRoot, Status> {
+    let configured = [
+        !root.object_id.is_empty(),
+        !root.external_id.is_empty(),
+        !root.link_id.is_empty(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if configured != 1 {
+        return Err(Status::invalid_argument(
+            "each context root must set exactly one of object_id, external_id, or link_id",
+        ));
+    }
+    if !root.object_id.is_empty() {
+        Ok(retrieval::RetrievalRoot::Object(root.object_id))
+    } else if !root.external_id.is_empty() {
+        Ok(retrieval::RetrievalRoot::External(root.external_id))
+    } else {
+        Ok(retrieval::RetrievalRoot::Link(root.link_id))
+    }
+}
+
+fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
+    match error {
+        retrieval::RetrievalError::InvalidArgument(message) => Status::invalid_argument(message),
+        retrieval::RetrievalError::Storage(message) => Status::internal(message),
+    }
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
     async fn create_object(
@@ -2274,6 +2364,61 @@ impl SekaiService for SekaiServiceImpl {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
                 links: res.links.iter().map(to_proto_link).collect(),
             }),
+        }))
+    }
+    async fn retrieve_context(
+        &self,
+        req: Request<RetrieveContextRequest>,
+    ) -> Result<Response<RetrieveContextResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let roots = inner
+            .roots
+            .into_iter()
+            .map(from_proto_context_root)
+            .collect::<Result<Vec<_>, _>>()?;
+        let direction =
+            retrieval::RetrievalDirection::parse(&inner.direction).map_err(map_retrieval_error)?;
+        let query = retrieval::RetrievalQuery {
+            roots,
+            relations: inner.relations,
+            direction,
+            max_depth: inner.max_depth,
+            max_objects: inner.max_objects,
+            max_links: inner.max_links,
+            kind_filter: inner.kind_filter,
+        };
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut result = retrieval::retrieve(
+            &self.db,
+            &query,
+            |object| self.security.can_access(&object.id, &principal_refs),
+            |object| is_reserved_governance_kind(&object.kind),
+        )
+        .map_err(map_retrieval_error)?;
+        for candidate in &mut result.candidates {
+            candidate.object =
+                self.resolve_computed_for_response(candidate.object.clone(), &principals)?;
+        }
+
+        Ok(Response::new(RetrieveContextResponse {
+            candidates: result
+                .candidates
+                .iter()
+                .map(|candidate| ContextCandidate {
+                    object: Some(to_proto_obj(&candidate.object)),
+                    depth: candidate.depth,
+                    via_relation: candidate.via_relation.clone(),
+                    affinity: candidate.affinity,
+                })
+                .collect(),
+            links: result.links.iter().map(to_proto_link).collect(),
+            truncated: result.truncated,
+            unresolved_roots: result.unresolved_roots,
+            denied_objects: result.denied_objects,
+            truncated_objects: result.truncated_objects,
+            truncated_links: result.truncated_links,
         }))
     }
     async fn list_schema_types(
@@ -2832,11 +2977,32 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::invalid_argument)?;
         let schema_restricted_property =
             schema_restricted_action_property(&self.db, &schema, &r.params);
-        let msg = actions
-            .execute(&self.db, &schema, &r.action, &r.params, &actor)
-            .map_err(Status::invalid_argument)?;
+        let provisional_learning_grant = (r.action
+            == crate::sekai::learning::RECORD_LEARNING_ACTION)
+            .then(|| security::Grant {
+                id: String::new(),
+                object_id: r.params.get("id").cloned().unwrap_or_default(),
+                principal: actor.clone(),
+                role: security::Role::Admin,
+                created: now_millis(),
+            })
+            .filter(|grant| !grant.object_id.is_empty());
+        if let Some(grant) = &provisional_learning_grant {
+            self.security.add_grant(grant);
+        }
+        let msg = match actions.execute(&self.db, &schema, &r.action, &r.params, &actor) {
+            Ok(msg) => msg,
+            Err(error) => {
+                if let Some(grant) = &provisional_learning_grant {
+                    self.security
+                        .remove_grant(&grant.object_id, &grant.principal);
+                }
+                return Err(Status::invalid_argument(error));
+            }
+        };
         drop(actions);
         drop(schema);
+        self.refresh_security_after_action(&r.action, &r.params, &actor)?;
         self.db
             .record_decision(&audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -4460,6 +4626,196 @@ impl SekaiService for SekaiServiceImpl {
     }
 }
 
+fn scoring_learning_id(namespace: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"chisei.scoring.record_learning.v1");
+    for value in [namespace, request_id] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    format!("learning:chisei.scoring:{encoded}")
+}
+
+fn bounded_knowledge_text(value: &str, max_chars: usize) -> String {
+    let mut normalized = String::new();
+    let mut chars: usize = 0;
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars.saturating_add(1) >= max_chars {
+                break;
+            }
+            normalized.push(' ');
+            chars += 1;
+        }
+        pending_space = false;
+        if chars >= max_chars {
+            break;
+        }
+        normalized.push(character);
+        chars += 1;
+    }
+    normalized
+}
+
+fn knowledge_source_request_id(request_id: &str) -> String {
+    let trimmed = request_id.trim();
+    if trimmed.chars().count() <= 256 && !trimmed.chars().any(char::is_control) {
+        return trimmed.to_string();
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"chisei.scoring.source_request.v1");
+    digest.update((request_id.len() as u64).to_be_bytes());
+    digest.update(request_id.as_bytes());
+    let encoded = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{encoded}")
+}
+
+#[async_trait::async_trait]
+impl KnowledgeWriter for SekaiServiceImpl {
+    async fn write_knowledge(
+        &self,
+        request: &KnowledgeWriteRequest,
+    ) -> Result<KnowledgeWriteOutcome, String> {
+        let namespace = request.namespace.trim();
+        if namespace.is_empty() {
+            return Err("knowledge write requires an observation namespace".into());
+        }
+        if request.request_id.trim().is_empty() {
+            return Err("knowledge write requires a source request id".into());
+        }
+
+        let target = match self
+            .db
+            .find_by_external_id(&format!("namespace:{namespace}"))?
+        {
+            Some(target) if target.kind == "namespace" => target,
+            Some(target) => {
+                return Err(format!(
+                    "namespace external id resolved to unexpected kind: {}",
+                    target.kind
+                ));
+            }
+            None => self
+                .db
+                .find_by_external_id(&format!("policy:{namespace}"))?
+                .or(self
+                    .db
+                    .find_by_external_id(&format!("project:{namespace}"))?)
+                .ok_or_else(|| format!("no governed target found for namespace: {namespace}"))?,
+        };
+
+        let learning_id = scoring_learning_id(namespace, &request.request_id);
+        let passed = if request.passed { "true" } else { "false" };
+        let mut reasoning = bounded_knowledge_text(&request.reasoning, 2_000);
+        if reasoning.is_empty() {
+            reasoning = format!(
+                "The scoring judge recorded a {} outcome with score {}.",
+                if request.passed { "passing" } else { "failing" },
+                request.score.clamp(0, 100)
+            );
+        }
+        let task_class = bounded_knowledge_text(&request.task_class, 128);
+        let model = bounded_knowledge_text(&request.model, 256);
+        let task_class = if task_class.is_empty() {
+            "unclassified".to_string()
+        } else {
+            task_class
+        };
+        let model = if model.is_empty() {
+            "unknown".to_string()
+        } else {
+            model
+        };
+        let title = format!(
+            "Scored {task_class} task outcome: {}",
+            if request.passed {
+                "passed"
+            } else {
+                "needs correction"
+            }
+        );
+        let prevention = if request.passed {
+            format!("Preserve this evaluated behavior: {reasoning}")
+        } else {
+            format!("Before repeating this task, address: {reasoning}")
+        };
+        let params = HashMap::from([
+            ("id".into(), learning_id.clone()),
+            ("target_id".into(), target.id.clone()),
+            ("title".into(), title),
+            ("prevention".into(), prevention),
+            ("reasoning".into(), reasoning),
+            (
+                "source_request_id".into(),
+                knowledge_source_request_id(&request.request_id),
+            ),
+            ("score".into(), request.score.clamp(0, 100).to_string()),
+            ("passed".into(), passed.into()),
+            ("task_class".into(), task_class),
+            ("model".into(), model),
+            ("producer".into(), "chisei.scoring".into()),
+            ("status".into(), "candidate".into()),
+        ]);
+        let mut rpc_request = Request::new(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+                params,
+                actor: "chisei.scoring".into(),
+            }),
+            dry_run: false,
+        });
+        rpc_request.metadata_mut().insert(
+            "x-principal",
+            tonic::metadata::MetadataValue::from_static("chisei.scoring"),
+        );
+        rpc_request.metadata_mut().insert(
+            "x-chisei-work-unit",
+            tonic::metadata::MetadataValue::try_from(learning_id.as_str())
+                .map_err(|error| format!("invalid knowledge work-unit metadata: {error}"))?,
+        );
+
+        match <Self as SekaiService>::execute_action(self, rpc_request).await {
+            Ok(response) => {
+                let result = response
+                    .into_inner()
+                    .result
+                    .ok_or_else(|| "record_learning returned no action result".to_string())?;
+                match result.decision.as_str() {
+                    "allow" | "require_approval" => Ok(KnowledgeWriteOutcome::Accepted),
+                    "deny" => Ok(KnowledgeWriteOutcome::PolicyDenied),
+                    decision => Err(format!(
+                        "record_learning returned unknown policy decision: {decision}"
+                    )),
+                }
+            }
+            Err(status)
+                if status.code() == tonic::Code::PermissionDenied
+                    && status.message().contains("denied by policy") =>
+            {
+                Ok(KnowledgeWriteOutcome::PolicyDenied)
+            }
+            Err(status) => Err(format!(
+                "record_learning failed ({}): {}",
+                status.code(),
+                status.message()
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4603,6 +4959,35 @@ mod tests {
                 updated: 0,
             })
             .unwrap();
+    }
+
+    fn seed_scoring_namespace(svc: &SekaiServiceImpl, namespace: &str) -> String {
+        let id = format!("namespace-{namespace}");
+        svc.db
+            .create_object(&domain::Object {
+                id: id.clone(),
+                kind: "namespace".into(),
+                name: namespace.into(),
+                namespace: String::new(),
+                external_id: format!("namespace:{namespace}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        id
+    }
+
+    fn scored_knowledge_request(namespace: &str, request_id: &str) -> KnowledgeWriteRequest {
+        KnowledgeWriteRequest {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            task_class: "primary".into(),
+            model: "claude-opus-4-8".into(),
+            score: 84,
+            passed: true,
+            reasoning: "The implementation satisfies the requested behavior.".into(),
+        }
     }
 
     #[tokio::test]
@@ -9054,6 +9439,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoring_writer_records_private_typed_learning_and_retries_idempotently() {
+        let svc = service();
+        let namespace_id = seed_scoring_namespace(&svc, "acme");
+        let request = scored_knowledge_request("acme", "request-42");
+        let learning_id = scoring_learning_id("acme", "request-42");
+
+        assert_eq!(
+            svc.write_knowledge(&request).await.unwrap(),
+            KnowledgeWriteOutcome::Accepted
+        );
+        let learning = svc.db.get_object(&learning_id).unwrap().unwrap();
+        assert_eq!(learning.kind, domain::KIND_LEARNING);
+        assert_eq!(learning.namespace, "acme");
+        assert_eq!(learning.name, "Scored learning");
+        assert_eq!(learning.properties["producer"], "chisei.scoring");
+        assert_eq!(learning.properties["status"], "candidate");
+        assert_eq!(
+            learning.properties["title"],
+            "Scored primary task outcome: passed"
+        );
+        assert!(
+            learning.properties["prevention"]
+                .contains("The implementation satisfies the requested behavior.")
+        );
+        assert_eq!(learning.properties["source_request_id"], "request-42");
+        let long_source = knowledge_source_request_id(&"x".repeat(300));
+        assert!(long_source.starts_with("sha256:"));
+        assert_eq!(long_source.chars().count(), 71);
+
+        let link = svc
+            .db
+            .get_link(&format!("{learning_id}->{namespace_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.from_id, learning_id);
+        assert_eq!(link.to_id, namespace_id);
+        assert_eq!(link.relation, domain::REL_TOUCHES);
+
+        let grants = svc.db.list_grants(&learning.id).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].principal, "chisei.scoring");
+        assert_eq!(grants[0].role, security::Role::Admin);
+
+        // The action inserted the fallback ACL directly in its transaction. The service refreshes
+        // its in-process checker before returning, so the learning is never left world-readable.
+        let denied = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: learning.id.clone(),
+                },
+                "unrelated",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        // The same namespace/request pair produces the same id and the action's exact-retry path
+        // does not duplicate the object, link, or grant.
+        assert_eq!(
+            svc.write_knowledge(&request).await.unwrap(),
+            KnowledgeWriteOutcome::Accepted
+        );
+        let learnings = svc
+            .db
+            .list_objects(&domain::ListFilter {
+                kind: Some(domain::KIND_LEARNING.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(learnings.len(), 1);
+        assert_eq!(svc.db.list_grants(&learning.id).unwrap().len(), 1);
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some(crate::sekai::learning::RECORD_LEARNING_ACTION.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        for field in [
+            "title",
+            "prevention",
+            "reasoning",
+            "source_request_id",
+            "score",
+            "passed",
+            "task_class",
+            "model",
+            "producer",
+            "status",
+        ] {
+            assert_eq!(decisions[0].evidence[field], "[redacted]");
+        }
+    }
+
+    #[tokio::test]
+    async fn scoring_writer_uses_a_project_target_when_namespace_object_is_absent() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "project-acme".into(),
+                kind: "project".into(),
+                name: "acme".into(),
+                namespace: "acme".into(),
+                external_id: "project:acme".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        let request = scored_knowledge_request("acme", "project-request");
+        let learning_id = scoring_learning_id("acme", "project-request");
+
+        assert_eq!(
+            svc.write_knowledge(&request).await.unwrap(),
+            KnowledgeWriteOutcome::Accepted
+        );
+        assert!(svc.db.get_object(&learning_id).unwrap().is_some());
+        assert!(
+            svc.db
+                .get_link(&format!("{learning_id}->project-acme"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoring_writer_uses_an_explicit_service_grant_for_protected_targets() {
+        let svc = service();
+        let target_id = seed_scoring_namespace(&svc, "acme");
+        grant_object_role(&svc, &target_id, "namespace-owner", security::Role::Admin);
+        let request = scored_knowledge_request("acme", "protected-request");
+
+        assert!(svc.write_knowledge(&request).await.is_err());
+
+        grant_object_role(&svc, &target_id, "chisei.scoring", security::Role::Editor);
+        assert_eq!(
+            svc.write_knowledge(&request).await.unwrap(),
+            KnowledgeWriteOutcome::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn scoring_writer_obeys_namespace_deny_and_approval_policies() {
+        let denied_svc = service();
+        seed_scoring_namespace(&denied_svc, "denied");
+        denied_svc
+            .db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "denied".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::from([(
+                    crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+                    action_policy::ActionDecision::Deny,
+                )]),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let denied_request = scored_knowledge_request("denied", "request-denied");
+        let denied_id = scoring_learning_id("denied", "request-denied");
+
+        assert_eq!(
+            denied_svc.write_knowledge(&denied_request).await.unwrap(),
+            KnowledgeWriteOutcome::PolicyDenied
+        );
+        assert!(denied_svc.db.get_object(&denied_id).unwrap().is_none());
+        let denied_decisions = denied_svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some(crate::sekai::learning::RECORD_LEARNING_ACTION.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(denied_decisions.len(), 1);
+        assert_eq!(denied_decisions[0].reason, "action_policy_denied");
+        assert_eq!(denied_decisions[0].evidence["policy_scope"], "denied");
+
+        let approval_svc = service();
+        seed_scoring_namespace(&approval_svc, "approval");
+        approval_svc
+            .db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "approval".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::from([(
+                    crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+                    action_policy::ActionDecision::RequireApproval,
+                )]),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let approval_request = scored_knowledge_request("approval", "request-approval");
+        let approval_id = scoring_learning_id("approval", "request-approval");
+
+        assert_eq!(
+            approval_svc
+                .write_knowledge(&approval_request)
+                .await
+                .unwrap(),
+            KnowledgeWriteOutcome::Accepted
+        );
+        assert!(approval_svc.db.get_object(&approval_id).unwrap().is_none());
+        let pending = approval_svc
+            .db
+            .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].action,
+            crate::sekai::learning::RECORD_LEARNING_ACTION
+        );
+        assert_eq!(pending[0].params["id"], approval_id);
+        assert_eq!(pending[0].work_unit, approval_id);
+    }
+
+    #[tokio::test]
     async fn execute_action_denied_by_policy_is_blocked_and_audited() {
         let svc = service();
         seed_domain_object(&svc, "obj-1");
@@ -10045,6 +10651,198 @@ mod tests {
             .into_inner();
         assert_eq!(resolved.objects.len(), 0);
         assert_eq!(resolved.total, 0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
+        let svc = service();
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "secret_note".into(),
+            r#type: "string".into(),
+            required: false,
+            description: String::new(),
+            enum_values: Vec::new(),
+            link_kind: String::new(),
+            compute_expr: String::new(),
+            classification: "sensitive".into(),
+            struct_fields: Vec::new(),
+        });
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(schema_type),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        for (id, external_id, secret) in [
+            ("context-root", "widget:context-root", true),
+            ("context-allowed", "widget:context-allowed", false),
+            ("context-denied", "widget:context-denied", false),
+            ("behind-denied", "widget:behind-denied", false),
+            ("behind-governance", "widget:behind-governance", false),
+        ] {
+            let mut properties = HashMap::from([("name".into(), id.into())]);
+            if secret {
+                properties.insert("secret_note".into(), "launch code".into());
+            }
+            let mut object = widget_object(id, properties);
+            object.external_id = external_id.into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.db
+            .create_object(&domain::Object {
+                id: "internal-policy".into(),
+                kind: action_policy::ACTION_POLICY_KIND.into(),
+                name: "internal".into(),
+                namespace: String::new(),
+                external_id: "policy:internal".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        for link in [
+            domain::Link {
+                id: "context-visible-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-allowed".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-denied-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-denied-link".into(),
+                from_id: "context-denied".into(),
+                to_id: "behind-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-governance-link".into(),
+                from_id: "context-root".into(),
+                to_id: "internal-policy".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-governance-link".into(),
+                from_id: "internal-policy".into(),
+                to_id: "behind-governance".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+        ] {
+            svc.db.create_link(&link).unwrap();
+        }
+        let denied_grant = security::Grant {
+            id: "context-denied-grant".into(),
+            object_id: "context-denied".into(),
+            principal: "bob".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&denied_grant).unwrap();
+        svc.security.add_grant(&denied_grant);
+
+        let response = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: vec![ContextRoot {
+                        external_id: "widget:context-root".into(),
+                        ..Default::default()
+                    }],
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    max_depth: 3,
+                    max_objects: 20,
+                    max_links: 20,
+                    kind_filter: Vec::new(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let candidate_ids = response
+            .candidates
+            .iter()
+            .map(|candidate| candidate.object.as_ref().unwrap().id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, vec!["context-root", "context-allowed"]);
+        assert_eq!(response.candidates[0].depth, 0);
+        assert_eq!(
+            response.candidates[0].object.as_ref().unwrap().properties["secret_note"],
+            REDACTED_VALUE
+        );
+        assert_eq!(response.denied_objects, 2);
+        assert_eq!(response.links.len(), 1);
+        assert_eq!(response.links[0].id, "context-visible-link");
+        assert!(!response.truncated);
+
+        let denied_root = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: vec![ContextRoot {
+                        object_id: "context-denied".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(denied_root.candidates.is_empty());
+        assert_eq!(denied_root.denied_objects, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_rejects_ambiguous_roots() {
+        let err = service()
+            .retrieve_context(with_principal(RetrieveContextRequest {
+                roots: vec![ContextRoot {
+                    object_id: "one".into(),
+                    external_id: "two".into(),
+                    link_id: String::new(),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_requires_an_authenticated_principal() {
+        let err = service()
+            .retrieve_context(Request::new(RetrieveContextRequest {
+                roots: vec![ContextRoot {
+                    object_id: "one".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]

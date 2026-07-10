@@ -144,6 +144,7 @@ mod tests {
             egress_records: vec![],
             external_egress: true,
             template_only: false,
+            expanded_context_items: 0,
         }
     }
 

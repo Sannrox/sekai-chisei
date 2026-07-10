@@ -105,6 +105,17 @@ pub struct GateDecision {
     pub candidate_score: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextExpansionGate {
+    pub profile_key: String,
+    pub allowed: bool,
+    pub verdict: String,
+    pub reason: String,
+    pub iteration_id: String,
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+}
+
 pub struct EvalStore {
     suites: Mutex<HashMap<String, Suite>>,
     runs: Mutex<HashMap<String, Run>>,
@@ -418,6 +429,56 @@ impl EvalStore {
         })
     }
 
+    pub fn context_expansion_gate(&self, profile_key: &str) -> ContextExpansionGate {
+        let denied = |verdict: &str, reason: &str| ContextExpansionGate {
+            profile_key: profile_key.to_string(),
+            allowed: false,
+            verdict: verdict.to_string(),
+            reason: reason.to_string(),
+            iteration_id: String::new(),
+            baseline_run_id: String::new(),
+            candidate_run_id: String::new(),
+        };
+        let Some(iteration) = self.latest_iteration_for_file(profile_key) else {
+            return denied(
+                "missing",
+                "no eval iteration exists for the context profile",
+            );
+        };
+        let mut gate = ContextExpansionGate {
+            profile_key: profile_key.to_string(),
+            allowed: false,
+            verdict: String::new(),
+            reason: String::new(),
+            iteration_id: iteration.id.clone(),
+            baseline_run_id: iteration.baseline_run_id.clone(),
+            candidate_run_id: iteration.candidate_run_id.clone(),
+        };
+        if iteration.parent_iteration_id.is_empty()
+            || iteration.baseline_run_id == iteration.candidate_run_id
+        {
+            gate.verdict = "baseline_only".into();
+            gate.reason = "a candidate iteration is required before context expansion".into();
+            return gate;
+        }
+        if iteration.regressed {
+            gate.verdict = "regressed".into();
+            gate.reason = "the latest context-profile iteration regressed".into();
+            return gate;
+        }
+        let Some(decision) =
+            self.compare_runs(&iteration.baseline_run_id, &iteration.candidate_run_id)
+        else {
+            gate.verdict = "unavailable".into();
+            gate.reason = "the context-profile eval runs are unavailable".into();
+            return gate;
+        };
+        gate.allowed = decision.verdict == "pass";
+        gate.verdict = decision.verdict;
+        gate.reason = decision.reason;
+        gate
+    }
+
     pub fn variance(&self, suite_id: &str, config_ref: &str) -> VarianceRun {
         let runs = self.list_runs(suite_id);
         analyze_variance(suite_id, config_ref, &runs)
@@ -648,6 +709,89 @@ mod tests {
 
         let gate = store.compare_runs("r1", "r2").unwrap();
         assert_eq!(gate.verdict, "fail");
+    }
+
+    #[test]
+    fn context_expansion_requires_a_passing_candidate_and_rolls_back_on_regression() {
+        let store = EvalStore::new();
+        let run = |id: &str, passed: bool, score: i32| Run {
+            id: id.into(),
+            suite_id: "context-suite".into(),
+            config_ref: id.into(),
+            results: vec![CaseResult {
+                case_id: "context-case".into(),
+                passed,
+                status: "done".into(),
+                result: String::new(),
+                score,
+                reason: String::new(),
+                elapsed: 1,
+            }],
+            timestamp: i64::from(score),
+        };
+        store.create_run(run("baseline", true, 80));
+        store.create_run(run("candidate", true, 90));
+        store.create_run(run("regressed", false, 10));
+
+        let profile = "context-expansion:pipeline-v1:acme";
+        assert_eq!(store.context_expansion_gate(profile).verdict, "missing");
+        store.create_iteration(Iteration {
+            id: "iteration-1".into(),
+            run_id: "baseline".into(),
+            suite_id: "context-suite".into(),
+            namespace: "acme".into(),
+            changed_file: profile.into(),
+            diff_hash: "baseline".into(),
+            parent_iteration_id: String::new(),
+            baseline_run_id: "baseline".into(),
+            candidate_run_id: "baseline".into(),
+            delta: 0.0,
+            regressed: false,
+            created: 1,
+        });
+        assert_eq!(
+            store.context_expansion_gate(profile).verdict,
+            "baseline_only"
+        );
+
+        store.create_iteration(Iteration {
+            id: "iteration-2".into(),
+            run_id: "candidate".into(),
+            suite_id: "context-suite".into(),
+            namespace: "acme".into(),
+            changed_file: profile.into(),
+            diff_hash: "candidate".into(),
+            parent_iteration_id: "iteration-1".into(),
+            baseline_run_id: "baseline".into(),
+            candidate_run_id: "candidate".into(),
+            delta: 10.0,
+            regressed: false,
+            created: 2,
+        });
+        let passing = store.context_expansion_gate(profile);
+        assert!(passing.allowed);
+        assert_eq!(passing.verdict, "pass");
+        assert_eq!(passing.baseline_run_id, "baseline");
+        assert_eq!(passing.candidate_run_id, "candidate");
+
+        store.create_iteration(Iteration {
+            id: "iteration-3".into(),
+            run_id: "regressed".into(),
+            suite_id: "context-suite".into(),
+            namespace: "acme".into(),
+            changed_file: profile.into(),
+            diff_hash: "regressed".into(),
+            parent_iteration_id: "iteration-2".into(),
+            baseline_run_id: "candidate".into(),
+            candidate_run_id: "regressed".into(),
+            delta: -80.0,
+            regressed: true,
+            created: 3,
+        });
+        let rolled_back = store.context_expansion_gate(profile);
+        assert!(!rolled_back.allowed);
+        assert_eq!(rolled_back.verdict, "regressed");
+        assert_eq!(rolled_back.iteration_id, "iteration-3");
     }
 
     #[test]
