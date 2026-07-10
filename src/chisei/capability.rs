@@ -9,14 +9,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chisei::eval::{Assertion, Case, Suite};
+use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
+use crate::db::sekai::SekaiDb;
+use crate::sekai::audit::Decision;
 
 pub const MIN_RECURRING_TASKS: usize = 3;
 pub const MIN_SUCCESSFUL_TASKS: usize = 2;
 pub const MAX_SEED_EVAL_CASES: usize = 8;
 
 pub const PROPOSAL_AWAITING_REVIEW: &str = "awaiting_review";
+pub const PROPOSAL_APPROVED: &str = "approved";
+pub const PROPOSAL_REJECTED: &str = "rejected";
+pub const PROPOSAL_GATE_PASSED: &str = "gate_passed";
+pub const PROPOSAL_GATE_FAILED: &str = "gate_failed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityObservation {
@@ -57,7 +63,73 @@ pub struct CapabilityProposal {
     pub status: String,
     pub proposed_by: String,
     pub created: i64,
+    #[serde(default)]
+    pub review: Option<CapabilityReview>,
+    #[serde(default)]
+    pub gate: Option<CapabilityGateEvidence>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityReview {
+    pub reviewer: String,
+    pub approved: bool,
+    pub reason: String,
+    pub proposal_digest: String,
+    pub reviewed: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityGateEvidence {
+    pub run_id: String,
+    pub passed: bool,
+    pub reason: String,
+    pub proposal_digest: String,
+    pub gated_by: String,
+    pub gated: i64,
+}
+
+/// Proof that a reviewed, unchanged proposal passed its own eval suite. The registry accepts this
+/// authorization rather than a bare status string, preventing an ungated proposal from launching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityLaunchAuthorization {
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub eval_suite_id: String,
+    pub eval_run_id: String,
+    pub approved_by: String,
+    pub gated_by: String,
+    pub authorized: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityGateError {
+    InvalidState(String),
+    InvalidReviewer(String),
+    MissingRun(String),
+    WrongSuite { expected: String, actual: String },
+    ProposalChanged,
+    Audit(String),
+}
+
+impl std::fmt::Display for CapabilityGateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidState(state) => write!(formatter, "invalid proposal state: {state}"),
+            Self::InvalidReviewer(reason) => write!(formatter, "invalid reviewer: {reason}"),
+            Self::MissingRun(run_id) => write!(formatter, "eval run not found: {run_id}"),
+            Self::WrongSuite { expected, actual } => {
+                write!(
+                    formatter,
+                    "eval run belongs to suite {actual}, expected {expected}"
+                )
+            }
+            Self::ProposalChanged => write!(formatter, "proposal changed after approval"),
+            Self::Audit(error) => write!(formatter, "audit failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityGateError {}
 
 /// Author one proposal per recurring `(namespace, task_class)` group.
 ///
@@ -204,9 +276,220 @@ pub fn author_capability_proposals(
                 status: PROPOSAL_AWAITING_REVIEW.to_string(),
                 proposed_by: proposed_by.to_string(),
                 created: now,
+                review: None,
+                gate: None,
             })
         })
         .collect()
+}
+
+/// Record a human approval or rejection of the exact proposal contents.
+pub fn review_capability_proposal(
+    db: &SekaiDb,
+    proposal: &mut CapabilityProposal,
+    reviewer: &str,
+    approved: bool,
+    reason: &str,
+    now: i64,
+) -> Result<(), CapabilityGateError> {
+    if proposal.status != PROPOSAL_AWAITING_REVIEW {
+        return Err(CapabilityGateError::InvalidState(proposal.status.clone()));
+    }
+    let reviewer = reviewer.trim();
+    if reviewer.is_empty() {
+        return Err(CapabilityGateError::InvalidReviewer(
+            "reviewer is required".to_string(),
+        ));
+    }
+    if reviewer == proposal.proposed_by.trim() {
+        return Err(CapabilityGateError::InvalidReviewer(
+            "proposer cannot approve or reject their own proposal".to_string(),
+        ));
+    }
+
+    let digest = proposal_digest(proposal);
+    let status = if approved {
+        PROPOSAL_APPROVED
+    } else {
+        PROPOSAL_REJECTED
+    };
+    record_capability_decision(
+        db,
+        proposal,
+        reviewer,
+        "capability_proposal_reviewed",
+        reason,
+        status,
+        BTreeMap::from([
+            ("approved".to_string(), approved.to_string()),
+            ("proposal_digest".to_string(), digest.clone()),
+        ]),
+        now,
+    )?;
+
+    proposal.status = status.to_string();
+    proposal.review = Some(CapabilityReview {
+        reviewer: reviewer.to_string(),
+        approved,
+        reason: reason.to_string(),
+        proposal_digest: digest,
+        reviewed: now,
+    });
+    Ok(())
+}
+
+/// Gate an approved proposal against one run of its own seed suite.
+///
+/// Every expected case must appear exactly once and pass. The proposal digest must still match the
+/// human-reviewed digest. Failed evals are terminally recorded as `gate_failed`; infrastructure or
+/// caller errors leave the approved proposal untouched so a valid run can be supplied later.
+pub fn gate_capability_proposal(
+    db: &SekaiDb,
+    eval: &EvalStore,
+    proposal: &mut CapabilityProposal,
+    run_id: &str,
+    gated_by: &str,
+    now: i64,
+) -> Result<Option<CapabilityLaunchAuthorization>, CapabilityGateError> {
+    if proposal.status != PROPOSAL_APPROVED {
+        return Err(CapabilityGateError::InvalidState(proposal.status.clone()));
+    }
+    let review = proposal
+        .review
+        .as_ref()
+        .filter(|review| review.approved)
+        .ok_or_else(|| {
+            CapabilityGateError::InvalidState("approval evidence missing".to_string())
+        })?;
+    let current_digest = proposal_digest(proposal);
+    if review.proposal_digest != current_digest {
+        return Err(CapabilityGateError::ProposalChanged);
+    }
+    let run = eval
+        .get_run(run_id)
+        .ok_or_else(|| CapabilityGateError::MissingRun(run_id.to_string()))?;
+    if run.suite_id != proposal.eval_suite.id {
+        return Err(CapabilityGateError::WrongSuite {
+            expected: proposal.eval_suite.id.clone(),
+            actual: run.suite_id,
+        });
+    }
+
+    let mut result_counts: HashMap<&str, usize> = HashMap::new();
+    let mut failed_cases = Vec::new();
+    for result in &run.results {
+        *result_counts.entry(&result.case_id).or_default() += 1;
+        if !result.passed {
+            failed_cases.push(result.case_id.clone());
+        }
+    }
+    let invalid_cases: Vec<String> = proposal
+        .eval_suite
+        .cases
+        .iter()
+        .filter(|case| result_counts.get(case.id.as_str()).copied() != Some(1))
+        .map(|case| case.id.clone())
+        .collect();
+    let passed = invalid_cases.is_empty()
+        && failed_cases.is_empty()
+        && run.results.len() == proposal.eval_suite.cases.len();
+    let reason = if passed {
+        format!("all {} seed eval cases passed", run.results.len())
+    } else {
+        format!(
+            "capability eval failed; invalid case coverage: [{}]; failed cases: [{}]",
+            invalid_cases.join(", "),
+            failed_cases.join(", ")
+        )
+    };
+    let status = if passed {
+        PROPOSAL_GATE_PASSED
+    } else {
+        PROPOSAL_GATE_FAILED
+    };
+    record_capability_decision(
+        db,
+        proposal,
+        gated_by,
+        "capability_eval_gated",
+        &reason,
+        status,
+        BTreeMap::from([
+            ("eval_run_id".to_string(), run.id.clone()),
+            ("eval_suite_id".to_string(), run.suite_id.clone()),
+            ("proposal_digest".to_string(), current_digest.clone()),
+        ]),
+        now,
+    )?;
+
+    proposal.status = status.to_string();
+    proposal.gate = Some(CapabilityGateEvidence {
+        run_id: run.id.clone(),
+        passed,
+        reason,
+        proposal_digest: current_digest.clone(),
+        gated_by: gated_by.to_string(),
+        gated: now,
+    });
+    if !passed {
+        return Ok(None);
+    }
+
+    Ok(Some(CapabilityLaunchAuthorization {
+        proposal_id: proposal.id.clone(),
+        proposal_digest: current_digest,
+        eval_suite_id: proposal.eval_suite.id.clone(),
+        eval_run_id: run.id,
+        approved_by: review.reviewer.clone(),
+        gated_by: gated_by.to_string(),
+        authorized: now,
+    }))
+}
+
+fn proposal_digest(proposal: &CapabilityProposal) -> String {
+    let canonical = serde_json::to_vec(&(
+        &proposal.id,
+        &proposal.namespace,
+        &proposal.task_class,
+        &proposal.agent_spec,
+        &proposal.allowed_action_types,
+        &proposal.eval_suite,
+        &proposal.routing_policy,
+        &proposal.proposed_by,
+        proposal.created,
+    ))
+    .expect("capability proposal fields are serializable");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_capability_decision(
+    db: &SekaiDb,
+    proposal: &CapabilityProposal,
+    actor: &str,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    evidence: BTreeMap<String, String>,
+    now: i64,
+) -> Result<(), CapabilityGateError> {
+    db.record_decision(&Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now,
+        actor: actor.to_string(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        evidence: evidence.into_iter().collect(),
+        target_id: proposal.id.clone(),
+        outcome: outcome.to_string(),
+    })
+    .map_err(CapabilityGateError::Audit)
 }
 
 fn normalize_task_class(value: &str) -> String {
@@ -251,6 +534,8 @@ fn is_terminal(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::eval::{CaseResult, Run};
+    use crate::sekai::audit::DecisionFilter;
 
     fn observation(
         id: &str,
@@ -271,6 +556,45 @@ mod tests {
             },
             task_class: task_class.to_string(),
             action_types: action_types.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    fn proposal() -> CapabilityProposal {
+        let observations = vec![
+            observation("1", "review", "done", &["comment"], 1),
+            observation("2", "review", "done", &["comment"], 2),
+            observation("3", "review", "done", &["comment"], 3),
+        ];
+        author_capability_proposals(
+            &observations,
+            &["comment".to_string()],
+            &BTreeMap::new(),
+            "chisei.author",
+            42,
+        )
+        .remove(0)
+    }
+
+    fn eval_run(proposal: &CapabilityProposal, passed: bool) -> Run {
+        Run {
+            id: "capability-run-1".to_string(),
+            suite_id: proposal.eval_suite.id.clone(),
+            config_ref: proposal.id.clone(),
+            results: proposal
+                .eval_suite
+                .cases
+                .iter()
+                .map(|case| CaseResult {
+                    case_id: case.id.clone(),
+                    passed,
+                    status: if passed { "ok" } else { "failed" }.to_string(),
+                    result: String::new(),
+                    score: if passed { 100 } else { 0 },
+                    reason: String::new(),
+                    elapsed: 1,
+                })
+                .collect(),
+            timestamp: 100,
         }
     }
 
@@ -417,5 +741,130 @@ mod tests {
 
         assert_eq!(cases.len(), 2);
         assert!(cases.iter().all(|case| !case.name.ends_with('2')));
+    }
+
+    #[test]
+    fn review_requires_an_independent_reviewer_and_is_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut proposal = proposal();
+
+        assert!(matches!(
+            review_capability_proposal(
+                &db,
+                &mut proposal,
+                "chisei.author",
+                true,
+                "self approval",
+                50,
+            ),
+            Err(CapabilityGateError::InvalidReviewer(_))
+        ));
+        review_capability_proposal(
+            &db,
+            &mut proposal,
+            "human:reviewer",
+            true,
+            "scope and eval suite are appropriate",
+            51,
+        )
+        .unwrap();
+
+        assert_eq!(proposal.status, PROPOSAL_APPROVED);
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                target_id: Some(proposal.id.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, "capability_proposal_reviewed");
+        assert_eq!(decisions[0].outcome, PROPOSAL_APPROVED);
+    }
+
+    #[test]
+    fn gate_rejects_a_proposal_changed_after_approval() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let eval = EvalStore::new();
+        let mut proposal = proposal();
+        review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
+        proposal.allowed_action_types.push("new-action".to_string());
+        eval.create_run(eval_run(&proposal, true));
+
+        assert_eq!(
+            gate_capability_proposal(
+                &db,
+                &eval,
+                &mut proposal,
+                "capability-run-1",
+                "chisei.gate",
+                60,
+            ),
+            Err(CapabilityGateError::ProposalChanged)
+        );
+        assert_eq!(proposal.status, PROPOSAL_APPROVED);
+    }
+
+    #[test]
+    fn passing_own_suite_authorizes_launch_and_is_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let eval = EvalStore::new();
+        let mut proposal = proposal();
+        review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
+        eval.create_run(eval_run(&proposal, true));
+
+        let authorization = gate_capability_proposal(
+            &db,
+            &eval,
+            &mut proposal,
+            "capability-run-1",
+            "chisei.gate",
+            60,
+        )
+        .unwrap()
+        .expect("launch authorization");
+
+        assert_eq!(proposal.status, PROPOSAL_GATE_PASSED);
+        assert_eq!(authorization.proposal_id, proposal.id);
+        assert_eq!(authorization.approved_by, "reviewer");
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                target_id: Some(proposal.id.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.action == "capability_eval_gated"
+                    && decision.outcome == PROPOSAL_GATE_PASSED)
+        );
+    }
+
+    #[test]
+    fn incomplete_or_failing_suite_is_terminally_gate_failed() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let eval = EvalStore::new();
+        let mut proposal = proposal();
+        review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
+        let mut run = eval_run(&proposal, true);
+        run.results.pop();
+        eval.create_run(run);
+
+        let authorization = gate_capability_proposal(
+            &db,
+            &eval,
+            &mut proposal,
+            "capability-run-1",
+            "chisei.gate",
+            60,
+        )
+        .unwrap();
+
+        assert!(authorization.is_none());
+        assert_eq!(proposal.status, PROPOSAL_GATE_FAILED);
+        assert!(!proposal.gate.as_ref().unwrap().passed);
     }
 }
