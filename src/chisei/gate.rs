@@ -274,6 +274,7 @@ mod tests {
                 timestamp: ts_base + i as i64,
                 scored: false,
                 task_class: task_class.into(),
+                cost_usd_micros: 0,
             })
             .unwrap();
         }

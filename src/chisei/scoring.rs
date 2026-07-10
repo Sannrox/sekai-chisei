@@ -51,6 +51,10 @@ pub struct SampleObservation {
     /// matching how Plan 8B routing bias decisions are keyed.
     #[serde(default)]
     pub task_class: String,
+    /// Metered call cost paired with the quality verdict. Zero means pricing
+    /// was unavailable, so the observation cannot update the cost frontier.
+    #[serde(default)]
+    pub cost_usd_micros: i64,
 }
 
 /// Structured verdict the judge produces for a single observation.
@@ -338,6 +342,32 @@ impl ScoringJob {
                                 "scoring knowledge write failed; retaining the evaluated result without a learning"
                             );
                         }
+                    }
+                }
+                if obs.cost_usd_micros > 0 && !obs.resolved_model.trim().is_empty() {
+                    let portfolio = crate::chisei::portfolio::PortfolioStore::new(self.db.clone());
+                    if let Err(error) = portfolio.record(&crate::chisei::portfolio::Observation {
+                        namespace: obs.namespace.clone(),
+                        task_class: obs.task_class.clone(),
+                        model: obs.resolved_model.clone(),
+                        // A judge score cannot override deterministic authored
+                        // assertions. Failed gates contribute zero portfolio
+                        // value so routing never optimizes toward outputs that
+                        // look plausible but violate the task contract.
+                        quality_score: if passed {
+                            verdict.score.clamp(0, 100) as f64
+                        } else {
+                            0.0
+                        },
+                        cost_usd_micros: obs.cost_usd_micros,
+                        sample_count: 1,
+                        updated_at: obs.timestamp,
+                    }) {
+                        warn!(
+                            request_id = %obs.request_id,
+                            %error,
+                            "scoring job failed to update portfolio frontier"
+                        );
                     }
                 }
                 results.push(eval::CaseResult {
@@ -936,6 +966,7 @@ mod tests {
             timestamp: ts,
             scored: false,
             task_class: task_class.into(),
+            cost_usd_micros: 0,
         })
         .unwrap();
     }
@@ -1000,6 +1031,46 @@ mod tests {
         // An iteration exists and the namespace now has a (stable) regression signal.
         let signal = eval.namespace_regression_signal("acme").unwrap();
         assert!(!signal.regressed);
+    }
+
+    #[tokio::test]
+    async fn scored_metered_observation_updates_model_frontier() {
+        let (db, eval) = setup();
+        db.put_sample_observation(&SampleObservation {
+            request_id: "metered".into(),
+            namespace: "acme".into(),
+            spec: "do the thing".into(),
+            resolved_model: "model-a".into(),
+            output_content: "done".into(),
+            sample_reason: "base".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            stop_reason: "end_turn".into(),
+            timestamp: 100,
+            scored: false,
+            task_class: "primary".into(),
+            cost_usd_micros: 42,
+        })
+        .unwrap();
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval,
+            Arc::new(StubJudge {
+                score: 88,
+                passed: true,
+            }),
+            16,
+            "judge",
+        );
+
+        assert_eq!(job.run_once().await.unwrap(), 1);
+        let points = crate::chisei::portfolio::PortfolioStore::new(db)
+            .frontier("acme", "primary")
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].model, "model-a");
+        assert_eq!(points[0].quality_score, 88.0);
+        assert_eq!(points[0].cost_usd_micros, 42);
     }
 
     #[tokio::test]

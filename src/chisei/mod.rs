@@ -9,6 +9,7 @@ pub mod gate;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;
+pub mod portfolio;
 pub mod privacy;
 pub mod promotion;
 pub mod sampling;
