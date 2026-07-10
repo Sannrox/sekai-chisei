@@ -22,6 +22,40 @@ message PolicyResolution {
   string route_bias = 6;
 }
 
+message PortfolioPoint {
+  string model = 1;
+  double quality_score = 2;
+  int64 cost_usd_micros = 3;
+  int64 sample_count = 4;
+  int64 updated_at = 5;
+}
+
+message PortfolioObjective {
+  string namespace = 1;
+  // "maximize_value" or "minimize_cost".
+  string mode = 2;
+  int64 budget_usd_micros = 3;
+  double quality_bar = 4;
+  int64 min_samples = 5;
+  int64 updated_at = 6;
+}
+
+message PortfolioTaskDemand {
+  string task_class = 1;
+  int64 expected_calls = 2;
+  // Set has_quality_bar=false to inherit the objective's default bar.
+  double quality_bar = 3;
+  bool has_quality_bar = 4;
+}
+
+message PortfolioAllocation {
+  string task_class = 1;
+  string model = 2;
+  double quality_score = 3;
+  int64 cost_per_call_usd_micros = 4;
+  int64 expected_calls = 5;
+}
+
 message PipelineRequest {
   string request_id = 1;
   string namespace = 2;
@@ -355,6 +389,31 @@ message SetBudgetLimitRequest {
 }
 message SetBudgetLimitResponse {}
 
+message RecordPortfolioObservationRequest {
+  string namespace = 1;
+  string task_class = 2;
+  string model = 3;
+  double quality_score = 4;
+  int64 cost_usd_micros = 5;
+  int64 sample_count = 6;
+  int64 updated_at = 7;
+}
+message RecordPortfolioObservationResponse { repeated PortfolioPoint frontier = 1; }
+message GetPortfolioFrontierRequest { string namespace = 1; string task_class = 2; }
+message GetPortfolioFrontierResponse { repeated PortfolioPoint frontier = 1; }
+message SetPortfolioObjectiveRequest { PortfolioObjective objective = 1; }
+message SetPortfolioObjectiveResponse { PortfolioObjective objective = 1; }
+message AllocatePortfolioRequest {
+  string namespace = 1;
+  repeated PortfolioTaskDemand demands = 2;
+}
+message AllocatePortfolioResponse {
+  PortfolioObjective objective = 1;
+  repeated PortfolioAllocation allocations = 2;
+  int64 total_cost_usd_micros = 3;
+  double total_value = 4;
+}
+
 message SetNamespacePolicyRequest {
   string namespace = 1;
   repeated string allowed_runtimes = 2;
@@ -490,6 +549,12 @@ service ChiseiService {
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
   rpc SetBudgetLimit(SetBudgetLimitRequest) returns (SetBudgetLimitResponse);
+
+  // Intelligence portfolio
+  rpc RecordPortfolioObservation(RecordPortfolioObservationRequest) returns (RecordPortfolioObservationResponse);
+  rpc GetPortfolioFrontier(GetPortfolioFrontierRequest) returns (GetPortfolioFrontierResponse);
+  rpc SetPortfolioObjective(SetPortfolioObjectiveRequest) returns (SetPortfolioObjectiveResponse);
+  rpc AllocatePortfolio(AllocatePortfolioRequest) returns (AllocatePortfolioResponse);
 
   // Model Policy
   rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);

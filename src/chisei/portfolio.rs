@@ -11,6 +11,73 @@ pub struct FrontierPoint {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observation {
+    pub namespace: String,
+    pub task_class: String,
+    pub model: String,
+    pub quality_score: f64,
+    pub cost_usd_micros: i64,
+    pub sample_count: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectiveMode {
+    MaximizeValue,
+    MinimizeCost,
+}
+
+impl ObjectiveMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "maximize_value" | "max_value" => Ok(Self::MaximizeValue),
+            "minimize_cost" | "min_cost" => Ok(Self::MinimizeCost),
+            other => Err(format!("unsupported portfolio objective mode '{other}'")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaximizeValue => "maximize_value",
+            Self::MinimizeCost => "minimize_cost",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Objective {
+    pub namespace: String,
+    pub mode: ObjectiveMode,
+    pub budget_usd_micros: i64,
+    pub quality_bar: f64,
+    pub min_samples: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskDemand {
+    pub task_class: String,
+    pub expected_calls: i64,
+    pub quality_bar: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Allocation {
+    pub task_class: String,
+    pub model: String,
+    pub quality_score: f64,
+    pub cost_per_call_usd_micros: i64,
+    pub expected_calls: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllocationPlan {
+    pub allocations: Vec<Allocation>,
+    pub total_cost_usd_micros: i64,
+    pub total_value: f64,
+}
+
 pub struct PortfolioStore {
     db: Arc<SekaiDb>,
 }
@@ -20,43 +87,34 @@ impl PortfolioStore {
         Self { db }
     }
 
-    pub fn record(
-        &self,
-        namespace: &str,
-        task_class: &str,
-        model: &str,
-        quality_score: f64,
-        cost_usd_micros: i64,
-        sample_count: i64,
-        updated_at: i64,
-    ) -> Result<(), String> {
-        let namespace = namespace.trim();
-        let task_class = normalize_task_class(task_class);
-        let model = model.trim();
+    pub fn record(&self, observation: &Observation) -> Result<(), String> {
+        let namespace = observation.namespace.trim();
+        let task_class = normalize_task_class(&observation.task_class);
+        let model = observation.model.trim();
         if namespace.is_empty() {
             return Err("portfolio observation namespace required".into());
         }
         if model.is_empty() {
             return Err("portfolio observation model required".into());
         }
-        if !quality_score.is_finite() || !(0.0..=100.0).contains(&quality_score) {
+        if !observation.quality_score.is_finite()
+            || !(0.0..=100.0).contains(&observation.quality_score)
+        {
             return Err("portfolio quality_score must be finite and between 0 and 100".into());
         }
-        if cost_usd_micros < 0 {
+        if observation.cost_usd_micros < 0 {
             return Err("portfolio cost_usd_micros must be non-negative".into());
         }
-        if sample_count <= 0 {
+        if observation.sample_count <= 0 {
             return Err("portfolio sample_count must be positive".into());
         }
-        self.db.portfolio_record_observation(
-            namespace,
-            &task_class,
-            model,
-            quality_score,
-            cost_usd_micros,
-            sample_count,
-            updated_at,
-        )
+        let normalized = Observation {
+            namespace: namespace.to_string(),
+            task_class,
+            model: model.to_string(),
+            ..observation.clone()
+        };
+        self.db.portfolio_record_observation(&normalized)
     }
 
     pub fn points(&self, namespace: &str, task_class: &str) -> Result<Vec<FrontierPoint>, String> {
@@ -87,6 +145,153 @@ impl PortfolioStore {
             .cloned()
             .collect())
     }
+
+    pub fn set_objective(&self, objective: &Objective) -> Result<(), String> {
+        if objective.namespace.trim().is_empty() {
+            return Err("portfolio objective namespace required".into());
+        }
+        if objective.budget_usd_micros < 0 {
+            return Err("portfolio budget_usd_micros must be non-negative".into());
+        }
+        if !objective.quality_bar.is_finite() || !(0.0..=100.0).contains(&objective.quality_bar) {
+            return Err("portfolio quality_bar must be finite and between 0 and 100".into());
+        }
+        if objective.min_samples <= 0 {
+            return Err("portfolio min_samples must be positive".into());
+        }
+        self.db.portfolio_set_objective(objective)
+    }
+
+    pub fn objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
+        self.db.portfolio_objective(namespace.trim())
+    }
+
+    pub fn allocate(
+        &self,
+        objective: &Objective,
+        demands: &[TaskDemand],
+    ) -> Result<AllocationPlan, String> {
+        if demands.is_empty() {
+            return Err("at least one portfolio task demand required".into());
+        }
+
+        let mut choices = Vec::with_capacity(demands.len());
+        for demand in demands {
+            if demand.expected_calls <= 0 {
+                return Err(format!(
+                    "expected_calls must be positive for task class {:?}",
+                    demand.task_class
+                ));
+            }
+            let quality_bar = demand.quality_bar.unwrap_or(objective.quality_bar);
+            if !quality_bar.is_finite() || !(0.0..=100.0).contains(&quality_bar) {
+                return Err(format!(
+                    "quality bar must be finite and between 0 and 100 for task class {:?}",
+                    demand.task_class
+                ));
+            }
+            let task_class = normalize_task_class(&demand.task_class);
+            let candidates: Vec<_> = self
+                .frontier(&objective.namespace, &task_class)?
+                .into_iter()
+                .filter(|point| {
+                    point.sample_count >= objective.min_samples
+                        && point.quality_score >= quality_bar
+                })
+                .collect();
+            let selected = candidates.first().cloned().ok_or_else(|| {
+                format!(
+                    "no sufficiently sampled model clears quality bar {quality_bar:.1} for task class {task_class}"
+                )
+            })?;
+            choices.push((demand.clone(), candidates, 0usize, selected));
+        }
+
+        let mut total_cost = plan_cost(&choices)?;
+        if objective.budget_usd_micros > 0 && total_cost > objective.budget_usd_micros {
+            return Err(format!(
+                "minimum quality allocation costs {total_cost} micros, above budget {}",
+                objective.budget_usd_micros
+            ));
+        }
+
+        if objective.mode == ObjectiveMode::MaximizeValue {
+            loop {
+                let best = choices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (demand, candidates, selected_index, selected))| {
+                        let next_index = selected_index + 1;
+                        let next = candidates.get(next_index)?;
+                        let cost_delta = (next.cost_usd_micros - selected.cost_usd_micros)
+                            .checked_mul(demand.expected_calls)?;
+                        let value_delta = (next.quality_score - selected.quality_score)
+                            * demand.expected_calls as f64;
+                        if cost_delta <= 0 || value_delta <= 0.0 {
+                            return None;
+                        }
+                        if objective.budget_usd_micros > 0
+                            && total_cost.checked_add(cost_delta)? > objective.budget_usd_micros
+                        {
+                            return None;
+                        }
+                        Some((
+                            index,
+                            value_delta / cost_delta as f64,
+                            next.model.as_str(),
+                            cost_delta,
+                        ))
+                    })
+                    .max_by(|left, right| {
+                        left.1
+                            .total_cmp(&right.1)
+                            .then_with(|| right.2.cmp(left.2))
+                            .then_with(|| right.0.cmp(&left.0))
+                    });
+                let Some((index, _, _, cost_delta)) = best else {
+                    break;
+                };
+                let (_, candidates, selected_index, selected) = &mut choices[index];
+                *selected_index += 1;
+                *selected = candidates[*selected_index].clone();
+                total_cost += cost_delta;
+            }
+        }
+
+        let allocations: Vec<_> = choices
+            .into_iter()
+            .map(|(demand, _, _, point)| Allocation {
+                task_class: normalize_task_class(&demand.task_class),
+                model: point.model,
+                quality_score: point.quality_score,
+                cost_per_call_usd_micros: point.cost_usd_micros,
+                expected_calls: demand.expected_calls,
+            })
+            .collect();
+        let total_value = allocations
+            .iter()
+            .map(|allocation| allocation.quality_score * allocation.expected_calls as f64)
+            .sum();
+        Ok(AllocationPlan {
+            allocations,
+            total_cost_usd_micros: total_cost,
+            total_value,
+        })
+    }
+}
+
+type Choice = (TaskDemand, Vec<FrontierPoint>, usize, FrontierPoint);
+
+fn plan_cost(choices: &[Choice]) -> Result<i64, String> {
+    choices
+        .iter()
+        .try_fold(0i64, |total, (demand, _, _, point)| {
+            point
+                .cost_usd_micros
+                .checked_mul(demand.expected_calls)
+                .and_then(|cost| total.checked_add(cost))
+                .ok_or_else(|| "portfolio allocation cost overflow".to_string())
+        })
 }
 
 pub fn normalize_task_class(task_class: &str) -> String {
@@ -110,10 +315,18 @@ mod tests {
     fn observations_are_aggregated_by_weighted_mean() {
         let store = store();
         store
-            .record("acme", " Primary ", "model-a", 80.0, 10, 1, 10)
+            .record(&observation(
+                "acme",
+                " Primary ",
+                "model-a",
+                80.0,
+                10,
+                1,
+                10,
+            ))
             .unwrap();
         store
-            .record("acme", "primary", "model-a", 90.0, 20, 3, 20)
+            .record(&observation("acme", "primary", "model-a", 90.0, 20, 3, 20))
             .unwrap();
 
         let point = store.points("acme", "PRIMARY").unwrap().pop().unwrap();
@@ -133,7 +346,7 @@ mod tests {
             ("capable", 95.0, 30),
         ] {
             store
-                .record("acme", "primary", model, quality, cost, 3, 1)
+                .record(&observation("acme", "primary", model, quality, cost, 3, 1))
                 .unwrap();
         }
 
@@ -149,17 +362,138 @@ mod tests {
     #[test]
     fn invalid_observations_are_rejected() {
         let store = store();
-        assert!(store.record("", "primary", "model", 80.0, 1, 1, 1).is_err());
-        assert!(store.record("acme", "primary", "", 80.0, 1, 1, 1).is_err());
         assert!(
             store
-                .record("acme", "primary", "model", f64::NAN, 1, 1, 1)
+                .record(&observation("", "primary", "model", 80.0, 1, 1, 1))
                 .is_err()
         );
         assert!(
             store
-                .record("acme", "primary", "model", 80.0, -1, 1, 1)
+                .record(&observation("acme", "primary", "", 80.0, 1, 1, 1))
                 .is_err()
         );
+        assert!(
+            store
+                .record(&observation("acme", "primary", "model", f64::NAN, 1, 1, 1))
+                .is_err()
+        );
+        assert!(
+            store
+                .record(&observation("acme", "primary", "model", 80.0, -1, 1, 1))
+                .is_err()
+        );
+    }
+
+    fn seeded_store() -> PortfolioStore {
+        let store = store();
+        for (task_class, model, quality, cost) in [
+            ("primary", "small", 80.0, 10),
+            ("primary", "medium", 90.0, 20),
+            ("primary", "large", 95.0, 50),
+            ("bulk", "small", 75.0, 5),
+            ("bulk", "medium", 85.0, 15),
+        ] {
+            store
+                .record(&observation("acme", task_class, model, quality, cost, 5, 1))
+                .unwrap();
+        }
+        store
+    }
+
+    fn objective(mode: ObjectiveMode, budget: i64) -> Objective {
+        Objective {
+            namespace: "acme".into(),
+            mode,
+            budget_usd_micros: budget,
+            quality_bar: 75.0,
+            min_samples: 3,
+            updated_at: 1,
+        }
+    }
+
+    fn observation(
+        namespace: &str,
+        task_class: &str,
+        model: &str,
+        quality_score: f64,
+        cost_usd_micros: i64,
+        sample_count: i64,
+        updated_at: i64,
+    ) -> Observation {
+        Observation {
+            namespace: namespace.into(),
+            task_class: task_class.into(),
+            model: model.into(),
+            quality_score,
+            cost_usd_micros,
+            sample_count,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn minimize_cost_selects_cheapest_points_above_quality_bars() {
+        let store = seeded_store();
+        let plan = store
+            .allocate(
+                &objective(ObjectiveMode::MinimizeCost, 100),
+                &[
+                    TaskDemand {
+                        task_class: "primary".into(),
+                        expected_calls: 2,
+                        quality_bar: Some(85.0),
+                    },
+                    TaskDemand {
+                        task_class: "bulk".into(),
+                        expected_calls: 3,
+                        quality_bar: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(plan.allocations[0].model, "medium");
+        assert_eq!(plan.allocations[1].model, "small");
+        assert_eq!(plan.total_cost_usd_micros, 55);
+    }
+
+    #[test]
+    fn maximize_value_spends_budget_on_best_marginal_upgrade() {
+        let store = seeded_store();
+        let plan = store
+            .allocate(
+                &objective(ObjectiveMode::MaximizeValue, 60),
+                &[
+                    TaskDemand {
+                        task_class: "primary".into(),
+                        expected_calls: 2,
+                        quality_bar: None,
+                    },
+                    TaskDemand {
+                        task_class: "bulk".into(),
+                        expected_calls: 2,
+                        quality_bar: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(plan.allocations[0].model, "medium");
+        assert_eq!(plan.allocations[1].model, "small");
+        assert_eq!(plan.total_cost_usd_micros, 50);
+    }
+
+    #[test]
+    fn allocation_fails_when_quality_floor_is_unaffordable() {
+        let store = seeded_store();
+        let error = store
+            .allocate(
+                &objective(ObjectiveMode::MinimizeCost, 10),
+                &[TaskDemand {
+                    task_class: "primary".into(),
+                    expected_calls: 1,
+                    quality_bar: Some(90.0),
+                }],
+            )
+            .unwrap_err();
+        assert!(error.contains("above budget"));
     }
 }
