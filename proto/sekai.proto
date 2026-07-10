@@ -291,6 +291,40 @@ message GetLinkedObjectsResponse { repeated Object objects = 1; }
 message TraverseRequest { GraphQuery query = 1; }
 message TraverseResponse { GraphResult result = 1; }
 
+// A bounded, governed context-retrieval root. Exactly one field must be set.
+message ContextRoot {
+  string object_id = 1;
+  string external_id = 2;
+  string link_id = 3;
+}
+
+message RetrieveContextRequest {
+  repeated ContextRoot roots = 1;
+  repeated string relations = 2;
+  string direction = 3; // outgoing | incoming | both; empty defaults to both
+  uint32 max_depth = 4; // 0 is roots-only; values above 3 are capped
+  uint32 max_objects = 5; // 0 defaults to 20; absolute cap is 100
+  uint32 max_links = 6; // 0 defaults to 40 when expanding; cap is 200
+  repeated string kind_filter = 7;
+}
+
+message ContextCandidate {
+  Object object = 1;
+  uint32 depth = 2;
+  string via_relation = 3;
+  double affinity = 4;
+}
+
+message RetrieveContextResponse {
+  repeated ContextCandidate candidates = 1;
+  repeated Link links = 2;
+  bool truncated = 3;
+  uint32 unresolved_roots = 4;
+  uint32 denied_objects = 5;
+  uint32 truncated_objects = 6;
+  uint32 truncated_links = 7;
+}
+
 message ListSchemaTypesRequest {}
 message ListSchemaTypesResponse { repeated ObjectType types = 1; }
 message CreateSchemaTypeRequest { ObjectType type = 1; }
@@ -592,6 +626,7 @@ service SekaiService {
   rpc GetLinkedObjects(GetLinkedObjectsRequest) returns (GetLinkedObjectsResponse);
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
+  rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
 
   rpc ListSchemaTypes(ListSchemaTypesRequest) returns (ListSchemaTypesResponse);
   rpc CreateSchemaType(CreateSchemaTypeRequest) returns (CreateSchemaTypeResponse);

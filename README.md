@@ -235,6 +235,73 @@ bounded to `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` characters (default 4000) s
 precision-injection never balloons the prompt; the egress audit records the
 injected character count and how many object contexts were dropped by the cap.
 
+Clients that can shape the raw provider request may select exact governed fields
+with a top-level `chisei_context` manifest. The gateway removes this control
+field before forwarding and injects only fields that are both selected and
+permitted by egress policy:
+
+```json
+{
+  "model": "gpt-5.5",
+  "input": "Analyze the selected evidence.",
+  "chisei_context": {
+    "objects": [
+      { "ref": "ticker:AAPL", "fields": ["score", "confidence"] }
+    ]
+  }
+}
+```
+
+The audit distinguishes explicit from legacy text-reference selection and
+records requested and omitted fields, eligible versus injected characters, and
+an estimated avoided-input-token count. Empty field lists are rejected so an
+explicit selector cannot silently fall back to broad context.
+
+For ontology-scoped retrieval, each selector may use exactly one of `ref`, `id`,
+or `link_id`, and a bounded `retrieval` block selects the only relations, kinds,
+and fields eligible for related context:
+
+```json
+{
+  "chisei_context": {
+    "objects": [{ "id": "service-api", "fields": ["status"] }],
+    "retrieval": {
+      "relations": ["touches", "depends_on"],
+      "direction": "both",
+      "max_depth": 2,
+      "max_objects": 8,
+      "max_links": 16,
+      "kinds": ["learning"],
+      "fields": ["title", "prevention"]
+    }
+  }
+}
+```
+
+The control plane resolves roots and link endpoints through an authenticated,
+ACL-aware query that never crosses unreadable or reserved governance objects.
+Depth is capped at three, result width is hard-bounded, and candidates are
+ordered deterministically by graph proximity and corroboration across roots.
+Resolution, denial, graph truncation, character truncation, and injected-object
+counts are retained in the gateway audit. Graph values are labelled as
+untrusted data in the model context.
+
+Related-context expansion is disabled until its exact retrieval shape has a
+distinct baseline and candidate eval run whose comparison passes. Directly
+selected root fields still pass through their normal policy checks while the
+expansion is disabled. The `gateway.egress` audit records the versioned
+`context_expansion_profile`, baseline and candidate run IDs, verdict, reason,
+whether expansion was allowed, and how many related objects were injected.
+Create eval runs with the audited profile key as `changed_file`; the first run
+establishes only a baseline, a passing later run enables expansion, and a newer
+regression disables it again automatically.
+
+The Chisei enrichment pipeline applies the same rule to linked learnings and
+related verdicts. Its stable profile is
+`context-expansion:pipeline-v1:<namespace>`, recorded under the
+`chisei.context_expansion` audit action. Explicit object fields remain
+available when that profile has no passing candidate evidence.
+
 ### One-command launch
 
 ```bash
