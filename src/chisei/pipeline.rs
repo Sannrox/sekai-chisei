@@ -21,6 +21,7 @@ pub struct PipelineRequest {
     pub egress_records: Vec<egress::ContextEgressRecord>,
     pub external_egress: bool,
     pub template_only: bool,
+    pub expanded_context_items: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,7 @@ pub struct RunResult {
     pub risk_score: f64,
     pub review_policy: Option<ReviewPolicy>,
     pub egress_records: Vec<egress::ContextEgressRecord>,
+    pub expanded_context_items: usize,
 }
 
 impl RunResult {
@@ -264,128 +266,147 @@ impl Step for ObjectContextEnrichStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
-        if req.template_only {
-            return StepDecision {
-                step: String::new(),
-                action: "skipped".into(),
-                reasoning: "template_only sanitization contract".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-        let mut lines = Vec::new();
-        let context_objects = resolve_context_objects(req, db);
-        if context_objects.is_empty() {
-            return StepDecision {
-                step: String::new(),
-                action: "none".into(),
-                reasoning: "no matching object context found".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-        let mut type_cache = HashMap::new();
-        for obj in context_objects {
-            let mut egress_record = egress::new_record(&obj);
-            let mut has_content = false;
-            let mut details = Vec::new();
-            if let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
-                obj.properties
-                    .get(**key)
-                    .is_some_and(|value| !value.is_empty())
-            }) && let Some(verdict) = filter_context_property(
-                db,
-                &mut type_cache,
-                &obj,
-                verdict_key,
-                &mut egress_record,
-                req.external_egress,
-            ) {
-                details.push(format!("prior_verdict: {}", verdict));
-                has_content = true;
-            }
-            if let Some(conviction_key) = CONVICTION_KEYS.iter().find(|key| {
-                obj.properties
-                    .get(**key)
-                    .is_some_and(|value| !value.is_empty())
-            }) && let Some(conviction) = filter_context_property(
-                db,
-                &mut type_cache,
-                &obj,
-                conviction_key,
-                &mut egress_record,
-                req.external_egress,
-            ) {
-                details.push(format!("conviction: {}", conviction));
-                has_content = true;
-            }
-            if obj.properties.get("score").is_some_and(|s| !s.is_empty())
-                && !details.iter().any(|d| d.contains("conviction"))
-                && let Some(score) = filter_context_property(
-                    db,
-                    &mut type_cache,
-                    &obj,
-                    "score",
-                    &mut egress_record,
-                    req.external_egress,
-                )
-            {
-                details.push(format!("score: {}", score));
-                has_content = true;
-            }
-            if obj
-                .properties
-                .get("success_rate")
-                .is_some_and(|value| !value.is_empty())
-                && let Some(rate) = filter_context_property(
-                    db,
-                    &mut type_cache,
-                    &obj,
-                    "success_rate",
-                    &mut egress_record,
-                    req.external_egress,
-                )
-            {
-                details.push(format!("success_rate: {}", rate));
-                has_content = true;
-            }
-            if object_implements(db, &obj, INTERFACE_RISK_SCORED)
-                && obj
-                    .properties
-                    .get("risk_score")
-                    .is_some_and(|value| !value.is_empty())
-                && let Some(score) = filter_context_property(
-                    db,
-                    &mut type_cache,
-                    &obj,
-                    "risk_score",
-                    &mut egress_record,
-                    req.external_egress,
-                )
-            {
-                details.push(format!("risk_score: {}", score));
-                has_content = true;
-            }
-            if object_implements(db, &obj, INTERFACE_RISK_SCORED)
-                && obj
-                    .properties
-                    .get("risk_reason")
-                    .is_some_and(|value| !value.is_empty())
-                && let Some(reason) = filter_context_property(
-                    db,
-                    &mut type_cache,
-                    &obj,
-                    "risk_reason",
-                    &mut egress_record,
-                    req.external_egress,
-                )
-            {
-                details.push(format!("risk_reason: {}", reason));
-                has_content = true;
-            }
+        run_object_context_enrich(req, db, false)
+    }
 
+    fn run_with_context_expansion(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        context_expansion_allowed: bool,
+    ) -> StepDecision {
+        run_object_context_enrich(req, db, context_expansion_allowed)
+    }
+}
+
+fn run_object_context_enrich(
+    req: &mut PipelineRequest,
+    db: &SekaiDb,
+    context_expansion_allowed: bool,
+) -> StepDecision {
+    if req.template_only {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "template_only sanitization contract".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    let mut lines = Vec::new();
+    let context_objects = resolve_context_objects(req, db);
+    if context_objects.is_empty() {
+        return StepDecision {
+            step: String::new(),
+            action: "none".into(),
+            reasoning: "no matching object context found".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    let mut type_cache = HashMap::new();
+    for obj in context_objects {
+        let mut egress_record = egress::new_record(&obj);
+        let mut has_content = false;
+        let mut details = Vec::new();
+        if let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
+            obj.properties
+                .get(**key)
+                .is_some_and(|value| !value.is_empty())
+        }) && let Some(verdict) = filter_context_property(
+            db,
+            &mut type_cache,
+            &obj,
+            verdict_key,
+            &mut egress_record,
+            req.external_egress,
+        ) {
+            details.push(format!("prior_verdict: {}", verdict));
+            has_content = true;
+        }
+        if let Some(conviction_key) = CONVICTION_KEYS.iter().find(|key| {
+            obj.properties
+                .get(**key)
+                .is_some_and(|value| !value.is_empty())
+        }) && let Some(conviction) = filter_context_property(
+            db,
+            &mut type_cache,
+            &obj,
+            conviction_key,
+            &mut egress_record,
+            req.external_egress,
+        ) {
+            details.push(format!("conviction: {}", conviction));
+            has_content = true;
+        }
+        if obj.properties.get("score").is_some_and(|s| !s.is_empty())
+            && !details.iter().any(|d| d.contains("conviction"))
+            && let Some(score) = filter_context_property(
+                db,
+                &mut type_cache,
+                &obj,
+                "score",
+                &mut egress_record,
+                req.external_egress,
+            )
+        {
+            details.push(format!("score: {}", score));
+            has_content = true;
+        }
+        if obj
+            .properties
+            .get("success_rate")
+            .is_some_and(|value| !value.is_empty())
+            && let Some(rate) = filter_context_property(
+                db,
+                &mut type_cache,
+                &obj,
+                "success_rate",
+                &mut egress_record,
+                req.external_egress,
+            )
+        {
+            details.push(format!("success_rate: {}", rate));
+            has_content = true;
+        }
+        if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+            && obj
+                .properties
+                .get("risk_score")
+                .is_some_and(|value| !value.is_empty())
+            && let Some(score) = filter_context_property(
+                db,
+                &mut type_cache,
+                &obj,
+                "risk_score",
+                &mut egress_record,
+                req.external_egress,
+            )
+        {
+            details.push(format!("risk_score: {}", score));
+            has_content = true;
+        }
+        if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+            && obj
+                .properties
+                .get("risk_reason")
+                .is_some_and(|value| !value.is_empty())
+            && let Some(reason) = filter_context_property(
+                db,
+                &mut type_cache,
+                &obj,
+                "risk_reason",
+                &mut egress_record,
+                req.external_egress,
+            )
+        {
+            details.push(format!("risk_reason: {}", reason));
+            has_content = true;
+        }
+
+        if context_expansion_allowed {
             let learnings = db
                 .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
@@ -419,64 +440,67 @@ impl Step for ObjectContextEnrichStep {
                 }
             }
             if !pitfalls.is_empty() {
+                req.expanded_context_items =
+                    req.expanded_context_items.saturating_add(pitfalls.len());
                 details.push(format!("recent_learning: {}", pitfalls.join(", ")));
                 has_content = true;
             }
             let (related_verdicts, mut related_records) =
                 collect_related_verdict_context(&obj, db, req.external_egress);
             if !related_verdicts.is_empty() {
+                req.expanded_context_items = req
+                    .expanded_context_items
+                    .saturating_add(related_verdicts.len());
                 details.extend(related_verdicts);
                 has_content = true;
             }
             req.egress_records.append(&mut related_records);
-            if has_content {
-                if !req.external_egress || egress::include_identity(&obj) {
-                    egress_record.included_fields.push("identity".into());
-                    lines.push(format!(
-                        "object {} ({}) [{}] {}",
-                        obj.kind,
-                        obj.name,
-                        obj.external_id,
-                        details.join(", ")
-                    ));
-                } else {
-                    egress_record.redacted_fields.push("identity".into());
-                    egress_record
-                        .reasons
-                        .push("identity denied by default egress policy".into());
-                    lines.push(format!("object context {}", details.join(", ")));
-                }
-            }
-            if !egress_record.included_fields.is_empty()
-                || !egress_record.redacted_fields.is_empty()
-            {
-                req.egress_records.push(egress_record);
+        }
+        if has_content {
+            if !req.external_egress || egress::include_identity(&obj) {
+                egress_record.included_fields.push("identity".into());
+                lines.push(format!(
+                    "object {} ({}) [{}] {}",
+                    obj.kind,
+                    obj.name,
+                    obj.external_id,
+                    details.join(", ")
+                ));
+            } else {
+                egress_record.redacted_fields.push("identity".into());
+                egress_record
+                    .reasons
+                    .push("identity denied by default egress policy".into());
+                lines.push(format!("object context {}", details.join(", ")));
             }
         }
+        if !egress_record.included_fields.is_empty() || !egress_record.redacted_fields.is_empty() {
+            req.egress_records.push(egress_record);
+        }
+    }
 
-        if lines.is_empty() {
-            return StepDecision {
-                step: String::new(),
-                action: "none".into(),
-                reasoning: "no matching object context found".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-        req.spec
-            .push_str(&format!("\n\n[Object context]\n{}", lines.join("\n")));
-        StepDecision {
+    if lines.is_empty() {
+        return StepDecision {
             step: String::new(),
-            action: "enrich".into(),
-            reasoning: format!("injected {} object context block(s)", lines.len()),
+            action: "none".into(),
+            reasoning: "no matching object context found".into(),
             confidence: 1.0,
-            suggestion: format!(
-                "enriched spec with generic object context from {}",
-                lines.len()
-            ),
-            value: lines.len().to_string(),
-        }
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    req.spec
+        .push_str(&format!("\n\n[Object context]\n{}", lines.join("\n")));
+    StepDecision {
+        step: String::new(),
+        action: "enrich".into(),
+        reasoning: format!("injected {} object context block(s)", lines.len()),
+        confidence: 1.0,
+        suggestion: format!(
+            "enriched spec with generic object context from {}",
+            lines.len()
+        ),
+        value: lines.len().to_string(),
     }
 }
 
@@ -509,6 +533,15 @@ mod object_context_tests {
 pub trait Step: Send + Sync {
     fn name(&self) -> &str;
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision;
+
+    fn run_with_context_expansion(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        _context_expansion_allowed: bool,
+    ) -> StepDecision {
+        self.run(req, db)
+    }
 }
 
 pub struct Pipeline {
@@ -521,11 +554,23 @@ impl Pipeline {
     }
 
     pub fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> RunResult {
+        self.run_with_context_expansion(req, db, false)
+    }
+
+    /// Run the pipeline with the server-owned result of the context-expansion eval gate.
+    /// Existing callers use [`Pipeline::run`], which denies expansion by default.
+    pub fn run_with_context_expansion(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        context_expansion_allowed: bool,
+    ) -> RunResult {
+        req.expanded_context_items = 0;
         let decisions: Vec<StepDecision> = self
             .steps
             .iter()
             .map(|s| {
-                let mut d = s.run(req, db);
+                let mut d = s.run_with_context_expansion(req, db, context_expansion_allowed);
                 d.step = s.name().into();
                 d
             })
@@ -539,6 +584,7 @@ impl Pipeline {
             risk_score: req.risk_score,
             review_policy,
             egress_records: req.egress_records.clone(),
+            expanded_context_items: req.expanded_context_items,
         }
     }
 }
@@ -550,99 +596,127 @@ impl Step for LearningsEnrichStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
-        if req.template_only {
-            return StepDecision {
-                step: String::new(),
-                action: "skipped".into(),
-                reasoning: "template_only sanitization contract".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
+        run_learnings_enrich(req, db, false)
+    }
+
+    fn run_with_context_expansion(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        context_expansion_allowed: bool,
+    ) -> StepDecision {
+        run_learnings_enrich(req, db, context_expansion_allowed)
+    }
+}
+
+fn run_learnings_enrich(
+    req: &mut PipelineRequest,
+    db: &SekaiDb,
+    context_expansion_allowed: bool,
+) -> StepDecision {
+    if req.template_only {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "template_only sanitization contract".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    if !context_expansion_allowed {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "context expansion has not passed the eval gate".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    let mut pitfalls = Vec::new();
+    let mut found_context = false;
+    let mut type_cache = HashMap::new();
+    for context in resolve_context_objects(req, db) {
+        found_context = true;
+        let mut sources = vec![context.id.clone()];
+        if let Some(ns_obj) = db
+            .find_by_external_id(&format!("namespace:{}", context.kind))
+            .ok()
+            .flatten()
+        {
+            sources.push(ns_obj.id);
         }
-        let mut pitfalls = Vec::new();
-        let mut found_context = false;
-        let mut type_cache = HashMap::new();
-        for context in resolve_context_objects(req, db) {
-            found_context = true;
-            let mut sources = vec![context.id.clone()];
-            if let Some(ns_obj) = db
-                .find_by_external_id(&format!("namespace:{}", context.kind))
-                .ok()
-                .flatten()
-            {
-                sources.push(ns_obj.id);
-            }
-            for source_id in sources {
-                let learnings = db
-                    .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
-                    .unwrap_or_default();
-                for obj in learnings {
-                    if obj.kind != KIND_LEARNING {
-                        continue;
-                    }
-                    let mut learning_record = egress::new_record(&obj);
-                    let title = filter_context_property(
-                        db,
-                        &mut type_cache,
-                        &obj,
-                        "title",
-                        &mut learning_record,
-                        req.external_egress,
-                    );
-                    let prevention = filter_context_property(
-                        db,
-                        &mut type_cache,
-                        &obj,
-                        "prevention",
-                        &mut learning_record,
-                        req.external_egress,
-                    );
-                    if let (Some(title), Some(prevention)) = (title, prevention) {
-                        pitfalls.push(format!("{title} - {prevention}"));
-                    }
-                    req.egress_records.push(learning_record);
-                    if pitfalls.len() >= 3 {
-                        break;
-                    }
+        for source_id in sources {
+            let learnings = db
+                .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
+                .unwrap_or_default();
+            for obj in learnings {
+                if obj.kind != KIND_LEARNING {
+                    continue;
                 }
+                let mut learning_record = egress::new_record(&obj);
+                let title = filter_context_property(
+                    db,
+                    &mut type_cache,
+                    &obj,
+                    "title",
+                    &mut learning_record,
+                    req.external_egress,
+                );
+                let prevention = filter_context_property(
+                    db,
+                    &mut type_cache,
+                    &obj,
+                    "prevention",
+                    &mut learning_record,
+                    req.external_egress,
+                );
+                if let (Some(title), Some(prevention)) = (title, prevention) {
+                    pitfalls.push(format!("{title} - {prevention}"));
+                    req.expanded_context_items = req.expanded_context_items.saturating_add(1);
+                }
+                req.egress_records.push(learning_record);
                 if pitfalls.len() >= 3 {
                     break;
                 }
             }
+            if pitfalls.len() >= 3 {
+                break;
+            }
         }
-        if !found_context {
-            return StepDecision {
-                step: String::new(),
-                action: "none".into(),
-                reasoning: "no object context found".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-        if pitfalls.is_empty() {
-            return StepDecision {
-                step: String::new(),
-                action: "none".into(),
-                reasoning: "no relevant learnings found".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-        req.spec.push_str(&format!(
-            "\n\n[Known pitfalls]\n- {}",
-            pitfalls.join("\n- ")
-        ));
-        StepDecision {
+    }
+    if !found_context {
+        return StepDecision {
             step: String::new(),
-            action: "enrich".into(),
-            reasoning: format!("injected {} learning(s) from Sekai", pitfalls.len()),
+            action: "none".into(),
+            reasoning: "no object context found".into(),
             confidence: 1.0,
-            suggestion: format!("spec enriched with {} prior pitfall(s)", pitfalls.len()),
-            value: pitfalls.len().to_string(),
-        }
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    if pitfalls.is_empty() {
+        return StepDecision {
+            step: String::new(),
+            action: "none".into(),
+            reasoning: "no relevant learnings found".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    req.spec.push_str(&format!(
+        "\n\n[Known pitfalls]\n- {}",
+        pitfalls.join("\n- ")
+    ));
+    StepDecision {
+        step: String::new(),
+        action: "enrich".into(),
+        reasoning: format!("injected {} learning(s) from Sekai", pitfalls.len()),
+        confidence: 1.0,
+        suggestion: format!("spec enriched with {} prior pitfall(s)", pitfalls.len()),
+        value: pitfalls.len().to_string(),
     }
 }
 
@@ -1107,6 +1181,7 @@ mod tests {
             egress_records: vec![],
             external_egress: true,
             template_only: false,
+            expanded_context_items: 0,
         }
     }
 
@@ -1122,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enrich_with_learnings() {
+    fn test_context_expansion_allows_linked_learnings() {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "r1".into(),
@@ -1175,14 +1250,15 @@ mod tests {
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "component:service".into();
-        let result = p.run(&mut req, &db);
+        let result = p.run_with_context_expansion(&mut req, &db, true);
         assert_eq!(result.steps[1].step, "learnings_enrich");
         assert_eq!(result.steps[1].action, "enrich");
         assert!(result.prepared_spec.contains("Known pitfalls"));
+        assert!(result.expanded_context_items > 0);
     }
 
     #[test]
-    fn test_object_context_enrichment_from_ticker_reference() {
+    fn test_direct_context_survives_default_denied_expansion() {
         let db = SekaiDb::new(":memory:").unwrap();
         let created = chrono::Utc::now().timestamp_millis();
         db.create_object(&Object {
@@ -1229,6 +1305,28 @@ mod tests {
             created,
         })
         .unwrap();
+        db.create_object(&Object {
+            id: "analysis-aapl".into(),
+            kind: "analysis".into(),
+            name: "AAPL analysis".into(),
+            namespace: "".into(),
+            external_id: "analysis:AAPL".into(),
+            properties: HashMap::from([
+                ("verdict".into(), "related-only verdict".into()),
+                (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
+            ]),
+            created,
+            updated: created,
+        })
+        .unwrap();
+        db.create_link(&Link {
+            id: "touches-analysis".into(),
+            from_id: "analysis-aapl".into(),
+            to_id: "ticker-aapl".into(),
+            relation: REL_TOUCHES.into(),
+            created,
+        })
+        .unwrap();
 
         let p = default_pipeline();
         let mut req = PipelineRequest {
@@ -1245,12 +1343,20 @@ mod tests {
             egress_records: vec![],
             external_egress: true,
             template_only: false,
+            expanded_context_items: 0,
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");
         assert!(result.prepared_spec.contains("Object context"));
         assert!(result.prepared_spec.contains("prior_verdict: bullish"));
         assert!(result.prepared_spec.contains("conviction: 0.87"));
+        assert!(!result.prepared_spec.contains("recent_learning"));
+        assert!(!result.prepared_spec.contains("avoid overstated upside"));
+        assert!(!result.prepared_spec.contains("related_verdict"));
+        assert!(!result.prepared_spec.contains("related-only verdict"));
+        assert_eq!(result.steps[1].action, "skipped");
+        assert!(result.steps[1].reasoning.contains("eval gate"));
+        assert_eq!(result.expanded_context_items, 0);
         assert!(!result.prepared_spec.contains("object ticker (AAPL)"));
         assert!(
             result
@@ -1791,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_related_verdict_context_is_preserved() {
+    fn test_context_expansion_allows_related_verdict_context() {
         let db = SekaiDb::new(":memory:").unwrap();
         db.create_object(&Object {
             id: "asset-local".into(),
@@ -1828,10 +1934,11 @@ mod tests {
         let mut req = make_req();
         req.namespace = "asset:LOCAL".into();
         req.external_egress = false;
-        let result = p.run(&mut req, &db);
+        let result = p.run_with_context_expansion(&mut req, &db, true);
         assert_eq!(result.steps[0].action, "enrich");
         assert!(result.prepared_spec.contains("related_verdict"));
         assert!(result.prepared_spec.contains("watch margin risk"));
+        assert!(result.expanded_context_items > 0);
         assert!(result.prepared_spec.contains("Local analysis"));
     }
 

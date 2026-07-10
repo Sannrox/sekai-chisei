@@ -286,6 +286,22 @@ Resolution, denial, graph truncation, character truncation, and injected-object
 counts are retained in the gateway audit. Graph values are labelled as
 untrusted data in the model context.
 
+Related-context expansion is disabled until its exact retrieval shape has a
+distinct baseline and candidate eval run whose comparison passes. Directly
+selected root fields still pass through their normal policy checks while the
+expansion is disabled. The `gateway.egress` audit records the versioned
+`context_expansion_profile`, baseline and candidate run IDs, verdict, reason,
+whether expansion was allowed, and how many related objects were injected.
+Create eval runs with the audited profile key as `changed_file`; the first run
+establishes only a baseline, a passing later run enables expansion, and a newer
+regression disables it again automatically.
+
+The Chisei enrichment pipeline applies the same rule to linked learnings and
+related verdicts. Its stable profile is
+`context-expansion:pipeline-v1:<namespace>`, recorded under the
+`chisei.context_expansion` audit action. Explicit object fields remain
+available when that profile has no passing candidate evidence.
+
 ### One-command launch
 
 ```bash
