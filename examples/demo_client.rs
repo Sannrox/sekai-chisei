@@ -341,6 +341,7 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             key_id: String::new(),
             task_class: String::new(),
             user_id: String::new(),
+            expected_calls: 1,
         })
         .await
     {
