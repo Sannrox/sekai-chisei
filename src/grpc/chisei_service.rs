@@ -1312,6 +1312,25 @@ fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
     })
 }
 
+fn portfolio_runtime_for_model(
+    policy: Option<&Policy>,
+    current_runtime: &str,
+    model: &str,
+) -> Option<String> {
+    let model_runtime = crate::llm::provider_name(model);
+    if model_runtime == current_runtime.trim() {
+        return Some(model_runtime.to_string());
+    }
+    policy
+        .filter(|policy| {
+            policy
+                .allowed_runtimes
+                .iter()
+                .any(|allowed| allowed == model_runtime)
+        })
+        .map(|_| model_runtime.to_string())
+}
+
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
         return;
@@ -1830,7 +1849,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .map(|policy| policy.default_model.as_str())
             .filter(|model| !model.is_empty())
             .unwrap_or(&r.preferred_model);
-        let (runtime, model) = if let Some(policy) = effective_policy.as_ref() {
+        let (mut runtime, model) = if let Some(policy) = effective_policy.as_ref() {
             self.policy
                 .apply_policy(policy, &r.preferred_runtime, preferred_model)
                 .map_err(Status::invalid_argument)?
@@ -1970,6 +1989,12 @@ impl ChiseiService for ChiseiServiceImpl {
                 if let Ok(plan) = self.portfolio.allocate(&objective, &[demand])
                     && let Some(allocation) = plan.allocations.first()
                     && portfolio_model_allowed(effective_policy.as_ref(), &allocation.model)
+                    && portfolio_runtime_for_model(
+                        effective_policy.as_ref(),
+                        &runtime,
+                        &allocation.model,
+                    )
+                    .is_some()
                     && let Ok(proposed) = self
                         .resolve_live_model(
                             &allocation.model,
@@ -1988,6 +2013,12 @@ impl ChiseiService for ChiseiServiceImpl {
                         false,
                     )
                     && portfolio_model_allowed(effective_policy.as_ref(), &selection.model)
+                    && portfolio_runtime_for_model(
+                        effective_policy.as_ref(),
+                        &runtime,
+                        &selection.model,
+                    )
+                    .is_some()
                     && let Ok(selected) = self
                         .resolve_live_model(
                             &selection.model,
@@ -2006,6 +2037,9 @@ impl ChiseiService for ChiseiServiceImpl {
                         &objective,
                         "shifted",
                     );
+                    runtime =
+                        portfolio_runtime_for_model(effective_policy.as_ref(), &runtime, &selected)
+                            .expect("portfolio runtime was validated before selection");
                     model = selected;
                     route_bias = Some("portfolio");
                 }
@@ -3241,6 +3275,26 @@ mod tests {
         // An active eval regression reverts every class to the capable tier.
         assert_eq!(cheap_route_bias("background", true), None);
         assert_eq!(cheap_route_bias("bulk", true), None);
+    }
+
+    #[test]
+    fn portfolio_cross_provider_runtime_requires_explicit_policy_allowance() {
+        let mut policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["anthropic".into()],
+            allowed_models: vec!["claude-sonnet-4-20250514".into(), "gpt-5.5".into()],
+            default_runtime: "anthropic".into(),
+            default_model: "claude-sonnet-4-20250514".into(),
+            data_class: String::new(),
+        };
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            None
+        );
+        policy.allowed_runtimes.push("openai".into());
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            Some("openai".into())
+        );
     }
 
     #[test]
