@@ -871,6 +871,43 @@ impl SekaiDb {
         Ok(results)
     }
 
+    pub fn get_links_limited(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        limit: usize,
+    ) -> Result<Vec<Link>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let col = match dir {
+            Direction::Outgoing => "from_id",
+            Direction::Incoming => "to_id",
+        };
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let sql = if relation.is_empty() {
+            format!(
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {col} = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
+            )
+        } else {
+            format!(
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {col} = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
+            )
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, limit], row_to_link)
+                .map_err(|error| error.to_string())?
+        } else {
+            stmt.query_map(params![object_id, relation, limit], row_to_link)
+                .map_err(|error| error.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_linked_objects(
         &self,
         object_id: &str,

@@ -40,6 +40,15 @@ pub struct ChiseiServiceImpl {
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
+const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
+
+fn pipeline_context_expansion_profile_key(namespace: &str) -> String {
+    format!(
+        "context-expansion:{}:{}",
+        PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION,
+        namespace.trim()
+    )
+}
 
 struct FinishStreamedExecution<'a> {
     db: &'a SekaiDb,
@@ -225,6 +234,47 @@ impl ChiseiServiceImpl {
         }
     }
 
+    fn pipeline_context_expansion_gate(
+        &self,
+        namespace: &str,
+    ) -> crate::chisei::eval::ContextExpansionGate {
+        self.eval
+            .context_expansion_gate(&pipeline_context_expansion_profile_key(namespace))
+    }
+
+    fn record_context_expansion_gate(
+        &self,
+        request_id: &str,
+        namespace: &str,
+        gate: &crate::chisei::eval::ContextExpansionGate,
+        expanded_context_items: usize,
+    ) -> Result<(), Status> {
+        self.db
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.pipeline".into(),
+                action: "chisei.context_expansion".into(),
+                reason: gate.reason.clone(),
+                evidence: HashMap::from([
+                    ("request_id".into(), request_id.to_string()),
+                    ("profile_key".into(), gate.profile_key.clone()),
+                    ("iteration_id".into(), gate.iteration_id.clone()),
+                    ("baseline_run_id".into(), gate.baseline_run_id.clone()),
+                    ("candidate_run_id".into(), gate.candidate_run_id.clone()),
+                    ("verdict".into(), gate.verdict.clone()),
+                    ("allowed".into(), gate.allowed.to_string()),
+                    (
+                        "expanded_context_items".into(),
+                        expanded_context_items.to_string(),
+                    ),
+                ]),
+                target_id: namespace.to_string(),
+                outcome: if gate.allowed { "allowed" } else { "skipped" }.into(),
+            })
+            .map_err(Status::internal)
+    }
+
     /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
     /// and config — so emitted runs are visible to live regression checks immediately.
     pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
@@ -319,9 +369,15 @@ impl ChiseiServiceImpl {
             egress_records: vec![],
             external_egress: !safe_only,
             template_only,
+            expanded_context_items: 0,
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
-        let initial_run = self.pipeline.run(&mut pipeline_req, &self.db);
+        let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
+        let initial_run = self.pipeline.run_with_context_expansion(
+            &mut pipeline_req,
+            &self.db,
+            context_expansion_gate.allowed,
+        );
         let fallback_runtime = pipeline_req.runtime.clone();
         let (initial_runtime, initial_model) = self
             .resolve_model_for_run(
@@ -360,8 +416,13 @@ impl ChiseiServiceImpl {
                     egress_records: vec![],
                     external_egress: false,
                     template_only,
+                    expanded_context_items: 0,
                 };
-                let local_run = self.pipeline.run(&mut local_pipeline_req, &self.db);
+                let local_run = self.pipeline.run_with_context_expansion(
+                    &mut local_pipeline_req,
+                    &self.db,
+                    context_expansion_gate.allowed,
+                );
                 let (local_runtime, local_model) = self
                     .resolve_model_for_run(
                         &input,
@@ -385,6 +446,12 @@ impl ChiseiServiceImpl {
                     (local_run, local_runtime, local_model, local_provider, false)
                 }
             };
+        self.record_context_expansion_gate(
+            &input.request_id,
+            &input.namespace,
+            &context_expansion_gate,
+            run.expanded_context_items,
+        )?;
         let egress_decisions =
             build_egress_decisions(&run.egress_records, &provider, provider_is_external);
         let prepared_messages = build_prepared_messages(&input, &run.prepared_spec);
@@ -1747,8 +1814,20 @@ impl ChiseiService for ChiseiServiceImpl {
             egress_records: vec![],
             external_egress: true,
             template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
+            expanded_context_items: 0,
         };
-        let result = self.pipeline.run(&mut pr, &self.db);
+        let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
+        let result = self.pipeline.run_with_context_expansion(
+            &mut pr,
+            &self.db,
+            context_expansion_gate.allowed,
+        );
+        self.record_context_expansion_gate(
+            &pr.request_id,
+            &pr.namespace,
+            &context_expansion_gate,
+            result.expanded_context_items,
+        )?;
         let steps = result
             .steps
             .iter()
@@ -3192,6 +3271,118 @@ mod tests {
             }],
             timestamp,
         }
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_audits_and_applies_the_context_expansion_gate() {
+        let svc = memory_service();
+        svc.db
+            .create_object(&Object {
+                id: "ticker-aapl".into(),
+                kind: "ticker".into(),
+                name: "AAPL".into(),
+                namespace: "acme".into(),
+                external_id: "ticker:AAPL".into(),
+                properties: HashMap::from([
+                    ("score".into(), "0.82".into()),
+                    (
+                        crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "score".into(),
+                    ),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "analysis-aapl".into(),
+                kind: "analysis".into(),
+                name: "AAPL analysis".into(),
+                namespace: "acme".into(),
+                external_id: "analysis:AAPL".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "validate the filing date".into()),
+                    (
+                        crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "verdict".into(),
+                    ),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_link(&crate::domain::Link {
+                id: "analysis-touches-aapl".into(),
+                from_id: "analysis-aapl".into(),
+                to_id: "ticker-aapl".into(),
+                relation: crate::domain::REL_TOUCHES.into(),
+                created: 1,
+            })
+            .unwrap();
+
+        let request = |id: &str| RunPipelineRequest {
+            request: Some(PipelineRequest {
+                request_id: id.into(),
+                namespace: "acme".into(),
+                spec: "inspect ticker:AAPL".into(),
+                model: String::new(),
+                runtime: String::new(),
+                task_type: String::new(),
+                priority: 0,
+                task_class: String::new(),
+            }),
+        };
+        let denied = svc
+            .run_pipeline(Request::new(request("before-eval")))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(denied.prepared_spec.contains("score: 0.82"));
+        assert!(!denied.prepared_spec.contains("validate the filing date"));
+
+        create_suite(&svc, "acme").await;
+        let profile = pipeline_context_expansion_profile_key("acme");
+        for (id, score, timestamp) in [("context-base", 90, 1), ("context-pass", 95, 2)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: profile.clone(),
+                diff_hash: format!("hash-{id}"),
+            }))
+            .await
+            .unwrap();
+        }
+        let allowed = svc
+            .run_pipeline(Request::new(request("after-eval")))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(allowed.prepared_spec.contains("validate the filing date"));
+
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("chisei.context_expansion".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().any(|decision| {
+            decision.evidence["request_id"] == "before-eval"
+                && decision.evidence["verdict"] == "missing"
+                && decision.evidence["allowed"] == "false"
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.evidence["request_id"] == "after-eval"
+                && decision.evidence["verdict"] == "pass"
+                && decision.evidence["allowed"] == "true"
+                && decision.evidence["expanded_context_items"] != "0"
+        }));
     }
 
     #[tokio::test]
