@@ -1323,10 +1323,11 @@ fn portfolio_runtime_for_model(
     }
     policy
         .filter(|policy| {
-            policy
-                .allowed_runtimes
-                .iter()
-                .any(|allowed| allowed == model_runtime)
+            policy.allowed_runtimes.is_empty()
+                || policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == model_runtime)
         })
         .map(|_| model_runtime.to_string())
 }
@@ -3291,6 +3292,11 @@ mod tests {
             None
         );
         policy.allowed_runtimes.push("openai".into());
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            Some("openai".into())
+        );
+        policy.allowed_runtimes.clear();
         assert_eq!(
             portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
             Some("openai".into())
