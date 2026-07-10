@@ -1214,6 +1214,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     action_policy::ACTION_POLICY_KIND,
     action_policy::BLAST_RADIUS_KIND,
     action_approval::ACTION_APPROVAL_KIND,
+    crate::domain::KIND_CAPABILITY,
 ];
 
 fn is_reserved_governance_kind(kind: &str) -> bool {
