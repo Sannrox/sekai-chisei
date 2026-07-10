@@ -551,6 +551,12 @@ pub fn register_capability(
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(registry_storage)?
     };
+    for object in &existing {
+        let registered = capability_from_object(object)?;
+        if registered.authorization == *authorization {
+            return Ok(registered);
+        }
+    }
     existing.sort_by_key(capability_object_version);
     let version = existing
         .iter()
@@ -917,6 +923,7 @@ fn proposal_digest(proposal: &CapabilityProposal) -> String {
         &proposal.allowed_action_types,
         &proposal.eval_suite,
         &proposal.routing_policy,
+        &proposal.rationale,
         &proposal.proposed_by,
         proposal.created,
     ))
@@ -1304,6 +1311,29 @@ mod tests {
     }
 
     #[test]
+    fn gate_rejects_rationale_changed_after_approval() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let eval = EvalStore::new();
+        let mut proposal = proposal();
+        review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
+        proposal.rationale = "different justification".to_string();
+        eval.create_run(eval_run(&proposal, true));
+
+        assert_eq!(
+            gate_capability_proposal(
+                &db,
+                &eval,
+                &mut proposal,
+                "capability-run-1",
+                "chisei.gate",
+                60,
+            ),
+            Err(CapabilityGateError::ProposalChanged)
+        );
+        assert_eq!(proposal.status, PROPOSAL_APPROVED);
+    }
+
+    #[test]
     fn gate_rejects_a_run_from_another_proposal() {
         let db = SekaiDb::new(":memory:").unwrap();
         let eval = EvalStore::new();
@@ -1443,6 +1473,31 @@ mod tests {
         assert_eq!(lineage.from_id, version_2.id);
         assert_eq!(lineage.to_id, version_1.id);
         assert_eq!(lineage.relation, REL_DEPENDS_ON);
+    }
+
+    #[test]
+    fn registry_retry_with_same_authorization_is_idempotent() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (proposal, authorization) = authorized_proposal(&db, 100);
+        let first =
+            register_capability(&db, &proposal, &authorization, "human:registrar", 200).unwrap();
+        let retry =
+            register_capability(&db, &proposal, &authorization, "human:registrar", 300).unwrap();
+
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.version, 1);
+        let versions = list_capability_versions(&db, "acme", "review").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].status, CAPABILITY_ACTIVE);
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                action: Some("capability_registered".to_string()),
+                target_id: Some(first.id),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
     }
 
     #[test]
