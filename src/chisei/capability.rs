@@ -55,7 +55,7 @@ pub struct CapabilityRoutingPolicy {
     pub fallback_tier: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapabilityProposal {
     pub id: String,
     pub namespace: String,
@@ -65,13 +65,13 @@ pub struct CapabilityProposal {
     pub eval_suite: Suite,
     pub routing_policy: CapabilityRoutingPolicy,
     pub rationale: String,
-    pub status: String,
+    status: String,
     pub proposed_by: String,
     pub created: i64,
     #[serde(default)]
-    pub review: Option<CapabilityReview>,
+    review: Option<CapabilityReview>,
     #[serde(default)]
-    pub gate: Option<CapabilityGateEvidence>,
+    gate: Option<CapabilityGateEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,15 +95,15 @@ pub struct CapabilityGateEvidence {
 
 /// Proof that a reviewed, unchanged proposal passed its own eval suite. The registry accepts this
 /// authorization rather than a bare status string, preventing an ungated proposal from launching.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityLaunchAuthorization {
-    pub proposal_id: String,
-    pub proposal_digest: String,
-    pub eval_suite_id: String,
-    pub eval_run_id: String,
-    pub approved_by: String,
-    pub gated_by: String,
-    pub authorized: i64,
+    proposal_id: String,
+    proposal_digest: String,
+    eval_suite_id: String,
+    eval_run_id: String,
+    approved_by: String,
+    gated_by: String,
+    authorized: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +143,7 @@ impl std::fmt::Display for CapabilityGateError {
 
 impl std::error::Error for CapabilityGateError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapabilityVersion {
     pub id: String,
     pub namespace: String,
@@ -157,6 +157,114 @@ pub struct CapabilityVersion {
     pub revoked_by: String,
     pub revoked_reason: String,
     pub revoked: i64,
+}
+
+#[derive(Deserialize)]
+struct StoredCapabilityProposal {
+    id: String,
+    namespace: String,
+    task_class: String,
+    agent_spec: AgentSpec,
+    allowed_action_types: Vec<String>,
+    eval_suite: Suite,
+    routing_policy: CapabilityRoutingPolicy,
+    rationale: String,
+    status: String,
+    proposed_by: String,
+    created: i64,
+    #[serde(default)]
+    review: Option<CapabilityReview>,
+    #[serde(default)]
+    gate: Option<CapabilityGateEvidence>,
+}
+
+impl From<StoredCapabilityProposal> for CapabilityProposal {
+    fn from(stored: StoredCapabilityProposal) -> Self {
+        Self {
+            id: stored.id,
+            namespace: stored.namespace,
+            task_class: stored.task_class,
+            agent_spec: stored.agent_spec,
+            allowed_action_types: stored.allowed_action_types,
+            eval_suite: stored.eval_suite,
+            routing_policy: stored.routing_policy,
+            rationale: stored.rationale,
+            status: stored.status,
+            proposed_by: stored.proposed_by,
+            created: stored.created,
+            review: stored.review,
+            gate: stored.gate,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredLaunchAuthorization {
+    proposal_id: String,
+    proposal_digest: String,
+    eval_suite_id: String,
+    eval_run_id: String,
+    approved_by: String,
+    gated_by: String,
+    authorized: i64,
+}
+
+impl From<StoredLaunchAuthorization> for CapabilityLaunchAuthorization {
+    fn from(stored: StoredLaunchAuthorization) -> Self {
+        Self {
+            proposal_id: stored.proposal_id,
+            proposal_digest: stored.proposal_digest,
+            eval_suite_id: stored.eval_suite_id,
+            eval_run_id: stored.eval_run_id,
+            approved_by: stored.approved_by,
+            gated_by: stored.gated_by,
+            authorized: stored.authorized,
+        }
+    }
+}
+
+impl CapabilityProposal {
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub fn review(&self) -> Option<&CapabilityReview> {
+        self.review.as_ref()
+    }
+
+    pub fn gate(&self) -> Option<&CapabilityGateEvidence> {
+        self.gate.as_ref()
+    }
+}
+
+impl CapabilityLaunchAuthorization {
+    pub fn proposal_id(&self) -> &str {
+        &self.proposal_id
+    }
+
+    pub fn proposal_digest(&self) -> &str {
+        &self.proposal_digest
+    }
+
+    pub fn eval_suite_id(&self) -> &str {
+        &self.eval_suite_id
+    }
+
+    pub fn eval_run_id(&self) -> &str {
+        &self.eval_run_id
+    }
+
+    pub fn approved_by(&self) -> &str {
+        &self.approved_by
+    }
+
+    pub fn gated_by(&self) -> &str {
+        &self.gated_by
+    }
+
+    pub fn authorized(&self) -> i64 {
+        self.authorized
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,9 +967,14 @@ fn capability_from_object(object: &Object) -> Result<CapabilityVersion, Capabili
             .parse()
             .map_err(|error| registry_storage(format!("invalid version: {error}")))?,
         status: property("status")?,
-        proposal: serde_json::from_str(&property("proposal")?).map_err(registry_storage)?,
-        authorization: serde_json::from_str(&property("authorization")?)
+        proposal: serde_json::from_str::<StoredCapabilityProposal>(&property("proposal")?)
+            .map(CapabilityProposal::from)
             .map_err(registry_storage)?,
+        authorization: serde_json::from_str::<StoredLaunchAuthorization>(&property(
+            "authorization",
+        )?)
+        .map(CapabilityLaunchAuthorization::from)
+        .map_err(registry_storage)?,
         created_by: property("created_by")?,
         created: object.created,
         revoked_by: property("revoked_by")?,
