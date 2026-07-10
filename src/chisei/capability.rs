@@ -6,13 +6,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
 use crate::db::sekai::SekaiDb;
-use crate::sekai::audit::Decision;
+use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
+use crate::sekai::audit::{Decision, insert_object_changes, object_diff_changes};
 
 pub const MIN_RECURRING_TASKS: usize = 3;
 pub const MIN_SUCCESSFUL_TASKS: usize = 2;
@@ -23,6 +25,9 @@ pub const PROPOSAL_APPROVED: &str = "approved";
 pub const PROPOSAL_REJECTED: &str = "rejected";
 pub const PROPOSAL_GATE_PASSED: &str = "gate_passed";
 pub const PROPOSAL_GATE_FAILED: &str = "gate_failed";
+pub const CAPABILITY_ACTIVE: &str = "active";
+pub const CAPABILITY_SUPERSEDED: &str = "superseded";
+pub const CAPABILITY_REVOKED: &str = "revoked";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityObservation {
@@ -130,6 +135,47 @@ impl std::fmt::Display for CapabilityGateError {
 }
 
 impl std::error::Error for CapabilityGateError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityVersion {
+    pub id: String,
+    pub namespace: String,
+    pub task_class: String,
+    pub version: u32,
+    pub status: String,
+    pub proposal: CapabilityProposal,
+    pub authorization: CapabilityLaunchAuthorization,
+    pub created_by: String,
+    pub created: i64,
+    pub revoked_by: String,
+    pub revoked_reason: String,
+    pub revoked: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityRegistryError {
+    InvalidAuthorization(String),
+    InvalidState(String),
+    NotFound(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for CapabilityRegistryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAuthorization(reason) => {
+                write!(formatter, "invalid launch authorization: {reason}")
+            }
+            Self::InvalidState(state) => write!(formatter, "invalid capability state: {state}"),
+            Self::NotFound(id) => write!(formatter, "capability not found: {id}"),
+            Self::Storage(error) => {
+                write!(formatter, "capability registry storage failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapabilityRegistryError {}
 
 /// Author one proposal per recurring `(namespace, task_class)` group.
 ///
@@ -446,6 +492,402 @@ pub fn gate_capability_proposal(
     }))
 }
 
+/// Register a new active capability version from a valid launch authorization.
+///
+/// Version creation, superseding the prior active version, lineage-link creation, object-change
+/// audit, and decision audit share one SQLite transaction. This guarantees at most one active
+/// version per `(namespace, task_class)` even under concurrent callers.
+pub fn register_capability(
+    db: &SekaiDb,
+    proposal: &CapabilityProposal,
+    authorization: &CapabilityLaunchAuthorization,
+    actor: &str,
+    now: i64,
+) -> Result<CapabilityVersion, CapabilityRegistryError> {
+    validate_launch_authorization(proposal, authorization)?;
+    let actor = actor.trim();
+    if actor.is_empty() {
+        return Err(CapabilityRegistryError::InvalidAuthorization(
+            "registering actor is required".to_string(),
+        ));
+    }
+
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(registry_storage)?;
+    let mut existing = {
+        let mut statement = tx
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated \
+                 FROM sekai_objects WHERE kind = ?1 AND namespace = ?2 \
+                 AND json_extract(properties, '$.task_class') = ?3",
+            )
+            .map_err(registry_storage)?;
+        let rows = statement
+            .query_map(
+                params![KIND_CAPABILITY, proposal.namespace, proposal.task_class],
+                crate::db::sekai::row_to_object,
+            )
+            .map_err(registry_storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(registry_storage)?
+    };
+    existing.sort_by_key(capability_object_version);
+    let version = existing
+        .iter()
+        .map(capability_object_version)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| CapabilityRegistryError::InvalidState("version overflow".to_string()))?;
+    let previous = existing.last().cloned();
+    let mut changes = Vec::new();
+
+    for object in existing.iter_mut().filter(|object| {
+        object.properties.get("status").map(String::as_str) == Some(CAPABILITY_ACTIVE)
+    }) {
+        let before = object.clone();
+        object
+            .properties
+            .insert("status".to_string(), CAPABILITY_SUPERSEDED.to_string());
+        object.updated = now;
+        let properties = serde_json::to_string(&object.properties).map_err(registry_storage)?;
+        tx.execute(
+            "UPDATE sekai_objects SET properties = ?2, updated = ?3 WHERE id = ?1",
+            params![object.id, properties, now],
+        )
+        .map_err(registry_storage)?;
+        changes.extend(object_diff_changes(actor, Some(&before), Some(object), now));
+    }
+
+    let capability = CapabilityVersion {
+        id: format!(
+            "capability-{}-v{version}",
+            group_key_hash(&proposal.namespace, &proposal.task_class)
+        ),
+        namespace: proposal.namespace.clone(),
+        task_class: proposal.task_class.clone(),
+        version,
+        status: CAPABILITY_ACTIVE.to_string(),
+        proposal: proposal.clone(),
+        authorization: authorization.clone(),
+        created_by: actor.to_string(),
+        created: now,
+        revoked_by: String::new(),
+        revoked_reason: String::new(),
+        revoked: 0,
+    };
+    let object = capability_to_object(&capability)?;
+    let properties = serde_json::to_string(&object.properties).map_err(registry_storage)?;
+    tx.execute(
+        "INSERT INTO sekai_objects \
+         (id, kind, name, namespace, external_id, properties, created, updated) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            object.id,
+            object.kind,
+            object.name,
+            object.namespace,
+            object.external_id,
+            properties,
+            object.created,
+            object.updated,
+        ],
+    )
+    .map_err(registry_storage)?;
+    changes.extend(object_diff_changes(actor, None, Some(&object), now));
+
+    if let Some(previous) = previous {
+        let link = Link {
+            id: format!("capability-lineage-{}", capability.id),
+            from_id: capability.id.clone(),
+            to_id: previous.id,
+            relation: REL_DEPENDS_ON.to_string(),
+            created: now,
+        };
+        tx.execute(
+            "INSERT INTO sekai_links (id, from_id, to_id, relation, created) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                link.id,
+                link.from_id,
+                link.to_id,
+                link.relation,
+                link.created
+            ],
+        )
+        .map_err(registry_storage)?;
+    }
+    insert_object_changes(&tx, &changes).map_err(registry_storage)?;
+    insert_registry_decision(
+        &tx,
+        &capability.id,
+        actor,
+        "capability_registered",
+        "approved capability passed its seed eval suite",
+        CAPABILITY_ACTIVE,
+        BTreeMap::from([
+            ("proposal_id".to_string(), proposal.id.clone()),
+            (
+                "proposal_digest".to_string(),
+                authorization.proposal_digest.clone(),
+            ),
+            ("version".to_string(), version.to_string()),
+        ]),
+        now,
+    )?;
+    tx.commit().map_err(registry_storage)?;
+    Ok(capability)
+}
+
+/// Revoke an active capability version without deleting its graph or audit history.
+pub fn revoke_capability(
+    db: &SekaiDb,
+    capability_id: &str,
+    actor: &str,
+    reason: &str,
+    now: i64,
+) -> Result<CapabilityVersion, CapabilityRegistryError> {
+    let actor = actor.trim();
+    if actor.is_empty() || reason.trim().is_empty() {
+        return Err(CapabilityRegistryError::InvalidState(
+            "revocation actor and reason are required".to_string(),
+        ));
+    }
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(registry_storage)?;
+    let before = tx
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated \
+             FROM sekai_objects WHERE id = ?1",
+            params![capability_id],
+            crate::db::sekai::row_to_object,
+        )
+        .optional()
+        .map_err(registry_storage)?
+        .ok_or_else(|| CapabilityRegistryError::NotFound(capability_id.to_string()))?;
+    if before.kind != KIND_CAPABILITY {
+        return Err(CapabilityRegistryError::NotFound(capability_id.to_string()));
+    }
+    let mut capability = capability_from_object(&before)?;
+    if capability.status != CAPABILITY_ACTIVE {
+        return Err(CapabilityRegistryError::InvalidState(
+            capability.status.clone(),
+        ));
+    }
+    capability.status = CAPABILITY_REVOKED.to_string();
+    capability.revoked_by = actor.to_string();
+    capability.revoked_reason = reason.trim().to_string();
+    capability.revoked = now;
+    let after = capability_to_object(&capability)?;
+    let properties = serde_json::to_string(&after.properties).map_err(registry_storage)?;
+    tx.execute(
+        "UPDATE sekai_objects SET properties = ?2, updated = ?3 WHERE id = ?1",
+        params![after.id, properties, now],
+    )
+    .map_err(registry_storage)?;
+    let changes = object_diff_changes(actor, Some(&before), Some(&after), now);
+    insert_object_changes(&tx, &changes).map_err(registry_storage)?;
+    insert_registry_decision(
+        &tx,
+        capability_id,
+        actor,
+        "capability_revoked",
+        reason,
+        CAPABILITY_REVOKED,
+        BTreeMap::from([("version".to_string(), capability.version.to_string())]),
+        now,
+    )?;
+    tx.commit().map_err(registry_storage)?;
+    Ok(capability)
+}
+
+pub fn list_capability_versions(
+    db: &SekaiDb,
+    namespace: &str,
+    task_class: &str,
+) -> Result<Vec<CapabilityVersion>, CapabilityRegistryError> {
+    let normalized_class = normalize_task_class(task_class);
+    let mut capabilities: Vec<_> = db
+        .list_all_objects(&ListFilter {
+            kind: Some(KIND_CAPABILITY.to_string()),
+            namespace: Some(namespace.trim().to_string()),
+            ..Default::default()
+        })
+        .map_err(registry_storage)?
+        .into_iter()
+        .filter(|object| {
+            object.properties.get("task_class").map(String::as_str)
+                == Some(normalized_class.as_str())
+        })
+        .map(|object| capability_from_object(&object))
+        .collect::<Result<_, _>>()?;
+    capabilities.sort_by_key(|capability| capability.version);
+    Ok(capabilities)
+}
+
+pub fn get_active_capability(
+    db: &SekaiDb,
+    namespace: &str,
+    task_class: &str,
+) -> Result<Option<CapabilityVersion>, CapabilityRegistryError> {
+    let active: Vec<_> = list_capability_versions(db, namespace, task_class)?
+        .into_iter()
+        .filter(|capability| capability.status == CAPABILITY_ACTIVE)
+        .collect();
+    match active.len() {
+        0 => Ok(None),
+        1 => Ok(active.into_iter().next()),
+        count => Err(CapabilityRegistryError::InvalidState(format!(
+            "{count} active versions found"
+        ))),
+    }
+}
+
+fn validate_launch_authorization(
+    proposal: &CapabilityProposal,
+    authorization: &CapabilityLaunchAuthorization,
+) -> Result<(), CapabilityRegistryError> {
+    let gate = proposal
+        .gate
+        .as_ref()
+        .filter(|gate| gate.passed)
+        .ok_or_else(|| {
+            CapabilityRegistryError::InvalidAuthorization(
+                "passing gate evidence is required".to_string(),
+            )
+        })?;
+    let digest = proposal_digest(proposal);
+    let valid = proposal.status == PROPOSAL_GATE_PASSED
+        && authorization.proposal_id == proposal.id
+        && authorization.proposal_digest == digest
+        && authorization.proposal_digest == gate.proposal_digest
+        && authorization.eval_suite_id == proposal.eval_suite.id
+        && authorization.eval_run_id == gate.run_id
+        && authorization.approved_by
+            == proposal
+                .review
+                .as_ref()
+                .filter(|review| review.approved)
+                .map(|review| review.reviewer.as_str())
+                .unwrap_or_default()
+        && authorization.gated_by == gate.gated_by;
+    if !valid {
+        return Err(CapabilityRegistryError::InvalidAuthorization(
+            "authorization does not match the reviewed and gated proposal".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn capability_to_object(capability: &CapabilityVersion) -> Result<Object, CapabilityRegistryError> {
+    let mut properties = HashMap::new();
+    properties.insert("task_class".to_string(), capability.task_class.clone());
+    properties.insert("version".to_string(), capability.version.to_string());
+    properties.insert("status".to_string(), capability.status.clone());
+    properties.insert(
+        "proposal".to_string(),
+        serde_json::to_string(&capability.proposal).map_err(registry_storage)?,
+    );
+    properties.insert(
+        "authorization".to_string(),
+        serde_json::to_string(&capability.authorization).map_err(registry_storage)?,
+    );
+    properties.insert("created_by".to_string(), capability.created_by.clone());
+    properties.insert("revoked_by".to_string(), capability.revoked_by.clone());
+    properties.insert(
+        "revoked_reason".to_string(),
+        capability.revoked_reason.clone(),
+    );
+    properties.insert("revoked".to_string(), capability.revoked.to_string());
+    Ok(Object {
+        id: capability.id.clone(),
+        kind: KIND_CAPABILITY.to_string(),
+        name: capability.proposal.agent_spec.name.clone(),
+        namespace: capability.namespace.clone(),
+        external_id: format!(
+            "capability:{}:v{}",
+            group_key_hash(&capability.namespace, &capability.task_class),
+            capability.version
+        ),
+        properties,
+        created: capability.created,
+        updated: capability.revoked.max(capability.created),
+    })
+}
+
+fn capability_from_object(object: &Object) -> Result<CapabilityVersion, CapabilityRegistryError> {
+    let property = |name: &str| {
+        object.properties.get(name).cloned().ok_or_else(|| {
+            CapabilityRegistryError::Storage(format!(
+                "capability {} is missing property {name}",
+                object.id
+            ))
+        })
+    };
+    Ok(CapabilityVersion {
+        id: object.id.clone(),
+        namespace: object.namespace.clone(),
+        task_class: property("task_class")?,
+        version: property("version")?
+            .parse()
+            .map_err(|error| registry_storage(format!("invalid version: {error}")))?,
+        status: property("status")?,
+        proposal: serde_json::from_str(&property("proposal")?).map_err(registry_storage)?,
+        authorization: serde_json::from_str(&property("authorization")?)
+            .map_err(registry_storage)?,
+        created_by: property("created_by")?,
+        created: object.created,
+        revoked_by: property("revoked_by")?,
+        revoked_reason: property("revoked_reason")?,
+        revoked: property("revoked")?
+            .parse()
+            .map_err(|error| registry_storage(format!("invalid revoked timestamp: {error}")))?,
+    })
+}
+
+fn capability_object_version(object: &Object) -> u32 {
+    object
+        .properties
+        .get("version")
+        .and_then(|version| version.parse().ok())
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_registry_decision(
+    conn: &rusqlite::Connection,
+    target_id: &str,
+    actor: &str,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    evidence: BTreeMap<String, String>,
+    now: i64,
+) -> Result<(), CapabilityRegistryError> {
+    let evidence = serde_json::to_string(&evidence).map_err(registry_storage)?;
+    conn.execute(
+        "INSERT INTO sekai_decisions \
+         (id, timestamp, actor, action, reason, evidence, target_id, outcome) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            now,
+            actor,
+            action,
+            reason,
+            evidence,
+            target_id,
+            outcome,
+        ],
+    )
+    .map_err(registry_storage)?;
+    Ok(())
+}
+
+fn registry_storage(error: impl std::fmt::Display) -> CapabilityRegistryError {
+    CapabilityRegistryError::Storage(error.to_string())
+}
+
 fn proposal_digest(proposal: &CapabilityProposal) -> String {
     let canonical = serde_json::to_vec(&(
         &proposal.id,
@@ -559,7 +1001,7 @@ mod tests {
         }
     }
 
-    fn proposal() -> CapabilityProposal {
+    fn proposal_at(now: i64) -> CapabilityProposal {
         let observations = vec![
             observation("1", "review", "done", &["comment"], 1),
             observation("2", "review", "done", &["comment"], 2),
@@ -570,9 +1012,38 @@ mod tests {
             &["comment".to_string()],
             &BTreeMap::new(),
             "chisei.author",
-            42,
+            now,
         )
         .remove(0)
+    }
+
+    fn proposal() -> CapabilityProposal {
+        proposal_at(42)
+    }
+
+    fn authorized_proposal(
+        db: &SekaiDb,
+        now: i64,
+    ) -> (CapabilityProposal, CapabilityLaunchAuthorization) {
+        let eval = EvalStore::new();
+        let mut proposal = proposal_at(now);
+        review_capability_proposal(
+            db,
+            &mut proposal,
+            "human:reviewer",
+            true,
+            "approved",
+            now + 1,
+        )
+        .unwrap();
+        let mut run = eval_run(&proposal, true);
+        run.id = format!("capability-run-{now}");
+        eval.create_run(run.clone());
+        let authorization =
+            gate_capability_proposal(db, &eval, &mut proposal, &run.id, "chisei.gate", now + 2)
+                .unwrap()
+                .unwrap();
+        (proposal, authorization)
     }
 
     fn eval_run(proposal: &CapabilityProposal, passed: bool) -> Run {
@@ -866,5 +1337,96 @@ mod tests {
         assert!(authorization.is_none());
         assert_eq!(proposal.status, PROPOSAL_GATE_FAILED);
         assert!(!proposal.gate.as_ref().unwrap().passed);
+    }
+
+    #[test]
+    fn registry_rejects_forged_launch_authorization() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (proposal, mut authorization) = authorized_proposal(&db, 100);
+        authorization.proposal_digest = "forged".to_string();
+
+        assert!(matches!(
+            register_capability(&db, &proposal, &authorization, "human:registrar", 200),
+            Err(CapabilityRegistryError::InvalidAuthorization(_))
+        ));
+        assert!(
+            list_capability_versions(&db, "acme", "review")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn registry_versions_atomically_and_links_lineage() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (proposal_v1, authorization_v1) = authorized_proposal(&db, 100);
+        let version_1 =
+            register_capability(&db, &proposal_v1, &authorization_v1, "human:registrar", 200)
+                .unwrap();
+        let (proposal_v2, authorization_v2) = authorized_proposal(&db, 300);
+        let version_2 =
+            register_capability(&db, &proposal_v2, &authorization_v2, "human:registrar", 400)
+                .unwrap();
+
+        assert_eq!(version_1.version, 1);
+        assert_eq!(version_2.version, 2);
+        let versions = list_capability_versions(&db, "acme", "Review").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].status, CAPABILITY_SUPERSEDED);
+        assert_eq!(versions[1].status, CAPABILITY_ACTIVE);
+        assert_eq!(
+            get_active_capability(&db, "acme", "review")
+                .unwrap()
+                .unwrap()
+                .id,
+            version_2.id
+        );
+        let lineage = db
+            .get_link(&format!("capability-lineage-{}", version_2.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lineage.from_id, version_2.id);
+        assert_eq!(lineage.to_id, version_1.id);
+        assert_eq!(lineage.relation, REL_DEPENDS_ON);
+    }
+
+    #[test]
+    fn revocation_preserves_version_and_removes_it_from_active_lookup() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (proposal, authorization) = authorized_proposal(&db, 100);
+        let registered =
+            register_capability(&db, &proposal, &authorization, "human:registrar", 200).unwrap();
+
+        let revoked = revoke_capability(
+            &db,
+            &registered.id,
+            "human:security",
+            "permission scope is obsolete",
+            300,
+        )
+        .unwrap();
+
+        assert_eq!(revoked.status, CAPABILITY_REVOKED);
+        assert_eq!(revoked.revoked_by, "human:security");
+        assert!(
+            get_active_capability(&db, "acme", "review")
+                .unwrap()
+                .is_none()
+        );
+        let versions = list_capability_versions(&db, "acme", "review").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].status, CAPABILITY_REVOKED);
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                target_id: Some(registered.id),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.action == "capability_revoked")
+        );
     }
 }
