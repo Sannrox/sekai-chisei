@@ -60,7 +60,8 @@ impl SekaiDb {
                 timestamp INTEGER NOT NULL,
                 scored INTEGER NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
-                task_class TEXT NOT NULL DEFAULT ''
+                task_class TEXT NOT NULL DEFAULT '',
+                cost_usd_micros INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);",
         )
@@ -85,6 +86,15 @@ impl SekaiDb {
         }
         match conn.execute(
             "ALTER TABLE chisei_sample_observations ADD COLUMN task_class TEXT NOT NULL DEFAULT ''",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") => {}
+            Err(err) => return Err(err.to_string()),
+        }
+        match conn.execute(
+            "ALTER TABLE chisei_sample_observations ADD COLUMN cost_usd_micros INTEGER NOT NULL DEFAULT 0",
             [],
         ) {
             Ok(_) => {}
@@ -526,8 +536,8 @@ impl SekaiDb {
         let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO chisei_sample_observations
-                (request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored, task_class)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
+                (request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored, task_class, cost_usd_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)",
             params![
                 obs.request_id,
                 obs.namespace,
@@ -540,6 +550,7 @@ impl SekaiDb {
                 obs.stop_reason,
                 obs.timestamp,
                 obs.task_class,
+                obs.cost_usd_micros,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -555,7 +566,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored, task_class
+                "SELECT request_id, namespace, spec, resolved_model, output_content, sample_reason, input_tokens, output_tokens, stop_reason, timestamp, scored, task_class, cost_usd_micros
                  FROM chisei_sample_observations WHERE scored = 0 ORDER BY timestamp, request_id LIMIT ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -574,6 +585,7 @@ impl SekaiDb {
                     timestamp: row.get(9)?,
                     scored: row.get::<_, i64>(10)? != 0,
                     task_class: row.get(11)?,
+                    cost_usd_micros: row.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?;

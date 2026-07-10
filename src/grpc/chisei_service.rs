@@ -16,6 +16,9 @@ use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
+use crate::chisei::portfolio::{
+    Objective, ObjectiveMode, Observation, PortfolioStore, TaskDemand as PortfolioDemand,
+};
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::chisei::promotion::CandidateStore;
 use crate::config::Config;
@@ -28,6 +31,7 @@ pub struct ChiseiServiceImpl {
     policy: Arc<PolicyResolver>,
     pipeline: pipe::Pipeline,
     eval: Arc<EvalStore>,
+    portfolio: Arc<PortfolioStore>,
     planned_executions: Arc<Mutex<HashMap<String, ExecutionPlan>>>,
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
@@ -161,6 +165,7 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
                         timestamp: chrono::Utc::now().timestamp_millis(),
                         scored: false,
                         task_class: execution.task_class.to_string(),
+                        cost_usd_micros: 0,
                     });
         }
     }
@@ -224,6 +229,7 @@ impl ChiseiServiceImpl {
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
+            portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             evolve_enhancements,
@@ -300,6 +306,40 @@ impl ChiseiServiceImpl {
         self.active_promotions.clone()
     }
 
+    fn record_portfolio_shift(
+        &self,
+        scope: &str,
+        task_class: &str,
+        selection: &crate::chisei::portfolio::RouteSelection,
+        objective: &Objective,
+        outcome: &str,
+    ) {
+        if !selection.shifted {
+            return;
+        }
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.portfolio".into(),
+            action: "chisei.portfolio_route_shift".into(),
+            reason: selection.reason.clone(),
+            evidence: HashMap::from([
+                ("task_class".into(), task_class.to_string()),
+                ("previous_model".into(), selection.previous_model.clone()),
+                ("selected_model".into(), selection.model.clone()),
+                ("objective_mode".into(), objective.mode.as_str().into()),
+                (
+                    "budget_usd_micros".into(),
+                    objective.budget_usd_micros.to_string(),
+                ),
+                ("quality_bar".into(), objective.quality_bar.to_string()),
+                ("min_samples".into(), objective.min_samples.to_string()),
+            ]),
+            target_id: scope.to_string(),
+            outcome: outcome.to_string(),
+        });
+    }
+
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
@@ -330,6 +370,7 @@ impl ChiseiServiceImpl {
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
+            portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             evolve_enhancements,
@@ -1264,6 +1305,33 @@ fn is_known_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic")
 }
 
+fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
+    policy.is_none_or(|policy| {
+        policy.allowed_models.is_empty()
+            || policy.allowed_models.iter().any(|allowed| allowed == model)
+    })
+}
+
+fn portfolio_runtime_for_model(
+    policy: Option<&Policy>,
+    current_runtime: &str,
+    model: &str,
+) -> Option<String> {
+    let model_runtime = crate::llm::provider_name(model);
+    if model_runtime == current_runtime.trim() {
+        return Some(model_runtime.to_string());
+    }
+    policy
+        .filter(|policy| {
+            policy.allowed_runtimes.is_empty()
+                || policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == model_runtime)
+        })
+        .map(|_| model_runtime.to_string())
+}
+
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
         return;
@@ -1499,6 +1567,27 @@ fn eval_iteration_pb(iteration: crate::chisei::eval::Iteration) -> EvalIteration
     }
 }
 
+fn portfolio_point_pb(point: crate::chisei::portfolio::FrontierPoint) -> PortfolioPoint {
+    PortfolioPoint {
+        model: point.model,
+        quality_score: point.quality_score,
+        cost_usd_micros: point.cost_usd_micros,
+        sample_count: point.sample_count,
+        updated_at: point.updated_at,
+    }
+}
+
+fn portfolio_objective_pb(objective: &Objective) -> PortfolioObjective {
+    PortfolioObjective {
+        namespace: objective.namespace.clone(),
+        mode: objective.mode.as_str().into(),
+        budget_usd_micros: objective.budget_usd_micros,
+        quality_bar: objective.quality_bar,
+        min_samples: objective.min_samples,
+        updated_at: objective.updated_at,
+    }
+}
+
 #[tonic::async_trait]
 impl ChiseiService for ChiseiServiceImpl {
     type ExecutePlanStreamStream =
@@ -1585,6 +1674,126 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(SetBudgetLimitResponse {}))
     }
 
+    async fn record_portfolio_observation(
+        &self,
+        req: Request<RecordPortfolioObservationRequest>,
+    ) -> Result<Response<RecordPortfolioObservationResponse>, Status> {
+        let r = req.into_inner();
+        let updated_at = if r.updated_at > 0 {
+            r.updated_at
+        } else {
+            chrono::Utc::now().timestamp_millis()
+        };
+        self.portfolio
+            .record(&Observation {
+                namespace: r.namespace.clone(),
+                task_class: r.task_class.clone(),
+                model: r.model,
+                quality_score: r.quality_score,
+                cost_usd_micros: r.cost_usd_micros,
+                sample_count: r.sample_count,
+                updated_at,
+            })
+            .map_err(Status::invalid_argument)?;
+        let frontier = self
+            .portfolio
+            .frontier(&r.namespace, &r.task_class)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(portfolio_point_pb)
+            .collect();
+        Ok(Response::new(RecordPortfolioObservationResponse {
+            frontier,
+        }))
+    }
+
+    async fn get_portfolio_frontier(
+        &self,
+        req: Request<GetPortfolioFrontierRequest>,
+    ) -> Result<Response<GetPortfolioFrontierResponse>, Status> {
+        let r = req.into_inner();
+        if r.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("portfolio namespace required"));
+        }
+        let frontier = self
+            .portfolio
+            .frontier(&r.namespace, &r.task_class)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(portfolio_point_pb)
+            .collect();
+        Ok(Response::new(GetPortfolioFrontierResponse { frontier }))
+    }
+
+    async fn set_portfolio_objective(
+        &self,
+        req: Request<SetPortfolioObjectiveRequest>,
+    ) -> Result<Response<SetPortfolioObjectiveResponse>, Status> {
+        let r = req
+            .into_inner()
+            .objective
+            .ok_or_else(|| Status::invalid_argument("portfolio objective required"))?;
+        let objective = Objective {
+            namespace: r.namespace.trim().to_string(),
+            mode: ObjectiveMode::parse(&r.mode).map_err(Status::invalid_argument)?,
+            budget_usd_micros: r.budget_usd_micros,
+            quality_bar: r.quality_bar,
+            min_samples: r.min_samples,
+            updated_at: if r.updated_at > 0 {
+                r.updated_at
+            } else {
+                chrono::Utc::now().timestamp_millis()
+            },
+        };
+        self.portfolio
+            .set_objective(&objective)
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(SetPortfolioObjectiveResponse {
+            objective: Some(portfolio_objective_pb(&objective)),
+        }))
+    }
+
+    async fn allocate_portfolio(
+        &self,
+        req: Request<AllocatePortfolioRequest>,
+    ) -> Result<Response<AllocatePortfolioResponse>, Status> {
+        let r = req.into_inner();
+        let objective = self
+            .portfolio
+            .objective(&r.namespace)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::failed_precondition("portfolio objective not configured"))?;
+        let demands: Vec<_> = r
+            .demands
+            .into_iter()
+            .map(|demand| PortfolioDemand {
+                task_class: demand.task_class,
+                expected_calls: demand.expected_calls,
+                quality_bar: demand.has_quality_bar.then_some(demand.quality_bar),
+            })
+            .collect();
+        let plan = self
+            .portfolio
+            .allocate(&objective, &demands)
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(AllocatePortfolioResponse {
+            objective: Some(portfolio_objective_pb(&objective)),
+            allocations: plan
+                .allocations
+                .into_iter()
+                .map(|allocation| PortfolioAllocation {
+                    task_class: allocation.task_class,
+                    model: allocation.model,
+                    quality_score: allocation.quality_score,
+                    cost_per_call_usd_micros: allocation.cost_per_call_usd_micros,
+                    expected_calls: allocation.expected_calls,
+                })
+                .collect(),
+            total_cost_usd_micros: plan.total_cost_usd_micros,
+            total_value: plan.total_value,
+        }))
+    }
+
     async fn set_namespace_policy(
         &self,
         req: Request<SetNamespacePolicyRequest>,
@@ -1641,7 +1850,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .map(|policy| policy.default_model.as_str())
             .filter(|model| !model.is_empty())
             .unwrap_or(&r.preferred_model);
-        let (runtime, model) = if let Some(policy) = effective_policy.as_ref() {
+        let (mut runtime, model) = if let Some(policy) = effective_policy.as_ref() {
             self.policy
                 .apply_policy(policy, &r.preferred_runtime, preferred_model)
                 .map_err(Status::invalid_argument)?
@@ -1721,15 +1930,122 @@ impl ChiseiService for ChiseiServiceImpl {
         // Record the cheap bias only when it produced an actual demotion to a
         // strictly cheaper cost tier, so the audited route_bias reflects
         // realized cost reductions rather than intent or equal-cost swaps.
-        let (model, route_bias) = match cheap_model {
+        let (mut model, mut route_bias) = match cheap_model {
             Some(cheap)
                 if crate::chisei::model_routing::named_model_cost_rank(&cheap)
                     < crate::chisei::model_routing::named_model_cost_rank(&capable_model) =>
             {
                 (cheap, Some("cheap"))
             }
-            _ => (capable_model, None),
+            _ => (capable_model.clone(), None),
         };
+
+        // Portfolio routing supersedes the static cheap/capable heuristic when
+        // a scope has an objective and sufficiently sampled frontier data.
+        // A regressed eval or promoted capable override reverts immediately;
+        // ordinary changes require repeated confirmation plus a cooldown.
+        let objective = self
+            .portfolio
+            .objective(&policy_scope)
+            .ok()
+            .flatten()
+            .map(|objective| (policy_scope.clone(), objective))
+            .or_else(|| {
+                if r.namespace.trim().is_empty() || r.namespace == policy_scope {
+                    None
+                } else {
+                    self.portfolio
+                        .objective(&r.namespace)
+                        .ok()
+                        .flatten()
+                        .map(|objective| (r.namespace.clone(), objective))
+                }
+            });
+        if let Some((portfolio_scope, objective)) = objective {
+            let now = chrono::Utc::now().timestamp_millis();
+            if regression_signal.is_some() || capable_override_active {
+                if let Ok(selection) = self.portfolio.damped_route(
+                    &portfolio_scope,
+                    &normalized_task_class,
+                    &capable_model,
+                    now,
+                    true,
+                ) {
+                    self.record_portfolio_shift(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &selection,
+                        &objective,
+                        "reverted",
+                    );
+                    model = capable_model.clone();
+                    route_bias = None;
+                }
+            } else {
+                let demand = PortfolioDemand {
+                    task_class: normalized_task_class.clone(),
+                    expected_calls: r.expected_calls.max(1),
+                    quality_bar: None,
+                };
+                if let Ok(plan) = self.portfolio.allocate(&objective, &[demand])
+                    && let Some(allocation) = plan.allocations.first()
+                    && portfolio_model_allowed(effective_policy.as_ref(), &allocation.model)
+                    && portfolio_runtime_for_model(
+                        effective_policy.as_ref(),
+                        &runtime,
+                        &allocation.model,
+                    )
+                    .is_some()
+                    && let Ok(proposed) = self
+                        .resolve_live_model(
+                            &allocation.model,
+                            effective_policy.as_ref(),
+                            None,
+                            safe_only,
+                            &safe_providers,
+                        )
+                        .await
+                    && proposed == allocation.model
+                    && let Ok(selection) = self.portfolio.damped_route(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &proposed,
+                        now,
+                        false,
+                    )
+                    && portfolio_model_allowed(effective_policy.as_ref(), &selection.model)
+                    && portfolio_runtime_for_model(
+                        effective_policy.as_ref(),
+                        &runtime,
+                        &selection.model,
+                    )
+                    .is_some()
+                    && let Ok(selected) = self
+                        .resolve_live_model(
+                            &selection.model,
+                            effective_policy.as_ref(),
+                            None,
+                            safe_only,
+                            &safe_providers,
+                        )
+                        .await
+                    && selected == selection.model
+                {
+                    self.record_portfolio_shift(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &selection,
+                        &objective,
+                        "shifted",
+                    );
+                    runtime =
+                        portfolio_runtime_for_model(effective_policy.as_ref(), &runtime, &selected)
+                            .expect("portfolio runtime was validated before selection");
+                    model = selected;
+                    route_bias = Some("portfolio");
+                }
+            }
+        }
 
         let provider = crate::llm::provider_name(&model);
         if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
@@ -1896,6 +2212,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 timestamp: observation.timestamp,
                 scored: false,
                 task_class: crate::chisei::scoring::normalize_task_class(&observation.task_class),
+                cost_usd_micros: observation.cost_usd_micros,
             })
             .map_err(Status::internal)?;
         Ok(Response::new(RecordSampleObservationResponse {
@@ -2157,6 +2474,7 @@ impl ChiseiService for ChiseiServiceImpl {
                             task_class: crate::chisei::scoring::normalize_task_class(
                                 &input.task_class,
                             ),
+                            cost_usd_micros: 0,
                         });
             }
         }
@@ -2961,6 +3279,31 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_cross_provider_runtime_requires_explicit_policy_allowance() {
+        let mut policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["anthropic".into()],
+            allowed_models: vec!["claude-sonnet-4-20250514".into(), "gpt-5.5".into()],
+            default_runtime: "anthropic".into(),
+            default_model: "claude-sonnet-4-20250514".into(),
+            data_class: String::new(),
+        };
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            None
+        );
+        policy.allowed_runtimes.push("openai".into());
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            Some("openai".into())
+        );
+        policy.allowed_runtimes.clear();
+        assert_eq!(
+            portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
+            Some("openai".into())
+        );
+    }
+
+    #[test]
     fn budget_metric_accepts_tokens_and_requests_case_insensitive() {
         assert_eq!(budget_metric("").unwrap(), METRIC_TOKENS);
         assert_eq!(budget_metric("tokens").unwrap(), METRIC_TOKENS);
@@ -3218,6 +3561,52 @@ mod tests {
         ChiseiServiceImpl::new(db, config(path))
     }
 
+    #[tokio::test]
+    async fn portfolio_rpcs_persist_frontier_and_allocate_objective() {
+        let svc = memory_service();
+        for (model, quality, cost) in [("small", 80.0, 10), ("large", 95.0, 30)] {
+            svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
+                namespace: "acme".into(),
+                task_class: "primary".into(),
+                model: model.into(),
+                quality_score: quality,
+                cost_usd_micros: cost,
+                sample_count: 5,
+                updated_at: 1,
+            }))
+            .await
+            .unwrap();
+        }
+        svc.set_portfolio_objective(Request::new(SetPortfolioObjectiveRequest {
+            objective: Some(PortfolioObjective {
+                namespace: "acme".into(),
+                mode: "minimize_cost".into(),
+                budget_usd_micros: 100,
+                quality_bar: 90.0,
+                min_samples: 3,
+                updated_at: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let response = svc
+            .allocate_portfolio(Request::new(AllocatePortfolioRequest {
+                namespace: "acme".into(),
+                demands: vec![PortfolioTaskDemand {
+                    task_class: "primary".into(),
+                    expected_calls: 2,
+                    quality_bar: 0.0,
+                    has_quality_bar: false,
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.allocations[0].model, "large");
+        assert_eq!(response.total_cost_usd_micros, 60);
+    }
+
     fn resolve_policy_request(
         namespace: &str,
         preferred_runtime: &str,
@@ -3233,6 +3622,7 @@ mod tests {
             key_id: String::new(),
             task_class: String::new(),
             user_id: String::new(),
+            expected_calls: 1,
         }
     }
 
@@ -3652,6 +4042,104 @@ mod tests {
         assert_eq!(resolved.model, "native-default");
         assert_eq!(resolved.route_bias, "");
         assert!(resolved.eval_regressed);
+    }
+
+    #[tokio::test]
+    async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-default".into(), "native-cheap".into()],
+            default_runtime: "native".into(),
+            default_model: "native-default".into(),
+            data_class: String::new(),
+        }))
+        .await
+        .unwrap();
+        for (model, quality, cost) in [("native-cheap", 85.0, 10), ("native-default", 95.0, 30)] {
+            svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
+                namespace: "sekai-chisei".into(),
+                task_class: "primary".into(),
+                model: model.into(),
+                quality_score: quality,
+                cost_usd_micros: cost,
+                sample_count: 5,
+                updated_at: 1,
+            }))
+            .await
+            .unwrap();
+        }
+        svc.set_portfolio_objective(Request::new(SetPortfolioObjectiveRequest {
+            objective: Some(PortfolioObjective {
+                namespace: "sekai-chisei".into(),
+                mode: "minimize_cost".into(),
+                budget_usd_micros: 100,
+                quality_bar: 80.0,
+                min_samples: 3,
+                updated_at: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let routed = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "native",
+                "native-default",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(routed.model, "native-cheap");
+        assert_eq!(routed.route_bias, "portfolio");
+
+        create_suite(&svc, "sekai-chisei").await;
+        for (id, score, timestamp) in [("run-1", 95, 100), ("run-2", 60, 200)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: "sekai-chisei".into(),
+                diff_hash: id.into(),
+            }))
+            .await
+            .unwrap();
+        }
+        let reverted = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "native",
+                "native-default",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(reverted.model, "native-default");
+        assert_eq!(reverted.route_bias, "");
+        assert!(reverted.eval_regressed);
+
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("chisei.portfolio_route_shift".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.outcome == "shifted")
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.outcome == "reverted")
+        );
     }
 
     #[tokio::test]
@@ -4156,6 +4644,7 @@ mod tests {
                 key_id: String::new(),
                 task_class: String::new(),
                 user_id: String::new(),
+                expected_calls: 1,
             }))
             .await
             .expect_err("sensitive private preflight should deny unsafe provider");
