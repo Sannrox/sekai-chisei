@@ -796,7 +796,8 @@ fn validate_launch_authorization(
                 .filter(|review| review.approved)
                 .map(|review| review.reviewer.as_str())
                 .unwrap_or_default()
-        && authorization.gated_by == gate.gated_by;
+        && authorization.gated_by == gate.gated_by
+        && authorization.authorized == gate.gated;
     if !valid {
         return Err(CapabilityRegistryError::InvalidAuthorization(
             "authorization does not match the reviewed and gated proposal".to_string(),
@@ -1429,6 +1430,23 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         let (proposal, mut authorization) = authorized_proposal(&db, 100);
         authorization.proposal_digest = "forged".to_string();
+
+        assert!(matches!(
+            register_capability(&db, &proposal, &authorization, "human:registrar", 200),
+            Err(CapabilityRegistryError::InvalidAuthorization(_))
+        ));
+        assert!(
+            list_capability_versions(&db, "acme", "review")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn registry_rejects_a_forged_authorization_timestamp() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (proposal, mut authorization) = authorized_proposal(&db, 100);
+        authorization.authorized += 1;
 
         assert!(matches!(
             register_capability(&db, &proposal, &authorization, "human:registrar", 200),
