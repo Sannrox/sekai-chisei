@@ -165,6 +165,7 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
                         timestamp: chrono::Utc::now().timestamp_millis(),
                         scored: false,
                         task_class: execution.task_class.to_string(),
+                        cost_usd_micros: 0,
                     });
         }
     }
@@ -303,6 +304,40 @@ impl ChiseiServiceImpl {
     /// live routing.
     pub fn active_promotions(&self) -> Arc<ActivePromotions> {
         self.active_promotions.clone()
+    }
+
+    fn record_portfolio_shift(
+        &self,
+        scope: &str,
+        task_class: &str,
+        selection: &crate::chisei::portfolio::RouteSelection,
+        objective: &Objective,
+        outcome: &str,
+    ) {
+        if !selection.shifted {
+            return;
+        }
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.portfolio".into(),
+            action: "chisei.portfolio_route_shift".into(),
+            reason: selection.reason.clone(),
+            evidence: HashMap::from([
+                ("task_class".into(), task_class.to_string()),
+                ("previous_model".into(), selection.previous_model.clone()),
+                ("selected_model".into(), selection.model.clone()),
+                ("objective_mode".into(), objective.mode.as_str().into()),
+                (
+                    "budget_usd_micros".into(),
+                    objective.budget_usd_micros.to_string(),
+                ),
+                ("quality_bar".into(), objective.quality_bar.to_string()),
+                ("min_samples".into(), objective.min_samples.to_string()),
+            ]),
+            target_id: scope.to_string(),
+            outcome: outcome.to_string(),
+        });
     }
 
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
@@ -1270,6 +1305,13 @@ fn is_known_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic")
 }
 
+fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
+    policy.is_none_or(|policy| {
+        policy.allowed_models.is_empty()
+            || policy.allowed_models.iter().any(|allowed| allowed == model)
+    })
+}
+
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
         return;
@@ -1868,15 +1910,107 @@ impl ChiseiService for ChiseiServiceImpl {
         // Record the cheap bias only when it produced an actual demotion to a
         // strictly cheaper cost tier, so the audited route_bias reflects
         // realized cost reductions rather than intent or equal-cost swaps.
-        let (model, route_bias) = match cheap_model {
+        let (mut model, mut route_bias) = match cheap_model {
             Some(cheap)
                 if crate::chisei::model_routing::named_model_cost_rank(&cheap)
                     < crate::chisei::model_routing::named_model_cost_rank(&capable_model) =>
             {
                 (cheap, Some("cheap"))
             }
-            _ => (capable_model, None),
+            _ => (capable_model.clone(), None),
         };
+
+        // Portfolio routing supersedes the static cheap/capable heuristic when
+        // a scope has an objective and sufficiently sampled frontier data.
+        // A regressed eval or promoted capable override reverts immediately;
+        // ordinary changes require repeated confirmation plus a cooldown.
+        let objective = self
+            .portfolio
+            .objective(&policy_scope)
+            .ok()
+            .flatten()
+            .map(|objective| (policy_scope.clone(), objective))
+            .or_else(|| {
+                if r.namespace.trim().is_empty() || r.namespace == policy_scope {
+                    None
+                } else {
+                    self.portfolio
+                        .objective(&r.namespace)
+                        .ok()
+                        .flatten()
+                        .map(|objective| (r.namespace.clone(), objective))
+                }
+            });
+        if let Some((portfolio_scope, objective)) = objective {
+            let now = chrono::Utc::now().timestamp_millis();
+            if regression_signal.is_some() || capable_override_active {
+                if let Ok(selection) = self.portfolio.damped_route(
+                    &portfolio_scope,
+                    &normalized_task_class,
+                    &capable_model,
+                    now,
+                    true,
+                ) {
+                    self.record_portfolio_shift(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &selection,
+                        &objective,
+                        "reverted",
+                    );
+                    model = capable_model.clone();
+                    route_bias = None;
+                }
+            } else {
+                let demand = PortfolioDemand {
+                    task_class: normalized_task_class.clone(),
+                    expected_calls: r.expected_calls.max(1),
+                    quality_bar: None,
+                };
+                if let Ok(plan) = self.portfolio.allocate(&objective, &[demand])
+                    && let Some(allocation) = plan.allocations.first()
+                    && portfolio_model_allowed(effective_policy.as_ref(), &allocation.model)
+                    && let Ok(proposed) = self
+                        .resolve_live_model(
+                            &allocation.model,
+                            effective_policy.as_ref(),
+                            None,
+                            safe_only,
+                            &safe_providers,
+                        )
+                        .await
+                    && proposed == allocation.model
+                    && let Ok(selection) = self.portfolio.damped_route(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &proposed,
+                        now,
+                        false,
+                    )
+                    && portfolio_model_allowed(effective_policy.as_ref(), &selection.model)
+                    && let Ok(selected) = self
+                        .resolve_live_model(
+                            &selection.model,
+                            effective_policy.as_ref(),
+                            None,
+                            safe_only,
+                            &safe_providers,
+                        )
+                        .await
+                    && selected == selection.model
+                {
+                    self.record_portfolio_shift(
+                        &portfolio_scope,
+                        &normalized_task_class,
+                        &selection,
+                        &objective,
+                        "shifted",
+                    );
+                    model = selected;
+                    route_bias = Some("portfolio");
+                }
+            }
+        }
 
         let provider = crate::llm::provider_name(&model);
         if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
@@ -2043,6 +2177,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 timestamp: observation.timestamp,
                 scored: false,
                 task_class: crate::chisei::scoring::normalize_task_class(&observation.task_class),
+                cost_usd_micros: observation.cost_usd_micros,
             })
             .map_err(Status::internal)?;
         Ok(Response::new(RecordSampleObservationResponse {
@@ -2304,6 +2439,7 @@ impl ChiseiService for ChiseiServiceImpl {
                             task_class: crate::chisei::scoring::normalize_task_class(
                                 &input.task_class,
                             ),
+                            cost_usd_micros: 0,
                         });
             }
         }
@@ -3426,6 +3562,7 @@ mod tests {
             key_id: String::new(),
             task_class: String::new(),
             user_id: String::new(),
+            expected_calls: 1,
         }
     }
 
@@ -3845,6 +3982,104 @@ mod tests {
         assert_eq!(resolved.model, "native-default");
         assert_eq!(resolved.route_bias, "");
         assert!(resolved.eval_regressed);
+    }
+
+    #[tokio::test]
+    async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
+        let svc = memory_service();
+        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+            namespace: "sekai-chisei".into(),
+            allowed_runtimes: vec!["native".into()],
+            allowed_models: vec!["native-default".into(), "native-cheap".into()],
+            default_runtime: "native".into(),
+            default_model: "native-default".into(),
+            data_class: String::new(),
+        }))
+        .await
+        .unwrap();
+        for (model, quality, cost) in [("native-cheap", 85.0, 10), ("native-default", 95.0, 30)] {
+            svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
+                namespace: "sekai-chisei".into(),
+                task_class: "primary".into(),
+                model: model.into(),
+                quality_score: quality,
+                cost_usd_micros: cost,
+                sample_count: 5,
+                updated_at: 1,
+            }))
+            .await
+            .unwrap();
+        }
+        svc.set_portfolio_objective(Request::new(SetPortfolioObjectiveRequest {
+            objective: Some(PortfolioObjective {
+                namespace: "sekai-chisei".into(),
+                mode: "minimize_cost".into(),
+                budget_usd_micros: 100,
+                quality_bar: 80.0,
+                min_samples: 3,
+                updated_at: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let routed = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "native",
+                "native-default",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(routed.model, "native-cheap");
+        assert_eq!(routed.route_bias, "portfolio");
+
+        create_suite(&svc, "sekai-chisei").await;
+        for (id, score, timestamp) in [("run-1", 95, 100), ("run-2", 60, 200)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: "sekai-chisei".into(),
+                diff_hash: id.into(),
+            }))
+            .await
+            .unwrap();
+        }
+        let reverted = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "sekai-chisei",
+                "native",
+                "native-default",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(reverted.model, "native-default");
+        assert_eq!(reverted.route_bias, "");
+        assert!(reverted.eval_regressed);
+
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("chisei.portfolio_route_shift".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.outcome == "shifted")
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.outcome == "reverted")
+        );
     }
 
     #[tokio::test]
@@ -4349,6 +4584,7 @@ mod tests {
                 key_id: String::new(),
                 task_class: String::new(),
                 user_id: String::new(),
+                expected_calls: 1,
             }))
             .await
             .expect_err("sensitive private preflight should deny unsafe provider");

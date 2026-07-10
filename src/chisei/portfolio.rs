@@ -78,6 +78,14 @@ pub struct AllocationPlan {
     pub total_value: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteSelection {
+    pub model: String,
+    pub previous_model: String,
+    pub shifted: bool,
+    pub reason: String,
+}
+
 pub struct PortfolioStore {
     db: Arc<SekaiDb>,
 }
@@ -277,6 +285,26 @@ impl PortfolioStore {
             total_cost_usd_micros: total_cost,
             total_value,
         })
+    }
+
+    pub fn damped_route(
+        &self,
+        namespace: &str,
+        task_class: &str,
+        proposed_model: &str,
+        now_ms: i64,
+        force: bool,
+    ) -> Result<RouteSelection, String> {
+        if namespace.trim().is_empty() || proposed_model.trim().is_empty() {
+            return Err("portfolio route namespace and proposed model required".into());
+        }
+        self.db.portfolio_damped_route(
+            namespace.trim(),
+            &normalize_task_class(task_class),
+            proposed_model.trim(),
+            now_ms,
+            force,
+        )
     }
 }
 
@@ -495,5 +523,41 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("above budget"));
+    }
+
+    #[test]
+    fn route_changes_require_cooldown_and_repeated_confirmation() {
+        let store = store();
+        let initial = store
+            .damped_route("acme", "primary", "small", 0, false)
+            .unwrap();
+        assert!(initial.shifted);
+
+        for now in [1, 2] {
+            let held = store
+                .damped_route("acme", "primary", "large", now, false)
+                .unwrap();
+            assert_eq!(held.model, "small");
+            assert!(!held.shifted);
+        }
+        let shifted = store
+            .damped_route("acme", "primary", "large", 15 * 60 * 1000, false)
+            .unwrap();
+        assert_eq!(shifted.model, "large");
+        assert!(shifted.shifted);
+    }
+
+    #[test]
+    fn forced_regression_route_bypasses_damping() {
+        let store = store();
+        store
+            .damped_route("acme", "primary", "small", 0, false)
+            .unwrap();
+        let reverted = store
+            .damped_route("acme", "primary", "capable", 1, true)
+            .unwrap();
+        assert_eq!(reverted.model, "capable");
+        assert_eq!(reverted.previous_model, "small");
+        assert!(reverted.shifted);
     }
 }

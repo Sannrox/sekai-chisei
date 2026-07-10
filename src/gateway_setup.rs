@@ -1241,6 +1241,7 @@ mod tests {
                 agent: "codex-app".to_string(),
                 user_id: String::new(),
                 key_id: "codex-app".to_string(),
+                expected_calls: 1,
             }))
             .await
             .unwrap()

@@ -1,6 +1,8 @@
 use rusqlite::params;
 
-use crate::chisei::portfolio::{FrontierPoint, Objective, ObjectiveMode, Observation};
+use crate::chisei::portfolio::{
+    FrontierPoint, Objective, ObjectiveMode, Observation, RouteSelection,
+};
 use crate::db::sekai::SekaiDb;
 
 impl SekaiDb {
@@ -26,6 +28,16 @@ impl SekaiDb {
                 quality_bar REAL NOT NULL,
                 min_samples INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chisei_portfolio_routes (
+                namespace TEXT NOT NULL,
+                task_class TEXT NOT NULL,
+                current_model TEXT NOT NULL,
+                pending_model TEXT NOT NULL DEFAULT '',
+                pending_count INTEGER NOT NULL DEFAULT 0,
+                shifted_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (namespace, task_class)
             );",
         )
         .map_err(|err| err.to_string())
@@ -152,5 +164,130 @@ impl SekaiDb {
             },
         )
         .transpose()
+    }
+
+    pub(crate) fn portfolio_damped_route(
+        &self,
+        namespace: &str,
+        task_class: &str,
+        proposed_model: &str,
+        now_ms: i64,
+        force: bool,
+    ) -> Result<RouteSelection, String> {
+        use rusqlite::OptionalExtension;
+
+        const CONFIRMATIONS: i64 = 3;
+        const COOLDOWN_MS: i64 = 15 * 60 * 1000;
+
+        let conn = self.conn();
+        let state = conn
+            .query_row(
+                "SELECT current_model, pending_model, pending_count, shifted_at
+                 FROM chisei_portfolio_routes WHERE namespace = ?1 AND task_class = ?2",
+                params![namespace, task_class],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+        let Some((current, pending, pending_count, shifted_at)) = state else {
+            conn.execute(
+                "INSERT INTO chisei_portfolio_routes
+                    (namespace, task_class, current_model, pending_model, pending_count, shifted_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', 0, ?4, ?4)",
+                params![namespace, task_class, proposed_model, now_ms],
+            )
+            .map_err(|err| err.to_string())?;
+            return Ok(RouteSelection {
+                model: proposed_model.to_string(),
+                previous_model: String::new(),
+                shifted: !force,
+                reason: if force {
+                    "initialized on regression-safe model".into()
+                } else {
+                    "initial allocation".into()
+                },
+            });
+        };
+
+        if current == proposed_model {
+            conn.execute(
+                "UPDATE chisei_portfolio_routes
+                 SET pending_model = '', pending_count = 0, updated_at = ?3
+                 WHERE namespace = ?1 AND task_class = ?2",
+                params![namespace, task_class, now_ms],
+            )
+            .map_err(|err| err.to_string())?;
+            return Ok(RouteSelection {
+                model: current.clone(),
+                previous_model: current,
+                shifted: false,
+                reason: "allocation unchanged".into(),
+            });
+        }
+
+        if force {
+            conn.execute(
+                "UPDATE chisei_portfolio_routes
+                 SET current_model = ?3, pending_model = '', pending_count = 0,
+                     shifted_at = ?4, updated_at = ?4
+                 WHERE namespace = ?1 AND task_class = ?2",
+                params![namespace, task_class, proposed_model, now_ms],
+            )
+            .map_err(|err| err.to_string())?;
+            return Ok(RouteSelection {
+                model: proposed_model.to_string(),
+                previous_model: current,
+                shifted: true,
+                reason: "forced regression reversion".into(),
+            });
+        }
+
+        let next_count = if pending == proposed_model {
+            pending_count + 1
+        } else {
+            1
+        };
+        let cooldown_elapsed = now_ms.saturating_sub(shifted_at) >= COOLDOWN_MS;
+        if next_count >= CONFIRMATIONS && cooldown_elapsed {
+            conn.execute(
+                "UPDATE chisei_portfolio_routes
+                 SET current_model = ?3, pending_model = '', pending_count = 0,
+                     shifted_at = ?4, updated_at = ?4
+                 WHERE namespace = ?1 AND task_class = ?2",
+                params![namespace, task_class, proposed_model, now_ms],
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(RouteSelection {
+                model: proposed_model.to_string(),
+                previous_model: current,
+                shifted: true,
+                reason: format!("allocation confirmed {CONFIRMATIONS} times after cooldown"),
+            })
+        } else {
+            conn.execute(
+                "UPDATE chisei_portfolio_routes
+                 SET pending_model = ?3, pending_count = ?4, updated_at = ?5
+                 WHERE namespace = ?1 AND task_class = ?2",
+                params![namespace, task_class, proposed_model, next_count, now_ms],
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(RouteSelection {
+                model: current.clone(),
+                previous_model: current,
+                shifted: false,
+                reason: if cooldown_elapsed {
+                    format!("waiting for allocation confirmation {next_count}/{CONFIRMATIONS}")
+                } else {
+                    "allocation held during cooldown".into()
+                },
+            })
+        }
     }
 }

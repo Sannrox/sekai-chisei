@@ -434,6 +434,8 @@ message ResolvePolicyRequest {
   string key_id = 7;
   string task_class = 8;
   string user_id = 9;
+  // Expected calls remaining in the allocation horizon. Defaults to one.
+  int64 expected_calls = 10;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 message CheckEgressRequest {
@@ -463,6 +465,7 @@ message SampleObservation {
   string stop_reason = 9;
   int64 timestamp = 10;
   string task_class = 11;
+  int64 cost_usd_micros = 12;
 }
 message RecordSampleObservationRequest { SampleObservation observation = 1; }
 message RecordSampleObservationResponse { bool recorded = 1; }
