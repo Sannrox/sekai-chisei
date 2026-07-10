@@ -94,6 +94,38 @@ pub trait Judge: Send + Sync {
     ) -> Result<JudgeVerdict, JudgeError>;
 }
 
+/// The scored fields needed to turn one observation into governed graph knowledge.
+/// Deliberately excludes the raw prompt and model output so writers cannot accidentally persist
+/// unbounded, unreviewed task content.
+#[derive(Debug, Clone)]
+pub struct KnowledgeWriteRequest {
+    pub request_id: String,
+    pub namespace: String,
+    pub task_class: String,
+    pub model: String,
+    pub score: i32,
+    pub passed: bool,
+    pub reasoning: String,
+}
+
+/// Terminal outcomes from the governed knowledge-write boundary. A policy denial is terminal for
+/// the observation because [`crate::grpc::sekai_service::SekaiServiceImpl`] audits the denial; it
+/// must not turn a deliberate governance decision into an infrastructure retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeWriteOutcome {
+    Accepted,
+    PolicyDenied,
+}
+
+/// Optional sink for turning scored observations into durable, governed knowledge.
+#[async_trait::async_trait]
+pub trait KnowledgeWriter: Send + Sync {
+    async fn write_knowledge(
+        &self,
+        request: &KnowledgeWriteRequest,
+    ) -> Result<KnowledgeWriteOutcome, String>;
+}
+
 /// Synthetic suite id namespace for sampled observations of a namespace.
 const SUITE_PREFIX: &str = "sampling-";
 
@@ -150,6 +182,7 @@ pub struct ScoringJob {
     interval: Duration,
     batch_size: i32,
     model: String,
+    knowledge_writer: Option<Arc<dyn KnowledgeWriter>>,
 }
 
 impl ScoringJob {
@@ -170,6 +203,7 @@ impl ScoringJob {
             interval: Duration::from_secs(config.scoring_interval_secs.max(1)),
             batch_size: config.scoring_batch_size,
             model: config.scoring_model,
+            knowledge_writer: None,
         }
     }
 
@@ -188,7 +222,15 @@ impl ScoringJob {
             interval: Duration::from_secs(60),
             batch_size,
             model: model.into(),
+            knowledge_writer: None,
         }
+    }
+
+    /// Attach governed memory write-back. Constructors intentionally leave this unset so existing
+    /// users and tests retain their prior score-only behavior.
+    pub fn with_knowledge_writer(mut self, writer: Arc<dyn KnowledgeWriter>) -> Self {
+        self.knowledge_writer = Some(writer);
+        self
     }
 
     pub async fn run_loop(self) {
@@ -269,6 +311,35 @@ impl ScoringJob {
                 } else {
                     format!("{} | gate: {}", verdict.reasoning, gate_reason)
                 };
+                if let Some(writer) = &self.knowledge_writer {
+                    let write_request = KnowledgeWriteRequest {
+                        request_id: obs.request_id.clone(),
+                        namespace: obs.namespace.clone(),
+                        task_class: obs.task_class.clone(),
+                        model: obs.resolved_model.clone(),
+                        score: verdict.score,
+                        passed,
+                        reasoning: reason.clone(),
+                    };
+                    match writer.write_knowledge(&write_request).await {
+                        Ok(KnowledgeWriteOutcome::Accepted) => {}
+                        Ok(KnowledgeWriteOutcome::PolicyDenied) => {
+                            warn!(
+                                request_id = %obs.request_id,
+                                namespace = %namespace,
+                                "scoring knowledge write denied by policy; observation is terminal"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                request_id = %obs.request_id,
+                                namespace = %namespace,
+                                %error,
+                                "scoring knowledge write failed; retaining the evaluated result without a learning"
+                            );
+                        }
+                    }
+                }
                 results.push(eval::CaseResult {
                     case_id: obs.request_id.clone(),
                     passed,
@@ -815,6 +886,22 @@ mod tests {
         }
     }
 
+    struct SelectiveKnowledgeWriter;
+
+    #[async_trait::async_trait]
+    impl KnowledgeWriter for SelectiveKnowledgeWriter {
+        async fn write_knowledge(
+            &self,
+            request: &KnowledgeWriteRequest,
+        ) -> Result<KnowledgeWriteOutcome, String> {
+            if request.request_id == "req-retry" {
+                Err("simulated knowledge store outage".into())
+            } else {
+                Ok(KnowledgeWriteOutcome::Accepted)
+            }
+        }
+    }
+
     fn setup() -> (Arc<SekaiDb>, Arc<EvalStore>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         (db, Arc::new(EvalStore::new()))
@@ -1001,6 +1088,45 @@ mod tests {
         let remaining = db.list_unscored_observations(16).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].request_id, "req-bad");
+    }
+
+    #[tokio::test]
+    async fn knowledge_write_failure_keeps_the_evaluated_observation_in_the_run() {
+        let (db, eval) = setup();
+        observe(&db, "req-ok", "acme", 100);
+        observe(&db, "req-retry", "acme", 101);
+
+        let job = ScoringJob::with_judge(
+            db.clone(),
+            eval,
+            Arc::new(StubJudge {
+                score: 90,
+                passed: true,
+            }),
+            16,
+            "claude-opus-4-8",
+        )
+        .with_knowledge_writer(Arc::new(SelectiveKnowledgeWriter));
+
+        assert_eq!(job.run_once().await.unwrap(), 2);
+        let remaining = db.list_unscored_observations(16).unwrap();
+        assert!(remaining.is_empty());
+
+        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].results.len(), 2);
+        assert!(
+            runs[0]
+                .results
+                .iter()
+                .any(|result| result.case_id == "req-ok")
+        );
+        assert!(
+            runs[0]
+                .results
+                .iter()
+                .any(|result| result.case_id == "req-retry")
+        );
     }
 
     #[tokio::test]

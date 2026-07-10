@@ -91,10 +91,26 @@ impl ActionApproval {
 
     /// Params with sensitive values masked, for display to clients.
     pub fn redacted_params(&self) -> HashMap<String, String> {
+        let learning_sensitive = self.action == crate::sekai::learning::RECORD_LEARNING_ACTION;
         self.params
             .iter()
             .map(|(key, value)| {
-                let value = if is_sensitive_name(key) {
+                let value = if is_sensitive_name(key)
+                    || (learning_sensitive
+                        && [
+                            "title",
+                            "prevention",
+                            "reasoning",
+                            "source_request_id",
+                            "score",
+                            "passed",
+                            "task_class",
+                            "model",
+                            "producer",
+                            "status",
+                        ]
+                        .contains(&key.as_str()))
+                {
                     "[redacted]".to_string()
                 } else {
                     value.clone()
