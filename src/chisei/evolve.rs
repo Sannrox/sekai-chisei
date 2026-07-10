@@ -109,7 +109,7 @@ pub fn mine_patterns(tasks: &[TaskRecord]) -> Vec<Pattern> {
             }
         }
     }
-    word_stats
+    let mut patterns: Vec<_> = word_stats
         .into_iter()
         .filter(|(_, (total, _))| *total >= 3)
         .map(|(word, (total, succ))| Pattern {
@@ -118,7 +118,14 @@ pub fn mine_patterns(tasks: &[TaskRecord]) -> Vec<Pattern> {
             success_rate: succ as f64 / total as f64,
             category: "keyword".into(),
         })
-        .collect()
+        .collect();
+    patterns.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then_with(|| left.pattern.cmp(&right.pattern))
+    });
+    patterns
 }
 
 pub fn suggest(task: &TaskRecord, patterns: &[Pattern]) -> Vec<Suggestion> {

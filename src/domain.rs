@@ -13,6 +13,7 @@ pub type ObjectKind = String;
 pub const KIND_MODEL: &str = "model";
 pub const KIND_COMPONENT: &str = "component";
 pub const KIND_LEARNING: &str = "learning";
+pub const KIND_CAPABILITY: &str = "capability";
 
 pub const DEFAULT_LIST_LIMIT: i32 = 100;
 pub const MAX_LIST_LIMIT: i32 = 1000;
