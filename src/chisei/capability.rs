@@ -526,6 +526,7 @@ pub fn gate_capability_proposal(
     if review.proposal_digest != current_digest {
         return Err(CapabilityGateError::ProposalChanged);
     }
+    let approved_by = review.reviewer.clone();
     let run = eval
         .get_run(run_id)
         .ok_or_else(|| CapabilityGateError::MissingRun(run_id.to_string()))?;
@@ -607,7 +608,7 @@ pub fn gate_capability_proposal(
         proposal_digest: current_digest,
         eval_suite_id: proposal.eval_suite.id.clone(),
         eval_run_id: run.id,
-        approved_by: review.reviewer.clone(),
+        approved_by,
         gated_by: gated_by.to_string(),
         authorized: now,
     }))
