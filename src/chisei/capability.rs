@@ -112,6 +112,7 @@ pub enum CapabilityGateError {
     InvalidReviewer(String),
     MissingRun(String),
     WrongSuite { expected: String, actual: String },
+    WrongConfig { expected: String, actual: String },
     ProposalChanged,
     Audit(String),
 }
@@ -126,6 +127,12 @@ impl std::fmt::Display for CapabilityGateError {
                 write!(
                     formatter,
                     "eval run belongs to suite {actual}, expected {expected}"
+                )
+            }
+            Self::WrongConfig { expected, actual } => {
+                write!(
+                    formatter,
+                    "eval run targets config {actual}, expected {expected}"
                 )
             }
             Self::ProposalChanged => write!(formatter, "proposal changed after approval"),
@@ -418,6 +425,12 @@ pub fn gate_capability_proposal(
         return Err(CapabilityGateError::WrongSuite {
             expected: proposal.eval_suite.id.clone(),
             actual: run.suite_id,
+        });
+    }
+    if run.config_ref != proposal.id {
+        return Err(CapabilityGateError::WrongConfig {
+            expected: proposal.id.clone(),
+            actual: run.config_ref,
         });
     }
 
@@ -1272,6 +1285,34 @@ mod tests {
                 60,
             ),
             Err(CapabilityGateError::ProposalChanged)
+        );
+        assert_eq!(proposal.status, PROPOSAL_APPROVED);
+    }
+
+    #[test]
+    fn gate_rejects_a_run_from_another_proposal() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let eval = EvalStore::new();
+        let mut proposal = proposal();
+        review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
+        let mut run = eval_run(&proposal, true);
+        run.config_ref = "older-proposal".to_string();
+        eval.create_run(run);
+        let expected_id = proposal.id.clone();
+
+        assert_eq!(
+            gate_capability_proposal(
+                &db,
+                &eval,
+                &mut proposal,
+                "capability-run-1",
+                "chisei.gate",
+                60,
+            ),
+            Err(CapabilityGateError::WrongConfig {
+                expected: expected_id,
+                actual: "older-proposal".to_string(),
+            })
         );
         assert_eq!(proposal.status, PROPOSAL_APPROVED);
     }
