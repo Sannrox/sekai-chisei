@@ -14,7 +14,7 @@ use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
-use crate::sekai::{audit, compute, coordination, dataset, function, security};
+use crate::sekai::{audit, compute, coordination, dataset, function, retrieval, security};
 use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "[redacted]";
@@ -191,7 +191,8 @@ impl SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .clone();
         compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
-            self.security.can_access(&candidate.id, &refs)
+            !is_reserved_governance_kind(&candidate.kind)
+                && self.security.can_access(&candidate.id, &refs)
         })
         .map_err(Status::internal)?;
         Ok(redact_restricted_properties(
@@ -1782,6 +1783,36 @@ fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
     })
 }
 
+fn from_proto_context_root(root: ContextRoot) -> Result<retrieval::RetrievalRoot, Status> {
+    let configured = [
+        !root.object_id.is_empty(),
+        !root.external_id.is_empty(),
+        !root.link_id.is_empty(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if configured != 1 {
+        return Err(Status::invalid_argument(
+            "each context root must set exactly one of object_id, external_id, or link_id",
+        ));
+    }
+    if !root.object_id.is_empty() {
+        Ok(retrieval::RetrievalRoot::Object(root.object_id))
+    } else if !root.external_id.is_empty() {
+        Ok(retrieval::RetrievalRoot::External(root.external_id))
+    } else {
+        Ok(retrieval::RetrievalRoot::Link(root.link_id))
+    }
+}
+
+fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
+    match error {
+        retrieval::RetrievalError::InvalidArgument(message) => Status::invalid_argument(message),
+        retrieval::RetrievalError::Storage(message) => Status::internal(message),
+    }
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
     async fn create_object(
@@ -2274,6 +2305,61 @@ impl SekaiService for SekaiServiceImpl {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
                 links: res.links.iter().map(to_proto_link).collect(),
             }),
+        }))
+    }
+    async fn retrieve_context(
+        &self,
+        req: Request<RetrieveContextRequest>,
+    ) -> Result<Response<RetrieveContextResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let roots = inner
+            .roots
+            .into_iter()
+            .map(from_proto_context_root)
+            .collect::<Result<Vec<_>, _>>()?;
+        let direction =
+            retrieval::RetrievalDirection::parse(&inner.direction).map_err(map_retrieval_error)?;
+        let query = retrieval::RetrievalQuery {
+            roots,
+            relations: inner.relations,
+            direction,
+            max_depth: inner.max_depth,
+            max_objects: inner.max_objects,
+            max_links: inner.max_links,
+            kind_filter: inner.kind_filter,
+        };
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut result = retrieval::retrieve(
+            &self.db,
+            &query,
+            |object| self.security.can_access(&object.id, &principal_refs),
+            |object| is_reserved_governance_kind(&object.kind),
+        )
+        .map_err(map_retrieval_error)?;
+        for candidate in &mut result.candidates {
+            candidate.object =
+                self.resolve_computed_for_response(candidate.object.clone(), &principals)?;
+        }
+
+        Ok(Response::new(RetrieveContextResponse {
+            candidates: result
+                .candidates
+                .iter()
+                .map(|candidate| ContextCandidate {
+                    object: Some(to_proto_obj(&candidate.object)),
+                    depth: candidate.depth,
+                    via_relation: candidate.via_relation.clone(),
+                    affinity: candidate.affinity,
+                })
+                .collect(),
+            links: result.links.iter().map(to_proto_link).collect(),
+            truncated: result.truncated,
+            unresolved_roots: result.unresolved_roots,
+            denied_objects: result.denied_objects,
+            truncated_objects: result.truncated_objects,
+            truncated_links: result.truncated_links,
         }))
     }
     async fn list_schema_types(
@@ -10045,6 +10131,198 @@ mod tests {
             .into_inner();
         assert_eq!(resolved.objects.len(), 0);
         assert_eq!(resolved.total, 0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
+        let svc = service();
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "secret_note".into(),
+            r#type: "string".into(),
+            required: false,
+            description: String::new(),
+            enum_values: Vec::new(),
+            link_kind: String::new(),
+            compute_expr: String::new(),
+            classification: "sensitive".into(),
+            struct_fields: Vec::new(),
+        });
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(schema_type),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        for (id, external_id, secret) in [
+            ("context-root", "widget:context-root", true),
+            ("context-allowed", "widget:context-allowed", false),
+            ("context-denied", "widget:context-denied", false),
+            ("behind-denied", "widget:behind-denied", false),
+            ("behind-governance", "widget:behind-governance", false),
+        ] {
+            let mut properties = HashMap::from([("name".into(), id.into())]);
+            if secret {
+                properties.insert("secret_note".into(), "launch code".into());
+            }
+            let mut object = widget_object(id, properties);
+            object.external_id = external_id.into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.db
+            .create_object(&domain::Object {
+                id: "internal-policy".into(),
+                kind: action_policy::ACTION_POLICY_KIND.into(),
+                name: "internal".into(),
+                namespace: String::new(),
+                external_id: "policy:internal".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        for link in [
+            domain::Link {
+                id: "context-visible-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-allowed".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-denied-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-denied-link".into(),
+                from_id: "context-denied".into(),
+                to_id: "behind-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-governance-link".into(),
+                from_id: "context-root".into(),
+                to_id: "internal-policy".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-governance-link".into(),
+                from_id: "internal-policy".into(),
+                to_id: "behind-governance".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+        ] {
+            svc.db.create_link(&link).unwrap();
+        }
+        let denied_grant = security::Grant {
+            id: "context-denied-grant".into(),
+            object_id: "context-denied".into(),
+            principal: "bob".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&denied_grant).unwrap();
+        svc.security.add_grant(&denied_grant);
+
+        let response = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: vec![ContextRoot {
+                        external_id: "widget:context-root".into(),
+                        ..Default::default()
+                    }],
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    max_depth: 3,
+                    max_objects: 20,
+                    max_links: 20,
+                    kind_filter: Vec::new(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let candidate_ids = response
+            .candidates
+            .iter()
+            .map(|candidate| candidate.object.as_ref().unwrap().id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, vec!["context-root", "context-allowed"]);
+        assert_eq!(response.candidates[0].depth, 0);
+        assert_eq!(
+            response.candidates[0].object.as_ref().unwrap().properties["secret_note"],
+            REDACTED_VALUE
+        );
+        assert_eq!(response.denied_objects, 2);
+        assert_eq!(response.links.len(), 1);
+        assert_eq!(response.links[0].id, "context-visible-link");
+        assert!(!response.truncated);
+
+        let denied_root = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: vec![ContextRoot {
+                        object_id: "context-denied".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(denied_root.candidates.is_empty());
+        assert_eq!(denied_root.denied_objects, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_rejects_ambiguous_roots() {
+        let err = service()
+            .retrieve_context(with_principal(RetrieveContextRequest {
+                roots: vec![ContextRoot {
+                    object_id: "one".into(),
+                    external_id: "two".into(),
+                    link_id: String::new(),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn retrieve_context_requires_an_authenticated_principal() {
+        let err = service()
+            .retrieve_context(Request::new(RetrieveContextRequest {
+                roots: vec![ContextRoot {
+                    object_id: "one".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]

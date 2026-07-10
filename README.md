@@ -257,6 +257,35 @@ records requested and omitted fields, eligible versus injected characters, and
 an estimated avoided-input-token count. Empty field lists are rejected so an
 explicit selector cannot silently fall back to broad context.
 
+For ontology-scoped retrieval, each selector may use exactly one of `ref`, `id`,
+or `link_id`, and a bounded `retrieval` block selects the only relations, kinds,
+and fields eligible for related context:
+
+```json
+{
+  "chisei_context": {
+    "objects": [{ "id": "service-api", "fields": ["status"] }],
+    "retrieval": {
+      "relations": ["touches", "depends_on"],
+      "direction": "both",
+      "max_depth": 2,
+      "max_objects": 8,
+      "max_links": 16,
+      "kinds": ["learning"],
+      "fields": ["title", "prevention"]
+    }
+  }
+}
+```
+
+The control plane resolves roots and link endpoints through an authenticated,
+ACL-aware query that never crosses unreadable or reserved governance objects.
+Depth is capped at three, result width is hard-bounded, and candidates are
+ordered deterministically by graph proximity and corroboration across roots.
+Resolution, denial, graph truncation, character truncation, and injected-object
+counts are retained in the gateway audit. Graph values are labelled as
+untrusted data in the model context.
+
 ### One-command launch
 
 ```bash
