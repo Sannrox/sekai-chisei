@@ -413,7 +413,12 @@ fn build_services(
             batch_size = config.scoring_batch_size,
             "scoring job enabled"
         );
-        tokio::spawn(chisei_svc.scoring_job().run_loop());
+        tokio::spawn(
+            chisei_svc
+                .scoring_job()
+                .with_knowledge_writer(sekai_svc.clone())
+                .run_loop(),
+        );
     }
 
     (sekai_svc, chisei_svc)

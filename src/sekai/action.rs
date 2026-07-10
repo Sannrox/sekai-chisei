@@ -71,7 +71,7 @@ impl RiskClass {
 pub fn op_risk_class(op: &str) -> RiskClass {
     match op {
         "delete_link" | "delete_object" => RiskClass::Destructive,
-        "create_object" | "set_property" | "create_link" => RiskClass::Write,
+        "create_object" | "set_property" | "create_link" | "record_learning" => RiskClass::Write,
         _ => RiskClass::Destructive,
     }
 }
@@ -164,6 +164,17 @@ impl ActionExecutor {
                     get("relation")
                 ),
                 "delete_link" => format!("delete_link {}", get("id")),
+                "record_learning" => {
+                    return Ok(vec![
+                        format!("create_object kind=learning id={}", get("id")),
+                        format!(
+                            "create_link {}->{} ({})",
+                            get("id"),
+                            get("target_id"),
+                            crate::domain::REL_TOUCHES
+                        ),
+                    ]);
+                }
                 other => other.to_string(),
             };
             return Ok(vec![describe]);
@@ -210,6 +221,9 @@ impl ActionExecutor {
             }
         };
         if self.registry.contains_key(action) {
+            if action == crate::sekai::learning::RECORD_LEARNING_ACTION {
+                return (2, 0);
+            }
             return count_op(action);
         }
         match self.action_types.get(action) {
@@ -232,6 +246,23 @@ impl ActionExecutor {
     }
 
     pub fn sensitive_param_names(&self, action: &str) -> HashSet<String> {
+        if action == crate::sekai::learning::RECORD_LEARNING_ACTION {
+            return [
+                "title",
+                "prevention",
+                "reasoning",
+                "source_request_id",
+                "score",
+                "passed",
+                "task_class",
+                "model",
+                "producer",
+                "status",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        }
         self.action_types
             .get(action)
             .map(|action_type| {
@@ -311,6 +342,9 @@ impl ActionExecutor {
                 .map(|object| vec![object.kind])
                 .unwrap_or_default());
         }
+        if action == crate::sekai::learning::RECORD_LEARNING_ACTION {
+            return Ok(vec![crate::domain::KIND_LEARNING.to_string()]);
+        }
         let Some(action_type) = self.action_types.get(action) else {
             return Ok(Vec::new());
         };
@@ -352,6 +386,28 @@ impl ActionExecutor {
     }
 
     fn register_builtins(&mut self) {
+        self.registry.insert(
+            crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+            ActionDef {
+                name: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+                required: vec![
+                    "id".into(),
+                    "target_id".into(),
+                    "title".into(),
+                    "prevention".into(),
+                    "reasoning".into(),
+                    "source_request_id".into(),
+                    "score".into(),
+                    "passed".into(),
+                    "task_class".into(),
+                    "model".into(),
+                    "producer".into(),
+                    "status".into(),
+                ],
+                target_ids: Box::new(crate::sekai::learning::record_learning_target_ids),
+                execute: Box::new(crate::sekai::learning::record_learning),
+            },
+        );
         self.registry.insert(
             "create_object".into(),
             ActionDef {
