@@ -375,6 +375,16 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+message VerifyAuditLedgerRequest {}
+message VerifyAuditLedgerResponse {
+  bool ok = 1;
+  int64 entries_checked = 2;
+  int64 first_bad_seq = 3;   // first sequence number that failed (0 when ok)
+  string error = 4;
+  int64 anchor_seq = 5;      // verification started after this purge anchor (0 = genesis)
+  int64 head_seq = 6;
+  string head_hash = 7;
+}
 
 message CreateActionTypeRequest { ActionTypeDef action_type = 1; }
 message CreateActionTypeResponse { ActionTypeDef action_type = 1; }
@@ -654,6 +664,7 @@ service SekaiService {
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
+  rpc VerifyAuditLedger(VerifyAuditLedgerRequest) returns (VerifyAuditLedgerResponse);
 
   rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);

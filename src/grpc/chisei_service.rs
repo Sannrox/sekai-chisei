@@ -2240,8 +2240,11 @@ impl ChiseiService for ChiseiServiceImpl {
         if event.id.trim().is_empty() {
             event.id = uuid::Uuid::new_v4().to_string();
         }
-        if event.timestamp <= 0 {
-            event.timestamp = chrono::Utc::now().timestamp_millis();
+        // Clamp to server time: a future timestamp would pin the purgeable
+        // prefix of the hash-chained ledger and silently stop retention.
+        let now = chrono::Utc::now().timestamp_millis();
+        if event.timestamp <= 0 || event.timestamp > now {
+            event.timestamp = now;
         }
         if event.target_id.trim().is_empty() {
             event.target_id = "llm_calls".to_string();
@@ -3880,6 +3883,34 @@ mod tests {
             decisions[0].evidence.get("request_id").map(String::as_str),
             Some("req-1")
         );
+    }
+
+    #[tokio::test]
+    async fn record_gateway_audit_clamps_future_timestamp() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        let event = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: String::new(),
+                    timestamp: future,
+                    actor: "codex-app".into(),
+                    action: "gateway.model_rewrite".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "routed".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .event
+            .unwrap();
+        // A future timestamp would pin the ledger's purgeable prefix forever.
+        assert!(event.timestamp < future);
+        assert!(event.timestamp <= chrono::Utc::now().timestamp_millis());
     }
 
     #[tokio::test]

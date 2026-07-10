@@ -74,6 +74,7 @@ impl SekaiDb {
         self.migrate_grants()?;
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
+        self.migrate_ledger()?;
         self.migrate_task_observations()?;
         self.migrate_schema_types()?;
         self.migrate_coordination()?;

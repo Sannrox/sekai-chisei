@@ -4480,8 +4480,12 @@ impl SekaiService for SekaiServiceImpl {
         if decision.id.is_empty() {
             decision.id = uuid::Uuid::new_v4().to_string();
         }
-        if decision.timestamp <= 0 {
-            decision.timestamp = now_millis();
+        // Clamp to server time: a client-supplied future timestamp would sit
+        // above every later entry in the ledger and pin the purgeable prefix
+        // forever (retention would silently stop).
+        let now = now_millis();
+        if decision.timestamp <= 0 || decision.timestamp > now {
+            decision.timestamp = now;
         }
         self.db
             .record_decision(&audit::Decision {
@@ -4624,6 +4628,30 @@ impl SekaiService for SekaiServiceImpl {
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
+    }
+
+    async fn verify_audit_ledger(
+        &self,
+        req: Request<VerifyAuditLedgerRequest>,
+    ) -> Result<Response<VerifyAuditLedgerResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        // The chain walk re-hashes every entry since the last purge anchor;
+        // keep that off the async executor threads.
+        let db = self.db.clone();
+        let report = tokio::task::spawn_blocking(move || db.verify_ledger())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(VerifyAuditLedgerResponse {
+            ok: report.ok,
+            entries_checked: report.entries_checked,
+            first_bad_seq: report.first_bad_seq,
+            error: report.error,
+            anchor_seq: report.anchor_seq,
+            head_seq: report.head_seq,
+            head_hash: report.head_hash,
+        }))
     }
 }
 
@@ -5087,6 +5115,63 @@ mod tests {
         assert_eq!(decisions[0].evidence["key"], "[redacted]");
         assert_eq!(decisions[0].evidence["value"], "[redacted]");
         assert_eq!(decisions[0].outcome, "set obj-1.password = [redacted]");
+    }
+
+    #[tokio::test]
+    async fn record_decision_clamps_future_timestamp() {
+        let svc = service();
+        let future = now_millis() + 86_400_000;
+        let recorded = svc
+            .record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: String::new(),
+                    timestamp: future,
+                    actor: "tester".into(),
+                    action: "act".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "done".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        // A future timestamp would pin the ledger's purgeable prefix forever.
+        assert!(recorded.timestamp < future);
+        assert!(recorded.timestamp <= now_millis());
+    }
+
+    #[tokio::test]
+    async fn verify_audit_ledger_reports_clean_chain() {
+        let svc = service();
+        for i in 0..3 {
+            svc.record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: format!("d{i}"),
+                    timestamp: 0,
+                    actor: "tester".into(),
+                    action: "act".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "done".into(),
+                }),
+            }))
+            .await
+            .unwrap();
+        }
+        let report = svc
+            .verify_audit_ledger(with_principal(VerifyAuditLedgerRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(report.ok, "{}", report.error);
+        assert_eq!(report.entries_checked, 3);
+        assert_eq!(report.head_seq, 3);
+        assert!(!report.head_hash.is_empty());
     }
 
     #[tokio::test]
