@@ -179,8 +179,15 @@ impl PortfolioStore {
         objective: &Objective,
         demands: &[TaskDemand],
     ) -> Result<AllocationPlan, String> {
+        const MAX_DEMANDS: usize = 64;
+        const MAX_CANDIDATES_PER_DEMAND: usize = 128;
         if demands.is_empty() {
             return Err("at least one portfolio task demand required".into());
+        }
+        if demands.len() > MAX_DEMANDS {
+            return Err(format!(
+                "portfolio allocation supports at most {MAX_DEMANDS} task demands"
+            ));
         }
 
         let mut choices = Vec::with_capacity(demands.len());
@@ -207,6 +214,11 @@ impl PortfolioStore {
                         && point.quality_score >= quality_bar
                 })
                 .collect();
+            if candidates.len() > MAX_CANDIDATES_PER_DEMAND {
+                return Err(format!(
+                    "portfolio allocation supports at most {MAX_CANDIDATES_PER_DEMAND} candidates per task demand"
+                ));
+            }
             let selected = candidates.first().cloned().ok_or_else(|| {
                 format!(
                     "no sufficiently sampled model clears quality bar {quality_bar:.1} for task class {task_class}"
@@ -215,55 +227,22 @@ impl PortfolioStore {
             choices.push((demand.clone(), candidates, 0usize, selected));
         }
 
-        let mut total_cost = plan_cost(&choices)?;
+        if objective.mode == ObjectiveMode::MaximizeValue {
+            let selected_indices = maximize_value_indices(&choices, objective.budget_usd_micros)?;
+            for ((_, candidates, selected_index, selected), next_index) in
+                choices.iter_mut().zip(selected_indices)
+            {
+                *selected_index = next_index;
+                *selected = candidates[next_index].clone();
+            }
+        }
+
+        let total_cost = plan_cost(&choices)?;
         if objective.budget_usd_micros > 0 && total_cost > objective.budget_usd_micros {
             return Err(format!(
                 "minimum quality allocation costs {total_cost} micros, above budget {}",
                 objective.budget_usd_micros
             ));
-        }
-
-        if objective.mode == ObjectiveMode::MaximizeValue {
-            loop {
-                let best = choices
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, (demand, candidates, selected_index, selected))| {
-                        let next_index = selected_index + 1;
-                        let next = candidates.get(next_index)?;
-                        let cost_delta = (next.cost_usd_micros - selected.cost_usd_micros)
-                            .checked_mul(demand.expected_calls)?;
-                        let value_delta = (next.quality_score - selected.quality_score)
-                            * demand.expected_calls as f64;
-                        if cost_delta <= 0 || value_delta <= 0.0 {
-                            return None;
-                        }
-                        if objective.budget_usd_micros > 0
-                            && total_cost.checked_add(cost_delta)? > objective.budget_usd_micros
-                        {
-                            return None;
-                        }
-                        Some((
-                            index,
-                            value_delta / cost_delta as f64,
-                            next.model.as_str(),
-                            cost_delta,
-                        ))
-                    })
-                    .max_by(|left, right| {
-                        left.1
-                            .total_cmp(&right.1)
-                            .then_with(|| right.2.cmp(left.2))
-                            .then_with(|| right.0.cmp(&left.0))
-                    });
-                let Some((index, _, _, cost_delta)) = best else {
-                    break;
-                };
-                let (_, candidates, selected_index, selected) = &mut choices[index];
-                *selected_index += 1;
-                *selected = candidates[*selected_index].clone();
-                total_cost += cost_delta;
-            }
         }
 
         let allocations: Vec<_> = choices
@@ -309,6 +288,90 @@ impl PortfolioStore {
 }
 
 type Choice = (TaskDemand, Vec<FrontierPoint>, usize, FrontierPoint);
+
+#[derive(Clone)]
+struct AllocationState {
+    cost: i64,
+    value: f64,
+    selected_indices: Vec<usize>,
+}
+
+fn maximize_value_indices(choices: &[Choice], budget: i64) -> Result<Vec<usize>, String> {
+    const MAX_OPTIMIZER_STATES: usize = 100_000;
+
+    if budget == 0 {
+        return Ok(choices
+            .iter()
+            .map(|(_, candidates, _, _)| candidates.len() - 1)
+            .collect());
+    }
+
+    let mut states = vec![AllocationState {
+        cost: 0,
+        value: 0.0,
+        selected_indices: Vec::with_capacity(choices.len()),
+    }];
+    for (demand, candidates, _, _) in choices {
+        let mut next = Vec::new();
+        for state in &states {
+            for (index, candidate) in candidates.iter().enumerate() {
+                let candidate_cost = candidate
+                    .cost_usd_micros
+                    .checked_mul(demand.expected_calls)
+                    .ok_or_else(|| "portfolio allocation cost overflow".to_string())?;
+                let cost = state
+                    .cost
+                    .checked_add(candidate_cost)
+                    .ok_or_else(|| "portfolio allocation cost overflow".to_string())?;
+                if cost > budget {
+                    continue;
+                }
+                let mut selected_indices = state.selected_indices.clone();
+                selected_indices.push(index);
+                next.push(AllocationState {
+                    cost,
+                    value: state.value + candidate.quality_score * demand.expected_calls as f64,
+                    selected_indices,
+                });
+                if next.len() > MAX_OPTIMIZER_STATES {
+                    return Err("portfolio allocation search is too complex".into());
+                }
+            }
+        }
+        if next.is_empty() {
+            return Err(format!(
+                "minimum quality allocation is above budget {budget}"
+            ));
+        }
+        next.sort_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| right.value.total_cmp(&left.value))
+                .then_with(|| left.selected_indices.cmp(&right.selected_indices))
+        });
+        let mut best_value = f64::NEG_INFINITY;
+        states = next
+            .into_iter()
+            .filter(|state| {
+                if state.value > best_value {
+                    best_value = state.value;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+    }
+
+    states.sort_by(|left, right| {
+        right
+            .value
+            .total_cmp(&left.value)
+            .then_with(|| left.cost.cmp(&right.cost))
+            .then_with(|| left.selected_indices.cmp(&right.selected_indices))
+    });
+    Ok(states.remove(0).selected_indices)
+}
 
 fn plan_cost(choices: &[Choice]) -> Result<i64, String> {
     choices
@@ -485,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn maximize_value_spends_budget_on_best_marginal_upgrade() {
+    fn maximize_value_spends_budget_on_best_allocation() {
         let store = seeded_store();
         let plan = store
             .allocate(
@@ -504,9 +567,88 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(plan.allocations[0].model, "medium");
-        assert_eq!(plan.allocations[1].model, "small");
+        assert_eq!(plan.allocations[0].model, "small");
+        assert_eq!(plan.allocations[1].model, "medium");
         assert_eq!(plan.total_cost_usd_micros, 50);
+    }
+
+    #[test]
+    fn maximize_value_handles_upgrades_with_deferred_payoff() {
+        let store = store();
+        for (task_class, model, quality, cost) in [
+            ("a", "a-free", 0.0, 0),
+            ("a", "a-step", 1.0, 100),
+            ("a", "a-best", 100.0, 101),
+            ("b", "b-free", 0.0, 0),
+            ("b", "b-best", 50.0, 100),
+        ] {
+            store
+                .record(&observation("acme", task_class, model, quality, cost, 1, 1))
+                .unwrap();
+        }
+        let mut objective = objective(ObjectiveMode::MaximizeValue, 101);
+        objective.quality_bar = 0.0;
+        objective.min_samples = 1;
+
+        let plan = store
+            .allocate(
+                &objective,
+                &[
+                    TaskDemand {
+                        task_class: "a".into(),
+                        expected_calls: 1,
+                        quality_bar: None,
+                    },
+                    TaskDemand {
+                        task_class: "b".into(),
+                        expected_calls: 1,
+                        quality_bar: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(plan.allocations[0].model, "a-best");
+        assert_eq!(plan.allocations[1].model, "b-free");
+        assert_eq!(plan.total_value, 100.0);
+        assert_eq!(plan.total_cost_usd_micros, 101);
+    }
+
+    #[test]
+    fn unlimited_budget_reports_cost_overflow() {
+        let store = store();
+        for task_class in ["a", "b"] {
+            store
+                .record(&observation(
+                    "acme",
+                    task_class,
+                    "expensive",
+                    100.0,
+                    i64::MAX,
+                    1,
+                    1,
+                ))
+                .unwrap();
+        }
+        let mut objective = objective(ObjectiveMode::MaximizeValue, 0);
+        objective.min_samples = 1;
+        let error = store
+            .allocate(
+                &objective,
+                &[
+                    TaskDemand {
+                        task_class: "a".into(),
+                        expected_calls: 1,
+                        quality_bar: None,
+                    },
+                    TaskDemand {
+                        task_class: "b".into(),
+                        expected_calls: 1,
+                        quality_bar: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(error.contains("overflow"));
     }
 
     #[test]
