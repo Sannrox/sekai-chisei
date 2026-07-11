@@ -3666,14 +3666,20 @@ async fn record_usage_and_append(
                 {
                     warn!(error = %err, "chisei-gateway usage record failed");
                 } else {
-                    emit_budget_threshold_warnings(
-                        config,
-                        identity,
-                        context.work_unit_id.as_deref(),
-                        total_tokens,
-                        &mut chisei,
-                    )
-                    .await;
+                    let warning_config = config.clone();
+                    let warning_identity = identity.clone();
+                    let warning_work_unit = context.work_unit_id.clone();
+                    let mut warning_client = chisei.clone();
+                    tokio::spawn(async move {
+                        emit_budget_threshold_warnings(
+                            &warning_config,
+                            &warning_identity,
+                            warning_work_unit.as_deref(),
+                            total_tokens,
+                            &mut warning_client,
+                        )
+                        .await;
+                    });
                 }
             }
             let pipeline_observation =
@@ -7860,12 +7866,22 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
-                action: Some("gateway.budget_warning".to_string()),
-                ..Default::default()
-            })
-            .unwrap();
+        let decisions = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let decisions = db
+                    .list_decisions(&crate::sekai::audit::DecisionFilter {
+                        action: Some("gateway.budget_warning".to_string()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                if !decisions.is_empty() {
+                    break decisions;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("budget warning should be recorded");
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].outcome, "warned");
         assert_eq!(
