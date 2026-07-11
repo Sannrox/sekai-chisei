@@ -286,7 +286,10 @@ impl SekaiDb {
         if !request_ids.is_empty() {
             sql.push_str(" OR json_extract(evidence, '$.request_id') IN (");
             sql.push_str(&vec!["?"; request_ids.len()].join(","));
+            sql.push_str(") OR target_id IN (");
+            sql.push_str(&vec!["?"; request_ids.len()].join(","));
             sql.push(')');
+            values.extend(request_ids.iter().cloned());
             values.extend(request_ids.iter().cloned());
         }
         sql.push_str(") ORDER BY timestamp ASC, rowid ASC");
