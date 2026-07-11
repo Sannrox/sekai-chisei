@@ -527,6 +527,12 @@ impl ModelSovereigntyRegistry {
                 "only an eval-gated model candidate can be promoted".into(),
             ));
         }
+        if adoption.baseline_model_id != self.active_model {
+            return Err(ArtifactError::Invalid(format!(
+                "model candidate was evaluated against stale incumbent {:?}; current incumbent is {:?}",
+                adoption.baseline_model_id, self.active_model
+            )));
+        }
         adoption.status = ModelAdoptionStatus::Promoted;
         adoption.promoted_at = Some(promoted_at);
         self.active_model = adoption.model_id.clone();
@@ -1242,6 +1248,28 @@ mod tests {
                 .record_eval("candidate-1", passing_evidence("quality"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn promotion_rejects_evidence_against_a_stale_incumbent() {
+        let mut registry = ModelSovereigntyRegistry::new("model-a").unwrap();
+        registry
+            .begin_adoption("candidate-b", "model-b", vec!["quality".into()], 100)
+            .unwrap();
+        registry
+            .begin_adoption("candidate-c", "model-c", vec!["quality".into()], 101)
+            .unwrap();
+        registry
+            .record_eval("candidate-b", passing_evidence("quality"))
+            .unwrap();
+        registry
+            .record_eval("candidate-c", passing_evidence("quality"))
+            .unwrap();
+
+        registry.promote("candidate-b", 200).unwrap();
+        assert_eq!(registry.active_model(), "model-b");
+        assert!(registry.promote("candidate-c", 201).is_err());
+        assert_eq!(registry.active_model(), "model-b");
     }
 
     #[test]
