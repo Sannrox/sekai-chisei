@@ -171,6 +171,7 @@ impl ModelEvalEvidence {
 pub struct ModelAdoption {
     pub candidate_id: String,
     pub model_id: String,
+    pub baseline_model_id: String,
     pub required_suites: Vec<String>,
     pub evidence: BTreeMap<String, ModelEvalEvidence>,
     pub status: ModelAdoptionStatus,
@@ -181,7 +182,7 @@ pub struct ModelAdoption {
 /// Server-owned adoption state. Callers may submit eval evidence, but cannot
 /// mark a candidate passed or promoted themselves.
 pub struct ModelSovereigntyRegistry {
-    active_model: Option<String>,
+    active_model: String,
     adoptions: HashMap<String, ModelAdoption>,
 }
 
@@ -341,22 +342,18 @@ impl GovernanceRegistry {
     }
 }
 
-impl Default for ModelSovereigntyRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ModelSovereigntyRegistry {
-    pub fn new() -> Self {
-        Self {
-            active_model: None,
+    pub fn new(active_model: impl Into<String>) -> Result<Self, ArtifactError> {
+        let active_model = active_model.into();
+        require_nonempty("active_model", &active_model)?;
+        Ok(Self {
+            active_model,
             adoptions: HashMap::new(),
-        }
+        })
     }
 
-    pub fn active_model(&self) -> Option<&str> {
-        self.active_model.as_deref()
+    pub fn active_model(&self) -> &str {
+        &self.active_model
     }
 
     pub fn begin_adoption(
@@ -386,6 +383,7 @@ impl ModelSovereigntyRegistry {
         let adoption = ModelAdoption {
             candidate_id: candidate_id.clone(),
             model_id,
+            baseline_model_id: self.active_model.clone(),
             required_suites,
             evidence: BTreeMap::new(),
             status: ModelAdoptionStatus::PendingEvaluation,
@@ -418,6 +416,12 @@ impl ModelSovereigntyRegistry {
             return Err(ArtifactError::Invalid(
                 "eval runs must belong to the required suite".into(),
             ));
+        }
+        if baseline.config_ref != adoption.baseline_model_id {
+            return Err(ArtifactError::Invalid(format!(
+                "baseline eval run targets {:?}, not incumbent model {:?}",
+                baseline.config_ref, adoption.baseline_model_id
+            )));
         }
         if candidate.config_ref != adoption.model_id {
             return Err(ArtifactError::Invalid(format!(
@@ -494,7 +498,7 @@ impl ModelSovereigntyRegistry {
         }
         adoption.status = ModelAdoptionStatus::Promoted;
         adoption.promoted_at = Some(promoted_at);
-        self.active_model = Some(adoption.model_id.clone());
+        self.active_model = adoption.model_id.clone();
         Ok(adoption.clone())
     }
 
@@ -1045,7 +1049,7 @@ mod tests {
 
     #[test]
     fn model_promotion_requires_every_eval_suite() {
-        let mut registry = ModelSovereigntyRegistry::new();
+        let mut registry = ModelSovereigntyRegistry::new("provider/old-model").unwrap();
         registry
             .begin_adoption(
                 "candidate-1",
@@ -1065,12 +1069,12 @@ mod tests {
         let promoted = registry.promote("candidate-1", 200).unwrap();
 
         assert_eq!(promoted.status, ModelAdoptionStatus::Promoted);
-        assert_eq!(registry.active_model(), Some("provider/new-model"));
+        assert_eq!(registry.active_model(), "provider/new-model");
     }
 
     #[test]
     fn regressing_model_is_permanently_gate_failed() {
-        let mut registry = ModelSovereigntyRegistry::new();
+        let mut registry = ModelSovereigntyRegistry::new("old-model").unwrap();
         registry
             .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
             .unwrap();
@@ -1089,7 +1093,7 @@ mod tests {
 
     #[test]
     fn caller_cannot_submit_unrequired_or_reused_eval_run() {
-        let mut registry = ModelSovereigntyRegistry::new();
+        let mut registry = ModelSovereigntyRegistry::new("old-model").unwrap();
         registry
             .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
             .unwrap();
@@ -1131,10 +1135,30 @@ mod tests {
             results: vec![result("one", true), result("two", true)],
             timestamp: 2,
         });
-        let mut registry = ModelSovereigntyRegistry::new();
+        eval.create_run(Run {
+            id: "weak-baseline".into(),
+            suite_id: "quality".into(),
+            config_ref: "broken-model".into(),
+            results: vec![result("one", false), result("two", false)],
+            timestamp: 0,
+        });
+        let mut registry = ModelSovereigntyRegistry::new("old-model").unwrap();
         registry
             .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
             .unwrap();
+
+        assert!(
+            registry
+                .record_eval_from_store(
+                    &eval,
+                    "candidate-1",
+                    "quality",
+                    "weak-baseline",
+                    "candidate",
+                    0.0,
+                )
+                .is_err()
+        );
 
         let adoption = registry
             .record_eval_from_store(
