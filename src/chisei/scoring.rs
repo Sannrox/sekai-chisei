@@ -467,6 +467,7 @@ impl ScoringJob {
             evidence.insert("namespace".to_string(), namespace.to_string());
             evidence.insert("attempts".to_string(), attempts.to_string());
             evidence.insert("error".to_string(), message.clone());
+            evidence.insert("request_id".to_string(), obs.request_id.clone());
             let _ = self.db.record_decision(&crate::sekai::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: chrono::Utc::now().timestamp_millis(),
@@ -1519,6 +1520,7 @@ mod tests {
             .unwrap();
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].target_id, "req-bad");
+        assert_eq!(retired[0].evidence["request_id"], "req-bad");
     }
 
     #[tokio::test]
