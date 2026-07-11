@@ -40,6 +40,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map_err(std::io::Error::other)?;
             run_launch(config).await
         }
+        "provenance" => {
+            let work_unit = args
+                .get(1)
+                .ok_or_else(|| std::io::Error::other("usage: sekaictl provenance <work-unit>"))?;
+            let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/sekai.db".into());
+            let db =
+                sekai_chisei::db::sekai::SekaiDb::new(&db_path).map_err(std::io::Error::other)?;
+            let report = sekai_chisei::provenance::assemble_report(&db, work_unit)
+                .map_err(std::io::Error::other)?;
+            print!("{}", sekai_chisei::provenance::render_text(&report));
+            Ok(())
+        }
         other => {
             eprintln!("unknown command {other:?}");
             print_root_usage();
@@ -151,7 +163,7 @@ async fn run_gateway_command(
 }
 
 fn print_root_usage() {
-    println!("Usage: sekaictl <credential|gateway|launch|action|estimate> ...\n");
+    println!("Usage: sekaictl <credential|gateway|launch|action|estimate|provenance> ...\n");
     println!("Credential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
@@ -164,6 +176,7 @@ fn print_root_usage() {
     println!("  {}", estimate_usage());
     println!("\nGoverned action commands:");
     println!("{}", sekai_chisei::action_cli::usage());
+    println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
 }
 
 fn print_gateway_usage() {
