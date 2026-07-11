@@ -39,6 +39,17 @@ pub struct GovernedAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataEgress {
+    pub decision_id: String,
+    pub request_id: String,
+    pub provider: String,
+    pub model: String,
+    pub included_fields: i64,
+    pub redacted_fields: i64,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyException {
     pub decision_id: String,
     pub action: String,
@@ -115,6 +126,34 @@ impl ProvenanceReport {
             })
             .collect()
     }
+
+    pub fn data_egress(&self) -> Vec<DataEgress> {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.actor == "chisei.egress")
+            .map(|decision| DataEgress {
+                decision_id: decision.id.clone(),
+                request_id: decision.target_id.clone(),
+                provider: decision
+                    .evidence
+                    .get("provider")
+                    .cloned()
+                    .unwrap_or_default(),
+                model: decision.evidence.get("model").cloned().unwrap_or_default(),
+                included_fields: evidence_i64(decision, "included_count"),
+                redacted_fields: evidence_i64(decision, "redacted_count"),
+                outcome: decision.outcome.clone(),
+            })
+            .collect()
+    }
+}
+
+fn evidence_i64(decision: &Decision, key: &str) -> i64 {
+    decision
+        .evidence
+        .get(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 fn inferred_action_decision(decision: &Decision) -> &'static str {
@@ -268,6 +307,19 @@ pub fn render_text(report: &ProvenanceReport) -> String {
             if action.dry_run { " dry-run" } else { "" }
         ));
     }
+    output.push_str("\nData access and egress\n");
+    let egress = report.data_egress();
+    if egress.is_empty() {
+        output.push_str("  no recorded context egress\n");
+    }
+    for record in egress {
+        output.push_str(&format!(
+            "  {}  request={} provider={} model={} included_fields={} redacted_fields={} outcome={}\n",
+            record.decision_id, record.request_id, record.provider, record.model,
+            record.included_fields, record.redacted_fields, record.outcome
+        ));
+    }
+    output.push_str("  coverage: model calls, recorded context egress, policy decisions, and governed actions; activity outside governed surfaces is not captured\n");
     output
 }
 
@@ -479,6 +531,50 @@ mod tests {
         assert!(
             render_text(&report)
                 .contains("action=run_command target=workspace risk=write decision=allow")
+        );
+    }
+
+    #[test]
+    fn request_target_decisions_surface_egress_counts() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: "llm_calls".into(),
+            name: "LLM calls".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "llm_calls",
+            &[HashMap::from([
+                ("request_id".into(), "req-egress".into()),
+                ("work_unit_id".into(), "task".into()),
+            ])],
+        )
+        .unwrap();
+        db.record_decision(&Decision {
+            id: "egress".into(),
+            timestamp: 1,
+            actor: "chisei.egress".into(),
+            action: "context_egress".into(),
+            reason: "context egress policy applied".into(),
+            evidence: HashMap::from([
+                ("provider".into(), "anthropic".into()),
+                ("model".into(), "claude".into()),
+                ("included_count".into(), "4".into()),
+                ("redacted_count".into(), "2".into()),
+            ]),
+            target_id: "req-egress".into(),
+            outcome: "redacted".into(),
+        })
+        .unwrap();
+
+        let report = assemble_report(&db, "task").unwrap();
+        assert_eq!(report.data_egress()[0].redacted_fields, 2);
+        assert!(
+            render_text(&report)
+                .contains("provider=anthropic model=claude included_fields=4 redacted_fields=2")
         );
     }
 
