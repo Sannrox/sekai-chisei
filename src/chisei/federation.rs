@@ -23,6 +23,7 @@ pub enum GovernanceArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableEvalSuite {
     pub name: String,
     pub description: String,
@@ -32,6 +33,7 @@ pub struct PortableEvalSuite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableEvalCase {
     pub id: String,
     pub name: String,
@@ -40,6 +42,7 @@ pub struct PortableEvalCase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableRoutingPrior {
     pub task_class: String,
     pub model_capability: String,
@@ -49,6 +52,7 @@ pub struct PortableRoutingPrior {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableActionPolicy {
     pub scope_class: String,
     pub default_decision: String,
@@ -57,6 +61,7 @@ pub struct PortableActionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactProvenance {
     pub publisher_id: String,
     pub source_artifact_id: String,
@@ -65,6 +70,7 @@ pub struct ArtifactProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableArtifact {
     pub schema: String,
     pub artifact_id: String,
@@ -95,6 +101,7 @@ impl std::error::Error for ArtifactError {}
 /// bucketed outcome and count, not an observation, prompt, response, object id,
 /// actor id, or provider credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FederatedContribution {
     pub participant_id: String,
     pub contribution_id: String,
@@ -106,6 +113,7 @@ pub struct FederatedContribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FederatedPrior {
     pub task_class: String,
     pub model_capability: String,
@@ -135,6 +143,7 @@ pub enum ModelAdoptionStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelEvalEvidence {
     pub suite_id: String,
     pub baseline_run_id: String,
@@ -155,6 +164,7 @@ impl ModelEvalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelAdoption {
     pub candidate_id: String,
     pub model_id: String,
@@ -173,6 +183,7 @@ pub struct ModelSovereigntyRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactAdoption {
     pub local_namespace: String,
     pub artifact_id: String,
@@ -825,6 +836,25 @@ mod tests {
         suite.name = "tampered".into();
 
         assert_eq!(artifact.verify(), Err(ArtifactError::HashMismatch));
+    }
+
+    #[test]
+    fn portable_artifact_rejects_unknown_envelope_and_payload_fields() {
+        let artifact =
+            PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        let mut encoded = serde_json::to_value(&artifact).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("unverified".into(), serde_json::json!("secret"));
+        assert!(serde_json::from_value::<PortableArtifact>(encoded).is_err());
+
+        let mut encoded = serde_json::to_value(&artifact).unwrap();
+        encoded["artifact"]["eval_suite"]["cases"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("prompt".into(), serde_json::json!("private prompt"));
+        assert!(serde_json::from_value::<PortableArtifact>(encoded).is_err());
     }
 
     #[test]
