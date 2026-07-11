@@ -1,6 +1,7 @@
 pub mod action;
 pub mod action_approval;
 pub mod action_policy;
+pub mod attestation;
 pub mod audit;
 pub mod capacity;
 pub mod compute;
@@ -10,6 +11,7 @@ pub mod dataset;
 pub mod escalation;
 pub mod function;
 pub mod learning;
+pub mod ledger;
 pub mod lineage;
 pub mod observation;
 pub mod propagation;
