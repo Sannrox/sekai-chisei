@@ -3256,7 +3256,7 @@ fn parse_gateway_keys(
     Ok(keys)
 }
 
-fn parse_pricing_table(
+pub fn parse_pricing_table(
     spec: &str,
 ) -> Result<HashMap<String, ModelPricing>, Box<dyn std::error::Error>> {
     let mut pricing = HashMap::new();

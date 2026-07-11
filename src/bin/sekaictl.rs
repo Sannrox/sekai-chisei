@@ -1,3 +1,6 @@
+use sekai_chisei::cost_estimate::{
+    CostEstimateConfig, estimate_cost, pricing_from_env, render_estimate, usage as estimate_usage,
+};
 use sekai_chisei::credential_cli::{
     CredentialCommand, create_credential, list_credentials, parse_credential_command,
     revoke_credential, rotate_credential, usage as credential_usage,
@@ -21,6 +24,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "gateway" => run_gateway_command(args.into_iter().skip(1).collect()).await,
         "action" => {
             sekai_chisei::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
+        }
+        "estimate" => {
+            sekai_chisei::launch::load_local_env();
+            let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
+                .map_err(std::io::Error::other)?;
+            let pricing = pricing_from_env().map_err(std::io::Error::other)?;
+            let estimate = estimate_cost(&config, &pricing).map_err(std::io::Error::other)?;
+            println!("{}", render_estimate(&config, &estimate));
+            Ok(())
         }
         "launch" => {
             sekai_chisei::launch::load_local_env();
@@ -139,7 +151,7 @@ async fn run_gateway_command(
 }
 
 fn print_root_usage() {
-    println!("Usage: sekaictl <credential|gateway|launch|action> ...\n");
+    println!("Usage: sekaictl <credential|gateway|launch|action|estimate> ...\n");
     println!("Credential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
@@ -148,6 +160,8 @@ fn print_root_usage() {
     println!("  sekaictl gateway report [...]");
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
+    println!("\nCost estimate:");
+    println!("  {}", estimate_usage());
     println!("\nGoverned action commands:");
     println!("{}", sekai_chisei::action_cli::usage());
 }
