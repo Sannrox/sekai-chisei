@@ -881,6 +881,8 @@ async fn ensure_llm_calls_dataset(
         "sample_reason",
         "sample_rate",
         "route_bias",
+        "policy_scope",
+        "policy_version",
         "status",
         "error_type",
         "refusal_reason",
