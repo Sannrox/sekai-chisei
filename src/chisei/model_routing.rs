@@ -32,6 +32,15 @@ pub fn route_bias(steps: &[crate::chisei::pipeline::StepDecision]) -> Option<&st
         })
 }
 
+/// Whether a task class may automatically use a lower-cost model tier.
+/// Unknown, primary, and reasoning work deliberately fail safe to capable.
+pub fn is_cheap_eligible_task_class(task_class: &str) -> bool {
+    matches!(
+        task_class.trim().to_ascii_lowercase().as_str(),
+        "background" | "bulk" | "batch" | "small_fast" | "small-fast"
+    )
+}
+
 pub fn resolve_model(ctx: RoutingContext<'_>) -> Result<String, String> {
     if ctx.requested.is_empty() {
         return Err("model resolution received an empty model".into());
