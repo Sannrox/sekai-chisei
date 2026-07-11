@@ -107,6 +107,7 @@ impl std::error::Error for ArtifactError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederatedContribution {
+    pub federation_id: String,
     pub participant_id: String,
     pub contribution_id: String,
     pub task_class: String,
@@ -121,6 +122,7 @@ impl FederatedContribution {
     fn signing_payload(&self) -> Result<Vec<u8>, ArtifactError> {
         #[derive(Serialize)]
         struct Payload<'a> {
+            federation_id: &'a str,
             participant_id: &'a str,
             contribution_id: &'a str,
             task_class: &'a str,
@@ -130,6 +132,7 @@ impl FederatedContribution {
             source_artifact_hash: &'a str,
         }
         serde_json::to_vec(&Payload {
+            federation_id: &self.federation_id,
             participant_id: &self.participant_id,
             contribution_id: &self.contribution_id,
             task_class: &self.task_class,
@@ -571,6 +574,7 @@ fn validate_eval_evidence(evidence: &ModelEvalEvidence) -> Result<(), ArtifactEr
 /// Aggregates governance signal with a minimum-participant disclosure gate.
 /// No method exposes individual contributions after ingestion.
 pub struct FederationAggregator {
+    federation_id: String,
     minimum_participants: usize,
     participant_hash_key: [u8; 32],
     trusted_participants: HashMap<String, VerifyingKey>,
@@ -589,10 +593,13 @@ struct AggregateBucket {
 
 impl FederationAggregator {
     pub fn new(
+        federation_id: impl Into<String>,
         minimum_participants: usize,
         participant_hash_key: [u8; 32],
         trusted_participants: impl IntoIterator<Item = (String, [u8; 32])>,
     ) -> Result<Self, ArtifactError> {
+        let federation_id = federation_id.into();
+        require_nonempty("federation_id", &federation_id)?;
         if minimum_participants < 3 {
             return Err(ArtifactError::Invalid(
                 "federation requires at least three participants per published bucket".into(),
@@ -619,6 +626,7 @@ impl FederationAggregator {
             ));
         }
         Ok(Self {
+            federation_id,
             minimum_participants,
             participant_hash_key,
             trusted_participants: verified,
@@ -633,6 +641,12 @@ impl FederationAggregator {
         contribution: FederatedContribution,
     ) -> Result<ContributionReceipt, ArtifactError> {
         validate_contribution(&contribution)?;
+        if contribution.federation_id != self.federation_id {
+            return Err(ArtifactError::Invalid(format!(
+                "contribution targets federation {:?}, not {:?}",
+                contribution.federation_id, self.federation_id
+            )));
+        }
         let verifying_key = self
             .trusted_participants
             .get(&contribution.participant_id)
@@ -755,6 +769,7 @@ fn sample_size_bucket(attempts: u64) -> u64 {
 }
 
 fn validate_contribution(contribution: &FederatedContribution) -> Result<(), ArtifactError> {
+    require_nonempty("federation_id", &contribution.federation_id)?;
     require_nonempty("participant_id", &contribution.participant_id)?;
     require_nonempty("contribution_id", &contribution.contribution_id)?;
     require_nonempty("task_class", &contribution.task_class)?;
@@ -1105,6 +1120,7 @@ mod tests {
         attempts: u64,
     ) -> FederatedContribution {
         let mut contribution = FederatedContribution {
+            federation_id: "network-1".into(),
             participant_id: participant.into(),
             contribution_id: contribution_id.into(),
             task_class: "rust-refactor".into(),
@@ -1122,7 +1138,8 @@ mod tests {
 
     #[test]
     fn federation_publishes_only_after_disclosure_threshold() {
-        let mut aggregator = FederationAggregator::new(3, [9; 32], trusted_participants()).unwrap();
+        let mut aggregator =
+            FederationAggregator::new("network-1", 3, [9; 32], trusted_participants()).unwrap();
         aggregator
             .ingest(contribution("org-a", "one", 8, 10))
             .unwrap();
@@ -1150,7 +1167,8 @@ mod tests {
 
     #[test]
     fn federation_rejects_replay_without_double_counting() {
-        let mut aggregator = FederationAggregator::new(3, [9; 32], trusted_participants()).unwrap();
+        let mut aggregator =
+            FederationAggregator::new("network-1", 3, [9; 32], trusted_participants()).unwrap();
         let first = contribution("org-a", "same", 8, 10);
         assert!(aggregator.ingest(first.clone()).unwrap().accepted);
         assert!(!aggregator.ingest(first).unwrap().accepted);
@@ -1167,7 +1185,8 @@ mod tests {
 
     #[test]
     fn federation_accepts_one_contribution_per_participant_bucket() {
-        let mut aggregator = FederationAggregator::new(3, [9; 32], trusted_participants()).unwrap();
+        let mut aggregator =
+            FederationAggregator::new("network-1", 3, [9; 32], trusted_participants()).unwrap();
         assert!(
             aggregator
                 .ingest(contribution("org-a", "one", 8, 10))
@@ -1194,7 +1213,8 @@ mod tests {
 
     #[test]
     fn federation_rejects_forged_and_untrusted_participant_identities() {
-        let mut aggregator = FederationAggregator::new(3, [9; 32], trusted_participants()).unwrap();
+        let mut aggregator =
+            FederationAggregator::new("network-1", 3, [9; 32], trusted_participants()).unwrap();
         let mut forged = contribution("org-a", "one", 8, 10);
         forged.participant_id = "org-b".into();
         assert!(aggregator.ingest(forged).is_err());
@@ -1202,11 +1222,17 @@ mod tests {
         let untrusted = contribution("org-d", "two", 8, 10);
         assert!(aggregator.ingest(untrusted).is_err());
         assert!(aggregator.publishable_priors().is_empty());
+
+        let mut other_network =
+            FederationAggregator::new("network-2", 3, [8; 32], trusted_participants()).unwrap();
+        let replayed = contribution("org-a", "cross-network", 8, 10);
+        assert!(other_network.ingest(replayed).is_err());
     }
 
     #[test]
     fn federation_rejects_non_aggregate_or_unproven_signal() {
-        let mut aggregator = FederationAggregator::new(3, [9; 32], trusted_participants()).unwrap();
+        let mut aggregator =
+            FederationAggregator::new("network-1", 3, [9; 32], trusted_participants()).unwrap();
         let mut invalid = contribution("org-a", "one", 2, 1);
         assert!(aggregator.ingest(invalid.clone()).is_err());
         invalid.successes = 1;
