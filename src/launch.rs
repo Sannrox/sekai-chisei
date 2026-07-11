@@ -273,12 +273,15 @@ pub async fn run_launch(
             turns: config.estimate_turns,
             output_tokens_per_turn: None,
         };
-        let pricing = crate::cost_estimate::pricing_from_env()?;
-        let estimate = crate::cost_estimate::estimate_cost(&estimate_config, &pricing)?;
-        println!(
-            "{}",
-            crate::cost_estimate::render_estimate(&estimate_config, &estimate)
-        );
+        match crate::cost_estimate::pricing_from_env()
+            .and_then(|pricing| crate::cost_estimate::estimate_cost(&estimate_config, &pricing))
+        {
+            Ok(estimate) => println!(
+                "{}",
+                crate::cost_estimate::render_estimate(&estimate_config, &estimate)
+            ),
+            Err(error) => eprintln!("warning: pre-launch cost estimate unavailable: {error}"),
+        }
     }
     std::fs::create_dir_all(LOG_DIR)?;
     recover_stale_codex_config();
