@@ -1,8 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::db::sekai::SekaiDb;
+use crate::sekai::attestation::{AttestationVerification, EVIDENCE_ATTESTATION_ID};
 use crate::sekai::audit::Decision;
 use crate::sekai::dataset::{RowFilter, RowQuery};
+use crate::sekai::ledger::LedgerVerification;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCall {
@@ -23,6 +25,31 @@ pub struct ProvenanceReport {
     pub work_unit_id: String,
     pub calls: Vec<ModelCall>,
     pub decisions: Vec<Decision>,
+    pub assurance: Option<AssuranceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAttestation {
+    pub attestation_id: String,
+    pub decision_id: String,
+    pub verification: AttestationVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssuranceSummary {
+    pub ledger: LedgerVerification,
+    pub attestations: Vec<VerifiedAttestation>,
+}
+
+impl AssuranceSummary {
+    pub fn verifiable(&self, evidence_present: bool) -> bool {
+        evidence_present
+            && self.ledger.ok
+            && self
+                .attestations
+                .iter()
+                .all(|attestation| attestation.verification.ok)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +231,7 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
         .cloned()
         .collect::<BTreeSet<_>>();
     let decisions = db.list_work_unit_decisions(work_unit_id, &request_ids)?;
+    let assurance = Some(assemble_assurance(db, &decisions)?);
 
     let mut calls = rows.into_iter().map(model_call).collect::<Vec<_>>();
     calls.sort_by_key(|call| call.timestamp_ms);
@@ -211,6 +239,26 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
         work_unit_id: work_unit_id.into(),
         calls,
         decisions,
+        assurance,
+    })
+}
+
+fn assemble_assurance(db: &SekaiDb, decisions: &[Decision]) -> Result<AssuranceSummary, String> {
+    let ledger = db.verify_ledger()?;
+    let mut attestations = Vec::new();
+    for decision in decisions {
+        let Some(attestation_id) = decision.evidence.get(EVIDENCE_ATTESTATION_ID) else {
+            continue;
+        };
+        attestations.push(VerifiedAttestation {
+            attestation_id: attestation_id.clone(),
+            decision_id: decision.id.clone(),
+            verification: db.verify_attestation(attestation_id)?,
+        });
+    }
+    Ok(AssuranceSummary {
+        ledger,
+        attestations,
     })
 }
 
@@ -320,6 +368,41 @@ pub fn render_text(report: &ProvenanceReport) -> String {
         ));
     }
     output.push_str("  coverage: model calls, recorded context egress, policy decisions, and governed actions; activity outside governed surfaces is not captured\n");
+    output.push_str("\nVerification\n");
+    match &report.assurance {
+        Some(assurance) => {
+            let evidence_present = !report.calls.is_empty() || !report.decisions.is_empty();
+            output.push_str(&format!(
+                "  {}: audit ledger {} ({} entries checked, head seq {}), {} policy attestation(s) verified\n",
+                if assurance.verifiable(evidence_present) { "verifiable" } else { "not verifiable" },
+                if assurance.ledger.ok { "valid" } else { "INVALID" },
+                assurance.ledger.entries_checked,
+                assurance.ledger.head_seq,
+                assurance.attestations.iter().filter(|item| item.verification.ok).count(),
+            ));
+            for item in &assurance.attestations {
+                output.push_str(&format!(
+                    "  attestation={} decision={} status={} hash={} replay={} linked={}{}\n",
+                    item.attestation_id,
+                    item.decision_id,
+                    if item.verification.ok {
+                        "valid"
+                    } else {
+                        "INVALID"
+                    },
+                    item.verification.hash_ok,
+                    item.verification.replay_ok,
+                    item.verification.decision_linked,
+                    if item.verification.error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" error={}", item.verification.error)
+                    },
+                ));
+            }
+        }
+        None => output.push_str("  recorded truth only; verification was not performed\n"),
+    }
     output
 }
 
@@ -372,6 +455,7 @@ mod tests {
         assert_eq!(report.calls.len(), 1);
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.total_cost_usd_micros(), 42);
+        assert!(report.assurance.as_ref().unwrap().ledger.ok);
         assert!(render_text(&report).contains("provider=anthropic model=claude"));
     }
 
@@ -495,6 +579,7 @@ mod tests {
                     outcome: "leak_warned".into(),
                 },
             ],
+            assurance: None,
         };
 
         let verdict = report.policy_verdict();
@@ -523,6 +608,7 @@ mod tests {
                 target_id: "workspace".into(),
                 outcome: "command completed".into(),
             }],
+            assurance: None,
         };
 
         let actions = report.governed_actions();
@@ -576,6 +662,76 @@ mod tests {
             render_text(&report)
                 .contains("provider=anthropic model=claude included_fields=4 redacted_fields=2")
         );
+    }
+
+    #[test]
+    fn verifies_linked_policy_attestations_and_the_audit_ledger() {
+        use crate::sekai::action::RiskClass;
+        use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
+        use crate::sekai::attestation::{
+            ActionAttestationInput, EVIDENCE_ATTESTATION_HASH, build_action_attestation,
+        };
+
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: "llm_calls".into(),
+            name: "LLM calls".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "llm_calls",
+            &[HashMap::from([
+                ("request_id".into(), "req".into()),
+                ("work_unit_id".into(), "task".into()),
+            ])],
+        )
+        .unwrap();
+        let policy = ActionPolicy {
+            scope: "agent:tester".into(),
+            default_decision: ActionDecision::Allow,
+            action_overrides: HashMap::new(),
+            risk_overrides: HashMap::new(),
+            max_mutations_per_work_unit: None,
+            max_deletes_per_work_unit: None,
+        };
+        let attestation = build_action_attestation(ActionAttestationInput {
+            decision_id: "decision",
+            policy: &policy,
+            action: "set_property",
+            actor: "tester",
+            risk: RiskClass::Write,
+            namespace: "default",
+            decision: ActionDecision::Allow,
+            created: 1,
+        });
+        let decision = Decision {
+            id: "decision".into(),
+            timestamp: 1,
+            actor: "tester".into(),
+            action: "set_property".into(),
+            reason: "execute_action".into(),
+            evidence: HashMap::from([
+                ("request_id".into(), "req".into()),
+                (EVIDENCE_ATTESTATION_ID.into(), attestation.id.clone()),
+                (
+                    EVIDENCE_ATTESTATION_HASH.into(),
+                    attestation.content_hash.clone(),
+                ),
+            ]),
+            target_id: "object".into(),
+            outcome: "updated".into(),
+        };
+        db.record_decision_with_attestation(&decision, Some(&attestation))
+            .unwrap();
+
+        let report = assemble_report(&db, "task").unwrap();
+        let assurance = report.assurance.as_ref().unwrap();
+        assert!(assurance.verifiable(true));
+        assert_eq!(assurance.attestations.len(), 1);
+        assert!(render_text(&report).contains("verifiable: audit ledger valid"));
     }
 
     fn empty_call() -> ModelCall {
