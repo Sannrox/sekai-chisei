@@ -13,6 +13,9 @@ pub struct ModelCall {
     pub provider: String,
     pub requested_model: String,
     pub resolved_model: String,
+    pub route_bias: String,
+    pub policy_scope: String,
+    pub policy_version: String,
     pub status: String,
     pub refusal_reason: String,
     pub input_tokens: i64,
@@ -73,6 +76,8 @@ pub struct DataEgress {
     pub model: String,
     pub included_fields: i64,
     pub redacted_fields: i64,
+    pub included: Vec<String>,
+    pub redacted: Vec<String>,
     pub outcome: String,
 }
 
@@ -169,6 +174,8 @@ impl ProvenanceReport {
                 model: decision.evidence.get("model").cloned().unwrap_or_default(),
                 included_fields: evidence_i64(decision, "included_count"),
                 redacted_fields: evidence_i64(decision, "redacted_count"),
+                included: evidence_list(decision, "included_fields"),
+                redacted: evidence_list(decision, "redacted_fields"),
                 outcome: decision.outcome.clone(),
             })
             .collect()
@@ -181,6 +188,14 @@ fn evidence_i64(decision: &Decision, key: &str) -> i64 {
         .get(key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(0)
+}
+
+fn evidence_list(decision: &Decision, key: &str) -> Vec<String> {
+    decision
+        .evidence
+        .get(key)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default()
 }
 
 fn inferred_action_decision(decision: &Decision) -> &'static str {
@@ -271,6 +286,9 @@ fn model_call(row: HashMap<String, String>) -> ModelCall {
         provider: value("provider"),
         requested_model: value("model"),
         resolved_model: value("resolved_model"),
+        route_bias: value("route_bias"),
+        policy_scope: value("policy_scope"),
+        policy_version: value("policy_version"),
         status: value("status"),
         refusal_reason: value("refusal_reason"),
         input_tokens: number("input_tokens"),
@@ -319,6 +337,18 @@ pub fn render_text(report: &ProvenanceReport) -> String {
         if !call.refusal_reason.is_empty() {
             output.push_str(&format!(" refusal={}", call.refusal_reason));
         }
+        if !call.route_bias.is_empty() || !call.policy_scope.is_empty() {
+            output.push_str(&format!(
+                " route_reason={} policy={}@{}",
+                if call.route_bias.is_empty() {
+                    "policy"
+                } else {
+                    &call.route_bias
+                },
+                call.policy_scope,
+                call.policy_version,
+            ));
+        }
         output.push('\n');
     }
     output.push_str("\nAudit trail\n");
@@ -366,6 +396,12 @@ pub fn render_text(report: &ProvenanceReport) -> String {
             record.decision_id, record.request_id, record.provider, record.model,
             record.included_fields, record.redacted_fields, record.outcome
         ));
+        if !record.included.is_empty() {
+            output.push_str(&format!("    cleared: {}\n", record.included.join(", ")));
+        }
+        if !record.redacted.is_empty() {
+            output.push_str(&format!("    denied: {}\n", record.redacted.join(", ")));
+        }
     }
     output.push_str("  coverage: model calls, recorded context egress, policy decisions, and governed actions; activity outside governed surfaces is not captured\n");
     output.push_str("\nVerification\n");
@@ -650,6 +686,8 @@ mod tests {
                 ("model".into(), "claude".into()),
                 ("included_count".into(), "4".into()),
                 ("redacted_count".into(), "2".into()),
+                ("included_fields".into(), r#"["object#1.title"]"#.into()),
+                ("redacted_fields".into(), r#"["object#1.secret"]"#.into()),
             ]),
             target_id: "req-egress".into(),
             outcome: "redacted".into(),
@@ -662,6 +700,8 @@ mod tests {
             render_text(&report)
                 .contains("provider=anthropic model=claude included_fields=4 redacted_fields=2")
         );
+        assert!(render_text(&report).contains("cleared: object#1.title"));
+        assert!(render_text(&report).contains("denied: object#1.secret"));
     }
 
     #[test]
@@ -741,6 +781,9 @@ mod tests {
             provider: String::new(),
             requested_model: String::new(),
             resolved_model: String::new(),
+            route_bias: String::new(),
+            policy_scope: String::new(),
+            policy_version: String::new(),
             status: String::new(),
             refusal_reason: String::new(),
             input_tokens: 0,
