@@ -20,6 +20,11 @@ message PolicyResolution {
   // Cost-tier bias applied for this resolution ("cheap" when a bulk task class
   // was routed to a cheaper model; empty for the default capable tier).
   string route_bias = 6;
+  // Scope whose policy produced this resolution and the content hash of that
+  // policy revision. Empty when no policy applied (implicit allow). Callers
+  // should carry these into audit evidence so the decision is reproducible.
+  string policy_scope = 7;
+  string policy_version = 8;
 }
 
 message PortfolioPoint {
@@ -447,6 +452,9 @@ message CheckEgressRequest {
 message CheckEgressResponse {
   bool allowed = 1;
   repeated EgressDecision findings = 2;
+  // Content hash of the namespace policy revision that supplied the data
+  // class for this check. Empty when no policy applied.
+  string policy_version = 3;
 }
 
 message RunPipelineRequest { PipelineRequest request = 1; }

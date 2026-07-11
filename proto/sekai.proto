@@ -375,6 +375,62 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+message PolicyAttestation {
+  string id = 1;
+  string decision_id = 2;       // the audit decision this attestation authorizes
+  string policy_kind = 3;       // e.g. action_policy
+  string policy_scope = 4;
+  string policy_version = 5;    // content hash of policy_snapshot
+  string policy_snapshot = 6;   // canonical JSON of the policy pinned at decision time
+  map<string, string> inputs = 7; // action, actor, risk_class, namespace
+  string decision = 8;          // allow | deny | require_approval
+  string content_hash = 9;
+  int64 created = 10;
+}
+message GetAttestationRequest { string id = 1; }
+message GetAttestationResponse { PolicyAttestation attestation = 1; }
+message ListAttestationsRequest {
+  string decision_id = 1;
+  string policy_scope = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+message ListAttestationsResponse { repeated PolicyAttestation attestations = 1; }
+message VerifyAttestationRequest { string id = 1; }
+message VerifyAttestationResponse {
+  bool ok = 1;
+  bool found = 2;
+  bool hash_ok = 3;            // stored hashes match recomputation
+  bool replay_ok = 4;          // pinned policy replayed over inputs re-derives the decision
+  string replayed_decision = 5;
+  bool decision_linked = 6;    // linked audit decision binds this attestation back
+  string error = 7;
+}
+message VerifyAuditLedgerRequest {}
+message VerifyAuditLedgerResponse {
+  bool ok = 1;
+  int64 entries_checked = 2;
+  int64 first_bad_seq = 3;   // first sequence number that failed (0 when ok)
+  string error = 4;
+  int64 anchor_seq = 5;      // verification started after this purge anchor (0 = genesis)
+  int64 head_seq = 6;
+  string head_hash = 7;
+}
+message AssuranceRecord {
+  Decision decision = 1;
+  PolicyAttestation attestation = 2;
+  VerifyAttestationResponse verification = 3;
+}
+message ExportAssuranceRequest {
+  string action = 1;       // exact action class; required
+  string policy_scope = 2; // administrative scope whose policy proofs may be exported
+  int64 after = 3;
+  int32 limit = 4;
+}
+message ExportAssuranceResponse {
+  repeated AssuranceRecord records = 1;
+  VerifyAuditLedgerResponse ledger = 2;
+}
 
 message CreateActionTypeRequest { ActionTypeDef action_type = 1; }
 message CreateActionTypeResponse { ActionTypeDef action_type = 1; }
@@ -654,6 +710,11 @@ service SekaiService {
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
+  rpc VerifyAuditLedger(VerifyAuditLedgerRequest) returns (VerifyAuditLedgerResponse);
+  rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
+  rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
+  rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);
+  rpc ExportAssurance(ExportAssuranceRequest) returns (ExportAssuranceResponse);
 
   rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);

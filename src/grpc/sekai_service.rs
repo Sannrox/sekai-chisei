@@ -11,9 +11,10 @@ use super::pb::sekai::*;
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::sekai::SekaiDb;
 use crate::domain;
-use crate::sekai::action::{self, ActionExecutor};
+use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
+use crate::sekai::attestation;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, compute, coordination, dataset, function, retrieval, security};
@@ -348,6 +349,13 @@ fn redact_action_evidence(
 ) -> std::collections::HashMap<String, String> {
     params
         .iter()
+        // Reserved evidence keys are written by the attestation binding, not
+        // by callers; a param with the same name must not be able to plant a
+        // fake attestation reference in the audit log.
+        .filter(|(key, _)| {
+            key.as_str() != attestation::EVIDENCE_ATTESTATION_ID
+                && key.as_str() != attestation::EVIDENCE_ATTESTATION_HASH
+        })
         .map(|(key, value)| {
             let lower = key.to_ascii_lowercase();
             let sensitive_property = params
@@ -1263,6 +1271,59 @@ fn action_budget_subject(action_risk: &str, namespace: &str, actor: &str) -> Str
         return format!("{base}/project:{}", namespace.trim());
     }
     format!("{base}/project:{}/agent:{}", namespace.trim(), actor.trim())
+}
+
+/// Pin the policy that rendered an action decision as a replayable
+/// attestation and bind it into the audit decision's evidence. The returned
+/// record must be persisted atomically with the decision via
+/// `record_decision_with_attestation`. No policy (implicit allow) means
+/// there is nothing to attest.
+#[allow(clippy::too_many_arguments)]
+fn attest_action_decision(
+    policy: Option<&action_policy::ActionPolicy>,
+    decision_id: &str,
+    action_name: &str,
+    actor: &str,
+    risk: RiskClass,
+    namespace: &str,
+    decision: ActionDecision,
+    evidence: &mut HashMap<String, String>,
+) -> Option<attestation::PolicyAttestation> {
+    let policy = policy?;
+    let record = attestation::build_action_attestation(attestation::ActionAttestationInput {
+        decision_id,
+        policy,
+        action: action_name,
+        actor,
+        risk,
+        namespace,
+        decision,
+        created: now_millis(),
+    });
+    evidence.insert(
+        attestation::EVIDENCE_ATTESTATION_ID.into(),
+        record.id.clone(),
+    );
+    evidence.insert(
+        attestation::EVIDENCE_ATTESTATION_HASH.into(),
+        record.content_hash.clone(),
+    );
+    Some(record)
+}
+
+fn to_proto_attestation(a: &attestation::PolicyAttestation) -> PolicyAttestation {
+    PolicyAttestation {
+        id: a.id.clone(),
+        decision_id: a.decision_id.clone(),
+        policy_kind: a.policy_kind.clone(),
+        policy_scope: a.policy_scope.clone(),
+        policy_version: a.policy_version.clone(),
+        policy_snapshot: a.policy_snapshot.clone(),
+        inputs: a.inputs.clone(),
+        decision: a.decision.clone(),
+        content_hash: a.content_hash.clone(),
+        created: a.created,
+    }
 }
 
 fn to_proto_action_approval(approval: &action_approval::ActionApproval) -> ActionApproval {
@@ -2786,21 +2847,35 @@ impl SekaiService for SekaiServiceImpl {
             if !policy_scope.is_empty() {
                 evidence.insert("policy_scope".into(), policy_scope.clone());
             }
+            let decision_id = uuid::Uuid::new_v4().to_string();
+            let attested = attest_action_decision(
+                resolved_policy.as_ref(),
+                &decision_id,
+                &r.action,
+                &actor,
+                action_risk,
+                &policy_namespace,
+                decision,
+                &mut evidence,
+            );
             self.db
-                .record_decision(&audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now_millis(),
-                    actor: actor.clone(),
-                    action: r.action.clone(),
-                    reason: "execute_action_dry_run".into(),
-                    evidence,
-                    target_id: target_ids.first().cloned().unwrap_or_default(),
-                    outcome: format!(
-                        "dry-run: {} planned op(s), decision={}",
-                        planned_ops.len(),
-                        decision.as_str()
-                    ),
-                })
+                .record_decision_with_attestation(
+                    &audit::Decision {
+                        id: decision_id,
+                        timestamp: now_millis(),
+                        actor: actor.clone(),
+                        action: r.action.clone(),
+                        reason: "execute_action_dry_run".into(),
+                        evidence,
+                        target_id: target_ids.first().cloned().unwrap_or_default(),
+                        outcome: format!(
+                            "dry-run: {} planned op(s), decision={}",
+                            planned_ops.len(),
+                            decision.as_str()
+                        ),
+                    },
+                    attested.as_ref(),
+                )
                 .map_err(Status::internal)?;
             return Ok(Response::new(ExecuteActionResponse {
                 result: Some(ActionResult {
@@ -2838,17 +2913,31 @@ impl SekaiService for SekaiServiceImpl {
             if !work_unit.is_empty() {
                 evidence.insert("work_unit".into(), work_unit.clone());
             }
+            let decision_id = uuid::Uuid::new_v4().to_string();
+            let attested = attest_action_decision(
+                resolved_policy.as_ref(),
+                &decision_id,
+                &r.action,
+                &actor,
+                action_risk,
+                &policy_namespace,
+                decision,
+                &mut evidence,
+            );
             self.db
-                .record_decision(&audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now_millis(),
-                    actor: actor.clone(),
-                    action: r.action.clone(),
-                    reason: "action_approval_pending".into(),
-                    evidence,
-                    target_id: target_ids.first().cloned().unwrap_or_default(),
-                    outcome: format!("held for approval: {}", approval.id),
-                })
+                .record_decision_with_attestation(
+                    &audit::Decision {
+                        id: decision_id,
+                        timestamp: now_millis(),
+                        actor: actor.clone(),
+                        action: r.action.clone(),
+                        reason: "action_approval_pending".into(),
+                        evidence,
+                        target_id: target_ids.first().cloned().unwrap_or_default(),
+                        outcome: format!("held for approval: {}", approval.id),
+                    },
+                    attested.as_ref(),
+                )
                 .map_err(Status::internal)?;
             return Ok(Response::new(ExecuteActionResponse {
                 result: Some(ActionResult {
@@ -2867,17 +2956,31 @@ impl SekaiService for SekaiServiceImpl {
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("policy_scope".into(), policy_scope.clone());
             evidence.insert("decision".into(), decision.as_str().into());
+            let decision_id = uuid::Uuid::new_v4().to_string();
+            let attested = attest_action_decision(
+                resolved_policy.as_ref(),
+                &decision_id,
+                &r.action,
+                &actor,
+                action_risk,
+                &policy_namespace,
+                decision,
+                &mut evidence,
+            );
             self.db
-                .record_decision(&audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now_millis(),
-                    actor: actor.clone(),
-                    action: r.action.clone(),
-                    reason: "action_policy_denied".into(),
-                    evidence,
-                    target_id: target_ids.first().cloned().unwrap_or_default(),
-                    outcome: format!("{} by action policy {}", decision.as_str(), policy_scope),
-                })
+                .record_decision_with_attestation(
+                    &audit::Decision {
+                        id: decision_id,
+                        timestamp: now_millis(),
+                        actor: actor.clone(),
+                        action: r.action.clone(),
+                        reason: "action_policy_denied".into(),
+                        evidence,
+                        target_id: target_ids.first().cloned().unwrap_or_default(),
+                        outcome: format!("{} by action policy {}", decision.as_str(), policy_scope),
+                    },
+                    attested.as_ref(),
+                )
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(format!(
                 "action {} denied by policy",
@@ -3004,26 +3107,38 @@ impl SekaiService for SekaiServiceImpl {
         drop(actions);
         drop(schema);
         self.refresh_security_after_action(&r.action, &r.params, &actor)?;
+        let mut evidence =
+            redact_action_evidence(&r.params, &sensitive_params, schema_restricted_property);
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        let attested = attest_action_decision(
+            resolved_policy.as_ref(),
+            &decision_id,
+            &r.action,
+            &actor,
+            action_risk,
+            &policy_namespace,
+            decision,
+            &mut evidence,
+        );
         self.db
-            .record_decision(&audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now_millis(),
-                actor,
-                action: r.action.clone(),
-                reason: "execute_action".into(),
-                evidence: redact_action_evidence(
-                    &r.params,
-                    &sensitive_params,
-                    schema_restricted_property,
-                ),
-                target_id: target_ids.first().cloned().unwrap_or_default(),
-                outcome: redact_action_outcome(
-                    &r.action,
-                    &r.params,
-                    &msg,
-                    schema_restricted_property,
-                ),
-            })
+            .record_decision_with_attestation(
+                &audit::Decision {
+                    id: decision_id,
+                    timestamp: now_millis(),
+                    actor,
+                    action: r.action.clone(),
+                    reason: "execute_action".into(),
+                    evidence,
+                    target_id: target_ids.first().cloned().unwrap_or_default(),
+                    outcome: redact_action_outcome(
+                        &r.action,
+                        &r.params,
+                        &msg,
+                        schema_restricted_property,
+                    ),
+                },
+                attested.as_ref(),
+            )
             .map_err(Status::internal)?;
         // Record the effect against the work unit's blast-radius counters.
         if !work_unit.is_empty() && blast_caps.is_some() && (op_mutations > 0 || op_deletes > 0) {
@@ -3141,20 +3256,35 @@ impl SekaiService for SekaiServiceImpl {
         if let Some(policy) = &resolved_policy
             && policy.decide(&approval.action, action_risk) == ActionDecision::Deny
         {
+            let mut evidence = HashMap::from([
+                ("approval_id".to_string(), approval.id.clone()),
+                ("policy_scope".to_string(), policy.scope.clone()),
+            ]);
+            let decision_id = uuid::Uuid::new_v4().to_string();
+            let attested = attest_action_decision(
+                Some(policy),
+                &decision_id,
+                &approval.action,
+                &approval.actor,
+                action_risk,
+                &namespace,
+                ActionDecision::Deny,
+                &mut evidence,
+            );
             self.db
-                .record_decision(&audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now_millis(),
-                    actor: approver,
-                    action: approval.action.clone(),
-                    reason: "action_approval_policy_denied".into(),
-                    evidence: HashMap::from([
-                        ("approval_id".into(), approval.id.clone()),
-                        ("policy_scope".into(), policy.scope.clone()),
-                    ]),
-                    target_id: approval.target_id.clone(),
-                    outcome: "policy now denies the held action".into(),
-                })
+                .record_decision_with_attestation(
+                    &audit::Decision {
+                        id: decision_id,
+                        timestamp: now_millis(),
+                        actor: approver,
+                        action: approval.action.clone(),
+                        reason: "action_approval_policy_denied".into(),
+                        evidence,
+                        target_id: approval.target_id.clone(),
+                        outcome: "policy now denies the held action".into(),
+                    },
+                    attested.as_ref(),
+                )
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "action policy now denies this approval",
@@ -3254,17 +3384,37 @@ impl SekaiService for SekaiServiceImpl {
         self.db
             .update_action_approval(&approval)
             .map_err(Status::internal)?;
+        // Attest the policy that permitted the resume, so the executed
+        // outcome is as replayable as the hold decision was.
+        let mut evidence = HashMap::from([("approval_id".to_string(), approval.id.clone())]);
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        let attested = attest_action_decision(
+            resolved_policy.as_ref(),
+            &decision_id,
+            &approval.action,
+            &approval.actor,
+            action_risk,
+            &namespace,
+            resolved_policy
+                .as_ref()
+                .map(|policy| policy.decide(&approval.action, action_risk))
+                .unwrap_or(ActionDecision::Allow),
+            &mut evidence,
+        );
         self.db
-            .record_decision(&audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now_millis(),
-                actor: approval.decided_by.clone(),
-                action: approval.action.clone(),
-                reason: "action_approval_approved".into(),
-                evidence: HashMap::from([("approval_id".into(), approval.id.clone())]),
-                target_id: approval.target_id.clone(),
-                outcome: msg.clone(),
-            })
+            .record_decision_with_attestation(
+                &audit::Decision {
+                    id: decision_id,
+                    timestamp: now_millis(),
+                    actor: approval.decided_by.clone(),
+                    action: approval.action.clone(),
+                    reason: "action_approval_approved".into(),
+                    evidence,
+                    target_id: approval.target_id.clone(),
+                    outcome: msg.clone(),
+                },
+                attested.as_ref(),
+            )
             .map_err(Status::internal)?;
 
         Ok(Response::new(ApproveActionResponse {
@@ -4480,9 +4630,22 @@ impl SekaiService for SekaiServiceImpl {
         if decision.id.is_empty() {
             decision.id = uuid::Uuid::new_v4().to_string();
         }
-        if decision.timestamp <= 0 {
-            decision.timestamp = now_millis();
+        // Clamp to server time: a client-supplied future timestamp would sit
+        // above every later entry in the ledger and pin the purgeable prefix
+        // forever (retention would silently stop).
+        let now = now_millis();
+        if decision.timestamp <= 0 || decision.timestamp > now {
+            decision.timestamp = now;
         }
+        // Reserved keys: only the server-side attestation binding may claim
+        // one, otherwise a caller could dress up an arbitrary decision as
+        // policy-attested.
+        decision
+            .evidence
+            .remove(attestation::EVIDENCE_ATTESTATION_ID);
+        decision
+            .evidence
+            .remove(attestation::EVIDENCE_ATTESTATION_HASH);
         self.db
             .record_decision(&audit::Decision {
                 id: decision.id.clone(),
@@ -4624,6 +4787,258 @@ impl SekaiService for SekaiServiceImpl {
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
+    }
+
+    async fn verify_audit_ledger(
+        &self,
+        req: Request<VerifyAuditLedgerRequest>,
+    ) -> Result<Response<VerifyAuditLedgerResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        // The chain walk re-hashes every entry since the last purge anchor;
+        // keep that off the async executor threads.
+        let db = self.db.clone();
+        let report = tokio::task::spawn_blocking(move || db.verify_ledger())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(VerifyAuditLedgerResponse {
+            ok: report.ok,
+            entries_checked: report.entries_checked,
+            first_bad_seq: report.first_bad_seq,
+            error: report.error,
+            anchor_seq: report.anchor_seq,
+            head_seq: report.head_seq,
+            head_hash: report.head_hash,
+        }))
+    }
+
+    async fn get_attestation(
+        &self,
+        req: Request<GetAttestationRequest>,
+    ) -> Result<Response<GetAttestationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let id = req.into_inner().id;
+        if id.trim().is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        let attestation = self
+            .db
+            .get_attestation(&id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("attestation not found"))?;
+        // Attestations embed the full policy snapshot; reading policy content
+        // is admin-gated like get_action_policy / list_action_policies.
+        check_action_admin(&self.security, &attestation.policy_scope, &principals)?;
+        Ok(Response::new(GetAttestationResponse {
+            attestation: Some(to_proto_attestation(&attestation)),
+        }))
+    }
+
+    async fn list_attestations(
+        &self,
+        req: Request<ListAttestationsRequest>,
+    ) -> Result<Response<ListAttestationsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let decision_id = (!inner.decision_id.trim().is_empty()).then_some(inner.decision_id);
+        let policy_scope = (!inner.policy_scope.trim().is_empty()).then_some(inner.policy_scope);
+        // Attestations embed full policy snapshots (admin-gated content).
+        // With a scope filter the caller must be admin for that scope; without
+        // one, only the scopes the caller administers are returned.
+        if let Some(scope) = policy_scope.as_deref() {
+            check_action_admin(&self.security, scope, &principals)?;
+        }
+        // Paginate over *visible* rows: scan the table in batches and apply
+        // limit/offset after the admin filter, so partially-privileged
+        // callers get stable pages (mirrors list_decisions). A scan cap
+        // bounds the work when most rows are invisible to the caller.
+        let visible_limit = if inner.limit > 0 {
+            inner.limit as usize
+        } else {
+            100
+        };
+        let visible_offset = inner.offset.max(0) as usize;
+        let batch_size = visible_limit.clamp(50, 200);
+        let max_scan = (visible_offset + visible_limit).saturating_mul(10).max(200);
+        let mut attestations = Vec::new();
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+        let mut scan_offset = 0i32;
+        while attestations.len() < visible_limit && scanned < max_scan {
+            let batch = self
+                .db
+                .list_attestations(
+                    decision_id.as_deref(),
+                    policy_scope.as_deref(),
+                    batch_size as i32,
+                    scan_offset,
+                )
+                .map_err(Status::internal)?;
+            if batch.is_empty() {
+                break;
+            }
+            scan_offset += batch.len() as i32;
+            scanned += batch.len();
+            for attestation in &batch {
+                if check_action_admin(&self.security, &attestation.policy_scope, &principals)
+                    .is_err()
+                {
+                    continue;
+                }
+                if skipped < visible_offset {
+                    skipped += 1;
+                    continue;
+                }
+                if attestations.len() < visible_limit {
+                    attestations.push(to_proto_attestation(attestation));
+                }
+            }
+        }
+        // A short page from an exhausted scan budget must not read like the
+        // end of the data (matches list_decisions).
+        if attestations.len() < visible_limit && scanned >= max_scan {
+            return Err(Status::resource_exhausted(
+                "attestation visibility scan limit exceeded; refine filters",
+            ));
+        }
+        Ok(Response::new(ListAttestationsResponse { attestations }))
+    }
+
+    async fn verify_attestation(
+        &self,
+        req: Request<VerifyAttestationRequest>,
+    ) -> Result<Response<VerifyAttestationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let id = req.into_inner().id;
+        if id.trim().is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        // Verification results expose the replayed decision for a scope's
+        // policy; gate like the other attestation reads.
+        if let Some(attestation) = self.db.get_attestation(&id).map_err(Status::internal)? {
+            check_action_admin(&self.security, &attestation.policy_scope, &principals)?;
+        }
+        let report = self.db.verify_attestation(&id).map_err(Status::internal)?;
+        Ok(Response::new(VerifyAttestationResponse {
+            ok: report.ok,
+            found: report.found,
+            hash_ok: report.hash_ok,
+            replay_ok: report.replay_ok,
+            replayed_decision: report.replayed_decision,
+            decision_linked: report.decision_linked,
+            error: report.error,
+        }))
+    }
+
+    async fn export_assurance(
+        &self,
+        req: Request<ExportAssuranceRequest>,
+    ) -> Result<Response<ExportAssuranceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        if inner.action.trim().is_empty() {
+            return Err(Status::invalid_argument("action required"));
+        }
+        if inner.policy_scope.trim().is_empty() {
+            return Err(Status::invalid_argument("policy_scope required"));
+        }
+        check_action_admin(&self.security, &inner.policy_scope, &principals)?;
+
+        let limit = if inner.limit > 0 {
+            inner.limit.min(200)
+        } else {
+            100
+        };
+        let decisions = self
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                actor: None,
+                action: Some(inner.action),
+                target_id: None,
+                after: inner.after,
+                limit,
+                offset: 0,
+            })
+            .map_err(Status::internal)?;
+        let mut records = Vec::with_capacity(decisions.len());
+        for decision in decisions {
+            if decision.target_id.is_empty()
+                || check_read(&self.security, &decision.target_id, &principals).is_err()
+            {
+                continue;
+            }
+            let attestation = decision
+                .evidence
+                .get(attestation::EVIDENCE_ATTESTATION_ID)
+                .map(String::as_str)
+                .map(|id| self.db.get_attestation(id))
+                .transpose()
+                .map_err(Status::internal)?
+                .flatten()
+                .filter(|proof| proof.policy_scope == inner.policy_scope);
+            let verification = if let Some(proof) = &attestation {
+                let report = self
+                    .db
+                    .verify_attestation(&proof.id)
+                    .map_err(Status::internal)?;
+                Some(VerifyAttestationResponse {
+                    ok: report.ok,
+                    found: report.found,
+                    hash_ok: report.hash_ok,
+                    replay_ok: report.replay_ok,
+                    replayed_decision: report.replayed_decision,
+                    decision_linked: report.decision_linked,
+                    error: report.error,
+                })
+            } else {
+                Some(VerifyAttestationResponse {
+                    ok: false,
+                    found: false,
+                    hash_ok: false,
+                    replay_ok: false,
+                    replayed_decision: String::new(),
+                    decision_linked: false,
+                    error: "no attestation for requested policy scope".into(),
+                })
+            };
+            records.push(AssuranceRecord {
+                decision: Some(Decision {
+                    id: decision.id,
+                    timestamp: decision.timestamp,
+                    actor: decision.actor,
+                    action: decision.action,
+                    reason: decision.reason,
+                    evidence: decision.evidence,
+                    target_id: decision.target_id,
+                    outcome: decision.outcome,
+                }),
+                attestation: attestation.as_ref().map(to_proto_attestation),
+                verification,
+            });
+        }
+
+        let db = self.db.clone();
+        let ledger = tokio::task::spawn_blocking(move || db.verify_ledger())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(ExportAssuranceResponse {
+            records,
+            ledger: Some(VerifyAuditLedgerResponse {
+                ok: ledger.ok,
+                entries_checked: ledger.entries_checked,
+                first_bad_seq: ledger.first_bad_seq,
+                error: ledger.error,
+                anchor_seq: ledger.anchor_seq,
+                head_seq: ledger.head_seq,
+                head_hash: ledger.head_hash,
+            }),
+        }))
     }
 }
 
@@ -5087,6 +5502,96 @@ mod tests {
         assert_eq!(decisions[0].evidence["key"], "[redacted]");
         assert_eq!(decisions[0].evidence["value"], "[redacted]");
         assert_eq!(decisions[0].outcome, "set obj-1.password = [redacted]");
+    }
+
+    #[tokio::test]
+    async fn record_decision_clamps_future_timestamp() {
+        let svc = service();
+        let future = now_millis() + 86_400_000;
+        let recorded = svc
+            .record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: String::new(),
+                    timestamp: future,
+                    actor: "tester".into(),
+                    action: "act".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "done".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        // A future timestamp would pin the ledger's purgeable prefix forever.
+        assert!(recorded.timestamp < future);
+        assert!(recorded.timestamp <= now_millis());
+    }
+
+    #[tokio::test]
+    async fn record_decision_strips_reserved_attestation_evidence_keys() {
+        let svc = service();
+        let recorded = svc
+            .record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: String::new(),
+                    timestamp: 0,
+                    actor: "tester".into(),
+                    action: "act".into(),
+                    reason: String::new(),
+                    evidence: HashMap::from([
+                        ("attestation_id".into(), "forged".into()),
+                        ("attestation_hash".into(), "forged".into()),
+                        ("note".into(), "kept".into()),
+                    ]),
+                    target_id: String::new(),
+                    outcome: "done".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert!(!recorded.evidence.contains_key("attestation_id"));
+        assert!(!recorded.evidence.contains_key("attestation_hash"));
+        assert_eq!(recorded.evidence["note"], "kept");
+        let stored = svc.db.get_decision(&recorded.id).unwrap().unwrap();
+        assert!(!stored.evidence.contains_key("attestation_id"));
+        assert!(!stored.evidence.contains_key("attestation_hash"));
+    }
+
+    #[tokio::test]
+    async fn verify_audit_ledger_reports_clean_chain() {
+        let svc = service();
+        for i in 0..3 {
+            svc.record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    id: format!("d{i}"),
+                    timestamp: 0,
+                    actor: "tester".into(),
+                    action: "act".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "done".into(),
+                }),
+            }))
+            .await
+            .unwrap();
+        }
+        let report = svc
+            .verify_audit_ledger(with_principal(VerifyAuditLedgerRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(report.ok, "{}", report.error);
+        assert_eq!(report.entries_checked, 3);
+        assert_eq!(report.head_seq, 3);
+        assert!(!report.head_hash.is_empty());
     }
 
     #[tokio::test]
@@ -9719,6 +10224,175 @@ mod tests {
         assert_eq!(decisions[0].evidence["risk_class"], "destructive");
         assert_eq!(decisions[0].evidence["decision"], "deny");
         assert_eq!(decisions[0].evidence["policy_scope"], "agent:tester");
+
+        // The denial carries a verifiable attestation of the policy applied.
+        // Attestation reads expose the policy snapshot, so they are gated on
+        // action admin like direct policy reads.
+        let attestation_id = decisions[0].evidence["attestation_id"].clone();
+        let denied = svc
+            .get_attestation(with_principal(GetAttestationRequest {
+                id: attestation_id.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        let hidden = svc
+            .list_attestations(with_principal(ListAttestationsRequest {
+                decision_id: String::new(),
+                policy_scope: String::new(),
+                limit: 0,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .attestations;
+        assert!(hidden.is_empty());
+
+        grant_action_admin(&svc);
+        let listed = svc
+            .list_attestations(with_principal(ListAttestationsRequest {
+                decision_id: decisions[0].id.clone(),
+                policy_scope: String::new(),
+                limit: 0,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .attestations;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, attestation_id);
+        assert_eq!(listed[0].decision, "deny");
+        assert_eq!(listed[0].policy_scope, "agent:tester");
+        assert_eq!(listed[0].inputs["action"], "delete_link");
+        assert_eq!(listed[0].inputs["risk_class"], "destructive");
+
+        let report = svc
+            .verify_attestation(with_principal(VerifyAttestationRequest {
+                id: attestation_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(report.ok, "{}", report.error);
+        assert!(report.hash_ok);
+        assert!(report.replay_ok);
+        assert!(report.decision_linked);
+        assert_eq!(report.replayed_decision, "deny");
+
+        let export = svc
+            .export_assurance(with_principal(ExportAssuranceRequest {
+                action: "delete_link".into(),
+                policy_scope: "agent:tester".into(),
+                after: 0,
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(export.records.len(), 1);
+        assert_eq!(
+            export.records[0].decision.as_ref().unwrap().action,
+            "delete_link"
+        );
+        assert_eq!(
+            export.records[0].attestation.as_ref().unwrap().policy_scope,
+            "agent:tester"
+        );
+        assert!(export.records[0].verification.as_ref().unwrap().ok);
+        assert!(export.ledger.as_ref().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn list_attestations_paginates_over_visible_rows_only() {
+        let svc = service();
+        // tester administers scope-a only; scope-b attestations stay hidden.
+        let grant = security::Grant {
+            id: "scope-a-admin".into(),
+            object_id: action_object_id("scope-a"),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+
+        for (scope, created) in [
+            ("scope-a", 300),
+            ("scope-b", 250),
+            ("scope-a", 200),
+            ("scope-b", 150),
+            ("scope-a", 100),
+        ] {
+            let attestation =
+                attestation::build_action_attestation(attestation::ActionAttestationInput {
+                    decision_id: &format!("dec-{scope}-{created}"),
+                    policy: &action_policy::ActionPolicy::allow_all(scope),
+                    action: "set_property",
+                    actor: "tester",
+                    risk: action::RiskClass::Write,
+                    namespace: "default",
+                    decision: action_policy::ActionDecision::Allow,
+                    created,
+                });
+            svc.db.insert_attestation(&attestation).unwrap();
+        }
+
+        // limit/offset apply to visible rows: skipping 1 of the 3 visible
+        // scope-a rows (created DESC) yields the 200 and 100 entries, even
+        // though hidden scope-b rows are interleaved in the raw table order.
+        let page = svc
+            .list_attestations(with_principal(ListAttestationsRequest {
+                decision_id: String::new(),
+                policy_scope: String::new(),
+                limit: 2,
+                offset: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .attestations;
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|a| a.policy_scope == "scope-a"));
+        assert_eq!(page[0].created, 200);
+        assert_eq!(page[1].created, 100);
+    }
+
+    #[tokio::test]
+    async fn execute_action_without_policy_records_no_attestation() {
+        let svc = service();
+        seed_domain_object(&svc, "obj-1");
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_property".into(),
+                params: HashMap::from([
+                    ("id".into(), "obj-1".into()),
+                    ("key".into(), "status".into()),
+                    ("value".into(), "ok".into()),
+                ]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(!decisions[0].evidence.contains_key("attestation_id"));
+        assert!(
+            svc.db
+                .list_attestations(None, None, 10, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
