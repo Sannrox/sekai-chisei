@@ -1804,6 +1804,7 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         let policy = policy_from_request(&r);
         let policy_data_class = policy.data_class.clone();
+        let policy_version = policy.version();
         persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
         self.policy.set_namespace_policy(&r.namespace, policy);
         let (runtime, model) = self
@@ -1818,6 +1819,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
                 route_bias: String::new(),
+                policy_scope: r.namespace,
+                policy_version,
             }),
         }))
     }
@@ -2064,6 +2067,14 @@ impl ChiseiService for ChiseiServiceImpl {
                     .unwrap_or_default(),
                 data_class: data_class.as_str().into(),
                 route_bias: route_bias.unwrap_or_default().to_string(),
+                policy_scope: effective_policy
+                    .as_ref()
+                    .map(|_| policy_scope.clone())
+                    .unwrap_or_default(),
+                policy_version: effective_policy
+                    .as_ref()
+                    .map(|policy| policy.version())
+                    .unwrap_or_default(),
             }),
         }))
     }
@@ -2073,7 +2084,12 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<CheckEgressRequest>,
     ) -> Result<Response<CheckEgressResponse>, Status> {
         let r = req.into_inner();
-        let data_class = self.data_class(self.policy.effective_policy(&r.namespace).as_ref());
+        let effective_policy = self.policy.effective_policy(&r.namespace);
+        let policy_version = effective_policy
+            .as_ref()
+            .map(|policy| policy.version())
+            .unwrap_or_default();
+        let data_class = self.data_class(effective_policy.as_ref());
         let provider_is_external = crate::chisei::egress::is_external_provider(&r.provider);
         let task_class = TaskClass::parse(&r.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
@@ -2095,6 +2111,7 @@ impl ChiseiService for ChiseiServiceImpl {
             return Ok(Response::new(CheckEgressResponse {
                 allowed: false,
                 findings,
+                policy_version,
             }));
         }
         let findings =
@@ -2105,6 +2122,7 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(CheckEgressResponse {
             allowed,
             findings: leak_findings_to_decisions(&r.provider, provider_is_external, &findings),
+            policy_version,
         }))
     }
 
@@ -2240,9 +2258,21 @@ impl ChiseiService for ChiseiServiceImpl {
         if event.id.trim().is_empty() {
             event.id = uuid::Uuid::new_v4().to_string();
         }
-        if event.timestamp <= 0 {
-            event.timestamp = chrono::Utc::now().timestamp_millis();
+        // Clamp to server time: a future timestamp would pin the purgeable
+        // prefix of the hash-chained ledger and silently stop retention.
+        let now = chrono::Utc::now().timestamp_millis();
+        if event.timestamp <= 0 || event.timestamp > now {
+            event.timestamp = now;
         }
+        // Reserved keys: only the server-side attestation binding may claim
+        // one, otherwise a caller could dress up an arbitrary audit event as
+        // policy-attested.
+        event
+            .evidence
+            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_ID);
+        event
+            .evidence
+            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_HASH);
         if event.target_id.trim().is_empty() {
             event.target_id = "llm_calls".to_string();
         }
@@ -3883,6 +3913,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_gateway_audit_strips_reserved_attestation_evidence_keys() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
+        let event = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: String::new(),
+                    timestamp: 0,
+                    actor: "codex-app".into(),
+                    action: "gateway.model_rewrite".into(),
+                    reason: String::new(),
+                    evidence: HashMap::from([
+                        ("attestation_id".into(), "forged".into()),
+                        ("attestation_hash".into(), "forged".into()),
+                        ("request_id".into(), "req-1".into()),
+                    ]),
+                    target_id: String::new(),
+                    outcome: "routed".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .event
+            .unwrap();
+        assert!(!event.evidence.contains_key("attestation_id"));
+        assert!(!event.evidence.contains_key("attestation_hash"));
+        assert_eq!(event.evidence["request_id"], "req-1");
+        let stored = db.get_decision(&event.id).unwrap().unwrap();
+        assert!(!stored.evidence.contains_key("attestation_id"));
+        assert!(!stored.evidence.contains_key("attestation_hash"));
+    }
+
+    #[tokio::test]
+    async fn record_gateway_audit_clamps_future_timestamp() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        let event = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: String::new(),
+                    timestamp: future,
+                    actor: "codex-app".into(),
+                    action: "gateway.model_rewrite".into(),
+                    reason: String::new(),
+                    evidence: HashMap::new(),
+                    target_id: String::new(),
+                    outcome: "routed".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .event
+            .unwrap();
+        // A future timestamp would pin the ledger's purgeable prefix forever.
+        assert!(event.timestamp < future);
+        assert!(event.timestamp <= chrono::Utc::now().timestamp_millis());
+    }
+
+    #[tokio::test]
     async fn set_namespace_policy_applies_to_resolve_policy() {
         let svc = memory_service();
         svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
@@ -3910,6 +4002,8 @@ mod tests {
 
         assert_eq!(resolved.runtime, "openai");
         assert_eq!(resolved.model, "native-default");
+        assert_eq!(resolved.policy_scope, "sekai-chisei");
+        assert_eq!(resolved.policy_version.len(), 64);
     }
 
     #[tokio::test]
@@ -4845,6 +4939,7 @@ mod tests {
             .into_inner();
 
         assert!(!response.allowed);
+        assert_eq!(response.policy_version.len(), 64);
         assert!(response.findings.iter().any(|decision| {
             decision
                 .reasons

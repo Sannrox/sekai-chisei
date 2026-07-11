@@ -1005,23 +1005,17 @@ fn insert_registry_decision(
     evidence: BTreeMap<String, String>,
     now: i64,
 ) -> Result<(), CapabilityRegistryError> {
-    let evidence = serde_json::to_string(&evidence).map_err(registry_storage)?;
-    conn.execute(
-        "INSERT INTO sekai_decisions \
-         (id, timestamp, actor, action, reason, evidence, target_id, outcome) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            uuid::Uuid::new_v4().to_string(),
-            now,
-            actor,
-            action,
-            reason,
-            evidence,
-            target_id,
-            outcome,
-        ],
-    )
-    .map_err(registry_storage)?;
+    let decision = crate::sekai::audit::Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now,
+        actor: actor.into(),
+        action: action.into(),
+        reason: reason.into(),
+        evidence: evidence.into_iter().collect(),
+        target_id: target_id.into(),
+        outcome: outcome.into(),
+    };
+    crate::sekai::ledger::insert_chained_decision(conn, &decision).map_err(registry_storage)?;
     Ok(())
 }
 

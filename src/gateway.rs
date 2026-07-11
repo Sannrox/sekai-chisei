@@ -403,6 +403,8 @@ async fn proxy_gateway(
         request_bytes,
         started_ms,
         route_bias: None,
+        policy_scope: None,
+        policy_version: None,
         task_class: task_class.clone(),
     };
     if state.config.no_preflight && context_request.is_some() {
@@ -418,6 +420,8 @@ async fn proxy_gateway(
             resolved_model: requested_model.clone(),
             resolved_provider: client_provider,
             route_bias: None,
+            policy_scope: None,
+            policy_version: None,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -539,6 +543,8 @@ async fn proxy_gateway(
                     request_bytes,
                     started_ms,
                     route_bias: resolved.route_bias,
+                    policy_scope: resolved.policy_scope,
+                    policy_version: resolved.policy_version,
                     task_class,
                 },
                 prepared.response_adapter,
@@ -567,6 +573,8 @@ struct UsageContext {
     request_bytes: usize,
     started_ms: i64,
     route_bias: Option<String>,
+    policy_scope: Option<String>,
+    policy_version: Option<String>,
     task_class: String,
 }
 
@@ -722,6 +730,8 @@ struct PolicyPreflight {
     resolved_model: Option<String>,
     resolved_provider: ProviderKind,
     route_bias: Option<String>,
+    policy_scope: Option<String>,
+    policy_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +863,8 @@ async fn resolve_policy_preflight(
             resolved_model: None,
             resolved_provider: provider,
             route_bias: None,
+            policy_scope: None,
+            policy_version: None,
         });
     };
     let Some(target) = &config.chisei_grpc_target else {
@@ -861,6 +873,8 @@ async fn resolve_policy_preflight(
             resolved_model: Some(requested_model.to_string()),
             resolved_provider: provider,
             route_bias: None,
+            policy_scope: None,
+            policy_version: None,
         });
     };
     match connect_sekai(target).await {
@@ -986,6 +1000,10 @@ async fn resolve_policy_preflight(
                         resolved_model: Some(resolution.model),
                         resolved_provider,
                         route_bias: Some(resolution.route_bias).filter(|bias| !bias.is_empty()),
+                        policy_scope: Some(resolution.policy_scope)
+                            .filter(|scope| !scope.is_empty()),
+                        policy_version: Some(resolution.policy_version)
+                            .filter(|version| !version.is_empty()),
                     })
                 }
                 Err(err) if err.code() == tonic::Code::InvalidArgument => {
@@ -1006,6 +1024,8 @@ async fn resolve_policy_preflight(
                         resolved_model: Some(requested_model.to_string()),
                         resolved_provider: provider,
                         route_bias: None,
+                        policy_scope: None,
+                        policy_version: None,
                     })
                 }
             }
@@ -1022,6 +1042,8 @@ async fn resolve_policy_preflight(
                 resolved_model: Some(requested_model.to_string()),
                 resolved_provider: provider,
                 route_bias: None,
+                policy_scope: None,
+                policy_version: None,
             })
         }
     }
@@ -3693,6 +3715,20 @@ async fn record_usage_and_append(
                 .filter(|bias| !bias.is_empty())
             {
                 values.insert("route_bias".to_string(), route_bias.to_string());
+            }
+            if let Some(policy_scope) = context
+                .policy_scope
+                .as_deref()
+                .filter(|scope| !scope.is_empty())
+            {
+                values.insert("policy_scope".to_string(), policy_scope.to_string());
+            }
+            if let Some(policy_version) = context
+                .policy_version
+                .as_deref()
+                .filter(|version| !version.is_empty())
+            {
+                values.insert("policy_version".to_string(), policy_version.to_string());
             }
             if let Some(observation) = &pipeline_observation {
                 values.insert(
