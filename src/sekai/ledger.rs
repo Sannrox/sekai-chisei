@@ -25,6 +25,8 @@ use crate::sekai::audit::Decision;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+type LedgerRow = (Decision, String, i64, String, String);
+
 /// Verification report for the decision ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerVerification {
@@ -293,7 +295,7 @@ impl SekaiDb {
         loop {
             // NULL seqs sort first in ASC order, so unchained rows surface in
             // the first batch and fail parsing below.
-            let batch: Vec<rusqlite::Result<(Decision, String, i64, String, String)>> = {
+            let batch: Vec<rusqlite::Result<LedgerRow>> = {
                 let conn = self.conn();
                 let mut stmt = conn
                     .prepare(

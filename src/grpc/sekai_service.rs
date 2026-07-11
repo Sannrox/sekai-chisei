@@ -1290,16 +1290,16 @@ fn attest_action_decision(
     evidence: &mut HashMap<String, String>,
 ) -> Option<attestation::PolicyAttestation> {
     let policy = policy?;
-    let record = attestation::build_action_attestation(
+    let record = attestation::build_action_attestation(attestation::ActionAttestationInput {
         decision_id,
         policy,
-        action_name,
+        action: action_name,
         actor,
         risk,
         namespace,
         decision,
-        now_millis(),
-    );
+        created: now_millis(),
+    });
     evidence.insert(
         attestation::EVIDENCE_ATTESTATION_ID.into(),
         record.id.clone(),
@@ -10325,16 +10325,17 @@ mod tests {
             ("scope-b", 150),
             ("scope-a", 100),
         ] {
-            let attestation = attestation::build_action_attestation(
-                &format!("dec-{scope}-{created}"),
-                &action_policy::ActionPolicy::allow_all(scope),
-                "set_property",
-                "tester",
-                action::RiskClass::Write,
-                "default",
-                action_policy::ActionDecision::Allow,
-                created,
-            );
+            let attestation =
+                attestation::build_action_attestation(attestation::ActionAttestationInput {
+                    decision_id: &format!("dec-{scope}-{created}"),
+                    policy: &action_policy::ActionPolicy::allow_all(scope),
+                    action: "set_property",
+                    actor: "tester",
+                    risk: action::RiskClass::Write,
+                    namespace: "default",
+                    decision: action_policy::ActionDecision::Allow,
+                    created,
+                });
             svc.db.insert_attestation(&attestation).unwrap();
         }
 

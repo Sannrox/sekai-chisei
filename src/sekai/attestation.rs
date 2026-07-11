@@ -107,34 +107,36 @@ pub fn attestation_content_hash(a: &PolicyAttestation) -> String {
 
 /// Build an attestation for an action-policy decision. The caller supplies
 /// the audit decision id it will record so the two records cross-reference.
-pub fn build_action_attestation(
-    decision_id: &str,
-    policy: &ActionPolicy,
-    action: &str,
-    actor: &str,
-    risk: RiskClass,
-    namespace: &str,
-    decision: ActionDecision,
-    created: i64,
-) -> PolicyAttestation {
-    let snapshot = snapshot_action_policy(policy);
+pub struct ActionAttestationInput<'a> {
+    pub decision_id: &'a str,
+    pub policy: &'a ActionPolicy,
+    pub action: &'a str,
+    pub actor: &'a str,
+    pub risk: RiskClass,
+    pub namespace: &'a str,
+    pub decision: ActionDecision,
+    pub created: i64,
+}
+
+pub fn build_action_attestation(input: ActionAttestationInput<'_>) -> PolicyAttestation {
+    let snapshot = snapshot_action_policy(input.policy);
     let version = policy_version(&snapshot);
     let mut attestation = PolicyAttestation {
         id: uuid::Uuid::new_v4().to_string(),
-        decision_id: decision_id.to_string(),
+        decision_id: input.decision_id.to_string(),
         policy_kind: ACTION_POLICY_KIND.to_string(),
-        policy_scope: policy.scope.clone(),
+        policy_scope: input.policy.scope.clone(),
         policy_version: version,
         policy_snapshot: snapshot,
         inputs: HashMap::from([
-            ("action".to_string(), action.to_string()),
-            ("actor".to_string(), actor.to_string()),
-            ("risk_class".to_string(), risk.as_str().to_string()),
-            ("namespace".to_string(), namespace.to_string()),
+            ("action".to_string(), input.action.to_string()),
+            ("actor".to_string(), input.actor.to_string()),
+            ("risk_class".to_string(), input.risk.as_str().to_string()),
+            ("namespace".to_string(), input.namespace.to_string()),
         ]),
-        decision: decision.as_str().to_string(),
+        decision: input.decision.as_str().to_string(),
         content_hash: String::new(),
-        created,
+        created: input.created,
     };
     attestation.content_hash = attestation_content_hash(&attestation);
     attestation
@@ -370,16 +372,16 @@ mod tests {
     }
 
     fn attest(decision_id: &str) -> PolicyAttestation {
-        build_action_attestation(
+        build_action_attestation(ActionAttestationInput {
             decision_id,
-            &policy(),
-            "delete_object",
-            "tester",
-            RiskClass::Destructive,
-            "default",
-            ActionDecision::Deny,
-            1_000,
-        )
+            policy: &policy(),
+            action: "delete_object",
+            actor: "tester",
+            risk: RiskClass::Destructive,
+            namespace: "default",
+            decision: ActionDecision::Deny,
+            created: 1_000,
+        })
     }
 
     fn record_linked_decision(db: &SekaiDb, attestation: &PolicyAttestation) {
