@@ -25,6 +25,9 @@ use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::sekai::SekaiDb;
 use crate::domain::{ListFilter, Object};
+use crate::sekai::coordination::{
+    RESERVATION_STATUS_ACTIVE, ReservationFilter, WORK_UNIT_STATUS_RUNNING,
+};
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -1262,6 +1265,38 @@ fn budget_subject(
     Err(Status::invalid_argument("budget subject required"))
 }
 
+fn active_continuation_allocation(
+    db: &SekaiDb,
+    work_unit_id: &str,
+    budget_identities: &[&str],
+    now_ms: i64,
+) -> bool {
+    let Ok(Some(work_unit)) = db.get_work_unit(work_unit_id) else {
+        return false;
+    };
+    if work_unit.status != WORK_UNIT_STATUS_RUNNING
+        || !budget_identities.iter().any(|identity| {
+            *identity == work_unit.owner_principal || *identity == work_unit.creator_principal
+        })
+    {
+        return false;
+    }
+    db.list_reservations(&ReservationFilter {
+        work_unit_id: Some(work_unit_id.to_string()),
+        status: Some(RESERVATION_STATUS_ACTIVE.to_string()),
+        ..Default::default()
+    })
+    .is_ok_and(|reservations| {
+        reservations.iter().any(|reservation| {
+            reservation.released_at == 0
+                && reservation.expires_at > now_ms
+                && budget_identities
+                    .iter()
+                    .any(|identity| *identity == reservation.lease_owner)
+        })
+    })
+}
+
 fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
     let mut scopes = Vec::new();
     push_scope(&mut scopes, req.subject.trim());
@@ -1287,9 +1322,10 @@ fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option<&'static s
     if eval_regressed {
         return None;
     }
-    match task_class.trim().to_ascii_lowercase().as_str() {
-        "background" | "bulk" | "batch" | "small_fast" | "small-fast" => Some("cheap"),
-        _ => None,
+    if crate::chisei::model_routing::is_cheap_eligible_task_class(task_class) {
+        Some("cheap")
+    } else {
+        None
     }
 }
 
@@ -1330,6 +1366,26 @@ fn portfolio_runtime_for_model(
                     .any(|allowed| allowed == model_runtime)
         })
         .map(|_| model_runtime.to_string())
+}
+
+fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str) -> Option<String> {
+    let runtime = crate::llm::provider_name(model);
+    if runtime != "ollama" {
+        return None;
+    }
+    match policy {
+        None => Some(runtime.to_string()),
+        Some(policy)
+            if policy.allowed_runtimes.is_empty()
+                || policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == runtime) =>
+        {
+            Some(runtime.to_string())
+        }
+        Some(_) => None,
+    }
 }
 
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
@@ -1607,10 +1663,65 @@ impl ChiseiService for ChiseiServiceImpl {
             &r.work_unit,
             &r.user_id,
         )?;
-        let allowed = self
+        let within_cap = self
             .budget
             .check_with_metric(&budget_subject, r.estimated_tokens, metric)
             .is_ok();
+        let pressure = self
+            .budget
+            .projected_pressure_percent(&budget_subject, r.estimated_tokens, metric)
+            .unwrap_or(0);
+        let mut route_bias = self
+            .budget
+            .route_bias(&budget_subject, r.estimated_tokens, metric, &r.task_class)
+            .as_str()
+            .to_string();
+        // Continuation authority is derived entirely from durable server-side
+        // coordination state. `mid_task` is compatibility metadata only and
+        // must never authorize a hard-cap exception.
+        let continuation_started = !r.work_unit.trim().is_empty()
+            && active_continuation_allocation(
+                &self.db,
+                &r.work_unit,
+                &[r.agent.as_str(), r.key_id.as_str(), r.user_id.as_str()],
+                chrono::Utc::now().timestamp_millis(),
+            )
+            && self
+                .budget
+                .get_usage_with_metric(&budget_subject, metric)
+                .tokens_used
+                > 0;
+        let (allowed, degradation_level, warning) = if within_cap {
+            if continuation_started || pressure >= 90 {
+                (
+                    true,
+                    if route_bias == "cheap" {
+                        "cheap_cloud"
+                    } else {
+                        "warn"
+                    },
+                    true,
+                )
+            } else if route_bias == "cheap" {
+                (true, "cheap_cloud", false)
+            } else {
+                (true, "capable", false)
+            }
+        } else if metric == crate::db::chisei_budget::METRIC_TOKENS && continuation_started {
+            (true, "warn", true)
+        } else if metric == crate::db::chisei_budget::METRIC_TOKENS
+            && r.local_free_available
+            && crate::chisei::model_routing::is_cheap_eligible_task_class(&r.task_class)
+        {
+            route_bias = "local_free".to_string();
+            // This is a provisional route recommendation, not permission to
+            // exceed the cap. The gateway must resolve it to a verified local
+            // model before execution; direct CheckBudget consumers still see
+            // the hard enforcement decision in `allowed`.
+            (false, "local_free", true)
+        } else {
+            (false, "hard_cap", true)
+        };
         let u = self.budget.get_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(CheckBudgetResponse {
             allowed,
@@ -1621,6 +1732,9 @@ impl ChiseiService for ChiseiServiceImpl {
                 period_type: u.period_type.as_str().into(),
                 period_start: u.period_start,
             }),
+            route_bias,
+            degradation_level: degradation_level.to_string(),
+            warning,
         }))
     }
 
@@ -1843,11 +1957,42 @@ impl ChiseiService for ChiseiServiceImpl {
                 };
                 (fallback, None)
             });
-        let regression_signal = self
-            .eval
-            .namespace_regression_signal(&policy_scope)
-            .filter(|signal| signal.regressed);
-        let preferred_model = regression_signal
+        let mut regression_scopes = vec![policy_scope.as_str()];
+        if !r.namespace.trim().is_empty() && r.namespace != policy_scope {
+            regression_scopes.push(r.namespace.as_str());
+        }
+        let mut regression_reasons = Vec::new();
+        for scope in regression_scopes {
+            let namespace_signal = self
+                .eval
+                .namespace_regression_signal(scope)
+                .filter(|signal| signal.regressed);
+            let task_class_signal = crate::chisei::scoring::task_class_regression_signal(
+                &self.db,
+                scope,
+                &r.task_class,
+            );
+            let namespace_created = namespace_signal
+                .as_ref()
+                .and_then(|signal| signal.iteration.as_ref())
+                .map(|iteration| iteration.created)
+                .unwrap_or(i64::MIN);
+            if let Some(signal) = task_class_signal
+                && signal.observed_at >= namespace_created
+            {
+                if signal.regressed {
+                    regression_reasons.push(signal.reason);
+                }
+                continue;
+            }
+            if let Some(signal) = namespace_signal {
+                regression_reasons.push(signal.reason);
+            }
+        }
+        let eval_regressed = !regression_reasons.is_empty();
+        let eval_regression_reason = regression_reasons.join(" | ");
+        let preferred_model = eval_regressed
+            .then_some(())
             .as_ref()
             .and(effective_policy.as_ref())
             .map(|policy| policy.default_model.as_str())
@@ -1915,8 +2060,41 @@ impl ChiseiService for ChiseiServiceImpl {
             || self
                 .active_promotions
                 .capable_override_active(&r.namespace, &normalized_task_class);
+        let wants_local_free = r.budget_route_bias == "local_free";
+        if wants_local_free && (eval_regressed || capable_override_active) {
+            let safety_reason = if eval_regressed {
+                eval_regression_reason.as_str()
+            } else {
+                "an active capable-tier override"
+            };
+            return Err(Status::resource_exhausted(format!(
+                "hard budget cap reached and the local-free tier is blocked by the quality safety net: {safety_reason}"
+            )));
+        }
+        let local_free_model = if wants_local_free {
+            self.resolve_live_model(
+                "ollama/cheap",
+                effective_policy.as_ref(),
+                Some("cheap"),
+                safe_only,
+                &safe_providers,
+            )
+            .await
+            .ok()
+            .and_then(|model| {
+                local_free_runtime_for_model(effective_policy.as_ref(), &model)
+                    .map(|local_runtime| (local_runtime, model))
+            })
+        } else {
+            None
+        };
+        if wants_local_free && local_free_model.is_none() {
+            return Err(Status::resource_exhausted(
+                "hard budget cap reached and no policy-allowed local-free model is available",
+            ));
+        }
         let wants_cheap = !capable_override_active
-            && cheap_route_bias(&r.task_class, regression_signal.is_some()) == Some("cheap");
+            && cheap_route_bias(&r.task_class, eval_regressed) == Some("cheap");
         let cheap_model = if wants_cheap && is_known_provider_runtime(&runtime) {
             self.resolve_live_model(
                 &format!("{}/cheap", runtime.trim()),
@@ -1933,14 +2111,20 @@ impl ChiseiService for ChiseiServiceImpl {
         // Record the cheap bias only when it produced an actual demotion to a
         // strictly cheaper cost tier, so the audited route_bias reflects
         // realized cost reductions rather than intent or equal-cost swaps.
-        let (mut model, mut route_bias) = match cheap_model {
-            Some(cheap)
-                if crate::chisei::model_routing::named_model_cost_rank(&cheap)
-                    < crate::chisei::model_routing::named_model_cost_rank(&capable_model) =>
-            {
-                (cheap, Some("cheap"))
+        let (mut model, mut route_bias) = match local_free_model {
+            Some((local_runtime, local_model)) => {
+                runtime = local_runtime;
+                (local_model, Some("local_free"))
             }
-            _ => (capable_model.clone(), None),
+            None => match cheap_model {
+                Some(cheap)
+                    if crate::chisei::model_routing::named_model_cost_rank(&cheap)
+                        < crate::chisei::model_routing::named_model_cost_rank(&capable_model) =>
+                {
+                    (cheap, Some("cheap"))
+                }
+                _ => (capable_model.clone(), None),
+            },
         };
 
         // Portfolio routing supersedes the static cheap/capable heuristic when
@@ -1964,9 +2148,9 @@ impl ChiseiService for ChiseiServiceImpl {
                         .map(|objective| (r.namespace.clone(), objective))
                 }
             });
-        if let Some((portfolio_scope, objective)) = objective {
+        if !wants_local_free && let Some((portfolio_scope, objective)) = objective {
             let now = chrono::Utc::now().timestamp_millis();
-            if regression_signal.is_some() || capable_override_active {
+            if eval_regressed || capable_override_active {
                 if let Ok(selection) = self.portfolio.damped_route(
                     &portfolio_scope,
                     &normalized_task_class,
@@ -2061,10 +2245,8 @@ impl ChiseiService for ChiseiServiceImpl {
             resolution: Some(PolicyResolution {
                 runtime,
                 model,
-                eval_regressed: regression_signal.is_some(),
-                eval_regression_reason: regression_signal
-                    .map(|signal| signal.reason)
-                    .unwrap_or_default(),
+                eval_regressed,
+                eval_regression_reason,
                 data_class: data_class.as_str().into(),
                 route_bias: route_bias.unwrap_or_default().to_string(),
                 policy_scope: effective_policy
@@ -3352,6 +3534,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_free_runtime_is_allowed_without_policy_and_respects_explicit_policy() {
+        assert_eq!(
+            local_free_runtime_for_model(None, "ollama/qwen:14b"),
+            Some("ollama".to_string())
+        );
+        assert_eq!(local_free_runtime_for_model(None, "gpt-5.5"), None);
+        let cloud_only = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec![],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        assert_eq!(
+            local_free_runtime_for_model(Some(&cloud_only), "ollama/qwen:14b"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
@@ -3397,6 +3599,145 @@ mod tests {
         assert_eq!(resolution.model, "gpt-5.5-mini");
         assert_eq!(resolution.route_bias, "cheap");
         assert_eq!(resolution.runtime, "openai");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+        create_suite(&svc, "proj").await;
+        for (id, score, timestamp) in [("class-run-1", 95, 100), ("class-run-2", 50, 200)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: "proj".into(),
+                diff_hash: id.into(),
+            }))
+            .await
+            .unwrap();
+        }
+        assert!(
+            svc.eval
+                .namespace_regression_signal("proj")
+                .unwrap()
+                .regressed
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        for (task_class, delta, regressed) in [("background", -80.0, true), ("bulk", 0.0, false)] {
+            svc.db
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: format!("class-signal-{task_class}"),
+                    timestamp: now,
+                    actor: "chisei.scoring".into(),
+                    action: "task_class_signal".into(),
+                    reason: format!("test signal for {task_class}"),
+                    evidence: HashMap::from([
+                        ("delta".into(), format!("{delta:.1}")),
+                        ("regressed".into(), regressed.to_string()),
+                    ]),
+                    target_id: serde_json::to_string(&("proj", task_class)).unwrap(),
+                    outcome: if regressed {
+                        "regressed".into()
+                    } else {
+                        "stable".into()
+                    },
+                })
+                .unwrap();
+        }
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5");
+        background.task_class = "background".into();
+        let reverted = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(reverted.model, "gpt-5.5");
+        assert_eq!(reverted.route_bias, "");
+        assert!(reverted.eval_regressed);
+        assert!(reverted.eval_regression_reason.contains("background"));
+
+        let mut bulk = resolve_policy_request("proj", "openai", "gpt-5.5");
+        bulk.task_class = "bulk".into();
+        let healthy = svc
+            .resolve_policy(Request::new(bulk))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(healthy.model, "gpt-5.5-mini");
+        assert_eq!(healthy.route_bias, "cheap");
+        assert!(!healthy.eval_regressed);
+    }
+
+    #[tokio::test]
+    async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "project-scope",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        for (scope, delta, regressed) in
+            [("project-scope", 0.0, false), ("request-ns", -80.0, true)]
+        {
+            svc.db
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: format!("class-signal-{scope}"),
+                    timestamp: now,
+                    actor: "chisei.scoring".into(),
+                    action: "task_class_signal".into(),
+                    reason: format!("test signal for {scope}"),
+                    evidence: HashMap::from([
+                        ("delta".into(), format!("{delta:.1}")),
+                        ("regressed".into(), regressed.to_string()),
+                    ]),
+                    target_id: serde_json::to_string(&(scope, "background")).unwrap(),
+                    outcome: if regressed {
+                        "regressed".into()
+                    } else {
+                        "stable".into()
+                    },
+                })
+                .unwrap();
+        }
+
+        let mut request = resolve_policy_request("request-ns", "openai", "gpt-5.5");
+        request.project = "project-scope".into();
+        request.task_class = "background".into();
+        let resolved = svc
+            .resolve_policy(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(resolved.route_bias, "");
+        assert!(resolved.eval_regressed);
+        assert!(resolved.eval_regression_reason.contains("request-ns"));
     }
 
     #[tokio::test]
@@ -3457,6 +3798,16 @@ mod tests {
             .unwrap();
         assert_eq!(resolution.model, "gpt-5.5");
         assert_eq!(resolution.route_bias, "");
+
+        let mut local_free = resolve_policy_request("proj", "openai", "gpt-5.5");
+        local_free.task_class = "background".into();
+        local_free.budget_route_bias = "local_free".into();
+        let error = svc
+            .resolve_policy(Request::new(local_free))
+            .await
+            .expect_err("capable override must block local-free degradation");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("active capable-tier override"));
     }
 
     #[tokio::test]
@@ -3653,6 +4004,7 @@ mod tests {
             task_class: String::new(),
             user_id: String::new(),
             expected_calls: 1,
+            budget_route_bias: String::new(),
         }
     }
 
@@ -3832,11 +4184,17 @@ mod tests {
                 key_id: "codex-app".into(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: "background".into(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(allowed.allowed);
+        assert_eq!(allowed.route_bias, "capable");
+        assert_eq!(allowed.degradation_level, "capable");
+        assert!(!allowed.warning);
         assert_eq!(
             allowed.usage.unwrap().user_id,
             "project:sekai-chisei/agent:codex-app"
@@ -3849,11 +4207,33 @@ mod tests {
             project: "sekai-chisei".into(),
             agent: "codex-app".into(),
             key_id: "codex-app".into(),
-            work_unit: String::new(),
+            work_unit: "wu-existing".into(),
             metric: String::new(),
         }))
         .await
         .unwrap();
+
+        let near_cap = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 1,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+                work_unit: String::new(),
+                metric: String::new(),
+                task_class: "background".into(),
+                mid_task: false,
+                local_free_available: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(near_cap.allowed);
+        assert_eq!(near_cap.route_bias, "cheap");
+        assert_eq!(near_cap.degradation_level, "cheap_cloud");
+        assert!(near_cap.warning);
 
         let denied = svc
             .check_budget(Request::new(CheckBudgetRequest {
@@ -3865,11 +4245,192 @@ mod tests {
                 key_id: "codex-app".into(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: "background".into(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(!denied.allowed);
+        assert_eq!(denied.route_bias, "cheap");
+        assert_eq!(denied.degradation_level, "hard_cap");
+        assert!(denied.warning);
+
+        let forged_continuation = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+                work_unit: "wu-new".into(),
+                metric: String::new(),
+                task_class: "reasoning".into(),
+                mid_task: true,
+                local_free_available: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!forged_continuation.allowed);
+        assert_eq!(forged_continuation.degradation_level, "hard_cap");
+
+        let reused_finished_id = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+                work_unit: "wu-existing".into(),
+                metric: String::new(),
+                task_class: "reasoning".into(),
+                mid_task: true,
+                local_free_available: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reused_finished_id.allowed);
+        assert_eq!(reused_finished_id.degradation_level, "hard_cap");
+
+        let local_floor = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+                work_unit: String::new(),
+                metric: String::new(),
+                task_class: "background".into(),
+                mid_task: false,
+                local_free_available: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!local_floor.allowed);
+        assert_eq!(local_floor.route_bias, "local_free");
+        assert_eq!(local_floor.degradation_level, "local_free");
+        assert!(local_floor.warning);
+
+        let reasoning_has_no_cheap_local_floor = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: String::new(),
+                project: "sekai-chisei".into(),
+                agent: "codex-app".into(),
+                key_id: "codex-app".into(),
+                work_unit: String::new(),
+                metric: String::new(),
+                task_class: "reasoning".into(),
+                mid_task: false,
+                local_free_available: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reasoning_has_no_cheap_local_floor.allowed);
+        assert_eq!(reasoning_has_no_cheap_local_floor.route_bias, "capable");
+        assert_eq!(
+            reasoning_has_no_cheap_local_floor.degradation_level,
+            "hard_cap"
+        );
+
+        let now = chrono::Utc::now().timestamp_millis();
+        svc.db
+            .create_contention_scope(&crate::sekai::coordination::ContentionScope {
+                id: "scope-budget-test".into(),
+                name: "budget test".into(),
+                parent_scope_id: String::new(),
+                max_concurrency: 1,
+                admission_policy: crate::sekai::coordination::ADMISSION_POLICY_FIFO.into(),
+                heartbeat_ttl_seconds: 30,
+                timeout_seconds: 60,
+                owner_principal: "codex-app".into(),
+                created: now,
+                updated: now,
+            })
+            .unwrap();
+        svc.db
+            .create_work_unit(&crate::sekai::coordination::WorkUnit {
+                id: "wu-existing".into(),
+                kind: "test".into(),
+                actor: "codex-app".into(),
+                target_object_id: String::new(),
+                status: crate::sekai::coordination::WORK_UNIT_STATUS_PENDING.into(),
+                requested_spec: "continue existing work".into(),
+                scope_id: "scope-budget-test".into(),
+                priority: 0,
+                timeout_seconds: 60,
+                heartbeat_ttl_seconds: 30,
+                created_at: now,
+                admitted_at: 0,
+                started_at: 0,
+                finished_at: 0,
+                last_heartbeat_at: 0,
+                failure_reason: String::new(),
+                cancel_reason: String::new(),
+                owner_principal: "codex-app".into(),
+                creator_principal: "codex-app".into(),
+                idempotency_key: String::new(),
+                updated_at: now,
+            })
+            .unwrap();
+        assert!(
+            svc.db
+                .try_admit_work_unit("wu-existing", "codex-app", now)
+                .unwrap()
+                .admitted
+        );
+        let wrong_identity = svc
+            .check_budget(Request::new(CheckBudgetRequest {
+                user_id: String::new(),
+                estimated_tokens: 3,
+                subject: "project:sekai-chisei/agent:codex-app".into(),
+                project: "sekai-chisei".into(),
+                agent: "attacker".into(),
+                key_id: "attacker".into(),
+                work_unit: "wu-existing".into(),
+                metric: String::new(),
+                task_class: "reasoning".into(),
+                mid_task: true,
+                local_free_available: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!wrong_identity.allowed);
+        assert_eq!(wrong_identity.degradation_level, "hard_cap");
+
+        let continuation_request = Request::new(CheckBudgetRequest {
+            user_id: String::new(),
+            estimated_tokens: 3,
+            subject: String::new(),
+            project: "sekai-chisei".into(),
+            agent: "codex-app".into(),
+            key_id: "codex-app".into(),
+            work_unit: "wu-existing".into(),
+            metric: String::new(),
+            task_class: "reasoning".into(),
+            mid_task: false,
+            local_free_available: false,
+        });
+        let continuation = svc
+            .check_budget(continuation_request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(continuation.allowed);
+        assert_eq!(continuation.route_bias, "capable");
+        assert_eq!(continuation.degradation_level, "warn");
+        assert!(continuation.warning);
     }
 
     #[tokio::test]
@@ -4739,6 +5300,7 @@ mod tests {
                 task_class: String::new(),
                 user_id: String::new(),
                 expected_calls: 1,
+                budget_route_bias: String::new(),
             }))
             .await
             .expect_err("sensitive private preflight should deny unsafe provider");

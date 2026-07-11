@@ -47,16 +47,6 @@ const DECISION_LOOKBACK_MS: i64 = 24 * 60 * 60 * 1000;
 /// history is healthy enough to propose routing it to the cheaper tier.
 const CHEAP_BIAS_PASS_RATE: f64 = 0.9;
 
-/// Whether `cheap_route_bias` (grpc/chisei_service.rs) would ever route this (already-normalized)
-/// task class to the cheaper tier. Mirrored here rather than imported to avoid a
-/// `chisei::promotion` -> `grpc` dependency; keep in sync if that routing vocabulary changes.
-fn is_cheap_eligible(normalized_class: &str) -> bool {
-    matches!(
-        normalized_class,
-        "background" | "bulk" | "batch" | "small_fast" | "small-fast"
-    )
-}
-
 /// Mirrors `scoring::ClassCount`'s JSON shape (`{"pass": N, "total": N}`) stored in the
 /// `task_class_breakdown` audit evidence field.
 #[derive(Deserialize)]
@@ -196,7 +186,9 @@ pub fn propose_routing_bias_candidate(
     // tier are worth a routing-bias proposal in either direction: a "cheap" proposal for e.g.
     // "primary" would never take effect if promoted, and a "capable" revert is meaningless for a
     // class that was never biased cheap to begin with.
-    if namespace.is_empty() || normalized_class.is_empty() || !is_cheap_eligible(&normalized_class)
+    if namespace.is_empty()
+        || normalized_class.is_empty()
+        || !crate::chisei::model_routing::is_cheap_eligible_task_class(&normalized_class)
     {
         return None;
     }
@@ -235,10 +227,12 @@ pub fn propose_routing_bias_candidate(
     }
     let pass_rate = passed as f64 / total as f64;
 
-    let regressed = eval
-        .namespace_regression_signal(namespace)
-        .map(|signal| signal.regressed)
-        .unwrap_or(false);
+    let regressed = crate::chisei::scoring::task_class_or_namespace_regressed(
+        db,
+        eval,
+        namespace,
+        &normalized_class,
+    );
 
     let (bias, rationale) = if regressed {
         (
