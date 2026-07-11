@@ -3121,6 +3121,11 @@ impl SekaiService for SekaiServiceImpl {
         self.refresh_security_after_action(&r.action, &r.params, &actor)?;
         let mut evidence =
             redact_action_evidence(&r.params, &sensitive_params, schema_restricted_property);
+        evidence.insert("risk_class".into(), action_risk.as_str().into());
+        evidence.insert("decision".into(), decision.as_str().into());
+        if !policy_scope.is_empty() {
+            evidence.insert("policy_scope".into(), policy_scope.clone());
+        }
         if !work_unit.is_empty() {
             evidence.insert("work_unit".into(), work_unit.clone());
         }
@@ -3274,7 +3279,12 @@ impl SekaiService for SekaiServiceImpl {
             let mut evidence = HashMap::from([
                 ("approval_id".to_string(), approval.id.clone()),
                 ("policy_scope".to_string(), policy.scope.clone()),
+                ("risk_class".to_string(), action_risk.as_str().into()),
+                ("decision".to_string(), "deny".into()),
             ]);
+            if !approval.work_unit.is_empty() {
+                evidence.insert("work_unit".into(), approval.work_unit.clone());
+            }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
                 Some(policy),
@@ -3352,6 +3362,10 @@ impl SekaiService for SekaiServiceImpl {
             let mut evidence =
                 HashMap::from([("budget_subject".to_string(), budget_subject.clone())]);
             evidence.insert("risk_class".to_string(), action_risk.as_str().into());
+            evidence.insert("decision".to_string(), "deny".into());
+            if !approval.work_unit.is_empty() {
+                evidence.insert("work_unit".into(), approval.work_unit.clone());
+            }
             self.db
                 .record_decision(&audit::Decision {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -3401,7 +3415,17 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?;
         // Attest the policy that permitted the resume, so the executed
         // outcome is as replayable as the hold decision was.
-        let mut evidence = HashMap::from([("approval_id".to_string(), approval.id.clone())]);
+        let mut evidence = HashMap::from([
+            ("approval_id".to_string(), approval.id.clone()),
+            ("risk_class".to_string(), action_risk.as_str().into()),
+            ("decision".to_string(), "approved".into()),
+        ]);
+        if !approval.policy_scope.is_empty() {
+            evidence.insert("policy_scope".into(), approval.policy_scope.clone());
+        }
+        if !approval.work_unit.is_empty() {
+            evidence.insert("work_unit".into(), approval.work_unit.clone());
+        }
         let decision_id = uuid::Uuid::new_v4().to_string();
         let attested = attest_action_decision(
             resolved_policy.as_ref(),
@@ -3475,6 +3499,17 @@ impl SekaiService for SekaiServiceImpl {
         self.db
             .update_action_approval(&approval)
             .map_err(Status::internal)?;
+        let mut evidence = HashMap::from([
+            ("approval_id".into(), approval.id.clone()),
+            ("risk_class".into(), approval.risk_class.clone()),
+            ("decision".into(), "deny".into()),
+        ]);
+        if !approval.policy_scope.is_empty() {
+            evidence.insert("policy_scope".into(), approval.policy_scope.clone());
+        }
+        if !approval.work_unit.is_empty() {
+            evidence.insert("work_unit".into(), approval.work_unit.clone());
+        }
         self.db
             .record_decision(&audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -3482,7 +3517,7 @@ impl SekaiService for SekaiServiceImpl {
                 actor: approval.decided_by.clone(),
                 action: approval.action.clone(),
                 reason: "action_approval_denied".into(),
-                evidence: HashMap::from([("approval_id".into(), approval.id.clone())]),
+                evidence,
                 target_id: approval.target_id.clone(),
                 outcome: approval.outcome.clone(),
             })
@@ -5485,7 +5520,7 @@ mod tests {
         seed_domain_object(&svc, "obj-1");
         grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
 
-        svc.execute_action(with_named_principal(
+        let mut request = with_named_principal(
             ExecuteActionRequest {
                 request: Some(ActionRequest {
                     action: "set_property".into(),
@@ -5499,9 +5534,11 @@ mod tests {
                 dry_run: false,
             },
             "alice",
-        ))
-        .await
-        .unwrap();
+        );
+        request
+            .metadata_mut()
+            .insert("x-chisei-work-unit", "successful-work".parse().unwrap());
+        svc.execute_action(request).await.unwrap();
 
         let decisions = svc
             .db
@@ -5516,6 +5553,9 @@ mod tests {
         assert_eq!(decisions[0].reason, "execute_action");
         assert_eq!(decisions[0].evidence["key"], "[redacted]");
         assert_eq!(decisions[0].evidence["value"], "[redacted]");
+        assert_eq!(decisions[0].evidence["work_unit"], "successful-work");
+        assert_eq!(decisions[0].evidence["risk_class"], "write");
+        assert_eq!(decisions[0].evidence["decision"], "allow");
         assert_eq!(decisions[0].outcome, "set obj-1.password = [redacted]");
     }
 
@@ -10708,11 +10748,13 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert!(
-            decisions
-                .iter()
-                .any(|d| d.reason == "action_approval_approved")
-        );
+        let approved = decisions
+            .iter()
+            .find(|d| d.reason == "action_approval_approved")
+            .unwrap();
+        assert_eq!(approved.evidence["work_unit"], "wu-1");
+        assert_eq!(approved.evidence["risk_class"], "write");
+        assert_eq!(approved.evidence["decision"], "approved");
         assert!(decisions.iter().any(|d| d.reason == "execute_action"));
     }
 
@@ -10735,6 +10777,21 @@ mod tests {
             .unwrap();
         assert_eq!(approval.status, "denied");
         assert_eq!(approval.outcome, "not now");
+
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let denied = decisions
+            .iter()
+            .find(|decision| decision.reason == "action_approval_denied")
+            .unwrap();
+        assert_eq!(denied.evidence["work_unit"], "wu-1");
+        assert_eq!(denied.evidence["risk_class"], "write");
+        assert_eq!(denied.evidence["decision"], "deny");
 
         // No mutation.
         let obj = svc.db.get_object("obj-1").unwrap().unwrap();
