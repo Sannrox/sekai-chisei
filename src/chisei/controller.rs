@@ -165,10 +165,12 @@ pub fn check_rollbacks(
         if payload.bias != "cheap" {
             continue;
         }
-        let regressed = eval
-            .namespace_regression_signal(&candidate.namespace)
-            .map(|signal| signal.regressed)
-            .unwrap_or(false);
+        let regressed = crate::chisei::scoring::task_class_or_namespace_regressed(
+            db,
+            eval,
+            &candidate.namespace,
+            &candidate.task_class,
+        );
         if !regressed {
             continue;
         }
@@ -181,7 +183,7 @@ pub fn check_rollbacks(
             db,
             "rolled_back",
             &rolled,
-            "auto-rolled back: namespace regression detected while promoted",
+            "auto-rolled back: task-class quality regression detected while promoted",
         );
         rolled_back += 1;
     }

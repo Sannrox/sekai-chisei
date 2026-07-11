@@ -227,10 +227,12 @@ pub fn propose_routing_bias_candidate(
     }
     let pass_rate = passed as f64 / total as f64;
 
-    let regressed = eval
-        .namespace_regression_signal(namespace)
-        .map(|signal| signal.regressed)
-        .unwrap_or(false);
+    let regressed = crate::chisei::scoring::task_class_or_namespace_regressed(
+        db,
+        eval,
+        namespace,
+        &normalized_class,
+    );
 
     let (bias, rationale) = if regressed {
         (

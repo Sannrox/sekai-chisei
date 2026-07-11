@@ -1850,11 +1850,42 @@ impl ChiseiService for ChiseiServiceImpl {
                 };
                 (fallback, None)
             });
-        let regression_signal = self
-            .eval
-            .namespace_regression_signal(&policy_scope)
-            .filter(|signal| signal.regressed);
-        let preferred_model = regression_signal
+        let mut regression_scopes = vec![policy_scope.as_str()];
+        if !r.namespace.trim().is_empty() && r.namespace != policy_scope {
+            regression_scopes.push(r.namespace.as_str());
+        }
+        let mut regression_reasons = Vec::new();
+        for scope in regression_scopes {
+            let namespace_signal = self
+                .eval
+                .namespace_regression_signal(scope)
+                .filter(|signal| signal.regressed);
+            let task_class_signal = crate::chisei::scoring::task_class_regression_signal(
+                &self.db,
+                scope,
+                &r.task_class,
+            );
+            let namespace_created = namespace_signal
+                .as_ref()
+                .and_then(|signal| signal.iteration.as_ref())
+                .map(|iteration| iteration.created)
+                .unwrap_or(i64::MIN);
+            if let Some(signal) = task_class_signal
+                && signal.observed_at >= namespace_created
+            {
+                if signal.regressed {
+                    regression_reasons.push(signal.reason);
+                }
+                continue;
+            }
+            if let Some(signal) = namespace_signal {
+                regression_reasons.push(signal.reason);
+            }
+        }
+        let eval_regressed = !regression_reasons.is_empty();
+        let eval_regression_reason = regression_reasons.join(" | ");
+        let preferred_model = eval_regressed
+            .then_some(())
             .as_ref()
             .and(effective_policy.as_ref())
             .map(|policy| policy.default_model.as_str())
@@ -1923,7 +1954,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .active_promotions
                 .capable_override_active(&r.namespace, &normalized_task_class);
         let wants_cheap = !capable_override_active
-            && cheap_route_bias(&r.task_class, regression_signal.is_some()) == Some("cheap");
+            && cheap_route_bias(&r.task_class, eval_regressed) == Some("cheap");
         let cheap_model = if wants_cheap && is_known_provider_runtime(&runtime) {
             self.resolve_live_model(
                 &format!("{}/cheap", runtime.trim()),
@@ -1973,7 +2004,7 @@ impl ChiseiService for ChiseiServiceImpl {
             });
         if let Some((portfolio_scope, objective)) = objective {
             let now = chrono::Utc::now().timestamp_millis();
-            if regression_signal.is_some() || capable_override_active {
+            if eval_regressed || capable_override_active {
                 if let Ok(selection) = self.portfolio.damped_route(
                     &portfolio_scope,
                     &normalized_task_class,
@@ -2068,10 +2099,8 @@ impl ChiseiService for ChiseiServiceImpl {
             resolution: Some(PolicyResolution {
                 runtime,
                 model,
-                eval_regressed: regression_signal.is_some(),
-                eval_regression_reason: regression_signal
-                    .map(|signal| signal.reason)
-                    .unwrap_or_default(),
+                eval_regressed,
+                eval_regression_reason,
                 data_class: data_class.as_str().into(),
                 route_bias: route_bias.unwrap_or_default().to_string(),
                 policy_scope: effective_policy
@@ -3404,6 +3433,145 @@ mod tests {
         assert_eq!(resolution.model, "gpt-5.5-mini");
         assert_eq!(resolution.route_bias, "cheap");
         assert_eq!(resolution.runtime, "openai");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "proj",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+        create_suite(&svc, "proj").await;
+        for (id, score, timestamp) in [("class-run-1", 95, 100), ("class-run-2", 50, 200)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: "proj".into(),
+                diff_hash: id.into(),
+            }))
+            .await
+            .unwrap();
+        }
+        assert!(
+            svc.eval
+                .namespace_regression_signal("proj")
+                .unwrap()
+                .regressed
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        for (task_class, delta, regressed) in [("background", -80.0, true), ("bulk", 0.0, false)] {
+            svc.db
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: format!("class-signal-{task_class}"),
+                    timestamp: now,
+                    actor: "chisei.scoring".into(),
+                    action: "task_class_signal".into(),
+                    reason: format!("test signal for {task_class}"),
+                    evidence: HashMap::from([
+                        ("delta".into(), format!("{delta:.1}")),
+                        ("regressed".into(), regressed.to_string()),
+                    ]),
+                    target_id: serde_json::to_string(&("proj", task_class)).unwrap(),
+                    outcome: if regressed {
+                        "regressed".into()
+                    } else {
+                        "stable".into()
+                    },
+                })
+                .unwrap();
+        }
+        let mut background = resolve_policy_request("proj", "openai", "gpt-5.5");
+        background.task_class = "background".into();
+        let reverted = svc
+            .resolve_policy(Request::new(background))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(reverted.model, "gpt-5.5");
+        assert_eq!(reverted.route_bias, "");
+        assert!(reverted.eval_regressed);
+        assert!(reverted.eval_regression_reason.contains("background"));
+
+        let mut bulk = resolve_policy_request("proj", "openai", "gpt-5.5");
+        bulk.task_class = "bulk".into();
+        let healthy = svc
+            .resolve_policy(Request::new(bulk))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(healthy.model, "gpt-5.5-mini");
+        assert_eq!(healthy.route_bias, "cheap");
+        assert!(!healthy.eval_regressed);
+    }
+
+    #[tokio::test]
+    async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "project-scope",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            },
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        for (scope, delta, regressed) in
+            [("project-scope", 0.0, false), ("request-ns", -80.0, true)]
+        {
+            svc.db
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: format!("class-signal-{scope}"),
+                    timestamp: now,
+                    actor: "chisei.scoring".into(),
+                    action: "task_class_signal".into(),
+                    reason: format!("test signal for {scope}"),
+                    evidence: HashMap::from([
+                        ("delta".into(), format!("{delta:.1}")),
+                        ("regressed".into(), regressed.to_string()),
+                    ]),
+                    target_id: serde_json::to_string(&(scope, "background")).unwrap(),
+                    outcome: if regressed {
+                        "regressed".into()
+                    } else {
+                        "stable".into()
+                    },
+                })
+                .unwrap();
+        }
+
+        let mut request = resolve_policy_request("request-ns", "openai", "gpt-5.5");
+        request.project = "project-scope".into();
+        request.task_class = "background".into();
+        let resolved = svc
+            .resolve_policy(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(resolved.route_bias, "");
+        assert!(resolved.eval_regressed);
+        assert!(resolved.eval_regression_reason.contains("request-ns"));
     }
 
     #[tokio::test]
