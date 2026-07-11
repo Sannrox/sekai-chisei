@@ -363,8 +363,17 @@ message CheckBudgetRequest {
   // - "tokens" (default): compare against token usage
   // - "requests": compare against request counts
   string metric = 8;
+  // Routing value class used for budget-aware model selection. Only explicitly
+  // downgrade-eligible classes (background/bulk/batch/small-fast) may receive
+  // a cheap bias; unknown and reasoning/primary classes fail safe to capable.
+  string task_class = 9;
 }
-message CheckBudgetResponse { bool allowed = 1; BudgetUsage usage = 2; }
+message CheckBudgetResponse {
+  bool allowed = 1;
+  BudgetUsage usage = 2;
+  // Advisory model-routing bias. Enforcement remains represented by `allowed`.
+  string route_bias = 3;
+}
 message RecordUsageRequest {
   string user_id = 1;
   int32 tokens_used = 2;

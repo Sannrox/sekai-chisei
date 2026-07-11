@@ -433,6 +433,7 @@ async fn proxy_gateway(
             &identity,
             request_bytes,
             work_unit_id.as_deref().unwrap_or(""),
+            &task_class,
         )
         .await
         {
@@ -627,6 +628,7 @@ async fn check_budget_preflight(
     identity: &GatewayIdentity,
     request_bytes: usize,
     work_unit: &str,
+    task_class: &str,
 ) -> Result<(), GatewayRejection> {
     let Some(target) = &config.chisei_grpc_target else {
         return Ok(());
@@ -642,6 +644,7 @@ async fn check_budget_preflight(
         key_id: identity.key_id.clone(),
         work_unit: work_unit.to_string(),
         metric: String::new(),
+        task_class: task_class.to_string(),
     };
 
     let check_budget = |req: CheckBudgetRequest| async move {
@@ -3848,6 +3851,7 @@ async fn emit_budget_threshold_warnings(
                 work_unit: String::new(),
                 user_id: String::new(),
                 metric: String::new(),
+                task_class: String::new(),
             }))
             .await;
         let Ok(response) = response else {
@@ -8758,6 +8762,7 @@ mod tests {
                 key_id: "codex-app".to_string(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: String::new(),
             }))
             .await
             .unwrap()
@@ -8774,6 +8779,7 @@ mod tests {
                 key_id: "codex-app".to_string(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: String::new(),
             }))
             .await
             .unwrap()

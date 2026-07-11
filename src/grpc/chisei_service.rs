@@ -1287,9 +1287,10 @@ fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option<&'static s
     if eval_regressed {
         return None;
     }
-    match task_class.trim().to_ascii_lowercase().as_str() {
-        "background" | "bulk" | "batch" | "small_fast" | "small-fast" => Some("cheap"),
-        _ => None,
+    if crate::chisei::model_routing::is_cheap_eligible_task_class(task_class) {
+        Some("cheap")
+    } else {
+        None
     }
 }
 
@@ -1611,6 +1612,11 @@ impl ChiseiService for ChiseiServiceImpl {
             .budget
             .check_with_metric(&budget_subject, r.estimated_tokens, metric)
             .is_ok();
+        let route_bias = self
+            .budget
+            .route_bias(&budget_subject, r.estimated_tokens, metric, &r.task_class)
+            .as_str()
+            .to_string();
         let u = self.budget.get_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(CheckBudgetResponse {
             allowed,
@@ -1621,6 +1627,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 period_type: u.period_type.as_str().into(),
                 period_start: u.period_start,
             }),
+            route_bias,
         }))
     }
 
@@ -3832,11 +3839,13 @@ mod tests {
                 key_id: "codex-app".into(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: "background".into(),
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(allowed.allowed);
+        assert_eq!(allowed.route_bias, "capable");
         assert_eq!(
             allowed.usage.unwrap().user_id,
             "project:sekai-chisei/agent:codex-app"
@@ -3865,11 +3874,13 @@ mod tests {
                 key_id: "codex-app".into(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: "background".into(),
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(!denied.allowed);
+        assert_eq!(denied.route_bias, "cheap");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::db::chisei_budget::METRIC_TOKENS;
+use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
 use crate::db::sekai::SekaiDb;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +54,23 @@ pub enum PressureLevel {
     Moderate,
     Critical,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetRouteBias {
+    Capable,
+    Cheap,
+}
+
+impl BudgetRouteBias {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capable => "capable",
+            Self::Cheap => "cheap",
+        }
+    }
+}
+
+const CHEAP_BIAS_THRESHOLD_PERCENT: i64 = 70;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -175,6 +192,38 @@ impl BudgetTracker {
         }
     }
 
+    /// Maps projected token-budget pressure to an advisory routing bias. The
+    /// most constrained bounded scope in the hierarchy wins. Unknown, primary,
+    /// and reasoning work stay capable by default; request-count quotas never
+    /// influence model selection.
+    pub fn route_bias(
+        &self,
+        scope_id: &str,
+        estimated: i32,
+        metric: &str,
+        task_class: &str,
+    ) -> BudgetRouteBias {
+        if metric != METRIC_TOKENS
+            || !crate::chisei::model_routing::is_cheap_eligible_task_class(task_class)
+        {
+            return BudgetRouteBias::Capable;
+        }
+
+        let projected = i64::from(estimated.max(0));
+        let pressured = scope_chain(scope_id).into_iter().any(|scope| {
+            let usage = self.get_usage_with_metric(&scope, metric);
+            let limit = i64::from(usage.max_tokens);
+            limit > 0
+                && (i64::from(usage.tokens_used).max(0) + projected) * 100
+                    >= limit * CHEAP_BIAS_THRESHOLD_PERCENT
+        });
+        if pressured {
+            BudgetRouteBias::Cheap
+        } else {
+            BudgetRouteBias::Capable
+        }
+    }
+
     pub fn namespace_pressure(&self, namespace: &str) -> PressureLevel {
         let level = self
             .db
@@ -220,6 +269,45 @@ mod tests {
         assert_eq!(t.namespace_pressure("ns1"), PressureLevel::Moderate);
         t.record("ns1:alice", 20);
         assert_eq!(t.namespace_pressure("ns1"), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn budget_bias_downgrades_only_eligible_work_under_chain_pressure() {
+        let t = tracker();
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
+        t.record("project:p/agent:a", 65);
+
+        assert_eq!(
+            t.route_bias("project:p/agent:a", 5, METRIC_TOKENS, "background"),
+            BudgetRouteBias::Cheap
+        );
+        assert_eq!(
+            t.route_bias("project:p/agent:a", 5, METRIC_TOKENS, "primary"),
+            BudgetRouteBias::Capable
+        );
+        assert_eq!(
+            t.route_bias("project:p/agent:a", 5, METRIC_TOKENS, "reasoning"),
+            BudgetRouteBias::Capable
+        );
+        assert_eq!(
+            t.route_bias("project:p/agent:a", 5, METRIC_TOKENS, "unknown"),
+            BudgetRouteBias::Capable
+        );
+    }
+
+    #[test]
+    fn budget_bias_stays_capable_without_pressure_or_for_non_token_quotas() {
+        let t = tracker();
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
+        t.record("project:p", 10);
+        assert_eq!(
+            t.route_bias("project:p", 5, METRIC_TOKENS, "bulk"),
+            BudgetRouteBias::Capable
+        );
+        assert_eq!(
+            t.route_bias("project:p", 100, "requests", "bulk"),
+            BudgetRouteBias::Capable
+        );
     }
 
     #[test]

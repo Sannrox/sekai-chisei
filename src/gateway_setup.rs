@@ -1224,6 +1224,7 @@ mod tests {
                 key_id: "codex-app".to_string(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: String::new(),
             }))
             .await
             .unwrap()
