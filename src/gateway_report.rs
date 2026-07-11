@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use tonic::Request as GrpcRequest;
 
-use crate::grpc::client::connect_sekai;
+use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::CheckBudgetRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
@@ -135,7 +136,7 @@ pub async fn run_report(
     config: GatewayReportConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = connect_sekai(&config.chisei_grpc_target).await?;
-    let mut sekai = SekaiServiceClient::new(channel);
+    let mut sekai = SekaiServiceClient::new(channel.clone());
     let resp = sekai
         .query_rows(gateway_request(QueryRowsRequest {
             dataset_id: LLM_CALLS_DATASET.to_string(),
@@ -180,7 +181,7 @@ pub async fn run_report(
     } else {
         let mut rows = summarize_rows(resp.rows.clone(), config.group_by);
         if config.group_by == ReportGroupBy::WorkUnit {
-            attach_work_unit_budgets(&mut rows, &resp.rows, &config.chisei_grpc_target).await?;
+            attach_work_unit_budgets(&mut rows, &resp.rows, channel).await;
         }
         print_report(config.group_by, &rows);
     }
@@ -310,41 +311,73 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
 async fn attach_work_unit_budgets(
     summaries: &mut [GatewayReportRow],
     source_rows: &[Row],
-    target: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = connect_sekai(target).await?;
-    let mut chisei = ChiseiServiceClient::new(channel);
-    for summary in summaries.iter_mut().filter(|row| row.group != "(unknown)") {
-        let source = source_rows.iter().find(|row| {
-            row.values
-                .get("work_unit_id")
-                .is_some_and(|value| value == &summary.group)
-        });
-        let response = chisei
-            .check_budget(gateway_request(CheckBudgetRequest {
-                subject: String::new(),
-                estimated_tokens: 0,
-                project: source
-                    .and_then(|row| row.values.get("project"))
-                    .cloned()
-                    .unwrap_or_default(),
-                agent: source
-                    .and_then(|row| row.values.get("agent"))
-                    .cloned()
-                    .unwrap_or_default(),
-                key_id: String::new(),
-                work_unit: summary.group.clone(),
-                user_id: String::new(),
-                metric: "tokens".to_string(),
-            }))
-            .await?
-            .into_inner();
-        if let Some(usage) = response.usage {
-            summary.budget_used = i64::from(usage.tokens_used);
-            summary.budget_limit = i64::from(usage.max_tokens);
+    channel: GatewayClient,
+) {
+    let contexts = source_rows
+        .iter()
+        .filter_map(|row| {
+            let work_unit = row.values.get("work_unit_id")?.trim();
+            if work_unit.is_empty() {
+                return None;
+            }
+            Some((
+                work_unit.to_string(),
+                (
+                    row.values.get("project").cloned().unwrap_or_default(),
+                    row.values.get("agent").cloned().unwrap_or_default(),
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let requests = summaries
+        .iter()
+        .filter(|row| row.group != "(unknown)")
+        .map(|summary| {
+            let (project, agent) = contexts.get(&summary.group).cloned().unwrap_or_default();
+            (summary.group.clone(), project, agent)
+        })
+        .collect::<Vec<_>>();
+    let usages = stream::iter(requests)
+        .map(|(work_unit, project, agent)| {
+            let mut chisei = ChiseiServiceClient::new(channel.clone());
+            async move {
+                let result = chisei
+                    .check_budget(gateway_request(CheckBudgetRequest {
+                        subject: String::new(),
+                        estimated_tokens: 0,
+                        project,
+                        agent,
+                        key_id: String::new(),
+                        work_unit: work_unit.clone(),
+                        user_id: String::new(),
+                        metric: "tokens".to_string(),
+                    }))
+                    .await
+                    .map(|response| response.into_inner().usage);
+                (work_unit, result)
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let mut by_work_unit = summaries
+        .iter_mut()
+        .map(|summary| (summary.group.clone(), summary))
+        .collect::<BTreeMap<_, _>>();
+    for (work_unit, result) in usages {
+        match result {
+            Ok(Some(usage)) => {
+                if let Some(summary) = by_work_unit.get_mut(&work_unit) {
+                    summary.budget_used = i64::from(usage.tokens_used);
+                    summary.budget_limit = i64::from(usage.max_tokens);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%work_unit, %error, "could not load work-unit budget usage");
+            }
         }
     }
-    Ok(())
 }
 
 fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
