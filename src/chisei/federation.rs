@@ -153,7 +153,8 @@ pub struct FederatedPrior {
     pub model_capability: String,
     /// Aggregate rate rounded to a five-percentage-point band.
     pub success_rate_bps: u16,
-    /// Lower-bound power-of-two bucket, never the exact aggregate count.
+    /// Power-of-two lower bound representing the range `[n, 2n - 1]`; the
+    /// value is a bucket label, not an assertion that the aggregate equals it.
     pub sample_size: u64,
     pub participant_count: u64,
     pub source_hashes: Vec<String>,
