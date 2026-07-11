@@ -26,6 +26,19 @@ pub struct ProvenanceReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GovernedAction {
+    pub decision_id: String,
+    pub timestamp_ms: i64,
+    pub actor: String,
+    pub action: String,
+    pub target_id: String,
+    pub risk_class: String,
+    pub decision: String,
+    pub outcome: String,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyException {
     pub decision_id: String,
     pub action: String,
@@ -72,6 +85,43 @@ impl ProvenanceReport {
             enforced_refusals,
             exceptions,
         }
+    }
+
+    pub fn governed_actions(&self) -> Vec<GovernedAction> {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.evidence.contains_key("risk_class"))
+            .map(|decision| GovernedAction {
+                decision_id: decision.id.clone(),
+                timestamp_ms: decision.timestamp,
+                actor: decision.actor.clone(),
+                action: decision.action.clone(),
+                target_id: decision.target_id.clone(),
+                risk_class: decision
+                    .evidence
+                    .get("risk_class")
+                    .cloned()
+                    .unwrap_or_default(),
+                decision: decision
+                    .evidence
+                    .get("decision")
+                    .cloned()
+                    .unwrap_or_else(|| inferred_action_decision(decision).into()),
+                outcome: decision.outcome.clone(),
+                dry_run: decision
+                    .evidence
+                    .get("dry_run")
+                    .is_some_and(|value| value == "true"),
+            })
+            .collect()
+    }
+}
+
+fn inferred_action_decision(decision: &Decision) -> &'static str {
+    if decision.reason.contains("denied") || decision.reason.contains("exceeded") {
+        "deny"
+    } else {
+        "allow"
     }
 }
 
@@ -199,6 +249,24 @@ pub fn render_text(report: &ProvenanceReport) -> String {
                 exception.decision_id, exception.action, exception.outcome, exception.reason
             ));
         }
+    }
+    let actions = report.governed_actions();
+    output.push_str("\nGoverned actions and commands\n");
+    if actions.is_empty() {
+        output.push_str("  none recorded\n");
+    }
+    for action in actions {
+        output.push_str(&format!(
+            "  {}  actor={} action={} target={} risk={} decision={} outcome={}{}\n",
+            action.decision_id,
+            action.actor,
+            action.action,
+            action.target_id,
+            action.risk_class,
+            action.decision,
+            action.outcome,
+            if action.dry_run { " dry-run" } else { "" }
+        ));
     }
     output
 }
@@ -382,6 +450,36 @@ mod tests {
         assert_eq!(verdict.enforced_refusals, 2);
         assert_eq!(verdict.exceptions[0].decision_id, "warned");
         assert!(render_text(&report).contains("policy exceptions: 1 recorded exception"));
+    }
+
+    #[test]
+    fn renders_governed_actions_from_attributed_decisions() {
+        let report = ProvenanceReport {
+            work_unit_id: "task".into(),
+            calls: vec![],
+            decisions: vec![Decision {
+                id: "action-1".into(),
+                timestamp: 3,
+                actor: "agent".into(),
+                action: "run_command".into(),
+                reason: "execute_action".into(),
+                evidence: HashMap::from([
+                    ("work_unit".into(), "task".into()),
+                    ("risk_class".into(), "write".into()),
+                    ("decision".into(), "allow".into()),
+                ]),
+                target_id: "workspace".into(),
+                outcome: "command completed".into(),
+            }],
+        };
+
+        let actions = report.governed_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, "run_command");
+        assert!(
+            render_text(&report)
+                .contains("action=run_command target=workspace risk=write decision=allow")
+        );
     }
 
     fn empty_call() -> ModelCall {
