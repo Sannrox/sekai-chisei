@@ -3670,7 +3670,11 @@ async fn record_usage_and_append(
                     let warning_identity = identity.clone();
                     let warning_work_unit = context.work_unit_id.clone();
                     let mut warning_client = chisei.clone();
-                    tokio::spawn(async move {
+                    // Threshold warnings are best-effort telemetry: they must never add
+                    // control-plane round trips to the model response path. A warning may
+                    // be abandoned during runtime shutdown, but task failures while the
+                    // gateway is live remain visible in the gateway log.
+                    let warning_task = tokio::spawn(async move {
                         emit_budget_threshold_warnings(
                             &warning_config,
                             &warning_identity,
@@ -3679,6 +3683,11 @@ async fn record_usage_and_append(
                             &mut warning_client,
                         )
                         .await;
+                    });
+                    tokio::spawn(async move {
+                        if let Err(error) = warning_task.await {
+                            warn!(%error, "budget threshold warning task failed");
+                        }
                     });
                 }
             }
