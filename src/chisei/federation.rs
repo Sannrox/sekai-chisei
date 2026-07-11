@@ -114,6 +114,36 @@ pub struct FederatedContribution {
     pub successes: u64,
     pub attempts: u64,
     pub source_artifact_hash: String,
+    pub participant_signature: String,
+}
+
+impl FederatedContribution {
+    fn signing_payload(&self) -> Result<Vec<u8>, ArtifactError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            participant_id: &'a str,
+            contribution_id: &'a str,
+            task_class: &'a str,
+            model_capability: &'a str,
+            successes: u64,
+            attempts: u64,
+            source_artifact_hash: &'a str,
+        }
+        serde_json::to_vec(&Payload {
+            participant_id: &self.participant_id,
+            contribution_id: &self.contribution_id,
+            task_class: &self.task_class,
+            model_capability: &self.model_capability,
+            successes: self.successes,
+            attempts: self.attempts,
+            source_artifact_hash: &self.source_artifact_hash,
+        })
+        .map_err(|error| ArtifactError::Invalid(error.to_string()))
+    }
+
+    pub fn set_participant_signature(&mut self, signature: &[u8; 64]) {
+        self.participant_signature = encode_hex(signature);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +564,7 @@ fn validate_eval_evidence(evidence: &ModelEvalEvidence) -> Result<(), ArtifactEr
 pub struct FederationAggregator {
     minimum_participants: usize,
     participant_hash_key: [u8; 32],
+    trusted_participants: HashMap<String, VerifyingKey>,
     seen_contributions: HashSet<String>,
     buckets: HashMap<(String, String), AggregateBucket>,
     receipts: Vec<ContributionReceipt>,
@@ -551,6 +582,7 @@ impl FederationAggregator {
     pub fn new(
         minimum_participants: usize,
         participant_hash_key: [u8; 32],
+        trusted_participants: impl IntoIterator<Item = (String, [u8; 32])>,
     ) -> Result<Self, ArtifactError> {
         if minimum_participants < 2 {
             return Err(ArtifactError::Invalid(
@@ -562,9 +594,25 @@ impl FederationAggregator {
                 "participant hash key must not be all zeroes".into(),
             ));
         }
+        let mut verified = HashMap::new();
+        for (participant_id, key) in trusted_participants {
+            require_nonempty("trusted participant id", &participant_id)?;
+            let key = VerifyingKey::from_bytes(&key).map_err(|error| {
+                ArtifactError::Invalid(format!(
+                    "invalid key for participant {participant_id:?}: {error}"
+                ))
+            })?;
+            verified.insert(participant_id, key);
+        }
+        if verified.len() < minimum_participants {
+            return Err(ArtifactError::Invalid(
+                "trusted participant set is smaller than the disclosure threshold".into(),
+            ));
+        }
         Ok(Self {
             minimum_participants,
             participant_hash_key,
+            trusted_participants: verified,
             seen_contributions: HashSet::new(),
             buckets: HashMap::new(),
             receipts: Vec::new(),
@@ -576,6 +624,24 @@ impl FederationAggregator {
         contribution: FederatedContribution,
     ) -> Result<ContributionReceipt, ArtifactError> {
         validate_contribution(&contribution)?;
+        let verifying_key = self
+            .trusted_participants
+            .get(&contribution.participant_id)
+            .ok_or_else(|| {
+                ArtifactError::Invalid(format!(
+                    "participant {:?} is not trusted",
+                    contribution.participant_id
+                ))
+            })?;
+        let signature = Signature::from_bytes(&decode_hex::<64>(
+            "participant_signature",
+            &contribution.participant_signature,
+        )?);
+        verifying_key
+            .verify_strict(&contribution.signing_payload()?, &signature)
+            .map_err(|_| {
+                ArtifactError::Invalid("participant signature verification failed".into())
+            })?;
         let participant_hash =
             opaque_hash(&self.participant_hash_key, &contribution.participant_id);
         if self
@@ -894,6 +960,28 @@ mod tests {
         artifact.set_publisher_signature(&signature.to_bytes());
     }
 
+    fn participant_signing_key(participant: &str) -> SigningKey {
+        SigningKey::from_bytes(&match participant {
+            "org-a" => [1; 32],
+            "org-b" => [2; 32],
+            _ => [3; 32],
+        })
+    }
+
+    fn trusted_participants() -> Vec<(String, [u8; 32])> {
+        ["org-a", "org-b"]
+            .into_iter()
+            .map(|participant| {
+                (
+                    participant.to_string(),
+                    participant_signing_key(participant)
+                        .verifying_key()
+                        .to_bytes(),
+                )
+            })
+            .collect()
+    }
+
     fn suite() -> GovernanceArtifact {
         GovernanceArtifact::EvalSuite(PortableEvalSuite {
             name: "safe refactoring".into(),
@@ -991,7 +1079,7 @@ mod tests {
         successes: u64,
         attempts: u64,
     ) -> FederatedContribution {
-        FederatedContribution {
+        let mut contribution = FederatedContribution {
             participant_id: participant.into(),
             contribution_id: contribution_id.into(),
             task_class: "rust-refactor".into(),
@@ -999,12 +1087,17 @@ mod tests {
             successes,
             attempts,
             source_artifact_hash: "a".repeat(64),
-        }
+            participant_signature: String::new(),
+        };
+        let signature =
+            participant_signing_key(participant).sign(&contribution.signing_payload().unwrap());
+        contribution.set_participant_signature(&signature.to_bytes());
+        contribution
     }
 
     #[test]
     fn federation_publishes_only_after_disclosure_threshold() {
-        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32], trusted_participants()).unwrap();
         aggregator
             .ingest(contribution("org-a", "one", 8, 10))
             .unwrap();
@@ -1028,7 +1121,7 @@ mod tests {
 
     #[test]
     fn federation_rejects_replay_without_double_counting() {
-        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32], trusted_participants()).unwrap();
         let first = contribution("org-a", "same", 8, 10);
         assert!(aggregator.ingest(first.clone()).unwrap().accepted);
         assert!(!aggregator.ingest(first).unwrap().accepted);
@@ -1042,7 +1135,7 @@ mod tests {
 
     #[test]
     fn federation_accepts_one_contribution_per_participant_bucket() {
-        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32], trusted_participants()).unwrap();
         assert!(
             aggregator
                 .ingest(contribution("org-a", "one", 8, 10))
@@ -1065,8 +1158,20 @@ mod tests {
     }
 
     #[test]
+    fn federation_rejects_forged_and_untrusted_participant_identities() {
+        let mut aggregator = FederationAggregator::new(2, [9; 32], trusted_participants()).unwrap();
+        let mut forged = contribution("org-a", "one", 8, 10);
+        forged.participant_id = "org-b".into();
+        assert!(aggregator.ingest(forged).is_err());
+
+        let untrusted = contribution("org-c", "two", 8, 10);
+        assert!(aggregator.ingest(untrusted).is_err());
+        assert!(aggregator.publishable_priors().is_empty());
+    }
+
+    #[test]
     fn federation_rejects_non_aggregate_or_unproven_signal() {
-        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32], trusted_participants()).unwrap();
         let mut invalid = contribution("org-a", "one", 2, 1);
         assert!(aggregator.ingest(invalid.clone()).is_err());
         invalid.successes = 1;
