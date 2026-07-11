@@ -4933,6 +4933,113 @@ impl SekaiService for SekaiServiceImpl {
             error: report.error,
         }))
     }
+
+    async fn export_assurance(
+        &self,
+        req: Request<ExportAssuranceRequest>,
+    ) -> Result<Response<ExportAssuranceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        if inner.action.trim().is_empty() {
+            return Err(Status::invalid_argument("action required"));
+        }
+        if inner.policy_scope.trim().is_empty() {
+            return Err(Status::invalid_argument("policy_scope required"));
+        }
+        check_action_admin(&self.security, &inner.policy_scope, &principals)?;
+
+        let limit = if inner.limit > 0 {
+            inner.limit.min(200)
+        } else {
+            100
+        };
+        let decisions = self
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                actor: None,
+                action: Some(inner.action),
+                target_id: None,
+                after: inner.after,
+                limit,
+                offset: 0,
+            })
+            .map_err(Status::internal)?;
+        let mut records = Vec::with_capacity(decisions.len());
+        for decision in decisions {
+            if decision.target_id.is_empty()
+                || check_read(&self.security, &decision.target_id, &principals).is_err()
+            {
+                continue;
+            }
+            let attestation = decision
+                .evidence
+                .get(attestation::EVIDENCE_ATTESTATION_ID)
+                .map(String::as_str)
+                .map(|id| self.db.get_attestation(id))
+                .transpose()
+                .map_err(Status::internal)?
+                .flatten()
+                .filter(|proof| proof.policy_scope == inner.policy_scope);
+            let verification = if let Some(proof) = &attestation {
+                let report = self
+                    .db
+                    .verify_attestation(&proof.id)
+                    .map_err(Status::internal)?;
+                Some(VerifyAttestationResponse {
+                    ok: report.ok,
+                    found: report.found,
+                    hash_ok: report.hash_ok,
+                    replay_ok: report.replay_ok,
+                    replayed_decision: report.replayed_decision,
+                    decision_linked: report.decision_linked,
+                    error: report.error,
+                })
+            } else {
+                Some(VerifyAttestationResponse {
+                    ok: false,
+                    found: false,
+                    hash_ok: false,
+                    replay_ok: false,
+                    replayed_decision: String::new(),
+                    decision_linked: false,
+                    error: "no attestation for requested policy scope".into(),
+                })
+            };
+            records.push(AssuranceRecord {
+                decision: Some(Decision {
+                    id: decision.id,
+                    timestamp: decision.timestamp,
+                    actor: decision.actor,
+                    action: decision.action,
+                    reason: decision.reason,
+                    evidence: decision.evidence,
+                    target_id: decision.target_id,
+                    outcome: decision.outcome,
+                }),
+                attestation: attestation.as_ref().map(to_proto_attestation),
+                verification,
+            });
+        }
+
+        let db = self.db.clone();
+        let ledger = tokio::task::spawn_blocking(move || db.verify_ledger())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(ExportAssuranceResponse {
+            records,
+            ledger: Some(VerifyAuditLedgerResponse {
+                ok: ledger.ok,
+                entries_checked: ledger.entries_checked,
+                first_bad_seq: ledger.first_bad_seq,
+                error: ledger.error,
+                anchor_seq: ledger.anchor_seq,
+                head_seq: ledger.head_seq,
+                head_hash: ledger.head_hash,
+            }),
+        }))
+    }
 }
 
 fn scoring_learning_id(namespace: &str, request_id: &str) -> String {
@@ -10173,6 +10280,28 @@ mod tests {
         assert!(report.replay_ok);
         assert!(report.decision_linked);
         assert_eq!(report.replayed_decision, "deny");
+
+        let export = svc
+            .export_assurance(with_principal(ExportAssuranceRequest {
+                action: "delete_link".into(),
+                policy_scope: "agent:tester".into(),
+                after: 0,
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(export.records.len(), 1);
+        assert_eq!(
+            export.records[0].decision.as_ref().unwrap().action,
+            "delete_link"
+        );
+        assert_eq!(
+            export.records[0].attestation.as_ref().unwrap().policy_scope,
+            "agent:tester"
+        );
+        assert!(export.records[0].verification.as_ref().unwrap().ok);
+        assert!(export.ledger.as_ref().unwrap().ok);
     }
 
     #[tokio::test]

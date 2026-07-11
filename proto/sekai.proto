@@ -416,6 +416,21 @@ message VerifyAuditLedgerResponse {
   int64 head_seq = 6;
   string head_hash = 7;
 }
+message AssuranceRecord {
+  Decision decision = 1;
+  PolicyAttestation attestation = 2;
+  VerifyAttestationResponse verification = 3;
+}
+message ExportAssuranceRequest {
+  string action = 1;       // exact action class; required
+  string policy_scope = 2; // administrative scope whose policy proofs may be exported
+  int64 after = 3;
+  int32 limit = 4;
+}
+message ExportAssuranceResponse {
+  repeated AssuranceRecord records = 1;
+  VerifyAuditLedgerResponse ledger = 2;
+}
 
 message CreateActionTypeRequest { ActionTypeDef action_type = 1; }
 message CreateActionTypeResponse { ActionTypeDef action_type = 1; }
@@ -699,6 +714,7 @@ service SekaiService {
   rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
   rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
   rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);
+  rpc ExportAssurance(ExportAssuranceRequest) returns (ExportAssuranceResponse);
 
   rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);
