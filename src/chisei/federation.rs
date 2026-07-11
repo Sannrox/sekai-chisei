@@ -170,6 +170,141 @@ pub struct ModelSovereigntyRegistry {
     adoptions: HashMap<String, ModelAdoption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactAdoption {
+    pub local_namespace: String,
+    pub artifact_id: String,
+    pub version: u64,
+    pub content_hash: String,
+    pub adopted_at: i64,
+}
+
+/// Registry for exchanging verified governance artifacts. Publisher trust is
+/// configured locally; publishing an envelope never grants its publisher trust.
+pub struct GovernanceRegistry {
+    trusted_publishers: HashSet<String>,
+    artifacts: HashMap<String, Vec<PortableArtifact>>,
+    adoptions: HashMap<(String, String), ArtifactAdoption>,
+}
+
+impl GovernanceRegistry {
+    pub fn new(trusted_publishers: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            trusted_publishers: trusted_publishers.into_iter().collect(),
+            artifacts: HashMap::new(),
+            adoptions: HashMap::new(),
+        }
+    }
+
+    pub fn publish(&mut self, artifact: PortableArtifact) -> Result<(), ArtifactError> {
+        artifact.verify()?;
+        if !self
+            .trusted_publishers
+            .contains(&artifact.provenance.publisher_id)
+        {
+            return Err(ArtifactError::Invalid(format!(
+                "publisher {:?} is not trusted",
+                artifact.provenance.publisher_id
+            )));
+        }
+
+        let versions = self
+            .artifacts
+            .entry(artifact.artifact_id.clone())
+            .or_default();
+        if let Some(existing) = versions
+            .iter()
+            .find(|existing| existing.version == artifact.version)
+        {
+            return if existing.content_hash == artifact.content_hash {
+                Ok(())
+            } else {
+                Err(ArtifactError::Invalid(format!(
+                    "artifact {:?} version {} already has different content",
+                    artifact.artifact_id, artifact.version
+                )))
+            };
+        }
+
+        match versions.last() {
+            None => {
+                if artifact.version != 1 || artifact.provenance.parent_hash.is_some() {
+                    return Err(ArtifactError::Invalid(
+                        "the first published version must be version 1 without a parent".into(),
+                    ));
+                }
+            }
+            Some(previous) => {
+                if artifact.version != previous.version + 1 {
+                    return Err(ArtifactError::Invalid(format!(
+                        "artifact version must follow version {}",
+                        previous.version
+                    )));
+                }
+                if artifact.provenance.parent_hash.as_deref()
+                    != Some(previous.content_hash.as_str())
+                {
+                    return Err(ArtifactError::Invalid(
+                        "artifact parent hash does not match the prior version".into(),
+                    ));
+                }
+            }
+        }
+        versions.push(artifact);
+        Ok(())
+    }
+
+    pub fn latest(&self, artifact_id: &str) -> Option<&PortableArtifact> {
+        self.artifacts.get(artifact_id)?.last()
+    }
+
+    pub fn list_latest(&self) -> Vec<&PortableArtifact> {
+        let mut artifacts = self
+            .artifacts
+            .values()
+            .filter_map(|versions| versions.last())
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+        artifacts
+    }
+
+    pub fn adopt(
+        &mut self,
+        local_namespace: impl Into<String>,
+        artifact_id: &str,
+        version: u64,
+        adopted_at: i64,
+    ) -> Result<ArtifactAdoption, ArtifactError> {
+        let local_namespace = local_namespace.into();
+        require_nonempty("local_namespace", &local_namespace)?;
+        let artifact = self
+            .artifacts
+            .get(artifact_id)
+            .and_then(|versions| versions.iter().find(|item| item.version == version))
+            .ok_or_else(|| {
+                ArtifactError::Invalid(format!(
+                    "artifact {artifact_id:?} version {version} is not published"
+                ))
+            })?;
+        artifact.verify()?;
+        let adoption = ArtifactAdoption {
+            local_namespace: local_namespace.clone(),
+            artifact_id: artifact_id.to_string(),
+            version,
+            content_hash: artifact.content_hash.clone(),
+            adopted_at,
+        };
+        self.adoptions
+            .insert((local_namespace, artifact_id.to_string()), adoption.clone());
+        Ok(adoption)
+    }
+
+    pub fn adoption(&self, local_namespace: &str, artifact_id: &str) -> Option<&ArtifactAdoption> {
+        self.adoptions
+            .get(&(local_namespace.to_string(), artifact_id.to_string()))
+    }
+}
+
 impl Default for ModelSovereigntyRegistry {
     fn default() -> Self {
         Self::new()
@@ -783,5 +918,76 @@ mod tests {
         let mut evidence = passing_evidence("quality");
         evidence.candidate_run_id = evidence.baseline_run_id.clone();
         assert!(registry.record_eval("candidate-1", evidence).is_err());
+    }
+
+    #[test]
+    fn registry_enforces_trust_and_version_lineage() {
+        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
+        let first = PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        registry.publish(first.clone()).unwrap();
+
+        let mut second_provenance = provenance();
+        second_provenance.parent_hash = Some(first.content_hash.clone());
+        let second =
+            PortableArtifact::new("eval-safe-refactor", 2, second_provenance, suite()).unwrap();
+        registry.publish(second.clone()).unwrap();
+        assert_eq!(registry.latest("eval-safe-refactor"), Some(&second));
+
+        let mut untrusted_provenance = provenance();
+        untrusted_provenance.publisher_id = "unknown.example".into();
+        let untrusted = PortableArtifact::new("other", 1, untrusted_provenance, suite()).unwrap();
+        assert!(registry.publish(untrusted).is_err());
+    }
+
+    #[test]
+    fn registry_rejects_forks_and_conflicting_versions() {
+        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
+        let first = PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        registry.publish(first.clone()).unwrap();
+
+        let conflict = PortableArtifact::new(
+            "eval-safe-refactor",
+            1,
+            provenance(),
+            GovernanceArtifact::EvalSuite(PortableEvalSuite {
+                name: "different".into(),
+                description: String::new(),
+                cases: vec![PortableEvalCase {
+                    id: "case".into(),
+                    name: "case".into(),
+                    namespace: "rust".into(),
+                    assertion_types: vec!["exit_code".into()],
+                }],
+            }),
+        )
+        .unwrap();
+        assert!(registry.publish(conflict).is_err());
+
+        let mut wrong_parent = provenance();
+        wrong_parent.parent_hash = Some("b".repeat(64));
+        let fork = PortableArtifact::new("eval-safe-refactor", 2, wrong_parent, suite()).unwrap();
+        assert!(registry.publish(fork).is_err());
+    }
+
+    #[test]
+    fn adoption_pins_an_exact_verified_version() {
+        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
+        let artifact =
+            PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        registry.publish(artifact.clone()).unwrap();
+        let adoption = registry
+            .adopt("local-team", "eval-safe-refactor", 1, 200)
+            .unwrap();
+
+        assert_eq!(adoption.content_hash, artifact.content_hash);
+        assert_eq!(
+            registry.adoption("local-team", "eval-safe-refactor"),
+            Some(&adoption)
+        );
+        assert!(
+            registry
+                .adopt("local-team", "eval-safe-refactor", 2, 201)
+                .is_err()
+        );
     }
 }
