@@ -209,19 +209,35 @@ impl BudgetTracker {
             return BudgetRouteBias::Capable;
         }
 
-        let projected = i64::from(estimated.max(0));
-        let pressured = scope_chain(scope_id).into_iter().any(|scope| {
-            let usage = self.get_usage_with_metric(&scope, metric);
-            let limit = i64::from(usage.max_tokens);
-            limit > 0
-                && (i64::from(usage.tokens_used).max(0) + projected) * 100
-                    >= limit * CHEAP_BIAS_THRESHOLD_PERCENT
-        });
+        let pressured = self
+            .projected_pressure_percent(scope_id, estimated, metric)
+            .is_some_and(|pressure| pressure >= CHEAP_BIAS_THRESHOLD_PERCENT);
         if pressured {
             BudgetRouteBias::Cheap
         } else {
             BudgetRouteBias::Capable
         }
+    }
+
+    /// Highest projected utilization across the bounded hierarchy. `None`
+    /// means no scope in the chain has a limit for this metric.
+    pub fn projected_pressure_percent(
+        &self,
+        scope_id: &str,
+        estimated: i32,
+        metric: &str,
+    ) -> Option<i64> {
+        let projected = i64::from(estimated.max(0));
+        scope_chain(scope_id)
+            .into_iter()
+            .filter_map(|scope| {
+                let usage = self.get_usage_with_metric(&scope, metric);
+                let limit = i64::from(usage.max_tokens);
+                (limit > 0).then(|| {
+                    (i64::from(usage.tokens_used).max(0) + projected).saturating_mul(100) / limit
+                })
+            })
+            .max()
     }
 
     pub fn namespace_pressure(&self, namespace: &str) -> PressureLevel {

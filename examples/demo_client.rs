@@ -296,6 +296,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             metric: String::new(),
             work_unit: String::new(),
             task_class: String::new(),
+            mid_task: false,
+            local_free_available: false,
         })
         .await
     {
@@ -343,6 +345,7 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             task_class: String::new(),
             user_id: String::new(),
             expected_calls: 1,
+            budget_route_bias: String::new(),
         })
         .await
     {

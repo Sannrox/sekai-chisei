@@ -24,10 +24,10 @@ use crate::gateway_keys::hash_gateway_key;
 use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
-    CheckBudgetRequest, CompareRunsRequest, GatewayAuditEvent, GetLatestEvalIterationRequest,
-    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
-    RecordSampleObservationRequest, RecordUsageRequest, ResolvePolicyRequest, RunPipelineRequest,
-    SampleObservation,
+    CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, GatewayAuditEvent,
+    GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
+    RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
+    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
@@ -48,6 +48,7 @@ const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project")
 const X_CHISEI_WORK_UNIT: HeaderName = HeaderName::from_static("x-chisei-work-unit");
 const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id");
 const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
+const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 
@@ -393,6 +394,8 @@ async fn proxy_gateway(
     // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
     // even under `no_preflight`, where the routing-only call below is skipped.
     let task_class = resolve_task_class(&headers, requested_model.as_deref());
+    let mid_task = header_str(&headers, &X_CHISEI_MID_TASK)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let preflight_context = UsageContext {
         request_id: request_id.clone(),
         provider: client_provider,
@@ -428,19 +431,23 @@ async fn proxy_gateway(
         };
         (resolved, egress)
     } else {
-        if let Err(rejection) = check_budget_preflight(
+        let budget = match check_budget_preflight(
             &state.config,
             &identity,
             request_bytes,
             work_unit_id.as_deref().unwrap_or(""),
             &task_class,
+            mid_task,
         )
         .await
         {
-            record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                .await;
-            return rejection.response();
-        }
+            Ok(budget) => budget,
+            Err(rejection) => {
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
+        };
         let resolved = match resolve_policy_preflight(
             &state.config,
             &identity,
@@ -448,11 +455,41 @@ async fn proxy_gateway(
             &body,
             requested_model.as_deref(),
             &task_class,
+            &budget,
         )
         .await
         {
-            Ok(resolved) => resolved,
+            Ok(resolved)
+                if !budget.provisional_local_free
+                    || (resolved.route_bias.as_deref() == Some("local_free")
+                        && resolved.resolved_provider
+                            == ProviderKind::OpenAi(OpenAiRuntime::Ollama)) =>
+            {
+                resolved
+            }
+            Ok(_) => {
+                let rejection = GatewayRejection::json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "budget_exceeded",
+                    "budget exceeded and local-free routing could not be verified",
+                );
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
             Err(rejection) => {
+                let rejection = if budget.provisional_local_free {
+                    GatewayRejection::json(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "budget_exceeded",
+                        format!(
+                            "budget exceeded and local-free routing failed: {}",
+                            rejection.reason
+                        ),
+                    )
+                } else {
+                    rejection
+                };
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
                 return rejection.response();
@@ -509,20 +546,27 @@ async fn proxy_gateway(
         identity_context.upstream_auth,
         prepared.provider,
     );
+    let resolved_to_local = matches!(
+        prepared.provider,
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama | OpenAiRuntime::Native)
+    );
     // Cross-provider requests were translated to a different provider family, so
     // the client's credential (e.g. an Anthropic subscription token) must never
     // be forwarded to the resolved upstream. Apply the resolved provider's own
     // gateway auth instead (a no-op for Ollama/native) and strip client auth
     // headers below regardless of the passthrough mode.
-    if prepared.cross_provider || upstream_auth_mode == UpstreamAuthMode::GatewayKey {
+    if prepared.cross_provider
+        || resolved_to_local
+        || upstream_auth_mode == UpstreamAuthMode::GatewayKey
+    {
         upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
             Ok(upstream) => upstream,
             Err(response) => return *response,
         };
     }
     for (name, value) in headers.iter() {
-        let strip_client_auth =
-            prepared.cross_provider && (name == AUTHORIZATION || name == X_API_KEY);
+        let strip_client_auth = (prepared.cross_provider || resolved_to_local)
+            && (name == AUTHORIZATION || name == X_API_KEY);
         if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
             upstream = upstream.header(name, value);
         }
@@ -629,9 +673,10 @@ async fn check_budget_preflight(
     request_bytes: usize,
     work_unit: &str,
     task_class: &str,
-) -> Result<(), GatewayRejection> {
+    mid_task: bool,
+) -> Result<BudgetPreflight, GatewayRejection> {
     let Some(target) = &config.chisei_grpc_target else {
-        return Ok(());
+        return Ok(BudgetPreflight::default());
     };
     let estimated_tokens = estimate_tokens_from_bytes(request_bytes);
 
@@ -645,6 +690,8 @@ async fn check_budget_preflight(
         work_unit: work_unit.to_string(),
         metric: String::new(),
         task_class: task_class.to_string(),
+        mid_task,
+        local_free_available: !config.ollama_base_url.trim().is_empty(),
     };
 
     let check_budget = |req: CheckBudgetRequest| async move {
@@ -656,8 +703,33 @@ async fn check_budget_preflight(
                 match client.check_budget(GrpcRequest::new(req)).await {
                     Ok(resp) => {
                         let resp = resp.into_inner();
-                        if resp.allowed {
-                            Ok(())
+                        let provisional_local_free = !resp.allowed
+                            && resp.route_bias == "local_free"
+                            && resp.degradation_level == "local_free";
+                        if resp.allowed || provisional_local_free {
+                            if resp.warning {
+                                record_gateway_decision(
+                                    config,
+                                    identity,
+                                    "gateway.budget_degraded",
+                                    &format!("budget degradation level {}", resp.degradation_level),
+                                    if provisional_local_free {
+                                        "pending_resolution"
+                                    } else {
+                                        "routed"
+                                    },
+                                    HashMap::from([
+                                        ("route_bias".to_string(), resp.route_bias.clone()),
+                                        (
+                                            "degradation_level".to_string(),
+                                            resp.degradation_level.clone(),
+                                        ),
+                                        ("mid_task".to_string(), mid_task.to_string()),
+                                    ]),
+                                )
+                                .await;
+                            }
+                            Ok(resp)
                         } else {
                             let usage = resp.usage;
                             let message = usage
@@ -699,7 +771,14 @@ async fn check_budget_preflight(
                     }
                     Err(err) => {
                         governance_error(config, identity, &format!("CheckBudget failed: {err}"))
-                            .await
+                            .await?;
+                        Ok(CheckBudgetResponse {
+                            allowed: true,
+                            usage: None,
+                            route_bias: String::new(),
+                            degradation_level: "capable".to_string(),
+                            warning: false,
+                        })
                     }
                 }
             }
@@ -709,12 +788,20 @@ async fn check_budget_preflight(
                     identity,
                     &format!("failed to connect to Chisei control plane: {err}"),
                 )
-                .await
+                .await?;
+                Ok(CheckBudgetResponse {
+                    allowed: true,
+                    usage: None,
+                    route_bias: String::new(),
+                    degradation_level: "capable".to_string(),
+                    warning: false,
+                })
             }
         }
     };
 
-    check_budget(CheckBudgetRequest {
+    let budget_subject = audit_budget_subject(&base_budget_request);
+    let token_budget = check_budget(CheckBudgetRequest {
         metric: String::new(),
         ..base_budget_request.clone()
     })
@@ -724,7 +811,21 @@ async fn check_budget_preflight(
         metric: METRIC_REQUESTS.to_string(),
         ..base_budget_request
     })
-    .await
+    .await?;
+    Ok(BudgetPreflight {
+        provisional_local_free: !token_budget.allowed
+            && token_budget.route_bias == "local_free"
+            && token_budget.degradation_level == "local_free",
+        route_bias: Some(token_budget.route_bias).filter(|bias| !bias.is_empty()),
+        budget_subject,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct BudgetPreflight {
+    provisional_local_free: bool,
+    route_bias: Option<String>,
+    budget_subject: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -859,6 +960,7 @@ async fn resolve_policy_preflight(
     body: &[u8],
     requested_model: Option<&str>,
     task_class: &str,
+    budget: &BudgetPreflight,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         return Ok(PolicyPreflight {
@@ -894,6 +996,7 @@ async fn resolve_policy_preflight(
                 task_class: task_class.to_string(),
                 user_id: String::new(),
                 expected_calls: 1,
+                budget_route_bias: budget.route_bias.clone().unwrap_or_default(),
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
@@ -1018,6 +1121,37 @@ async fn resolve_policy_preflight(
                         &format!("policy denied request: {err}"),
                     )
                     .await
+                }
+                Err(err) if err.code() == tonic::Code::ResourceExhausted => {
+                    let reason = format!(
+                        "budget exceeded for {}: {}",
+                        budget.budget_subject.as_deref().unwrap_or("unknown scope"),
+                        err.message()
+                    );
+                    let mut evidence = HashMap::from([
+                        ("requested_model".to_string(), requested_model.to_string()),
+                        (
+                            "budget_route_bias".to_string(),
+                            budget.route_bias.clone().unwrap_or_default(),
+                        ),
+                    ]);
+                    if let Some(subject) = budget.budget_subject.as_deref() {
+                        evidence.insert("budget_subject".to_string(), subject.to_string());
+                    }
+                    record_gateway_decision(
+                        config,
+                        identity,
+                        "gateway.budget_denied",
+                        &reason,
+                        "denied",
+                        evidence,
+                    )
+                    .await;
+                    Err(GatewayRejection::json(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "budget_exceeded",
+                        reason,
+                    ))
                 }
                 Err(err) => {
                     governance_error(config, identity, &format!("ResolvePolicy failed: {err}"))
@@ -3852,6 +3986,8 @@ async fn emit_budget_threshold_warnings(
                 user_id: String::new(),
                 metric: String::new(),
                 task_class: String::new(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await;
         let Ok(response) = response else {
@@ -5765,6 +5901,7 @@ mod tests {
                         task_class: String::new(),
                         user_id: String::new(),
                         expected_calls: 1,
+                        budget_route_bias: String::new(),
                     }))
                     .await
                     .map(|_| true)
@@ -7764,7 +7901,7 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            ollama_base_url: String::new(),
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
@@ -7940,7 +8077,7 @@ mod tests {
             openai_base_url: upstream_base,
             openai_api_key: Some("real-openai-key".to_string()),
             anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            ollama_base_url: String::new(),
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
@@ -8763,6 +8900,8 @@ mod tests {
                 work_unit: String::new(),
                 metric: String::new(),
                 task_class: String::new(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await
             .unwrap()
@@ -8780,6 +8919,8 @@ mod tests {
                 work_unit: String::new(),
                 metric: String::new(),
                 task_class: String::new(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await
             .unwrap()

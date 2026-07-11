@@ -367,12 +367,20 @@ message CheckBudgetRequest {
   // downgrade-eligible classes (background/bulk/batch/small-fast) may receive
   // a cheap bias; unknown and reasoning/primary classes fail safe to capable.
   string task_class = 9;
+  // True only for a continuation of an already-started unit of work. A hard
+  // cap warns and permits the continuation instead of failing it mid-task.
+  bool mid_task = 10;
+  // The caller can execute an allowed local model without metered cloud cost.
+  bool local_free_available = 11;
 }
 message CheckBudgetResponse {
   bool allowed = 1;
   BudgetUsage usage = 2;
   // Advisory model-routing bias. Enforcement remains represented by `allowed`.
   string route_bias = 3;
+  // capable, cheap_cloud, local_free, warn, or hard_cap.
+  string degradation_level = 4;
+  bool warning = 5;
 }
 message RecordUsageRequest {
   string user_id = 1;
@@ -450,6 +458,8 @@ message ResolvePolicyRequest {
   string user_id = 9;
   // Expected calls remaining in the allocation horizon. Defaults to one.
   int64 expected_calls = 10;
+  // Advisory bias returned by CheckBudget (cheap or local_free).
+  string budget_route_bias = 11;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 message CheckEgressRequest {
