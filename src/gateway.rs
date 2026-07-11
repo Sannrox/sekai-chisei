@@ -3814,11 +3814,11 @@ async fn emit_budget_threshold_warnings(
 ) {
     let project_scope = format!("project:{}", identity.project.trim());
     let agent_scope = format!("{project_scope}/agent:{}", identity.agent.trim());
-    let mut scopes = vec![("agent", agent_scope)];
+    let mut scopes = vec![("project", project_scope), ("agent", agent_scope.clone())];
     if let Some(work_unit) = work_unit.filter(|value| !value.trim().is_empty()) {
         scopes.push((
             "work_unit",
-            format!("{}/work_unit:{}", scopes[0].1, work_unit.trim()),
+            format!("{agent_scope}/work_unit:{}", work_unit.trim()),
         ));
     }
 
