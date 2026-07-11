@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 
 pub const PORTABLE_ARTIFACT_SCHEMA: &str = "sekai.governance/v1";
 
@@ -87,6 +88,184 @@ impl std::fmt::Display for ArtifactError {
 }
 
 impl std::error::Error for ArtifactError {}
+
+/// The only signal a participant may submit to federation. It contains a
+/// bucketed outcome and count, not an observation, prompt, response, object id,
+/// actor id, or provider credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedContribution {
+    pub participant_id: String,
+    pub contribution_id: String,
+    pub task_class: String,
+    pub model_capability: String,
+    pub successes: u64,
+    pub attempts: u64,
+    pub source_artifact_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedPrior {
+    pub task_class: String,
+    pub model_capability: String,
+    pub success_rate_bps: u16,
+    pub sample_size: u64,
+    pub participant_count: u64,
+    pub source_hashes: Vec<String>,
+}
+
+/// Receipt retained by the coordinator. Participant identifiers are hashed so
+/// a later audit can detect replay without publishing network membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributionReceipt {
+    pub contribution_id: String,
+    pub participant_hash: String,
+    pub accepted: bool,
+    pub reason: String,
+}
+
+/// Aggregates governance signal with a minimum-participant disclosure gate.
+/// No method exposes individual contributions after ingestion.
+pub struct FederationAggregator {
+    minimum_participants: usize,
+    seen_contributions: HashSet<String>,
+    buckets: HashMap<(String, String), AggregateBucket>,
+    receipts: Vec<ContributionReceipt>,
+}
+
+#[derive(Default)]
+struct AggregateBucket {
+    successes: u64,
+    attempts: u64,
+    participants: HashSet<String>,
+    source_hashes: HashSet<String>,
+}
+
+impl FederationAggregator {
+    pub fn new(minimum_participants: usize) -> Result<Self, ArtifactError> {
+        if minimum_participants < 2 {
+            return Err(ArtifactError::Invalid(
+                "federation requires at least two participants per published bucket".into(),
+            ));
+        }
+        Ok(Self {
+            minimum_participants,
+            seen_contributions: HashSet::new(),
+            buckets: HashMap::new(),
+            receipts: Vec::new(),
+        })
+    }
+
+    pub fn ingest(
+        &mut self,
+        contribution: FederatedContribution,
+    ) -> Result<ContributionReceipt, ArtifactError> {
+        validate_contribution(&contribution)?;
+        let participant_hash = opaque_hash(&contribution.participant_id);
+        if !self
+            .seen_contributions
+            .insert(contribution.contribution_id.clone())
+        {
+            let receipt = ContributionReceipt {
+                contribution_id: contribution.contribution_id,
+                participant_hash,
+                accepted: false,
+                reason: "duplicate contribution".into(),
+            };
+            self.receipts.push(receipt.clone());
+            return Ok(receipt);
+        }
+
+        let bucket = self
+            .buckets
+            .entry((contribution.task_class, contribution.model_capability))
+            .or_default();
+        let successes = bucket
+            .successes
+            .checked_add(contribution.successes)
+            .ok_or_else(|| ArtifactError::Invalid("success count overflow".into()))?;
+        let attempts = bucket
+            .attempts
+            .checked_add(contribution.attempts)
+            .ok_or_else(|| ArtifactError::Invalid("attempt count overflow".into()))?;
+        bucket.successes = successes;
+        bucket.attempts = attempts;
+        bucket.participants.insert(participant_hash.clone());
+        bucket
+            .source_hashes
+            .insert(contribution.source_artifact_hash);
+
+        let receipt = ContributionReceipt {
+            contribution_id: contribution.contribution_id,
+            participant_hash,
+            accepted: true,
+            reason: "aggregate governance signal accepted".into(),
+        };
+        self.receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub fn publishable_priors(&self) -> Vec<FederatedPrior> {
+        let mut priors = self
+            .buckets
+            .iter()
+            .filter(|(_, bucket)| bucket.participants.len() >= self.minimum_participants)
+            .map(|((task_class, model_capability), bucket)| {
+                let mut source_hashes = bucket.source_hashes.iter().cloned().collect::<Vec<_>>();
+                source_hashes.sort();
+                FederatedPrior {
+                    task_class: task_class.clone(),
+                    model_capability: model_capability.clone(),
+                    success_rate_bps: ((u128::from(bucket.successes) * 10_000)
+                        / u128::from(bucket.attempts)) as u16,
+                    sample_size: bucket.attempts,
+                    participant_count: bucket.participants.len() as u64,
+                    source_hashes,
+                }
+            })
+            .collect::<Vec<_>>();
+        priors.sort_by(|left, right| {
+            left.task_class
+                .cmp(&right.task_class)
+                .then_with(|| left.model_capability.cmp(&right.model_capability))
+        });
+        priors
+    }
+
+    pub fn receipts(&self) -> &[ContributionReceipt] {
+        &self.receipts
+    }
+}
+
+fn validate_contribution(contribution: &FederatedContribution) -> Result<(), ArtifactError> {
+    require_nonempty("participant_id", &contribution.participant_id)?;
+    require_nonempty("contribution_id", &contribution.contribution_id)?;
+    require_nonempty("task_class", &contribution.task_class)?;
+    require_nonempty("model_capability", &contribution.model_capability)?;
+    require_sha256("source_artifact_hash", &contribution.source_artifact_hash)?;
+    if contribution.attempts == 0 {
+        return Err(ArtifactError::Invalid("attempts must be positive".into()));
+    }
+    if contribution.successes > contribution.attempts {
+        return Err(ArtifactError::Invalid(
+            "successes must not exceed attempts".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_sha256(field: &str, value: &str) -> Result<(), ArtifactError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ArtifactError::Invalid(format!(
+            "{field} must be a SHA-256 hex digest"
+        )))
+    }
+}
+
+fn opaque_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
 
 impl PortableArtifact {
     pub fn new(
@@ -283,5 +462,70 @@ mod tests {
             error,
             ArtifactError::Invalid("sample_size must be positive".into())
         );
+    }
+
+    fn contribution(
+        participant: &str,
+        contribution_id: &str,
+        successes: u64,
+        attempts: u64,
+    ) -> FederatedContribution {
+        FederatedContribution {
+            participant_id: participant.into(),
+            contribution_id: contribution_id.into(),
+            task_class: "rust-refactor".into(),
+            model_capability: "capable".into(),
+            successes,
+            attempts,
+            source_artifact_hash: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn federation_publishes_only_after_disclosure_threshold() {
+        let mut aggregator = FederationAggregator::new(2).unwrap();
+        aggregator
+            .ingest(contribution("org-a", "one", 8, 10))
+            .unwrap();
+        assert!(aggregator.publishable_priors().is_empty());
+
+        aggregator
+            .ingest(contribution("org-b", "two", 9, 10))
+            .unwrap();
+        assert_eq!(
+            aggregator.publishable_priors(),
+            vec![FederatedPrior {
+                task_class: "rust-refactor".into(),
+                model_capability: "capable".into(),
+                success_rate_bps: 8_500,
+                sample_size: 20,
+                participant_count: 2,
+                source_hashes: vec!["a".repeat(64)],
+            }]
+        );
+    }
+
+    #[test]
+    fn federation_rejects_replay_without_double_counting() {
+        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let first = contribution("org-a", "same", 8, 10);
+        assert!(aggregator.ingest(first.clone()).unwrap().accepted);
+        assert!(!aggregator.ingest(first).unwrap().accepted);
+        aggregator
+            .ingest(contribution("org-b", "other", 10, 10))
+            .unwrap();
+
+        assert_eq!(aggregator.publishable_priors()[0].sample_size, 20);
+        assert_ne!(aggregator.receipts()[0].participant_hash, "org-a");
+    }
+
+    #[test]
+    fn federation_rejects_non_aggregate_or_unproven_signal() {
+        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let mut invalid = contribution("org-a", "one", 2, 1);
+        assert!(aggregator.ingest(invalid.clone()).is_err());
+        invalid.successes = 1;
+        invalid.source_artifact_hash = "not-a-hash".into();
+        assert!(aggregator.ingest(invalid).is_err());
     }
 }
