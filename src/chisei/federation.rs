@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::chisei::eval::EvalStore;
 
@@ -239,7 +239,7 @@ impl GovernanceRegistry {
             decode_hex::<64>("publisher_signature", &artifact.publisher_signature)?;
         let signature = Signature::from_bytes(&signature_bytes);
         verifying_key
-            .verify(artifact.content_hash.as_bytes(), &signature)
+            .verify_strict(artifact.content_hash.as_bytes(), &signature)
             .map_err(|_| {
                 ArtifactError::Invalid("publisher signature verification failed".into())
             })?;
