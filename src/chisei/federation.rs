@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
+use crate::chisei::eval::EvalStore;
+
 pub const PORTABLE_ARTIFACT_SCHEMA: &str = "sekai.governance/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,7 +362,52 @@ impl ModelSovereigntyRegistry {
         Ok(adoption)
     }
 
-    pub fn record_eval(
+    pub fn record_eval_from_store(
+        &mut self,
+        eval: &EvalStore,
+        candidate_id: &str,
+        suite_id: &str,
+        baseline_run_id: &str,
+        candidate_run_id: &str,
+        allowed_regression: f64,
+    ) -> Result<ModelAdoption, ArtifactError> {
+        let adoption = self.adoptions.get(candidate_id).ok_or_else(|| {
+            ArtifactError::Invalid(format!("unknown model candidate {candidate_id:?}"))
+        })?;
+        let baseline = eval.get_run(baseline_run_id).ok_or_else(|| {
+            ArtifactError::Invalid(format!("unknown baseline eval run {baseline_run_id:?}"))
+        })?;
+        let candidate = eval.get_run(candidate_run_id).ok_or_else(|| {
+            ArtifactError::Invalid(format!("unknown candidate eval run {candidate_run_id:?}"))
+        })?;
+        if baseline.suite_id != suite_id || candidate.suite_id != suite_id {
+            return Err(ArtifactError::Invalid(
+                "eval runs must belong to the required suite".into(),
+            ));
+        }
+        if candidate.config_ref != adoption.model_id {
+            return Err(ArtifactError::Invalid(format!(
+                "candidate eval run targets {:?}, not adoption model {:?}",
+                candidate.config_ref, adoption.model_id
+            )));
+        }
+        let comparison = eval
+            .compare_runs(baseline_run_id, candidate_run_id)
+            .ok_or_else(|| ArtifactError::Invalid("eval runs cannot be compared".into()))?;
+        self.record_eval(
+            candidate_id,
+            ModelEvalEvidence {
+                suite_id: suite_id.to_string(),
+                baseline_run_id: baseline_run_id.to_string(),
+                candidate_run_id: candidate_run_id.to_string(),
+                baseline_score: comparison.baseline_score,
+                candidate_score: comparison.candidate_score,
+                allowed_regression,
+            },
+        )
+    }
+
+    fn record_eval(
         &mut self,
         candidate_id: &str,
         evidence: ModelEvalEvidence,
@@ -481,9 +528,9 @@ impl FederationAggregator {
     ) -> Result<ContributionReceipt, ArtifactError> {
         validate_contribution(&contribution)?;
         let participant_hash = opaque_hash(&contribution.participant_id);
-        if !self
+        if self
             .seen_contributions
-            .insert(contribution.contribution_id.clone())
+            .contains(&contribution.contribution_id)
         {
             let receipt = ContributionReceipt {
                 contribution_id: contribution.contribution_id,
@@ -497,8 +544,23 @@ impl FederationAggregator {
 
         let bucket = self
             .buckets
-            .entry((contribution.task_class, contribution.model_capability))
+            .entry((
+                contribution.task_class.clone(),
+                contribution.model_capability.clone(),
+            ))
             .or_default();
+        if bucket.participants.contains(&participant_hash) {
+            self.seen_contributions
+                .insert(contribution.contribution_id.clone());
+            let receipt = ContributionReceipt {
+                contribution_id: contribution.contribution_id,
+                participant_hash,
+                accepted: false,
+                reason: "participant already contributed to this bucket".into(),
+            };
+            self.receipts.push(receipt.clone());
+            return Ok(receipt);
+        }
         let successes = bucket
             .successes
             .checked_add(contribution.successes)
@@ -507,6 +569,8 @@ impl FederationAggregator {
             .attempts
             .checked_add(contribution.attempts)
             .ok_or_else(|| ArtifactError::Invalid("attempt count overflow".into()))?;
+        self.seen_contributions
+            .insert(contribution.contribution_id.clone());
         bucket.successes = successes;
         bucket.attempts = attempts;
         bucket.participants.insert(participant_hash.clone());
@@ -840,6 +904,30 @@ mod tests {
     }
 
     #[test]
+    fn federation_accepts_one_contribution_per_participant_bucket() {
+        let mut aggregator = FederationAggregator::new(2).unwrap();
+        assert!(
+            aggregator
+                .ingest(contribution("org-a", "one", 8, 10))
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            !aggregator
+                .ingest(contribution("org-a", "two", 10, 10))
+                .unwrap()
+                .accepted
+        );
+        aggregator
+            .ingest(contribution("org-b", "three", 10, 10))
+            .unwrap();
+
+        let prior = &aggregator.publishable_priors()[0];
+        assert_eq!(prior.sample_size, 20);
+        assert_eq!(prior.success_rate_bps, 9_000);
+    }
+
+    #[test]
     fn federation_rejects_non_aggregate_or_unproven_signal() {
         let mut aggregator = FederationAggregator::new(2).unwrap();
         let mut invalid = contribution("org-a", "one", 2, 1);
@@ -918,6 +1006,52 @@ mod tests {
         let mut evidence = passing_evidence("quality");
         evidence.candidate_run_id = evidence.baseline_run_id.clone();
         assert!(registry.record_eval("candidate-1", evidence).is_err());
+    }
+
+    #[test]
+    fn model_gate_derives_scores_from_server_owned_eval_runs() {
+        use crate::chisei::eval::{CaseResult, Run};
+
+        let eval = EvalStore::new();
+        let result = |case_id: &str, passed: bool| CaseResult {
+            case_id: case_id.into(),
+            passed,
+            status: String::new(),
+            result: String::new(),
+            score: if passed { 100 } else { 0 },
+            reason: String::new(),
+            elapsed: 0,
+        };
+        eval.create_run(Run {
+            id: "baseline".into(),
+            suite_id: "quality".into(),
+            config_ref: "old-model".into(),
+            results: vec![result("one", true), result("two", false)],
+            timestamp: 1,
+        });
+        eval.create_run(Run {
+            id: "candidate".into(),
+            suite_id: "quality".into(),
+            config_ref: "new-model".into(),
+            results: vec![result("one", true), result("two", true)],
+            timestamp: 2,
+        });
+        let mut registry = ModelSovereigntyRegistry::new();
+        registry
+            .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
+            .unwrap();
+
+        let adoption = registry
+            .record_eval_from_store(
+                &eval,
+                "candidate-1",
+                "quality",
+                "baseline",
+                "candidate",
+                0.0,
+            )
+            .unwrap();
+        assert_eq!(adoption.status, ModelAdoptionStatus::GatePassed);
     }
 
     #[test]
