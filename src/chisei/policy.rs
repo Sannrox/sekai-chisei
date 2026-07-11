@@ -10,6 +10,30 @@ pub struct Policy {
     pub data_class: String,
 }
 
+impl Policy {
+    /// Content hash identifying this exact policy revision. Surfaced with
+    /// every resolution so a decision can be pinned to (and re-derived from)
+    /// the policy version that produced it.
+    pub fn version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_vec(&(
+            &self.allowed_runtimes,
+            &self.allowed_models,
+            &self.default_runtime,
+            &self.default_model,
+            &self.data_class,
+        ))
+        .unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&canonical);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 pub struct PolicyResolver {
     namespace_policies: Mutex<HashMap<String, Policy>>,
 }
@@ -185,5 +209,23 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "agent:codex-app");
         assert_eq!(policy.default_model, "gpt-5.5");
+    }
+
+    #[test]
+    fn policy_version_is_stable_and_content_addressed() {
+        let policy = Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5".into(),
+            data_class: "internal".into(),
+        };
+        let same = policy.clone();
+        let mut changed = policy.clone();
+        changed.data_class = "sensitive".into();
+
+        assert_eq!(policy.version(), same.version());
+        assert_eq!(policy.version().len(), 64);
+        assert_ne!(policy.version(), changed.version());
     }
 }

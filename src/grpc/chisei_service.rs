@@ -1804,6 +1804,7 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         let policy = policy_from_request(&r);
         let policy_data_class = policy.data_class.clone();
+        let policy_version = policy.version();
         persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
         self.policy.set_namespace_policy(&r.namespace, policy);
         let (runtime, model) = self
@@ -1818,6 +1819,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 eval_regressed: false,
                 eval_regression_reason: String::new(),
                 route_bias: String::new(),
+                policy_scope: r.namespace,
+                policy_version,
             }),
         }))
     }
@@ -2064,6 +2067,14 @@ impl ChiseiService for ChiseiServiceImpl {
                     .unwrap_or_default(),
                 data_class: data_class.as_str().into(),
                 route_bias: route_bias.unwrap_or_default().to_string(),
+                policy_scope: effective_policy
+                    .as_ref()
+                    .map(|_| policy_scope.clone())
+                    .unwrap_or_default(),
+                policy_version: effective_policy
+                    .as_ref()
+                    .map(|policy| policy.version())
+                    .unwrap_or_default(),
             }),
         }))
     }
@@ -2073,7 +2084,12 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<CheckEgressRequest>,
     ) -> Result<Response<CheckEgressResponse>, Status> {
         let r = req.into_inner();
-        let data_class = self.data_class(self.policy.effective_policy(&r.namespace).as_ref());
+        let effective_policy = self.policy.effective_policy(&r.namespace);
+        let policy_version = effective_policy
+            .as_ref()
+            .map(|policy| policy.version())
+            .unwrap_or_default();
+        let data_class = self.data_class(effective_policy.as_ref());
         let provider_is_external = crate::chisei::egress::is_external_provider(&r.provider);
         let task_class = TaskClass::parse(&r.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
@@ -2095,6 +2111,7 @@ impl ChiseiService for ChiseiServiceImpl {
             return Ok(Response::new(CheckEgressResponse {
                 allowed: false,
                 findings,
+                policy_version,
             }));
         }
         let findings =
@@ -2105,6 +2122,7 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(CheckEgressResponse {
             allowed,
             findings: leak_findings_to_decisions(&r.provider, provider_is_external, &findings),
+            policy_version,
         }))
     }
 
@@ -3984,6 +4002,8 @@ mod tests {
 
         assert_eq!(resolved.runtime, "openai");
         assert_eq!(resolved.model, "native-default");
+        assert_eq!(resolved.policy_scope, "sekai-chisei");
+        assert_eq!(resolved.policy_version.len(), 64);
     }
 
     #[tokio::test]
@@ -4919,6 +4939,7 @@ mod tests {
             .into_inner();
 
         assert!(!response.allowed);
+        assert_eq!(response.policy_version.len(), 64);
         assert!(response.findings.iter().any(|decision| {
             decision
                 .reasons
