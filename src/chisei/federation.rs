@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
 use crate::chisei::eval::EvalStore;
 
 pub const PORTABLE_ARTIFACT_SCHEMA: &str = "sekai.governance/v1";
@@ -78,6 +80,7 @@ pub struct PortableArtifact {
     pub provenance: ArtifactProvenance,
     pub artifact: GovernanceArtifact,
     pub content_hash: String,
+    pub publisher_signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,31 +198,51 @@ pub struct ArtifactAdoption {
 /// Registry for exchanging verified governance artifacts. Publisher trust is
 /// configured locally; publishing an envelope never grants its publisher trust.
 pub struct GovernanceRegistry {
-    trusted_publishers: HashSet<String>,
+    trusted_publishers: HashMap<String, VerifyingKey>,
     artifacts: HashMap<String, Vec<PortableArtifact>>,
     adoptions: HashMap<(String, String), ArtifactAdoption>,
 }
 
 impl GovernanceRegistry {
-    pub fn new(trusted_publishers: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            trusted_publishers: trusted_publishers.into_iter().collect(),
+    pub fn new(
+        trusted_publishers: impl IntoIterator<Item = (String, [u8; 32])>,
+    ) -> Result<Self, ArtifactError> {
+        let mut verified = HashMap::new();
+        for (publisher_id, key) in trusted_publishers {
+            require_nonempty("trusted publisher id", &publisher_id)?;
+            let key = VerifyingKey::from_bytes(&key).map_err(|error| {
+                ArtifactError::Invalid(format!(
+                    "invalid key for publisher {publisher_id:?}: {error}"
+                ))
+            })?;
+            verified.insert(publisher_id, key);
+        }
+        Ok(Self {
+            trusted_publishers: verified,
             artifacts: HashMap::new(),
             adoptions: HashMap::new(),
-        }
+        })
     }
 
     pub fn publish(&mut self, artifact: PortableArtifact) -> Result<(), ArtifactError> {
         artifact.verify()?;
-        if !self
+        let verifying_key = self
             .trusted_publishers
-            .contains(&artifact.provenance.publisher_id)
-        {
-            return Err(ArtifactError::Invalid(format!(
-                "publisher {:?} is not trusted",
-                artifact.provenance.publisher_id
-            )));
-        }
+            .get(&artifact.provenance.publisher_id)
+            .ok_or_else(|| {
+                ArtifactError::Invalid(format!(
+                    "publisher {:?} is not trusted",
+                    artifact.provenance.publisher_id
+                ))
+            })?;
+        let signature_bytes =
+            decode_hex::<64>("publisher_signature", &artifact.publisher_signature)?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(artifact.content_hash.as_bytes(), &signature)
+            .map_err(|_| {
+                ArtifactError::Invalid("publisher signature verification failed".into())
+            })?;
 
         let versions = self
             .artifacts
@@ -676,10 +699,15 @@ impl PortableArtifact {
             provenance,
             artifact,
             content_hash: String::new(),
+            publisher_signature: String::new(),
         };
         envelope.validate_fields()?;
         envelope.content_hash = envelope.calculate_hash()?;
         Ok(envelope)
+    }
+
+    pub fn set_publisher_signature(&mut self, signature: &[u8; 64]) {
+        self.publisher_signature = encode_hex(signature);
     }
 
     pub fn verify(&self) -> Result<(), ArtifactError> {
@@ -772,6 +800,25 @@ impl PortableArtifact {
     }
 }
 
+fn decode_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], ArtifactError> {
+    if value.len() != N * 2 {
+        return Err(ArtifactError::Invalid(format!(
+            "{field} must contain {} hexadecimal characters",
+            N * 2
+        )));
+    }
+    let mut decoded = [0u8; N];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| ArtifactError::Invalid(format!("{field} contains invalid hexadecimal")))?;
+    }
+    Ok(decoded)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn require_nonempty(field: &str, value: &str) -> Result<(), ArtifactError> {
     if value.trim().is_empty() {
         Err(ArtifactError::Invalid(format!("{field} must not be empty")))
@@ -792,6 +839,7 @@ fn validate_decision(value: &str) -> Result<(), ArtifactError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn provenance() -> ArtifactProvenance {
         ArtifactProvenance {
@@ -800,6 +848,23 @@ mod tests {
             created_at: 1_700_000_000,
             parent_hash: None,
         }
+    }
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn trusted_registry() -> GovernanceRegistry {
+        GovernanceRegistry::new(vec![(
+            "org.example".into(),
+            signing_key().verifying_key().to_bytes(),
+        )])
+        .unwrap()
+    }
+
+    fn sign(artifact: &mut PortableArtifact) {
+        let signature = signing_key().sign(artifact.content_hash.as_bytes());
+        artifact.set_publisher_signature(&signature.to_bytes());
     }
 
     fn suite() -> GovernanceArtifact {
@@ -1086,30 +1151,42 @@ mod tests {
 
     #[test]
     fn registry_enforces_trust_and_version_lineage() {
-        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
-        let first = PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        let mut registry = trusted_registry();
+        let mut first =
+            PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        sign(&mut first);
         registry.publish(first.clone()).unwrap();
 
         let mut second_provenance = provenance();
         second_provenance.parent_hash = Some(first.content_hash.clone());
-        let second =
+        let mut second =
             PortableArtifact::new("eval-safe-refactor", 2, second_provenance, suite()).unwrap();
+        sign(&mut second);
         registry.publish(second.clone()).unwrap();
         assert_eq!(registry.latest("eval-safe-refactor"), Some(&second));
 
         let mut untrusted_provenance = provenance();
         untrusted_provenance.publisher_id = "unknown.example".into();
-        let untrusted = PortableArtifact::new("other", 1, untrusted_provenance, suite()).unwrap();
+        let mut untrusted =
+            PortableArtifact::new("other", 1, untrusted_provenance, suite()).unwrap();
+        sign(&mut untrusted);
         assert!(registry.publish(untrusted).is_err());
+
+        let mut forged = PortableArtifact::new("forged", 1, provenance(), suite()).unwrap();
+        let attacker = SigningKey::from_bytes(&[8; 32]);
+        forged.set_publisher_signature(&attacker.sign(forged.content_hash.as_bytes()).to_bytes());
+        assert!(registry.publish(forged).is_err());
     }
 
     #[test]
     fn registry_rejects_forks_and_conflicting_versions() {
-        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
-        let first = PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        let mut registry = trusted_registry();
+        let mut first =
+            PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        sign(&mut first);
         registry.publish(first.clone()).unwrap();
 
-        let conflict = PortableArtifact::new(
+        let mut conflict = PortableArtifact::new(
             "eval-safe-refactor",
             1,
             provenance(),
@@ -1125,19 +1202,23 @@ mod tests {
             }),
         )
         .unwrap();
+        sign(&mut conflict);
         assert!(registry.publish(conflict).is_err());
 
         let mut wrong_parent = provenance();
         wrong_parent.parent_hash = Some("b".repeat(64));
-        let fork = PortableArtifact::new("eval-safe-refactor", 2, wrong_parent, suite()).unwrap();
+        let mut fork =
+            PortableArtifact::new("eval-safe-refactor", 2, wrong_parent, suite()).unwrap();
+        sign(&mut fork);
         assert!(registry.publish(fork).is_err());
     }
 
     #[test]
     fn adoption_pins_an_exact_verified_version() {
-        let mut registry = GovernanceRegistry::new(vec!["org.example".into()]);
-        let artifact =
+        let mut registry = trusted_registry();
+        let mut artifact =
             PortableArtifact::new("eval-safe-refactor", 1, provenance(), suite()).unwrap();
+        sign(&mut artifact);
         registry.publish(artifact.clone()).unwrap();
         let adoption = registry
             .adopt("local-team", "eval-safe-refactor", 1, 200)
