@@ -25,10 +25,73 @@ pub struct ProvenanceReport {
     pub decisions: Vec<Decision>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyException {
+    pub decision_id: String,
+    pub action: String,
+    pub outcome: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVerdict {
+    pub clean: bool,
+    pub enforced_refusals: usize,
+    pub exceptions: Vec<PolicyException>,
+}
+
 impl ProvenanceReport {
     pub fn total_cost_usd_micros(&self) -> i64 {
         self.calls.iter().map(|call| call.cost_usd_micros).sum()
     }
+
+    pub fn policy_verdict(&self) -> PolicyVerdict {
+        let exceptions = self
+            .decisions
+            .iter()
+            .filter(|decision| is_policy_exception(decision))
+            .map(|decision| PolicyException {
+                decision_id: decision.id.clone(),
+                action: decision.action.clone(),
+                outcome: decision.outcome.clone(),
+                reason: decision.reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        let enforced_refusals = self
+            .calls
+            .iter()
+            .filter(|call| !call.refusal_reason.is_empty())
+            .count()
+            + self
+                .decisions
+                .iter()
+                .filter(|decision| is_enforced_refusal(decision))
+                .count();
+        PolicyVerdict {
+            clean: exceptions.is_empty(),
+            enforced_refusals,
+            exceptions,
+        }
+    }
+}
+
+fn is_policy_exception(decision: &Decision) -> bool {
+    decision
+        .evidence
+        .get("policy_violation")
+        .is_some_and(|value| value == "true")
+        || matches!(
+            decision.outcome.as_str(),
+            "bypassed" | "violated" | "policy_violation" | "leak_warned"
+        )
+}
+
+fn is_enforced_refusal(decision: &Decision) -> bool {
+    matches!(
+        decision.outcome.as_str(),
+        "denied" | "blocked" | "leak_blocked" | "redacted" | "skipped"
+    ) || decision.reason.contains("denied")
+        || decision.reason.contains("exceeded")
 }
 
 pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceReport, String> {
@@ -80,9 +143,22 @@ fn model_call(row: HashMap<String, String>) -> ModelCall {
 }
 
 pub fn render_text(report: &ProvenanceReport) -> String {
+    let verdict = report.policy_verdict();
+    let verdict_summary = if verdict.clean {
+        format!(
+            "policy-clean: no recorded policy violations ({} refusal(s) enforced)",
+            verdict.enforced_refusals
+        )
+    } else {
+        format!(
+            "policy exceptions: {} recorded exception(s)",
+            verdict.exceptions.len()
+        )
+    };
     let mut output = format!(
-        "Provenance for {}\n\nSummary\n  model calls: {}\n  audit decisions: {}\n  cost: ${:.6}\n\nModel calls\n",
+        "Provenance for {}\n\nSummary\n  {}\n  model calls: {}\n  audit decisions: {}\n  cost: ${:.6}\n\nModel calls\n",
         report.work_unit_id,
+        verdict_summary,
         report.calls.len(),
         report.decisions.len(),
         report.total_cost_usd_micros() as f64 / 1_000_000.0,
@@ -114,6 +190,15 @@ pub fn render_text(report: &ProvenanceReport) -> String {
             "  {}  actor={} action={} outcome={} reason={}\n",
             decision.id, decision.actor, decision.action, decision.outcome, decision.reason
         ));
+    }
+    if !verdict.exceptions.is_empty() {
+        output.push_str("\nPolicy exceptions\n");
+        for exception in verdict.exceptions {
+            output.push_str(&format!(
+                "  {}  action={} outcome={} reason={}\n",
+                exception.decision_id, exception.action, exception.outcome, exception.reason
+            ));
+        }
     }
     output
 }
@@ -257,5 +342,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["work", "work-id"]
         );
+    }
+
+    #[test]
+    fn verdict_distinguishes_enforced_blocks_from_policy_exceptions() {
+        let report = ProvenanceReport {
+            work_unit_id: "task".into(),
+            calls: vec![ModelCall {
+                request_id: "refused".into(),
+                refusal_reason: "budget".into(),
+                ..empty_call()
+            }],
+            decisions: vec![
+                Decision {
+                    id: "blocked".into(),
+                    timestamp: 1,
+                    actor: "privacy".into(),
+                    action: "leak_check".into(),
+                    reason: "leak checker evaluated outbound payload".into(),
+                    evidence: HashMap::new(),
+                    target_id: "req".into(),
+                    outcome: "leak_blocked".into(),
+                },
+                Decision {
+                    id: "warned".into(),
+                    timestamp: 2,
+                    actor: "privacy".into(),
+                    action: "leak_check".into(),
+                    reason: "possible secret".into(),
+                    evidence: HashMap::new(),
+                    target_id: "req".into(),
+                    outcome: "leak_warned".into(),
+                },
+            ],
+        };
+
+        let verdict = report.policy_verdict();
+        assert!(!verdict.clean);
+        assert_eq!(verdict.enforced_refusals, 2);
+        assert_eq!(verdict.exceptions[0].decision_id, "warned");
+        assert!(render_text(&report).contains("policy exceptions: 1 recorded exception"));
+    }
+
+    fn empty_call() -> ModelCall {
+        ModelCall {
+            request_id: String::new(),
+            timestamp_ms: 0,
+            provider: String::new(),
+            requested_model: String::new(),
+            resolved_model: String::new(),
+            status: String::new(),
+            refusal_reason: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd_micros: 0,
+        }
     }
 }
