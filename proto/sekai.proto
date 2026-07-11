@@ -375,6 +375,37 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+message PolicyAttestation {
+  string id = 1;
+  string decision_id = 2;       // the audit decision this attestation authorizes
+  string policy_kind = 3;       // e.g. action_policy
+  string policy_scope = 4;
+  string policy_version = 5;    // content hash of policy_snapshot
+  string policy_snapshot = 6;   // canonical JSON of the policy pinned at decision time
+  map<string, string> inputs = 7; // action, actor, risk_class, namespace
+  string decision = 8;          // allow | deny | require_approval
+  string content_hash = 9;
+  int64 created = 10;
+}
+message GetAttestationRequest { string id = 1; }
+message GetAttestationResponse { PolicyAttestation attestation = 1; }
+message ListAttestationsRequest {
+  string decision_id = 1;
+  string policy_scope = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+message ListAttestationsResponse { repeated PolicyAttestation attestations = 1; }
+message VerifyAttestationRequest { string id = 1; }
+message VerifyAttestationResponse {
+  bool ok = 1;
+  bool found = 2;
+  bool hash_ok = 3;            // stored hashes match recomputation
+  bool replay_ok = 4;          // pinned policy replayed over inputs re-derives the decision
+  string replayed_decision = 5;
+  bool decision_linked = 6;    // linked audit decision binds this attestation back
+  string error = 7;
+}
 message VerifyAuditLedgerRequest {}
 message VerifyAuditLedgerResponse {
   bool ok = 1;
@@ -665,6 +696,9 @@ service SekaiService {
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
   rpc VerifyAuditLedger(VerifyAuditLedgerRequest) returns (VerifyAuditLedgerResponse);
+  rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
+  rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
+  rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);
 
   rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);

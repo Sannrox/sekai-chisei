@@ -187,6 +187,29 @@ impl SekaiDb {
         crate::sekai::ledger::insert_chained_decision(&conn, d)
     }
 
+    pub fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE id = ?1",
+            params![id],
+            |row| {
+                let ev_str: String = row.get(5)?;
+                Ok(Decision {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    reason: row.get(4)?,
+                    evidence: serde_json::from_str(&ev_str).unwrap_or_default(),
+                    target_id: row.get(6)?,
+                    outcome: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
     pub fn list_decisions(&self, f: &DecisionFilter) -> Result<Vec<Decision>, String> {
         let conn = self.conn();
         let mut sql = "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE 1=1".to_string();
@@ -432,13 +455,23 @@ impl SekaiDb {
         // and its head is anchored so the remaining chain stays verifiable.
         let n1 = self.purge_decisions_with_anchor(before)?;
         let conn = self.conn();
+        // Attestations follow their decision: once the decision is purged,
+        // keeping the attestation would only make legitimately retired
+        // history verify as tampering (and grow the table without bound).
         let n2 = conn
+            .execute(
+                "DELETE FROM sekai_attestations \
+                 WHERE decision_id NOT IN (SELECT id FROM sekai_decisions)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        let n3 = conn
             .execute(
                 "DELETE FROM sekai_object_changes WHERE timestamp < ?1",
                 params![before],
             )
             .map_err(|e| e.to_string())?;
-        Ok(n1 + n2 as i32)
+        Ok(n1 + (n2 + n3) as i32)
     }
 }
 

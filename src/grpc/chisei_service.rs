@@ -2246,6 +2246,15 @@ impl ChiseiService for ChiseiServiceImpl {
         if event.timestamp <= 0 || event.timestamp > now {
             event.timestamp = now;
         }
+        // Reserved keys: only the server-side attestation binding may claim
+        // one, otherwise a caller could dress up an arbitrary audit event as
+        // policy-attested.
+        event
+            .evidence
+            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_ID);
+        event
+            .evidence
+            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_HASH);
         if event.target_id.trim().is_empty() {
             event.target_id = "llm_calls".to_string();
         }
@@ -3883,6 +3892,40 @@ mod tests {
             decisions[0].evidence.get("request_id").map(String::as_str),
             Some("req-1")
         );
+    }
+
+    #[tokio::test]
+    async fn record_gateway_audit_strips_reserved_attestation_evidence_keys() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
+        let event = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: String::new(),
+                    timestamp: 0,
+                    actor: "codex-app".into(),
+                    action: "gateway.model_rewrite".into(),
+                    reason: String::new(),
+                    evidence: HashMap::from([
+                        ("attestation_id".into(), "forged".into()),
+                        ("attestation_hash".into(), "forged".into()),
+                        ("request_id".into(), "req-1".into()),
+                    ]),
+                    target_id: String::new(),
+                    outcome: "routed".into(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .event
+            .unwrap();
+        assert!(!event.evidence.contains_key("attestation_id"));
+        assert!(!event.evidence.contains_key("attestation_hash"));
+        assert_eq!(event.evidence["request_id"], "req-1");
+        let stored = db.get_decision(&event.id).unwrap().unwrap();
+        assert!(!stored.evidence.contains_key("attestation_id"));
+        assert!(!stored.evidence.contains_key("attestation_hash"));
     }
 
     #[tokio::test]
