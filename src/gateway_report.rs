@@ -313,22 +313,22 @@ async fn attach_work_unit_budgets(
     source_rows: &[Row],
     channel: GatewayClient,
 ) {
-    let contexts = source_rows
-        .iter()
-        .filter_map(|row| {
-            let work_unit = row.values.get("work_unit_id")?.trim();
-            if work_unit.is_empty() {
-                return None;
-            }
-            Some((
-                work_unit.to_string(),
-                (
-                    row.values.get("project").cloned().unwrap_or_default(),
-                    row.values.get("agent").cloned().unwrap_or_default(),
-                ),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut contexts = BTreeMap::new();
+    for row in source_rows {
+        let Some(work_unit) = row
+            .values
+            .get("work_unit_id")
+            .filter(|work_unit| !work_unit.is_empty())
+        else {
+            continue;
+        };
+        contexts.entry(work_unit.clone()).or_insert_with(|| {
+            (
+                row.values.get("project").cloned().unwrap_or_default(),
+                row.values.get("agent").cloned().unwrap_or_default(),
+            )
+        });
+    }
     let requests = summaries
         .iter()
         .filter(|row| row.group != "(unknown)")
