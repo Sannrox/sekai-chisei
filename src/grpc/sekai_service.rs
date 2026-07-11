@@ -2962,6 +2962,9 @@ impl SekaiService for SekaiServiceImpl {
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("policy_scope".into(), policy_scope.clone());
             evidence.insert("decision".into(), decision.as_str().into());
+            if !work_unit.is_empty() {
+                evidence.insert("work_unit".into(), work_unit.clone());
+            }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
                 resolved_policy.as_ref(),
@@ -10207,17 +10210,18 @@ mod tests {
             })
             .unwrap();
 
-        let err = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "delete_link".into(),
-                    params: HashMap::from([("id".into(), "obj-1->obj-1".into())]),
-                    actor: String::new(),
-                }),
-                dry_run: false,
-            }))
-            .await
-            .unwrap_err();
+        let mut request = with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "delete_link".into(),
+                params: HashMap::from([("id".into(), "obj-1->obj-1".into())]),
+                actor: String::new(),
+            }),
+            dry_run: false,
+        });
+        request
+            .metadata_mut()
+            .insert("x-chisei-work-unit", "denied-action-work".parse().unwrap());
+        let err = svc.execute_action(request).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
         // Link still exists (no mutation).
@@ -10236,6 +10240,7 @@ mod tests {
         assert_eq!(decisions[0].evidence["risk_class"], "destructive");
         assert_eq!(decisions[0].evidence["decision"], "deny");
         assert_eq!(decisions[0].evidence["policy_scope"], "agent:tester");
+        assert_eq!(decisions[0].evidence["work_unit"], "denied-action-work");
 
         // The denial carries a verifiable attestation of the policy applied.
         // Attestation reads expose the policy snapshot, so they are gated on
