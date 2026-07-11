@@ -13,4 +13,5 @@ pub mod grpc;
 pub mod launch;
 pub mod llm;
 pub mod obs;
+pub mod provenance;
 pub mod sekai;
