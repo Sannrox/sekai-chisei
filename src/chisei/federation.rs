@@ -151,7 +151,9 @@ impl FederatedContribution {
 pub struct FederatedPrior {
     pub task_class: String,
     pub model_capability: String,
+    /// Aggregate rate rounded to a five-percentage-point band.
     pub success_rate_bps: u16,
+    /// Lower-bound power-of-two bucket, never the exact aggregate count.
     pub sample_size: u64,
     pub participant_count: u64,
     pub source_hashes: Vec<String>,
@@ -721,9 +723,8 @@ impl FederationAggregator {
                 FederatedPrior {
                     task_class: task_class.clone(),
                     model_capability: model_capability.clone(),
-                    success_rate_bps: ((u128::from(bucket.successes) * 10_000)
-                        / u128::from(bucket.attempts)) as u16,
-                    sample_size: bucket.attempts,
+                    success_rate_bps: rounded_rate_bps(bucket.successes, bucket.attempts),
+                    sample_size: sample_size_bucket(bucket.attempts),
                     participant_count: bucket.participants.len() as u64,
                     source_hashes,
                 }
@@ -740,6 +741,16 @@ impl FederationAggregator {
     pub fn receipts(&self) -> &[ContributionReceipt] {
         &self.receipts
     }
+}
+
+fn rounded_rate_bps(successes: u64, attempts: u64) -> u16 {
+    let raw = ((u128::from(successes) * 10_000) / u128::from(attempts)) as u16;
+    ((raw.saturating_add(250) / 500) * 500).min(10_000)
+}
+
+fn sample_size_bucket(attempts: u64) -> u64 {
+    debug_assert!(attempts > 0);
+    1u64 << (63 - attempts.leading_zeros())
 }
 
 fn validate_contribution(contribution: &FederatedContribution) -> Result<(), ArtifactError> {
@@ -1059,6 +1070,13 @@ mod tests {
     }
 
     #[test]
+    fn published_aggregates_suppress_exact_counts() {
+        assert_eq!(rounded_rate_bps(26, 30), 8_500);
+        assert_eq!(sample_size_bucket(30), 16);
+        assert_eq!(sample_size_bucket(32), 32);
+    }
+
+    #[test]
     fn routing_prior_requires_aggregate_evidence() {
         let error = PortableArtifact::new(
             "routing-rust-capable",
@@ -1122,7 +1140,7 @@ mod tests {
                 task_class: "rust-refactor".into(),
                 model_capability: "capable".into(),
                 success_rate_bps: 9_000,
-                sample_size: 30,
+                sample_size: 16,
                 participant_count: 3,
                 source_hashes: vec!["a".repeat(64)],
             }]
@@ -1142,7 +1160,7 @@ mod tests {
             .ingest(contribution("org-c", "third", 9, 10))
             .unwrap();
 
-        assert_eq!(aggregator.publishable_priors()[0].sample_size, 30);
+        assert_eq!(aggregator.publishable_priors()[0].sample_size, 16);
         assert_ne!(aggregator.receipts()[0].participant_hash, "org-a");
     }
 
@@ -1169,7 +1187,7 @@ mod tests {
             .unwrap();
 
         let prior = &aggregator.publishable_priors()[0];
-        assert_eq!(prior.sample_size, 30);
+        assert_eq!(prior.sample_size, 16);
         assert_eq!(prior.success_rate_bps, 9_000);
     }
 
