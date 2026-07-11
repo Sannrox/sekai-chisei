@@ -266,6 +266,56 @@ impl SekaiDb {
         Ok(results)
     }
 
+    /// Load only decisions attributable to one work unit or one of its model
+    /// requests. Evidence is JSON, so filtering here avoids materializing the
+    /// entire durable audit ledger in report processes.
+    pub fn list_work_unit_decisions(
+        &self,
+        work_unit_id: &str,
+        request_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Decision>, String> {
+        let conn = self.conn();
+        let mut sql = "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE (json_extract(evidence, '$.work_unit') = ? OR json_extract(evidence, '$.work_unit_id') = ? OR (json_extract(evidence, '$.scope_kind') = 'work_unit' AND json_extract(evidence, '$.budget_subject') LIKE ? ESCAPE '\\')".to_string();
+        let escaped_work_unit = work_unit_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut values: Vec<String> = vec![
+            work_unit_id.into(),
+            work_unit_id.into(),
+            format!("%/work_unit:{escaped_work_unit}"),
+        ];
+        if !request_ids.is_empty() {
+            sql.push_str(" OR json_extract(evidence, '$.request_id') IN (");
+            sql.push_str(&vec!["?"; request_ids.len()].join(","));
+            sql.push(')');
+            values.extend(request_ids.iter().cloned());
+        }
+        sql.push_str(") ORDER BY timestamp ASC, rowid ASC");
+        let refs = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::types::ToSql)
+            .collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                let evidence: String = row.get(5)?;
+                Ok(Decision {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    reason: row.get(4)?,
+                    evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+                    target_id: row.get(6)?,
+                    outcome: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn record_object_change(&self, c: &ObjectChange) -> Result<(), String> {
         let conn = self.conn();
         conn.execute("INSERT INTO sekai_object_changes (id,object_id,field,old_value,new_value,changed_by,timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)",

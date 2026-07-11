@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::db::sekai::SekaiDb;
-use crate::sekai::audit::{Decision, DecisionFilter};
+use crate::sekai::audit::Decision;
 use crate::sekai::dataset::{RowFilter, RowQuery};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,19 +51,7 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
         .filter_map(|row| row.get("request_id"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let first_call_at = rows
-        .iter()
-        .filter_map(|row| row.get("timestamp_ms")?.parse::<i64>().ok())
-        .min()
-        .unwrap_or(0);
-    let mut decisions = db.list_decisions(&DecisionFilter {
-        target_id: Some("llm_calls".into()),
-        after: first_call_at.saturating_sub(1),
-        ..Default::default()
-    })?;
-    decisions.retain(|decision| decision_matches(decision, work_unit_id, &request_ids));
-    decisions.reverse();
-    decisions.sort_by_key(|decision| decision.timestamp);
+    let decisions = db.list_work_unit_decisions(work_unit_id, &request_ids)?;
 
     let mut calls = rows.into_iter().map(model_call).collect::<Vec<_>>();
     calls.sort_by_key(|call| call.timestamp_ms);
@@ -72,27 +60,6 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
         calls,
         decisions,
     })
-}
-
-fn decision_matches(
-    decision: &Decision,
-    work_unit_id: &str,
-    request_ids: &BTreeSet<String>,
-) -> bool {
-    ["work_unit", "work_unit_id"].iter().any(|key| {
-        decision
-            .evidence
-            .get(*key)
-            .is_some_and(|value| value == work_unit_id)
-    }) || decision
-        .evidence
-        .get("request_id")
-        .is_some_and(|value| request_ids.contains(value))
-        || (decision.evidence.get("scope_kind").map(String::as_str) == Some("work_unit")
-            && decision
-                .evidence
-                .get("budget_subject")
-                .is_some_and(|value| value.ends_with(&format!("/work_unit:{work_unit_id}"))))
 }
 
 fn model_call(row: HashMap<String, String>) -> ModelCall {
