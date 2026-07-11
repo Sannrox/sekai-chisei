@@ -693,8 +693,20 @@ mod tests {
             outcome: "redacted".into(),
         })
         .unwrap();
+        db.record_decision(&Decision {
+            id: "colliding-object".into(),
+            timestamp: 2,
+            actor: "agent".into(),
+            action: "set_property".into(),
+            reason: "object mutation".into(),
+            evidence: HashMap::new(),
+            target_id: "req-egress".into(),
+            outcome: "updated".into(),
+        })
+        .unwrap();
 
         let report = assemble_report(&db, "task").unwrap();
+        assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.data_egress()[0].redacted_fields, 2);
         assert!(
             render_text(&report)
