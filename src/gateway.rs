@@ -3665,6 +3665,15 @@ async fn record_usage_and_append(
                     .await
                 {
                     warn!(error = %err, "chisei-gateway usage record failed");
+                } else {
+                    emit_budget_threshold_warnings(
+                        config,
+                        identity,
+                        context.work_unit_id.as_deref(),
+                        total_tokens,
+                        &mut chisei,
+                    )
+                    .await;
                 }
             }
             let pipeline_observation =
@@ -3792,6 +3801,77 @@ async fn record_usage_and_append(
         }
         Err(err) => {
             warn!(error = %err, "chisei-gateway usage append skipped; Chisei unavailable");
+        }
+    }
+}
+
+async fn emit_budget_threshold_warnings(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    work_unit: Option<&str>,
+    usage_delta: i32,
+    chisei: &mut ChiseiServiceClient<GatewayClient>,
+) {
+    let project_scope = format!("project:{}", identity.project.trim());
+    let agent_scope = format!("{project_scope}/agent:{}", identity.agent.trim());
+    let mut scopes = vec![("agent", agent_scope)];
+    if let Some(work_unit) = work_unit.filter(|value| !value.trim().is_empty()) {
+        scopes.push((
+            "work_unit",
+            format!("{}/work_unit:{}", scopes[0].1, work_unit.trim()),
+        ));
+    }
+
+    for (scope_kind, scope_id) in scopes {
+        let response = chisei
+            .check_budget(GrpcRequest::new(CheckBudgetRequest {
+                subject: scope_id.clone(),
+                estimated_tokens: 0,
+                project: String::new(),
+                agent: String::new(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                user_id: String::new(),
+                metric: String::new(),
+            }))
+            .await;
+        let Ok(response) = response else {
+            warn!(%scope_id, error = %response.unwrap_err(), "budget threshold check failed");
+            continue;
+        };
+        let Some(usage) = response.into_inner().usage else {
+            continue;
+        };
+        if usage.max_tokens <= 0 {
+            continue;
+        }
+        let previous = usage.tokens_used.saturating_sub(usage_delta).max(0);
+        for threshold in [70, 90] {
+            let crossed = i64::from(previous) * 100 < i64::from(usage.max_tokens) * threshold
+                && i64::from(usage.tokens_used) * 100 >= i64::from(usage.max_tokens) * threshold;
+            if !crossed {
+                continue;
+            }
+            let reason = format!(
+                "{scope_kind} budget reached {threshold}%: used {} of {} tokens",
+                usage.tokens_used, usage.max_tokens
+            );
+            warn!(%scope_id, threshold, used = usage.tokens_used, limit = usage.max_tokens, "budget threshold crossed");
+            record_gateway_decision(
+                config,
+                identity,
+                "gateway.budget_warning",
+                &reason,
+                "warned",
+                HashMap::from([
+                    ("budget_subject".to_string(), scope_id.clone()),
+                    ("scope_kind".to_string(), scope_kind.to_string()),
+                    ("threshold_percent".to_string(), threshold.to_string()),
+                    ("tokens_used".to_string(), usage.tokens_used.to_string()),
+                    ("max_tokens".to_string(), usage.max_tokens.to_string()),
+                ]),
+            )
+            .await;
         }
     }
 }
@@ -7722,6 +7802,86 @@ mod tests {
         );
         assert_eq!(rows[0].get("agent").map(String::as_str), Some("codex-app"));
         assert_eq!(rows[0].get("provider").map(String::as_str), Some("openai"));
+    }
+
+    #[tokio::test]
+    async fn work_unit_budget_threshold_crossing_records_warning() {
+        let (upstream_base, _) = spawn_fake_upstream(
+            r#"{"id":"resp_1","usage":{"input_tokens":60,"output_tokens":15,"total_tokens":75}}"#,
+            "application/json",
+        )
+        .await;
+        let (chisei_target, db) = spawn_control_plane().await;
+
+        let channel = connect_sekai(&chisei_target).await.unwrap();
+        ChiseiServiceClient::new(channel)
+            .set_budget_limit(GrpcRequest::new(SetBudgetLimitRequest {
+                user_id: String::new(),
+                max_tokens: 100,
+                period_type: "day".to_string(),
+                subject: String::new(),
+                project: "default".to_string(),
+                agent: "codex-app".to_string(),
+                key_id: String::new(),
+                work_unit: "feature-x".to_string(),
+                metric: String::new(),
+            }))
+            .await
+            .unwrap();
+
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-work-unit", "feature-x")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.budget_warning".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, "warned");
+        assert_eq!(
+            decisions[0]
+                .evidence
+                .get("threshold_percent")
+                .map(String::as_str),
+            Some("70")
+        );
+        assert_eq!(
+            decisions[0]
+                .evidence
+                .get("budget_subject")
+                .map(String::as_str),
+            Some("project:default/agent:codex-app/work_unit:feature-x")
+        );
     }
 
     #[tokio::test]
