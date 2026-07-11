@@ -41,10 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run_launch(config).await
         }
         "provenance" => {
+            sekai_chisei::launch::load_local_env();
             let work_unit = args
                 .get(1)
                 .ok_or_else(|| std::io::Error::other("usage: sekaictl provenance <work-unit>"))?;
             let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/sekai.db".into());
+            if !std::path::Path::new(&db_path).is_file() {
+                return Err(std::io::Error::other(format!(
+                    "control-plane database does not exist: {db_path}"
+                ))
+                .into());
+            }
             let db =
                 sekai_chisei::db::sekai::SekaiDb::new(&db_path).map_err(std::io::Error::other)?;
             let report = sekai_chisei::provenance::assemble_report(&db, work_unit)

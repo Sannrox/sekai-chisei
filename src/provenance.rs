@@ -51,8 +51,18 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
         .filter_map(|row| row.get("request_id"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut decisions = db.list_decisions(&DecisionFilter::default())?;
+    let first_call_at = rows
+        .iter()
+        .filter_map(|row| row.get("timestamp_ms")?.parse::<i64>().ok())
+        .min()
+        .unwrap_or(0);
+    let mut decisions = db.list_decisions(&DecisionFilter {
+        target_id: Some("llm_calls".into()),
+        after: first_call_at.saturating_sub(1),
+        ..Default::default()
+    })?;
     decisions.retain(|decision| decision_matches(decision, work_unit_id, &request_ids));
+    decisions.reverse();
     decisions.sort_by_key(|decision| decision.timestamp);
 
     let mut calls = rows.into_iter().map(model_call).collect::<Vec<_>>();
@@ -78,6 +88,11 @@ fn decision_matches(
         .evidence
         .get("request_id")
         .is_some_and(|value| request_ids.contains(value))
+        || (decision.evidence.get("scope_kind").map(String::as_str) == Some("work_unit")
+            && decision
+                .evidence
+                .get("budget_subject")
+                .is_some_and(|value| value.ends_with(&format!("/work_unit:{work_unit_id}"))))
 }
 
 fn model_call(row: HashMap<String, String>) -> ModelCall {
@@ -186,5 +201,46 @@ mod tests {
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.total_cost_usd_micros(), 42);
         assert!(render_text(&report).contains("provider=anthropic model=claude"));
+    }
+
+    #[test]
+    fn includes_work_unit_budget_warnings() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: "llm_calls".into(),
+            name: "LLM calls".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "llm_calls",
+            &[HashMap::from([
+                ("request_id".into(), "req-1".into()),
+                ("work_unit_id".into(), "task-1".into()),
+                ("timestamp_ms".into(), "10".into()),
+            ])],
+        )
+        .unwrap();
+        db.record_decision(&Decision {
+            id: "warning".into(),
+            timestamp: 11,
+            actor: "gateway".into(),
+            action: "gateway.budget_warning".into(),
+            reason: "threshold".into(),
+            evidence: HashMap::from([
+                ("scope_kind".into(), "work_unit".into()),
+                (
+                    "budget_subject".into(),
+                    "project:p/agent:a/work_unit:task-1".into(),
+                ),
+            ]),
+            target_id: "llm_calls".into(),
+            outcome: "warned".into(),
+        })
+        .unwrap();
+
+        assert_eq!(assemble_report(&db, "task-1").unwrap().decisions.len(), 1);
     }
 }
