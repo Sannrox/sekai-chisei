@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use hmac::{Hmac, Mac};
 
 use crate::chisei::eval::EvalStore;
 
@@ -532,6 +533,7 @@ fn validate_eval_evidence(evidence: &ModelEvalEvidence) -> Result<(), ArtifactEr
 /// No method exposes individual contributions after ingestion.
 pub struct FederationAggregator {
     minimum_participants: usize,
+    participant_hash_key: [u8; 32],
     seen_contributions: HashSet<String>,
     buckets: HashMap<(String, String), AggregateBucket>,
     receipts: Vec<ContributionReceipt>,
@@ -546,14 +548,23 @@ struct AggregateBucket {
 }
 
 impl FederationAggregator {
-    pub fn new(minimum_participants: usize) -> Result<Self, ArtifactError> {
+    pub fn new(
+        minimum_participants: usize,
+        participant_hash_key: [u8; 32],
+    ) -> Result<Self, ArtifactError> {
         if minimum_participants < 2 {
             return Err(ArtifactError::Invalid(
                 "federation requires at least two participants per published bucket".into(),
             ));
         }
+        if participant_hash_key == [0; 32] {
+            return Err(ArtifactError::Invalid(
+                "participant hash key must not be all zeroes".into(),
+            ));
+        }
         Ok(Self {
             minimum_participants,
+            participant_hash_key,
             seen_contributions: HashSet::new(),
             buckets: HashMap::new(),
             receipts: Vec::new(),
@@ -565,7 +576,8 @@ impl FederationAggregator {
         contribution: FederatedContribution,
     ) -> Result<ContributionReceipt, ArtifactError> {
         validate_contribution(&contribution)?;
-        let participant_hash = opaque_hash(&contribution.participant_id);
+        let participant_hash =
+            opaque_hash(&self.participant_hash_key, &contribution.participant_id);
         if self
             .seen_contributions
             .contains(&contribution.contribution_id)
@@ -685,8 +697,10 @@ fn require_sha256(field: &str, value: &str) -> Result<(), ArtifactError> {
     }
 }
 
-fn opaque_hash(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+fn opaque_hash(key: &[u8; 32], value: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("SHA-256 accepts 32-byte HMAC keys");
+    mac.update(value.as_bytes());
+    encode_hex(&mac.finalize().into_bytes())
 }
 
 impl PortableArtifact {
@@ -805,18 +819,27 @@ impl PortableArtifact {
 }
 
 fn decode_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], ArtifactError> {
-    if value.len() != N * 2 {
+    let encoded = value.as_bytes();
+    if encoded.len() != N * 2 || !encoded.iter().all(u8::is_ascii_hexdigit) {
         return Err(ArtifactError::Invalid(format!(
-            "{field} must contain {} hexadecimal characters",
+            "{field} must contain {} ASCII hexadecimal characters",
             N * 2
         )));
     }
     let mut decoded = [0u8; N];
-    for (index, byte) in decoded.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| ArtifactError::Invalid(format!("{field} contains invalid hexadecimal")))?;
+    for (pair, byte) in encoded.chunks_exact(2).zip(decoded.iter_mut()) {
+        *byte = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(decoded)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("decode_hex validates ASCII hexadecimal bytes"),
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -927,6 +950,21 @@ mod tests {
     }
 
     #[test]
+    fn signature_decoder_rejects_multibyte_input_without_panicking() {
+        let crafted = format!("€{}", "a".repeat(125));
+        assert_eq!(crafted.len(), 128);
+        assert!(decode_hex::<64>("publisher_signature", &crafted).is_err());
+    }
+
+    #[test]
+    fn participant_pseudonyms_are_coordinator_keyed() {
+        let first = opaque_hash(&[9; 32], "org.example");
+        let second = opaque_hash(&[8; 32], "org.example");
+        assert_ne!(first, second);
+        assert_ne!(first, format!("{:x}", Sha256::digest(b"org.example")));
+    }
+
+    #[test]
     fn routing_prior_requires_aggregate_evidence() {
         let error = PortableArtifact::new(
             "routing-rust-capable",
@@ -966,7 +1004,7 @@ mod tests {
 
     #[test]
     fn federation_publishes_only_after_disclosure_threshold() {
-        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
         aggregator
             .ingest(contribution("org-a", "one", 8, 10))
             .unwrap();
@@ -990,7 +1028,7 @@ mod tests {
 
     #[test]
     fn federation_rejects_replay_without_double_counting() {
-        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
         let first = contribution("org-a", "same", 8, 10);
         assert!(aggregator.ingest(first.clone()).unwrap().accepted);
         assert!(!aggregator.ingest(first).unwrap().accepted);
@@ -1004,7 +1042,7 @@ mod tests {
 
     #[test]
     fn federation_accepts_one_contribution_per_participant_bucket() {
-        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
         assert!(
             aggregator
                 .ingest(contribution("org-a", "one", 8, 10))
@@ -1028,7 +1066,7 @@ mod tests {
 
     #[test]
     fn federation_rejects_non_aggregate_or_unproven_signal() {
-        let mut aggregator = FederationAggregator::new(2).unwrap();
+        let mut aggregator = FederationAggregator::new(2, [9; 32]).unwrap();
         let mut invalid = contribution("org-a", "one", 2, 1);
         assert!(aggregator.ingest(invalid.clone()).is_err());
         invalid.successes = 1;
