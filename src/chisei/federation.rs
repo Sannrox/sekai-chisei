@@ -123,6 +123,191 @@ pub struct ContributionReceipt {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAdoptionStatus {
+    PendingEvaluation,
+    GatePassed,
+    GateFailed,
+    Promoted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelEvalEvidence {
+    pub suite_id: String,
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+    pub baseline_score: f64,
+    pub candidate_score: f64,
+    pub allowed_regression: f64,
+}
+
+impl ModelEvalEvidence {
+    pub fn passed(&self) -> bool {
+        self.baseline_score.is_finite()
+            && self.candidate_score.is_finite()
+            && self.allowed_regression.is_finite()
+            && self.allowed_regression >= 0.0
+            && self.candidate_score + self.allowed_regression >= self.baseline_score
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelAdoption {
+    pub candidate_id: String,
+    pub model_id: String,
+    pub required_suites: Vec<String>,
+    pub evidence: BTreeMap<String, ModelEvalEvidence>,
+    pub status: ModelAdoptionStatus,
+    pub created_at: i64,
+    pub promoted_at: Option<i64>,
+}
+
+/// Server-owned adoption state. Callers may submit eval evidence, but cannot
+/// mark a candidate passed or promoted themselves.
+pub struct ModelSovereigntyRegistry {
+    active_model: Option<String>,
+    adoptions: HashMap<String, ModelAdoption>,
+}
+
+impl Default for ModelSovereigntyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelSovereigntyRegistry {
+    pub fn new() -> Self {
+        Self {
+            active_model: None,
+            adoptions: HashMap::new(),
+        }
+    }
+
+    pub fn active_model(&self) -> Option<&str> {
+        self.active_model.as_deref()
+    }
+
+    pub fn begin_adoption(
+        &mut self,
+        candidate_id: impl Into<String>,
+        model_id: impl Into<String>,
+        mut required_suites: Vec<String>,
+        created_at: i64,
+    ) -> Result<ModelAdoption, ArtifactError> {
+        let candidate_id = candidate_id.into();
+        let model_id = model_id.into();
+        require_nonempty("candidate_id", &candidate_id)?;
+        require_nonempty("model_id", &model_id)?;
+        required_suites.sort();
+        required_suites.dedup();
+        if required_suites.is_empty() || required_suites.iter().any(|suite| suite.trim().is_empty())
+        {
+            return Err(ArtifactError::Invalid(
+                "model adoption requires at least one named eval suite".into(),
+            ));
+        }
+        if self.adoptions.contains_key(&candidate_id) {
+            return Err(ArtifactError::Invalid(format!(
+                "model candidate {candidate_id:?} already exists"
+            )));
+        }
+        let adoption = ModelAdoption {
+            candidate_id: candidate_id.clone(),
+            model_id,
+            required_suites,
+            evidence: BTreeMap::new(),
+            status: ModelAdoptionStatus::PendingEvaluation,
+            created_at,
+            promoted_at: None,
+        };
+        self.adoptions.insert(candidate_id, adoption.clone());
+        Ok(adoption)
+    }
+
+    pub fn record_eval(
+        &mut self,
+        candidate_id: &str,
+        evidence: ModelEvalEvidence,
+    ) -> Result<ModelAdoption, ArtifactError> {
+        validate_eval_evidence(&evidence)?;
+        let adoption = self.adoptions.get_mut(candidate_id).ok_or_else(|| {
+            ArtifactError::Invalid(format!("unknown model candidate {candidate_id:?}"))
+        })?;
+        if adoption.status != ModelAdoptionStatus::PendingEvaluation {
+            return Err(ArtifactError::Invalid(
+                "eval evidence cannot change after the gate is decided".into(),
+            ));
+        }
+        if !adoption.required_suites.contains(&evidence.suite_id) {
+            return Err(ArtifactError::Invalid(format!(
+                "eval suite {:?} is not required by this adoption",
+                evidence.suite_id
+            )));
+        }
+        if adoption.evidence.contains_key(&evidence.suite_id) {
+            return Err(ArtifactError::Invalid(format!(
+                "eval suite {:?} already recorded",
+                evidence.suite_id
+            )));
+        }
+        let passed = evidence.passed();
+        adoption
+            .evidence
+            .insert(evidence.suite_id.clone(), evidence);
+        if !passed {
+            adoption.status = ModelAdoptionStatus::GateFailed;
+        } else if adoption.evidence.len() == adoption.required_suites.len() {
+            adoption.status = ModelAdoptionStatus::GatePassed;
+        }
+        Ok(adoption.clone())
+    }
+
+    pub fn promote(
+        &mut self,
+        candidate_id: &str,
+        promoted_at: i64,
+    ) -> Result<ModelAdoption, ArtifactError> {
+        let adoption = self.adoptions.get_mut(candidate_id).ok_or_else(|| {
+            ArtifactError::Invalid(format!("unknown model candidate {candidate_id:?}"))
+        })?;
+        if adoption.status != ModelAdoptionStatus::GatePassed {
+            return Err(ArtifactError::Invalid(
+                "only an eval-gated model candidate can be promoted".into(),
+            ));
+        }
+        adoption.status = ModelAdoptionStatus::Promoted;
+        adoption.promoted_at = Some(promoted_at);
+        self.active_model = Some(adoption.model_id.clone());
+        Ok(adoption.clone())
+    }
+
+    pub fn get(&self, candidate_id: &str) -> Option<&ModelAdoption> {
+        self.adoptions.get(candidate_id)
+    }
+}
+
+fn validate_eval_evidence(evidence: &ModelEvalEvidence) -> Result<(), ArtifactError> {
+    require_nonempty("suite_id", &evidence.suite_id)?;
+    require_nonempty("baseline_run_id", &evidence.baseline_run_id)?;
+    require_nonempty("candidate_run_id", &evidence.candidate_run_id)?;
+    if evidence.baseline_run_id == evidence.candidate_run_id {
+        return Err(ArtifactError::Invalid(
+            "baseline and candidate eval runs must differ".into(),
+        ));
+    }
+    if !evidence.baseline_score.is_finite()
+        || !evidence.candidate_score.is_finite()
+        || !evidence.allowed_regression.is_finite()
+        || evidence.allowed_regression < 0.0
+    {
+        return Err(ArtifactError::Invalid(
+            "eval scores and allowed regression must be finite and non-negative".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Aggregates governance signal with a minimum-participant disclosure gate.
 /// No method exposes individual contributions after ingestion.
 pub struct FederationAggregator {
@@ -527,5 +712,76 @@ mod tests {
         invalid.successes = 1;
         invalid.source_artifact_hash = "not-a-hash".into();
         assert!(aggregator.ingest(invalid).is_err());
+    }
+
+    fn passing_evidence(suite_id: &str) -> ModelEvalEvidence {
+        ModelEvalEvidence {
+            suite_id: suite_id.into(),
+            baseline_run_id: format!("{suite_id}-baseline"),
+            candidate_run_id: format!("{suite_id}-candidate"),
+            baseline_score: 0.90,
+            candidate_score: 0.91,
+            allowed_regression: 0.01,
+        }
+    }
+
+    #[test]
+    fn model_promotion_requires_every_eval_suite() {
+        let mut registry = ModelSovereigntyRegistry::new();
+        registry
+            .begin_adoption(
+                "candidate-1",
+                "provider/new-model",
+                vec!["quality".into(), "security".into()],
+                100,
+            )
+            .unwrap();
+
+        registry
+            .record_eval("candidate-1", passing_evidence("quality"))
+            .unwrap();
+        assert!(registry.promote("candidate-1", 200).is_err());
+        registry
+            .record_eval("candidate-1", passing_evidence("security"))
+            .unwrap();
+        let promoted = registry.promote("candidate-1", 200).unwrap();
+
+        assert_eq!(promoted.status, ModelAdoptionStatus::Promoted);
+        assert_eq!(registry.active_model(), Some("provider/new-model"));
+    }
+
+    #[test]
+    fn regressing_model_is_permanently_gate_failed() {
+        let mut registry = ModelSovereigntyRegistry::new();
+        registry
+            .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
+            .unwrap();
+        let mut evidence = passing_evidence("quality");
+        evidence.candidate_score = 0.5;
+        let failed = registry.record_eval("candidate-1", evidence).unwrap();
+
+        assert_eq!(failed.status, ModelAdoptionStatus::GateFailed);
+        assert!(registry.promote("candidate-1", 200).is_err());
+        assert!(
+            registry
+                .record_eval("candidate-1", passing_evidence("quality"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn caller_cannot_submit_unrequired_or_reused_eval_run() {
+        let mut registry = ModelSovereigntyRegistry::new();
+        registry
+            .begin_adoption("candidate-1", "new-model", vec!["quality".into()], 100)
+            .unwrap();
+        assert!(
+            registry
+                .record_eval("candidate-1", passing_evidence("other"))
+                .is_err()
+        );
+        let mut evidence = passing_evidence("quality");
+        evidence.candidate_run_id = evidence.baseline_run_id.clone();
+        assert!(registry.record_eval("candidate-1", evidence).is_err());
     }
 }
