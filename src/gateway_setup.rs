@@ -1224,6 +1224,9 @@ mod tests {
                 key_id: "codex-app".to_string(),
                 work_unit: String::new(),
                 metric: String::new(),
+                task_class: String::new(),
+                mid_task: false,
+                local_free_available: false,
             }))
             .await
             .unwrap()
@@ -1242,6 +1245,7 @@ mod tests {
                 user_id: String::new(),
                 key_id: "codex-app".to_string(),
                 expected_calls: 1,
+                budget_route_bias: String::new(),
             }))
             .await
             .unwrap()

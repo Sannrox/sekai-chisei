@@ -50,7 +50,7 @@ pub fn gate_candidate(
         return None;
     }
     let decision = match candidate.kind.as_str() {
-        KIND_ROUTING_BIAS => gate_routing_bias(eval, &candidate)?,
+        KIND_ROUTING_BIAS => gate_routing_bias(db, eval, &candidate)?,
         KIND_TEMPLATE => gate_template(&candidate, tasks)?,
         _ => return None,
     };
@@ -113,7 +113,11 @@ pub fn gate_candidate(
 /// of returning `None`: unlike missing evidence, a corrupt/unrecognized payload will never resolve
 /// itself on a later retry, so treating it as "not enough evidence yet" would leave the candidate
 /// stuck in `proposed` forever, silently re-gated on every tick with no audit trail.
-fn gate_routing_bias(eval: &EvalStore, candidate: &Candidate) -> Option<GateDecision> {
+fn gate_routing_bias(
+    db: &SekaiDb,
+    eval: &EvalStore,
+    candidate: &Candidate,
+) -> Option<GateDecision> {
     let payload: RoutingBiasPayload = match serde_json::from_str(&candidate.payload) {
         Ok(p) => p,
         Err(e) => {
@@ -134,8 +138,21 @@ fn gate_routing_bias(eval: &EvalStore, candidate: &Candidate) -> Option<GateDeci
             // exists, so `None` here means the evidence vanished between propose and gate (e.g.
             // restart before hydration) — treat it the same as "not enough evidence yet", not as
             // a resolved regression, so the candidate is left `proposed` to retry.
-            let signal = eval.namespace_regression_signal(&candidate.namespace)?;
-            let regressed = signal.regressed;
+            let class_signal = crate::chisei::scoring::task_class_regression_signal(
+                db,
+                &candidate.namespace,
+                &candidate.task_class,
+            );
+            let namespace_signal = eval.namespace_regression_signal(&candidate.namespace);
+            if class_signal.is_none() && namespace_signal.is_none() {
+                return None;
+            }
+            let regressed = crate::chisei::scoring::task_class_or_namespace_regressed(
+                db,
+                eval,
+                &candidate.namespace,
+                &candidate.task_class,
+            );
             Some(GateDecision {
                 verdict: if regressed {
                     "pass".to_string()

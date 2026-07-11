@@ -30,6 +30,7 @@ use crate::chisei::eval::{self, EvalStore};
 use crate::config::Config;
 use crate::db::sekai::SekaiDb;
 use crate::llm;
+use crate::sekai::audit::DecisionFilter;
 
 /// A sampled execution captured at execute time, carrying enough context to be scored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +161,17 @@ const SAMPLING_RETENTION: i64 = 20;
 /// gate. (A like-for-like baseline design would be more rigorous — see module note — but this
 /// removes the worst false-positive source without a redesign.) The scored run is always recorded.
 const MIN_OBS_FOR_REGRESSION: usize = 5;
+const TASK_CLASS_REGRESSION_THRESHOLD: f64 = 10.0;
+const TASK_CLASS_SIGNAL_LOOKBACK_MS: i64 = 24 * 60 * 60 * 1000;
+const TASK_CLASS_SIGNAL_SCAN_LIMIT: i32 = 20;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskClassRegressionSignal {
+    pub regressed: bool,
+    pub reason: String,
+    pub delta: f64,
+    pub observed_at: i64,
+}
 
 const JUDGE_SYSTEM_PREAMBLE: &str = "You are a rigorous, impartial evaluator of an AI coding \
 assistant's output. Score the output against the rubric and call the `record_score` tool exactly \
@@ -562,17 +574,39 @@ impl ScoringJob {
         evidence.insert("run_id".to_string(), run.id.clone());
         evidence.insert("model".to_string(), self.model.clone());
         evidence.insert("pass_rate".to_string(), format!("{pass_count}/{total}"));
+        let task_class_breakdown = task_class_breakdown_json(group, &run.results);
         evidence.insert(
             "task_class_breakdown".to_string(),
-            task_class_breakdown_json(group, &run.results),
+            task_class_breakdown.clone(),
         );
+        let class_deltas = task_class_deltas(&self.db, namespace, &task_class_breakdown);
+        if !class_deltas.is_empty() {
+            evidence.insert(
+                "task_class_deltas".to_string(),
+                serde_json::to_string(&class_deltas).unwrap_or_default(),
+            );
+        }
+        let class_regressions: BTreeMap<String, f64> = class_deltas
+            .iter()
+            .filter(|(_, delta)| **delta < -TASK_CLASS_REGRESSION_THRESHOLD)
+            .map(|(task_class, delta)| (task_class.clone(), *delta))
+            .collect();
+        if !class_regressions.is_empty() {
+            evidence.insert(
+                "task_class_regressions".to_string(),
+                serde_json::to_string(&class_regressions).unwrap_or_default(),
+            );
+        }
         if let Some(delta) = delta {
             evidence.insert("delta".to_string(), format!("{delta:.1}"));
             evidence.insert("regressed".to_string(), regressed.to_string());
         }
+        // Capture audit time after iteration tracking so a class-scoped signal
+        // from this batch is never considered older than its namespace signal.
+        let decision_timestamp = chrono::Utc::now().timestamp_millis();
         let _ = self.db.record_decision(&crate::sekai::audit::Decision {
             id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
+            timestamp: decision_timestamp,
             actor: "chisei.scoring".into(),
             action: "scored".into(),
             reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
@@ -584,6 +618,55 @@ impl ScoringJob {
                 "stable".into()
             },
         });
+        for (task_class, delta) in &class_deltas {
+            let regressed = *delta < -TASK_CLASS_REGRESSION_THRESHOLD;
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: decision_timestamp,
+                actor: "chisei.scoring".into(),
+                action: "task_class_signal".into(),
+                reason: if regressed {
+                    format!(
+                        "sampled quality regressed for task_class {task_class} in namespace {namespace} (delta {delta:.1})"
+                    )
+                } else {
+                    format!(
+                        "sampled quality is stable for task_class {task_class} in namespace {namespace} (delta {delta:.1})"
+                    )
+                },
+                evidence: std::collections::HashMap::from([
+                    ("namespace".to_string(), namespace.to_string()),
+                    ("task_class".to_string(), task_class.clone()),
+                    ("delta".to_string(), format!("{delta:.1}")),
+                    ("regressed".to_string(), regressed.to_string()),
+                ]),
+                target_id: task_class_signal_target(namespace, task_class),
+                outcome: if regressed {
+                    "regressed".into()
+                } else {
+                    "stable".into()
+                },
+            });
+        }
+        for (task_class, delta) in class_regressions {
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: decision_timestamp,
+                actor: "chisei.scoring".into(),
+                action: "cheap_tier_regressed".into(),
+                reason: format!(
+                    "sampled quality regressed for task_class {task_class} in namespace {namespace} (delta {delta:.1})"
+                ),
+                evidence: std::collections::HashMap::from([
+                    ("namespace".to_string(), namespace.to_string()),
+                    ("task_class".to_string(), task_class.clone()),
+                    ("delta".to_string(), format!("{delta:.1}")),
+                    ("route_bias".to_string(), "capable".to_string()),
+                ]),
+                target_id: namespace.to_string(),
+                outcome: "reverted_to_capable".into(),
+            });
+        }
 
         // Bound the continuously-produced runs/iterations for this synthetic suite, in both the DB
         // and the in-memory store (the latter is hydrated wholesale at startup). Retention keeps
@@ -803,10 +886,22 @@ pub(crate) fn normalize_task_class(task_class: &str) -> String {
     task_class.trim().to_ascii_lowercase()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ClassCount {
     pass: u64,
     total: u64,
+    #[serde(default)]
+    score_sum: Option<i64>,
+}
+
+impl ClassCount {
+    fn mean_score(&self) -> Option<f64> {
+        if self.total == 0 {
+            return None;
+        }
+        self.score_sum
+            .map(|score_sum| score_sum as f64 / self.total as f64)
+    }
 }
 
 /// Per-task-class pass/total counts for one scored batch, as a compact JSON object
@@ -817,13 +912,118 @@ fn task_class_breakdown_json(group: &[&SampleObservation], results: &[eval::Case
     for (obs, result) in group.iter().zip(results.iter()) {
         let entry = counts
             .entry(normalize_task_class(&obs.task_class))
-            .or_insert(ClassCount { pass: 0, total: 0 });
+            .or_insert(ClassCount {
+                pass: 0,
+                total: 0,
+                score_sum: Some(0),
+            });
         entry.total += 1;
+        entry.score_sum = entry
+            .score_sum
+            .map(|score_sum| score_sum + i64::from(result.score));
         if result.passed {
             entry.pass += 1;
         }
     }
     serde_json::to_string(&counts).unwrap_or_default()
+}
+
+fn scored_decisions(db: &SekaiDb, namespace: &str) -> Vec<crate::sekai::audit::Decision> {
+    db.list_decisions(&DecisionFilter {
+        actor: Some("chisei.scoring".to_string()),
+        action: Some("scored".to_string()),
+        target_id: Some(namespace.to_string()),
+        after: chrono::Utc::now().timestamp_millis() - TASK_CLASS_SIGNAL_LOOKBACK_MS,
+        limit: TASK_CLASS_SIGNAL_SCAN_LIMIT,
+        ..Default::default()
+    })
+    .unwrap_or_default()
+}
+
+fn task_class_deltas(db: &SekaiDb, namespace: &str, current_json: &str) -> BTreeMap<String, f64> {
+    let Ok(current) = serde_json::from_str::<BTreeMap<String, ClassCount>>(current_json) else {
+        return BTreeMap::new();
+    };
+    let history = scored_decisions(db, namespace);
+    current
+        .into_iter()
+        .filter_map(|(task_class, counts)| {
+            if counts.total < MIN_OBS_FOR_REGRESSION as u64 {
+                return None;
+            }
+            let current_mean = counts.mean_score()?;
+            let baseline = history
+                .iter()
+                .filter_map(|decision| decision.evidence.get("task_class_breakdown"))
+                .filter_map(|json| serde_json::from_str::<BTreeMap<String, ClassCount>>(json).ok())
+                .filter_map(|breakdown| breakdown.get(&task_class).cloned())
+                .filter(|prior| prior.total >= MIN_OBS_FOR_REGRESSION as u64)
+                .filter_map(|prior| prior.mean_score())
+                .reduce(f64::max)?;
+            let delta = current_mean - baseline;
+            Some((task_class, delta))
+        })
+        .collect()
+}
+
+fn task_class_signal_target(namespace: &str, task_class: &str) -> String {
+    serde_json::to_string(&(namespace, task_class)).unwrap_or_default()
+}
+
+pub fn task_class_regression_signal(
+    db: &SekaiDb,
+    namespace: &str,
+    task_class: &str,
+) -> Option<TaskClassRegressionSignal> {
+    let normalized = normalize_task_class(task_class);
+    if namespace.trim().is_empty() || normalized.is_empty() {
+        return None;
+    }
+    let decision = db
+        .list_decisions(&DecisionFilter {
+            actor: Some("chisei.scoring".to_string()),
+            action: Some("task_class_signal".to_string()),
+            target_id: Some(task_class_signal_target(namespace, &normalized)),
+            limit: 1,
+            ..Default::default()
+        })
+        .ok()?
+        .into_iter()
+        .next()?;
+    let delta = decision.evidence.get("delta")?.parse::<f64>().ok()?;
+    let regressed = decision
+        .evidence
+        .get("regressed")
+        .is_some_and(|value| value == "true");
+    Some(TaskClassRegressionSignal {
+        regressed,
+        reason: decision.reason,
+        delta,
+        observed_at: decision.timestamp,
+    })
+}
+
+pub fn task_class_or_namespace_regressed(
+    db: &SekaiDb,
+    eval: &EvalStore,
+    namespace: &str,
+    task_class: &str,
+) -> bool {
+    let class_signal = task_class_regression_signal(db, namespace, task_class);
+    let namespace_signal = eval
+        .namespace_regression_signal(namespace)
+        .filter(|signal| signal.regressed);
+    let namespace_created = namespace_signal
+        .as_ref()
+        .and_then(|signal| signal.iteration.as_ref())
+        .map(|iteration| iteration.created)
+        .unwrap_or(i64::MIN);
+    if let Some(signal) = class_signal
+        && signal.observed_at >= namespace_created
+    {
+        return signal.regressed;
+    }
+    namespace_signal.is_some()
 }
 
 fn status_from_stop_reason(stop_reason: &str) -> String {
@@ -1076,7 +1276,14 @@ mod tests {
     #[tokio::test]
     async fn second_batch_with_low_scores_marks_regression() {
         let (db, eval) = setup();
-        observe_batch(&db, "acme", "good", MIN_OBS_FOR_REGRESSION, 100);
+        observe_batch_with_task_class(
+            &db,
+            "acme",
+            "background",
+            "good",
+            MIN_OBS_FOR_REGRESSION,
+            100,
+        );
         let good = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),
@@ -1090,7 +1297,14 @@ mod tests {
         assert_eq!(good.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION);
         assert!(!eval.namespace_regression_signal("acme").unwrap().regressed);
 
-        observe_batch(&db, "acme", "bad", MIN_OBS_FOR_REGRESSION, 200);
+        observe_batch_with_task_class(
+            &db,
+            "acme",
+            "background",
+            "bad",
+            MIN_OBS_FOR_REGRESSION,
+            200,
+        );
         let bad = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),
@@ -1105,6 +1319,56 @@ mod tests {
 
         // 10 vs 95 is a >10 point drop → regression flagged, which is what adaptive sampling reads.
         assert!(eval.namespace_regression_signal("acme").unwrap().regressed);
+        let class_signal = task_class_regression_signal(&db, "acme", "background").unwrap();
+        assert!(class_signal.regressed);
+        assert_eq!(class_signal.delta, -85.0);
+        let notifications = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("cheap_tier_regressed".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].evidence["task_class"], "background");
+        assert_eq!(notifications[0].outcome, "reverted_to_capable");
+
+        observe_batch_with_task_class(&db, "acme", "background", "tiny", 1, 300);
+        let tiny = ScoringJob::with_judge(
+            db.clone(),
+            eval,
+            Arc::new(StubJudge {
+                score: 95,
+                passed: true,
+            }),
+            16,
+            "claude-opus-4-8",
+        );
+        assert_eq!(tiny.run_once().await.unwrap(), 1);
+        assert!(
+            task_class_regression_signal(&db, "acme", "background")
+                .unwrap()
+                .regressed,
+            "an under-sampled batch must not clear a statistically meaningful regression"
+        );
+        for index in 0..25 {
+            db.record_decision(&crate::sekai::audit::Decision {
+                id: format!("unrelated-{index}"),
+                timestamp: 1_000 + index,
+                actor: "chisei.scoring".into(),
+                action: "scored".into(),
+                reason: String::new(),
+                evidence: std::collections::HashMap::new(),
+                target_id: "acme".into(),
+                outcome: "stable".into(),
+            })
+            .unwrap();
+        }
+        assert!(
+            task_class_regression_signal(&db, "acme", "background")
+                .unwrap()
+                .regressed,
+            "unrelated task-class batches must not evict an active class signal"
+        );
     }
 
     #[tokio::test]

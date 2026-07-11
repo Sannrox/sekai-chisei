@@ -230,7 +230,10 @@ impl SekaiDb {
             sql.push_str(" AND timestamp > ?");
             params.push(Box::new(f.after));
         }
-        sql.push_str(" ORDER BY timestamp DESC");
+        // Decisions can share a millisecond timestamp. `rowid` preserves
+        // insertion order so consumers reading the latest signal cannot pick
+        // an older same-millisecond decision nondeterministically.
+        sql.push_str(" ORDER BY timestamp DESC, rowid DESC");
         if f.limit > 0 {
             sql.push_str(" LIMIT ?");
             params.push(Box::new(f.limit));
@@ -560,6 +563,27 @@ mod tests {
             })
             .unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn decisions_with_equal_timestamps_return_newest_insertion_first() {
+        let db = setup();
+        for id in ["older", "newer"] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp: 100,
+                actor: "chisei.scoring".into(),
+                action: "scored".into(),
+                reason: String::new(),
+                evidence: HashMap::new(),
+                target_id: "acme".into(),
+                outcome: "stable".into(),
+            })
+            .unwrap();
+        }
+        let decisions = db.list_decisions(&DecisionFilter::default()).unwrap();
+        assert_eq!(decisions[0].id, "newer");
+        assert_eq!(decisions[1].id, "older");
     }
 
     #[test]

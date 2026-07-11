@@ -351,6 +351,9 @@ async fn attach_work_unit_budgets(
                         work_unit: work_unit.clone(),
                         user_id: String::new(),
                         metric: "tokens".to_string(),
+                        task_class: String::new(),
+                        mid_task: false,
+                        local_free_available: false,
                     }))
                     .await
                     .map(|response| response.into_inner().usage);
