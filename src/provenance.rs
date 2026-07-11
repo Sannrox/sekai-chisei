@@ -210,4 +210,52 @@ mod tests {
 
         assert_eq!(assemble_report(&db, "task-1").unwrap().decisions.len(), 1);
     }
+
+    #[test]
+    fn evidence_matching_is_exact_for_free_form_work_unit_ids() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: "llm_calls".into(),
+            name: "LLM calls".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "llm_calls",
+            &[HashMap::from([
+                ("request_id".into(), "req".into()),
+                ("work_unit_id".into(), "task_%".into()),
+            ])],
+        )
+        .unwrap();
+        for (id, key, value) in [
+            ("work", "work_unit", "task_%"),
+            ("work-id", "work_unit_id", "task_%"),
+            ("case-variant", "work_unit", "TASK_%"),
+        ] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp: 1,
+                actor: "agent".into(),
+                action: "action".into(),
+                reason: String::new(),
+                evidence: HashMap::from([(key.into(), value.into())]),
+                target_id: "object".into(),
+                outcome: "allowed".into(),
+            })
+            .unwrap();
+        }
+
+        let report = assemble_report(&db, "task_%").unwrap();
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work", "work-id"]
+        );
+    }
 }
