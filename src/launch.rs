@@ -139,6 +139,8 @@ pub struct LaunchConfig {
     pub budget_period: String,
     pub no_app: bool,
     pub keep_config: bool,
+    pub estimate_context_tokens: Option<i64>,
+    pub estimate_turns: i64,
 }
 
 impl LaunchConfig {
@@ -165,6 +167,8 @@ impl LaunchConfig {
             budget_period: "day".to_string(),
             no_app: false,
             keep_config: false,
+            estimate_context_tokens: None,
+            estimate_turns: 1,
         };
 
         let mut args = args.into_iter();
@@ -182,6 +186,22 @@ impl LaunchConfig {
                 "--budget-period" => config.budget_period = next_arg(&mut args, &arg)?,
                 "--no-app" => config.no_app = true,
                 "--keep-config" => config.keep_config = true,
+                "--estimate-context-tokens" => {
+                    config.estimate_context_tokens = Some(
+                        next_arg(&mut args, &arg)?
+                            .parse()
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| format!("{arg} must be a positive integer"))?,
+                    );
+                }
+                "--estimate-turns" => {
+                    config.estimate_turns = next_arg(&mut args, &arg)?
+                        .parse()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| format!("{arg} must be a positive integer"))?;
+                }
                 "--help" | "-h" => return Err(usage()),
                 other if other.starts_with('-') => {
                     return Err(format!("unknown argument {other:?}\n\n{}", usage()));
@@ -224,8 +244,16 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
-pub fn usage() -> String {
+fn usage_text() -> String {
     "Usage: sekaictl launch <agent> [--project <name>] [--model <model>] [--socket <path>] [--gateway-bind <addr>] [--budget <tokens>] [--budget-period <day|week|month>] [--no-app] [--keep-config]\n\nKnown app agents: codex-app (OpenAI-family), claude-code (Anthropic-family).\nThe gateway routes by model, so one shared gateway serves every client; each\nlaunch brings it up (or reuses it) and configures the namespace policy for all\nclients. Use --no-app to bring the shared gateway up without opening an app.\n\nBrings up the local stack and opens the client app wired through the Chisei gateway:\n  1. loads ./.env into the environment for any unset variables\n  2. starts the sekai server on the Unix socket if it is not already running\n  3. seeds the agent project, gateway key, budget, and model policy (idempotent)\n  4. starts chisei-gateway if it is not already running:\n     - codex-app: with OPENAI_API_KEY set it rewrites Codex local-login auth for api.openai.com;\n       without it, it forwards the Codex ChatGPT-plan login to the ChatGPT backend unchanged\n     - claude-code: with ANTHROPIC_API_KEY set it swaps in that key for api.anthropic.com;\n       without it, it forwards Claude Code's own subscription login unchanged (passthrough)\n  5. wires the client through the gateway and opens it:\n     - codex-app: routes ~/.codex/config.toml (model \"auto\", resolved server-side), opens the\n       Codex app, and restores the config when it quits (skip the revert with --keep-config)\n     - claude-code: spawns `claude` with ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL\n       env vars (process-scoped; nothing to revert)\n\n--model sets the gateway's default model (what codex-app's \"auto\" resolves to, and the primary\nmodel claude-code is told to send), not necessarily a fixed app model.\n\nExample: sekaictl launch codex-app\n         sekaictl launch claude-code\n         sekaictl launch codex-app --no-app   # just bring the shared gateway up".to_string()
+}
+
+pub fn usage() -> String {
+    usage_text().replacen(
+        "[--no-app]",
+        "[--estimate-context-tokens <tokens>] [--estimate-turns <count>] [--no-app]",
+        1,
+    )
 }
 
 /// Loads ./.env into the environment for any unset variables. Call before
@@ -238,6 +266,23 @@ pub async fn run_launch(
     config: LaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
+    if let Some(context_tokens) = config.estimate_context_tokens {
+        let estimate_config = crate::cost_estimate::CostEstimateConfig {
+            model: config.model.clone(),
+            context_tokens,
+            turns: config.estimate_turns,
+            output_tokens_per_turn: None,
+        };
+        match crate::cost_estimate::pricing_from_env()
+            .and_then(|pricing| crate::cost_estimate::estimate_cost(&estimate_config, &pricing))
+        {
+            Ok(estimate) => println!(
+                "{}",
+                crate::cost_estimate::render_estimate(&estimate_config, &estimate)
+            ),
+            Err(error) => eprintln!("warning: pre-launch cost estimate unavailable: {error}"),
+        }
+    }
     std::fs::create_dir_all(LOG_DIR)?;
     recover_stale_codex_config();
 
@@ -1040,6 +1085,10 @@ mod tests {
             "42".to_string(),
             "--gateway-bind".to_string(),
             "0.0.0.0:9000".to_string(),
+            "--estimate-context-tokens".to_string(),
+            "12000".to_string(),
+            "--estimate-turns".to_string(),
+            "4".to_string(),
         ])
         .unwrap();
 
@@ -1048,6 +1097,8 @@ mod tests {
         assert_eq!(config.model, "gpt-5.5");
         assert_eq!(config.budget_tokens, 42);
         assert_eq!(config.gateway_bind, "0.0.0.0:9000");
+        assert_eq!(config.estimate_context_tokens, Some(12_000));
+        assert_eq!(config.estimate_turns, 4);
         assert!(!config.no_app);
     }
 

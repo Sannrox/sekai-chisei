@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use tonic::Request as GrpcRequest;
 
-use crate::grpc::client::connect_sekai;
+use crate::grpc::client::{GatewayClient, connect_sekai};
+use crate::grpc::pb::chisei::CheckBudgetRequest;
+use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{QueryRowsRequest, Row, RowFilter, RowQuery};
 
@@ -123,13 +126,17 @@ pub struct GatewayReportRow {
     pub cost_usd_micros: i64,
     pub cache_read_input_tokens: i64,
     pub cache_savings_usd_micros: i64,
+    pub refusals: i64,
+    pub models: BTreeMap<String, i64>,
+    pub budget_used: i64,
+    pub budget_limit: i64,
 }
 
 pub async fn run_report(
     config: GatewayReportConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = connect_sekai(&config.chisei_grpc_target).await?;
-    let mut sekai = SekaiServiceClient::new(channel);
+    let mut sekai = SekaiServiceClient::new(channel.clone());
     let resp = sekai
         .query_rows(gateway_request(QueryRowsRequest {
             dataset_id: LLM_CALLS_DATASET.to_string(),
@@ -148,6 +155,8 @@ pub async fn run_report(
                     "pipeline_sampled".to_string(),
                     "sample_reason".to_string(),
                     "sample_rate".to_string(),
+                    "status".to_string(),
+                    "refusal_reason".to_string(),
                     "input_tokens".to_string(),
                     "output_tokens".to_string(),
                     "total_tokens".to_string(),
@@ -170,7 +179,10 @@ pub async fn run_report(
         std::fs::write(path, html)?;
         println!("wrote chisei gateway dashboard: {}", path.display());
     } else {
-        let rows = summarize_rows(resp.rows, config.group_by);
+        let mut rows = summarize_rows(resp.rows.clone(), config.group_by);
+        if config.group_by == ReportGroupBy::WorkUnit {
+            attach_work_unit_budgets(&mut rows, &resp.rows, channel).await;
+        }
         print_report(config.group_by, &rows);
     }
     Ok(())
@@ -263,6 +275,28 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
         summary.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
         summary.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
         summary.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
+        if row
+            .values
+            .get("status")
+            .is_some_and(|status| status == "refused")
+            || row
+                .values
+                .get("refusal_reason")
+                .is_some_and(|reason| !reason.is_empty())
+        {
+            summary.refusals += 1;
+        }
+        if group_by == ReportGroupBy::WorkUnit {
+            let model = row
+                .values
+                .get("resolved_model")
+                .filter(|model| !model.is_empty())
+                .or_else(|| row.values.get("model").filter(|model| !model.is_empty()))
+                .cloned();
+            if let Some(model) = model {
+                *summary.models.entry(model).or_default() += 1;
+            }
+        }
     }
     let mut summaries = groups.into_values().collect::<Vec<_>>();
     summaries.sort_by(|a, b| {
@@ -272,6 +306,78 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
             .then_with(|| a.group.cmp(&b.group))
     });
     summaries
+}
+
+async fn attach_work_unit_budgets(
+    summaries: &mut [GatewayReportRow],
+    source_rows: &[Row],
+    channel: GatewayClient,
+) {
+    let mut contexts = BTreeMap::new();
+    for row in source_rows {
+        let Some(work_unit) = row
+            .values
+            .get("work_unit_id")
+            .filter(|work_unit| !work_unit.is_empty())
+        else {
+            continue;
+        };
+        contexts.entry(work_unit.clone()).or_insert_with(|| {
+            (
+                row.values.get("project").cloned().unwrap_or_default(),
+                row.values.get("agent").cloned().unwrap_or_default(),
+            )
+        });
+    }
+    let requests = summaries
+        .iter()
+        .filter(|row| row.group != "(unknown)")
+        .map(|summary| {
+            let (project, agent) = contexts.get(&summary.group).cloned().unwrap_or_default();
+            (summary.group.clone(), project, agent)
+        })
+        .collect::<Vec<_>>();
+    let usages = stream::iter(requests)
+        .map(|(work_unit, project, agent)| {
+            let mut chisei = ChiseiServiceClient::new(channel.clone());
+            async move {
+                let result = chisei
+                    .check_budget(gateway_request(CheckBudgetRequest {
+                        subject: String::new(),
+                        estimated_tokens: 0,
+                        project,
+                        agent,
+                        key_id: String::new(),
+                        work_unit: work_unit.clone(),
+                        user_id: String::new(),
+                        metric: "tokens".to_string(),
+                    }))
+                    .await
+                    .map(|response| response.into_inner().usage);
+                (work_unit, result)
+            }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let mut by_work_unit = summaries
+        .iter_mut()
+        .map(|summary| (summary.group.clone(), summary))
+        .collect::<BTreeMap<_, _>>();
+    for (work_unit, result) in usages {
+        match result {
+            Ok(Some(usage)) => {
+                if let Some(summary) = by_work_unit.get_mut(&work_unit) {
+                    summary.budget_used = i64::from(usage.tokens_used);
+                    summary.budget_limit = i64::from(usage.max_tokens);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%work_unit, %error, "could not load work-unit budget usage");
+            }
+        }
+    }
 }
 
 fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
@@ -302,6 +408,10 @@ fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
 }
 
 fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
+    if group_by == ReportGroupBy::WorkUnit {
+        print_work_unit_report(rows);
+        return;
+    }
     println!(
         "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
         group_by.label(),
@@ -325,6 +435,46 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
             format_usd_micros(row.cost_usd_micros),
             row.cache_read_input_tokens,
             format_usd_micros(row.cache_savings_usd_micros)
+        );
+    }
+}
+
+fn print_work_unit_report(rows: &[GatewayReportRow]) {
+    println!(
+        "{:<24} {:>7} {:>9} {:>12} {:>11} {:>9}  models",
+        "work_unit", "calls", "refusals", "cost_usd", "cache_read", "budget"
+    );
+    println!("{}", "-".repeat(112));
+    for row in rows {
+        let billed_input = row.input_tokens.saturating_add(row.cache_read_input_tokens);
+        let cache_pct = if billed_input > 0 {
+            (row.cache_read_input_tokens.saturating_mul(100) / billed_input).clamp(0, 100)
+        } else {
+            0
+        };
+        let budget = if row.budget_limit > 0 {
+            format!(
+                "{}%",
+                (row.budget_used.saturating_mul(100) / row.budget_limit).clamp(0, 999)
+            )
+        } else {
+            "unlimited".to_string()
+        };
+        let models = row
+            .models
+            .iter()
+            .map(|(model, calls)| format!("{model}({calls})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{:<24} {:>7} {:>9} {:>12} {:>10}% {:>9}  {}",
+            truncate(&row.group, 24),
+            row.calls,
+            row.refusals,
+            format_usd_micros(row.cost_usd_micros),
+            cache_pct,
+            budget,
+            models
         );
     }
 }
@@ -746,6 +896,29 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn work_unit_summary_includes_refusals_and_model_mix() {
+        let rows = vec![
+            row([
+                ("work_unit_id", "feature-x"),
+                ("resolved_model", "claude-sonnet"),
+                ("status", "ok"),
+            ]),
+            row([
+                ("work_unit_id", "feature-x"),
+                ("model", "claude-haiku"),
+                ("status", "refused"),
+                ("refusal_reason", "budget"),
+            ]),
+        ];
+
+        let report = summarize_rows(rows, ReportGroupBy::WorkUnit);
+        assert_eq!(report[0].calls, 2);
+        assert_eq!(report[0].refusals, 1);
+        assert_eq!(report[0].models["claude-sonnet"], 1);
+        assert_eq!(report[0].models["claude-haiku"], 1);
     }
 
     #[test]
