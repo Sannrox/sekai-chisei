@@ -2844,6 +2844,9 @@ impl SekaiService for SekaiServiceImpl {
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("decision".into(), decision.as_str().into());
             evidence.insert("dry_run".into(), "true".into());
+            if !work_unit.is_empty() {
+                evidence.insert("work_unit".into(), work_unit.clone());
+            }
             if !policy_scope.is_empty() {
                 evidence.insert("policy_scope".into(), policy_scope.clone());
             }
@@ -2908,6 +2911,9 @@ impl SekaiService for SekaiServiceImpl {
             let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("policy_scope".into(), policy_scope.clone());
+            if !work_unit.is_empty() {
+                evidence.insert("work_unit".into(), work_unit.clone());
+            }
             evidence.insert("decision".into(), decision.as_str().into());
             evidence.insert("approval_id".into(), approval.id.clone());
             if !work_unit.is_empty() {
@@ -3049,6 +3055,9 @@ impl SekaiService for SekaiServiceImpl {
             let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("budget_subject".into(), budget_subject.clone());
+            if !work_unit.is_empty() {
+                evidence.insert("work_unit".into(), work_unit.clone());
+            }
             self.db
                 .record_decision(&audit::Decision {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -3109,6 +3118,9 @@ impl SekaiService for SekaiServiceImpl {
         self.refresh_security_after_action(&r.action, &r.params, &actor)?;
         let mut evidence =
             redact_action_evidence(&r.params, &sensitive_params, schema_restricted_property);
+        if !work_unit.is_empty() {
+            evidence.insert("work_unit".into(), work_unit.clone());
+        }
         let decision_id = uuid::Uuid::new_v4().to_string();
         let attested = attest_action_decision(
             resolved_policy.as_ref(),
