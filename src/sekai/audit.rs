@@ -286,9 +286,9 @@ impl SekaiDb {
         if !request_ids.is_empty() {
             sql.push_str(" OR json_extract(evidence, '$.request_id') IN (");
             sql.push_str(&vec!["?"; request_ids.len()].join(","));
-            sql.push_str(") OR target_id IN (");
+            sql.push_str(") OR (actor IN ('chisei.egress','chisei.privacy','chisei.sampling') AND target_id IN (");
             sql.push_str(&vec!["?"; request_ids.len()].join(","));
-            sql.push(')');
+            sql.push_str("))");
             values.extend(request_ids.iter().cloned());
             values.extend(request_ids.iter().cloned());
         }
