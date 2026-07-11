@@ -275,15 +275,13 @@ impl SekaiDb {
         request_ids: &BTreeSet<String>,
     ) -> Result<Vec<Decision>, String> {
         let conn = self.conn();
-        let mut sql = "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE (json_extract(evidence, '$.work_unit') = ? OR json_extract(evidence, '$.work_unit_id') = ? OR (json_extract(evidence, '$.scope_kind') = 'work_unit' AND json_extract(evidence, '$.budget_subject') LIKE ? ESCAPE '\\')".to_string();
-        let escaped_work_unit = work_unit_id
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let mut sql = "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE json_valid(evidence) AND (json_extract(evidence, '$.work_unit') = ? OR json_extract(evidence, '$.work_unit_id') = ? OR (json_extract(evidence, '$.scope_kind') = 'work_unit' AND substr(json_extract(evidence, '$.budget_subject'), -length(?)) = ?)".to_string();
+        let budget_suffix = format!("/work_unit:{work_unit_id}");
         let mut values: Vec<String> = vec![
             work_unit_id.into(),
             work_unit_id.into(),
-            format!("%/work_unit:{escaped_work_unit}"),
+            budget_suffix.clone(),
+            budget_suffix,
         ];
         if !request_ids.is_empty() {
             sql.push_str(" OR json_extract(evidence, '$.request_id') IN (");
@@ -774,5 +772,35 @@ mod tests {
         let obj = object("o1", "api", "default", "ext-1", HashMap::new());
 
         assert!(record_object_diff(&db, "tester", None, Some(&obj)).is_err());
+    }
+
+    #[test]
+    fn work_unit_query_skips_malformed_unrelated_evidence() {
+        let db = setup();
+        db.record_decision(&Decision {
+            id: "malformed".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "action".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "allowed".into(),
+        })
+        .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "UPDATE sekai_decisions SET evidence='not json' WHERE id='malformed'",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            db.list_work_unit_decisions("task", &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 }
