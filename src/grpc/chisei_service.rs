@@ -895,6 +895,26 @@ impl ChiseiServiceImpl {
         evidence.insert("decisions".to_string(), decisions.len().to_string());
         evidence.insert("included_count".to_string(), included_count.to_string());
         evidence.insert("redacted_count".to_string(), redacted_count.to_string());
+        evidence.insert(
+            "included_fields".to_string(),
+            serde_json::to_string(
+                &decisions
+                    .iter()
+                    .flat_map(|decision| decision.included.iter())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".into()),
+        );
+        evidence.insert(
+            "redacted_fields".to_string(),
+            serde_json::to_string(
+                &decisions
+                    .iter()
+                    .flat_map(|decision| decision.redacted.iter())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".into()),
+        );
         let _ = self.db.record_decision(&crate::sekai::audit::Decision {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().timestamp_millis(),
