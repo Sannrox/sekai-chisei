@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::db::sekai::SekaiDb;
-use crate::sekai::attestation::{AttestationVerification, EVIDENCE_ATTESTATION_ID};
+use crate::sekai::attestation::{
+    AttestationVerification, EVIDENCE_ATTESTATION_HASH, EVIDENCE_ATTESTATION_ID,
+};
 use crate::sekai::audit::Decision;
 use crate::sekai::dataset::{RowFilter, RowQuery};
 use crate::sekai::ledger::LedgerVerification;
@@ -265,10 +267,30 @@ fn assemble_assurance(db: &SekaiDb, decisions: &[Decision]) -> Result<AssuranceS
         let Some(attestation_id) = decision.evidence.get(EVIDENCE_ATTESTATION_ID) else {
             continue;
         };
+        let attestation = db.get_attestation(attestation_id)?;
+        let mut verification = db.verify_attestation(attestation_id)?;
+        if let Some(attestation) = &attestation {
+            let id_matches = attestation.decision_id == decision.id;
+            let hash_matches =
+                decision.evidence.get(EVIDENCE_ATTESTATION_HASH) == Some(&attestation.content_hash);
+            if !id_matches || !hash_matches {
+                verification.ok = false;
+                verification.decision_linked = false;
+                let binding_error = format!(
+                    "reported decision {} does not bind attestation {}",
+                    decision.id, attestation_id
+                );
+                verification.error = if verification.error.is_empty() {
+                    binding_error
+                } else {
+                    format!("{}; {binding_error}", verification.error)
+                };
+            }
+        }
         attestations.push(VerifiedAttestation {
             attestation_id: attestation_id.clone(),
             decision_id: decision.id.clone(),
-            verification: db.verify_attestation(attestation_id)?,
+            verification,
         });
     }
     Ok(AssuranceSummary {
@@ -784,6 +806,16 @@ mod tests {
         assert!(assurance.verifiable(true));
         assert_eq!(assurance.attestations.len(), 1);
         assert!(render_text(&report).contains("verifiable: audit ledger valid"));
+
+        let mut cross_linked = decision.clone();
+        cross_linked.id = "different-decision".into();
+        let cross_linked_assurance = assemble_assurance(&db, &[cross_linked]).unwrap();
+        assert!(!cross_linked_assurance.attestations[0].verification.ok);
+        assert!(
+            !cross_linked_assurance.attestations[0]
+                .verification
+                .decision_linked
+        );
     }
 
     fn empty_call() -> ModelCall {
