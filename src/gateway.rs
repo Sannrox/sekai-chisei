@@ -957,6 +957,7 @@ struct RawGatewayContextRetrieval {
     fields: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_policy_preflight(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
@@ -2144,6 +2145,7 @@ async fn gateway_context_expansion_gate(
     gate
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_context_egress(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
