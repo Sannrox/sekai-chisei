@@ -3135,10 +3135,7 @@ impl ChiseiService for ChiseiServiceImpl {
             stop_reason: chat.stop_reason.clone(),
             provider: provider.clone(),
         };
-        let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
-            .map_err(Status::internal)?;
-        self.record_evolve_task(
+        if let Err(error) = self.record_evolve_task(
             &input.request_id,
             &namespace_hint,
             &plan.enriched_spec,
@@ -3146,8 +3143,14 @@ impl ChiseiService for ChiseiServiceImpl {
                 .as_deref(),
             "done",
             chat.input_tokens + chat.output_tokens,
-        )
-        .map_err(Status::internal)?;
+        ) {
+            record_failed_operation_on(&self.db, &plan, &actor, "execution_bookkeeping_failed")
+                .map_err(Status::internal)?;
+            return Err(Status::internal(error));
+        }
+        let completed_at_ms = chrono::Utc::now().timestamp_millis();
+        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
+            .map_err(Status::internal)?;
         // Sampling consumption: a sampled request was selected for deeper
         // observation, so capture its actual execution outcome as a durable
         // audit record keyed to the request. Unsampled executions skip this —
