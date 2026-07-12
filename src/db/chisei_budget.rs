@@ -58,7 +58,7 @@ pub(crate) fn parent_scope_id(scope_id: &str) -> String {
     }
 }
 
-fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
+pub(crate) fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
     let now = chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_default();
     let date = now.date_naive();
     let start_date = match period_type {
