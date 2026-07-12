@@ -682,6 +682,9 @@ message GetProvenanceReportResponse { string report = 1; }
 
 // --- Service ---
 
+// Durable, namespace-isolated facts for agent operations. Domain-specific
+// concepts are represented through typed objects and links rather than new
+// fields in this core contract.
 service SekaiService {
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
