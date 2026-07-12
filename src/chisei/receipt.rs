@@ -24,6 +24,27 @@ pub enum ReceiptSurface {
     Outcome,
 }
 
+impl ReceiptSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Context => "context",
+            Self::Policy => "policy",
+            Self::Routing => "routing",
+            Self::Budget => "budget",
+            Self::Approval => "approval",
+            Self::Egress => "egress",
+            Self::Attempt => "attempt",
+            Self::ModelCall => "model_call",
+            Self::Action => "action",
+            Self::Artifact => "artifact",
+            Self::Verification => "verification",
+            Self::Intervention => "intervention",
+            Self::Outcome => "outcome",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptEventKind {
@@ -44,6 +65,45 @@ pub enum ReceiptEventKind {
 }
 
 impl ReceiptEventKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim() {
+            "intent_recorded" => Self::IntentRecorded,
+            "context_governed" => Self::ContextGoverned,
+            "policy_decided" => Self::PolicyDecided,
+            "route_selected" => Self::RouteSelected,
+            "budget_decided" => Self::BudgetDecided,
+            "approval_decided" => Self::ApprovalDecided,
+            "egress_decided" => Self::EgressDecided,
+            "attempt_started" => Self::AttemptStarted,
+            "model_called" => Self::ModelCalled,
+            "action_performed" => Self::ActionPerformed,
+            "artifact_produced" => Self::ArtifactProduced,
+            "verification_recorded" => Self::VerificationRecorded,
+            "human_intervened" => Self::HumanIntervened,
+            "outcome_recorded" => Self::OutcomeRecorded,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentRecorded => "intent_recorded",
+            Self::ContextGoverned => "context_governed",
+            Self::PolicyDecided => "policy_decided",
+            Self::RouteSelected => "route_selected",
+            Self::BudgetDecided => "budget_decided",
+            Self::ApprovalDecided => "approval_decided",
+            Self::EgressDecided => "egress_decided",
+            Self::AttemptStarted => "attempt_started",
+            Self::ModelCalled => "model_called",
+            Self::ActionPerformed => "action_performed",
+            Self::ArtifactProduced => "artifact_produced",
+            Self::VerificationRecorded => "verification_recorded",
+            Self::HumanIntervened => "human_intervened",
+            Self::OutcomeRecorded => "outcome_recorded",
+        }
+    }
+
     pub const fn surface(self) -> ReceiptSurface {
         match self {
             Self::IntentRecorded => ReceiptSurface::Intent,
