@@ -10,6 +10,7 @@ data/*.sqlite-*
 !.env.example
 .DS_Store
 *.log
+*.gateway-token
 __pycache__/
 *.pyc
 data/logs/
