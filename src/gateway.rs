@@ -551,18 +551,30 @@ impl GatewayRuntime {
 
     fn with_budget_reconciliation_path(mut self, path: Option<PathBuf>) -> Self {
         self.budget_reconciliation_path = path;
-        if let Some(path) = self.budget_reconciliation_path.as_ref()
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(entries) = serde_json::from_slice::<Vec<PendingBudgetUsage>>(&bytes)
-        {
+        if let Some(path) = self.budget_reconciliation_path.as_ref() {
             let cache = Arc::get_mut(&mut self.governance_cache)
                 .expect("new gateway runtime cache is not shared")
                 .get_mut();
-            for entry in entries {
-                let request = RecordUsageRequest::from(entry);
-                cache
-                    .pending_budget_usage
-                    .insert(usage_reconciliation_key(&request), request);
+            match std::fs::read(path) {
+                Ok(bytes) => match serde_json::from_slice::<Vec<PendingBudgetUsage>>(&bytes) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let request = RecordUsageRequest::from(entry);
+                            cache
+                                .pending_budget_usage
+                                .insert(usage_reconciliation_key(&request), request);
+                        }
+                    }
+                    Err(error) => {
+                        error!(path = %path.display(), %error, "budget reconciliation journal is invalid");
+                        cache.budget_reconciliation_saturated = true;
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    error!(path = %path.display(), %error, "budget reconciliation journal is unreadable");
+                    cache.budget_reconciliation_saturated = true;
+                }
             }
         }
         self
@@ -6821,6 +6833,23 @@ mod tests {
             MAX_PENDING_BUDGET_RECONCILIATIONS
         );
         assert!(cache.budget_reconciliation_saturated);
+    }
+
+    #[tokio::test]
+    async fn invalid_budget_reconciliation_journal_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "chisei-invalid-budget-reconciliation-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"not-json").unwrap();
+
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_budget_reconciliation_path(Some(path.clone()));
+        let cache = runtime.governance_cache.read().await;
+        assert!(cache.pending_budget_usage.is_empty());
+        assert!(cache.budget_reconciliation_saturated);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
