@@ -6710,16 +6710,6 @@ async fn response_from_upstream(
     match upstream.bytes().await {
         Ok(bytes) => {
             let (usage, observation) = extract_buffered_body_usage(&bytes);
-            record_usage_and_append(
-                config,
-                runtime,
-                identity,
-                usage,
-                observation,
-                &context,
-                status,
-            )
-            .await;
             let body = match response_adapter {
                 ResponseAdapter::Passthrough => bytes.to_vec(),
                 // Both cross-provider adapters map a buffered OpenAI chat body to
@@ -6734,22 +6724,46 @@ async fn response_from_upstream(
                     ) {
                         Ok(body) => body,
                         Err(err) => {
+                            let rejection = GatewayRejection {
+                                status: StatusCode::BAD_GATEWAY,
+                                error_type: "gateway_response_error".into(),
+                                reason: format!(
+                                    "failed to translate OpenAI response to Anthropic: {err}"
+                                ),
+                            };
+                            record_refusal_and_append(config, identity, &context, &rejection).await;
                             return json_error(
-                                StatusCode::BAD_GATEWAY,
-                                "gateway_response_error",
-                                &format!("failed to translate OpenAI response to Anthropic: {err}"),
+                                rejection.status,
+                                &rejection.error_type,
+                                &rejection.reason,
                             );
                         }
                     }
                 }
             };
-            builder.body(Body::from(body)).unwrap_or_else(|err| {
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "gateway_response_error",
-                    &format!("failed to build upstream response: {err}"),
-                )
-            })
+            let response = match builder.body(Body::from(body)) {
+                Ok(response) => response,
+                Err(err) => {
+                    let rejection = GatewayRejection {
+                        status: StatusCode::BAD_GATEWAY,
+                        error_type: "gateway_response_error".into(),
+                        reason: format!("failed to build upstream response: {err}"),
+                    };
+                    record_refusal_and_append(config, identity, &context, &rejection).await;
+                    return json_error(rejection.status, &rejection.error_type, &rejection.reason);
+                }
+            };
+            record_usage_and_append(
+                config,
+                runtime,
+                identity,
+                usage,
+                observation,
+                &context,
+                status,
+            )
+            .await;
+            response
         }
         Err(err) => json_error(
             StatusCode::BAD_GATEWAY,
