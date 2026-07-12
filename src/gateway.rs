@@ -1223,6 +1223,12 @@ struct GatewayRejection {
     reason: String,
 }
 
+#[derive(Clone, Copy)]
+struct ReceiptRejection<'a> {
+    rejection: &'a GatewayRejection,
+    model_attempted: bool,
+}
+
 fn audit_budget_subject(req: &CheckBudgetRequest) -> Option<String> {
     if !req.subject.trim().is_empty() {
         return Some(req.subject.trim().to_string());
@@ -5268,7 +5274,7 @@ async fn record_refusal_and_append(
     context: &UsageContext,
     rejection: &GatewayRejection,
 ) {
-    record_refusal_with_usage_and_append(config, identity, context, rejection, None).await;
+    record_refusal_with_usage_and_append(config, identity, context, rejection, None, false).await;
 }
 
 async fn record_refusal_with_usage_and_append(
@@ -5277,6 +5283,7 @@ async fn record_refusal_with_usage_and_append(
     context: &UsageContext,
     rejection: &GatewayRejection,
     usage: Option<ResponseUsage>,
+    model_attempted: bool,
 ) {
     let Some(target) = &config.chisei_grpc_target else {
         return;
@@ -5288,7 +5295,10 @@ async fn record_refusal_with_usage_and_append(
         rejection.status,
         usage.as_ref(),
         None,
-        Some(rejection),
+        Some(ReceiptRejection {
+            rejection,
+            model_attempted,
+        }),
     )
     .await;
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
@@ -5404,8 +5414,12 @@ fn build_gateway_operation_receipt(
     status: StatusCode,
     usage: Option<&ResponseUsage>,
     observation: Option<&ResponseObservation>,
-    rejection: Option<&GatewayRejection>,
+    rejection: Option<ReceiptRejection<'_>>,
 ) -> OperationReceipt {
+    let model_attempted = rejection
+        .map(|failure| failure.model_attempted)
+        .unwrap_or(true);
+    let rejection = rejection.map(|failure| failure.rejection);
     let operation_id = context.request_id.clone();
     let completed_at_ms = Utc::now().timestamp_millis();
     let actor = identity.agent.as_str();
@@ -5540,7 +5554,7 @@ fn build_gateway_operation_receipt(
             )]),
         ),
     ];
-    let outcome_parent = if rejection.is_some() && usage.is_none() {
+    let outcome_parent = if rejection.is_some() && !model_attempted {
         "egress"
     } else {
         events.extend([
@@ -5673,7 +5687,7 @@ async fn record_gateway_operation_receipt(
     status: StatusCode,
     usage: Option<&ResponseUsage>,
     observation: Option<&ResponseObservation>,
-    rejection: Option<&GatewayRejection>,
+    rejection: Option<ReceiptRejection<'_>>,
 ) {
     let receipt =
         build_gateway_operation_receipt(identity, context, status, usage, observation, rejection);
@@ -6815,7 +6829,7 @@ async fn response_from_upstream(
                 )
                 .await;
                 record_refusal_with_usage_and_append(
-                    &config, &identity, &context, &rejection, usage,
+                    &config, &identity, &context, &rejection, usage, true,
                 )
                 .await;
             } else {
@@ -6878,7 +6892,7 @@ async fn response_from_upstream(
                             )
                             .await;
                             record_refusal_with_usage_and_append(
-                                config, identity, &context, &rejection, usage,
+                                config, identity, &context, &rejection, usage, true,
                             )
                             .await;
                             return json_error(
@@ -6909,7 +6923,7 @@ async fn response_from_upstream(
                     )
                     .await;
                     record_refusal_with_usage_and_append(
-                        config, identity, &context, &rejection, usage,
+                        config, identity, &context, &rejection, usage, true,
                     )
                     .await;
                     return json_error(rejection.status, &rejection.error_type, &rejection.reason);
@@ -7166,7 +7180,10 @@ mod tests {
             rejection.status,
             None,
             None,
-            Some(&rejection),
+            Some(ReceiptRejection {
+                rejection: &rejection,
+                model_attempted: false,
+            }),
         );
 
         assert!(receipt.completeness().complete);
@@ -7190,7 +7207,10 @@ mod tests {
             budget_rejection.status,
             None,
             None,
-            Some(&budget_rejection),
+            Some(ReceiptRejection {
+                rejection: &budget_rejection,
+                model_attempted: false,
+            }),
         );
         assert!(budget_receipt.events.iter().any(|event| {
             event.kind == ReceiptEventKind::PolicyDecided
