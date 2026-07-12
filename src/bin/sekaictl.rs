@@ -28,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "action" => {
             sekai_chisei::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
         }
+        "receipt" => {
+            sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
+        }
         "estimate" => {
             sekai_chisei::launch::load_local_env();
             let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
@@ -184,7 +187,9 @@ async fn run_gateway_command(
 }
 
 fn print_root_usage() {
-    println!("Usage: sekaictl <credential|gateway|launch|action|estimate|provenance> ...\n");
+    println!(
+        "Usage: sekaictl <credential|gateway|launch|action|estimate|provenance|receipt> ...\n"
+    );
     println!("Credential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
@@ -198,6 +203,10 @@ fn print_root_usage() {
     println!("\nGoverned action commands:");
     println!("{}", sekai_chisei::action_cli::usage());
     println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
+    println!(
+        "\nOperation receipt:\n  {}",
+        sekai_chisei::receipt_cli::usage()
+    );
 }
 
 fn print_gateway_usage() {
