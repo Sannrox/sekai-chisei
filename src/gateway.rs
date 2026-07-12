@@ -4937,6 +4937,12 @@ fn upstream_auth_mode(
     requested_mode
 }
 
+#[derive(Clone, Copy)]
+enum GatewayUsageOutcome {
+    Success(StatusCode),
+    AccountingOnly(StatusCode),
+}
+
 async fn record_usage_and_append(
     config: &GatewayConfig,
     runtime: &GatewayRuntime,
@@ -4944,21 +4950,28 @@ async fn record_usage_and_append(
     usage: Option<ResponseUsage>,
     response_observation: Option<ResponseObservation>,
     context: &UsageContext,
-    status: StatusCode,
+    outcome: GatewayUsageOutcome,
 ) {
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
-    record_gateway_operation_receipt(
-        config,
-        identity,
-        context,
-        status,
-        usage.as_ref(),
-        response_observation.as_ref(),
-        None,
-    )
-    .await;
+    let status = match outcome {
+        GatewayUsageOutcome::Success(status) | GatewayUsageOutcome::AccountingOnly(status) => {
+            status
+        }
+    };
+    if matches!(outcome, GatewayUsageOutcome::Success(_)) {
+        record_gateway_operation_receipt(
+            config,
+            identity,
+            context,
+            status,
+            usage.as_ref(),
+            response_observation.as_ref(),
+            None,
+        )
+        .await;
+    }
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let total_tokens = usage.as_ref().map(|usage| usage.total_tokens).unwrap_or(0);
     let request_usage = RecordUsageRequest {
@@ -6750,7 +6763,7 @@ async fn response_from_upstream(
                 usage,
                 observation,
                 &context,
-                status,
+                GatewayUsageOutcome::Success(status),
             )
             .await;
         });
@@ -6790,6 +6803,16 @@ async fn response_from_upstream(
                                     "failed to translate OpenAI response to Anthropic: {err}"
                                 ),
                             };
+                            record_usage_and_append(
+                                config,
+                                runtime,
+                                identity,
+                                usage,
+                                observation.clone(),
+                                &context,
+                                GatewayUsageOutcome::AccountingOnly(rejection.status),
+                            )
+                            .await;
                             record_refusal_and_append(config, identity, &context, &rejection).await;
                             return json_error(
                                 rejection.status,
@@ -6808,6 +6831,16 @@ async fn response_from_upstream(
                         error_type: "gateway_response_error".into(),
                         reason: format!("failed to build upstream response: {err}"),
                     };
+                    record_usage_and_append(
+                        config,
+                        runtime,
+                        identity,
+                        usage,
+                        observation.clone(),
+                        &context,
+                        GatewayUsageOutcome::AccountingOnly(rejection.status),
+                    )
+                    .await;
                     record_refusal_and_append(config, identity, &context, &rejection).await;
                     return json_error(rejection.status, &rejection.error_type, &rejection.reason);
                 }
@@ -6819,7 +6852,7 @@ async fn response_from_upstream(
                 usage,
                 observation,
                 &context,
-                status,
+                GatewayUsageOutcome::Success(status),
             )
             .await;
             response
