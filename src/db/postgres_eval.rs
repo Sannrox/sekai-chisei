@@ -233,7 +233,7 @@ fn row_to_eval_suite(row: postgres::Row) -> Result<eval::Suite, String> {
         id: row.get(0),
         name: row.get(1),
         description: row.get(2),
-        cases: serde_json::from_str(&cases_json).map_err(|error| error.to_string())?,
+        cases: decode_json_or_default(&cases_json),
     })
 }
 
@@ -243,9 +243,16 @@ fn row_to_eval_run(row: postgres::Row) -> Result<eval::Run, String> {
         id: row.get(0),
         suite_id: row.get(1),
         config_ref: row.get(2),
-        results: serde_json::from_str(&results_json).map_err(|error| error.to_string())?,
+        results: decode_json_or_default(&results_json),
         timestamp: row.get(4),
     })
+}
+
+fn decode_json_or_default<T>(json: &str) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    serde_json::from_str(json).unwrap_or_default()
 }
 
 fn row_to_eval_iteration(row: postgres::Row) -> eval::Iteration {
@@ -274,5 +281,11 @@ mod tests {
     fn iteration_projection_matches_row_decoder() {
         assert_eq!(ITERATION_COLUMNS.split(',').count(), 12);
         assert!(ITERATION_COLUMNS.contains("regressed"));
+    }
+
+    #[test]
+    fn malformed_eval_payloads_default_without_hiding_other_rows() {
+        let decoded: Vec<eval::CaseResult> = decode_json_or_default("not-json");
+        assert!(decoded.is_empty());
     }
 }
