@@ -130,85 +130,88 @@ fn record_completed_operation_on(
     response: &PlannedChatResponse,
     completed_at_ms: i64,
 ) -> Result<(), String> {
-    let mut receipt = db
-        .get_operation_receipt(&plan.plan_id)?
-        .ok_or_else(|| format!("operation receipt {} not found", plan.plan_id))?;
-    let canonical_egress_id = format!("{}:egress", receipt.operation_id);
-    let parent = if receipt.events.iter().any(|event| {
-        event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
-    }) {
-        "egress"
-    } else {
-        "budget"
-    };
-    receipt.events.extend([
-        receipt_event(
-            &receipt.operation_id,
-            "attempt-1",
-            Some(parent),
-            completed_at_ms,
-            ReceiptEventKind::AttemptStarted,
-            actor,
-            BTreeMap::from([("attempt".into(), "1".into())]),
-        ),
-        receipt_event(
-            &receipt.operation_id,
-            "model-call-1",
-            Some("attempt-1"),
-            completed_at_ms,
-            ReceiptEventKind::ModelCalled,
-            "chisei.llm",
-            BTreeMap::from([
-                ("provider".into(), response.provider.clone()),
-                ("model".into(), plan.resolved_model.clone()),
-                ("input_tokens".into(), response.input_tokens.to_string()),
-                ("output_tokens".into(), response.output_tokens.to_string()),
-            ]),
-        ),
-        receipt_event(
-            &receipt.operation_id,
-            "artifact-1",
-            Some("model-call-1"),
-            completed_at_ms,
-            ReceiptEventKind::ArtifactProduced,
-            "chisei.llm",
-            BTreeMap::from([
-                ("artifact_type".into(), "model_response".into()),
-                ("content_hash".into(), planned_response_hash(response)),
-                ("content_stored".into(), "false".into()),
-            ]),
-        ),
-        receipt_event(
-            &receipt.operation_id,
-            "verification",
-            Some("artifact-1"),
-            completed_at_ms,
-            ReceiptEventKind::VerificationRecorded,
-            "chisei.execution",
-            BTreeMap::from([("status".into(), "not_requested".into())]),
-        ),
-        receipt_event(
-            &receipt.operation_id,
-            "outcome",
-            Some("verification"),
-            completed_at_ms,
-            ReceiptEventKind::OutcomeRecorded,
-            actor,
-            BTreeMap::from([
-                ("status".into(), "succeeded".into()),
-                ("completion_reason".into(), response.stop_reason.clone()),
-                (
-                    "latency_ms".into(),
-                    completed_at_ms
-                        .saturating_sub(receipt.started_at_ms)
-                        .to_string(),
-                ),
-            ]),
-        ),
-    ]);
-    receipt.completed_at_ms = Some(completed_at_ms);
-    receipt.uncovered_surfaces.clear();
-    db.put_operation_receipt(&receipt)
+    db.update_operation_receipt(&plan.plan_id, |receipt| {
+        if receipt.completed_at_ms.is_some() {
+            return Err("operation receipt already has a terminal outcome".into());
+        }
+        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
+        let parent = if receipt.events.iter().any(|event| {
+            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
+        }) {
+            "egress"
+        } else {
+            "budget"
+        };
+        receipt.events.extend([
+            receipt_event(
+                &receipt.operation_id,
+                "attempt-1",
+                Some(parent),
+                completed_at_ms,
+                ReceiptEventKind::AttemptStarted,
+                actor,
+                BTreeMap::from([("attempt".into(), "1".into())]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "model-call-1",
+                Some("attempt-1"),
+                completed_at_ms,
+                ReceiptEventKind::ModelCalled,
+                "chisei.llm",
+                BTreeMap::from([
+                    ("provider".into(), response.provider.clone()),
+                    ("model".into(), plan.resolved_model.clone()),
+                    ("input_tokens".into(), response.input_tokens.to_string()),
+                    ("output_tokens".into(), response.output_tokens.to_string()),
+                ]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "artifact-1",
+                Some("model-call-1"),
+                completed_at_ms,
+                ReceiptEventKind::ArtifactProduced,
+                "chisei.llm",
+                BTreeMap::from([
+                    ("artifact_type".into(), "model_response".into()),
+                    ("content_hash".into(), planned_response_hash(response)),
+                    ("content_stored".into(), "false".into()),
+                ]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "verification",
+                Some("artifact-1"),
+                completed_at_ms,
+                ReceiptEventKind::VerificationRecorded,
+                "chisei.execution",
+                BTreeMap::from([("status".into(), "not_requested".into())]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "outcome",
+                Some("verification"),
+                completed_at_ms,
+                ReceiptEventKind::OutcomeRecorded,
+                actor,
+                BTreeMap::from([
+                    ("status".into(), "succeeded".into()),
+                    ("completion_reason".into(), response.stop_reason.clone()),
+                    (
+                        "latency_ms".into(),
+                        completed_at_ms
+                            .saturating_sub(receipt.started_at_ms)
+                            .to_string(),
+                    ),
+                ]),
+            ),
+        ]);
+        receipt.completed_at_ms = Some(completed_at_ms);
+        receipt.uncovered_surfaces.clear();
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn pipeline_context_expansion_profile_key(namespace: &str) -> String {

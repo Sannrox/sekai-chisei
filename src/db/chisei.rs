@@ -321,6 +321,39 @@ impl SekaiDb {
         Ok((receipt, true))
     }
 
+    pub(crate) fn update_operation_receipt<F>(
+        &self,
+        operation_id: &str,
+        update: F,
+    ) -> Result<OperationReceipt, String>
+    where
+        F: FnOnce(&mut OperationReceipt) -> Result<(), String>,
+    {
+        // Hold the same sole connection guard used by reporter appends across
+        // this entire read-modify-write operation so completion cannot erase
+        // evidence reported concurrently.
+        let conn = self.conn();
+        let receipt_json = conn
+            .query_row(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
+                params![operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
+        let mut receipt: OperationReceipt =
+            serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+        update(&mut receipt)?;
+        let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
+            params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(receipt)
+    }
+
     pub fn authorize_operation_reporter(
         &self,
         operation_id: &str,
