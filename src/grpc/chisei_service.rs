@@ -3393,7 +3393,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let authorized = self
+        let changed = self
             .db
             .authorize_operation_reporter(
                 &request.operation_id,
@@ -3402,7 +3402,8 @@ impl ChiseiService for ChiseiServiceImpl {
             )
             .map_err(Status::internal)?;
         Ok(Response::new(AuthorizeOperationReporterResponse {
-            authorized,
+            authorized: true,
+            changed,
         }))
     }
 
@@ -5806,21 +5807,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
-        let mut authorization = Request::new(AuthorizeOperationReporterRequest {
-            operation_id: plan.plan_id.clone(),
-            principal: "agent:reporter".into(),
-            event_kinds: vec!["action_performed".into()],
-        });
-        authorization
-            .metadata_mut()
-            .insert("x-principal", "agent:authenticated".parse().unwrap());
-        assert!(
-            svc.authorize_operation_reporter(authorization)
-                .await
-                .unwrap()
-                .into_inner()
-                .authorized
-        );
+        let authorization = || {
+            let mut request = Request::new(AuthorizeOperationReporterRequest {
+                operation_id: plan.plan_id.clone(),
+                principal: "agent:reporter".into(),
+                event_kinds: vec!["action_performed".into()],
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "agent:authenticated".parse().unwrap());
+            request
+        };
+        let first_authorization = svc
+            .authorize_operation_reporter(authorization())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first_authorization.authorized);
+        assert!(first_authorization.changed);
+        let replayed_authorization = svc
+            .authorize_operation_reporter(authorization())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(replayed_authorization.authorized);
+        assert!(!replayed_authorization.changed);
         let report = || {
             let mut request = Request::new(ReportOperationEventRequest {
                 operation_id: plan.plan_id.clone(),
