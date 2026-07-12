@@ -379,10 +379,19 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
 }
 
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = GatewayRuntime::from_env();
+    validate_gateway_security(
+        config.bind_addr,
+        &config.gateway_keys,
+        config.fail_closed,
+        config.no_preflight,
+        config.allow_auth_passthrough,
+        runtime.admin_token.as_deref(),
+    )?;
     let bind_addr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     info!(addr = %bind_addr, "chisei-gateway listening");
-    axum::serve(listener, app(config)).await?;
+    axum::serve(listener, app_with_runtime(config, runtime)).await?;
     Ok(())
 }
 
