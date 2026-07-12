@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use super::sekai::SekaiDb;
 use crate::chisei::{
     eval, evolve,
-    receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind},
+    receipt::{OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind},
 };
 
 impl SekaiDb {
@@ -312,6 +312,54 @@ impl SekaiDb {
         )
         .map_err(|error| error.to_string())?;
         Ok((receipt, true))
+    }
+
+    pub fn authorize_operation_reporter(
+        &self,
+        operation_id: &str,
+        principal: &str,
+        event_kinds: Vec<ReceiptEventKind>,
+    ) -> Result<bool, String> {
+        let conn = self.conn();
+        let receipt_json = conn
+            .query_row(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
+                params![operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
+        let mut receipt: OperationReceipt =
+            serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+        let mut normalized = event_kinds;
+        normalized.sort_by_key(|kind| kind.as_str());
+        normalized.dedup();
+        if let Some(grant) = receipt
+            .reporter_grants
+            .iter_mut()
+            .find(|grant| grant.principal == principal)
+        {
+            let mut existing = grant.event_kinds.clone();
+            existing.sort_by_key(|kind| kind.as_str());
+            existing.dedup();
+            if existing == normalized {
+                return Ok(false);
+            }
+            grant.event_kinds = normalized;
+        } else {
+            receipt.reporter_grants.push(OperationReporterGrant {
+                principal: principal.to_string(),
+                event_kinds: normalized,
+            });
+        }
+        let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
+            params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {

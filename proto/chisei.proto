@@ -548,6 +548,14 @@ message ReportOperationEventResponse {
   repeated string missing_surfaces = 4;
 }
 
+message AuthorizeOperationReporterRequest {
+  string operation_id = 1;
+  string principal = 2;
+  repeated string event_kinds = 3;
+}
+
+message AuthorizeOperationReporterResponse { bool authorized = 1; }
+
 message GetAffinityRequest {
   reserved 1;
   reserved "agent_id";
@@ -635,6 +643,7 @@ service ChiseiService {
   rpc ExecutePlan(ExecutePlanRequest) returns (ExecutePlanResponse);
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
+  rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);

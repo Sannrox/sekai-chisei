@@ -5519,6 +5519,7 @@ fn build_gateway_operation_receipt(
         completed_at_ms: Some(completed_at_ms),
         events,
         uncovered_surfaces: Vec::<UncoveredSurface>::new(),
+        reporter_grants: Vec::new(),
     }
 }
 
