@@ -1079,6 +1079,7 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
             gateway_provided_providers: vec![],
+            gateway_receipt_principals: vec![],
             leak_review_model: None,
             tls_cert: None,
             tls_key: None,
