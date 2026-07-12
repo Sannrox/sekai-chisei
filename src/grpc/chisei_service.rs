@@ -67,11 +67,12 @@ fn authenticated_actor<T>(request: &Request<T>) -> String {
         .to_string()
 }
 
-fn token_authenticated<T>(request: &Request<T>) -> bool {
+fn auth_source<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()
         .get(AUTH_SOURCE_HEADER)
-        .is_some_and(|value| value == "token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 fn reportable_receipt_kind(kind: ReceiptEventKind) -> bool {
@@ -2849,7 +2850,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RecordGatewayAuditRequest>,
     ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
         let authenticated_principal = authenticated_actor(&req);
-        let token_authenticated = token_authenticated(&req);
+        let auth_source = auth_source(&req);
         let mut event = req
             .into_inner()
             .event
@@ -2890,9 +2891,13 @@ impl ChiseiService for ChiseiServiceImpl {
                 .gateway_receipt_principals
                 .iter()
                 .any(|principal| principal == &authenticated_principal);
-            if !token_authenticated
-                || (!configured_gateway
-                    && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root"))
+            let local_insecure_gateway = self.config.insecure
+                && auth_source.as_deref() == Some("local")
+                && authenticated_principal == "chisei-gateway";
+            if !local_insecure_gateway
+                && (auth_source.as_deref() != Some("token")
+                    || (!configured_gateway
+                        && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root")))
             {
                 return Err(Status::permission_denied(
                     "operation receipt writes require an authorized gateway service principal",
@@ -5998,6 +6003,33 @@ mod tests {
             .insert("x-principal", "local".parse().unwrap());
         let local_write = svc.record_gateway_audit(gateway_request).await.unwrap_err();
         assert_eq!(local_write.code(), tonic::Code::PermissionDenied);
+
+        svc.config.insecure = true;
+        let mut insecure_gateway_replay = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "gateway-receipt-insecure-local-replay".into(),
+                timestamp: plan.created_at + 26,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "insecure local gateway replay".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        insecure_gateway_replay
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        insecure_gateway_replay
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
+        svc.record_gateway_audit(insecure_gateway_replay)
+            .await
+            .unwrap();
+        svc.config.insecure = false;
 
         let mut root_replay = Request::new(RecordGatewayAuditRequest {
             event: Some(GatewayAuditEvent {
