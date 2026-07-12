@@ -43,6 +43,27 @@ pub enum ReceiptEventKind {
     OutcomeRecorded,
 }
 
+impl ReceiptEventKind {
+    pub const fn surface(self) -> ReceiptSurface {
+        match self {
+            Self::IntentRecorded => ReceiptSurface::Intent,
+            Self::ContextGoverned => ReceiptSurface::Context,
+            Self::PolicyDecided => ReceiptSurface::Policy,
+            Self::RouteSelected => ReceiptSurface::Routing,
+            Self::BudgetDecided => ReceiptSurface::Budget,
+            Self::ApprovalDecided => ReceiptSurface::Approval,
+            Self::EgressDecided => ReceiptSurface::Egress,
+            Self::AttemptStarted => ReceiptSurface::Attempt,
+            Self::ModelCalled => ReceiptSurface::ModelCall,
+            Self::ActionPerformed => ReceiptSurface::Action,
+            Self::ArtifactProduced => ReceiptSurface::Artifact,
+            Self::VerificationRecorded => ReceiptSurface::Verification,
+            Self::HumanIntervened => ReceiptSurface::Intervention,
+            Self::OutcomeRecorded => ReceiptSurface::Outcome,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedReference {
     pub kind: String,
@@ -139,6 +160,14 @@ impl OperationReceipt {
             if event.event_id.trim().is_empty() {
                 errors.push("event_id is required".to_string());
                 continue;
+            }
+            if event.surface != event.kind.surface() {
+                errors.push(format!(
+                    "event {} kind {:?} requires surface {:?}",
+                    event.event_id,
+                    event.kind,
+                    event.kind.surface()
+                ));
             }
             if by_id.insert(event.event_id.as_str(), event).is_some() {
                 errors.push(format!("duplicate event id {}", event.event_id));
@@ -362,6 +391,21 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("belongs to operation op-2"))
+        );
+    }
+
+    #[test]
+    fn mismatched_event_kind_and_surface_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events[1].surface = ReceiptSurface::Routing;
+        receipt.events[2].surface = ReceiptSurface::Policy;
+        let result = receipt.completeness();
+        assert!(!result.complete);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("requires surface"))
         );
     }
 }
