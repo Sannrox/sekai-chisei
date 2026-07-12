@@ -37,6 +37,8 @@ use tonic::{Request, Status, metadata::MetadataValue};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
+const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
+
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
@@ -109,11 +111,14 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             .ok_or_else(|| Status::unauthenticated("invalid token"))?;
 
         while req.metadata_mut().remove("x-principal").is_some() {}
+        while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
         req.metadata_mut().insert(
             "x-principal",
             MetadataValue::from_str(&principal)
                 .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
         );
+        req.metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("token"));
         Ok(req)
     }
 }
@@ -139,6 +144,9 @@ impl Default for LocalInterceptor {
 
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
+        req.metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("local"));
         if self.overwrite_principal {
             while req.metadata_mut().remove("x-principal").is_some() {}
             req.metadata_mut()
