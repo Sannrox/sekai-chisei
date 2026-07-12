@@ -69,10 +69,21 @@ fn content_hash(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for part in parts {
-        hasher.update(part.as_ref());
-        hasher.update([0]);
+        let bytes = part.as_ref();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn planned_response_hash(response: &PlannedChatResponse) -> String {
+    let tool_calls = response
+        .tool_calls
+        .iter()
+        .map(|call| (&call.id, &call.name, &call.args_json))
+        .collect::<Vec<_>>();
+    let canonical_tool_calls = serde_json::to_vec(&tool_calls).unwrap_or_default();
+    content_hash([response.content.as_bytes(), canonical_tool_calls.as_slice()])
 }
 
 fn receipt_event(
@@ -149,10 +160,7 @@ fn record_completed_operation_on(
             "chisei.llm",
             BTreeMap::from([
                 ("artifact_type".into(), "model_response".into()),
-                (
-                    "content_hash".into(),
-                    content_hash([response.content.as_bytes()]),
-                ),
+                ("content_hash".into(), planned_response_hash(response)),
                 ("content_stored".into(), "false".into()),
             ]),
         ),
@@ -3807,6 +3815,34 @@ mod tests {
     use crate::domain::Object;
     use std::fs;
     use std::sync::Arc;
+
+    #[test]
+    fn receipt_hash_preserves_part_boundaries() {
+        assert_ne!(
+            content_hash([b"a\0b".as_slice()]),
+            content_hash([b"a".as_slice(), b"b".as_slice()])
+        );
+    }
+
+    #[test]
+    fn response_artifact_hash_covers_tool_calls() {
+        let response = |name: &str| PlannedChatResponse {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: name.into(),
+                args_json: r#"{"value":1}"#.into(),
+            }],
+            input_tokens: 1,
+            output_tokens: 1,
+            stop_reason: "tool_use".into(),
+            provider: "native".into(),
+        };
+        assert_ne!(
+            planned_response_hash(&response("read")),
+            planned_response_hash(&response("write"))
+        );
+    }
 
     #[test]
     fn cheap_route_bias_only_for_bulk_classes_and_not_when_regressed() {
