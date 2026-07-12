@@ -68,7 +68,7 @@ impl Config {
             default_data_class: env("CHISEI_DEFAULT_DATA_CLASS", "unclassified"),
             safe_egress_providers: csv_env("CHISEI_SAFE_EGRESS_PROVIDERS"),
             gateway_provided_providers: csv_env("CHISEI_GATEWAY_PROVIDED_PROVIDERS"),
-            gateway_receipt_principals: csv_env("CHISEI_GATEWAY_RECEIPT_PRINCIPALS"),
+            gateway_receipt_principals: identity_csv_env("CHISEI_GATEWAY_RECEIPT_PRINCIPALS"),
             leak_review_model: env::var("LEAK_REVIEW_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -153,6 +153,16 @@ fn csv_env(key: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn identity_csv_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
