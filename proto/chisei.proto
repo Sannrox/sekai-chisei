@@ -394,6 +394,9 @@ message RecordUsageRequest {
   // Uses the same unit field name `tokens_used` for backwards compatibility.
   // Supported values: "tokens" (default) and "requests".
   string metric = 8;
+  // Stable caller-generated key. Replays with the same key are acknowledged
+  // without applying the usage delta twice.
+  string idempotency_key = 9;
 }
 message RecordUsageResponse { BudgetUsage usage = 1; }
 message SetBudgetLimitRequest {

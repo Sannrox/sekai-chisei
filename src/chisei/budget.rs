@@ -174,6 +174,22 @@ impl BudgetTracker {
         }
     }
 
+    pub fn record_idempotent_with_metric(
+        &self,
+        scope_id: &str,
+        amount: i32,
+        metric: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, String> {
+        self.db.budget_record_idempotent(
+            scope_id,
+            metric,
+            i64::from(amount),
+            idempotency_key,
+            now_ms(),
+        )
+    }
+
     pub fn get_usage(&self, scope_id: &str) -> Usage {
         self.get_usage_with_metric(scope_id, METRIC_TOKENS)
     }
@@ -190,6 +206,18 @@ impl BudgetTracker {
             period_type: PeriodType::parse(&period_type),
             period_start: 0,
         }
+    }
+
+    /// Returns the bounded scope with the least remaining headroom in the
+    /// hierarchy. When the whole chain is unlimited, preserves the requested
+    /// scope's ordinary zero-limit usage representation.
+    pub fn most_constrained_usage_with_metric(&self, scope_id: &str, metric: &str) -> Usage {
+        scope_chain(scope_id)
+            .into_iter()
+            .map(|scope| self.get_usage_with_metric(&scope, metric))
+            .filter(|usage| usage.max_tokens > 0)
+            .min_by_key(|usage| usage.max_tokens.saturating_sub(usage.tokens_used))
+            .unwrap_or_else(|| self.get_usage_with_metric(scope_id, metric))
     }
 
     /// Maps projected token-budget pressure to an advisory routing bias. The
@@ -340,6 +368,21 @@ mod tests {
         assert!(t.check_and_reserve("project:p/agent:a", 20).is_err());
         // A smaller request that fits under both levels succeeds.
         assert!(t.check_and_reserve("project:p/agent:a", 5).is_ok());
+    }
+
+    #[test]
+    fn most_constrained_usage_reports_limiting_ancestor() {
+        let t = tracker();
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
+        t.set_limit("project:p/agent:a", 500, PeriodType::Daily)
+            .unwrap();
+        t.record("project:p/agent:a/work_unit:w", 80);
+
+        let usage =
+            t.most_constrained_usage_with_metric("project:p/agent:a/work_unit:w", METRIC_TOKENS);
+        assert_eq!(usage.user_id, "project:p");
+        assert_eq!(usage.tokens_used, 80);
+        assert_eq!(usage.max_tokens, 100);
     }
 
     #[test]
