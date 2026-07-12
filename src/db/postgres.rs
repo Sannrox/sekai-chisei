@@ -6,6 +6,9 @@ use postgres::{Config as PostgresConfig, config::SslMode};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use uuid::Uuid;
+
+use crate::db::sekai::PrincipalCredential;
 
 const MIGRATION_LOCK_ID: i64 = 0x5345_4b41_4948_4101;
 const CONTROL_PLANE_SCHEMA: &str = include_str!("postgres/0001_control_plane.sql");
@@ -67,6 +70,147 @@ impl PostgresDb {
         (state.connections, state.idle_connections)
     }
 
+    pub fn get_principal_credential(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let mut connection = self.connection()?;
+        connection
+            .query_opt(
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at
+                 FROM sekai_principal_credentials
+                 WHERE token_hash = $1 AND status = 'active'
+                 ORDER BY created DESC LIMIT 1",
+                &[&token_hash],
+            )
+            .map(|row| row.map(row_to_principal_credential))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn principal_credentials_activity_epoch(&self) -> Result<i64, String> {
+        let mut connection = self.connection()?;
+        connection
+            .query_one(
+                "SELECT GREATEST(
+                    COALESCE(MAX(created), 0),
+                    COALESCE(MAX(rotated_at), 0),
+                    COALESCE(MAX(revoked_at), 0)
+                 ) FROM sekai_principal_credentials",
+                &[],
+            )
+            .map(|row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn create_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut connection = self.connection()?;
+        let row = connection
+            .query_one(
+                "INSERT INTO sekai_principal_credentials
+                    (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ($1, $2, $3, 'active', $4, 0, 0)
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                &[&id, &principal, &token_hash, &now],
+            )
+            .map_err(|error| format!("create principal credential: {error}"))?;
+        Ok(row_to_principal_credential(row))
+    }
+
+    pub fn rotate_principal_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let active = transaction
+            .query_opt(
+                "SELECT id FROM sekai_principal_credentials
+                 WHERE principal = $1 AND status = 'active'
+                 ORDER BY created DESC LIMIT 1 FOR UPDATE",
+                &[&principal],
+            )
+            .map_err(|error| error.to_string())?;
+        if active.is_none() {
+            return Err(format!("no active credential for {principal:?}"));
+        }
+        transaction
+            .execute(
+                "UPDATE sekai_principal_credentials
+                 SET status = 'rotated', rotated_at = $2
+                 WHERE principal = $1 AND status = 'active'",
+                &[&principal, &now],
+            )
+            .map_err(|error| error.to_string())?;
+        let row = transaction
+            .query_one(
+                "INSERT INTO sekai_principal_credentials
+                    (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ($1, $2, $3, 'active', $4, 0, 0)
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                &[&id, &principal, &token_hash, &now],
+            )
+            .map_err(|error| error.to_string())?;
+        let credential = row_to_principal_credential(row);
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(credential)
+    }
+
+    pub fn revoke_principal_credential(
+        &self,
+        principal: &str,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let row = connection
+            .query_opt(
+                "UPDATE sekai_principal_credentials
+                 SET status = 'revoked', revoked_at = $2
+                 WHERE id = (
+                    SELECT id FROM sekai_principal_credentials
+                    WHERE principal = $1 AND status = 'active'
+                    ORDER BY created DESC LIMIT 1 FOR UPDATE
+                 )
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                &[&principal, &now],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(row.map(row_to_principal_credential))
+    }
+
+    pub fn list_credentials(
+        &self,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        let mut connection = self.connection()?;
+        connection
+            .query(
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at
+                 FROM sekai_principal_credentials
+                 WHERE ($1::text IS NULL OR principal = $1)
+                   AND ($2::text IS NULL OR status = $2)
+                 ORDER BY created, id",
+                &[&principal, &status],
+            )
+            .map(|rows| rows.into_iter().map(row_to_principal_credential).collect())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
+        self.list_credentials(None, Some("active"))
+    }
+
     pub(crate) fn connection(&self) -> Result<PooledConnection<Manager>, String> {
         self.pool
             .get()
@@ -111,6 +255,18 @@ impl PostgresDb {
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
+    }
+}
+
+fn row_to_principal_credential(row: postgres::Row) -> PrincipalCredential {
+    PrincipalCredential {
+        id: row.get(0),
+        principal: row.get(1),
+        token_hash: row.get(2),
+        status: row.get(3),
+        created: row.get(4),
+        rotated_at: row.get(5),
+        revoked_at: row.get(6),
     }
 }
 
