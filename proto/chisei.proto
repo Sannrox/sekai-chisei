@@ -574,6 +574,9 @@ message EvolveTemplatesResponse { repeated EvolveTemplate templates = 1; }
 
 // --- Service ---
 
+// Governed decisions for agent operations: context, policy, budgets, routing,
+// evaluation, approvals, and learning. Agent runtimes remain replaceable
+// clients of this service.
 service ChiseiService {
   // Budget
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
@@ -596,7 +599,10 @@ service ChiseiService {
   rpc ListPipelineRuns(ListPipelineRunsRequest) returns (ListPipelineRunsResponse);
   rpc RecordSampleObservation(RecordSampleObservationRequest) returns (RecordSampleObservationResponse);
   rpc RecordGatewayAudit(RecordGatewayAuditRequest) returns (RecordGatewayAuditResponse);
+  // Native governed entry path. Planning resolves policy, context, routing,
+  // budget, and evaluation state before a provider call is allowed.
   rpc PlanExecution(PlanExecutionRequest) returns (PlanExecutionResponse);
+  // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlan(ExecutePlanRequest) returns (ExecutePlanResponse);
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
 

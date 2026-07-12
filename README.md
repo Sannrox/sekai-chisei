@@ -1,6 +1,6 @@
 # sekai-chisei
 
-`sekai-chisei` is a local-first Rust control plane for AI-assisted software delivery.
+`sekai-chisei` is a local-first Rust control plane for governed agent operations.
 
 Most agent systems treat LLM calls as isolated events. `sekai-chisei` treats them as
 governed operations: context-aware, policy-constrained, budget-tracked, auditable, and
@@ -8,9 +8,26 @@ measurable against a baseline.
 
 It combines:
 
-- `sekai`: a durable graph and dataset layer for typed objects and links, lineage, access control, audit history, coordination, and operational memory
-- `chisei`: a policy and decision layer for budget checks, model/runtime selection, request enrichment, evaluation gates, and learning loops
-- `llm`: provider adapters for OpenAI, Anthropic, Ollama-compatible endpoints, and native local LLM services
+- `sekai`: durable facts represented by typed objects and links, lineage, access
+  control, audit history, coordination, and operational memory
+- `chisei`: governed decisions for context, policy, budgets, approvals,
+  model/runtime selection, evaluation, and learning
+- `llm`: provider-call execution through OpenAI, Anthropic, Ollama-compatible,
+  and native local adapters; it is not the policy boundary
+
+The OpenAI- and Anthropic-compatible gateway and the native `PlanExecution` /
+`ExecutePlan` API are two governed entry paths into the same control plane.
+Agent runtimes and domain executors are replaceable integrations. Software
+delivery is one such integration, not the definition of the core contracts.
+
+### Core contract vocabulary
+
+Core APIs use namespace-first, domain-neutral concepts: namespace, actor,
+operation, attempt, action, artifact, verification, and outcome. Domain objects
+such as repositories, worktrees, commits, test suites, support tickets, or
+campaigns belong in typed schemas and adapters. Chisei does not introduce a
+separate first-class `application` scope and does not act as a workflow engine
+or agent runtime.
 
 ## Quickstart
 
@@ -55,6 +72,7 @@ See [docs/docker.md](docs/docker.md).
 - Dataset, lineage, audit, access control, action, and coordination primitives
 - Work-unit coordination with admission, heartbeat, completion, and reconciliation
 - Chisei pipeline for policy resolution, request enrichment, budget checks, model routing, and eval regression checks
+- Native governed execution plus an OpenAI- and Anthropic-compatible gateway
 - Provider routing for OpenAI, Anthropic, Ollama-compatible, and native endpoints
 - Local-first operation with explicit insecure mode for development
 
