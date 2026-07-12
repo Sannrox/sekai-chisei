@@ -1,5 +1,6 @@
 use std::error::Error as _;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 use tracing::{error, info, warn};
@@ -360,6 +361,8 @@ struct GatewayRuntime {
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
     governance_cache: Arc<RwLock<GovernanceCache>>,
     governance_cache_ttl: Duration,
+    budget_reconciliation_path: Option<PathBuf>,
+    budget_reconciliation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -369,6 +372,51 @@ struct GovernanceCache {
     egress: HashMap<String, CachedEgressDecision>,
     pending_budget_usage: HashMap<String, RecordUsageRequest>,
     budget_reconciliation_saturated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingBudgetUsage {
+    user_id: String,
+    tokens_used: i32,
+    subject: String,
+    project: String,
+    agent: String,
+    key_id: String,
+    work_unit: String,
+    metric: String,
+    idempotency_key: String,
+}
+
+impl From<RecordUsageRequest> for PendingBudgetUsage {
+    fn from(request: RecordUsageRequest) -> Self {
+        Self {
+            user_id: request.user_id,
+            tokens_used: request.tokens_used,
+            subject: request.subject,
+            project: request.project,
+            agent: request.agent,
+            key_id: request.key_id,
+            work_unit: request.work_unit,
+            metric: request.metric,
+            idempotency_key: request.idempotency_key,
+        }
+    }
+}
+
+impl From<PendingBudgetUsage> for RecordUsageRequest {
+    fn from(request: PendingBudgetUsage) -> Self {
+        Self {
+            user_id: request.user_id,
+            tokens_used: request.tokens_used,
+            subject: request.subject,
+            project: request.project,
+            agent: request.agent,
+            key_id: request.key_id,
+            work_unit: request.work_unit,
+            metric: request.metric,
+            idempotency_key: request.idempotency_key,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -453,6 +501,10 @@ impl GatewayRuntime {
                 .filter(|value| !value.trim().is_empty()),
         )
         .with_governance_cache_ttl(governance_cache_ttl)
+        .with_budget_reconciliation_path(Some(PathBuf::from(
+            std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
+                .unwrap_or_else(|_| "data/chisei-gateway-budget-reconciliation.json".to_string()),
+        )))
         .with_http_timeouts(HttpTimeouts::from_env());
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
@@ -482,6 +534,8 @@ impl GatewayRuntime {
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             governance_cache: Arc::new(RwLock::new(GovernanceCache::default())),
             governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
+            budget_reconciliation_path: None,
+            budget_reconciliation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -492,6 +546,25 @@ impl GatewayRuntime {
 
     fn with_http_timeouts(mut self, http_timeouts: HttpTimeouts) -> Self {
         self.http_timeouts = http_timeouts;
+        self
+    }
+
+    fn with_budget_reconciliation_path(mut self, path: Option<PathBuf>) -> Self {
+        self.budget_reconciliation_path = path;
+        if let Some(path) = self.budget_reconciliation_path.as_ref()
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(entries) = serde_json::from_slice::<Vec<PendingBudgetUsage>>(&bytes)
+        {
+            let cache = Arc::get_mut(&mut self.governance_cache)
+                .expect("new gateway runtime cache is not shared")
+                .get_mut();
+            for entry in entries {
+                let request = RecordUsageRequest::from(entry);
+                cache
+                    .pending_budget_usage
+                    .insert(usage_reconciliation_key(&request), request);
+            }
+        }
         self
     }
 }
@@ -1423,6 +1496,7 @@ async fn queue_pending_budget_usage(
     runtime: &GatewayRuntime,
     requests: impl IntoIterator<Item = RecordUsageRequest>,
 ) -> bool {
+    let _journal_guard = runtime.budget_reconciliation_lock.lock().await;
     let mut cache = runtime.governance_cache.write().await;
     let mut accepted = true;
     for request in requests {
@@ -1436,7 +1510,59 @@ async fn queue_pending_budget_usage(
             accepted = false;
         }
     }
-    accepted
+    let snapshot = cache
+        .pending_budget_usage
+        .values()
+        .cloned()
+        .map(PendingBudgetUsage::from)
+        .collect::<Vec<_>>();
+    drop(cache);
+    if persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot).await {
+        accepted
+    } else {
+        runtime
+            .governance_cache
+            .write()
+            .await
+            .budget_reconciliation_saturated = true;
+        false
+    }
+}
+
+async fn persist_pending_budget_usage(
+    path: Option<PathBuf>,
+    pending: Vec<PendingBudgetUsage>,
+) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    let Ok(bytes) = serde_json::to_vec(&pending) else {
+        return false;
+    };
+    matches!(
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension("tmp");
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(temporary, path)
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 fn usage_reconciliation_key(request: &RecordUsageRequest) -> String {
@@ -1459,6 +1585,7 @@ async fn reconcile_cached_budget_usage(
     runtime: &GatewayRuntime,
     client: &mut ChiseiServiceClient<GatewayClient>,
 ) -> Result<usize, tonic::Status> {
+    let _journal_guard = runtime.budget_reconciliation_lock.lock().await;
     let pending = {
         let mut cache = runtime.governance_cache.write().await;
         std::mem::take(&mut cache.pending_budget_usage)
@@ -1473,9 +1600,26 @@ async fn reconcile_cached_budget_usage(
                 let key = usage_reconciliation_key(&request);
                 cache.pending_budget_usage.insert(key, request);
             }
+            let snapshot = cache
+                .pending_budget_usage
+                .values()
+                .cloned()
+                .map(PendingBudgetUsage::from)
+                .collect();
+            drop(cache);
+            let _ =
+                persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot)
+                    .await;
             return Err(status);
         }
         reconciled += 1;
+    }
+    if !persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), Vec::new()).await {
+        runtime
+            .governance_cache
+            .write()
+            .await
+            .budget_reconciliation_saturated = true;
     }
     // Saturation means at least one usage event was not retained. It is
     // intentionally sticky: only operator reconciliation plus restart can
