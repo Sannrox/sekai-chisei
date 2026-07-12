@@ -3352,11 +3352,24 @@ impl ChiseiService for ChiseiServiceImpl {
         if request.operation_id.trim().is_empty() {
             return Err(Status::invalid_argument("operation_id required"));
         }
+        let receipt = self
+            .db
+            .get_operation_receipt(&request.operation_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("operation receipt not found"))?;
+        if actor != receipt.initiating_actor && !matches!(actor.as_str(), "root" | "chisei-gateway")
+        {
+            return Err(Status::permission_denied(
+                "operation events require the initiating actor or an authorized service principal",
+            ));
+        }
         let kind = ReceiptEventKind::parse(&request.kind)
             .ok_or(Status::invalid_argument("unsupported operation event kind"))?;
         if !matches!(
             kind,
-            ReceiptEventKind::ActionPerformed
+            ReceiptEventKind::AttemptStarted
+                | ReceiptEventKind::ModelCalled
+                | ReceiptEventKind::ActionPerformed
                 | ReceiptEventKind::ApprovalDecided
                 | ReceiptEventKind::ArtifactProduced
                 | ReceiptEventKind::VerificationRecorded
@@ -5746,7 +5759,7 @@ mod tests {
             });
             request
                 .metadata_mut()
-                .insert("x-principal", "agent:reporter".parse().unwrap());
+                .insert("x-principal", "agent:authenticated".parse().unwrap());
             request
         };
         let first = svc
@@ -5768,8 +5781,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(updated.events.iter().any(|event| {
-            event.event_id.ends_with(":reported-action") && event.actor == "agent:reporter"
+            event.event_id.ends_with(":reported-action") && event.actor == "agent:authenticated"
         }));
+
+        let mut unauthorized_report = report();
+        unauthorized_report.get_mut().event_id = format!("{}:forged-action", plan.plan_id);
+        unauthorized_report
+            .metadata_mut()
+            .insert("x-principal", "agent:intruder".parse().unwrap());
+        let denied = svc
+            .report_operation_event(unauthorized_report)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
