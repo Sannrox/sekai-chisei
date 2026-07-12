@@ -575,9 +575,19 @@ impl GatewayRuntime {
                     }
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if let Err(error) = initialize_budget_reconciliation_journal(path) {
-                        error!(path = %path.display(), %error, "budget reconciliation journal cannot be initialized");
-                        cache.budget_reconciliation_saturated = true;
+                    match initialize_budget_reconciliation_journal(path) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                let request = RecordUsageRequest::from(entry);
+                                cache
+                                    .pending_budget_usage
+                                    .insert(usage_reconciliation_key(&request), request);
+                            }
+                        }
+                        Err(error) => {
+                            error!(path = %path.display(), %error, "budget reconciliation journal cannot be initialized");
+                            cache.budget_reconciliation_saturated = true;
+                        }
                     }
                 }
                 Err(error) => {
@@ -590,7 +600,9 @@ impl GatewayRuntime {
     }
 }
 
-fn initialize_budget_reconciliation_journal(path: &Path) -> std::io::Result<()> {
+fn initialize_budget_reconciliation_journal(
+    path: &Path,
+) -> std::io::Result<Vec<PendingBudgetUsage>> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -604,9 +616,26 @@ fn initialize_budget_reconciliation_journal(path: &Path) -> std::io::Result<()> 
     options.create_new(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            for _ in 0..10 {
+                let bytes = std::fs::read(path)?;
+                if let Ok(entries) = serde_json::from_slice(&bytes) {
+                    return Ok(entries);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "concurrently created budget reconciliation journal is invalid",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     file.write_all(b"[]")?;
-    file.sync_all()
+    file.sync_all()?;
+    Ok(Vec::new())
 }
 
 #[derive(Debug, Clone)]
