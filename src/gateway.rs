@@ -814,7 +814,7 @@ async fn proxy_gateway(
         GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
     let mid_task = header_str(&headers, &X_CHISEI_MID_TASK)
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
-    let preflight_context = UsageContext {
+    let mut preflight_context = UsageContext {
         request_id: request_id.clone(),
         provider: client_provider,
         requested_model: requested_model.clone(),
@@ -945,6 +945,19 @@ async fn proxy_gateway(
                 return rejection.response();
             }
         };
+        preflight_context.provider = resolved.resolved_provider;
+        preflight_context.resolved_model = resolved.resolved_model.clone();
+        preflight_context.route_bias = resolved.route_bias.clone();
+        preflight_context.policy_scope = resolved.policy_scope.clone();
+        preflight_context.policy_version = resolved.policy_version.clone();
+        preflight_context.budget_subject = budget.budget_subject.clone();
+        preflight_context.budget_status = if budget.provisional_local_free {
+            "local_free"
+        } else {
+            "allowed"
+        }
+        .into();
+        preflight_context.egress_applied = true;
         let egress = match apply_context_egress(
             &state.config,
             &state.runtime,
@@ -961,7 +974,11 @@ async fn proxy_gateway(
         .await
         {
             Ok(egress) => egress,
-            Err(response) => return response,
+            Err(rejection) => {
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
         };
         (resolved, egress, Some(budget))
     };
@@ -3167,7 +3184,7 @@ async fn apply_context_egress(
     request_id: &str,
     work_unit_id: Option<&str>,
     failure_posture: &GovernanceFailurePosture,
-) -> Result<ContextEgressPreflight, Response<Body>> {
+) -> Result<ContextEgressPreflight, GatewayRejection> {
     let cache_key = egress_cache_key(identity, provider, body, context_request);
     let Some(target) = &config.chisei_grpc_target else {
         if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
@@ -3183,7 +3200,7 @@ async fn apply_context_egress(
             return Ok(decision);
         }
         if context_request.is_some() {
-            return Err(json_error(
+            return Err(GatewayRejection::json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "governance_unavailable",
                 "explicit governed context requires a configured control plane",
@@ -3225,10 +3242,10 @@ async fn apply_context_egress(
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
-                return Err(json_error(
+                return Err(GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "governance_unavailable",
-                    &format!("failed to resolve governed context: {error}"),
+                    format!("failed to resolve governed context: {error}"),
                 ));
             }
             return Ok(ContextEgressPreflight {
@@ -3267,10 +3284,10 @@ async fn apply_context_egress(
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
-                return Err(json_error(
+                return Err(GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "governance_unavailable",
-                    &format!("failed to resolve context schema: {status}"),
+                    format!("failed to resolve context schema: {status}"),
                 ));
             }
             return Ok(ContextEgressPreflight {
@@ -3289,26 +3306,26 @@ async fn apply_context_egress(
     {
         Ok(resolution) => resolution,
         Err(status) if status.code() == tonic::Code::InvalidArgument => {
-            return Err(json_error(
+            return Err(GatewayRejection::json(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("invalid governed context request: {status}"),
+                format!("invalid governed context request: {status}"),
             ));
         }
         Err(status)
             if context_request.is_some() && status.code() == tonic::Code::PermissionDenied =>
         {
-            return Err(json_error(
+            return Err(GatewayRejection::json(
                 StatusCode::FORBIDDEN,
                 "context_denied",
-                &format!("governed context access denied: {status}"),
+                format!("governed context access denied: {status}"),
             ));
         }
         Err(status) if context_request.is_some() && status.code() == tonic::Code::NotFound => {
-            return Err(json_error(
+            return Err(GatewayRejection::json(
                 StatusCode::NOT_FOUND,
                 "context_not_found",
-                &format!("governed context root not found: {status}"),
+                format!("governed context root not found: {status}"),
             ));
         }
         Err(status) => {
@@ -3325,10 +3342,10 @@ async fn apply_context_egress(
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
-                return Err(json_error(
+                return Err(GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "governance_unavailable",
-                    &format!("failed to resolve governed context: {status}"),
+                    format!("failed to resolve governed context: {status}"),
                 ));
             }
             return Ok(ContextEgressPreflight {
@@ -3337,7 +3354,7 @@ async fn apply_context_egress(
         }
     };
     if context_request.is_some() && resolution.unresolved_roots > 0 {
-        return Err(json_error(
+        return Err(GatewayRejection::json(
             StatusCode::NOT_FOUND,
             "context_not_found",
             "explicit governed context includes an unresolved root",
@@ -3362,10 +3379,10 @@ async fn apply_context_egress(
         let object_restricted_fields = match restricted_fields.get(&domain_object.kind) {
             Some(fields) => Some(fields),
             None if context_request.is_some() => {
-                return Err(json_error(
+                return Err(GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "governance_unavailable",
-                    &format!(
+                    format!(
                         "schema metadata unavailable for explicit context kind {}",
                         domain_object.kind
                     ),
@@ -3483,10 +3500,10 @@ async fn apply_context_egress(
             }
             Ok(None) => body.to_vec(),
             Err(err) => {
-                return Err(json_error(
+                return Err(GatewayRejection::json(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    &format!("failed to inject object context: {err}"),
+                    format!("failed to inject object context: {err}"),
                 ));
             }
         }
@@ -5396,8 +5413,12 @@ fn build_gateway_operation_receipt(
             "chisei.egress",
             BTreeMap::from([(
                 "status".into(),
-                if rejection_type.is_some_and(|kind| kind.contains("egress")) {
+                if rejection_type
+                    .is_some_and(|kind| kind.contains("egress") || kind.starts_with("context_"))
+                {
                     "denied"
+                } else if rejection.is_some() && context.egress_applied {
+                    "failed"
                 } else if context.egress_applied {
                     "evaluated"
                 } else {
@@ -10927,7 +10948,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
 
         let retrieval_request = GatewayContextRequest {
             objects: vec![GatewayContextObject {
@@ -10959,7 +10980,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
