@@ -1,9 +1,9 @@
-use chrono::Utc;
-use uuid::Uuid;
-
-use crate::config::Config;
-use crate::db::sekai::{PrincipalCredential, SekaiDb};
-use crate::gateway_keys::hash_gateway_key;
+use crate::grpc::client::connect_sekai;
+use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
+use crate::grpc::pb::sekai::{
+    CreateCredentialRequest, CredentialRecord, ListCredentialsRequest, RevokeCredentialRequest,
+    RotateCredentialRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialCommand {
@@ -127,70 +127,66 @@ fn validate_principal(principal: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn credential_db_path() -> String {
-    Config::from_env().db_path
+fn credential_target() -> String {
+    std::env::var("CHISEI_GRPC_URL")
+        .or_else(|_| std::env::var("SEKAI_SOCKET"))
+        .unwrap_or_else(|_| "./data/sekai.sock".to_string())
 }
 
-pub fn create_credential(principal: &str) -> Result<String, String> {
+pub async fn create_credential(principal: &str) -> Result<String, String> {
     validate_principal(principal)?;
-    let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-
-    if !db
-        .list_credentials(Some(principal), Some("active"))?
-        .is_empty()
-    {
-        return Err(format!(
-            "active credential already exists for {principal:?}; run rotate instead"
-        ));
-    }
-
-    let token = format!(
-        "sekai_{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
-    db.create_principal_credential(
-        principal,
-        &hash_gateway_key(&token),
-        Utc::now().timestamp_millis(),
-    )
-    .map_err(|err| format!("create credential: {err}"))?;
-    Ok(token)
+    let channel = connect_sekai(&credential_target())
+        .await
+        .map_err(|error| format!("connect to control plane: {error}"))?;
+    let response = SekaiServiceClient::new(channel)
+        .create_credential(CreateCredentialRequest {
+            principal: principal.to_string(),
+        })
+        .await
+        .map_err(|error| format!("create credential: {error}"))?;
+    Ok(response.into_inner().token)
 }
 
-pub fn rotate_credential(principal: &str) -> Result<String, String> {
+pub async fn rotate_credential(principal: &str) -> Result<String, String> {
     validate_principal(principal)?;
-    let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-
-    if db
-        .list_credentials(Some(principal), Some("active"))?
-        .is_empty()
-    {
-        return Err(format!("no active credential for {principal:?}"));
-    }
-
-    let token = format!(
-        "sekai_{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
-    db.rotate_principal_credential(principal, &hash_gateway_key(&token))
-        .map_err(|err| format!("rotate credential: {err}"))?;
-    Ok(token)
+    let channel = connect_sekai(&credential_target())
+        .await
+        .map_err(|error| format!("connect to control plane: {error}"))?;
+    let response = SekaiServiceClient::new(channel)
+        .rotate_credential(RotateCredentialRequest {
+            principal: principal.to_string(),
+        })
+        .await
+        .map_err(|error| format!("rotate credential: {error}"))?;
+    Ok(response.into_inner().token)
 }
 
-pub fn revoke_credential(principal: &str) -> Result<PrincipalCredential, String> {
+pub async fn revoke_credential(principal: &str) -> Result<CredentialRecord, String> {
     validate_principal(principal)?;
-    let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.revoke_principal_credential(principal)
-        .map_err(|err| format!("revoke credential: {err}"))?
-        .ok_or_else(|| format!("no active credential for {principal:?}"))
+    let channel = connect_sekai(&credential_target())
+        .await
+        .map_err(|error| format!("connect to control plane: {error}"))?;
+    SekaiServiceClient::new(channel)
+        .revoke_credential(RevokeCredentialRequest {
+            principal: principal.to_string(),
+        })
+        .await
+        .map_err(|error| format!("revoke credential: {error}"))?
+        .into_inner()
+        .credential
+        .ok_or_else(|| "control plane returned no revoked credential".to_string())
 }
 
-pub fn list_credentials() -> Result<Vec<PrincipalCredential>, String> {
-    let db = SekaiDb::new(&credential_db_path()).map_err(|err| format!("open db: {err}"))?;
-    db.list_credentials(None, None)
-        .map_err(|err| format!("list credentials: {err}"))
+pub async fn list_credentials() -> Result<Vec<CredentialRecord>, String> {
+    let channel = connect_sekai(&credential_target())
+        .await
+        .map_err(|error| format!("connect to control plane: {error}"))?;
+    Ok(SekaiServiceClient::new(channel)
+        .list_credentials(ListCredentialsRequest {})
+        .await
+        .map_err(|error| format!("list credentials: {error}"))?
+        .into_inner()
+        .credentials)
 }
 
 #[cfg(test)]
