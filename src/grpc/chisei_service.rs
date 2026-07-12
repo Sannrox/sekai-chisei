@@ -53,6 +53,7 @@ const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
+const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 
 fn authenticated_actor<T>(request: &Request<T>) -> String {
     request
@@ -2783,6 +2784,29 @@ impl ChiseiService for ChiseiServiceImpl {
         if event.target_id.trim().is_empty() {
             event.target_id = "llm_calls".to_string();
         }
+        if event.action == GATEWAY_RECEIPT_ACTION {
+            let receipt_json = event
+                .evidence
+                .get("receipt_json")
+                .ok_or(Status::invalid_argument("receipt_json required"))?;
+            let receipt: OperationReceipt = serde_json::from_str(receipt_json)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if receipt.initiating_actor != event.actor {
+                return Err(Status::invalid_argument(
+                    "receipt initiating actor must match gateway audit actor",
+                ));
+            }
+            let completeness = receipt.completeness();
+            if !completeness.complete {
+                return Err(Status::invalid_argument(format!(
+                    "gateway receipt is incomplete: missing={:?} errors={:?}",
+                    completeness.missing_surfaces, completeness.errors
+                )));
+            }
+            self.db
+                .put_operation_receipt(&receipt)
+                .map_err(Status::internal)?;
+        }
         self.db
             .record_decision(&crate::sekai::audit::Decision {
                 id: event.id.clone(),
@@ -5459,6 +5483,23 @@ mod tests {
                 .values()
                 .any(|value| value.contains("private response body"))
         }));
+        svc.record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "gateway-receipt-audit".into(),
+                timestamp: plan.created_at + 26,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "gateway operation completed".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        }))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
