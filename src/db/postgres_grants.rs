@@ -6,7 +6,11 @@ impl PostgresDb {
         self.connection()?
             .execute(
                 "INSERT INTO sekai_grants (id, object_id, principal, role, created)
-                 VALUES ($1, $2, $3, $4, $5)",
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (object_id, principal) DO UPDATE SET
+                    id = EXCLUDED.id,
+                    role = EXCLUDED.role,
+                    created = EXCLUDED.created",
                 &[
                     &grant.id,
                     &grant.object_id,
@@ -54,7 +58,7 @@ impl PostgresDb {
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         self.query_grants(
             "SELECT id, object_id, principal, role, created
-             FROM sekai_grants ORDER BY created, id",
+             FROM sekai_grants ORDER BY object_id, principal",
             &[],
         )
     }
