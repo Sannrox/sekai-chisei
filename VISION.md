@@ -2,158 +2,201 @@
 
 ## Purpose
 
-`sekai-chisei` should become the control plane for AI-assisted software delivery.
+`sekai-chisei` is a local-first control plane for governed agent operations.
 
-Its job is not just to call models. Its job is to maintain enough structured memory, policy, runtime context, and evaluation feedback to make autonomous or semi-autonomous coding agents predictable, governable, and continuously improvable.
+Its job is not to provide an agent runtime or merely call models. Its job is to
+maintain enough durable context, policy, budget, verification, and outcome data
+to make autonomous or semi-autonomous operations predictable, governable, and
+continuously improvable across domains.
 
-In practical terms, this project combines two layers:
+The product has two layers:
 
-- `sekai`: a durable graph and dataset system for namespaces, components, agents, tasks, learnings, lineage, access, and audit history
-- `chisei`: a decision layer that applies budget controls, policy resolution, task routing, model selection, evaluation, and evolution based on what `sekai` knows
+- `sekai` owns durable facts: namespaces, actors, operations, attempts, actions,
+  artifacts, verification, outcomes, lineage, access, audit history, and memory
+- `chisei` owns decisions: policy, context, routing, budgets, approvals,
+  evaluation, and learning rules
 
-The long-term goal is to make AI execution look less like isolated prompt calls and more like an operating system for engineering work.
+`LlmService` executes provider calls but is not the policy boundary. Existing
+OpenAI- and Anthropic-compatible clients enter through the gateway; native
+integrations use `PlanExecution` and `ExecutePlan`. Both paths are governed by
+the same control plane.
 
 ## Problem
 
-Most agent systems fail in the same ways:
+Agent systems commonly fail in the same ways:
 
-- They do not retain structured context across tasks
+- They do not retain structured context across operations
 - They cannot explain why a model, runtime, or action was chosen
-- They do not accumulate reliable learnings from prior work
-- They lack hard controls for spend, access, and safety
-- They struggle to compare one prompting or execution strategy against another
+- They do not accumulate reliable knowledge from prior outcomes
+- They lack hard controls for spend, access, egress, and safety
+- They struggle to compare one execution strategy against another
 
-`sekai-chisei` exists to close those gaps with a local-first, inspectable service that teams can control.
+`sekai-chisei` closes those gaps with a local-first, inspectable service that
+operators can control without coupling governance to one agent, model provider,
+or domain executor.
 
 ## Vision
 
 The system should answer five questions well:
 
-1. What is the relevant world model for this task?
-2. What agent, runtime, and model should handle it?
-3. What constraints apply before execution starts?
-4. How do we measure whether the outcome was good?
-5. What should the system learn so the next run improves?
+1. What durable facts are relevant to this operation?
+2. What actor, runtime, and model should handle it?
+3. What constraints and approvals apply before action begins?
+4. How do we verify and measure the outcome?
+5. What should the system learn so the next attempt improves?
 
-If this project succeeds, an engineering organization can represent its working environment as a graph, run AI tasks against that graph through governed pipelines, and continuously improve task quality through evaluation and observed outcomes.
+If this project succeeds, an organization can represent its operating
+environment as a namespace-isolated graph, run agent operations through
+governed entry paths, and improve future decisions through verified outcomes.
 
-## Product Shape
+## Product Boundary
 
-### 1. World Model
+### Sekai: Durable Facts
 
-`sekai` should be the canonical memory layer for operations:
+`sekai` is the canonical operational memory:
 
-- components, tasks, models, agents, policies, learnings, audit records, and graph relations
-- typed relations between those objects
-- graph traversal, lineage, schema validation, derived properties, datasets, and virtual tables
+- typed objects and relations for actors, operations, attempts, actions,
+  artifacts, verification, and outcomes
+- graph traversal, lineage, schema validation, derived properties, datasets,
+  and virtual tables
 - audit trails for decisions and object changes
-- access control around read and write behavior
+- namespace-first access control around read and write behavior
 
-This layer should stay simple, queryable, and durable. It is the ground truth that higher-level agent workflows depend on.
+This layer stays simple, queryable, and durable. Domain concepts such as a
+repository, support ticket, campaign, contract, deployment, or clinical case
+belong in schemas and adapters rather than the core contract.
 
-### 2. Agent Intelligence Policy Plane
+### Chisei: Governed Decisions
 
-`chisei` should decide how work gets executed:
+`chisei` decides how operations may proceed:
 
-- resolve allowed runtimes and models from namespace or namespace policy
-- enforce token budgets and surface capacity pressure
-- enrich tasks with prior learnings and risk signals
-- recommend execution choices instead of treating every task as stateless
-- maintain task-run history that can later be audited and improved
+- resolve allowed runtimes and models from namespace policy
+- enforce budgets, egress rules, action policy, and approval requirements
+- enrich operations with relevant memory and risk signals
+- evaluate attempts and attribute outcomes
+- adopt learning rules only through explicit governance
 
-This layer should make routing decisions explicit rather than implicit.
+The decision layer makes policy choices inspectable instead of burying them in
+an agent runtime or provider adapter.
 
-### 3. Evaluation And Learning Loop
+### Governed Entry Paths
 
-The project should support a disciplined improvement cycle:
+The gateway accepts existing OpenAI- and Anthropic-compatible clients. The
+native execution API plans and executes an operation through `PlanExecution`
+and `ExecutePlan`. These are two entry paths into the same control plane, not
+separate products.
 
-- define eval suites and cases for task outcomes
+Agent runtimes and domain executors remain replaceable integrations. Bugyo and
+Tenkai provide software-delivery behavior, but repository, worktree, commit,
+test-suite, deployment, and ticket concepts do not define the core ontology.
+
+### Evaluation And Learning Loop
+
+The product supports a disciplined improvement cycle:
+
+- define eval suites and verification criteria for outcomes
 - compare candidate behavior against baselines
 - mine recurring success and failure patterns
-- enhance future task specs with historical context
-- turn execution history into reusable templates and learnings
+- enrich future operations with bounded historical context
+- turn execution history into governed templates and learnings
 
-The important shift is from "run an agent" to "run an agent inside a measurable system."
-
-### 4. Provider Abstraction Without Provider Dependence
-
-LLM access should be pluggable across OpenAI, Anthropic, local Ollama, and native endpoints, but the value of the project should not depend on any one provider.
-
-The durable asset is the decision layer and the memory model around the providers, not the transport adapter itself.
+The important shift is from "run an agent" to "govern an operation inside a
+measurable system."
 
 ## Design Principles
 
-- Local-first by default. Teams should be able to run this on their own infrastructure with SQLite and gRPC as the initial operating baseline.
-- Structured over conversational. Important facts should become typed objects, links, datasets, policies, and audits instead of staying trapped in prompt text.
-- Governed autonomy. Agents should operate inside explicit budget, access, and policy constraints.
-- Measurable improvement. New strategies should be compared against baselines, not adopted on intuition.
-- Explainable decisions. Model choice, routing, access, and outcomes should be inspectable after the fact.
-- Incremental adoption. The system should be useful even before every part of the graph or eval stack is fully populated.
+- Local-first by default. Operators can run the control plane on their own
+  infrastructure, with SQLite and gRPC as the initial baseline.
+- Namespace-first isolation. Namespace remains the core policy and data
+  boundary; there is no separate first-class application scope.
+- Structured over conversational. Important facts become typed objects, links,
+  datasets, policies, and audits instead of remaining in prompt text.
+- Governed autonomy. Agents operate inside explicit budget, access, egress,
+  action, and approval constraints.
+- Measurable improvement. Strategies are compared against baselines and
+  verified outcomes rather than adopted on intuition.
+- Explainable decisions. Context, routing, access, actions, and outcomes remain
+  inspectable after the fact.
+- Incremental adoption. Existing clients can use the gateway while deeper
+  integrations adopt the native execution API.
 
 ## Non-Goals
 
 This project should not become:
 
-- a generic workflow engine with no opinion about AI delivery
+- a generic workflow engine or agent runtime
 - a thin proxy around third-party LLM APIs
 - an opaque autonomous agent that cannot justify its decisions
-- a monolithic developer platform that tries to replace source control, CI, or issue tracking
+- a domain-specific platform that embeds repositories, tickets, campaigns, or
+  similar integration concepts in its core contracts
+- a replacement for domain systems of record
 
-It should integrate with those systems as needed while remaining focused on memory, policy, evaluation, and orchestration.
+It integrates with runtimes and domain systems while remaining focused on
+durable facts, governed decisions, evaluation, and learning.
 
 ## Current State
 
 The codebase already establishes the core direction:
 
 - a Rust gRPC server with separate `sekai`, `chisei`, and `llm` services
-- a SQLite-backed object graph with links, datasets, virtual tables, lineage, audit, actions, and security controls
-- policy resolution and budget tracking for AI execution
-- a pipeline that enriches tasks, scores namespace risk, and recommends a model
-- an evaluation store with baseline comparison
-- evolution utilities that extract patterns and improve task specs
-- provider adapters for OpenAI, Anthropic, Ollama-compatible, and native endpoints
+- a SQLite-backed object graph with links, datasets, virtual tables, lineage,
+  audit, actions, and security controls
+- policy resolution, context enrichment, budget tracking, and model routing
+- governed native execution and a compatible HTTP gateway
+- evaluation, outcome, learning, and evolution primitives
+- provider adapters for OpenAI, Anthropic, Ollama-compatible, and native
+  endpoints
 
-That means the project is past the idea stage. The next challenge is turning these primitives into a coherent operating model.
+The next challenge is presenting and extending these primitives as one coherent,
+domain-neutral operating model.
 
 ## Next Milestones
 
 ### Near Term
 
-- Make the gRPC surface feel like one coherent product, not a collection of adjacent primitives
-- Persist more of the `chisei` runtime history so pipeline decisions and outcomes become first-class data
-- Tighten the connection between eval results, learnings, and future pipeline recommendations
-- Expand security and authorization from basic checks toward production-ready policy enforcement
+- Make the public surfaces communicate one product boundary
+- Persist more execution history so decisions and outcomes are first-class data
+- Tighten the connection between verification, learnings, and future decisions
+- Continue hardening authorization and policy enforcement
 
 ### Mid Term
 
-- Improve model and runtime selection using observed performance instead of defaults
-- Build stronger lineage between tasks, code changes, evaluations, and deployed outcomes
-- Support operational reporting for reliability, budget pressure, and agent effectiveness
+- Improve model and runtime selection using observed performance
+- Strengthen lineage across operations, actions, artifacts, verification, and
+  outcomes
+- Support operational reporting for reliability, budget pressure, and agent
+  effectiveness across domains
 
 ### Long Term
 
-- Become the backbone for multi-agent software delivery across many namespaces and teams
-- Enable organizations to treat AI execution policy as infrastructure
-- Make engineering memory cumulative so every completed task improves future execution quality
+- Become the governance backbone for multi-agent operations across namespaces
+  and teams
+- Enable organizations to treat agent policy as infrastructure
+- Make operational memory cumulative so every verified outcome improves future
+  execution quality
 
 ## Success Criteria
 
 `sekai-chisei` is succeeding when:
 
-- teams can inspect why a task was routed to a specific model or runtime
-- prior learnings materially improve future task specs and outcomes
-- budgets, access, and policy controls prevent unsafe or wasteful execution
-- evaluation gates catch regressions before new agent strategies are adopted
-- the graph becomes a trusted operational memory for engineering work
+- operators can inspect why an operation was routed to a model or runtime
+- prior outcomes materially improve future context and decisions
+- budgets, access, egress, action, and approval controls prevent unsafe or
+  wasteful execution
+- evaluation gates catch regressions before new strategies are adopted
+- the graph becomes trusted operational memory across multiple domains
+- a new domain can integrate through schemas and adapters without changing the
+  core contracts
 
 ## Short Version
 
-Build a system where AI coding work is:
+Build a system where agent operations are:
 
 - context-aware
 - policy-governed
 - budget-constrained
 - auditable
+- verifiable
 - measurable
 - self-improving
 
