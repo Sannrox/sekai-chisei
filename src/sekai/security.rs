@@ -212,7 +212,9 @@ impl SekaiDb {
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT id,object_id,principal,role,created FROM sekai_grants")
+            .prepare(
+                "SELECT id,object_id,principal,role,created FROM sekai_grants ORDER BY created, id",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -300,5 +302,31 @@ mod tests {
         let deleted = db.delete_grant("g1").unwrap().unwrap();
         assert_eq!(deleted.principal, "alice");
         assert!(db.list_grants("obj-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn grant_reload_applies_latest_role_last() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_grant(&Grant {
+            id: "older-admin".into(),
+            object_id: "obj-1".into(),
+            principal: "alice".into(),
+            role: Role::Admin,
+            created: 10,
+        })
+        .unwrap();
+        db.create_grant(&Grant {
+            id: "newer-viewer".into(),
+            object_id: "obj-1".into(),
+            principal: "alice".into(),
+            role: Role::Viewer,
+            created: 20,
+        })
+        .unwrap();
+
+        let checker = SecurityChecker::new();
+        checker.load(&db.list_all_grants().unwrap());
+        assert!(checker.can_access("obj-1", &["alice"]));
+        assert!(!checker.can_write("obj-1", &["alice"]));
     }
 }
