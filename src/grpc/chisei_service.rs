@@ -220,6 +220,9 @@ fn record_failed_operation_on(
     actor: &str,
     completion_reason: &str,
 ) -> Result<(), String> {
+    if db.get_operation_receipt(&plan.plan_id)?.is_none() {
+        return Ok(());
+    }
     let completed_at_ms = chrono::Utc::now().timestamp_millis();
     db.update_operation_receipt(&plan.plan_id, |receipt| {
         if receipt.completed_at_ms.is_some() {
