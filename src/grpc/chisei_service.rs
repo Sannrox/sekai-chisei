@@ -3605,10 +3605,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .reporter_grants
             .iter()
             .any(|grant| grant.principal == actor && grant.event_kinds.contains(&kind));
-        if actor != receipt.initiating_actor
-            && !matches!(actor.as_str(), "root" | "chisei-gateway")
-            && !explicitly_granted
-        {
+        if actor != receipt.initiating_actor && actor != "root" && !explicitly_granted {
             return Err(Status::permission_denied(
                 "operation event reporter is not authorized for this event kind",
             ));
