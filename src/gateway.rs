@@ -54,6 +54,8 @@ const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project")
 const X_CHISEI_WORK_UNIT: HeaderName = HeaderName::from_static("x-chisei-work-unit");
 const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id");
 const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
+const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
+const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
@@ -287,6 +289,55 @@ struct GatewayState {
     client: reqwest::Client,
     config: Arc<GatewayConfig>,
     runtime: GatewayRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GovernanceFailurePosture {
+    data_class: String,
+    action_risk: String,
+    fail_closed: bool,
+}
+
+impl GovernanceFailurePosture {
+    fn from_request(
+        config: &GatewayConfig,
+        identity: &GatewayIdentity,
+        headers: &HeaderMap,
+    ) -> Self {
+        let data_class = header_str(headers, &X_CHISEI_DATA_CLASS)
+            .map(normalize_governance_label)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let action_risk = header_str(headers, &X_CHISEI_ACTION_RISK)
+            .map(normalize_governance_label)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Only an operator-managed gateway identity can opt into the narrow
+        // availability exception. Caller-provided labels can make that posture
+        // stricter, but can never grant fail-open authority by themselves.
+        let trusted_low_risk_identity = identity.tier == "low-risk";
+        let fail_closed = config.fail_closed
+            || !trusted_low_risk_identity
+            || data_class != "unclassified"
+            || !matches!(action_risk.as_str(), "low" | "read");
+        Self {
+            data_class,
+            action_risk,
+            fail_closed,
+        }
+    }
+
+    fn evidence(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("data_class".to_string(), self.data_class.clone()),
+            ("action_risk".to_string(), self.action_risk.clone()),
+            ("fail_closed".to_string(), self.fail_closed.to_string()),
+        ])
+    }
+}
+
+fn normalize_governance_label(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
 #[derive(Clone)]
@@ -558,6 +609,8 @@ async fn proxy_gateway(
     // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
     // even under `no_preflight`, where the routing-only call below is skipped.
     let task_class = resolve_task_class(&headers, requested_model.as_deref());
+    let failure_posture =
+        GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
     let mid_task = header_str(&headers, &X_CHISEI_MID_TASK)
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let preflight_context = UsageContext {
@@ -581,6 +634,28 @@ async fn proxy_gateway(
             "explicit governed context is unavailable while preflight is disabled",
         );
     }
+    if state.config.no_preflight && failure_posture.fail_closed {
+        let rejection = GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "preflight cannot be disabled for classified or elevated-risk traffic",
+        );
+        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        return rejection.response();
+    }
+    if !state.config.no_preflight
+        && state.config.chisei_grpc_target.is_none()
+        && let Err(rejection) = governance_error(
+            &state.config,
+            &identity,
+            &failure_posture,
+            "control-plane governance is not configured",
+        )
+        .await
+    {
+        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        return rejection.response();
+    }
     let (resolved, egress) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
@@ -602,6 +677,7 @@ async fn proxy_gateway(
             work_unit_id.as_deref().unwrap_or(""),
             &task_class,
             mid_task,
+            &failure_posture,
         )
         .await
         {
@@ -622,6 +698,7 @@ async fn proxy_gateway(
             &budget,
             &request_id,
             work_unit_id.as_deref(),
+            &failure_posture,
         )
         .await
         {
@@ -671,6 +748,7 @@ async fn proxy_gateway(
             resolved.resolved_model.as_deref(),
             &request_id,
             work_unit_id.as_deref(),
+            &failure_posture,
         )
         .await
         {
@@ -890,6 +968,7 @@ async fn check_budget_preflight(
     work_unit: &str,
     task_class: &str,
     mid_task: bool,
+    failure_posture: &GovernanceFailurePosture,
 ) -> Result<BudgetPreflight, GatewayRejection> {
     let Some(target) = &config.chisei_grpc_target else {
         return Ok(BudgetPreflight::default());
@@ -986,8 +1065,13 @@ async fn check_budget_preflight(
                         }
                     }
                     Err(err) => {
-                        governance_error(config, identity, &format!("CheckBudget failed: {err}"))
-                            .await?;
+                        governance_error(
+                            config,
+                            identity,
+                            failure_posture,
+                            &format!("CheckBudget failed: {err}"),
+                        )
+                        .await?;
                         Ok(CheckBudgetResponse {
                             allowed: true,
                             usage: None,
@@ -1002,6 +1086,7 @@ async fn check_budget_preflight(
                 governance_error(
                     config,
                     identity,
+                    failure_posture,
                     &format!("failed to connect to Chisei control plane: {err}"),
                 )
                 .await?;
@@ -1180,6 +1265,7 @@ async fn resolve_policy_preflight(
     budget: &BudgetPreflight,
     request_id: &str,
     work_unit_id: Option<&str>,
+    failure_posture: &GovernanceFailurePosture,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         return Ok(PolicyPreflight {
@@ -1381,8 +1467,13 @@ async fn resolve_policy_preflight(
                     ))
                 }
                 Err(err) => {
-                    governance_error(config, identity, &format!("ResolvePolicy failed: {err}"))
-                        .await?;
+                    governance_error(
+                        config,
+                        identity,
+                        failure_posture,
+                        &format!("ResolvePolicy failed: {err}"),
+                    )
+                    .await?;
                     Ok(PolicyPreflight {
                         body: body.to_vec(),
                         resolved_model: Some(requested_model.to_string()),
@@ -1398,6 +1489,7 @@ async fn resolve_policy_preflight(
             governance_error(
                 config,
                 identity,
+                failure_posture,
                 &format!("failed to connect to Chisei control plane: {err}"),
             )
             .await?;
@@ -2368,6 +2460,7 @@ async fn apply_context_egress(
     resolved_model: Option<&str>,
     request_id: &str,
     work_unit_id: Option<&str>,
+    failure_posture: &GovernanceFailurePosture,
 ) -> Result<ContextEgressPreflight, Response<Body>> {
     let Some(target) = &config.chisei_grpc_target else {
         if context_request.is_some() {
@@ -2399,7 +2492,7 @@ async fn apply_context_egress(
     }
     let channel = match connect_sekai(target).await {
         Ok(channel) => channel,
-        Err(error) if context_request.is_some() || config.fail_closed => {
+        Err(error) if context_request.is_some() || failure_posture.fail_closed => {
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "governance_unavailable",
@@ -2429,7 +2522,7 @@ async fn apply_context_egress(
         .await
     {
         Ok(response) => restricted_gateway_fields(response.into_inner().types),
-        Err(status) if context_request.is_some() || config.fail_closed => {
+        Err(status) if context_request.is_some() || failure_posture.fail_closed => {
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "governance_unavailable",
@@ -2475,7 +2568,7 @@ async fn apply_context_egress(
                 &format!("governed context root not found: {status}"),
             ));
         }
-        Err(status) if context_request.is_some() || config.fail_closed => {
+        Err(status) if context_request.is_some() || failure_posture.fail_closed => {
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "governance_unavailable",
@@ -3304,6 +3397,7 @@ fn domain_object_from_proto(object: &SekaiObject) -> crate::domain::Object {
 async fn governance_error(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
+    failure_posture: &GovernanceFailurePosture,
     message: &str,
 ) -> Result<(), GatewayRejection> {
     record_gateway_decision(
@@ -3311,15 +3405,15 @@ async fn governance_error(
         identity,
         "gateway.governance_unavailable",
         message,
-        if config.fail_closed {
+        if failure_posture.fail_closed {
             "fail_closed"
         } else {
             "fail_open"
         },
-        HashMap::from([("fail_closed".to_string(), config.fail_closed.to_string())]),
+        failure_posture.evidence(),
     )
     .await;
-    if config.fail_closed {
+    if failure_posture.fail_closed {
         Err(GatewayRejection::json(
             StatusCode::SERVICE_UNAVAILABLE,
             "governance_unavailable",
@@ -3532,7 +3626,10 @@ fn passthrough_identity(headers: &HeaderMap, default_project: &str) -> Option<Ga
         agent: agent.to_string(),
         project: project.to_string(),
         key_id: String::new(),
-        tier: DEFAULT_GATEWAY_TIER.to_string(),
+        // Passthrough is an explicit operator opt-in. Keep its availability
+        // posture distinct from unrestricted derived keys, which remain
+        // fail-closed unless registered with a trusted low-risk tier.
+        tier: "low-risk".to_string(),
     })
 }
 
@@ -3583,7 +3680,9 @@ fn derive_identity_from_key(key: &str, default_project: &str) -> GatewayIdentity
         key_id: agent.clone(),
         agent,
         project: default_project.to_string(),
-        tier: DEFAULT_GATEWAY_TIER.to_string(),
+        // This compatibility path has no operator-managed registration from
+        // which to derive a trusted failure posture.
+        tier: "untrusted".to_string(),
     }
 }
 
@@ -5725,6 +5824,60 @@ mod tests {
     }
 
     #[test]
+    fn governance_failure_posture_closes_risky_classes_by_default() {
+        let config = routing_config();
+        let mut identity = GatewayIdentity {
+            agent: "safe-agent".into(),
+            project: "default".into(),
+            user_id: "agent:safe-agent".into(),
+            key_id: "safe-agent".into(),
+            tier: "low-risk".into(),
+        };
+        let mut safe_headers = HeaderMap::new();
+        safe_headers.insert(
+            &X_CHISEI_DATA_CLASS,
+            HeaderValue::from_static("unclassified"),
+        );
+        safe_headers.insert(&X_CHISEI_ACTION_RISK, HeaderValue::from_static("low"));
+        let safe = GovernanceFailurePosture::from_request(&config, &identity, &safe_headers);
+        assert_eq!(safe.data_class, "unclassified");
+        assert_eq!(safe.action_risk, "low");
+        assert!(!safe.fail_closed);
+
+        let mut classified_headers = HeaderMap::new();
+        classified_headers.insert(&X_CHISEI_DATA_CLASS, HeaderValue::from_static("sensitive"));
+        assert!(
+            GovernanceFailurePosture::from_request(&config, &identity, &classified_headers)
+                .fail_closed
+        );
+
+        let mut risky_headers = HeaderMap::new();
+        risky_headers.insert(
+            &X_CHISEI_ACTION_RISK,
+            HeaderValue::from_static("destructive"),
+        );
+        assert!(
+            GovernanceFailurePosture::from_request(&config, &identity, &risky_headers).fail_closed
+        );
+
+        assert!(
+            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
+                .fail_closed
+        );
+
+        identity.tier = DEFAULT_GATEWAY_TIER.into();
+        assert!(
+            GovernanceFailurePosture::from_request(&config, &identity, &safe_headers).fail_closed
+        );
+
+        identity.tier = "untrusted".into();
+        assert!(
+            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
+                .fail_closed
+        );
+    }
+
+    #[test]
     fn provider_kind_from_model_maps_backends() {
         assert_eq!(
             ProviderKind::from_model("gpt-5.5"),
@@ -6140,7 +6293,16 @@ mod tests {
             chisei_grpc_target: None,
             fail_closed: false,
             default_project: "default".to_string(),
-            gateway_keys: HashMap::new(),
+            gateway_keys: HashMap::from([(
+                "sk-chisei-codex-app".to_string(),
+                GatewayIdentity {
+                    agent: "codex-app".to_string(),
+                    project: "default".to_string(),
+                    user_id: "agent:codex-app".to_string(),
+                    key_id: "codex-app".to_string(),
+                    tier: "low-risk".to_string(),
+                },
+            )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
             no_preflight: false,
@@ -6166,7 +6328,16 @@ mod tests {
             chisei_grpc_target: None,
             fail_closed: false,
             default_project: "default".to_string(),
-            gateway_keys: HashMap::new(),
+            gateway_keys: HashMap::from([(
+                "sk-chisei-codex-app".to_string(),
+                GatewayIdentity {
+                    agent: "codex-app".to_string(),
+                    project: "default".to_string(),
+                    user_id: "agent:codex-app".to_string(),
+                    key_id: "codex-app".to_string(),
+                    tier: "low-risk".to_string(),
+                },
+            )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
             no_preflight: false,
@@ -6478,6 +6649,8 @@ mod tests {
         let resp = client
             .post(format!("{gateway_base}/v1/responses?trace=1"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .header("x-codex-test", "yes")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
@@ -6517,6 +6690,8 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -6543,6 +6718,8 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello",
@@ -6572,6 +6749,8 @@ mod tests {
         let resp = reqwest::Client::new()
             .get(format!("{gateway_base}/v1/models?client_version=0.141.0"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .send()
             .await
             .unwrap();
@@ -6620,6 +6799,8 @@ mod tests {
             .bearer_auth("native-openai-oauth-token")
             .header(X_CHISEI_AGENT.as_str(), "codex-app")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
+            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -6712,6 +6893,8 @@ mod tests {
             .bearer_auth("codex-local-login-token")
             .header(X_CHISEI_AGENT.as_str(), "codex-app")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
+            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -6767,6 +6950,8 @@ mod tests {
             .bearer_auth("native-claude-oauth-token")
             .header(X_CHISEI_AGENT.as_str(), "claude-code")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
+            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .header("anthropic-version", "2023-06-01")
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6",
@@ -6811,7 +6996,7 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
+            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -8140,7 +8325,7 @@ mod tests {
                     project: "default".to_string(),
                     user_id: "agent:codex-app".to_string(),
                     key_id: "codex-app".to_string(),
-                    tier: DEFAULT_GATEWAY_TIER.to_string(),
+                    tier: "low-risk".to_string(),
                 },
             )]),
             allow_auth_passthrough: false,
@@ -8155,12 +8340,25 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
             .send()
             .await
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let classified = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "sensitive")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(classified.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(requests.lock().unwrap().len(), 1);
 
         let explicit = reqwest::Client::new()
@@ -8193,7 +8391,7 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-            fail_closed: true,
+            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
                 "sk-chisei-codex-app".to_string(),
@@ -8202,7 +8400,7 @@ mod tests {
                     project: "default".to_string(),
                     user_id: "agent:codex-app".to_string(),
                     key_id: "codex-app".to_string(),
-                    tier: DEFAULT_GATEWAY_TIER.to_string(),
+                    tier: "low-risk".to_string(),
                 },
             )]),
             allow_auth_passthrough: false,
@@ -8217,6 +8415,8 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -8226,12 +8426,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].authorization.as_deref(),
-            Some("Bearer real-openai-key")
-        );
+        {
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0].authorization.as_deref(),
+                Some("Bearer real-openai-key")
+            );
+        }
+
+        let elevated_risk = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-action-risk", "write")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(elevated_risk.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -8384,7 +8597,6 @@ mod tests {
             key_id: "codex-app".into(),
             tier: DEFAULT_GATEWAY_TIER.into(),
         };
-
         let rejection = policy_denied(
             &config,
             &identity,
@@ -9142,6 +9354,8 @@ mod tests {
             key_id: "codex-app".into(),
             tier: DEFAULT_GATEWAY_TIER.into(),
         };
+        let failure_posture =
+            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new());
         let request = GatewayContextRequest {
             objects: vec![GatewayContextObject {
                 root: GatewayContextRoot::External("ticker:missing".into()),
@@ -9160,6 +9374,7 @@ mod tests {
             Some("gpt-5.5"),
             "request-missing-context",
             None,
+            &failure_posture,
         )
         .await
         .unwrap_err();
@@ -9191,6 +9406,7 @@ mod tests {
             Some("gpt-5.5"),
             "request-missing-retrieval",
             None,
+            &failure_posture,
         )
         .await
         .unwrap_err();
