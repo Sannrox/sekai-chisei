@@ -3443,6 +3443,25 @@ impl ChiseiService for ChiseiServiceImpl {
         if request.parent_event_id.trim().is_empty() {
             return Err(Status::invalid_argument("parent_event_id required"));
         }
+        let parent = receipt
+            .events
+            .iter()
+            .find(|event| event.event_id == request.parent_event_id)
+            .ok_or(Status::failed_precondition("causal parent not found"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let timestamp_ms = if request.timestamp_ms <= 0 {
+            now
+        } else if request.timestamp_ms > now {
+            return Err(Status::invalid_argument(
+                "event timestamp must not be in the future",
+            ));
+        } else if request.timestamp_ms < parent.timestamp_ms {
+            return Err(Status::invalid_argument(
+                "event timestamp must not precede its causal parent",
+            ));
+        } else {
+            request.timestamp_ms
+        };
         if request.attributes.len() > 64 {
             return Err(Status::invalid_argument(
                 "at most 64 attributes are allowed",
@@ -3528,7 +3547,7 @@ impl ChiseiService for ChiseiServiceImpl {
             event_id: event_id.clone(),
             operation_id: request.operation_id.clone(),
             parent_event_id: Some(request.parent_event_id),
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_ms,
             kind,
             surface: kind.surface(),
             actor,
@@ -5743,7 +5762,7 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 provider: "native".into(),
             },
-            plan.created_at + 25,
+            plan.created_at,
         )
         .unwrap();
         let completed = svc
@@ -5752,7 +5771,7 @@ mod tests {
             .unwrap()
             .expect("completed receipt");
         assert!(completed.completeness().complete);
-        assert_eq!(completed.completed_at_ms, Some(plan.created_at + 25));
+        assert_eq!(completed.completed_at_ms, Some(plan.created_at));
         assert!(completed.events.iter().any(|event| {
             event.kind == ReceiptEventKind::OutcomeRecorded
                 && event.parent_event_id.as_deref()
@@ -5880,7 +5899,7 @@ mod tests {
                 operation_id: plan.plan_id.clone(),
                 event_id: format!("{}:reported-action", plan.plan_id),
                 parent_event_id: format!("{}:outcome", plan.plan_id),
-                timestamp_ms: 1,
+                timestamp_ms: plan.created_at,
                 kind: "action_performed".into(),
                 attributes: HashMap::from([("action_type".into(), "tool.read".into())]),
                 references: vec![],
@@ -5909,7 +5928,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(updated.events.iter().any(|event| {
-            event.event_id.ends_with(":reported-action") && event.actor == "agent:reporter"
+            event.event_id.ends_with(":reported-action")
+                && event.actor == "agent:reporter"
+                && event.timestamp_ms == plan.created_at
         }));
 
         let mut get_request = Request::new(GetOperationReceiptRequest {
