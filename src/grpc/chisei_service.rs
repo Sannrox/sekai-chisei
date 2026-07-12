@@ -5863,7 +5863,7 @@ mod tests {
     #[tokio::test]
     async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
         let mut svc = memory_service();
-        svc.config.gateway_receipt_principals = vec!["gateway-prod".into()];
+        svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
         let mut request = Request::new(PlanExecutionRequest {
             input: Some(ExecutionInput {
                 request_id: "receipt-task-1".into(),
@@ -6033,7 +6033,7 @@ mod tests {
         });
         configured_gateway_replay
             .metadata_mut()
-            .insert("x-principal", "gateway-prod".parse().unwrap());
+            .insert("x-principal", "Gateway-Prod".parse().unwrap());
         svc.record_gateway_audit(configured_gateway_replay)
             .await
             .unwrap();
