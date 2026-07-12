@@ -289,7 +289,15 @@ Depth is capped at three, result width is hard-bounded, and candidates are
 ordered deterministically by graph proximity and corroboration across roots.
 Resolution, denial, graph truncation, character truncation, and injected-object
 counts are retained in the gateway audit. Graph values are labelled as
-untrusted data in the model context.
+untrusted data in the model context, and the audit marks their source as
+`sekai_graph` with trust level `untrusted`.
+
+This is a containment boundary, not a claim that the gateway solves prompt
+injection. Object context still passes through schema classification and egress
+filtering before injection, remains visibly separated from instructions, and is
+size-bounded. Tool output supplied by clients is not promoted to trusted
+instructions or exempted from those controls. Applications must still constrain
+tool permissions and validate model-proposed actions at execution time.
 
 Related-context expansion is disabled until its exact retrieval shape has a
 distinct baseline and candidate eval run whose comparison passes. Directly
