@@ -5268,6 +5268,16 @@ async fn record_refusal_and_append(
     context: &UsageContext,
     rejection: &GatewayRejection,
 ) {
+    record_refusal_with_usage_and_append(config, identity, context, rejection, None).await;
+}
+
+async fn record_refusal_with_usage_and_append(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    context: &UsageContext,
+    rejection: &GatewayRejection,
+    usage: Option<ResponseUsage>,
+) {
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
@@ -5276,7 +5286,7 @@ async fn record_refusal_and_append(
         identity,
         context,
         rejection.status,
-        None,
+        usage.as_ref(),
         None,
         Some(rejection),
     )
@@ -5315,6 +5325,27 @@ async fn record_refusal_and_append(
         context.request_bytes.to_string(),
     );
     values.insert("latency_ms".to_string(), elapsed_ms.max(0).to_string());
+    if let Some(usage) = usage {
+        values.insert("input_tokens".to_string(), usage.input_tokens.to_string());
+        values.insert("output_tokens".to_string(), usage.output_tokens.to_string());
+        values.insert("total_tokens".to_string(), usage.total_tokens.to_string());
+        if usage.cache_read_input_tokens > 0 {
+            values.insert(
+                "cache_read_input_tokens".to_string(),
+                usage.cache_read_input_tokens.to_string(),
+            );
+        }
+        if usage.cache_creation_input_tokens > 0 {
+            values.insert(
+                "cache_creation_input_tokens".to_string(),
+                usage.cache_creation_input_tokens.to_string(),
+            );
+        }
+        if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
+            values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
+            values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
+        }
+    }
 
     match connect_sekai(target).await {
         Ok(channel) => {
@@ -6816,7 +6847,10 @@ async fn response_from_upstream(
                                 GatewayUsageOutcome::AccountingOnly(rejection.status),
                             )
                             .await;
-                            record_refusal_and_append(config, identity, &context, &rejection).await;
+                            record_refusal_with_usage_and_append(
+                                config, identity, &context, &rejection, usage,
+                            )
+                            .await;
                             return json_error(
                                 rejection.status,
                                 &rejection.error_type,
@@ -6844,7 +6878,10 @@ async fn response_from_upstream(
                         GatewayUsageOutcome::AccountingOnly(rejection.status),
                     )
                     .await;
-                    record_refusal_and_append(config, identity, &context, &rejection).await;
+                    record_refusal_with_usage_and_append(
+                        config, identity, &context, &rejection, usage,
+                    )
+                    .await;
                     return json_error(rejection.status, &rejection.error_type, &rejection.reason);
                 }
             };
