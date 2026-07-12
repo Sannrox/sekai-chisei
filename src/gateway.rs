@@ -456,6 +456,8 @@ async fn proxy_gateway(
             requested_model.as_deref(),
             &task_class,
             &budget,
+            &request_id,
+            work_unit_id.as_deref(),
         )
         .await
         {
@@ -961,6 +963,8 @@ async fn resolve_policy_preflight(
     requested_model: Option<&str>,
     task_class: &str,
     budget: &BudgetPreflight,
+    request_id: &str,
+    work_unit_id: Option<&str>,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         return Ok(PolicyPreflight {
@@ -1018,6 +1022,8 @@ async fn resolve_policy_preflight(
                                 "policy resolved unsupported runtime {:?}",
                                 resolution.runtime
                             ),
+                            request_id,
+                            work_unit_id,
                         )
                         .await;
                     };
@@ -1039,6 +1045,8 @@ async fn resolve_policy_preflight(
                                 "policy resolved unsupported runtime {:?}",
                                 resolution.runtime
                             ),
+                            request_id,
+                            work_unit_id,
                         )
                         .await;
                     }
@@ -1053,6 +1061,8 @@ async fn resolve_policy_preflight(
                                 resolved_provider.runtime_name(),
                                 resolution.model
                             ),
+                            request_id,
+                            work_unit_id,
                         )
                         .await;
                     }
@@ -1119,6 +1129,8 @@ async fn resolve_policy_preflight(
                         requested_model,
                         requested_model,
                         &format!("policy denied request: {err}"),
+                        request_id,
+                        work_unit_id,
                     )
                     .await
                 }
@@ -1192,18 +1204,25 @@ async fn policy_denied(
     requested_model: &str,
     resolved_model: &str,
     reason: &str,
+    request_id: &str,
+    work_unit_id: Option<&str>,
 ) -> Result<PolicyPreflight, GatewayRejection> {
+    let mut evidence = HashMap::from([
+        ("requested_model".to_string(), requested_model.to_string()),
+        ("resolved_model".to_string(), resolved_model.to_string()),
+        ("project".to_string(), identity.project.clone()),
+        ("request_id".to_string(), request_id.to_string()),
+    ]);
+    if let Some(work_unit_id) = work_unit_id.filter(|value| !value.is_empty()) {
+        evidence.insert("work_unit".to_string(), work_unit_id.to_string());
+    }
     record_gateway_decision(
         config,
         identity,
         "gateway.policy_denied",
         reason,
         "denied",
-        HashMap::from([
-            ("requested_model".to_string(), requested_model.to_string()),
-            ("resolved_model".to_string(), resolved_model.to_string()),
-            ("project".to_string(), identity.project.clone()),
-        ]),
+        evidence,
     )
     .await;
     Err(GatewayRejection::json(
@@ -7961,6 +7980,43 @@ mod tests {
         );
         assert_eq!(rows[0].get("agent").map(String::as_str), Some("codex-app"));
         assert_eq!(rows[0].get("provider").map(String::as_str), Some("openai"));
+    }
+
+    #[tokio::test]
+    async fn policy_denial_records_request_and_work_unit_attribution() {
+        let (chisei_target, db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        let identity = GatewayIdentity {
+            agent: "codex-app".into(),
+            project: "default".into(),
+            user_id: "agent:codex-app".into(),
+            key_id: "codex-app".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+
+        let rejection = policy_denied(
+            &config,
+            &identity,
+            "requested-model",
+            "resolved-model",
+            "model denied by policy",
+            "request-policy-denied",
+            Some("work-policy-denied"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejection.status, StatusCode::FORBIDDEN);
+
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.policy_denied".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].evidence["request_id"], "request-policy-denied");
+        assert_eq!(decisions[0].evidence["work_unit"], "work-policy-denied");
     }
 
     #[tokio::test]
