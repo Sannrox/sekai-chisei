@@ -26,6 +26,8 @@ pub struct Config {
     /// control-plane server (e.g. Codex ChatGPT-plan passthrough). Model routing
     /// treats them as available even when the server holds no API key for them.
     pub gateway_provided_providers: Vec<String>,
+    /// Authenticated service principals allowed to persist gateway operation receipts.
+    pub gateway_receipt_principals: Vec<String>,
     pub leak_review_model: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
@@ -66,6 +68,7 @@ impl Config {
             default_data_class: env("CHISEI_DEFAULT_DATA_CLASS", "unclassified"),
             safe_egress_providers: csv_env("CHISEI_SAFE_EGRESS_PROVIDERS"),
             gateway_provided_providers: csv_env("CHISEI_GATEWAY_PROVIDED_PROVIDERS"),
+            gateway_receipt_principals: csv_env("CHISEI_GATEWAY_RECEIPT_PRINCIPALS"),
             leak_review_model: env::var("LEAK_REVIEW_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),

@@ -115,6 +115,7 @@ Configuration is read from environment variables:
 | `CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS` | `1200` | Gateway-wide requests allowed per window; prevents identity rotation from bypassing limits |
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed-window rate-limit duration |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | unset | Comma-separated providers whose upstream auth is supplied by the gateway (e.g. `openai`); model routing treats them as available without a server-side key |
+| `CHISEI_GATEWAY_RECEIPT_PRINCIPALS` | unset | Comma-separated authenticated service principals allowed to persist gateway operation receipts |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models; defaults to `http://localhost:11434/v1` |
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound LLM/gateway upstream TCP connect timeout |
 | `LLM_HTTP_READ_TIMEOUT_SECS` | `60` | Outbound LLM/gateway upstream idle-read timeout; protects streaming without imposing a total stream cap |
