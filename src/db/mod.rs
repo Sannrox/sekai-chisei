@@ -2,4 +2,5 @@ pub mod chisei;
 pub mod chisei_budget;
 pub mod chisei_portfolio;
 pub mod postgres;
+mod postgres_budget;
 pub mod sekai;
