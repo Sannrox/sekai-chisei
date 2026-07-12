@@ -2622,6 +2622,14 @@ async fn apply_context_egress(
             ("object_refs".to_string(), object_refs.join(",")),
             ("payload_rewritten".to_string(), rewritten.to_string()),
             (
+                "injected_context_source".to_string(),
+                "sekai_graph".to_string(),
+            ),
+            (
+                "injected_context_trust".to_string(),
+                "untrusted".to_string(),
+            ),
+            (
                 "injected_context_chars".to_string(),
                 injected_context_chars.to_string(),
             ),
@@ -8680,6 +8688,14 @@ mod tests {
         assert_eq!(
             evidence.get("context_selection").map(String::as_str),
             Some("explicit")
+        );
+        assert_eq!(
+            evidence.get("injected_context_source").map(String::as_str),
+            Some("sekai_graph")
+        );
+        assert_eq!(
+            evidence.get("injected_context_trust").map(String::as_str),
+            Some("untrusted")
         );
         assert_eq!(
             evidence.get("requested_field_count").map(String::as_str),
