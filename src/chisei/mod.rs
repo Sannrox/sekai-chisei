@@ -13,5 +13,6 @@ pub mod policy;
 pub mod portfolio;
 pub mod privacy;
 pub mod promotion;
+pub mod receipt;
 pub mod sampling;
 pub mod scoring;
