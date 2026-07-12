@@ -661,6 +661,25 @@ message ReconcileWorkUnitsResponse {
 message GetCoordinationSnapshotRequest {}
 message GetCoordinationSnapshotResponse { CoordinationSnapshot snapshot = 1; }
 
+message CredentialRecord {
+  string id = 1;
+  string principal = 2;
+  string status = 3;
+  int64 created = 4;
+  int64 rotated_at = 5;
+  int64 revoked_at = 6;
+}
+message CreateCredentialRequest { string principal = 1; }
+message CreateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
+message RotateCredentialRequest { string principal = 1; }
+message RotateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
+message RevokeCredentialRequest { string principal = 1; }
+message RevokeCredentialResponse { CredentialRecord credential = 1; }
+message ListCredentialsRequest {}
+message ListCredentialsResponse { repeated CredentialRecord credentials = 1; }
+message GetProvenanceReportRequest { string work_unit_id = 1; }
+message GetProvenanceReportResponse { string report = 1; }
+
 // --- Service ---
 
 service SekaiService {
@@ -747,4 +766,9 @@ service SekaiService {
   rpc ListRunEvents(ListRunEventsRequest) returns (ListRunEventsResponse);
   rpc ReconcileWorkUnits(ReconcileWorkUnitsRequest) returns (ReconcileWorkUnitsResponse);
   rpc GetCoordinationSnapshot(GetCoordinationSnapshotRequest) returns (GetCoordinationSnapshotResponse);
+  rpc CreateCredential(CreateCredentialRequest) returns (CreateCredentialResponse);
+  rpc RotateCredential(RotateCredentialRequest) returns (RotateCredentialResponse);
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
 }
