@@ -136,7 +136,13 @@ impl SekaiDb {
                 role TEXT NOT NULL,
                 created INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_grants_object ON sekai_grants(object_id);",
+            CREATE INDEX IF NOT EXISTS idx_grants_object ON sekai_grants(object_id);
+            DELETE FROM sekai_grants
+            WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM sekai_grants GROUP BY object_id, principal
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_grants_object_principal
+                ON sekai_grants(object_id, principal);",
         )
         .map_err(|e| e.to_string())
     }
@@ -144,7 +150,10 @@ impl SekaiDb {
     pub fn create_grant(&self, grant: &Grant) -> Result<(), String> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO sekai_grants (id,object_id,principal,role,created) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO sekai_grants (id,object_id,principal,role,created)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(object_id,principal) DO UPDATE SET
+                id=excluded.id, role=excluded.role, created=excluded.created",
             params![
                 grant.id,
                 grant.object_id,
@@ -213,7 +222,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id,object_id,principal,role,created FROM sekai_grants ORDER BY created, id",
+                "SELECT id,object_id,principal,role,created FROM sekai_grants ORDER BY object_id, principal",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -320,7 +329,7 @@ mod tests {
             object_id: "obj-1".into(),
             principal: "alice".into(),
             role: Role::Viewer,
-            created: 20,
+            created: 5,
         })
         .unwrap();
 
@@ -328,5 +337,7 @@ mod tests {
         checker.load(&db.list_all_grants().unwrap());
         assert!(checker.can_access("obj-1", &["alice"]));
         assert!(!checker.can_write("obj-1", &["alice"]));
+        assert!(db.get_grant("older-admin").unwrap().is_none());
+        assert_eq!(db.list_all_grants().unwrap().len(), 1);
     }
 }
