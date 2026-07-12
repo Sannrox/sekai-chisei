@@ -260,6 +260,10 @@ impl SekaiDb {
         if event.operation_id != operation_id {
             return Err("event operation id does not match receipt".into());
         }
+        // `conn()` returns the database's sole `MutexGuard<Connection>` and
+        // this guard remains live through the read, mutation, and update below.
+        // Concurrent reporters therefore serialize across this whole JSON
+        // read-modify-write sequence rather than overwriting one another.
         let conn = self.conn();
         let receipt_json = conn
             .query_row(
