@@ -169,7 +169,11 @@ impl ProvenanceReport {
             })
             .map(|decision| DataEgress {
                 decision_id: decision.id.clone(),
-                request_id: decision.target_id.clone(),
+                request_id: decision
+                    .evidence
+                    .get("request_id")
+                    .cloned()
+                    .unwrap_or_else(|| decision.target_id.clone()),
                 provider: decision
                     .evidence
                     .get("provider")
@@ -708,10 +712,11 @@ mod tests {
         db.record_decision(&Decision {
             id: "egress".into(),
             timestamp: 1,
-            actor: "chisei.egress".into(),
-            action: "context_egress".into(),
+            actor: "codex-app".into(),
+            action: "gateway.egress".into(),
             reason: "context egress policy applied".into(),
             evidence: HashMap::from([
+                ("request_id".into(), "req-egress".into()),
                 ("provider".into(), "anthropic".into()),
                 ("model".into(), "claude".into()),
                 ("included_count".into(), "4".into()),
@@ -719,7 +724,7 @@ mod tests {
                 ("included_fields".into(), r#"["object#1.title"]"#.into()),
                 ("redacted_fields".into(), r#"["object#1.secret"]"#.into()),
             ]),
-            target_id: "req-egress".into(),
+            target_id: "llm_calls".into(),
             outcome: "redacted".into(),
         })
         .unwrap();
@@ -738,6 +743,7 @@ mod tests {
         let report = assemble_report(&db, "task").unwrap();
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.data_egress()[0].redacted_fields, 2);
+        assert_eq!(report.data_egress()[0].request_id, "req-egress");
         assert!(
             render_text(&report)
                 .contains("provider=anthropic model=claude included_fields=4 redacted_fields=2")
