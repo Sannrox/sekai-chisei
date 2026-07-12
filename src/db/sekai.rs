@@ -1,7 +1,8 @@
+use r2d2::{CustomizeConnection, Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -11,7 +12,38 @@ use crate::domain::{
 };
 
 pub struct SekaiDb {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
+}
+
+#[derive(Debug)]
+struct SqliteConnectionSetup {
+    persistent: bool,
+}
+
+impl CustomizeConnection<Connection, rusqlite::Error> for SqliteConnectionSetup {
+    fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        conn.busy_timeout(Duration::from_secs(5))?;
+        if self.persistent {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        register_sql_helpers(conn)
+    }
+}
+
+fn register_sql_helpers(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.create_scalar_function(
+        "is_numeric_text",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: Option<String> = ctx.get(0).ok();
+            Ok(value
+                .as_deref()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .map(|value| value.is_finite())
+                .unwrap_or(false))
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -27,42 +59,36 @@ pub struct PrincipalCredential {
 
 impl SekaiDb {
     pub fn new(path: &str) -> Result<Self, String> {
-        let conn = if path == ":memory:" {
-            Connection::open_in_memory().map_err(|e| e.to_string())?
-        } else {
+        let persistent = path != ":memory:";
+        let manager = if persistent {
             std::fs::create_dir_all(
                 std::path::Path::new(path)
                     .parent()
                     .unwrap_or(std::path::Path::new(".")),
             )
             .ok();
-            Connection::open(path).map_err(|e| e.to_string())?
+            SqliteConnectionManager::file(path)
+        } else {
+            SqliteConnectionManager::memory()
         };
-        conn.busy_timeout(Duration::from_secs(5))
+        // Separate in-memory SQLite connections do not share state. Keep the
+        // embedded test backend single-connection while allowing persistent
+        // databases to serve concurrent readers and writers.
+        let max_size = if persistent { 16 } else { 1 };
+        let pool = Pool::builder()
+            .max_size(max_size)
+            .connection_customizer(Box::new(SqliteConnectionSetup { persistent }))
+            .build(manager)
             .map_err(|e| e.to_string())?;
-        if path != ":memory:" {
-            conn.pragma_update(None, "journal_mode", "WAL")
-                .map_err(|e| e.to_string())?;
-        }
-        let db = Self {
-            conn: Mutex::new(conn),
-        };
+        let db = Self { pool };
         db.migrate_all()?;
-        db.register_sql_helpers()?;
         Ok(db)
     }
 
-    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
-        match self.conn.lock() {
-            Ok(conn) => conn,
-            Err(poisoned) => {
-                crate::obs::metrics::record_db_lock_poisoned();
-                tracing::error!(
-                    "database connection lock was poisoned; recovering inner connection"
-                );
-                poisoned.into_inner()
-            }
-        }
+    pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
+        self.pool
+            .get()
+            .expect("SQLite connection pool unexpectedly unavailable")
     }
 
     pub fn db_lock_poisoned_total(&self) -> u64 {
@@ -124,24 +150,6 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    fn register_sql_helpers(&self) -> Result<(), String> {
-        let conn = self.conn();
-        conn.create_scalar_function(
-            "is_numeric_text",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let value: Option<String> = ctx.get(0).ok();
-                Ok(value
-                    .as_deref()
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .map(|v| v.is_finite())
-                    .unwrap_or(false))
-            },
-        )
-        .map_err(|e| e.to_string())
     }
 
     pub(crate) fn migrate_principal_credentials(&self) -> Result<(), String> {
@@ -1556,19 +1564,33 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_connection_lock_recovers_and_counts() {
+    fn pooled_connection_is_returned_after_unwind() {
         let db = test_db();
-        let before = db.db_lock_poisoned_total();
 
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _conn = db.conn();
-            panic!("poison connection lock for test");
+            panic!("unwind while holding pooled connection");
         }));
-        assert!(poisoned.is_err());
+        assert!(panicked.is_err());
 
         db.ping().unwrap();
-        assert!(db.db_lock_poisoned_total() > before);
-        db.ping().unwrap();
+    }
+
+    #[test]
+    fn persistent_database_uses_a_multi_connection_pool() {
+        let path = std::env::temp_dir().join(format!("sekai-pool-{}.db", Uuid::new_v4()));
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(db.pool.max_size(), 16);
+        let first = db.conn();
+        let second = db.conn();
+        first.query_row("SELECT 1", [], |_| Ok(())).unwrap();
+        second.query_row("SELECT 1", [], |_| Ok(())).unwrap();
+        drop((first, second, db));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
     }
 
     #[test]
