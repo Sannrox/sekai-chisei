@@ -16,11 +16,11 @@ impl PostgresDb {
                         ((chisei_portfolio_observations.quality_score * chisei_portfolio_observations.sample_count)
                          + (excluded.quality_score * excluded.sample_count))
                         / (chisei_portfolio_observations.sample_count + excluded.sample_count),
-                    cost_usd_micros = CAST(
+                    cost_usd_micros = CAST(trunc(
                         ((chisei_portfolio_observations.cost_usd_micros::numeric * chisei_portfolio_observations.sample_count)
                          + (excluded.cost_usd_micros::numeric * excluded.sample_count))
                         / (chisei_portfolio_observations.sample_count + excluded.sample_count)
-                        AS BIGINT),
+                        ) AS BIGINT),
                     sample_count = chisei_portfolio_observations.sample_count + excluded.sample_count,
                     updated_at = GREATEST(chisei_portfolio_observations.updated_at, excluded.updated_at)",
                 &[
