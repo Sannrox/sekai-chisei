@@ -505,6 +505,8 @@ async fn proxy_gateway(
             context_request.as_ref(),
             requested_model.as_deref(),
             resolved.resolved_model.as_deref(),
+            &request_id,
+            work_unit_id.as_deref(),
         )
         .await
         {
@@ -2150,6 +2152,8 @@ async fn apply_context_egress(
     context_request: Option<&GatewayContextRequest>,
     requested_model: Option<&str>,
     resolved_model: Option<&str>,
+    request_id: &str,
+    work_unit_id: Option<&str>,
 ) -> Result<ContextEgressPreflight, Response<Body>> {
     let Some(target) = &config.chisei_grpc_target else {
         if context_request.is_some() {
@@ -2437,6 +2441,11 @@ async fn apply_context_egress(
             "included"
         },
         HashMap::from([
+            ("request_id".to_string(), request_id.to_string()),
+            (
+                "work_unit".to_string(),
+                work_unit_id.unwrap_or_default().to_string(),
+            ),
             ("provider".to_string(), provider.runtime_name().to_string()),
             (
                 "requested_model".to_string(),
@@ -8242,6 +8251,7 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-work-unit", "gateway-egress-work")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "analyze ticker:{AAPL}"
@@ -8269,6 +8279,8 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].actor, "codex-app");
         assert_eq!(decisions[0].outcome, "redacted");
+        assert!(!decisions[0].evidence["request_id"].is_empty());
+        assert_eq!(decisions[0].evidence["work_unit"], "gateway-egress-work");
         assert_eq!(
             decisions[0].evidence.get("object_refs").map(String::as_str),
             Some("ticker:AAPL")
@@ -8757,6 +8769,8 @@ mod tests {
             Some(&request),
             Some("gpt-5.5"),
             Some("gpt-5.5"),
+            "request-missing-context",
+            None,
         )
         .await
         .unwrap_err();
@@ -8786,6 +8800,8 @@ mod tests {
             Some(&retrieval_request),
             Some("gpt-5.5"),
             Some("gpt-5.5"),
+            "request-missing-retrieval",
+            None,
         )
         .await
         .unwrap_err();
