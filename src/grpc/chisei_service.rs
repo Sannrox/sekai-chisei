@@ -3741,16 +3741,11 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
-        let explicitly_granted = receipt
-            .reporter_grants
-            .iter()
-            .any(|grant| grant.principal == actor);
         if actor != receipt.initiating_actor
             // The UDS interceptor assigns `local`; local socket access is the
             // administrative inspection boundary used by sekaictl. This
             // exception is read-only and is not accepted by mutation RPCs.
             && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-            && !explicitly_granted
         {
             return Err(Status::permission_denied(
                 "operation receipt is not visible to this principal",
@@ -6180,8 +6175,17 @@ mod tests {
         get_request
             .metadata_mut()
             .insert("x-principal", "agent:reporter".parse().unwrap());
+        let reporter_read = svc.get_operation_receipt(get_request).await.unwrap_err();
+        assert_eq!(reporter_read.code(), tonic::Code::PermissionDenied);
+
+        let mut initiator_get = Request::new(GetOperationReceiptRequest {
+            operation_id: plan.plan_id.clone(),
+        });
+        initiator_get
+            .metadata_mut()
+            .insert("x-principal", "agent:authenticated".parse().unwrap());
         let retrieved = svc
-            .get_operation_receipt(get_request)
+            .get_operation_receipt(initiator_get)
             .await
             .unwrap()
             .into_inner();
