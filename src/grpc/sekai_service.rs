@@ -5102,7 +5102,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateCredentialRequest>,
     ) -> Result<Response<CreateCredentialResponse>, Status> {
         require_credential_admin(&caller_principals(&req))?;
-        let principal = validate_credential_principal(&req.into_inner().principal)?;
+        let principal = validate_new_credential_principal(&req.into_inner().principal)?;
         if !self
             .db
             .list_credentials(Some(&principal), Some("active"))
@@ -5133,7 +5133,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RotateCredentialRequest>,
     ) -> Result<Response<RotateCredentialResponse>, Status> {
         require_credential_admin(&caller_principals(&req))?;
-        let principal = validate_credential_principal(&req.into_inner().principal)?;
+        let principal = validate_new_credential_principal(&req.into_inner().principal)?;
         if self
             .db
             .list_credentials(Some(&principal), Some("active"))
@@ -5227,6 +5227,16 @@ fn validate_credential_principal(principal: &str) -> Result<String, Status> {
         ));
     }
     Ok(principal.to_string())
+}
+
+fn validate_new_credential_principal(principal: &str) -> Result<String, Status> {
+    let principal = validate_credential_principal(principal)?;
+    if matches!(principal.as_str(), "root" | "local") {
+        return Err(Status::invalid_argument(format!(
+            "principal {principal:?} is reserved for control-plane authentication"
+        )));
+    }
+    Ok(principal)
 }
 
 fn new_credential_token() -> String {
@@ -11816,6 +11826,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn credential_rpcs_reject_privileged_principal_names() {
+        for principal in ["root", "local"] {
+            let error = service()
+                .create_credential(with_named_principal(
+                    CreateCredentialRequest {
+                        principal: principal.into(),
+                    },
+                    "local",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[tokio::test]
