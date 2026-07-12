@@ -50,6 +50,8 @@ message ChatStreamChunk {
 message ResolveProviderRequest { string model = 1; }
 message ResolveProviderResponse { string provider = 1; }
 
+// Provider-call execution surface. Policy and governance belong to Chisei;
+// callers that require governed execution use ChiseiService or the gateway.
 service LlmService {
   rpc Chat(ChatRequest) returns (ChatResponse);
   rpc ChatStream(ChatRequest) returns (stream ChatStreamChunk);
