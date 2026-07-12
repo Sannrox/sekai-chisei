@@ -5345,6 +5345,12 @@ async fn record_refusal_with_usage_and_append(
             values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
             values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
         }
+        if usage.cache_read_input_tokens > 0
+            && let Some(savings) = estimate_cache_savings_usd_micros(config, context, &usage)
+        {
+            values.insert("cache_savings_usd_micros".to_string(), savings.to_string());
+            values.insert("cache_savings_usd".to_string(), format_usd_micros(savings));
+        }
     }
 
     match connect_sekai(target).await {
@@ -5534,7 +5540,7 @@ fn build_gateway_operation_receipt(
             )]),
         ),
     ];
-    let outcome_parent = if rejection.is_some() {
+    let outcome_parent = if rejection.is_some() && usage.is_none() {
         "egress"
     } else {
         events.extend([
