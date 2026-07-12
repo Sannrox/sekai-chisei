@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::db::sekai::SekaiDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VarianceCaseResult {
@@ -117,6 +119,7 @@ pub struct ContextExpansionGate {
 }
 
 pub struct EvalStore {
+    db: Option<Arc<SekaiDb>>,
     suites: Mutex<HashMap<String, Suite>>,
     runs: Mutex<HashMap<String, Run>>,
     iterations: Mutex<HashMap<String, Iteration>>,
@@ -139,10 +142,21 @@ impl Default for EvalStore {
 impl EvalStore {
     pub fn new() -> Self {
         Self {
+            db: None,
             suites: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             iterations: Mutex::new(HashMap::new()),
-            sequence: AtomicU64::new(0),
+            sequence: AtomicU64::new(sequence_seed()),
+        }
+    }
+
+    pub fn with_db(db: Arc<SekaiDb>) -> Self {
+        Self {
+            db: Some(db),
+            suites: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            iterations: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(sequence_seed()),
         }
     }
 
@@ -159,9 +173,21 @@ impl EvalStore {
         self.suites.lock().unwrap().insert(s.id.clone(), s);
     }
     pub fn get_suite(&self, id: &str) -> Option<Suite> {
+        if let Some(db) = &self.db {
+            return db.get_eval_suite_record(id).unwrap_or_else(|error| {
+                tracing::error!(%error, suite_id = id, "failed to read shared eval suite");
+                None
+            });
+        }
         self.suites.lock().unwrap().get(id).cloned()
     }
     pub fn list_suites(&self) -> Vec<Suite> {
+        if let Some(db) = &self.db {
+            return db.list_eval_suite_records().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list shared eval suites");
+                Vec::new()
+            });
+        }
         self.suites.lock().unwrap().values().cloned().collect()
     }
 
@@ -169,9 +195,21 @@ impl EvalStore {
         self.runs.lock().unwrap().insert(r.id.clone(), r);
     }
     pub fn get_run(&self, id: &str) -> Option<Run> {
+        if let Some(db) = &self.db {
+            return db.get_eval_run_record(id).unwrap_or_else(|error| {
+                tracing::error!(%error, run_id = id, "failed to read shared eval run");
+                None
+            });
+        }
         self.runs.lock().unwrap().get(id).cloned()
     }
     pub fn list_runs(&self, suite_id: &str) -> Vec<Run> {
+        if let Some(db) = &self.db {
+            return db.list_eval_run_records(suite_id).unwrap_or_else(|error| {
+                tracing::error!(%error, suite_id, "failed to list shared eval runs");
+                Vec::new()
+            });
+        }
         self.runs
             .lock()
             .unwrap()
@@ -224,26 +262,38 @@ impl EvalStore {
     }
 
     pub fn list_iterations(&self, suite_id: &str) -> Vec<Iteration> {
-        let mut iterations: Vec<_> = self
-            .iterations
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|iteration| suite_id.is_empty() || iteration.suite_id == suite_id)
-            .cloned()
-            .collect();
+        let mut iterations: Vec<_> = if let Some(db) = &self.db {
+            if suite_id.is_empty() {
+                db.list_all_eval_iteration_records()
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, "failed to list shared eval iterations");
+                        Vec::new()
+                    })
+            } else {
+                db.list_eval_iteration_records(suite_id)
+                    .unwrap_or_else(|error| {
+                        tracing::error!(%error, suite_id, "failed to list shared eval iterations");
+                        Vec::new()
+                    })
+            }
+        } else {
+            self.iterations
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|iteration| suite_id.is_empty() || iteration.suite_id == suite_id)
+                .cloned()
+                .collect()
+        };
         iterations.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
         iterations
     }
 
     pub fn list_iterations_for_file(&self, changed_file: &str) -> Vec<Iteration> {
         let mut iterations: Vec<_> = self
-            .iterations
-            .lock()
-            .unwrap()
-            .values()
+            .list_iterations("")
+            .into_iter()
             .filter(|iteration| iteration.changed_file == changed_file)
-            .cloned()
             .collect();
         iterations.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
         iterations
@@ -319,7 +369,7 @@ impl EvalStore {
         if namespace.is_empty() {
             return None;
         }
-        let iterations: Vec<_> = self.iterations.lock().unwrap().values().cloned().collect();
+        let iterations = self.list_iterations("");
         let latest = self
             .iterations_for_namespace(&iterations, namespace)
             .into_iter()
@@ -376,9 +426,8 @@ impl EvalStore {
         run: &Run,
         changed_file: &str,
     ) -> Result<String, String> {
-        let suites = self.suites.lock().unwrap();
-        let suite = suites
-            .get(suite_id)
+        let suite = self
+            .get_suite(suite_id)
             .ok_or_else(|| format!("eval suite not found: {suite_id}"))?;
         let mut namespaces: Vec<String> = run
             .results
@@ -411,11 +460,10 @@ impl EvalStore {
     }
 
     pub fn compare_runs(&self, baseline_id: &str, candidate_id: &str) -> Option<GateDecision> {
-        let runs = self.runs.lock().unwrap();
-        let baseline = runs.get(baseline_id)?;
-        let candidate = runs.get(candidate_id)?;
-        let b_score = pass_rate(baseline);
-        let c_score = pass_rate(candidate);
+        let baseline = self.get_run(baseline_id)?;
+        let candidate = self.get_run(candidate_id)?;
+        let b_score = pass_rate(&baseline);
+        let c_score = pass_rate(&candidate);
         let verdict = if c_score >= b_score { "pass" } else { "fail" };
         Some(GateDecision {
             verdict: verdict.into(),
@@ -488,6 +536,10 @@ impl EvalStore {
         let runs = self.list_runs(suite_id);
         compare_models(suite_id, &runs)
     }
+}
+
+fn sequence_seed() -> u64 {
+    (uuid::Uuid::new_v4().as_u128() >> 64) as u64
 }
 
 const DEFAULT_REGRESSION_THRESHOLD: f64 = 10.0;
@@ -658,6 +710,38 @@ pub fn check_assertions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_backed_store_observes_writes_from_another_replica() {
+        let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
+        let writer = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let reader = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let store = EvalStore::with_db(reader);
+        let suite = Suite {
+            id: "shared-suite".into(),
+            name: "shared".into(),
+            description: String::new(),
+            cases: Vec::new(),
+        };
+        writer.put_eval_suite(&suite).unwrap();
+        assert_eq!(store.get_suite("shared-suite").unwrap().name, "shared");
+
+        let run = Run {
+            id: "shared-run".into(),
+            suite_id: suite.id,
+            config_ref: "v1".into(),
+            results: Vec::new(),
+            timestamp: 1,
+        };
+        writer.put_eval_run(&run).unwrap();
+        assert_eq!(store.get_run("shared-run").unwrap().config_ref, "v1");
+        assert_eq!(store.list_runs("shared-suite").len(), 1);
+
+        drop((store, writer));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
 
     #[test]
     fn test_eval_lifecycle() {
