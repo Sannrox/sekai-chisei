@@ -2750,6 +2750,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RecordGatewayAuditRequest>,
     ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
+        let authenticated_principal = authenticated_actor(&req);
         let mut event = req
             .into_inner()
             .event
@@ -2785,6 +2786,11 @@ impl ChiseiService for ChiseiServiceImpl {
             event.target_id = "llm_calls".to_string();
         }
         if event.action == GATEWAY_RECEIPT_ACTION {
+            if authenticated_principal != "chisei-gateway" {
+                return Err(Status::permission_denied(
+                    "operation receipt writes require the gateway service principal",
+                ));
+            }
             let receipt_json = event
                 .evidence
                 .get("receipt_json")
@@ -2796,12 +2802,27 @@ impl ChiseiService for ChiseiServiceImpl {
                     "receipt initiating actor must match gateway audit actor",
                 ));
             }
+            if event.target_id != receipt.operation_id {
+                return Err(Status::invalid_argument(
+                    "gateway audit target must match receipt operation id",
+                ));
+            }
             let completeness = receipt.completeness();
             if !completeness.complete {
                 return Err(Status::invalid_argument(format!(
                     "gateway receipt is incomplete: missing={:?} errors={:?}",
                     completeness.missing_surfaces, completeness.errors
                 )));
+            }
+            if let Some(existing) = self
+                .db
+                .get_operation_receipt(&receipt.operation_id)
+                .map_err(Status::internal)?
+                && existing != receipt
+            {
+                return Err(Status::already_exists(
+                    "operation receipt already exists with different evidence",
+                ));
             }
             self.db
                 .put_operation_receipt(&receipt)
@@ -5483,7 +5504,7 @@ mod tests {
                 .values()
                 .any(|value| value.contains("private response body"))
         }));
-        svc.record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+        let mut gateway_request = Request::new(RecordGatewayAuditRequest {
             event: Some(GatewayAuditEvent {
                 id: "gateway-receipt-audit".into(),
                 timestamp: plan.created_at + 26,
@@ -5497,9 +5518,57 @@ mod tests {
                 target_id: plan.plan_id.clone(),
                 outcome: "recorded".into(),
             }),
-        }))
-        .await
-        .unwrap();
+        });
+        gateway_request
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        svc.record_gateway_audit(gateway_request).await.unwrap();
+
+        let unauthorized = svc
+            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
+                event: Some(GatewayAuditEvent {
+                    id: "forged-gateway-receipt".into(),
+                    timestamp: plan.created_at + 27,
+                    actor: "agent:authenticated".into(),
+                    action: GATEWAY_RECEIPT_ACTION.into(),
+                    reason: "forged".into(),
+                    evidence: HashMap::from([(
+                        "receipt_json".into(),
+                        serde_json::to_string(&completed).unwrap(),
+                    )]),
+                    target_id: plan.plan_id.clone(),
+                    outcome: "recorded".into(),
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unauthorized.code(), tonic::Code::PermissionDenied);
+
+        let mut conflicting = completed.clone();
+        conflicting.namespace = "forged-namespace".into();
+        let mut conflicting_request = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "conflicting-gateway-receipt".into(),
+                timestamp: plan.created_at + 28,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "conflicting replay".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&conflicting).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        conflicting_request
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        let conflict = svc
+            .record_gateway_audit(conflicting_request)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
     }
 
     #[tokio::test]
