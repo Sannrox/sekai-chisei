@@ -4623,7 +4623,7 @@ async fn record_gateway_event(
                 actor: actor.to_string(),
                 action: action.to_string(),
                 reason: reason.to_string(),
-                evidence,
+                evidence: sanitize_audit_evidence(evidence),
                 target_id: "llm_calls".to_string(),
                 outcome: outcome.to_string(),
             }),
@@ -4632,6 +4632,29 @@ async fn record_gateway_event(
     {
         error!(error = %err, "chisei-gateway audit decision record failed");
     }
+}
+
+/// Audit evidence is a metadata-only boundary. Credentials are intentionally
+/// represented by non-secret identities such as `key_id`; any accidentally
+/// named credential field is dropped before crossing the persistence boundary.
+fn sanitize_audit_evidence(evidence: HashMap<String, String>) -> HashMap<String, String> {
+    evidence
+        .into_iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase().replace('-', "_");
+            !["authorization", "api_key", "credential", "cookie", "secret"]
+                .iter()
+                .any(|sensitive| key == *sensitive || key.ends_with(&format!("_{sensitive}")))
+                && ![
+                    "token",
+                    "oauth_token",
+                    "access_token",
+                    "auth_token",
+                    "bearer_token",
+                ]
+                .contains(&key.as_str())
+        })
+        .collect()
 }
 
 fn gateway_request<T>(message: T) -> GrpcRequest<T> {
@@ -5433,6 +5456,23 @@ mod tests {
         assert!(validate_gateway_security(bind, &keys, false, false, None).is_err());
         assert!(validate_gateway_security(bind, &keys, true, true, None).is_err());
         assert!(validate_gateway_security(bind, &keys, true, false, None).is_ok());
+    }
+
+    #[test]
+    fn audit_evidence_drops_credential_fields() {
+        let sanitized = sanitize_audit_evidence(HashMap::from([
+            ("authorization".to_string(), "Bearer private".to_string()),
+            ("upstream-api-key".to_string(), "private".to_string()),
+            ("oauth_token".to_string(), "private".to_string()),
+            ("session_cookie".to_string(), "private".to_string()),
+            ("key_id".to_string(), "gateway-key-1".to_string()),
+            ("request_id".to_string(), "request-1".to_string()),
+            ("input_tokens".to_string(), "42".to_string()),
+        ]));
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized["key_id"], "gateway-key-1");
+        assert_eq!(sanitized["request_id"], "request-1");
+        assert_eq!(sanitized["input_tokens"], "42");
     }
 
     fn routing_config() -> GatewayConfig {
