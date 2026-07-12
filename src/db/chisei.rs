@@ -3,7 +3,10 @@ use std::collections::{BTreeSet, HashMap};
 use rusqlite::{OptionalExtension, params};
 
 use super::sekai::SekaiDb;
-use crate::chisei::{eval, evolve, receipt::OperationReceipt};
+use crate::chisei::{
+    eval, evolve,
+    receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind, ReceiptSurface},
+};
 
 impl SekaiDb {
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
@@ -247,6 +250,68 @@ impl SekaiDb {
         receipt_json
             .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
             .transpose()
+    }
+
+    pub fn append_operation_receipt_event(
+        &self,
+        operation_id: &str,
+        event: OperationReceiptEvent,
+    ) -> Result<(OperationReceipt, bool), String> {
+        if event.operation_id != operation_id {
+            return Err("event operation id does not match receipt".into());
+        }
+        let conn = self.conn();
+        let receipt_json = conn
+            .query_row(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
+                params![operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
+        let mut receipt: OperationReceipt =
+            serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+        if let Some(existing) = receipt
+            .events
+            .iter()
+            .find(|existing| existing.event_id == event.event_id)
+        {
+            let mut replay = event.clone();
+            replay.timestamp_ms = existing.timestamp_ms;
+            if existing == &replay {
+                return Ok((receipt, false));
+            }
+            return Err(format!(
+                "event {} already exists with different evidence",
+                event.event_id
+            ));
+        }
+        let parent_id = event
+            .parent_event_id
+            .as_deref()
+            .ok_or_else(|| "reported event requires a causal parent".to_string())?;
+        if !receipt
+            .events
+            .iter()
+            .any(|existing| existing.event_id == parent_id)
+        {
+            return Err(format!("causal parent {parent_id} not found"));
+        }
+        if event.kind == ReceiptEventKind::OutcomeRecorded {
+            receipt.completed_at_ms = Some(event.timestamp_ms);
+            receipt
+                .uncovered_surfaces
+                .retain(|entry| entry.surface != ReceiptSurface::Outcome);
+        }
+        receipt.events.push(event);
+        let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        conn.execute(
+            "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
+            params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((receipt, true))
     }
 
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
