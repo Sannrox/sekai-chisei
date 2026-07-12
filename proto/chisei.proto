@@ -554,7 +554,10 @@ message AuthorizeOperationReporterRequest {
   repeated string event_kinds = 3;
 }
 
-message AuthorizeOperationReporterResponse { bool authorized = 1; }
+message AuthorizeOperationReporterResponse {
+  bool authorized = 1;
+  bool changed = 2;
+}
 
 message GetAffinityRequest {
   reserved 1;
