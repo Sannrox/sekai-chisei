@@ -16,16 +16,11 @@ pub struct SekaiDb {
 }
 
 #[derive(Debug)]
-struct SqliteConnectionSetup {
-    persistent: bool,
-}
+struct SqliteConnectionSetup;
 
 impl CustomizeConnection<Connection, rusqlite::Error> for SqliteConnectionSetup {
     fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
         conn.busy_timeout(Duration::from_secs(5))?;
-        if self.persistent {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-        }
         register_sql_helpers(conn)
     }
 }
@@ -67,6 +62,10 @@ impl SekaiDb {
                     .unwrap_or(std::path::Path::new(".")),
             )
             .ok();
+            let conn = Connection::open(path).map_err(|e| e.to_string())?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| e.to_string())?;
+            drop(conn);
             SqliteConnectionManager::file(path)
         } else {
             SqliteConnectionManager::memory()
@@ -77,7 +76,7 @@ impl SekaiDb {
         let max_size = if persistent { 16 } else { 1 };
         let pool = Pool::builder()
             .max_size(max_size)
-            .connection_customizer(Box::new(SqliteConnectionSetup { persistent }))
+            .connection_customizer(Box::new(SqliteConnectionSetup))
             .build(manager)
             .map_err(|e| e.to_string())?;
         let db = Self { pool };
@@ -86,9 +85,14 @@ impl SekaiDb {
     }
 
     pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
-        self.pool
-            .get()
-            .expect("SQLite connection pool unexpectedly unavailable")
+        loop {
+            match self.pool.get() {
+                Ok(conn) => return conn,
+                Err(error) => {
+                    tracing::error!(%error, "database connection pool unavailable; retrying");
+                }
+            }
+        }
     }
 
     pub fn db_lock_poisoned_total(&self) -> u64 {
