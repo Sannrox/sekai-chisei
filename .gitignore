@@ -11,6 +11,8 @@ data/*.sqlite-*
 .DS_Store
 *.log
 *.gateway-token
+data/chisei-gateway-budget-reconciliation.json
+data/chisei-gateway-budget-reconciliation.tmp
 __pycache__/
 *.pyc
 data/logs/
