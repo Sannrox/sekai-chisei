@@ -522,6 +522,32 @@ message ExecutePlanStreamEvent {
   int64 executed_at = 4;
 }
 
+message OperationEvidenceReference {
+  string kind = 1;
+  string reference = 2;
+  string content_hash = 3;
+  repeated string disclosed_fields = 4;
+  bool omitted = 5;
+  string omission_reason = 6;
+}
+
+message ReportOperationEventRequest {
+  string operation_id = 1;
+  string event_id = 2;
+  string parent_event_id = 3;
+  int64 timestamp_ms = 4;
+  string kind = 5;
+  map<string, string> attributes = 6;
+  repeated OperationEvidenceReference references = 7;
+}
+
+message ReportOperationEventResponse {
+  string event_id = 1;
+  bool recorded = 2;
+  bool complete = 3;
+  repeated string missing_surfaces = 4;
+}
+
 message GetAffinityRequest {
   reserved 1;
   reserved "agent_id";
@@ -608,6 +634,7 @@ service ChiseiService {
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlan(ExecutePlanRequest) returns (ExecutePlanResponse);
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
+  rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);
