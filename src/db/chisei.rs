@@ -302,6 +302,9 @@ impl SekaiDb {
             .uncovered_surfaces
             .retain(|entry| entry.surface != event.surface);
         if event.kind == ReceiptEventKind::OutcomeRecorded {
+            if receipt.completed_at_ms.is_some() {
+                return Err("operation receipt already has a terminal outcome".into());
+            }
             receipt.completed_at_ms = Some(event.timestamp_ms);
         }
         receipt.events.push(event);
