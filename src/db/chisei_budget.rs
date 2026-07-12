@@ -124,9 +124,9 @@ impl SekaiDb {
     /// Checks every bounded level of `scope_id`'s ancestor chain for headroom
     /// and, if all pass, atomically deducts `amount` at every level (bounded
     /// or not, so a limit added later at an ancestor sees accurate history).
-    /// Levels without a limit row are unlimited. Held under this `SekaiDb`'s
-    /// single connection lock for the whole check-then-write sequence, so
-    /// concurrent reservations against a shared ancestor never over-admit.
+    /// Levels without a limit row are unlimited. An immediate transaction
+    /// serializes the whole check-then-write sequence, so concurrent
+    /// reservations against a shared ancestor never over-admit.
     pub(crate) fn budget_check_and_reserve_chain(
         &self,
         scope_id: &str,
@@ -135,9 +135,12 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         for scope in &chain {
-            let limit: Option<(i64, String)> = conn
+            let limit: Option<(i64, String)> = transaction
                 .query_row(
                     "SELECT max_amount, period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                     params![scope, metric],
@@ -149,7 +152,7 @@ impl SekaiDb {
                 continue;
             };
             let period_start = period_start_ms(&period_type, now_ms);
-            let used: i64 = conn
+            let used: i64 = transaction
                 .query_row(
                     "SELECT amount_used FROM chisei_budget_usage WHERE scope_id=?1 AND metric=?2 AND period_start=?3",
                     params![scope, metric, period_start],
@@ -165,7 +168,7 @@ impl SekaiDb {
             }
         }
         for scope in &chain {
-            let period_type = conn
+            let period_type = transaction
                 .query_row(
                     "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                     params![scope, metric],
@@ -175,16 +178,17 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
                 .unwrap_or_else(|| "daily".to_string());
             let period_start = period_start_ms(&period_type, now_ms);
-            conn.execute(
-                "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
+            transaction
+                .execute(
+                    "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
                     amount_used = amount_used + excluded.amount_used",
-                params![scope, metric, period_start, amount],
-            )
-            .map_err(|e| e.to_string())?;
+                    params![scope, metric, period_start, amount],
+                )
+                .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     /// Read-only variant of [`Self::budget_check_and_reserve_chain`] — checks
@@ -367,6 +371,7 @@ impl SekaiDb {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn scope_chain_includes_flat_agent_scope() {
@@ -395,5 +400,37 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn concurrent_reservations_do_not_exceed_shared_limit() {
+        let path = std::env::temp_dir().join(format!("sekai-budget-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        db.budget_set_limit("global", METRIC_TOKENS, 10, "daily")
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.budget_check_and_reserve_chain("global", METRIC_TOKENS, 6, 0)
+                })
+            })
+            .collect::<Vec<_>>();
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+
+        assert_eq!(successes, 1);
+        assert_eq!(db.budget_usage("global", METRIC_TOKENS, 0).unwrap().0, 6);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
     }
 }
