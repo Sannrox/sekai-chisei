@@ -5284,7 +5284,8 @@ fn build_gateway_operation_receipt(
         .policy_version
         .clone()
         .unwrap_or_else(|| "unavailable/v1".into());
-    let policy_status = if rejection.is_some() {
+    let rejection_type = rejection.map(|rejection| rejection.error_type.as_str());
+    let policy_status = if rejection_type == Some("policy_denied") {
         "denied"
     } else if context.policy_version.is_some() {
         "resolved"
@@ -5372,7 +5373,14 @@ fn build_gateway_operation_receipt(
             ReceiptEventKind::BudgetDecided,
             "chisei.budget",
             BTreeMap::from([
-                ("status".into(), context.budget_status.clone()),
+                (
+                    "status".into(),
+                    if rejection_type.is_some_and(|kind| kind.starts_with("budget_")) {
+                        "denied".into()
+                    } else {
+                        context.budget_status.clone()
+                    },
+                ),
                 (
                     "subject".into(),
                     context.budget_subject.clone().unwrap_or_default(),
@@ -5388,7 +5396,9 @@ fn build_gateway_operation_receipt(
             "chisei.egress",
             BTreeMap::from([(
                 "status".into(),
-                if context.egress_applied {
+                if rejection_type.is_some_and(|kind| kind.contains("egress")) {
+                    "denied"
+                } else if context.egress_applied {
                     "evaluated"
                 } else {
                     "not_evaluated"
@@ -6965,6 +6975,32 @@ mod tests {
         assert!(receipt.completeness().complete);
         assert!(receipt.events.iter().any(|event| {
             event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+        }));
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::PolicyDecided
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+        }));
+
+        let budget_rejection = GatewayRejection::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "budget_exceeded",
+            "budget denied",
+        );
+        let budget_receipt = build_gateway_operation_receipt(
+            &identity,
+            &context,
+            budget_rejection.status,
+            None,
+            None,
+            Some(&budget_rejection),
+        );
+        assert!(budget_receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::PolicyDecided
+                && event.attributes.get("status").map(String::as_str) == Some("not_evaluated")
+        }));
+        assert!(budget_receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::BudgetDecided
                 && event.attributes.get("status").map(String::as_str) == Some("denied")
         }));
     }
