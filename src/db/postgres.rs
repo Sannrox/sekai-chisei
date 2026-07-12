@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use native_tls::TlsConnector;
-use postgres::Config as PostgresConfig;
+use postgres::{Config as PostgresConfig, config::SslMode};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
@@ -38,7 +38,7 @@ impl PostgresDb {
         if max_connections == 0 {
             return Err("PostgreSQL pool size must be greater than zero".into());
         }
-        let config = PostgresConfig::from_str(database_url).map_err(|error| error.to_string())?;
+        let config = secure_config(database_url)?;
         let tls = TlsConnector::builder()
             .build()
             .map(MakeTlsConnector::new)
@@ -95,6 +95,12 @@ impl PostgresDb {
     }
 }
 
+fn secure_config(database_url: &str) -> Result<PostgresConfig, String> {
+    let mut config = PostgresConfig::from_str(database_url).map_err(|error| error.to_string())?;
+    config.ssl_mode(SslMode::Require);
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +123,11 @@ mod tests {
     fn migration_lock_id_is_stable_and_nonzero() {
         assert_ne!(MIGRATION_LOCK_ID, 0);
         assert_eq!(MIGRATION_LOCK_ID, 0x5345_4b41_4948_4101);
+    }
+
+    #[test]
+    fn tls_is_required_even_when_url_requests_plaintext() {
+        let config = secure_config("postgresql://localhost/sekai?sslmode=disable").unwrap();
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
     }
 }
