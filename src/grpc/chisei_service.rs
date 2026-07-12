@@ -205,16 +205,7 @@ impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
-        let eval = Arc::new(EvalStore::new());
-        for suite in db.list_eval_suite_records().unwrap_or_default() {
-            eval.create_suite(suite);
-        }
-        for run in db.list_all_eval_run_records().unwrap_or_default() {
-            eval.create_run(run);
-        }
-        for iteration in db.list_all_eval_iteration_records().unwrap_or_default() {
-            eval.create_iteration(iteration);
-        }
+        let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
             db.list_evolve_task_records()
                 .unwrap_or_default()
@@ -346,16 +337,7 @@ impl ChiseiServiceImpl {
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
-        let eval = Arc::new(EvalStore::new());
-        for suite in db.list_eval_suite_records().unwrap_or_default() {
-            eval.create_suite(suite);
-        }
-        for run in db.list_all_eval_run_records().unwrap_or_default() {
-            eval.create_run(run);
-        }
-        for iteration in db.list_all_eval_iteration_records().unwrap_or_default() {
-            eval.create_iteration(iteration);
-        }
+        let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
             db.list_evolve_task_records()
                 .unwrap_or_default()
