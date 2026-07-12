@@ -28,7 +28,11 @@ use crate::chisei::receipt::{
 };
 use crate::db::chisei_budget::METRIC_REQUESTS;
 use crate::gateway_keys::hash_gateway_key;
-use crate::grpc::client::{GatewayClient, connect_sekai, connect_sekai_as_gateway};
+#[cfg(test)]
+use crate::grpc::client::connect_sekai;
+use crate::grpc::client::{
+    GatewayClient, connect_sekai_as_gateway_with_timeout, connect_sekai_with_timeout,
+};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, GatewayAuditEvent,
@@ -64,12 +68,19 @@ const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-actio
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
+const READINESS_PROBE_CACHE_SECS: u64 = 5;
 const MAX_BUDGET_CACHE_ENTRIES: usize = 4096;
 const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
 const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
 const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
+const DEFAULT_CONTROL_PLANE_RETRIES: u32 = 2;
+const DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS: u64 = 25;
+const DEFAULT_CONTROL_PLANE_TIMEOUT_MS: u64 = 3_000;
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 5;
+const DEFAULT_UPSTREAM_CONNECT_RETRIES: u32 = 1;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 
@@ -367,6 +378,62 @@ struct GatewayRuntime {
     governance_cache_ttl: Duration,
     budget_reconciliation_path: Option<PathBuf>,
     budget_reconciliation_lock: Arc<Mutex<()>>,
+    control_plane_circuit: Arc<RwLock<CircuitBreakerState>>,
+    readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
+    upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
+    resilience: ResilienceConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ResilienceConfig {
+    control_plane_retries: u32,
+    control_plane_retry_backoff: Duration,
+    control_plane_timeout: Duration,
+    circuit_failure_threshold: u32,
+    circuit_cooldown: Duration,
+    upstream_connect_retries: u32,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            control_plane_retries: DEFAULT_CONTROL_PLANE_RETRIES,
+            control_plane_retry_backoff: Duration::from_millis(
+                DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS,
+            ),
+            control_plane_timeout: Duration::from_millis(DEFAULT_CONTROL_PLANE_TIMEOUT_MS),
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown: Duration::from_secs(DEFAULT_CIRCUIT_COOLDOWN_SECS),
+            upstream_connect_retries: DEFAULT_UPSTREAM_CONNECT_RETRIES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CircuitBreakerState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    last_failure: Option<String>,
+}
+
+impl CircuitBreakerState {
+    fn is_open(&self) -> bool {
+        self.open_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+        self.last_failure = None;
+    }
+
+    fn record_failure(&mut self, error: String, config: &ResilienceConfig) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_failure = Some(error);
+        if self.consecutive_failures >= config.circuit_failure_threshold {
+            self.open_until = Some(Instant::now() + config.circuit_cooldown);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -498,6 +565,30 @@ impl GatewayRuntime {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS));
+        let resilience = ResilienceConfig {
+            control_plane_retries: env_u32(
+                "CHISEI_GATEWAY_CONTROL_PLANE_RETRIES",
+                DEFAULT_CONTROL_PLANE_RETRIES,
+            ),
+            control_plane_retry_backoff: Duration::from_millis(env_u64(
+                "CHISEI_GATEWAY_CONTROL_PLANE_RETRY_BACKOFF_MS",
+                DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS,
+            )),
+            control_plane_timeout: configured_control_plane_timeout(),
+            circuit_failure_threshold: env_u32(
+                "CHISEI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD",
+                DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            )
+            .max(1),
+            circuit_cooldown: Duration::from_secs(env_u64(
+                "CHISEI_GATEWAY_CIRCUIT_COOLDOWN_SECS",
+                DEFAULT_CIRCUIT_COOLDOWN_SECS,
+            )),
+            upstream_connect_retries: env_u32(
+                "CHISEI_GATEWAY_UPSTREAM_CONNECT_RETRIES",
+                DEFAULT_UPSTREAM_CONNECT_RETRIES,
+            ),
+        };
         let mut runtime = Self::new(
             key_cache_ttl,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
@@ -509,6 +600,7 @@ impl GatewayRuntime {
             std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
                 .unwrap_or_else(|_| "data/chisei-gateway-budget-reconciliation.json".to_string()),
         )))
+        .with_resilience(resilience)
         .with_http_timeouts(HttpTimeouts::from_env());
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
@@ -540,6 +632,10 @@ impl GatewayRuntime {
             governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
             budget_reconciliation_path: None,
             budget_reconciliation_lock: Arc::new(Mutex::new(())),
+            control_plane_circuit: Arc::new(RwLock::new(CircuitBreakerState::default())),
+            readiness_probe: Arc::new(Mutex::new(None)),
+            upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
+            resilience: ResilienceConfig::default(),
         }
     }
 
@@ -598,6 +694,79 @@ impl GatewayRuntime {
         }
         self
     }
+    fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = resilience;
+        self
+    }
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn configured_control_plane_timeout() -> Duration {
+    Duration::from_millis(
+        env_u64(
+            "CHISEI_GATEWAY_CONTROL_PLANE_TIMEOUT_MS",
+            DEFAULT_CONTROL_PLANE_TIMEOUT_MS,
+        )
+        .max(1),
+    )
+}
+
+async fn connect_governance(
+    runtime: &GatewayRuntime,
+    target: &str,
+) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
+    if runtime.control_plane_circuit.read().await.is_open() {
+        return Err(std::io::Error::other("control-plane circuit is open").into());
+    }
+
+    let mut last_error = None;
+    for attempt in 0..=runtime.resilience.control_plane_retries {
+        match connect_sekai_with_timeout(target, Some(runtime.resilience.control_plane_timeout))
+            .await
+        {
+            Ok(channel) => return Ok(channel),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < runtime.resilience.control_plane_retries {
+                    let multiplier = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
+                    tokio::time::sleep(runtime.resilience.control_plane_retry_backoff * multiplier)
+                        .await;
+                }
+            }
+        }
+    }
+    let error = last_error.unwrap_or_else(|| std::io::Error::other("connection failed").into());
+    runtime
+        .control_plane_circuit
+        .write()
+        .await
+        .record_failure(error.to_string(), &runtime.resilience);
+    Err(error)
+}
+
+async fn record_control_plane_success(runtime: &GatewayRuntime) {
+    runtime.control_plane_circuit.write().await.record_success();
+}
+
+async fn record_control_plane_failure(runtime: &GatewayRuntime, error: &impl ToString) {
+    runtime
+        .control_plane_circuit
+        .write()
+        .await
+        .record_failure(error.to_string(), &runtime.resilience);
 }
 
 fn initialize_budget_reconciliation_journal(
@@ -669,9 +838,84 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
     };
 
     Router::new()
+        .route("/healthz", axum::routing::get(gateway_health))
+        .route("/readyz", axum::routing::get(gateway_readiness))
         .route("/_chisei/admin/refresh", post(refresh_gateway_admin))
         .route("/{*path}", any(proxy_gateway))
         .with_state(state)
+}
+
+async fn gateway_health() -> Response<Body> {
+    json_response(StatusCode::OK, serde_json::json!({"status": "healthy"}))
+}
+
+async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> {
+    if state.config.no_preflight {
+        return json_response(
+            StatusCode::OK,
+            serde_json::json!({"status": "ready", "governance": "disabled"}),
+        );
+    }
+    let Some(target) = state.config.chisei_grpc_target.as_deref() else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "not_ready",
+                "reason": "control_plane_unconfigured"
+            }),
+        );
+    };
+    let circuit = state.runtime.control_plane_circuit.read().await;
+    if circuit.is_open() {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "not_ready",
+                "governance": "circuit_open",
+                "reason": "control-plane circuit is open"
+            }),
+        );
+    }
+    drop(circuit);
+
+    // This endpoint is intentionally unauthenticated for orchestrator probes.
+    // Serialize and cache the bounded dependency check so callers cannot turn
+    // it into an unbounded authenticated control-plane RPC source.
+    let mut cached_probe = state.runtime.readiness_probe.lock().await;
+    let ready = if let Some((checked_at, ready)) = *cached_probe
+        && checked_at.elapsed() < Duration::from_secs(READINESS_PROBE_CACHE_SECS)
+    {
+        ready
+    } else {
+        let ready = match connect_sekai_with_timeout(
+            target,
+            Some(state.runtime.resilience.control_plane_timeout),
+        )
+        .await
+        {
+            Ok(channel) => {
+                let mut client = SekaiServiceClient::new(channel);
+                client
+                    .list_schema_types(gateway_request(ListSchemaTypesRequest {}))
+                    .await
+                    .is_ok()
+            }
+            Err(_) => false,
+        };
+        *cached_probe = Some((Instant::now(), ready));
+        ready
+    };
+    if ready {
+        json_response(
+            StatusCode::OK,
+            serde_json::json!({"status": "ready", "governance": "available"}),
+        )
+    } else {
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"status": "not_ready", "governance": "unavailable"}),
+        )
+    }
 }
 
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1126,7 +1370,7 @@ async fn proxy_gateway(
             .into(),
         egress_applied: !state.config.no_preflight,
     };
-    match upstream.send().await {
+    match send_upstream_with_resilience(&state.runtime, prepared.provider, upstream).await {
         Ok(resp) => {
             response_from_upstream(
                 resp,
@@ -1138,7 +1382,27 @@ async fn proxy_gateway(
             )
             .await
         }
-        Err(err) => {
+        Err(UpstreamSendError::CircuitOpen) => {
+            let rejection = GatewayRejection {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error_type: "upstream_unavailable".into(),
+                reason: format!(
+                    "{} upstream circuit is open",
+                    prepared.provider.runtime_name()
+                ),
+            };
+            record_refusal_with_usage_and_append(
+                &state.config,
+                &identity,
+                &usage_context,
+                &rejection,
+                None,
+                true,
+            )
+            .await;
+            json_error(rejection.status, &rejection.error_type, &rejection.reason)
+        }
+        Err(UpstreamSendError::Request(err)) => {
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
@@ -1276,6 +1540,29 @@ impl GatewayRejection {
     }
 }
 
+fn is_transient_governance_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::Internal
+    )
+}
+
+fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
+    let (http_status, error_type) = match status.code() {
+        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+            (StatusCode::FORBIDDEN, "governance_denied")
+        }
+        tonic::Code::NotFound => (StatusCode::NOT_FOUND, "governance_not_found"),
+        tonic::Code::FailedPrecondition => (StatusCode::CONFLICT, "governance_precondition"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "governance_unavailable"),
+    };
+    GatewayRejection::json(http_status, error_type, status.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn check_budget_preflight(
     config: &GatewayConfig,
@@ -1320,10 +1607,24 @@ async fn check_budget_preflight(
 
     let check_budget = |req: CheckBudgetRequest| async move {
         let cache_key = budget_cache_key(&req);
-        match connect_sekai(target).await {
+        match connect_governance(runtime, target).await {
             Ok(channel) => {
                 let mut client = ChiseiServiceClient::new(channel);
                 if let Err(err) = reconcile_cached_budget_usage(runtime, &mut client).await {
+                    if !is_transient_governance_status(&err) {
+                        record_control_plane_success(runtime).await;
+                        runtime
+                            .governance_cache
+                            .write()
+                            .await
+                            .budget_reconciliation_saturated = true;
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "budget_reconciliation_required",
+                            format!("budget usage reconciliation failed permanently: {err}"),
+                        ));
+                    }
+                    record_control_plane_failure(runtime, &err).await;
                     if let Some(response) = reserve_cached_budget(runtime, &cache_key, &req).await {
                         record_gateway_decision(
                             config,
@@ -1348,6 +1649,7 @@ async fn check_budget_preflight(
                 let budget_subject = audit_budget_subject(&req);
                 match client.check_budget(GrpcRequest::new(req.clone())).await {
                     Ok(resp) => {
+                        record_control_plane_success(runtime).await;
                         let resp = resp.into_inner();
                         cache_budget_decision(runtime, cache_key, &resp, req.estimated_tokens)
                             .await;
@@ -1418,6 +1720,11 @@ async fn check_budget_preflight(
                         }
                     }
                     Err(err) => {
+                        if !is_transient_governance_status(&err) {
+                            record_control_plane_success(runtime).await;
+                            return Err(governance_status_rejection(&err));
+                        }
+                        record_control_plane_failure(runtime, &err).await;
                         if let Some(response) =
                             reserve_cached_budget(runtime, &cache_key, &req).await
                         {
@@ -1799,6 +2106,10 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
     );
 }
 
+async fn invalidate_cached_policy(runtime: &GatewayRuntime, key: &str) {
+    runtime.governance_cache.write().await.policies.remove(key);
+}
+
 async fn cached_policy_decision(
     runtime: &GatewayRuntime,
     key: &str,
@@ -1904,6 +2215,10 @@ async fn cached_egress_decision(
     Some(ContextEgressPreflight {
         body: cached.body.clone(),
     })
+}
+
+async fn invalidate_cached_egress(runtime: &GatewayRuntime, key: &str) {
+    runtime.governance_cache.write().await.egress.remove(key);
 }
 
 const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
@@ -2051,7 +2366,7 @@ async fn resolve_policy_preflight(
             policy_version: None,
         });
     };
-    match connect_sekai(target).await {
+    match connect_governance(runtime, target).await {
         Ok(channel) => {
             let mut client = ChiseiServiceClient::new(channel);
             let req = GrpcRequest::new(ResolvePolicyRequest {
@@ -2069,6 +2384,7 @@ async fn resolve_policy_preflight(
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
+                    record_control_plane_success(runtime).await;
                     let resolution = resp.into_inner().resolution.ok_or_else(|| {
                         GatewayRejection::json(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -2190,6 +2506,8 @@ async fn resolve_policy_preflight(
                     Ok(decision)
                 }
                 Err(err) if err.code() == tonic::Code::InvalidArgument => {
+                    invalidate_cached_policy(runtime, &cache_key).await;
+                    record_control_plane_success(runtime).await;
                     policy_denied(
                         config,
                         identity,
@@ -2202,6 +2520,8 @@ async fn resolve_policy_preflight(
                     .await
                 }
                 Err(err) if err.code() == tonic::Code::ResourceExhausted => {
+                    invalidate_cached_policy(runtime, &cache_key).await;
+                    record_control_plane_success(runtime).await;
                     let reason = format!(
                         "budget exceeded for {}: {}",
                         budget.budget_subject.as_deref().unwrap_or("unknown scope"),
@@ -2233,6 +2553,12 @@ async fn resolve_policy_preflight(
                     ))
                 }
                 Err(err) => {
+                    if !is_transient_governance_status(&err) {
+                        invalidate_cached_policy(runtime, &cache_key).await;
+                        record_control_plane_success(runtime).await;
+                        return Err(governance_status_rejection(&err));
+                    }
+                    record_control_plane_failure(runtime, &err).await;
                     if let Some(decision) =
                         cached_policy_decision(runtime, &cache_key, body, requested_model).await
                     {
@@ -3301,7 +3627,7 @@ async fn apply_context_egress(
             body: body.to_vec(),
         });
     }
-    let channel = match connect_sekai(target).await {
+    let channel = match connect_governance(runtime, target).await {
         Ok(channel) => channel,
         Err(error) => {
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
@@ -3346,6 +3672,12 @@ async fn apply_context_egress(
     {
         Ok(response) => restricted_gateway_fields(response.into_inner().types),
         Err(status) => {
+            if !is_transient_governance_status(&status) {
+                invalidate_cached_egress(runtime, &cache_key).await;
+                record_control_plane_success(runtime).await;
+                return Err(governance_status_rejection(&status));
+            }
+            record_control_plane_failure(runtime, &status).await;
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
                 record_gateway_decision(
                     config,
@@ -3379,8 +3711,13 @@ async fn apply_context_egress(
     )
     .await
     {
-        Ok(resolution) => resolution,
+        Ok(resolution) => {
+            record_control_plane_success(runtime).await;
+            resolution
+        }
         Err(status) if status.code() == tonic::Code::InvalidArgument => {
+            invalidate_cached_egress(runtime, &cache_key).await;
+            record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -3390,6 +3727,8 @@ async fn apply_context_egress(
         Err(status)
             if context_request.is_some() && status.code() == tonic::Code::PermissionDenied =>
         {
+            invalidate_cached_egress(runtime, &cache_key).await;
+            record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::FORBIDDEN,
                 "context_denied",
@@ -3397,6 +3736,8 @@ async fn apply_context_egress(
             ));
         }
         Err(status) if context_request.is_some() && status.code() == tonic::Code::NotFound => {
+            invalidate_cached_egress(runtime, &cache_key).await;
+            record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::NOT_FOUND,
                 "context_not_found",
@@ -3404,6 +3745,12 @@ async fn apply_context_egress(
             ));
         }
         Err(status) => {
+            if !is_transient_governance_status(&status) {
+                invalidate_cached_egress(runtime, &cache_key).await;
+                record_control_plane_success(runtime).await;
+                return Err(governance_status_rejection(&status));
+            }
+            record_control_plane_failure(runtime, &status).await;
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
                 record_gateway_decision(
                     config,
@@ -4332,7 +4679,7 @@ async fn resolve_identity_from_key_store(
     if let Some(entry) = cached_gateway_key_identity(state, &key_hash).await {
         return entry.identity.ok_or(IdentityError::UnknownKey).map(Some);
     }
-    let channel = connect_sekai(target)
+    let channel = connect_governance(&state.runtime, target)
         .await
         .map_err(|_| IdentityError::KeyStoreUnavailable)?;
     let mut sekai = SekaiServiceClient::new(channel);
@@ -4344,8 +4691,18 @@ async fn resolve_identity_from_key_store(
         }))
         .await
     {
-        Ok(resp) => resp.into_inner(),
-        Err(_) => return Err(IdentityError::KeyStoreUnavailable),
+        Ok(resp) => {
+            record_control_plane_success(&state.runtime).await;
+            resp.into_inner()
+        }
+        Err(error) => {
+            if is_transient_governance_status(&error) {
+                record_control_plane_failure(&state.runtime, &error).await;
+            } else {
+                record_control_plane_success(&state.runtime).await;
+            }
+            return Err(IdentityError::KeyStoreUnavailable);
+        }
     };
     let object = resp.objects.into_iter().find(|object| {
         object
@@ -4779,6 +5136,67 @@ enum ProviderKind {
     Anthropic,
 }
 
+#[derive(Debug)]
+enum UpstreamSendError {
+    CircuitOpen,
+    Request(reqwest::Error),
+}
+
+async fn send_upstream_with_resilience(
+    runtime: &GatewayRuntime,
+    provider: ProviderKind,
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, UpstreamSendError> {
+    let circuit_key = format!("{provider:?}");
+    if runtime
+        .upstream_circuits
+        .read()
+        .await
+        .get(&circuit_key)
+        .is_some_and(CircuitBreakerState::is_open)
+    {
+        return Err(UpstreamSendError::CircuitOpen);
+    }
+
+    let mut request = request;
+    for attempt in 0..=runtime.resilience.upstream_connect_retries {
+        let retry = request.try_clone();
+        match request.send().await {
+            Ok(response) => {
+                runtime
+                    .upstream_circuits
+                    .write()
+                    .await
+                    .entry(circuit_key)
+                    .or_default()
+                    .record_success();
+                return Ok(response);
+            }
+            Err(error)
+                if error.is_connect()
+                    && attempt < runtime.resilience.upstream_connect_retries
+                    && retry.is_some() =>
+            {
+                request = retry.expect("retry availability was checked");
+                let multiplier = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
+                tokio::time::sleep(runtime.resilience.control_plane_retry_backoff * multiplier)
+                    .await;
+            }
+            Err(error) => {
+                runtime
+                    .upstream_circuits
+                    .write()
+                    .await
+                    .entry(circuit_key)
+                    .or_default()
+                    .record_failure(error.to_string(), &runtime.resilience);
+                return Err(UpstreamSendError::Request(error));
+            }
+        }
+    }
+    unreachable!("upstream retry loop always returns")
+}
+
 impl ProviderKind {
     fn from_runtime(runtime: &str) -> Option<Self> {
         match runtime {
@@ -5012,7 +5430,7 @@ async fn record_usage_and_append(
         metric: String::new(),
         idempotency_key: format!("gateway-usage:{}:tokens", context.request_id),
     });
-    match connect_sekai(target).await {
+    match connect_sekai_with_timeout(target, Some(runtime.resilience.control_plane_timeout)).await {
         Ok(channel) => {
             let mut chisei = ChiseiServiceClient::new(channel.clone());
             if let Err(err) = chisei
@@ -5373,7 +5791,7 @@ async fn record_refusal_with_usage_and_append(
         }
     }
 
-    match connect_sekai(target).await {
+    match connect_sekai_with_timeout(target, Some(configured_control_plane_timeout())).await {
         Ok(channel) => {
             let mut sekai = SekaiServiceClient::new(channel);
             let append = AppendRowsRequest {
@@ -6124,7 +6542,8 @@ async fn record_gateway_event(
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
-    let Ok(channel) = connect_sekai_as_gateway(target).await else {
+    let timeout = configured_control_plane_timeout();
+    let Ok(channel) = connect_sekai_as_gateway_with_timeout(target, Some(timeout)).await else {
         return;
     };
     let mut sekai = SekaiServiceClient::new(channel.clone());
@@ -7705,6 +8124,201 @@ mod tests {
                 None,
             )
         );
+    }
+
+    #[test]
+    fn circuit_breaker_opens_at_threshold_and_resets_on_success() {
+        let resilience = ResilienceConfig {
+            circuit_failure_threshold: 2,
+            circuit_cooldown: Duration::from_secs(60),
+            ..ResilienceConfig::default()
+        };
+        let mut circuit = CircuitBreakerState::default();
+        circuit.record_failure("first".into(), &resilience);
+        assert!(!circuit.is_open());
+        circuit.record_failure("second".into(), &resilience);
+        assert!(circuit.is_open());
+        circuit.record_success();
+        assert!(!circuit.is_open());
+        assert_eq!(circuit.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn control_plane_circuit_rejects_after_repeated_connection_failure() {
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+                control_plane_retries: 0,
+                circuit_failure_threshold: 1,
+                circuit_cooldown: Duration::from_secs(60),
+                ..ResilienceConfig::default()
+            });
+        let target = "/tmp/sekai-chisei-missing-circuit-test.sock";
+        assert!(connect_governance(&runtime, target).await.is_err());
+        let error = connect_governance(&runtime, target).await.unwrap_err();
+        assert!(error.to_string().contains("circuit is open"));
+    }
+
+    #[tokio::test]
+    async fn stalled_control_plane_rpc_is_bounded_and_opens_circuit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+                control_plane_retries: 0,
+                control_plane_timeout: Duration::from_millis(25),
+                circuit_failure_threshold: 1,
+                ..ResilienceConfig::default()
+            });
+
+        let started = Instant::now();
+        let channel = connect_governance(&runtime, &target).await.unwrap();
+        let error = SekaiServiceClient::new(channel)
+            .list_schema_types(gateway_request(ListSchemaTypesRequest {}))
+            .await
+            .unwrap_err();
+        assert!(is_transient_governance_status(&error));
+        record_control_plane_failure(&runtime, &error).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(runtime.control_plane_circuit.read().await.is_open());
+    }
+
+    #[tokio::test]
+    async fn successful_key_store_lookup_resets_control_plane_failures() {
+        let (target, db) = spawn_control_plane().await;
+        let key = "sk-chisei-resilient-worker";
+        db.create_object(&crate::domain::Object {
+            id: "gateway-key-resilient-worker".into(),
+            kind: "gateway_key".into(),
+            name: "resilient-worker".into(),
+            namespace: "default".into(),
+            external_id: "gateway_key:resilient-worker:default".into(),
+            properties: HashMap::from([
+                ("agent".into(), "resilient-worker".into()),
+                ("project".into(), "default".into()),
+                ("status".into(), "active".into()),
+                ("key_hash".into(), hash_gateway_key(key)),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+                circuit_failure_threshold: 2,
+                ..ResilienceConfig::default()
+            });
+        runtime
+            .control_plane_circuit
+            .write()
+            .await
+            .record_failure("transient".into(), &runtime.resilience);
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(target);
+        let state = GatewayState {
+            client: runtime.http_timeouts.client(),
+            config: Arc::new(config),
+            runtime: runtime.clone(),
+        };
+
+        assert!(
+            resolve_identity_from_key_store(&state, key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            runtime
+                .control_plane_circuit
+                .read()
+                .await
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_health_and_readiness_reflect_governance_availability() {
+        let (upstream_base, _) =
+            spawn_fake_upstream(r#"{"id":"resp_1"}"#, "application/json").await;
+        let gateway_base = spawn_gateway(upstream_base.clone()).await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("{gateway_base}/healthz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{gateway_base}/readyz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let (target, _) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.openai_base_url = upstream_base;
+        config.chisei_grpc_target = Some(target);
+        let ready_gateway = spawn_gateway_with_config(config).await;
+        assert_eq!(
+            client
+                .get(format!("{ready_gateway}/readyz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let mut no_preflight_config = routing_config();
+        no_preflight_config.no_preflight = true;
+        let no_preflight_gateway = spawn_gateway_with_config(no_preflight_config).await;
+        assert_eq!(
+            client
+                .get(format!("{no_preflight_gateway}/readyz"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_failures_do_not_mutate_the_traffic_circuit() {
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+                circuit_failure_threshold: 1,
+                ..ResilienceConfig::default()
+            });
+        let mut config = routing_config();
+        config.chisei_grpc_target =
+            Some("/tmp/sekai-chisei-missing-readiness-isolation-test.sock".to_string());
+        let gateway_base = spawn_gateway_with_runtime(config, runtime.clone()).await;
+        for _ in 0..3 {
+            assert_eq!(
+                reqwest::Client::new()
+                    .get(format!("{gateway_base}/readyz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        let circuit = runtime.control_plane_circuit.read().await;
+        assert_eq!(circuit.consecutive_failures, 0);
+        assert!(!circuit.is_open());
     }
 
     #[test]
