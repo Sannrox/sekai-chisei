@@ -1,6 +1,6 @@
 use std::error::Error as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -574,7 +574,12 @@ impl GatewayRuntime {
                         cache.budget_reconciliation_saturated = true;
                     }
                 },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(error) = initialize_budget_reconciliation_journal(path) {
+                        error!(path = %path.display(), %error, "budget reconciliation journal cannot be initialized");
+                        cache.budget_reconciliation_saturated = true;
+                    }
+                }
                 Err(error) => {
                     error!(path = %path.display(), %error, "budget reconciliation journal is unreadable");
                     cache.budget_reconciliation_saturated = true;
@@ -583,6 +588,25 @@ impl GatewayRuntime {
         }
         self
     }
+}
+
+fn initialize_budget_reconciliation_journal(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(b"[]")?;
+    file.sync_all()
 }
 
 #[derive(Debug, Clone)]
@@ -7386,6 +7410,39 @@ mod tests {
         assert!(cache.budget_reconciliation_saturated);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_budget_reconciliation_journal_is_initialized() {
+        let path = std::env::temp_dir().join(format!(
+            "chisei-new-budget-reconciliation-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_budget_reconciliation_path(Some(path.clone()));
+        let cache = runtime.governance_cache.read().await;
+        assert!(!cache.budget_reconciliation_saturated);
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_budget_reconciliation_journal_fails_closed() {
+        let parent = std::env::temp_dir().join(format!(
+            "chisei-blocked-budget-reconciliation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&parent, b"not-a-directory").unwrap();
+        let path = parent.join("journal.json");
+
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_budget_reconciliation_path(Some(path));
+        let cache = runtime.governance_cache.read().await;
+        assert!(cache.budget_reconciliation_saturated);
+
+        std::fs::remove_file(parent).unwrap();
     }
 
     #[tokio::test]
