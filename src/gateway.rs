@@ -6751,6 +6751,7 @@ async fn response_from_upstream(
             let mut usage_tap = SseUsageTap::new();
             let mut translator = translate.then(|| AnthropicMessageStreamTranslator::new(model));
             let mut aborted = false;
+            let mut stream_error = None;
             let mut client_gone = false;
             while let Some(chunk) = upstream_stream.next().await {
                 match chunk {
@@ -6775,6 +6776,7 @@ async fn response_from_upstream(
                         }
                     }
                     Err(err) => {
+                        stream_error = Some(err.to_string());
                         if !client_gone {
                             let _ = tx.send(Err(err)).await;
                         }
@@ -6796,16 +6798,38 @@ async fn response_from_upstream(
                 }
             }
             let (usage, observation) = usage_tap.finish();
-            record_usage_and_append(
-                &config,
-                &runtime,
-                &identity,
-                usage,
-                observation,
-                &context,
-                GatewayUsageOutcome::Success(status),
-            )
-            .await;
+            if aborted {
+                let rejection = GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_stream_error".into(),
+                    reason: stream_error.unwrap_or_else(|| "upstream stream aborted".into()),
+                };
+                record_usage_and_append(
+                    &config,
+                    &runtime,
+                    &identity,
+                    usage,
+                    observation,
+                    &context,
+                    GatewayUsageOutcome::AccountingOnly(rejection.status),
+                )
+                .await;
+                record_refusal_with_usage_and_append(
+                    &config, &identity, &context, &rejection, usage,
+                )
+                .await;
+            } else {
+                record_usage_and_append(
+                    &config,
+                    &runtime,
+                    &identity,
+                    usage,
+                    observation,
+                    &context,
+                    GatewayUsageOutcome::Success(status),
+                )
+                .await;
+            }
         });
         let stream = ReceiverStream::new(rx);
         return builder
