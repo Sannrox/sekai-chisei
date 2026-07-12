@@ -2786,9 +2786,9 @@ impl ChiseiService for ChiseiServiceImpl {
             event.target_id = "llm_calls".to_string();
         }
         if event.action == GATEWAY_RECEIPT_ACTION {
-            if authenticated_principal != "chisei-gateway" {
+            if !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root") {
                 return Err(Status::permission_denied(
-                    "operation receipt writes require the gateway service principal",
+                    "operation receipt writes require the gateway service or root principal",
                 ));
             }
             let receipt_json = event
@@ -5523,6 +5523,26 @@ mod tests {
             .metadata_mut()
             .insert("x-principal", "chisei-gateway".parse().unwrap());
         svc.record_gateway_audit(gateway_request).await.unwrap();
+
+        let mut root_replay = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "gateway-receipt-root-replay".into(),
+                timestamp: plan.created_at + 27,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "legacy root gateway replay".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        root_replay
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        svc.record_gateway_audit(root_replay).await.unwrap();
 
         let unauthorized = svc
             .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
