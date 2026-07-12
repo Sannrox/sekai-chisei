@@ -54,6 +54,7 @@ const POLICY_KIND: &str = "policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
 const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
+const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 
 fn authenticated_actor<T>(request: &Request<T>) -> String {
     request
@@ -64,6 +65,13 @@ fn authenticated_actor<T>(request: &Request<T>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("local")
         .to_string()
+}
+
+fn token_authenticated<T>(request: &Request<T>) -> bool {
+    request
+        .metadata()
+        .get(AUTH_SOURCE_HEADER)
+        .is_some_and(|value| value == "token")
 }
 
 fn reportable_receipt_kind(kind: ReceiptEventKind) -> bool {
@@ -2841,6 +2849,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RecordGatewayAuditRequest>,
     ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
         let authenticated_principal = authenticated_actor(&req);
+        let token_authenticated = token_authenticated(&req);
         let mut event = req
             .into_inner()
             .event
@@ -2881,8 +2890,9 @@ impl ChiseiService for ChiseiServiceImpl {
                 .gateway_receipt_principals
                 .iter()
                 .any(|principal| principal == &authenticated_principal);
-            if !configured_gateway
-                && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root")
+            if !token_authenticated
+                || (!configured_gateway
+                    && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root"))
             {
                 return Err(Status::permission_denied(
                     "operation receipt writes require an authorized gateway service principal",
@@ -6007,6 +6017,30 @@ mod tests {
         root_replay
             .metadata_mut()
             .insert("x-principal", "root".parse().unwrap());
+        let spoofed_root = svc.record_gateway_audit(root_replay).await.unwrap_err();
+        assert_eq!(spoofed_root.code(), tonic::Code::PermissionDenied);
+
+        let mut root_replay = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "gateway-receipt-root-token-replay".into(),
+                timestamp: plan.created_at + 27,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "authenticated root gateway replay".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        root_replay
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        root_replay
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
         svc.record_gateway_audit(root_replay).await.unwrap();
 
         let mut configured_gateway_replay = Request::new(RecordGatewayAuditRequest {
@@ -6027,6 +6061,9 @@ mod tests {
         configured_gateway_replay
             .metadata_mut()
             .insert("x-principal", "Gateway-Prod".parse().unwrap());
+        configured_gateway_replay
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
         svc.record_gateway_audit(configured_gateway_replay)
             .await
             .unwrap();
@@ -6049,6 +6086,9 @@ mod tests {
         forged_request
             .metadata_mut()
             .insert("x-principal", "agent:intruder".parse().unwrap());
+        forged_request
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
         let unauthorized = svc.record_gateway_audit(forged_request).await.unwrap_err();
         assert_eq!(unauthorized.code(), tonic::Code::PermissionDenied);
 
@@ -6072,6 +6112,9 @@ mod tests {
         conflicting_request
             .metadata_mut()
             .insert("x-principal", "chisei-gateway".parse().unwrap());
+        conflicting_request
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
         let conflict = svc
             .record_gateway_audit(conflicting_request)
             .await
