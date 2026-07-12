@@ -947,6 +947,13 @@ async fn proxy_gateway(
                 return rejection.response();
             }
         };
+        preflight_context.budget_subject = budget.budget_subject.clone();
+        preflight_context.budget_status = if budget.provisional_local_free {
+            "local_free"
+        } else {
+            "allowed"
+        }
+        .into();
         let resolved = match resolve_policy_preflight(
             &state.config,
             &state.runtime,
@@ -1003,13 +1010,6 @@ async fn proxy_gateway(
         preflight_context.route_bias = resolved.route_bias.clone();
         preflight_context.policy_scope = resolved.policy_scope.clone();
         preflight_context.policy_version = resolved.policy_version.clone();
-        preflight_context.budget_subject = budget.budget_subject.clone();
-        preflight_context.budget_status = if budget.provisional_local_free {
-            "local_free"
-        } else {
-            "allowed"
-        }
-        .into();
         preflight_context.egress_applied = true;
         let egress = match apply_context_egress(
             &state.config,
@@ -1718,9 +1718,15 @@ async fn reconcile_cached_budget_usage(
                 .map(PendingBudgetUsage::from)
                 .collect();
             drop(cache);
-            let _ =
-                persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot)
-                    .await;
+            if !persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot)
+                .await
+            {
+                runtime
+                    .governance_cache
+                    .write()
+                    .await
+                    .budget_reconciliation_saturated = true;
+            }
             return Err(status);
         }
         reconciled += 1;
