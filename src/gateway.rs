@@ -5547,7 +5547,10 @@ async fn record_gateway_operation_receipt(
         } else {
             "recorded"
         },
-        HashMap::from([("receipt_json".into(), receipt_json)]),
+        HashMap::from([
+            ("operation_id".into(), receipt.operation_id),
+            ("receipt_json".into(), receipt_json),
+        ]),
     )
     .await;
 }
@@ -5965,6 +5968,14 @@ async fn record_gateway_event(
         return;
     }
     let mut chisei = ChiseiServiceClient::new(channel);
+    let target_id = if action == "operation.receipt.upsert" {
+        evidence
+            .get("operation_id")
+            .cloned()
+            .unwrap_or_else(|| "llm_calls".into())
+    } else {
+        "llm_calls".into()
+    };
     if let Err(err) = chisei
         .record_gateway_audit(gateway_request(RecordGatewayAuditRequest {
             event: Some(GatewayAuditEvent {
@@ -5974,7 +5985,7 @@ async fn record_gateway_event(
                 action: action.to_string(),
                 reason: reason.to_string(),
                 evidence: sanitize_audit_evidence(evidence),
-                target_id: "llm_calls".to_string(),
+                target_id,
                 outcome: outcome.to_string(),
             }),
         }))
