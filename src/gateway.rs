@@ -41,7 +41,9 @@ use crate::llm::{HttpTimeouts, classify_reqwest_error};
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RATE_LIMIT_REQUESTS: u64 = 120;
+const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 const X_CHISEI_AGENT: HeaderName = HeaderName::from_static("x-chisei-agent");
 const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project");
@@ -282,6 +284,10 @@ struct GatewayRuntime {
     key_cache_ttl: Duration,
     admin_token: Option<String>,
     http_timeouts: HttpTimeouts,
+    max_request_bytes: usize,
+    rate_limit_requests: u64,
+    rate_limit_window: Duration,
+    rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
 }
 
 impl GatewayRuntime {
@@ -291,13 +297,23 @@ impl GatewayRuntime {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS));
-        Self::new(
+        let mut runtime = Self::new(
             key_cache_ttl,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
         )
-        .with_http_timeouts(HttpTimeouts::from_env())
+        .with_http_timeouts(HttpTimeouts::from_env());
+        runtime.max_request_bytes =
+            positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
+        runtime.rate_limit_requests = positive_env("CHISEI_GATEWAY_RATE_LIMIT_REQUESTS")
+            .unwrap_or(DEFAULT_RATE_LIMIT_REQUESTS as usize)
+            as u64;
+        runtime.rate_limit_window = Duration::from_secs(
+            positive_env("CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS")
+                .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW_SECS as usize) as u64,
+        );
+        runtime
     }
 
     fn new(key_cache_ttl: Duration, admin_token: Option<String>) -> Self {
@@ -306,6 +322,10 @@ impl GatewayRuntime {
             key_cache_ttl,
             admin_token,
             http_timeouts: HttpTimeouts::default(),
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            rate_limit_requests: DEFAULT_RATE_LIMIT_REQUESTS,
+            rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
+            rate_limits: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -313,6 +333,19 @@ impl GatewayRuntime {
         self.http_timeouts = http_timeouts;
         self
     }
+}
+
+#[derive(Debug, Clone)]
+struct RateLimitWindow {
+    started_at: Instant,
+    requests: u64,
+}
+
+fn positive_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 #[derive(Debug, Clone)]
@@ -439,13 +472,33 @@ async fn proxy_gateway(
     };
     let identity = identity_context.identity;
 
-    let body = match to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+    if let Some(subject) = rate_limit_rejection(&state.runtime, &identity).await {
+        record_gateway_decision(
+            &state.config,
+            &identity,
+            "gateway.rate_limited",
+            "gateway request rate exceeded",
+            "denied",
+            HashMap::from([("rate_limit_subject".to_string(), subject)]),
+        )
+        .await;
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_exceeded",
+            "gateway request rate exceeded",
+        );
+    }
+
+    let body = match to_bytes(request.into_body(), state.runtime.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
-                &format!("failed to read request body: {err}"),
+                &format!(
+                    "request body exceeds the gateway limit of {} bytes: {err}",
+                    state.runtime.max_request_bytes
+                ),
             );
         }
     };
@@ -683,6 +736,38 @@ async fn proxy_gateway(
             ),
         ),
     }
+}
+
+async fn rate_limit_rejection(
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+) -> Option<String> {
+    let mut subjects = vec![format!("agent:{}", identity.agent)];
+    if !identity.key_id.is_empty() {
+        subjects.push(format!("key:{}", identity.key_id));
+    }
+    let now = Instant::now();
+    let mut limits = runtime.rate_limits.write().await;
+    for subject in &subjects {
+        let window = limits.entry(subject.clone()).or_insert(RateLimitWindow {
+            started_at: now,
+            requests: 0,
+        });
+        if now.duration_since(window.started_at) >= runtime.rate_limit_window {
+            window.started_at = now;
+            window.requests = 0;
+        }
+        if window.requests >= runtime.rate_limit_requests {
+            return Some(subject.clone());
+        }
+    }
+    for subject in subjects {
+        limits
+            .get_mut(&subject)
+            .expect("rate window exists")
+            .requests += 1;
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -5482,6 +5567,51 @@ mod tests {
         assert_eq!(sanitized["input_tokens"], "42");
     }
 
+    #[tokio::test]
+    async fn rate_limit_is_enforced_for_key_and_agent() {
+        let mut runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.rate_limit_requests = 2;
+        runtime.rate_limit_window = Duration::from_secs(60);
+        let identity = GatewayIdentity {
+            agent: "agent".to_string(),
+            project: "project".to_string(),
+            user_id: "user".to_string(),
+            key_id: "key".to_string(),
+            tier: DEFAULT_GATEWAY_TIER.to_string(),
+        };
+        assert_eq!(rate_limit_rejection(&runtime, &identity).await, None);
+        assert_eq!(rate_limit_rejection(&runtime, &identity).await, None);
+        assert_eq!(
+            rate_limit_rejection(&runtime, &identity).await.as_deref(),
+            Some("agent:agent")
+        );
+
+        let other_key = GatewayIdentity {
+            key_id: "other-key".to_string(),
+            ..identity
+        };
+        assert_eq!(
+            rate_limit_rejection(&runtime, &other_key).await.as_deref(),
+            Some("agent:agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_gateway_request_is_rejected() {
+        let mut runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.max_request_bytes = 16;
+        let gateway_base = spawn_gateway_with_runtime(routing_config(), runtime).await;
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("client-oauth-token")
+            .header(X_CHISEI_AGENT, "codex-app")
+            .body(r#"{"model":"gpt-5.5","input":"too large"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     fn routing_config() -> GatewayConfig {
         GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -5771,7 +5901,7 @@ mod tests {
         headers: HeaderMap,
         request: Request<Body>,
     ) -> Response<Body> {
-        let body = to_bytes(request.into_body(), MAX_REQUEST_BYTES)
+        let body = to_bytes(request.into_body(), DEFAULT_MAX_REQUEST_BYTES)
             .await
             .unwrap();
         state.requests.lock().unwrap().push(RecordedRequest {
