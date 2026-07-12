@@ -2,14 +2,7 @@ WITH ranked_grants AS (
     SELECT id,
            ROW_NUMBER() OVER (
                PARTITION BY object_id, principal
-               ORDER BY CASE role
-                   WHEN 'viewer' THEN 0
-                   WHEN 'editor' THEN 1
-                   WHEN 'admin' THEN 2
-                   ELSE 3
-               END,
-               created DESC,
-               id DESC
+               ORDER BY created DESC, id DESC
            ) AS duplicate_rank
     FROM sekai_grants
 )
