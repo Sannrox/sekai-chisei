@@ -2882,10 +2882,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .iter()
                 .any(|principal| principal == &authenticated_principal);
             if !configured_gateway
-                && !matches!(
-                    authenticated_principal.as_str(),
-                    "chisei-gateway" | "root" | "local"
-                )
+                && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root")
             {
                 return Err(Status::permission_denied(
                     "operation receipt writes require an authorized gateway service principal",
@@ -5989,7 +5986,8 @@ mod tests {
         gateway_request
             .metadata_mut()
             .insert("x-principal", "local".parse().unwrap());
-        svc.record_gateway_audit(gateway_request).await.unwrap();
+        let local_write = svc.record_gateway_audit(gateway_request).await.unwrap_err();
+        assert_eq!(local_write.code(), tonic::Code::PermissionDenied);
 
         let mut root_replay = Request::new(RecordGatewayAuditRequest {
             event: Some(GatewayAuditEvent {
