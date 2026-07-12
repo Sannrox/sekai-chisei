@@ -5046,6 +5046,9 @@ async fn record_usage_and_append(
                     });
                 }
             }
+            if matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
+                return;
+            }
             let pipeline_observation =
                 run_gateway_pipeline_observation(config, identity, context, &mut chisei).await;
             let portfolio_cost_usd_micros = usage
