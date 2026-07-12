@@ -114,7 +114,7 @@ impl PostgresDb {
             .query_one(
                 "INSERT INTO sekai_principal_credentials
                     (id, principal, token_hash, status, created, rotated_at, revoked_at)
-                 VALUES ($1, $2, $3, 'active', $4, 0, 0)
+                 VALUES ($1, $2, $3, 'active', $4, $4, 0)
                  RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
                 &[&id, &principal, &token_hash, &now],
             )
@@ -133,21 +133,10 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let active = transaction
-            .query_opt(
-                "SELECT id FROM sekai_principal_credentials
-                 WHERE principal = $1 AND status = 'active'
-                 ORDER BY created DESC LIMIT 1 FOR UPDATE",
-                &[&principal],
-            )
-            .map_err(|error| error.to_string())?;
-        if active.is_none() {
-            return Err(format!("no active credential for {principal:?}"));
-        }
         transaction
             .execute(
                 "UPDATE sekai_principal_credentials
-                 SET status = 'rotated', rotated_at = $2
+                 SET status = 'revoked', revoked_at = $2
                  WHERE principal = $1 AND status = 'active'",
                 &[&principal, &now],
             )
@@ -156,7 +145,7 @@ impl PostgresDb {
             .query_one(
                 "INSERT INTO sekai_principal_credentials
                     (id, principal, token_hash, status, created, rotated_at, revoked_at)
-                 VALUES ($1, $2, $3, 'active', $4, 0, 0)
+                 VALUES ($1, $2, $3, 'active', $4, $4, 0)
                  RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
                 &[&id, &principal, &token_hash, &now],
             )
