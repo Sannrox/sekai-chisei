@@ -51,6 +51,7 @@ const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-c
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
+const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -161,6 +162,14 @@ impl GatewayConfig {
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
 
+        validate_gateway_security(
+            bind_addr,
+            &gateway_keys,
+            fail_closed,
+            no_preflight,
+            std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
+        )?;
+
         Ok(Self {
             bind_addr,
             openai_base_url,
@@ -181,6 +190,38 @@ impl GatewayConfig {
             allow_cross_provider,
         })
     }
+}
+
+fn validate_gateway_security(
+    bind_addr: SocketAddr,
+    gateway_keys: &HashMap<String, GatewayIdentity>,
+    fail_closed: bool,
+    no_preflight: bool,
+    admin_token: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(token) = admin_token.map(str::trim).filter(|token| !token.is_empty())
+        && (token == "change-me" || token.len() < MIN_ADMIN_TOKEN_BYTES)
+    {
+        return Err(format!(
+            "CHISEI_GATEWAY_ADMIN_TOKEN must contain at least {MIN_ADMIN_TOKEN_BYTES} bytes and must not use a documented placeholder"
+        )
+        .into());
+    }
+
+    if !bind_addr.ip().is_loopback() {
+        if gateway_keys.is_empty() {
+            return Err(
+                "an exposed gateway requires at least one authenticated GATEWAY_KEYS entry".into(),
+            );
+        }
+        if !fail_closed {
+            return Err("an exposed gateway requires GATEWAY_GOVERNANCE_FAILURE=closed".into());
+        }
+        if no_preflight {
+            return Err("CHISEI_GATEWAY_NO_PREFLIGHT cannot be used on an exposed gateway".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +346,23 @@ async fn refresh_gateway_admin(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response<Body> {
+    if state.runtime.admin_token.is_none() {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "chisei gateway admin endpoint is disabled",
+        );
+    }
     if !admin_authorized(&headers, &state.runtime) {
+        record_gateway_event(
+            &state.config,
+            "chisei-gateway-admin",
+            "gateway.admin_refresh",
+            "invalid admin credential",
+            "denied",
+            HashMap::new(),
+        )
+        .await;
         return json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -315,6 +372,19 @@ async fn refresh_gateway_admin(
     let mut cache = state.runtime.key_cache.write().await;
     let cleared_entries = cache.len();
     cache.clear();
+    drop(cache);
+    record_gateway_event(
+        &state.config,
+        "chisei-gateway-admin",
+        "gateway.admin_refresh",
+        "gateway key cache refreshed",
+        "allowed",
+        HashMap::from([(
+            "cleared_key_cache_entries".to_string(),
+            cleared_entries.to_string(),
+        )]),
+    )
+    .await;
     json_response(
         StatusCode::OK,
         serde_json::json!({
@@ -326,7 +396,7 @@ async fn refresh_gateway_admin(
 
 fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
     let Some(expected) = runtime.admin_token.as_deref() else {
-        return true;
+        return false;
     };
     let Some(token) = client_key(headers) else {
         return false;
@@ -5322,6 +5392,44 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_weak_admin_tokens() {
+        let bind = "127.0.0.1:8788".parse().unwrap();
+        let keys = HashMap::new();
+        assert!(validate_gateway_security(bind, &keys, false, false, Some("change-me")).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, false, Some("too-short")).is_err());
+        assert!(
+            validate_gateway_security(
+                bind,
+                &keys,
+                false,
+                false,
+                Some("0123456789abcdef0123456789abcdef"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn exposed_gateway_requires_keys_fail_closed_and_preflight() {
+        let bind = "0.0.0.0:8788".parse().unwrap();
+        let mut keys = HashMap::new();
+        assert!(validate_gateway_security(bind, &keys, true, false, None).is_err());
+        keys.insert(
+            "hash".to_string(),
+            GatewayIdentity {
+                agent: "agent".to_string(),
+                project: "project".to_string(),
+                user_id: "user".to_string(),
+                key_id: "key".to_string(),
+                tier: DEFAULT_GATEWAY_TIER.to_string(),
+            },
+        );
+        assert!(validate_gateway_security(bind, &keys, false, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, true, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, None).is_ok());
+    }
 
     fn routing_config() -> GatewayConfig {
         GatewayConfig {
