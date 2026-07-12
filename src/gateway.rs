@@ -28,7 +28,7 @@ use crate::chisei::receipt::{
 };
 use crate::db::chisei_budget::METRIC_REQUESTS;
 use crate::gateway_keys::hash_gateway_key;
-use crate::grpc::client::{GatewayClient, connect_sekai};
+use crate::grpc::client::{GatewayClient, connect_sekai, connect_sekai_as_gateway};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, GatewayAuditEvent,
@@ -6114,7 +6114,7 @@ async fn record_gateway_event(
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
-    let Ok(channel) = connect_sekai(target).await else {
+    let Ok(channel) = connect_sekai_as_gateway(target).await else {
         return;
     };
     let mut sekai = SekaiServiceClient::new(channel.clone());
