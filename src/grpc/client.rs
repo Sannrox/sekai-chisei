@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -31,14 +32,28 @@ impl tonic::service::Interceptor for GatewayAuthInterceptor {
 pub async fn connect_sekai(
     target: &str,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
+    connect_sekai_with_timeout(target, None).await
+}
+
+pub async fn connect_sekai_with_timeout(
+    target: &str,
+    timeout: Option<Duration>,
+) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let auth_token = std::env::var("SEKAI_AUTH_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    connect_sekai_with_token(target, auth_token).await
+    connect_sekai_with_token(target, auth_token, timeout).await
 }
 
 pub async fn connect_sekai_as_gateway(
     target: &str,
+) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
+    connect_sekai_as_gateway_with_timeout(target, None).await
+}
+
+pub async fn connect_sekai_as_gateway_with_timeout(
+    target: &str,
+    timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let environment_token = || {
         std::env::var("SEKAI_AUTH_TOKEN")
@@ -56,12 +71,13 @@ pub async fn connect_sekai_as_gateway(
             .filter(|token| !token.is_empty())
             .or_else(environment_token)
     };
-    connect_sekai_with_token(target, auth_token).await
+    connect_sekai_with_token(target, auth_token, timeout).await
 }
 
 async fn connect_sekai_with_token(
     target: &str,
     auth_token: Option<String>,
+    timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let interceptor = GatewayAuthInterceptor { auth_token };
 
@@ -78,6 +94,9 @@ async fn connect_sekai_with_token(
             None
         };
         let mut channel = Channel::from_shared(target.to_string())?;
+        if let Some(timeout) = timeout {
+            channel = channel.connect_timeout(timeout).timeout(timeout);
+        }
         if let Some(tls) = tls {
             channel = channel.tls_config(tls)?;
         }
@@ -87,8 +106,12 @@ async fn connect_sekai_with_token(
 
     let socket_target = target.strip_prefix("unix://").unwrap_or(target);
     let socket_path = PathBuf::from(socket_target);
+    let mut endpoint = Endpoint::try_from("http://[::]:50051")?;
+    if let Some(timeout) = timeout {
+        endpoint = endpoint.connect_timeout(timeout).timeout(timeout);
+    }
     let channel =
-        Endpoint::try_from("http://[::]:50051")?
+        endpoint
             .connect_with_connector(service_fn(move |_: Uri| {
                 let socket_path = socket_path.clone();
                 async move {
