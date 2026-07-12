@@ -370,6 +370,14 @@ the Codex OpenAI/ChatGPT-plan split):
   terms — the gateway forwards the request untampered (only its own `x-chisei-*`
   headers are stripped) to avoid revocation, but use it with that caveat in mind.
 
+Passthrough credentials form a narrow in-memory trust boundary. The gateway
+reads `authorization` or `x-api-key` only to authenticate/identify the request
+and, for same-provider passthrough, forwards that header directly to the
+configured upstream. It never stores the credential or includes it in audit
+evidence. Every `x-chisei-*` header is stripped before forwarding, and audit
+evidence is centrally filtered for credential-, token-, cookie-, and
+secret-named fields. Cross-provider and local routes always strip client auth.
+
 If a gateway started only for Codex is already running on the port, it is not
 configured for `claude-code`; `launch` warns when it reuses a live gateway.
 
