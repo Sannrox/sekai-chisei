@@ -2876,12 +2876,19 @@ impl ChiseiService for ChiseiServiceImpl {
             event.target_id = "llm_calls".to_string();
         }
         if event.action == GATEWAY_RECEIPT_ACTION {
-            if !matches!(
-                authenticated_principal.as_str(),
-                "chisei-gateway" | "root" | "local"
-            ) {
+            let configured_gateway = self
+                .config
+                .gateway_receipt_principals
+                .iter()
+                .any(|principal| principal == &authenticated_principal);
+            if !configured_gateway
+                && !matches!(
+                    authenticated_principal.as_str(),
+                    "chisei-gateway" | "root" | "local"
+                )
+            {
                 return Err(Status::permission_denied(
-                    "operation receipt writes require the gateway service, root, or local principal",
+                    "operation receipt writes require an authorized gateway service principal",
                 ));
             }
             let receipt_json = event
@@ -4765,6 +4772,7 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
             gateway_provided_providers: vec![],
+            gateway_receipt_principals: vec![],
             leak_review_model: None,
             tls_cert: None,
             tls_key: None,
@@ -5854,7 +5862,8 @@ mod tests {
 
     #[tokio::test]
     async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
-        let svc = memory_service();
+        let mut svc = memory_service();
+        svc.config.gateway_receipt_principals = vec!["gateway-prod".into()];
         let mut request = Request::new(PlanExecutionRequest {
             input: Some(ExecutionInput {
                 request_id: "receipt-task-1".into(),
@@ -6006,6 +6015,28 @@ mod tests {
             .metadata_mut()
             .insert("x-principal", "root".parse().unwrap());
         svc.record_gateway_audit(root_replay).await.unwrap();
+
+        let mut configured_gateway_replay = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "gateway-receipt-configured-replay".into(),
+                timestamp: plan.created_at + 27,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "configured gateway replay".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        configured_gateway_replay
+            .metadata_mut()
+            .insert("x-principal", "gateway-prod".parse().unwrap());
+        svc.record_gateway_audit(configured_gateway_replay)
+            .await
+            .unwrap();
 
         let mut forged_request = Request::new(RecordGatewayAuditRequest {
             event: Some(GatewayAuditEvent {
