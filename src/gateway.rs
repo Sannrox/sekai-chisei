@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::{any, post};
 use chrono::Utc;
 use futures_util::StreamExt;
+use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
@@ -43,7 +45,9 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_REQUESTS: u64 = 120;
+const DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS: u64 = 1_200;
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const MAX_RATE_LIMIT_SUBJECTS: usize = 10_000;
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 const X_CHISEI_AGENT: HeaderName = HeaderName::from_static("x-chisei-agent");
 const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project");
@@ -293,6 +297,7 @@ struct GatewayRuntime {
     http_timeouts: HttpTimeouts,
     max_request_bytes: usize,
     rate_limit_requests: u64,
+    global_rate_limit_requests: u64,
     rate_limit_window: Duration,
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
 }
@@ -316,6 +321,9 @@ impl GatewayRuntime {
         runtime.rate_limit_requests = positive_env("CHISEI_GATEWAY_RATE_LIMIT_REQUESTS")
             .unwrap_or(DEFAULT_RATE_LIMIT_REQUESTS as usize)
             as u64;
+        runtime.global_rate_limit_requests =
+            positive_env("CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS")
+                .unwrap_or(DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS as usize) as u64;
         runtime.rate_limit_window = Duration::from_secs(
             positive_env("CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS")
                 .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW_SECS as usize) as u64,
@@ -331,6 +339,7 @@ impl GatewayRuntime {
             http_timeouts: HttpTimeouts::default(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             rate_limit_requests: DEFAULT_RATE_LIMIT_REQUESTS,
+            global_rate_limit_requests: DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS,
             rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -508,13 +517,25 @@ async fn proxy_gateway(
     let body = match to_bytes(request.into_body(), state.runtime.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
-            return json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request_error",
-                &format!(
-                    "request body exceeds the gateway limit of {} bytes: {err}",
+            let length_limited = err
+                .source()
+                .is_some_and(|source| source.is::<LengthLimitError>());
+            let message = if length_limited {
+                format!(
+                    "request body exceeds the gateway limit of {} bytes",
                     state.runtime.max_request_bytes
-                ),
+                )
+            } else {
+                "failed to read request body".to_string()
+            };
+            return json_error(
+                if length_limited {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "invalid_request_error",
+                &message,
             );
         }
     };
@@ -758,13 +779,29 @@ async fn rate_limit_rejection(
     runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
 ) -> Option<String> {
-    let mut subjects = vec![format!("agent:{}", identity.agent)];
+    let mut subjects = vec![
+        (
+            "gateway:global".to_string(),
+            runtime.global_rate_limit_requests,
+        ),
+        (
+            format!("agent:{}", identity.agent),
+            runtime.rate_limit_requests,
+        ),
+    ];
     if !identity.key_id.is_empty() {
-        subjects.push(format!("key:{}", identity.key_id));
+        subjects.push((
+            format!("key:{}", identity.key_id),
+            runtime.rate_limit_requests,
+        ));
     }
     let now = Instant::now();
     let mut limits = runtime.rate_limits.write().await;
-    for subject in &subjects {
+    limits.retain(|_, window| now.duration_since(window.started_at) < runtime.rate_limit_window);
+    for (subject, limit) in &subjects {
+        if !limits.contains_key(subject) && limits.len() >= MAX_RATE_LIMIT_SUBJECTS {
+            return Some("gateway:subject_capacity".to_string());
+        }
         let window = limits.entry(subject.clone()).or_insert(RateLimitWindow {
             started_at: now,
             requests: 0,
@@ -773,11 +810,11 @@ async fn rate_limit_rejection(
             window.started_at = now;
             window.requests = 0;
         }
-        if window.requests >= runtime.rate_limit_requests {
+        if window.requests >= *limit {
             return Some(subject.clone());
         }
     }
-    for subject in subjects {
+    for (subject, _) in subjects {
         limits
             .get_mut(&subject)
             .expect("rate window exists")
@@ -5601,6 +5638,7 @@ mod tests {
     async fn rate_limit_is_enforced_for_key_and_agent() {
         let mut runtime = GatewayRuntime::new(Duration::from_secs(30), None);
         runtime.rate_limit_requests = 2;
+        runtime.global_rate_limit_requests = 100;
         runtime.rate_limit_window = Duration::from_secs(60);
         let identity = GatewayIdentity {
             agent: "agent".to_string(),
@@ -5623,6 +5661,28 @@ mod tests {
         assert_eq!(
             rate_limit_rejection(&runtime, &other_key).await.as_deref(),
             Some("agent:agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn global_rate_limit_blocks_identity_rotation() {
+        let mut runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.rate_limit_requests = 100;
+        runtime.global_rate_limit_requests = 2;
+        let identity = |agent: &str| GatewayIdentity {
+            agent: agent.to_string(),
+            project: "project".to_string(),
+            user_id: format!("agent:{agent}"),
+            key_id: String::new(),
+            tier: DEFAULT_GATEWAY_TIER.to_string(),
+        };
+        assert_eq!(rate_limit_rejection(&runtime, &identity("one")).await, None);
+        assert_eq!(rate_limit_rejection(&runtime, &identity("two")).await, None);
+        assert_eq!(
+            rate_limit_rejection(&runtime, &identity("three"))
+                .await
+                .as_deref(),
+            Some("gateway:global")
         );
     }
 

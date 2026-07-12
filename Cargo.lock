@@ -1797,6 +1797,7 @@ dependencies = [
  "hmac",
  "http",
  "http-body",
+ "http-body-util",
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",

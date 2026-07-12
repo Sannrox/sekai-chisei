@@ -94,6 +94,7 @@ Configuration is read from environment variables:
 | `CHISEI_OPENAI_API_KEY_SECRET` / `CHISEI_ANTHROPIC_API_KEY_SECRET` | unset | Provider-key references resolved through `CHISEI_SECRET_COMMAND`; direct API-key environment variables take precedence |
 | `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `8388608` | Maximum buffered gateway request body size |
 | `CHISEI_GATEWAY_RATE_LIMIT_REQUESTS` | `120` | Requests allowed independently per virtual key and agent per window |
+| `CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS` | `1200` | Gateway-wide requests allowed per window; prevents identity rotation from bypassing limits |
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed-window rate-limit duration |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | unset | Comma-separated providers whose upstream auth is supplied by the gateway (e.g. `openai`); model routing treats them as available without a server-side key |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models; defaults to `http://localhost:11434/v1` |
