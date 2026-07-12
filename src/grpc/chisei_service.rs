@@ -3579,7 +3579,10 @@ impl ChiseiService for ChiseiServiceImpl {
             .iter()
             .any(|grant| grant.principal == actor);
         if actor != receipt.initiating_actor
-            && !matches!(actor.as_str(), "root" | "chisei-gateway")
+            // The UDS interceptor assigns `local`; local socket access is the
+            // administrative inspection boundary used by sekaictl. This
+            // exception is read-only and is not accepted by mutation RPCs.
+            && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
             && !explicitly_granted
         {
             return Err(Status::permission_denied(
@@ -5922,6 +5925,15 @@ mod tests {
             .into_inner();
         assert!(retrieved.complete);
         assert!(retrieved.receipt_json.contains(":reported-action"));
+        assert!(
+            svc.get_operation_receipt(Request::new(GetOperationReceiptRequest {
+                operation_id: plan.plan_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .complete
+        );
 
         let mut denied_get = Request::new(GetOperationReceiptRequest {
             operation_id: plan.plan_id.clone(),
