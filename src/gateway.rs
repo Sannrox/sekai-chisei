@@ -4642,17 +4642,21 @@ fn sanitize_audit_evidence(evidence: HashMap<String, String>) -> HashMap<String,
         .into_iter()
         .filter(|(key, _)| {
             let key = key.to_ascii_lowercase().replace('-', "_");
-            !["authorization", "api_key", "credential", "cookie", "secret"]
-                .iter()
-                .any(|sensitive| key == *sensitive || key.ends_with(&format!("_{sensitive}")))
-                && ![
-                    "token",
-                    "oauth_token",
-                    "access_token",
-                    "auth_token",
-                    "bearer_token",
-                ]
-                .contains(&key.as_str())
+            ![
+                "authorization",
+                "api_key",
+                "credential",
+                "cookie",
+                "secret",
+                "password",
+                "passwd",
+                "passphrase",
+                "private_key",
+            ]
+            .iter()
+            .any(|sensitive| key == *sensitive || key.ends_with(&format!("_{sensitive}")))
+                && key != "token"
+                && !key.ends_with("_token")
         })
         .collect()
 }
@@ -5465,6 +5469,9 @@ mod tests {
             ("upstream-api-key".to_string(), "private".to_string()),
             ("oauth_token".to_string(), "private".to_string()),
             ("session_cookie".to_string(), "private".to_string()),
+            ("refresh_token".to_string(), "private".to_string()),
+            ("database_password".to_string(), "private".to_string()),
+            ("signing_private_key".to_string(), "private".to_string()),
             ("key_id".to_string(), "gateway-key-1".to_string()),
             ("request_id".to_string(), "request-1".to_string()),
             ("input_tokens".to_string(), "42".to_string()),
