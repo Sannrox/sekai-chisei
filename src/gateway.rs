@@ -15,13 +15,17 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use http_body_util::LengthLimitError;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 use tracing::{error, info, warn};
 
+use crate::chisei::receipt::{
+    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    ReceiptEventKind, UncoveredSurface,
+};
 use crate::db::chisei_budget::METRIC_REQUESTS;
 use crate::gateway_keys::hash_gateway_key;
 use crate::grpc::client::{GatewayClient, connect_sekai};
@@ -797,6 +801,7 @@ async fn proxy_gateway(
         }
     };
     let request_bytes = body.len();
+    let request_hash = format!("{:x}", Sha256::digest(&body));
     let requested_model = extract_request_model(&body);
     let request_id = uuid::Uuid::new_v4().to_string();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
@@ -822,6 +827,10 @@ async fn proxy_gateway(
         policy_scope: None,
         policy_version: None,
         task_class: task_class.clone(),
+        request_hash: request_hash.clone(),
+        budget_subject: None,
+        budget_status: "not_evaluated".into(),
+        egress_applied: false,
     };
     if state.config.no_preflight && context_request.is_some() {
         return json_error(
@@ -852,7 +861,7 @@ async fn proxy_gateway(
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
         return rejection.response();
     }
-    let (resolved, egress) = if state.config.no_preflight {
+    let (resolved, egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_model.clone(),
@@ -864,7 +873,7 @@ async fn proxy_gateway(
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
         };
-        (resolved, egress)
+        (resolved, egress, None)
     } else {
         let budget = match check_budget_preflight(
             &state.config,
@@ -954,7 +963,7 @@ async fn proxy_gateway(
             Ok(egress) => egress,
             Err(response) => return response,
         };
-        (resolved, egress)
+        (resolved, egress, Some(budget))
     };
     let prepared = match prepare_upstream_request(
         &state.config,
@@ -1037,6 +1046,22 @@ async fn proxy_gateway(
                     policy_scope: resolved.policy_scope,
                     policy_version: resolved.policy_version,
                     task_class,
+                    request_hash,
+                    budget_subject: budget
+                        .as_ref()
+                        .and_then(|budget| budget.budget_subject.clone()),
+                    budget_status: budget
+                        .as_ref()
+                        .map(|budget| {
+                            if budget.provisional_local_free {
+                                "local_free"
+                            } else {
+                                "allowed"
+                            }
+                        })
+                        .unwrap_or("not_evaluated")
+                        .into(),
+                    egress_applied: !state.config.no_preflight,
                 },
                 prepared.response_adapter,
             )
@@ -1115,6 +1140,10 @@ struct UsageContext {
     policy_scope: Option<String>,
     policy_version: Option<String>,
     task_class: String,
+    request_hash: String,
+    budget_subject: Option<String>,
+    budget_status: String,
+    egress_applied: bool,
 }
 
 #[derive(Debug)]
@@ -4844,6 +4873,16 @@ async fn record_usage_and_append(
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
+    record_gateway_operation_receipt(
+        config,
+        identity,
+        context,
+        status,
+        usage.as_ref(),
+        response_observation.as_ref(),
+        None,
+    )
+    .await;
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let total_tokens = usage.as_ref().map(|usage| usage.total_tokens).unwrap_or(0);
     let request_usage = RecordUsageRequest {
@@ -5140,6 +5179,16 @@ async fn record_refusal_and_append(
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
+    record_gateway_operation_receipt(
+        config,
+        identity,
+        context,
+        rejection.status,
+        None,
+        None,
+        Some(rejection),
+    )
+    .await;
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let mut values = HashMap::new();
     values.insert("request_id".to_string(), context.request_id.clone());
@@ -5196,6 +5245,311 @@ async fn record_refusal_and_append(
             "chisei-gateway refusal append skipped; Chisei unavailable"
         ),
     }
+}
+
+fn gateway_receipt_event(
+    operation_id: &str,
+    suffix: &str,
+    parent: Option<&str>,
+    timestamp_ms: i64,
+    kind: ReceiptEventKind,
+    actor: &str,
+    attributes: BTreeMap<String, String>,
+) -> OperationReceiptEvent {
+    OperationReceiptEvent {
+        event_id: format!("{operation_id}:{suffix}"),
+        operation_id: operation_id.into(),
+        parent_event_id: parent.map(|parent| format!("{operation_id}:{parent}")),
+        timestamp_ms,
+        kind,
+        surface: kind.surface(),
+        actor: actor.into(),
+        references: Vec::new(),
+        attributes,
+    }
+}
+
+fn build_gateway_operation_receipt(
+    identity: &GatewayIdentity,
+    context: &UsageContext,
+    status: StatusCode,
+    usage: Option<&ResponseUsage>,
+    observation: Option<&ResponseObservation>,
+    rejection: Option<&GatewayRejection>,
+) -> OperationReceipt {
+    let operation_id = context.request_id.clone();
+    let completed_at_ms = Utc::now().timestamp_millis();
+    let actor = identity.agent.as_str();
+    let policy_version = context
+        .policy_version
+        .clone()
+        .unwrap_or_else(|| "unavailable/v1".into());
+    let policy_status = if rejection.is_some() {
+        "denied"
+    } else if context.policy_version.is_some() {
+        "resolved"
+    } else {
+        "not_evaluated"
+    };
+    let mut context_event = gateway_receipt_event(
+        &operation_id,
+        "context",
+        Some("intent"),
+        context.started_ms,
+        ReceiptEventKind::ContextGoverned,
+        "chisei.gateway",
+        BTreeMap::from([
+            ("egress_applied".into(), context.egress_applied.to_string()),
+            ("raw_context_stored".into(), "false".into()),
+        ]),
+    );
+    context_event.references.push(GovernedReference {
+        kind: "gateway_request".into(),
+        reference: format!("operation:{operation_id}:request"),
+        content_hash: Some(context.request_hash.clone()),
+        disclosed_fields: vec!["request_body".into()],
+        omitted: true,
+        omission_reason: Some("raw request content is not copied into receipts".into()),
+    });
+    let mut events = vec![
+        gateway_receipt_event(
+            &operation_id,
+            "intent",
+            None,
+            context.started_ms,
+            ReceiptEventKind::IntentRecorded,
+            actor,
+            BTreeMap::from([
+                ("request_id".into(), context.request_id.clone()),
+                ("request_hash".into(), context.request_hash.clone()),
+                ("request_bytes".into(), context.request_bytes.to_string()),
+            ]),
+        ),
+        context_event,
+        gateway_receipt_event(
+            &operation_id,
+            "policy",
+            Some("context"),
+            context.started_ms,
+            ReceiptEventKind::PolicyDecided,
+            "chisei.policy",
+            BTreeMap::from([
+                ("status".into(), policy_status.into()),
+                ("policy_version".into(), policy_version.clone()),
+                (
+                    "policy_scope".into(),
+                    context.policy_scope.clone().unwrap_or_default(),
+                ),
+            ]),
+        ),
+        gateway_receipt_event(
+            &operation_id,
+            "route",
+            Some("policy"),
+            context.started_ms,
+            ReceiptEventKind::RouteSelected,
+            "chisei.routing",
+            BTreeMap::from([
+                (
+                    "provider".into(),
+                    context.provider.runtime_name().to_string(),
+                ),
+                (
+                    "requested_model".into(),
+                    context.requested_model.clone().unwrap_or_default(),
+                ),
+                (
+                    "resolved_model".into(),
+                    context.resolved_model.clone().unwrap_or_default(),
+                ),
+            ]),
+        ),
+        gateway_receipt_event(
+            &operation_id,
+            "budget",
+            Some("route"),
+            context.started_ms,
+            ReceiptEventKind::BudgetDecided,
+            "chisei.budget",
+            BTreeMap::from([
+                ("status".into(), context.budget_status.clone()),
+                (
+                    "subject".into(),
+                    context.budget_subject.clone().unwrap_or_default(),
+                ),
+            ]),
+        ),
+        gateway_receipt_event(
+            &operation_id,
+            "egress",
+            Some("budget"),
+            context.started_ms,
+            ReceiptEventKind::EgressDecided,
+            "chisei.egress",
+            BTreeMap::from([(
+                "status".into(),
+                if context.egress_applied {
+                    "evaluated"
+                } else {
+                    "not_evaluated"
+                }
+                .into(),
+            )]),
+        ),
+    ];
+    let outcome_parent = if rejection.is_some() {
+        "egress"
+    } else {
+        events.extend([
+            gateway_receipt_event(
+                &operation_id,
+                "attempt-1",
+                Some("egress"),
+                context.started_ms,
+                ReceiptEventKind::AttemptStarted,
+                actor,
+                BTreeMap::from([("attempt".into(), "1".into())]),
+            ),
+            gateway_receipt_event(
+                &operation_id,
+                "model-call-1",
+                Some("attempt-1"),
+                completed_at_ms,
+                ReceiptEventKind::ModelCalled,
+                "chisei.gateway",
+                BTreeMap::from([
+                    (
+                        "input_tokens".into(),
+                        usage
+                            .map(|usage| usage.input_tokens)
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                    (
+                        "output_tokens".into(),
+                        usage
+                            .map(|usage| usage.output_tokens)
+                            .unwrap_or(0)
+                            .to_string(),
+                    ),
+                ]),
+            ),
+            gateway_receipt_event(
+                &operation_id,
+                "artifact-1",
+                Some("model-call-1"),
+                completed_at_ms,
+                ReceiptEventKind::ArtifactProduced,
+                "chisei.gateway",
+                BTreeMap::from([
+                    ("artifact_type".into(), "model_response".into()),
+                    (
+                        "observation_hash".into(),
+                        observation
+                            .map(|observation| {
+                                format!(
+                                    "{:x}",
+                                    Sha256::digest(observation.output_content.as_bytes())
+                                )
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    ("artifact_content_absent".into(), "true".into()),
+                    (
+                        "omission_reason".into(),
+                        "raw upstream response is not copied into receipts".into(),
+                    ),
+                ]),
+            ),
+            gateway_receipt_event(
+                &operation_id,
+                "verification",
+                Some("artifact-1"),
+                completed_at_ms,
+                ReceiptEventKind::VerificationRecorded,
+                "chisei.gateway",
+                BTreeMap::from([("status".into(), "not_requested".into())]),
+            ),
+        ]);
+        "verification"
+    };
+    events.push(gateway_receipt_event(
+        &operation_id,
+        "outcome",
+        Some(outcome_parent),
+        completed_at_ms,
+        ReceiptEventKind::OutcomeRecorded,
+        actor,
+        BTreeMap::from([
+            (
+                "status".into(),
+                if rejection.is_some() {
+                    "denied"
+                } else {
+                    "completed"
+                }
+                .into(),
+            ),
+            ("http_status".into(), status.as_u16().to_string()),
+            (
+                "completion_reason".into(),
+                rejection
+                    .map(|rejection| rejection.error_type.clone())
+                    .or_else(|| observation.map(|observation| observation.stop_reason.clone()))
+                    .unwrap_or_else(|| "upstream_completed".into()),
+            ),
+            (
+                "latency_ms".into(),
+                completed_at_ms
+                    .saturating_sub(context.started_ms)
+                    .to_string(),
+            ),
+        ]),
+    ));
+    OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id,
+        parent_operation_id: context.work_unit_id.clone(),
+        namespace: identity.project.clone(),
+        operation_class: "model_inference".into(),
+        initiating_actor: actor.into(),
+        schema_version: "chisei.gateway/v1".into(),
+        policy_version,
+        started_at_ms: context.started_ms,
+        completed_at_ms: Some(completed_at_ms),
+        events,
+        uncovered_surfaces: Vec::<UncoveredSurface>::new(),
+    }
+}
+
+async fn record_gateway_operation_receipt(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    context: &UsageContext,
+    status: StatusCode,
+    usage: Option<&ResponseUsage>,
+    observation: Option<&ResponseObservation>,
+    rejection: Option<&GatewayRejection>,
+) {
+    let receipt =
+        build_gateway_operation_receipt(identity, context, status, usage, observation, rejection);
+    let Ok(receipt_json) = serde_json::to_string(&receipt) else {
+        error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
+        return;
+    };
+    record_gateway_event(
+        config,
+        &identity.agent,
+        "operation.receipt.upsert",
+        "gateway operation completed",
+        if rejection.is_some() {
+            "denied"
+        } else {
+            "recorded"
+        },
+        HashMap::from([("receipt_json".into(), receipt_json)]),
+    )
+    .await;
 }
 
 async fn append_llm_calls_rows(
@@ -6502,6 +6856,105 @@ mod tests {
         assert_eq!(sanitized["key_id"], "gateway-key-1");
         assert_eq!(sanitized["request_id"], "request-1");
         assert_eq!(sanitized["input_tokens"], "42");
+    }
+
+    #[test]
+    fn gateway_success_receipt_uses_canonical_complete_shape() {
+        let identity = GatewayIdentity {
+            agent: "agent:gateway-test".into(),
+            project: "project-a".into(),
+            user_id: "user-a".into(),
+            key_id: "key-a".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        let context = UsageContext {
+            request_id: "gateway-op-1".into(),
+            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            requested_model: Some("gpt-5.5".into()),
+            resolved_model: Some("gpt-5.5".into()),
+            work_unit_id: Some("work-1".into()),
+            pipeline_spec: "private task body".into(),
+            request_bytes: 42,
+            started_ms: 100,
+            route_bias: None,
+            policy_scope: Some("project-a".into()),
+            policy_version: Some("policy-v1".into()),
+            task_class: "primary".into(),
+            request_hash: "request-hash".into(),
+            budget_subject: Some("project:project-a".into()),
+            budget_status: "allowed".into(),
+            egress_applied: true,
+        };
+        let observation = ResponseObservation {
+            output_content: "private model output".into(),
+            stop_reason: "end_turn".into(),
+        };
+        let receipt = build_gateway_operation_receipt(
+            &identity,
+            &context,
+            StatusCode::OK,
+            Some(&ResponseUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+            Some(&observation),
+            None,
+        );
+
+        assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
+        assert_eq!(receipt.initiating_actor, identity.agent);
+        assert!(receipt.completeness().complete);
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains("private task body"));
+        assert!(!serialized.contains("private model output"));
+    }
+
+    #[test]
+    fn gateway_refusal_receipt_is_terminal_and_complete() {
+        let identity = GatewayIdentity {
+            agent: "agent:gateway-test".into(),
+            project: "project-a".into(),
+            user_id: "user-a".into(),
+            key_id: "key-a".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        let context = UsageContext {
+            request_id: "gateway-op-denied".into(),
+            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            requested_model: Some("gpt-5.5".into()),
+            resolved_model: None,
+            work_unit_id: None,
+            pipeline_spec: String::new(),
+            request_bytes: 42,
+            started_ms: 100,
+            route_bias: None,
+            policy_scope: None,
+            policy_version: None,
+            task_class: "primary".into(),
+            request_hash: "request-hash".into(),
+            budget_subject: None,
+            budget_status: "not_evaluated".into(),
+            egress_applied: false,
+        };
+        let rejection =
+            GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", "request denied");
+        let receipt = build_gateway_operation_receipt(
+            &identity,
+            &context,
+            rejection.status,
+            None,
+            None,
+            Some(&rejection),
+        );
+
+        assert!(receipt.completeness().complete);
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+        }));
     }
 
     #[tokio::test]
