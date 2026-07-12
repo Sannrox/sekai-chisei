@@ -58,6 +58,13 @@ const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-c
 const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
+const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
+const MAX_BUDGET_CACHE_ENTRIES: usize = 4096;
+const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
+const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
+const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 
@@ -351,6 +358,80 @@ struct GatewayRuntime {
     global_rate_limit_requests: u64,
     rate_limit_window: Duration,
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
+    governance_cache: Arc<RwLock<GovernanceCache>>,
+    governance_cache_ttl: Duration,
+}
+
+#[derive(Default)]
+struct GovernanceCache {
+    budgets: HashMap<String, CachedBudgetDecision>,
+    policies: HashMap<String, CachedPolicyDecision>,
+    egress: HashMap<String, CachedEgressDecision>,
+    pending_budget_usage: HashMap<String, RecordUsageRequest>,
+    budget_reconciliation_saturated: bool,
+}
+
+#[derive(Clone)]
+struct CachedBudgetDecision {
+    response: CheckBudgetResponse,
+    remaining: Option<i32>,
+    cached_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedPolicyDecision {
+    resolved_model: Option<String>,
+    resolved_provider: ProviderKind,
+    route_bias: Option<String>,
+    policy_scope: Option<String>,
+    policy_version: Option<String>,
+    cached_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedEgressDecision {
+    body: Vec<u8>,
+    cached_at: Instant,
+}
+
+trait TimedGovernanceDecision {
+    fn cached_at(&self) -> Instant;
+}
+
+impl TimedGovernanceDecision for CachedBudgetDecision {
+    fn cached_at(&self) -> Instant {
+        self.cached_at
+    }
+}
+
+impl TimedGovernanceDecision for CachedPolicyDecision {
+    fn cached_at(&self) -> Instant {
+        self.cached_at
+    }
+}
+
+impl TimedGovernanceDecision for CachedEgressDecision {
+    fn cached_at(&self) -> Instant {
+        self.cached_at
+    }
+}
+
+fn prune_timed_cache<T: TimedGovernanceDecision>(
+    cache: &mut HashMap<String, T>,
+    ttl: Duration,
+    max_entries: usize,
+) {
+    cache.retain(|_, entry| entry.cached_at().elapsed() < ttl);
+    while cache.len() >= max_entries {
+        let Some(oldest) = cache
+            .iter()
+            .max_by_key(|(_, entry)| entry.cached_at().elapsed())
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
 }
 
 impl GatewayRuntime {
@@ -360,12 +441,18 @@ impl GatewayRuntime {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS));
+        let governance_cache_ttl = std::env::var("CHISEI_GATEWAY_GOVERNANCE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS));
         let mut runtime = Self::new(
             key_cache_ttl,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
         )
+        .with_governance_cache_ttl(governance_cache_ttl)
         .with_http_timeouts(HttpTimeouts::from_env());
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
@@ -393,7 +480,14 @@ impl GatewayRuntime {
             global_rate_limit_requests: DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS,
             rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            governance_cache: Arc::new(RwLock::new(GovernanceCache::default())),
+            governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
         }
+    }
+
+    fn with_governance_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.governance_cache_ttl = ttl;
+        self
     }
 
     fn with_http_timeouts(mut self, http_timeouts: HttpTimeouts) -> Self {
@@ -482,27 +576,44 @@ async fn refresh_gateway_admin(
             "invalid chisei gateway admin token",
         );
     }
-    let mut cache = state.runtime.key_cache.write().await;
-    let cleared_entries = cache.len();
-    cache.clear();
-    drop(cache);
+    let mut key_cache = state.runtime.key_cache.write().await;
+    let cleared_entries = key_cache.len();
+    key_cache.clear();
+    drop(key_cache);
+    let mut governance_cache = state.runtime.governance_cache.write().await;
+    let cleared_governance_entries = governance_cache.budgets.len()
+        + governance_cache.policies.len()
+        + governance_cache.egress.len();
+    governance_cache.budgets.clear();
+    governance_cache.policies.clear();
+    governance_cache.egress.clear();
+    let pending_budget_reconciliations = governance_cache.pending_budget_usage.len();
+    drop(governance_cache);
     record_gateway_event(
         &state.config,
         "chisei-gateway-admin",
         "gateway.admin_refresh",
         "gateway key cache refreshed",
         "allowed",
-        HashMap::from([(
-            "cleared_key_cache_entries".to_string(),
-            cleared_entries.to_string(),
-        )]),
+        HashMap::from([
+            (
+                "cleared_key_cache_entries".to_string(),
+                cleared_entries.to_string(),
+            ),
+            (
+                "cleared_governance_cache_entries".to_string(),
+                cleared_governance_entries.to_string(),
+            ),
+        ]),
     )
     .await;
     json_response(
         StatusCode::OK,
         serde_json::json!({
             "refreshed": true,
-            "cleared_key_cache_entries": cleared_entries
+            "cleared_key_cache_entries": cleared_entries,
+            "cleared_governance_cache_entries": cleared_governance_entries,
+            "pending_budget_reconciliations": pending_budget_reconciliations
         }),
     )
 }
@@ -672,6 +783,7 @@ async fn proxy_gateway(
     } else {
         let budget = match check_budget_preflight(
             &state.config,
+            &state.runtime,
             &identity,
             request_bytes,
             work_unit_id.as_deref().unwrap_or(""),
@@ -690,6 +802,7 @@ async fn proxy_gateway(
         };
         let resolved = match resolve_policy_preflight(
             &state.config,
+            &state.runtime,
             &identity,
             client_provider,
             &body,
@@ -740,6 +853,7 @@ async fn proxy_gateway(
         };
         let egress = match apply_context_egress(
             &state.config,
+            &state.runtime,
             &identity,
             client_provider,
             &resolved.body,
@@ -823,6 +937,7 @@ async fn proxy_gateway(
             response_from_upstream(
                 resp,
                 &state.config,
+                &state.runtime,
                 &identity,
                 UsageContext {
                     request_id,
@@ -961,8 +1076,10 @@ impl GatewayRejection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_budget_preflight(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     request_bytes: usize,
     work_unit: &str,
@@ -973,6 +1090,18 @@ async fn check_budget_preflight(
     let Some(target) = &config.chisei_grpc_target else {
         return Ok(BudgetPreflight::default());
     };
+    if runtime
+        .governance_cache
+        .read()
+        .await
+        .budget_reconciliation_saturated
+    {
+        return Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_reconciliation_required",
+            "budget usage overflow requires operator reconciliation before admission resumes",
+        ));
+    }
     let estimated_tokens = estimate_tokens_from_bytes(request_bytes);
 
     let base_budget_request = CheckBudgetRequest {
@@ -990,14 +1119,38 @@ async fn check_budget_preflight(
     };
 
     let check_budget = |req: CheckBudgetRequest| async move {
+        let cache_key = budget_cache_key(&req);
         match connect_sekai(target).await {
             Ok(channel) => {
                 let mut client = ChiseiServiceClient::new(channel);
+                if let Err(err) = reconcile_cached_budget_usage(runtime, &mut client).await {
+                    if let Some(response) = reserve_cached_budget(runtime, &cache_key, &req).await {
+                        record_gateway_decision(
+                            config,
+                            identity,
+                            "gateway.budget_last_known",
+                            &format!("budget reconciliation unavailable: {err}"),
+                            "reserved",
+                            HashMap::from([("metric".to_string(), req.metric.clone())]),
+                        )
+                        .await;
+                        return Ok(response);
+                    }
+                    governance_error(
+                        config,
+                        identity,
+                        failure_posture,
+                        &format!("budget reconciliation failed: {err}"),
+                    )
+                    .await?;
+                }
                 let estimated_tokens = req.estimated_tokens;
                 let budget_subject = audit_budget_subject(&req);
-                match client.check_budget(GrpcRequest::new(req)).await {
+                match client.check_budget(GrpcRequest::new(req.clone())).await {
                     Ok(resp) => {
                         let resp = resp.into_inner();
+                        cache_budget_decision(runtime, cache_key, &resp, req.estimated_tokens)
+                            .await;
                         let provisional_local_free = !resp.allowed
                             && resp.route_bias == "local_free"
                             && resp.degradation_level == "local_free";
@@ -1065,6 +1218,20 @@ async fn check_budget_preflight(
                         }
                     }
                     Err(err) => {
+                        if let Some(response) =
+                            reserve_cached_budget(runtime, &cache_key, &req).await
+                        {
+                            record_gateway_decision(
+                                config,
+                                identity,
+                                "gateway.budget_last_known",
+                                &format!("CheckBudget unavailable: {err}"),
+                                "reserved",
+                                HashMap::from([("metric".to_string(), req.metric.clone())]),
+                            )
+                            .await;
+                            return Ok(response);
+                        }
                         governance_error(
                             config,
                             identity,
@@ -1083,6 +1250,18 @@ async fn check_budget_preflight(
                 }
             }
             Err(err) => {
+                if let Some(response) = reserve_cached_budget(runtime, &cache_key, &req).await {
+                    record_gateway_decision(
+                        config,
+                        identity,
+                        "gateway.budget_last_known",
+                        &format!("control plane unavailable: {err}"),
+                        "reserved",
+                        HashMap::from([("metric".to_string(), req.metric.clone())]),
+                    )
+                    .await;
+                    return Ok(response);
+                }
                 governance_error(
                     config,
                     identity,
@@ -1142,6 +1321,312 @@ struct PolicyPreflight {
 #[derive(Debug, Clone)]
 struct ContextEgressPreflight {
     body: Vec<u8>,
+}
+
+fn governance_cache_key(parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn budget_cache_key(req: &CheckBudgetRequest) -> String {
+    let mid_task = if req.mid_task { "true" } else { "false" };
+    let local_free_available = if req.local_free_available {
+        "true"
+    } else {
+        "false"
+    };
+    governance_cache_key(&[
+        "budget-v1",
+        &req.subject,
+        &req.project,
+        &req.agent,
+        &req.key_id,
+        &req.work_unit,
+        &req.user_id,
+        &req.metric,
+        &req.task_class,
+        mid_task,
+        local_free_available,
+    ])
+}
+
+async fn cache_budget_decision(
+    runtime: &GatewayRuntime,
+    key: String,
+    response: &CheckBudgetResponse,
+    reserved: i32,
+) {
+    let Some(usage) = response.usage.as_ref() else {
+        return;
+    };
+    if !response.allowed {
+        return;
+    }
+    let mut cache = runtime.governance_cache.write().await;
+    prune_timed_cache(
+        &mut cache.budgets,
+        runtime.governance_cache_ttl,
+        MAX_BUDGET_CACHE_ENTRIES,
+    );
+    cache.budgets.insert(
+        key,
+        CachedBudgetDecision {
+            response: response.clone(),
+            remaining: (usage.max_tokens > 0).then(|| {
+                usage
+                    .max_tokens
+                    .saturating_sub(usage.tokens_used)
+                    .saturating_sub(reserved)
+            }),
+            cached_at: Instant::now(),
+        },
+    );
+}
+
+async fn reserve_cached_budget(
+    runtime: &GatewayRuntime,
+    key: &str,
+    request: &CheckBudgetRequest,
+) -> Option<CheckBudgetResponse> {
+    let mut cache = runtime.governance_cache.write().await;
+    if cache.budget_reconciliation_saturated {
+        return None;
+    }
+    let entry = cache.budgets.get_mut(key)?;
+    if entry.cached_at.elapsed() >= runtime.governance_cache_ttl {
+        return None;
+    }
+    if let Some(remaining) = entry.remaining.as_mut() {
+        if *remaining < request.estimated_tokens {
+            return None;
+        }
+        // Token responses can substantially exceed their prompt estimate. A
+        // finite last-known token decision therefore grants at most one
+        // outage request; request-count decisions remain exactly reservable.
+        if request.metric.is_empty() {
+            *remaining = 0;
+        } else {
+            *remaining -= request.estimated_tokens;
+        }
+    }
+    let mut response = entry.response.clone();
+    response.warning = true;
+    response.degradation_level = "last_known".to_string();
+    Some(response)
+}
+
+async fn queue_pending_budget_usage(
+    runtime: &GatewayRuntime,
+    requests: impl IntoIterator<Item = RecordUsageRequest>,
+) -> bool {
+    let mut cache = runtime.governance_cache.write().await;
+    let mut accepted = true;
+    for request in requests {
+        let key = usage_reconciliation_key(&request);
+        if cache.pending_budget_usage.contains_key(&key) {
+            continue;
+        } else if cache.pending_budget_usage.len() < MAX_PENDING_BUDGET_RECONCILIATIONS {
+            cache.pending_budget_usage.insert(key, request);
+        } else {
+            cache.budget_reconciliation_saturated = true;
+            accepted = false;
+        }
+    }
+    accepted
+}
+
+fn usage_reconciliation_key(request: &RecordUsageRequest) -> String {
+    if !request.idempotency_key.is_empty() {
+        return request.idempotency_key.clone();
+    }
+    governance_cache_key(&[
+        "usage-reconciliation-v1",
+        &request.subject,
+        &request.project,
+        &request.agent,
+        &request.key_id,
+        &request.work_unit,
+        &request.user_id,
+        &request.metric,
+    ])
+}
+
+async fn reconcile_cached_budget_usage(
+    runtime: &GatewayRuntime,
+    client: &mut ChiseiServiceClient<GatewayClient>,
+) -> Result<usize, tonic::Status> {
+    let pending = {
+        let mut cache = runtime.governance_cache.write().await;
+        std::mem::take(&mut cache.pending_budget_usage)
+            .into_values()
+            .collect::<Vec<_>>()
+    };
+    let mut reconciled = 0usize;
+    for (index, request) in pending.iter().cloned().enumerate() {
+        if let Err(status) = client.record_usage(gateway_request(request)).await {
+            let mut cache = runtime.governance_cache.write().await;
+            for request in pending[index..].iter().cloned() {
+                let key = usage_reconciliation_key(&request);
+                cache.pending_budget_usage.insert(key, request);
+            }
+            return Err(status);
+        }
+        reconciled += 1;
+    }
+    // Saturation means at least one usage event was not retained. It is
+    // intentionally sticky: only operator reconciliation plus restart can
+    // safely restore admissions without silently accepting an undercount.
+    Ok(reconciled)
+}
+
+fn policy_cache_key(
+    identity: &GatewayIdentity,
+    provider: ProviderKind,
+    requested_model: &str,
+    task_class: &str,
+    budget: &BudgetPreflight,
+) -> String {
+    governance_cache_key(&[
+        "policy-v1",
+        &identity.project,
+        &identity.agent,
+        &identity.key_id,
+        provider.runtime_name(),
+        requested_model,
+        task_class,
+        budget.route_bias.as_deref().unwrap_or_default(),
+    ])
+}
+
+async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: &PolicyPreflight) {
+    let mut cache = runtime.governance_cache.write().await;
+    prune_timed_cache(
+        &mut cache.policies,
+        runtime.governance_cache_ttl,
+        MAX_POLICY_CACHE_ENTRIES,
+    );
+    cache.policies.insert(
+        key,
+        CachedPolicyDecision {
+            resolved_model: decision.resolved_model.clone(),
+            resolved_provider: decision.resolved_provider,
+            route_bias: decision.route_bias.clone(),
+            policy_scope: decision.policy_scope.clone(),
+            policy_version: decision.policy_version.clone(),
+            cached_at: Instant::now(),
+        },
+    );
+}
+
+async fn cached_policy_decision(
+    runtime: &GatewayRuntime,
+    key: &str,
+    body: &[u8],
+    requested_model: &str,
+) -> Option<PolicyPreflight> {
+    let cache = runtime.governance_cache.read().await;
+    let cached = cache.policies.get(key)?;
+    if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
+        return None;
+    }
+    let body = match cached.resolved_model.as_deref() {
+        Some(resolved) if resolved != requested_model => {
+            rewrite_request_model(body, resolved).ok()?
+        }
+        _ => body.to_vec(),
+    };
+    Some(PolicyPreflight {
+        body,
+        resolved_model: cached.resolved_model.clone(),
+        resolved_provider: cached.resolved_provider,
+        route_bias: cached.route_bias.clone(),
+        policy_scope: cached.policy_scope.clone(),
+        policy_version: cached.policy_version.clone(),
+    })
+}
+
+fn egress_cache_key(
+    identity: &GatewayIdentity,
+    provider: ProviderKind,
+    body: &[u8],
+    context_request: Option<&GatewayContextRequest>,
+) -> String {
+    let context = context_request
+        .map(|request| format!("{request:?}"))
+        .unwrap_or_default();
+    let body_digest = format!("{:x}", Sha256::digest(body));
+    governance_cache_key(&[
+        "egress-v1",
+        &identity.project,
+        identity.context_principal(),
+        &identity.user_id,
+        &identity.agent,
+        &identity.key_id,
+        provider.runtime_name(),
+        &body_digest,
+        &context,
+    ])
+}
+
+async fn cache_egress_decision(
+    runtime: &GatewayRuntime,
+    key: String,
+    decision: &ContextEgressPreflight,
+) {
+    if decision.body.len() > MAX_CACHED_EGRESS_BODY_BYTES {
+        return;
+    }
+    let mut cache = runtime.governance_cache.write().await;
+    prune_timed_cache(
+        &mut cache.egress,
+        runtime.governance_cache_ttl,
+        MAX_EGRESS_CACHE_ENTRIES,
+    );
+    let mut cached_bytes = cache
+        .egress
+        .values()
+        .map(|entry| entry.body.len())
+        .sum::<usize>();
+    while !cache.egress.is_empty()
+        && cached_bytes.saturating_add(decision.body.len()) > MAX_EGRESS_CACHE_BYTES
+    {
+        let Some(oldest) = cache
+            .egress
+            .iter()
+            .max_by_key(|(_, entry)| entry.cached_at.elapsed())
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = cache.egress.remove(&oldest) {
+            cached_bytes = cached_bytes.saturating_sub(removed.body.len());
+        }
+    }
+    cache.egress.insert(
+        key,
+        CachedEgressDecision {
+            body: decision.body.clone(),
+            cached_at: Instant::now(),
+        },
+    );
+}
+
+async fn cached_egress_decision(
+    runtime: &GatewayRuntime,
+    key: &str,
+) -> Option<ContextEgressPreflight> {
+    let cache = runtime.governance_cache.read().await;
+    let cached = cache.egress.get(key)?;
+    if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
+        return None;
+    }
+    Some(ContextEgressPreflight {
+        body: cached.body.clone(),
+    })
 }
 
 const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
@@ -1257,6 +1742,7 @@ struct RawGatewayContextRetrieval {
 #[allow(clippy::too_many_arguments)]
 async fn resolve_policy_preflight(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     provider: ProviderKind,
     body: &[u8],
@@ -1277,6 +1763,7 @@ async fn resolve_policy_preflight(
             policy_version: None,
         });
     };
+    let cache_key = policy_cache_key(identity, provider, requested_model, task_class, budget);
     let Some(target) = &config.chisei_grpc_target else {
         return Ok(PolicyPreflight {
             body: body.to_vec(),
@@ -1412,7 +1899,7 @@ async fn resolve_policy_preflight(
                         .await;
                         rewritten
                     };
-                    Ok(PolicyPreflight {
+                    let decision = PolicyPreflight {
                         body: next_body,
                         resolved_model: Some(resolution.model),
                         resolved_provider,
@@ -1421,7 +1908,9 @@ async fn resolve_policy_preflight(
                             .filter(|scope| !scope.is_empty()),
                         policy_version: Some(resolution.policy_version)
                             .filter(|version| !version.is_empty()),
-                    })
+                    };
+                    cache_policy_decision(runtime, cache_key, &decision).await;
+                    Ok(decision)
                 }
                 Err(err) if err.code() == tonic::Code::InvalidArgument => {
                     policy_denied(
@@ -1467,6 +1956,23 @@ async fn resolve_policy_preflight(
                     ))
                 }
                 Err(err) => {
+                    if let Some(decision) =
+                        cached_policy_decision(runtime, &cache_key, body, requested_model).await
+                    {
+                        record_gateway_decision(
+                            config,
+                            identity,
+                            "gateway.policy_last_known",
+                            &format!("ResolvePolicy unavailable: {err}"),
+                            "enforced",
+                            HashMap::from([(
+                                "requested_model".to_string(),
+                                requested_model.to_string(),
+                            )]),
+                        )
+                        .await;
+                        return Ok(decision);
+                    }
                     governance_error(
                         config,
                         identity,
@@ -1486,6 +1992,20 @@ async fn resolve_policy_preflight(
             }
         }
         Err(err) => {
+            if let Some(decision) =
+                cached_policy_decision(runtime, &cache_key, body, requested_model).await
+            {
+                record_gateway_decision(
+                    config,
+                    identity,
+                    "gateway.policy_last_known",
+                    &format!("control plane unavailable: {err}"),
+                    "enforced",
+                    HashMap::from([("requested_model".to_string(), requested_model.to_string())]),
+                )
+                .await;
+                return Ok(decision);
+            }
             governance_error(
                 config,
                 identity,
@@ -2452,6 +2972,7 @@ async fn gateway_context_expansion_gate(
 #[allow(clippy::too_many_arguments)]
 async fn apply_context_egress(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     provider: ProviderKind,
     body: &[u8],
@@ -2462,7 +2983,20 @@ async fn apply_context_egress(
     work_unit_id: Option<&str>,
     failure_posture: &GovernanceFailurePosture,
 ) -> Result<ContextEgressPreflight, Response<Body>> {
+    let cache_key = egress_cache_key(identity, provider, body, context_request);
     let Some(target) = &config.chisei_grpc_target else {
+        if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
+            record_gateway_decision(
+                config,
+                identity,
+                "gateway.egress_last_known",
+                "control-plane governance is not configured",
+                "enforced",
+                HashMap::new(),
+            )
+            .await;
+            return Ok(decision);
+        }
         if context_request.is_some() {
             return Err(json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2492,14 +3026,26 @@ async fn apply_context_egress(
     }
     let channel = match connect_sekai(target).await {
         Ok(channel) => channel,
-        Err(error) if context_request.is_some() || failure_posture.fail_closed => {
-            return Err(json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                &format!("failed to resolve governed context: {error}"),
-            ));
-        }
-        Err(_) => {
+        Err(error) => {
+            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
+                record_gateway_decision(
+                    config,
+                    identity,
+                    "gateway.egress_last_known",
+                    &format!("control plane unavailable: {error}"),
+                    "enforced",
+                    HashMap::new(),
+                )
+                .await;
+                return Ok(decision);
+            }
+            if context_request.is_some() || failure_posture.fail_closed {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    &format!("failed to resolve governed context: {error}"),
+                ));
+            }
             return Ok(ContextEgressPreflight {
                 body: body.to_vec(),
             });
@@ -2522,14 +3068,26 @@ async fn apply_context_egress(
         .await
     {
         Ok(response) => restricted_gateway_fields(response.into_inner().types),
-        Err(status) if context_request.is_some() || failure_posture.fail_closed => {
-            return Err(json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                &format!("failed to resolve context schema: {status}"),
-            ));
-        }
-        Err(_) => {
+        Err(status) => {
+            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
+                record_gateway_decision(
+                    config,
+                    identity,
+                    "gateway.egress_last_known",
+                    &format!("context schema unavailable: {status}"),
+                    "enforced",
+                    HashMap::new(),
+                )
+                .await;
+                return Ok(decision);
+            }
+            if context_request.is_some() || failure_posture.fail_closed {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    &format!("failed to resolve context schema: {status}"),
+                ));
+            }
             return Ok(ContextEgressPreflight {
                 body: body.to_vec(),
             });
@@ -2568,14 +3126,26 @@ async fn apply_context_egress(
                 &format!("governed context root not found: {status}"),
             ));
         }
-        Err(status) if context_request.is_some() || failure_posture.fail_closed => {
-            return Err(json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                &format!("failed to resolve governed context: {status}"),
-            ));
-        }
-        Err(_) => {
+        Err(status) => {
+            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
+                record_gateway_decision(
+                    config,
+                    identity,
+                    "gateway.egress_last_known",
+                    &format!("context resolution unavailable: {status}"),
+                    "enforced",
+                    HashMap::new(),
+                )
+                .await;
+                return Ok(decision);
+            }
+            if context_request.is_some() || failure_posture.fail_closed {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    &format!("failed to resolve governed context: {status}"),
+                ));
+            }
             return Ok(ContextEgressPreflight {
                 body: body.to_vec(),
             });
@@ -2693,9 +3263,11 @@ async fn apply_context_egress(
         && truncated_links == 0
         && missing_field_count == 0
     {
-        return Ok(ContextEgressPreflight {
+        let decision = ContextEgressPreflight {
             body: body.to_vec(),
-        });
+        };
+        cache_egress_decision(runtime, cache_key, &decision).await;
+        return Ok(decision);
     }
     let mut rewritten = false;
     // Bound the injected object context so precision-injection never balloons
@@ -2867,7 +3439,9 @@ async fn apply_context_egress(
         ]),
     )
     .await;
-    Ok(ContextEgressPreflight { body: next_body })
+    let decision = ContextEgressPreflight { body: next_body };
+    cache_egress_decision(runtime, cache_key, &decision).await;
+    Ok(decision)
 }
 
 fn restricted_gateway_fields(
@@ -4104,6 +4678,7 @@ fn upstream_auth_mode(
 
 async fn record_usage_and_append(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     usage: Option<ResponseUsage>,
     response_observation: Option<ResponseObservation>,
@@ -4115,42 +4690,52 @@ async fn record_usage_and_append(
     };
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let total_tokens = usage.as_ref().map(|usage| usage.total_tokens).unwrap_or(0);
+    let request_usage = RecordUsageRequest {
+        user_id: identity.user_id.clone(),
+        tokens_used: 1,
+        subject: String::new(),
+        project: identity.project.clone(),
+        agent: identity.agent.clone(),
+        key_id: identity.key_id.clone(),
+        work_unit: context.work_unit_id.clone().unwrap_or_default(),
+        metric: METRIC_REQUESTS.to_string(),
+        idempotency_key: format!("gateway-usage:{}:requests", context.request_id),
+    };
+    let token_usage = (total_tokens > 0).then(|| RecordUsageRequest {
+        user_id: identity.user_id.clone(),
+        tokens_used: total_tokens,
+        subject: String::new(),
+        project: identity.project.clone(),
+        agent: identity.agent.clone(),
+        key_id: identity.key_id.clone(),
+        work_unit: context.work_unit_id.clone().unwrap_or_default(),
+        metric: String::new(),
+        idempotency_key: format!("gateway-usage:{}:tokens", context.request_id),
+    });
     match connect_sekai(target).await {
         Ok(channel) => {
             let mut chisei = ChiseiServiceClient::new(channel.clone());
             if let Err(err) = chisei
-                .record_usage(GrpcRequest::new(RecordUsageRequest {
-                    user_id: identity.user_id.clone(),
-                    tokens_used: 1,
-                    subject: String::new(),
-                    project: identity.project.clone(),
-                    agent: identity.agent.clone(),
-                    key_id: identity.key_id.clone(),
-                    work_unit: context.work_unit_id.clone().unwrap_or_default(),
-                    metric: METRIC_REQUESTS.to_string(),
-                }))
+                .record_usage(GrpcRequest::new(request_usage.clone()))
                 .await
             {
                 warn!(error = %err, "chisei-gateway request-count usage record failed");
+                if !queue_pending_budget_usage(runtime, [request_usage.clone()]).await {
+                    error!("chisei-gateway budget reconciliation queue is saturated");
+                }
             }
-            if total_tokens > 0 {
+            if let Some(token_usage) = token_usage.as_ref() {
                 // Empty `subject` lets the server walk the same
                 // project -> agent -> work_unit chain as the preflight check
                 // and deduct at every ancestor level in one call.
                 if let Err(err) = chisei
-                    .record_usage(GrpcRequest::new(RecordUsageRequest {
-                        user_id: identity.user_id.clone(),
-                        tokens_used: total_tokens,
-                        subject: String::new(),
-                        project: identity.project.clone(),
-                        agent: identity.agent.clone(),
-                        key_id: identity.key_id.clone(),
-                        work_unit: context.work_unit_id.clone().unwrap_or_default(),
-                        metric: String::new(),
-                    }))
+                    .record_usage(GrpcRequest::new(token_usage.clone()))
                     .await
                 {
                     warn!(error = %err, "chisei-gateway usage record failed");
+                    if !queue_pending_budget_usage(runtime, [token_usage.clone()]).await {
+                        error!("chisei-gateway budget reconciliation queue is saturated");
+                    }
                 } else {
                     let warning_config = config.clone();
                     let warning_identity = identity.clone();
@@ -4301,6 +4886,16 @@ async fn record_usage_and_append(
             record_gateway_pipeline_decision(config, identity, context, pipeline_observation).await;
         }
         Err(err) => {
+            if !queue_pending_budget_usage(
+                runtime,
+                std::iter::once(request_usage).chain(token_usage),
+            )
+            .await
+            {
+                error!(
+                    "chisei-gateway budget reconciliation queue saturated; cached budget admission disabled"
+                );
+            }
             warn!(error = %err, "chisei-gateway usage append skipped; Chisei unavailable");
         }
     }
@@ -5440,6 +6035,7 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 async fn response_from_upstream(
     upstream: reqwest::Response,
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     context: UsageContext,
     response_adapter: ResponseAdapter,
@@ -5480,6 +6076,7 @@ async fn response_from_upstream(
         }
         let translate = response_adapter == ResponseAdapter::OpenAiChatStreamToAnthropicMessage;
         let config = config.clone();
+        let runtime = runtime.clone();
         let identity = identity.clone();
         let context = context.clone();
         let model = context.resolved_model.clone().unwrap_or_default();
@@ -5534,7 +6131,16 @@ async fn response_from_upstream(
                 }
             }
             let (usage, observation) = usage_tap.finish();
-            record_usage_and_append(&config, &identity, usage, observation, &context, status).await;
+            record_usage_and_append(
+                &config,
+                &runtime,
+                &identity,
+                usage,
+                observation,
+                &context,
+                status,
+            )
+            .await;
         });
         let stream = ReceiverStream::new(rx);
         return builder
@@ -5551,7 +6157,16 @@ async fn response_from_upstream(
     match upstream.bytes().await {
         Ok(bytes) => {
             let (usage, observation) = extract_buffered_body_usage(&bytes);
-            record_usage_and_append(config, identity, usage, observation, &context, status).await;
+            record_usage_and_append(
+                config,
+                runtime,
+                identity,
+                usage,
+                observation,
+                &context,
+                status,
+            )
+            .await;
             let body = match response_adapter {
                 ResponseAdapter::Passthrough => bytes.to_vec(),
                 // Both cross-provider adapters map a buffered OpenAI chat body to
@@ -5874,6 +6489,263 @@ mod tests {
         assert!(
             GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
                 .fail_closed
+        );
+    }
+
+    #[tokio::test]
+    async fn last_known_budget_reservations_are_conservative_without_eager_usage() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_governance_cache_ttl(Duration::from_secs(60));
+        let request = CheckBudgetRequest {
+            user_id: "agent:safe-agent".into(),
+            estimated_tokens: 10,
+            subject: String::new(),
+            project: "default".into(),
+            agent: "safe-agent".into(),
+            key_id: "safe-agent".into(),
+            work_unit: String::new(),
+            metric: String::new(),
+            task_class: "primary".into(),
+            mid_task: false,
+            local_free_available: false,
+        };
+        let key = budget_cache_key(&request);
+        cache_budget_decision(
+            &runtime,
+            key.clone(),
+            &CheckBudgetResponse {
+                allowed: true,
+                usage: Some(crate::grpc::pb::chisei::BudgetUsage {
+                    user_id: request.user_id.clone(),
+                    tokens_used: 20,
+                    max_tokens: 100,
+                    period_type: "daily".into(),
+                    period_start: 0,
+                }),
+                route_bias: String::new(),
+                degradation_level: "capable".into(),
+                warning: false,
+            },
+            request.estimated_tokens,
+        )
+        .await;
+
+        let mut outage_request = request.clone();
+        outage_request.estimated_tokens = 30;
+        let response = reserve_cached_budget(&runtime, &key, &outage_request)
+            .await
+            .expect("last-known headroom should admit a bounded reservation");
+        assert_eq!(response.degradation_level, "last_known");
+        assert!(response.warning);
+
+        outage_request.estimated_tokens = 50;
+        assert!(
+            reserve_cached_budget(&runtime, &key, &outage_request)
+                .await
+                .is_none()
+        );
+        let cache = runtime.governance_cache.read().await;
+        assert_eq!(cache.budgets[&key].remaining, Some(0));
+        assert!(cache.pending_budget_usage.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unlimited_last_known_budget_remains_admissible() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_governance_cache_ttl(Duration::from_secs(60));
+        let request = CheckBudgetRequest {
+            user_id: "agent:safe-agent".into(),
+            estimated_tokens: 1,
+            subject: String::new(),
+            project: "default".into(),
+            agent: "safe-agent".into(),
+            key_id: "safe-agent".into(),
+            work_unit: String::new(),
+            metric: METRIC_REQUESTS.into(),
+            task_class: "primary".into(),
+            mid_task: false,
+            local_free_available: false,
+        };
+        let key = budget_cache_key(&request);
+        cache_budget_decision(
+            &runtime,
+            key.clone(),
+            &CheckBudgetResponse {
+                allowed: true,
+                usage: Some(crate::grpc::pb::chisei::BudgetUsage {
+                    user_id: request.user_id.clone(),
+                    tokens_used: 0,
+                    max_tokens: 0,
+                    period_type: "daily".into(),
+                    period_start: 0,
+                }),
+                route_bias: String::new(),
+                degradation_level: "capable".into(),
+                warning: false,
+            },
+            request.estimated_tokens,
+        )
+        .await;
+
+        assert!(
+            reserve_cached_budget(&runtime, &key, &request)
+                .await
+                .is_some()
+        );
+        assert!(
+            reserve_cached_budget(&runtime, &key, &request)
+                .await
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn budget_cache_key_covers_all_governance_inputs() {
+        let request = CheckBudgetRequest {
+            user_id: "agent:safe-agent".into(),
+            estimated_tokens: 10,
+            subject: String::new(),
+            project: "default".into(),
+            agent: "safe-agent".into(),
+            key_id: "safe-agent".into(),
+            work_unit: String::new(),
+            metric: String::new(),
+            task_class: "primary".into(),
+            mid_task: false,
+            local_free_available: false,
+        };
+        let baseline = budget_cache_key(&request);
+        assert_ne!(
+            baseline,
+            budget_cache_key(&CheckBudgetRequest {
+                mid_task: true,
+                ..request.clone()
+            })
+        );
+        assert_ne!(
+            baseline,
+            budget_cache_key(&CheckBudgetRequest {
+                local_free_available: true,
+                ..request
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_budget_reconciliation_is_deduplicated_and_bounded() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        let usage = |work_unit: String, tokens_used| RecordUsageRequest {
+            user_id: "agent:safe-agent".into(),
+            tokens_used,
+            subject: String::new(),
+            project: "default".into(),
+            agent: "safe-agent".into(),
+            key_id: "safe-agent".into(),
+            work_unit: work_unit.clone(),
+            metric: String::new(),
+            idempotency_key: format!("test-usage-{work_unit}"),
+        };
+        assert!(
+            queue_pending_budget_usage(
+                &runtime,
+                [usage("same".into(), 2), usage("same".into(), 3)],
+            )
+            .await
+        );
+        {
+            let cache = runtime.governance_cache.read().await;
+            assert_eq!(cache.pending_budget_usage.len(), 1);
+            assert_eq!(
+                cache
+                    .pending_budget_usage
+                    .values()
+                    .next()
+                    .unwrap()
+                    .tokens_used,
+                2
+            );
+        }
+        for index in 1..MAX_PENDING_BUDGET_RECONCILIATIONS {
+            assert!(
+                queue_pending_budget_usage(&runtime, [usage(format!("work-{index}"), 1)],).await
+            );
+        }
+        assert!(!queue_pending_budget_usage(&runtime, [usage("overflow".into(), 1)]).await);
+        let cache = runtime.governance_cache.read().await;
+        assert_eq!(
+            cache.pending_budget_usage.len(),
+            MAX_PENDING_BUDGET_RECONCILIATIONS
+        );
+        assert!(cache.budget_reconciliation_saturated);
+    }
+
+    #[tokio::test]
+    async fn stale_governance_decisions_are_not_reused() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_governance_cache_ttl(Duration::ZERO);
+        let policy = PolicyPreflight {
+            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
+            resolved_model: Some("gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+        };
+        cache_policy_decision(&runtime, "policy".into(), &policy).await;
+        cache_egress_decision(
+            &runtime,
+            "egress".into(),
+            &ContextEgressPreflight {
+                body: b"filtered".to_vec(),
+            },
+        )
+        .await;
+
+        assert!(
+            cached_policy_decision(&runtime, "policy", &policy.body, "gpt-5.5")
+                .await
+                .is_none()
+        );
+        assert!(cached_egress_decision(&runtime, "egress").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_egress_bodies_are_not_cached() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        cache_egress_decision(
+            &runtime,
+            "oversized".into(),
+            &ContextEgressPreflight {
+                body: vec![b'x'; MAX_CACHED_EGRESS_BODY_BYTES + 1],
+            },
+        )
+        .await;
+        assert!(runtime.governance_cache.read().await.egress.is_empty());
+    }
+
+    #[test]
+    fn egress_cache_is_scoped_to_the_authorized_principal() {
+        let identity = |agent: &str| GatewayIdentity {
+            agent: agent.into(),
+            project: "default".into(),
+            user_id: format!("agent:{agent}"),
+            key_id: String::new(),
+            tier: "low-risk".into(),
+        };
+        let body = br#"{"model":"gpt-5.5","input":"ticker:AAPL"}"#;
+        assert_ne!(
+            egress_cache_key(
+                &identity("agent-a"),
+                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+                body,
+                None,
+            ),
+            egress_cache_key(
+                &identity("agent-b"),
+                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+                body,
+                None,
+            )
         );
     }
 
@@ -9356,6 +10228,7 @@ mod tests {
         };
         let failure_posture =
             GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new());
+        let runtime = GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None);
         let request = GatewayContextRequest {
             objects: vec![GatewayContextObject {
                 root: GatewayContextRoot::External("ticker:missing".into()),
@@ -9366,6 +10239,7 @@ mod tests {
 
         let response = apply_context_egress(
             &config,
+            &runtime,
             &identity,
             ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             br#"{"model":"gpt-5.5","input":"analyze"}"#,
@@ -9398,6 +10272,7 @@ mod tests {
         };
         let response = apply_context_egress(
             &config,
+            &runtime,
             &identity,
             ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             br#"{"model":"gpt-5.5","input":"analyze"}"#,
