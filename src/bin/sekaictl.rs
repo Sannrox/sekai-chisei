@@ -9,6 +9,9 @@ use sekai_chisei::gateway_report::{GatewayReportConfig, report_usage, run_report
 use sekai_chisei::gateway_setup::{
     GatewaySetupConfig, key_usage, run_gateway_key_command, run_setup, usage as setup_usage,
 };
+use sekai_chisei::grpc::client::connect_sekai;
+use sekai_chisei::grpc::pb::sekai::GetProvenanceReportRequest;
+use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::launch::{LaunchConfig, run_launch, usage as launch_usage};
 
 #[tokio::main]
@@ -45,18 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let work_unit = args
                 .get(1)
                 .ok_or_else(|| std::io::Error::other("usage: sekaictl provenance <work-unit>"))?;
-            let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/sekai.db".into());
-            if !std::path::Path::new(&db_path).is_file() {
-                return Err(std::io::Error::other(format!(
-                    "control-plane database does not exist: {db_path}"
-                ))
-                .into());
-            }
-            let db =
-                sekai_chisei::db::sekai::SekaiDb::new(&db_path).map_err(std::io::Error::other)?;
-            let report = sekai_chisei::provenance::assemble_report(&db, work_unit)
-                .map_err(std::io::Error::other)?;
-            print!("{}", sekai_chisei::provenance::render_text(&report));
+            let target = std::env::var("CHISEI_GRPC_URL")
+                .or_else(|_| std::env::var("SEKAI_SOCKET"))
+                .unwrap_or_else(|_| "./data/sekai.sock".into());
+            let channel = connect_sekai(&target).await?;
+            let report = SekaiServiceClient::new(channel)
+                .get_provenance_report(GetProvenanceReportRequest {
+                    work_unit_id: work_unit.clone(),
+                })
+                .await?
+                .into_inner();
+            print!("{}", report.report);
             Ok(())
         }
         other => {
@@ -82,36 +84,48 @@ async fn run_credential_command(
     let command = parse_credential_command(args)?;
     match command {
         CredentialCommand::Create { principal } => {
-            let token = create_credential(&principal).map_err(std::io::Error::other)?;
+            let token = create_credential(&principal)
+                .await
+                .map_err(std::io::Error::other)?;
             println!("{}", token);
         }
         CredentialCommand::Rotate { principal } => {
-            let token = rotate_credential(&principal).map_err(std::io::Error::other)?;
+            let token = rotate_credential(&principal)
+                .await
+                .map_err(std::io::Error::other)?;
             println!("{}", token);
         }
         CredentialCommand::Revoke { principal } => {
-            revoke_credential(&principal).map_err(std::io::Error::other)?;
+            revoke_credential(&principal)
+                .await
+                .map_err(std::io::Error::other)?;
         }
         CredentialCommand::BulkCreate { principals } => {
             for principal in principals {
-                let token = create_credential(&principal).map_err(std::io::Error::other)?;
+                let token = create_credential(&principal)
+                    .await
+                    .map_err(std::io::Error::other)?;
                 println!("{principal}\t{token}");
             }
         }
         CredentialCommand::BulkRotate { principals } => {
             for principal in principals {
-                let token = rotate_credential(&principal).map_err(std::io::Error::other)?;
+                let token = rotate_credential(&principal)
+                    .await
+                    .map_err(std::io::Error::other)?;
                 println!("{principal}\t{token}");
             }
         }
         CredentialCommand::BulkRevoke { principals } => {
             for principal in principals {
-                revoke_credential(&principal).map_err(std::io::Error::other)?;
+                revoke_credential(&principal)
+                    .await
+                    .map_err(std::io::Error::other)?;
                 println!("{principal}\trevoked");
             }
         }
         CredentialCommand::List => {
-            let credentials = list_credentials().map_err(std::io::Error::other)?;
+            let credentials = list_credentials().await.map_err(std::io::Error::other)?;
             println!("principal\tstatus\tcreated\trotated_at");
             for credential in credentials {
                 println!(
