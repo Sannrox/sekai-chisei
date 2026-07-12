@@ -134,6 +134,12 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                &[&principal],
+            )
+            .map_err(|error| format!("lock credential rotation: {error}"))?;
+        transaction
             .execute(
                 "UPDATE sekai_principal_credentials
                  SET status = 'revoked', revoked_at = $2
