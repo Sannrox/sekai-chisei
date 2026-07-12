@@ -3343,6 +3343,150 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn report_operation_event(
+        &self,
+        req: Request<ReportOperationEventRequest>,
+    ) -> Result<Response<ReportOperationEventResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        if request.operation_id.trim().is_empty() {
+            return Err(Status::invalid_argument("operation_id required"));
+        }
+        let kind = ReceiptEventKind::parse(&request.kind)
+            .ok_or(Status::invalid_argument("unsupported operation event kind"))?;
+        if !matches!(
+            kind,
+            ReceiptEventKind::ActionPerformed
+                | ReceiptEventKind::ApprovalDecided
+                | ReceiptEventKind::ArtifactProduced
+                | ReceiptEventKind::VerificationRecorded
+                | ReceiptEventKind::HumanIntervened
+                | ReceiptEventKind::OutcomeRecorded
+        ) {
+            return Err(Status::invalid_argument(
+                "event kind is not reportable through this API",
+            ));
+        }
+        if request.parent_event_id.trim().is_empty() {
+            return Err(Status::invalid_argument("parent_event_id required"));
+        }
+        if request.attributes.len() > 64 {
+            return Err(Status::invalid_argument(
+                "at most 64 attributes are allowed",
+            ));
+        }
+        let sensitive_attribute = request.attributes.keys().find(|key| {
+            let key = key.to_ascii_lowercase().replace('-', "_");
+            [
+                "authorization",
+                "api_key",
+                "credential",
+                "cookie",
+                "secret",
+                "password",
+                "passwd",
+                "passphrase",
+                "private_key",
+                "token",
+            ]
+            .iter()
+            .any(|sensitive| key == *sensitive || key.ends_with(&format!("_{sensitive}")))
+        });
+        if let Some(key) = sensitive_attribute {
+            return Err(Status::invalid_argument(format!(
+                "sensitive attribute {key:?} is not allowed"
+            )));
+        }
+        if request
+            .attributes
+            .iter()
+            .any(|(key, value)| key.len() > 128 || value.len() > 4096)
+        {
+            return Err(Status::invalid_argument("attribute exceeds size limit"));
+        }
+        if request.references.len() > 32 {
+            return Err(Status::invalid_argument(
+                "at most 32 references are allowed",
+            ));
+        }
+        let references = request
+            .references
+            .into_iter()
+            .map(|reference| {
+                if reference.kind.trim().is_empty() || reference.reference.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "reference kind and reference are required",
+                    ));
+                }
+                if reference.omitted && reference.omission_reason.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "omitted reference requires omission_reason",
+                    ));
+                }
+                if !reference.content_hash.is_empty()
+                    && (reference.content_hash.len() != 64
+                        || !reference
+                            .content_hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit()))
+                {
+                    return Err(Status::invalid_argument(
+                        "content_hash must be a 64-character hexadecimal digest",
+                    ));
+                }
+                Ok(GovernedReference {
+                    kind: reference.kind,
+                    reference: reference.reference,
+                    content_hash: (!reference.content_hash.is_empty())
+                        .then_some(reference.content_hash),
+                    disclosed_fields: reference.disclosed_fields,
+                    omitted: reference.omitted,
+                    omission_reason: (!reference.omission_reason.is_empty())
+                        .then_some(reference.omission_reason),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let event_id = if request.event_id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            request.event_id
+        };
+        let event = OperationReceiptEvent {
+            event_id: event_id.clone(),
+            operation_id: request.operation_id.clone(),
+            parent_event_id: Some(request.parent_event_id),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            kind,
+            surface: kind.surface(),
+            actor,
+            references,
+            attributes: request.attributes.into_iter().collect(),
+        };
+        let (receipt, recorded) = self
+            .db
+            .append_operation_receipt_event(&request.operation_id, event)
+            .map_err(|error| {
+                if error.contains("not found") {
+                    Status::not_found(error)
+                } else if error.contains("already exists") {
+                    Status::already_exists(error)
+                } else {
+                    Status::failed_precondition(error)
+                }
+            })?;
+        let completeness = receipt.completeness();
+        Ok(Response::new(ReportOperationEventResponse {
+            event_id,
+            recorded,
+            complete: completeness.complete,
+            missing_surfaces: completeness
+                .missing_surfaces
+                .into_iter()
+                .map(|surface| surface.as_str().to_string())
+                .collect(),
+        }))
+    }
+
     async fn get_affinity(
         &self,
         req: Request<GetAffinityRequest>,
@@ -5589,6 +5733,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+        let report = || {
+            let mut request = Request::new(ReportOperationEventRequest {
+                operation_id: plan.plan_id.clone(),
+                event_id: format!("{}:reported-action", plan.plan_id),
+                parent_event_id: format!("{}:outcome", plan.plan_id),
+                timestamp_ms: 1,
+                kind: "action_performed".into(),
+                attributes: HashMap::from([("action_type".into(), "tool.read".into())]),
+                references: vec![],
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "agent:reporter".parse().unwrap());
+            request
+        };
+        let first = svc
+            .report_operation_event(report())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.recorded);
+        assert!(first.complete);
+        let replay = svc
+            .report_operation_event(report())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!replay.recorded);
+        let updated = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .unwrap();
+        assert!(updated.events.iter().any(|event| {
+            event.event_id.ends_with(":reported-action") && event.actor == "agent:reporter"
+        }));
     }
 
     #[tokio::test]
