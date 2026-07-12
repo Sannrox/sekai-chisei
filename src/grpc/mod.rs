@@ -306,9 +306,9 @@ fn ensure_local_gateway_credential(socket_path: &str, db: &SekaiDb) -> Result<()
     let token = format!("sekai-gateway-{}", uuid::Uuid::new_v4().simple());
     db.rotate_principal_credential("chisei-gateway", &hash_gateway_key(&token))
         .map_err(std::io::Error::other)?;
-    let temporary = format!("{token_path}.tmp");
+    let temporary = format!("{token_path}.tmp-{}", uuid::Uuid::new_v4().simple());
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(&temporary)?;
