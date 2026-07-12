@@ -1038,6 +1038,45 @@ impl ChiseiServiceImpl {
                 ]),
             ));
         }
+        let (completed_at_ms, uncovered_surfaces) = if plan.executable {
+            (
+                None,
+                vec![
+                    UncoveredSurface {
+                        surface: ReceiptSurface::Attempt,
+                        reason: "operation is planned but has not started".into(),
+                    },
+                    UncoveredSurface {
+                        surface: ReceiptSurface::ModelCall,
+                        reason: "operation is planned but has not called a model".into(),
+                    },
+                    UncoveredSurface {
+                        surface: ReceiptSurface::Outcome,
+                        reason: "operation is planned but has no terminal outcome".into(),
+                    },
+                ],
+            )
+        } else {
+            let parent = if plan.egress_decisions.is_empty() {
+                "budget"
+            } else {
+                "egress"
+            };
+            events.push(receipt_event(
+                &operation_id,
+                "outcome",
+                Some(parent),
+                started,
+                ReceiptEventKind::OutcomeRecorded,
+                actor,
+                BTreeMap::from([
+                    ("status".into(), "denied".into()),
+                    ("completion_reason".into(), "plan_not_executable".into()),
+                    ("warning_count".into(), plan.warnings.len().to_string()),
+                ]),
+            ));
+            (Some(started), Vec::new())
+        };
         self.db.put_operation_receipt(&OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id,
@@ -1048,22 +1087,9 @@ impl ChiseiServiceImpl {
             schema_version: EXECUTION_SCHEMA_VERSION.into(),
             policy_version,
             started_at_ms: started,
-            completed_at_ms: None,
+            completed_at_ms,
             events,
-            uncovered_surfaces: vec![
-                UncoveredSurface {
-                    surface: ReceiptSurface::Attempt,
-                    reason: "operation is planned but has not started".into(),
-                },
-                UncoveredSurface {
-                    surface: ReceiptSurface::ModelCall,
-                    reason: "operation is planned but has not called a model".into(),
-                },
-                UncoveredSurface {
-                    surface: ReceiptSurface::Outcome,
-                    reason: "operation is planned but has no terminal outcome".into(),
-                },
-            ],
+            uncovered_surfaces,
             reporter_grants: Vec::new(),
         })
     }
@@ -5702,6 +5728,16 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("regressed"))
         );
+        let denied_receipt = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .unwrap();
+        assert!(denied_receipt.completeness().complete);
+        assert!(denied_receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+        }));
 
         let _ = fs::remove_file(&path);
     }
