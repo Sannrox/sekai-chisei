@@ -75,6 +75,14 @@ fn auth_source<T>(request: &Request<T>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
+    match auth_source(request).as_deref() {
+        Some("token") => true,
+        Some("local") => config.insecure,
+        _ => false,
+    }
+}
+
 fn reportable_receipt_kind(kind: ReceiptEventKind) -> bool {
     matches!(
         kind,
@@ -3518,6 +3526,11 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<AuthorizeOperationReporterRequest>,
     ) -> Result<Response<AuthorizeOperationReporterResponse>, Status> {
         let actor = authenticated_actor(&req);
+        if !receipt_mutation_transport_allowed(&req, &self.config) {
+            return Err(Status::permission_denied(
+                "operation reporter authorization requires authenticated transport",
+            ));
+        }
         let request = req.into_inner();
         if request.operation_id.trim().is_empty() || request.principal.trim().is_empty() {
             return Err(Status::invalid_argument(
@@ -3567,6 +3580,11 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ReportOperationEventRequest>,
     ) -> Result<Response<ReportOperationEventResponse>, Status> {
         let actor = authenticated_actor(&req);
+        if !receipt_mutation_transport_allowed(&req, &self.config) {
+            return Err(Status::permission_denied(
+                "operation event reporting requires authenticated transport",
+            ));
+        }
         let request = req.into_inner();
         if request.operation_id.trim().is_empty() {
             return Err(Status::invalid_argument("operation_id required"));
@@ -6163,6 +6181,9 @@ mod tests {
                 .metadata_mut()
                 .insert("x-principal", "agent:authenticated".parse().unwrap());
             request
+                .metadata_mut()
+                .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+            request
         };
         let first_authorization = svc
             .authorize_operation_reporter(authorization())
@@ -6191,6 +6212,9 @@ mod tests {
             request
                 .metadata_mut()
                 .insert("x-principal", "agent:reporter".parse().unwrap());
+            request
+                .metadata_mut()
+                .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
             request
         };
         let first = svc
