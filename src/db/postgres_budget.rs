@@ -42,7 +42,7 @@ impl PostgresDb {
         // Overlapping hierarchies therefore serialize without deadlocking and
         // cannot each spend the same shared-ancestor headroom.
         for scope in &chain {
-            let key = format!("budget\0{metric}\0{scope}");
+            let key = budget_lock_key(metric, scope);
             transaction
                 .query_one(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -156,7 +156,7 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         for scope in &chain {
-            let key = format!("budget\0{metric}\0{scope}");
+            let key = budget_lock_key(metric, scope);
             transaction
                 .query_one(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -270,5 +270,23 @@ impl PostgresDb {
             });
         }
         Ok(worst)
+    }
+}
+
+fn budget_lock_key(metric: &str, scope: &str) -> String {
+    format!("budget:{}:{metric}:{}:{scope}", metric.len(), scope.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisory_lock_keys_are_nul_free_and_unambiguous() {
+        let first = budget_lock_key("tokens:a", "b");
+        let second = budget_lock_key("tokens", "a:b");
+        assert_ne!(first, second);
+        assert!(!first.as_bytes().contains(&0));
+        assert!(!second.as_bytes().contains(&0));
     }
 }
