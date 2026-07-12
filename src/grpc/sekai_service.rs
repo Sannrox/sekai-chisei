@@ -3415,10 +3415,18 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?;
         // Attest the policy that permitted the resume, so the executed
         // outcome is as replayable as the hold decision was.
+        let approval_policy_decision = resolved_policy
+            .as_ref()
+            .map(|policy| policy.decide(&approval.action, action_risk))
+            .unwrap_or(ActionDecision::Allow);
         let mut evidence = HashMap::from([
             ("approval_id".to_string(), approval.id.clone()),
             ("risk_class".to_string(), action_risk.as_str().into()),
-            ("decision".to_string(), "approved".into()),
+            (
+                "decision".to_string(),
+                approval_policy_decision.as_str().into(),
+            ),
+            ("approval_status".to_string(), "approved".into()),
         ]);
         if !approval.policy_scope.is_empty() {
             evidence.insert("policy_scope".into(), approval.policy_scope.clone());
@@ -3434,10 +3442,7 @@ impl SekaiService for SekaiServiceImpl {
             &approval.actor,
             action_risk,
             &namespace,
-            resolved_policy
-                .as_ref()
-                .map(|policy| policy.decide(&approval.action, action_risk))
-                .unwrap_or(ActionDecision::Allow),
+            approval_policy_decision,
             &mut evidence,
         );
         self.db
@@ -10754,7 +10759,8 @@ mod tests {
             .unwrap();
         assert_eq!(approved.evidence["work_unit"], "wu-1");
         assert_eq!(approved.evidence["risk_class"], "write");
-        assert_eq!(approved.evidence["decision"], "approved");
+        assert_eq!(approved.evidence["decision"], "require_approval");
+        assert_eq!(approved.evidence["approval_status"], "approved");
         assert!(decisions.iter().any(|d| d.reason == "execute_action"));
     }
 
