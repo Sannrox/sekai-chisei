@@ -116,3 +116,22 @@ It sends caller identity via `x-principal` using `SEKAI_PRINCIPAL`.
   demo's generated object id, so it reports `namespace not found in sekai` for the
   enrichment steps. That is expected — the graph object and the pipeline's namespace
   lookup are independent in this demo.
+
+## incident_response
+
+[incident_response.rs](incident_response.rs) shows a non-coding domain using
+only the core Sekai contract. A service incident is represented as a namespace,
+actor, operation, attempt, action, artifact, verification, and outcome connected
+by ordinary links. No incident-specific field, RPC, application scope, workflow
+engine, or agent runtime is added to the control plane.
+
+The example builds and prints the graph locally without starting the server:
+
+```bash
+cargo run --example incident_response
+```
+
+An integration can persist the same objects and links through `SekaiService`,
+then submit the operation through the Chisei gateway or native execution API.
+Incident tooling remains an adapter around the control plane rather than part of
+its ontology.
