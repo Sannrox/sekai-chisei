@@ -66,6 +66,20 @@ fn authenticated_actor<T>(request: &Request<T>) -> String {
         .to_string()
 }
 
+fn reportable_receipt_kind(kind: ReceiptEventKind) -> bool {
+    matches!(
+        kind,
+        ReceiptEventKind::AttemptStarted
+            | ReceiptEventKind::ModelCalled
+            | ReceiptEventKind::ActionPerformed
+            | ReceiptEventKind::ApprovalDecided
+            | ReceiptEventKind::ArtifactProduced
+            | ReceiptEventKind::VerificationRecorded
+            | ReceiptEventKind::HumanIntervened
+            | ReceiptEventKind::OutcomeRecorded
+    )
+}
+
 fn content_hash(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1050,6 +1064,7 @@ impl ChiseiServiceImpl {
                     reason: "operation is planned but has no terminal outcome".into(),
                 },
             ],
+            reporter_grants: Vec::new(),
         })
     }
 
@@ -3343,6 +3358,54 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn authorize_operation_reporter(
+        &self,
+        req: Request<AuthorizeOperationReporterRequest>,
+    ) -> Result<Response<AuthorizeOperationReporterResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        if request.operation_id.trim().is_empty() || request.principal.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "operation_id and principal are required",
+            ));
+        }
+        let receipt = self
+            .db
+            .get_operation_receipt(&request.operation_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("operation receipt not found"))?;
+        if actor != receipt.initiating_actor && actor != "root" {
+            return Err(Status::permission_denied(
+                "only the initiating actor or root may authorize reporters",
+            ));
+        }
+        if request.event_kinds.is_empty() {
+            return Err(Status::invalid_argument("event_kinds required"));
+        }
+        let event_kinds = request
+            .event_kinds
+            .iter()
+            .map(|kind| {
+                ReceiptEventKind::parse(kind)
+                    .filter(|kind| reportable_receipt_kind(*kind))
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!("unsupported event kind {kind:?}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let authorized = self
+            .db
+            .authorize_operation_reporter(
+                &request.operation_id,
+                request.principal.trim(),
+                event_kinds,
+            )
+            .map_err(Status::internal)?;
+        Ok(Response::new(AuthorizeOperationReporterResponse {
+            authorized,
+        }))
+    }
+
     async fn report_operation_event(
         &self,
         req: Request<ReportOperationEventRequest>,
@@ -3357,27 +3420,23 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
-        if actor != receipt.initiating_actor && !matches!(actor.as_str(), "root" | "chisei-gateway")
-        {
-            return Err(Status::permission_denied(
-                "operation events require the initiating actor or an authorized service principal",
-            ));
-        }
         let kind = ReceiptEventKind::parse(&request.kind)
             .ok_or(Status::invalid_argument("unsupported operation event kind"))?;
-        if !matches!(
-            kind,
-            ReceiptEventKind::AttemptStarted
-                | ReceiptEventKind::ModelCalled
-                | ReceiptEventKind::ActionPerformed
-                | ReceiptEventKind::ApprovalDecided
-                | ReceiptEventKind::ArtifactProduced
-                | ReceiptEventKind::VerificationRecorded
-                | ReceiptEventKind::HumanIntervened
-                | ReceiptEventKind::OutcomeRecorded
-        ) {
+        if !reportable_receipt_kind(kind) {
             return Err(Status::invalid_argument(
                 "event kind is not reportable through this API",
+            ));
+        }
+        let explicitly_granted = receipt
+            .reporter_grants
+            .iter()
+            .any(|grant| grant.principal == actor && grant.event_kinds.contains(&kind));
+        if actor != receipt.initiating_actor
+            && !matches!(actor.as_str(), "root" | "chisei-gateway")
+            && !explicitly_granted
+        {
+            return Err(Status::permission_denied(
+                "operation event reporter is not authorized for this event kind",
             ));
         }
         if request.parent_event_id.trim().is_empty() {
@@ -5747,6 +5806,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
+        let mut authorization = Request::new(AuthorizeOperationReporterRequest {
+            operation_id: plan.plan_id.clone(),
+            principal: "agent:reporter".into(),
+            event_kinds: vec!["action_performed".into()],
+        });
+        authorization
+            .metadata_mut()
+            .insert("x-principal", "agent:authenticated".parse().unwrap());
+        assert!(
+            svc.authorize_operation_reporter(authorization)
+                .await
+                .unwrap()
+                .into_inner()
+                .authorized
+        );
         let report = || {
             let mut request = Request::new(ReportOperationEventRequest {
                 operation_id: plan.plan_id.clone(),
@@ -5759,7 +5833,7 @@ mod tests {
             });
             request
                 .metadata_mut()
-                .insert("x-principal", "agent:authenticated".parse().unwrap());
+                .insert("x-principal", "agent:reporter".parse().unwrap());
             request
         };
         let first = svc
@@ -5781,7 +5855,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(updated.events.iter().any(|event| {
-            event.event_id.ends_with(":reported-action") && event.actor == "agent:authenticated"
+            event.event_id.ends_with(":reported-action") && event.actor == "agent:reporter"
         }));
 
         let mut unauthorized_report = report();
