@@ -3560,6 +3560,46 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn get_operation_receipt(
+        &self,
+        req: Request<GetOperationReceiptRequest>,
+    ) -> Result<Response<GetOperationReceiptResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        if request.operation_id.trim().is_empty() {
+            return Err(Status::invalid_argument("operation_id required"));
+        }
+        let receipt = self
+            .db
+            .get_operation_receipt(&request.operation_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("operation receipt not found"))?;
+        let explicitly_granted = receipt
+            .reporter_grants
+            .iter()
+            .any(|grant| grant.principal == actor);
+        if actor != receipt.initiating_actor
+            && !matches!(actor.as_str(), "root" | "chisei-gateway")
+            && !explicitly_granted
+        {
+            return Err(Status::permission_denied(
+                "operation receipt is not visible to this principal",
+            ));
+        }
+        let completeness = receipt.completeness();
+        let receipt_json =
+            serde_json::to_string(&receipt).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(GetOperationReceiptResponse {
+            receipt_json,
+            complete: completeness.complete,
+            missing_surfaces: completeness
+                .missing_surfaces
+                .into_iter()
+                .map(|surface| surface.as_str().to_string())
+                .collect(),
+        }))
+    }
+
     async fn get_affinity(
         &self,
         req: Request<GetAffinityRequest>,
@@ -5868,6 +5908,29 @@ mod tests {
         assert!(updated.events.iter().any(|event| {
             event.event_id.ends_with(":reported-action") && event.actor == "agent:reporter"
         }));
+
+        let mut get_request = Request::new(GetOperationReceiptRequest {
+            operation_id: plan.plan_id.clone(),
+        });
+        get_request
+            .metadata_mut()
+            .insert("x-principal", "agent:reporter".parse().unwrap());
+        let retrieved = svc
+            .get_operation_receipt(get_request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retrieved.complete);
+        assert!(retrieved.receipt_json.contains(":reported-action"));
+
+        let mut denied_get = Request::new(GetOperationReceiptRequest {
+            operation_id: plan.plan_id.clone(),
+        });
+        denied_get
+            .metadata_mut()
+            .insert("x-principal", "agent:intruder".parse().unwrap());
+        let denied = svc.get_operation_receipt(denied_get).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
         let mut unauthorized_report = report();
         unauthorized_report.get_mut().event_id = format!("{}:forged-action", plan.plan_id);

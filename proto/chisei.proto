@@ -559,6 +559,13 @@ message AuthorizeOperationReporterResponse {
   bool changed = 2;
 }
 
+message GetOperationReceiptRequest { string operation_id = 1; }
+message GetOperationReceiptResponse {
+  string receipt_json = 1;
+  bool complete = 2;
+  repeated string missing_surfaces = 3;
+}
+
 message GetAffinityRequest {
   reserved 1;
   reserved "agent_id";
@@ -647,6 +654,7 @@ service ChiseiService {
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
+  rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);
