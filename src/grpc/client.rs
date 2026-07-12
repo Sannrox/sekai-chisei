@@ -34,6 +34,30 @@ pub async fn connect_sekai(
     let auth_token = std::env::var("SEKAI_AUTH_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    connect_sekai_with_token(target, auth_token).await
+}
+
+pub async fn connect_sekai_as_gateway(
+    target: &str,
+) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
+    let auth_token = std::env::var("SEKAI_AUTH_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let socket_target = target.strip_prefix("unix://").unwrap_or(target);
+            (!target.starts_with("http://") && !target.starts_with("https://"))
+                .then(|| std::fs::read_to_string(format!("{socket_target}.gateway-token")).ok())
+                .flatten()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty())
+        });
+    connect_sekai_with_token(target, auth_token).await
+}
+
+async fn connect_sekai_with_token(
+    target: &str,
+    auth_token: Option<String>,
+) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let interceptor = GatewayAuthInterceptor { auth_token };
 
     if target.starts_with("http://") || target.starts_with("https://") {
