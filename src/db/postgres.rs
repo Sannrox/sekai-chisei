@@ -8,6 +8,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 
 const MIGRATION_LOCK_ID: i64 = 0x5345_4b41_4948_4101;
+const CONTROL_PLANE_SCHEMA: &str = include_str!("postgres/0001_control_plane.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -89,6 +90,24 @@ impl PostgresDb {
                 );",
             )
             .map_err(|error| format!("initialize PostgreSQL migrations: {error}"))?;
+        let applied = transaction
+            .query_opt(
+                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
+                &[&1_i64],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
+            .is_some();
+        if !applied {
+            transaction
+                .batch_execute(CONTROL_PLANE_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL control-plane schema: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                    &[&1_i64, &"control_plane", &chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -129,5 +148,29 @@ mod tests {
     fn tls_is_required_even_when_url_requests_plaintext() {
         let config = secure_config("postgresql://localhost/sekai?sslmode=disable").unwrap();
         assert_eq!(config.get_ssl_mode(), SslMode::Require);
+    }
+
+    #[test]
+    fn control_plane_migration_covers_every_durable_table() {
+        for table in [
+            "sekai_objects",
+            "sekai_principal_credentials",
+            "sekai_decisions",
+            "sekai_attestations",
+            "sekai_work_units",
+            "sekai_reservations",
+            "chisei_eval_suites",
+            "chisei_eval_runs",
+            "chisei_eval_iterations",
+            "chisei_budget_limits",
+            "chisei_budget_usage",
+        ] {
+            assert!(
+                CONTROL_PLANE_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL table {table}"
+            );
+        }
+        assert!(!CONTROL_PLANE_SCHEMA.contains("AUTOINCREMENT"));
+        assert!(!CONTROL_PLANE_SCHEMA.contains("INSERT OR"));
     }
 }
