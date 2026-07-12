@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use super::sekai::SekaiDb;
 use crate::chisei::{
     eval, evolve,
-    receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind, ReceiptSurface},
+    receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind},
 };
 
 impl SekaiDb {
@@ -298,11 +298,11 @@ impl SekaiDb {
         {
             return Err(format!("causal parent {parent_id} not found"));
         }
+        receipt
+            .uncovered_surfaces
+            .retain(|entry| entry.surface != event.surface);
         if event.kind == ReceiptEventKind::OutcomeRecorded {
             receipt.completed_at_ms = Some(event.timestamp_ms);
-            receipt
-                .uncovered_surfaces
-                .retain(|entry| entry.surface != ReceiptSurface::Outcome);
         }
         receipt.events.push(event);
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
