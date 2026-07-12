@@ -1,7 +1,10 @@
-use crate::chisei::eval;
+use std::collections::HashMap;
+
+use crate::chisei::{eval, evolve};
 use crate::db::postgres::PostgresDb;
 
 const ITERATION_COLUMNS: &str = "id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created";
+const SAMPLE_LEASE_MS: i64 = 30 * 60 * 1000;
 
 impl PostgresDb {
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
@@ -225,6 +228,170 @@ impl PostgresDb {
             .map(row_to_eval_iteration)
             .collect())
     }
+
+    pub fn put_evolve_task(&self, task: &evolve::TaskRecord) -> Result<(), String> {
+        let task_json = serde_json::to_string(task).map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO chisei_evolve_tasks (id, task_json) VALUES ($1, $2)
+                 ON CONFLICT(id) DO UPDATE SET task_json = excluded.task_json",
+                &[&task.id, &task_json],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT task_json FROM chisei_evolve_tasks WHERE id = $1",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let json: String = row.get(0);
+                serde_json::from_str(&json).map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    pub fn list_evolve_task_records(&self) -> Result<Vec<evolve::TaskRecord>, String> {
+        self.connection()?
+            .query("SELECT task_json FROM chisei_evolve_tasks ORDER BY id", &[])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let json: String = row.get(0);
+                serde_json::from_str(&json).map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    pub fn put_evolve_enhancement(
+        &self,
+        request_id: &str,
+        original_spec: &str,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO chisei_evolve_enhancements (request_id, original_spec)
+                 VALUES ($1, $2)
+                 ON CONFLICT(request_id) DO UPDATE SET original_spec = excluded.original_spec",
+                &[&request_id, &original_spec],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
+        self.connection()?
+            .query(
+                "SELECT request_id, original_spec FROM chisei_evolve_enhancements",
+                &[],
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.get(0), row.get(1)))
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn put_sample_observation(
+        &self,
+        observation: &crate::chisei::scoring::SampleObservation,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO chisei_sample_observations
+                    (request_id, namespace, spec, resolved_model, output_content,
+                     sample_reason, input_tokens, output_tokens, stop_reason, timestamp,
+                     scored, task_class, cost_usd_micros)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12)
+                 ON CONFLICT(request_id) DO NOTHING",
+                &[
+                    &observation.request_id,
+                    &observation.namespace,
+                    &observation.spec,
+                    &observation.resolved_model,
+                    &observation.output_content,
+                    &observation.sample_reason,
+                    &observation.input_tokens,
+                    &observation.output_tokens,
+                    &observation.stop_reason,
+                    &observation.timestamp,
+                    &observation.task_class,
+                    &observation.cost_usd_micros,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_unscored_observations(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String> {
+        let effective_limit = i64::from(if limit > 0 { limit } else { 16 });
+        let now = chrono::Utc::now().timestamp_millis();
+        let lease_expires_at = now.saturating_add(SAMPLE_LEASE_MS);
+        let lease_owner = format!("scorer-{}", uuid::Uuid::new_v4().simple());
+        self.connection()?
+            .query(
+                "WITH candidates AS (
+                    SELECT request_id FROM chisei_sample_observations
+                    WHERE scored = 0 AND lease_expires_at <= $2
+                    ORDER BY timestamp, request_id
+                    FOR UPDATE SKIP LOCKED LIMIT $1
+                 )
+                 UPDATE chisei_sample_observations AS observations
+                 SET lease_owner = $3, lease_expires_at = $4
+                 FROM candidates
+                 WHERE observations.request_id = candidates.request_id
+                 RETURNING observations.request_id, observations.namespace, observations.spec,
+                           observations.resolved_model, observations.output_content,
+                           observations.sample_reason, observations.input_tokens,
+                           observations.output_tokens, observations.stop_reason,
+                           observations.timestamp, observations.scored,
+                           observations.task_class, observations.cost_usd_micros",
+                &[&effective_limit, &now, &lease_owner, &lease_expires_at],
+            )
+            .map(|rows| {
+                let mut observations: Vec<_> =
+                    rows.into_iter().map(row_to_sample_observation).collect();
+                observations.sort_by(|left, right| {
+                    left.timestamp
+                        .cmp(&right.timestamp)
+                        .then_with(|| left.request_id.cmp(&right.request_id))
+                });
+                observations
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
+        self.connection()?
+            .query_opt(
+                "UPDATE chisei_sample_observations
+                 SET attempts = attempts + 1, lease_owner = '', lease_expires_at = 0
+                 WHERE request_id = $1
+                 RETURNING attempts",
+                &[&request_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0))
+            .ok_or_else(|| format!("sample observation not found: {request_id}"))
+    }
+
+    pub fn delete_observation(&self, request_id: &str) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM chisei_sample_observations WHERE request_id = $1",
+                &[&request_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn row_to_eval_suite(row: postgres::Row) -> Result<eval::Suite, String> {
@@ -275,6 +442,25 @@ fn row_to_eval_iteration(row: postgres::Row) -> eval::Iteration {
         delta: row.get(9),
         regressed: regressed != 0,
         created: row.get(11),
+    }
+}
+
+fn row_to_sample_observation(row: postgres::Row) -> crate::chisei::scoring::SampleObservation {
+    let scored: i64 = row.get(10);
+    crate::chisei::scoring::SampleObservation {
+        request_id: row.get(0),
+        namespace: row.get(1),
+        spec: row.get(2),
+        resolved_model: row.get(3),
+        output_content: row.get(4),
+        sample_reason: row.get(5),
+        input_tokens: row.get(6),
+        output_tokens: row.get(7),
+        stop_reason: row.get(8),
+        timestamp: row.get(9),
+        scored: scored != 0,
+        task_class: row.get(11),
+        cost_usd_micros: row.get(12),
     }
 }
 
