@@ -94,6 +94,13 @@ impl SekaiDb {
                 period_start INTEGER NOT NULL,
                 amount_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (scope_id, metric, period_start)
+            );
+            CREATE TABLE IF NOT EXISTS chisei_budget_usage_events (
+                idempotency_key TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             );",
         )
         .map_err(|e| e.to_string())
@@ -275,6 +282,76 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Applies a usage delta once for a stable caller-generated key. The event
+    /// marker and every scope-chain update commit in one SQLite transaction.
+    pub(crate) fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        if idempotency_key.is_empty() {
+            self.budget_adjust_chain(scope_id, metric, amount, now_ms)?;
+            return Ok(true);
+        }
+        let chain = scope_chain(scope_id);
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO chisei_budget_usage_events
+                 (idempotency_key, scope_id, metric, amount, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![idempotency_key, scope_id, metric, amount, now_ms],
+            )
+            .map_err(|e| e.to_string())?;
+        if inserted == 0 {
+            let stored = tx
+                .query_row(
+                    "SELECT scope_id, metric, amount FROM chisei_budget_usage_events
+                     WHERE idempotency_key=?1",
+                    params![idempotency_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            if stored != (scope_id.to_string(), metric.to_string(), amount) {
+                return Err("idempotency key was already used for different budget usage".into());
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        for scope in &chain {
+            let period_type = tx
+                .query_row(
+                    "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                    params![scope, metric],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| "daily".to_string());
+            let period_start = period_start_ms(&period_type, now_ms);
+            tx.execute(
+                "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                    amount_used = MAX(0, amount_used + excluded.amount_used)",
+                params![scope, metric, period_start, amount],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// Current usage/limit for `scope_id` alone (not the whole chain) — the

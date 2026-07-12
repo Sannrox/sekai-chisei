@@ -1724,7 +1724,9 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             (false, "hard_cap", true)
         };
-        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
+        let u = self
+            .budget
+            .most_constrained_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(CheckBudgetResponse {
             allowed,
             usage: Some(BudgetUsage {
@@ -1755,7 +1757,13 @@ impl ChiseiService for ChiseiServiceImpl {
             &r.user_id,
         )?;
         self.budget
-            .record_with_metric(&budget_subject, r.tokens_used, metric);
+            .record_idempotent_with_metric(
+                &budget_subject,
+                r.tokens_used,
+                metric,
+                &r.idempotency_key,
+            )
+            .map_err(Status::internal)?;
         let u = self.budget.get_usage_with_metric(&budget_subject, metric);
         Ok(Response::new(RecordUsageResponse {
             usage: Some(BudgetUsage {
@@ -4151,6 +4159,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_usage_is_idempotent_for_replayed_keys() {
+        let svc = memory_service();
+        let request = RecordUsageRequest {
+            user_id: "agent:codex-app".into(),
+            tokens_used: 8,
+            subject: String::new(),
+            project: "sekai-chisei".into(),
+            agent: "codex-app".into(),
+            key_id: "codex-app".into(),
+            work_unit: "wu-idempotent".into(),
+            metric: String::new(),
+            idempotency_key: "request-1:tokens".into(),
+        };
+
+        for _ in 0..2 {
+            let response = svc
+                .record_usage(Request::new(request.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.usage.unwrap().tokens_used, 8);
+        }
+
+        let response = svc
+            .record_usage(Request::new(RecordUsageRequest {
+                idempotency_key: "request-2:tokens".into(),
+                ..request
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.usage.unwrap().tokens_used, 16);
+
+        let mismatch = svc
+            .record_usage(Request::new(RecordUsageRequest {
+                user_id: "agent:other".into(),
+                tokens_used: 1,
+                idempotency_key: "request-1:tokens".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
     async fn budget_rpcs_accept_gateway_subject_metadata() {
         let svc = memory_service();
         svc.set_budget_limit(Request::new(SetBudgetLimitRequest {
@@ -4202,6 +4256,7 @@ mod tests {
             key_id: "codex-app".into(),
             work_unit: "wu-existing".into(),
             metric: String::new(),
+            idempotency_key: "test-existing-usage".into(),
         }))
         .await
         .unwrap();

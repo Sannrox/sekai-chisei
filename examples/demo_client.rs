@@ -322,6 +322,7 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             key_id: String::new(),
             metric: String::new(),
             work_unit: String::new(),
+            idempotency_key: "demo-client-usage".into(),
         })
         .await
     {
