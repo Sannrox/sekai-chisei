@@ -133,11 +133,10 @@ fn record_completed_operation_on(
     let mut receipt = db
         .get_operation_receipt(&plan.plan_id)?
         .ok_or_else(|| format!("operation receipt {} not found", plan.plan_id))?;
-    let parent = if receipt
-        .events
-        .iter()
-        .any(|event| event.event_id.ends_with(":egress"))
-    {
+    let canonical_egress_id = format!("{}:egress", receipt.operation_id);
+    let parent = if receipt.events.iter().any(|event| {
+        event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
+    }) {
         "egress"
     } else {
         "budget"
@@ -5792,6 +5791,34 @@ mod tests {
                 })
         }));
 
+        let mut without_canonical_egress = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .unwrap();
+        without_canonical_egress
+            .events
+            .retain(|event| event.kind != ReceiptEventKind::EgressDecided);
+        svc.db
+            .put_operation_receipt(&without_canonical_egress)
+            .unwrap();
+        svc.db
+            .append_operation_receipt_event(
+                &plan.plan_id,
+                OperationReceiptEvent {
+                    event_id: format!("report:{}:tool-egress", plan.plan_id),
+                    operation_id: plan.plan_id.clone(),
+                    parent_event_id: Some(format!("{}:budget", plan.plan_id)),
+                    timestamp_ms: plan.created_at,
+                    kind: ReceiptEventKind::ActionPerformed,
+                    surface: ReceiptSurface::Action,
+                    actor: "agent:authenticated".into(),
+                    references: vec![],
+                    attributes: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+
         svc.record_completed_operation(
             &plan,
             "agent:authenticated",
@@ -5817,6 +5844,11 @@ mod tests {
             event.kind == ReceiptEventKind::OutcomeRecorded
                 && event.parent_event_id.as_deref()
                     == Some(format!("{}:verification", plan.plan_id).as_str())
+        }));
+        assert!(completed.events.iter().any(|event| {
+            event.event_id.ends_with(":attempt-1")
+                && event.parent_event_id.as_deref()
+                    == Some(format!("{}:budget", plan.plan_id).as_str())
         }));
         assert!(completed.events.iter().all(|event| {
             !event
@@ -5980,6 +6012,24 @@ mod tests {
                 && event.actor == "agent:reporter"
                 && event.timestamp_ms == plan.created_at
         }));
+        let terminal_conflict = svc
+            .db
+            .append_operation_receipt_event(
+                &plan.plan_id,
+                OperationReceiptEvent {
+                    event_id: format!("report:{}:late-outcome", plan.plan_id),
+                    operation_id: plan.plan_id.clone(),
+                    parent_event_id: Some(format!("report:{}:reported-action", plan.plan_id)),
+                    timestamp_ms: plan.created_at,
+                    kind: ReceiptEventKind::OutcomeRecorded,
+                    surface: ReceiptSurface::Outcome,
+                    actor: "agent:authenticated".into(),
+                    references: vec![],
+                    attributes: BTreeMap::new(),
+                },
+            )
+            .unwrap_err();
+        assert!(terminal_conflict.contains("terminal outcome"));
 
         let mut get_request = Request::new(GetOperationReceiptRequest {
             operation_id: plan.plan_id.clone(),
