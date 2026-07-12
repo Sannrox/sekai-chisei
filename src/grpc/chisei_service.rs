@@ -2826,9 +2826,12 @@ impl ChiseiService for ChiseiServiceImpl {
             event.target_id = "llm_calls".to_string();
         }
         if event.action == GATEWAY_RECEIPT_ACTION {
-            if !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root") {
+            if !matches!(
+                authenticated_principal.as_str(),
+                "chisei-gateway" | "root" | "local"
+            ) {
                 return Err(Status::permission_denied(
-                    "operation receipt writes require the gateway service or root principal",
+                    "operation receipt writes require the gateway service, root, or local principal",
                 ));
             }
             let receipt_json = event
@@ -5873,7 +5876,7 @@ mod tests {
         });
         gateway_request
             .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
+            .insert("x-principal", "local".parse().unwrap());
         svc.record_gateway_audit(gateway_request).await.unwrap();
 
         let mut root_replay = Request::new(RecordGatewayAuditRequest {
@@ -5896,24 +5899,25 @@ mod tests {
             .insert("x-principal", "root".parse().unwrap());
         svc.record_gateway_audit(root_replay).await.unwrap();
 
-        let unauthorized = svc
-            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
-                event: Some(GatewayAuditEvent {
-                    id: "forged-gateway-receipt".into(),
-                    timestamp: plan.created_at + 27,
-                    actor: "agent:authenticated".into(),
-                    action: GATEWAY_RECEIPT_ACTION.into(),
-                    reason: "forged".into(),
-                    evidence: HashMap::from([(
-                        "receipt_json".into(),
-                        serde_json::to_string(&completed).unwrap(),
-                    )]),
-                    target_id: plan.plan_id.clone(),
-                    outcome: "recorded".into(),
-                }),
-            }))
-            .await
-            .unwrap_err();
+        let mut forged_request = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                id: "forged-gateway-receipt".into(),
+                timestamp: plan.created_at + 27,
+                actor: "agent:authenticated".into(),
+                action: GATEWAY_RECEIPT_ACTION.into(),
+                reason: "forged".into(),
+                evidence: HashMap::from([(
+                    "receipt_json".into(),
+                    serde_json::to_string(&completed).unwrap(),
+                )]),
+                target_id: plan.plan_id.clone(),
+                outcome: "recorded".into(),
+            }),
+        });
+        forged_request
+            .metadata_mut()
+            .insert("x-principal", "agent:intruder".parse().unwrap());
+        let unauthorized = svc.record_gateway_audit(forged_request).await.unwrap_err();
         assert_eq!(unauthorized.code(), tonic::Code::PermissionDenied);
 
         let mut conflicting = completed.clone();
