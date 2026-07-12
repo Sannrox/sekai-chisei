@@ -3538,10 +3538,15 @@ impl ChiseiService for ChiseiServiceImpl {
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
+        let reported_event_prefix = format!("report:{}:", request.operation_id);
         let event_id = if request.event_id.trim().is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
+            format!("{reported_event_prefix}{}", uuid::Uuid::new_v4())
+        } else if request.event_id.starts_with(&reported_event_prefix) {
             request.event_id
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "reported event_id must start with {reported_event_prefix:?}"
+            )));
         };
         let event = OperationReceiptEvent {
             event_id: event_id.clone(),
@@ -5897,7 +5902,7 @@ mod tests {
         let report = || {
             let mut request = Request::new(ReportOperationEventRequest {
                 operation_id: plan.plan_id.clone(),
-                event_id: format!("{}:reported-action", plan.plan_id),
+                event_id: format!("report:{}:reported-action", plan.plan_id),
                 parent_event_id: format!("{}:outcome", plan.plan_id),
                 timestamp_ms: plan.created_at,
                 kind: "action_performed".into(),
@@ -5922,6 +5927,13 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(!replay.recorded);
+        let mut colliding_report = report();
+        colliding_report.get_mut().event_id = format!("{}:outcome", plan.plan_id);
+        let collision = svc
+            .report_operation_event(colliding_report)
+            .await
+            .unwrap_err();
+        assert_eq!(collision.code(), tonic::Code::InvalidArgument);
         let updated = svc
             .db
             .get_operation_receipt(&plan.plan_id)
@@ -5966,7 +5978,7 @@ mod tests {
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
         let mut unauthorized_report = report();
-        unauthorized_report.get_mut().event_id = format!("{}:forged-action", plan.plan_id);
+        unauthorized_report.get_mut().event_id = format!("report:{}:forged-action", plan.plan_id);
         unauthorized_report
             .metadata_mut()
             .insert("x-principal", "agent:intruder".parse().unwrap());
