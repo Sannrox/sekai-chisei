@@ -53,7 +53,8 @@ impl PostgresDb {
 
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         self.query_grants(
-            "SELECT id, object_id, principal, role, created FROM sekai_grants",
+            "SELECT id, object_id, principal, role, created
+             FROM sekai_grants ORDER BY created, id",
             &[],
         )
     }
