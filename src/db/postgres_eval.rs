@@ -228,31 +228,36 @@ impl PostgresDb {
 }
 
 fn row_to_eval_suite(row: postgres::Row) -> Result<eval::Suite, String> {
+    let id: String = row.get(0);
     let cases_json: String = row.get(3);
     Ok(eval::Suite {
-        id: row.get(0),
+        id: id.clone(),
         name: row.get(1),
         description: row.get(2),
-        cases: decode_json_or_default(&cases_json),
+        cases: decode_json_or_default(&cases_json, "suite", &id),
     })
 }
 
 fn row_to_eval_run(row: postgres::Row) -> Result<eval::Run, String> {
+    let id: String = row.get(0);
     let results_json: String = row.get(3);
     Ok(eval::Run {
-        id: row.get(0),
+        id: id.clone(),
         suite_id: row.get(1),
         config_ref: row.get(2),
-        results: decode_json_or_default(&results_json),
+        results: decode_json_or_default(&results_json, "run", &id),
         timestamp: row.get(4),
     })
 }
 
-fn decode_json_or_default<T>(json: &str) -> T
+fn decode_json_or_default<T>(json: &str, record_kind: &str, record_id: &str) -> T
 where
     T: serde::de::DeserializeOwned + Default,
 {
-    serde_json::from_str(json).unwrap_or_default()
+    serde_json::from_str(json).unwrap_or_else(|error| {
+        tracing::warn!(%error, record_kind, record_id, "malformed PostgreSQL eval payload; using empty value");
+        T::default()
+    })
 }
 
 fn row_to_eval_iteration(row: postgres::Row) -> eval::Iteration {
@@ -285,7 +290,8 @@ mod tests {
 
     #[test]
     fn malformed_eval_payloads_default_without_hiding_other_rows() {
-        let decoded: Vec<eval::CaseResult> = decode_json_or_default("not-json");
+        let decoded: Vec<eval::CaseResult> =
+            decode_json_or_default("not-json", "run", "run-corrupt");
         assert!(decoded.is_empty());
     }
 }
