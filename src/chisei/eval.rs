@@ -170,7 +170,16 @@ impl EvalStore {
     }
 
     pub fn create_suite(&self, s: Suite) {
-        self.suites.lock().unwrap().insert(s.id.clone(), s);
+        if let Err(error) = self.put_suite(s) {
+            tracing::error!(%error, "failed to store eval suite");
+        }
+    }
+    pub fn put_suite(&self, suite: Suite) -> Result<(), String> {
+        if let Some(db) = &self.db {
+            return db.put_eval_suite(&suite);
+        }
+        self.suites.lock().unwrap().insert(suite.id.clone(), suite);
+        Ok(())
     }
     pub fn get_suite(&self, id: &str) -> Option<Suite> {
         if let Some(db) = &self.db {
@@ -192,7 +201,16 @@ impl EvalStore {
     }
 
     pub fn create_run(&self, r: Run) {
-        self.runs.lock().unwrap().insert(r.id.clone(), r);
+        if let Err(error) = self.put_run(r) {
+            tracing::error!(%error, "failed to store eval run");
+        }
+    }
+    pub fn put_run(&self, run: Run) -> Result<(), String> {
+        if let Some(db) = &self.db {
+            return db.put_eval_run(&run);
+        }
+        self.runs.lock().unwrap().insert(run.id.clone(), run);
+        Ok(())
     }
     pub fn get_run(&self, id: &str) -> Option<Run> {
         if let Some(db) = &self.db {
@@ -220,10 +238,19 @@ impl EvalStore {
     }
 
     pub fn create_iteration(&self, iteration: Iteration) {
+        if let Err(error) = self.put_iteration(iteration) {
+            tracing::error!(%error, "failed to store eval iteration");
+        }
+    }
+    pub fn put_iteration(&self, iteration: Iteration) -> Result<(), String> {
+        if let Some(db) = &self.db {
+            return db.put_eval_iteration(&iteration);
+        }
         self.iterations
             .lock()
             .unwrap()
             .insert(iteration.id.clone(), iteration);
+        Ok(())
     }
 
     /// Drop all but the newest `keep` runs for a suite from memory (newest by timestamp). Used to
@@ -358,7 +385,7 @@ impl EvalStore {
             iteration.delta = candidate_score - baseline_score;
             iteration.regressed = iteration.delta < -DEFAULT_REGRESSION_THRESHOLD;
         }
-        self.create_iteration(iteration.clone());
+        self.put_iteration(iteration.clone())?;
         Ok(iteration)
     }
 

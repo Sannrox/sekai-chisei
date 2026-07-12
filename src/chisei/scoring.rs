@@ -518,8 +518,7 @@ impl ScoringJob {
                 })
                 .collect(),
         };
-        self.db.put_eval_suite(&suite)?;
-        self.eval.create_suite(suite);
+        self.eval.put_suite(suite)?;
 
         // `now` alone can collide across two batches processed within the same millisecond; the
         // suffix guarantees a unique id so `INSERT OR REPLACE` never aliases an earlier run (which
@@ -534,8 +533,7 @@ impl ScoringJob {
         };
         let pass_count = run.results.iter().filter(|r| r.passed).count();
         let total = run.results.len();
-        self.db.put_eval_run(&run)?;
-        self.eval.create_run(run.clone());
+        self.eval.put_run(run.clone())?;
 
         // Track an iteration so regression detection (and adaptive sampling) picks this up — but
         // only for statistically meaningful batches, since the delta compares this batch's mean
@@ -549,7 +547,6 @@ impl ScoringJob {
                 .track_iteration(&suite_id, &run.id, &changed_file, &run.id)
             {
                 Ok(iteration) => {
-                    self.db.put_eval_iteration(&iteration)?;
                     delta = Some(iteration.delta);
                     regressed = iteration.regressed;
                 }
@@ -1135,7 +1132,7 @@ mod tests {
 
     fn setup() -> (Arc<SekaiDb>, Arc<EvalStore>) {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
-        (db, Arc::new(EvalStore::new()))
+        (db.clone(), Arc::new(EvalStore::with_db(db)))
     }
 
     fn observe(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64) {

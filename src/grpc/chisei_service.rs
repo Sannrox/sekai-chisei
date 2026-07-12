@@ -2989,8 +2989,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 })
                 .collect(),
         };
-        self.db.put_eval_suite(&suite).map_err(Status::internal)?;
-        self.eval.create_suite(suite);
+        self.eval.put_suite(suite).map_err(Status::internal)?;
         Ok(Response::new(CreateEvalSuiteResponse { suite: Some(s) }))
     }
 
@@ -3054,15 +3053,10 @@ impl ChiseiService for ChiseiServiceImpl {
                 .collect(),
             timestamp: r.timestamp,
         };
-        self.db.put_eval_run(&run).map_err(Status::internal)?;
-        self.eval.create_run(run);
+        self.eval.put_run(run).map_err(Status::internal)?;
         if !req.changed_file.is_empty() {
-            let iteration = self
-                .eval
+            self.eval
                 .track_iteration(&r.suite_id, &r.id, &req.changed_file, &req.diff_hash)
-                .map_err(Status::internal)?;
-            self.db
-                .put_eval_iteration(&iteration)
                 .map_err(Status::internal)?;
         }
         Ok(Response::new(CreateEvalRunResponse { run: Some(r) }))
@@ -3130,9 +3124,6 @@ impl ChiseiService for ChiseiServiceImpl {
         let iteration = self
             .eval
             .track_iteration(&r.suite_id, &r.run_id, &r.changed_file, &r.diff_hash)
-            .map_err(Status::internal)?;
-        self.db
-            .put_eval_iteration(&iteration)
             .map_err(Status::internal)?;
         Ok(Response::new(TrackEvalIterationResponse {
             iteration: Some(eval_iteration_pb(iteration)),
