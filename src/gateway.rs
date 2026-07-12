@@ -43,7 +43,7 @@ use crate::llm::{HttpTimeouts, classify_reqwest_error};
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-const DEFAULT_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_REQUESTS: u64 = 120;
 const DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS: u64 = 1_200;
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
