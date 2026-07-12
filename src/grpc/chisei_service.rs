@@ -214,6 +214,50 @@ fn record_completed_operation_on(
     Ok(())
 }
 
+fn record_failed_operation_on(
+    db: &SekaiDb,
+    plan: &ExecutionPlan,
+    actor: &str,
+    completion_reason: &str,
+) -> Result<(), String> {
+    let completed_at_ms = chrono::Utc::now().timestamp_millis();
+    db.update_operation_receipt(&plan.plan_id, |receipt| {
+        if receipt.completed_at_ms.is_some() {
+            return Ok(());
+        }
+        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
+        let parent = if receipt.events.iter().any(|event| {
+            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
+        }) {
+            "egress"
+        } else {
+            "budget"
+        };
+        receipt.events.push(receipt_event(
+            &receipt.operation_id,
+            "outcome",
+            Some(parent),
+            completed_at_ms,
+            ReceiptEventKind::OutcomeRecorded,
+            actor,
+            BTreeMap::from([
+                ("status".into(), "denied".into()),
+                ("completion_reason".into(), completion_reason.into()),
+                (
+                    "latency_ms".into(),
+                    completed_at_ms
+                        .saturating_sub(receipt.started_at_ms)
+                        .to_string(),
+                ),
+            ]),
+        ));
+        receipt.completed_at_ms = Some(completed_at_ms);
+        receipt.uncovered_surfaces.clear();
+        Ok(())
+    })?;
+    Ok(())
+}
+
 fn pipeline_context_expansion_profile_key(namespace: &str) -> String {
     format!(
         "context-expansion:{}:{}",
@@ -2968,6 +3012,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 task_class,
                 "cached_plan_unsafe_provider",
             );
+            record_failed_operation_on(&self.db, &plan, &actor, "provider_became_unsafe")
+                .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 crate::chisei::privacy::gate_reason(data_class, task_class, &provider),
             ));
@@ -2975,6 +3021,8 @@ impl ChiseiService for ChiseiServiceImpl {
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
+            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
+                .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "external execution plan missing egress decisions",
             ));
@@ -2984,6 +3032,13 @@ impl ChiseiService for ChiseiServiceImpl {
             .namespace_regression_signal(&namespace_hint)
             .filter(|signal| signal.regressed)
         {
+            record_failed_operation_on(
+                &self.db,
+                &plan,
+                &actor,
+                "evaluation_regressed_after_planning",
+            )
+            .map_err(Status::internal)?;
             return Err(Status::failed_precondition(signal.reason));
         }
         let normalized_user_id = if input.user_id.is_empty() {
@@ -3005,6 +3060,13 @@ impl ChiseiService for ChiseiServiceImpl {
                 &provider,
                 &leak_findings,
             );
+            record_failed_operation_on(
+                &self.db,
+                &plan,
+                &actor,
+                "privacy_leak_detected_after_planning",
+            )
+            .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "privacy leak checker blocked outbound payload",
             ));
@@ -3049,7 +3111,33 @@ impl ChiseiService for ChiseiServiceImpl {
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
-        let chat = execute_chat_request(&self.config, self.budget.clone(), llm_req).await?;
+        let chat = match execute_chat_request(&self.config, self.budget.clone(), llm_req).await {
+            Ok(chat) => chat,
+            Err(status) => {
+                record_failed_operation_on(&self.db, &plan, &actor, "model_call_failed")
+                    .map_err(Status::internal)?;
+                return Err(status);
+            }
+        };
+        let response = PlannedChatResponse {
+            content: chat.content.clone(),
+            tool_calls: chat
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    args_json: tc.args_json.clone(),
+                })
+                .collect(),
+            input_tokens: chat.input_tokens,
+            output_tokens: chat.output_tokens,
+            stop_reason: chat.stop_reason.clone(),
+            provider: provider.clone(),
+        };
+        let completed_at_ms = chrono::Utc::now().timestamp_millis();
+        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
+            .map_err(Status::internal)?;
         self.record_evolve_task(
             &input.request_id,
             &namespace_hint,
@@ -3110,25 +3198,6 @@ impl ChiseiService for ChiseiServiceImpl {
                         });
             }
         }
-        let response = PlannedChatResponse {
-            content: chat.content,
-            tool_calls: chat
-                .tool_calls
-                .into_iter()
-                .map(|tc| ToolCall {
-                    id: tc.id,
-                    name: tc.name,
-                    args_json: tc.args_json,
-                })
-                .collect(),
-            input_tokens: chat.input_tokens,
-            output_tokens: chat.output_tokens,
-            stop_reason: chat.stop_reason,
-            provider,
-        };
-        let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
-            .map_err(Status::internal)?;
         Ok(Response::new(ExecutePlanResponse {
             response: Some(response),
             executed_at: completed_at_ms / 1000,
@@ -3168,6 +3237,8 @@ impl ChiseiService for ChiseiServiceImpl {
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
+            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
+                .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "external execution plan missing egress decisions",
             ));
@@ -3177,6 +3248,13 @@ impl ChiseiService for ChiseiServiceImpl {
             .namespace_regression_signal(&namespace_hint)
             .filter(|signal| signal.regressed)
         {
+            record_failed_operation_on(
+                &self.db,
+                &plan,
+                &actor,
+                "evaluation_regressed_after_planning",
+            )
+            .map_err(Status::internal)?;
             return Err(Status::failed_precondition(signal.reason));
         }
         let normalized_user_id = if input.user_id.is_empty() {
@@ -3225,7 +3303,19 @@ impl ChiseiService for ChiseiServiceImpl {
             user_id: Some(normalized_user_id),
         };
         let chat_stream =
-            execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await?;
+            match execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await {
+                Ok(stream) => stream,
+                Err(status) => {
+                    record_failed_operation_on(
+                        &self.db,
+                        &plan,
+                        &actor,
+                        "model_stream_start_failed",
+                    )
+                    .map_err(Status::internal)?;
+                    return Err(status);
+                }
+            };
         let db = self.db.clone();
         let evolve_history = self.evolve_history.clone();
         let request_id = input.request_id.clone();
@@ -3255,6 +3345,15 @@ impl ChiseiService for ChiseiServiceImpl {
                 let chunk = match next {
                     Ok(chunk) => chunk,
                     Err(err) => {
+                        if let Err(receipt_error) = record_failed_operation_on(
+                            &db,
+                            &receipt_plan,
+                            &actor,
+                            "model_stream_failed",
+                        ) {
+                            yield Err(Status::internal(receipt_error));
+                            return;
+                        }
                         yield Err(err);
                         return;
                     }
@@ -6679,11 +6778,29 @@ mod tests {
         );
 
         let err = svc
-            .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+            .execute_plan(Request::new(ExecutePlanRequest {
+                plan: Some(plan.clone()),
+            }))
             .await
             .expect_err("stale external plan should be blocked after policy flip");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("privacy gate"));
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .expect("rejected execution receipt");
+        assert!(receipt.completeness().complete);
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+                && event
+                    .attributes
+                    .get("completion_reason")
+                    .map(String::as_str)
+                    == Some("provider_became_unsafe")
+        }));
     }
 
     #[tokio::test]
