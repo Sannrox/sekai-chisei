@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,10 @@ use crate::chisei::portfolio::{
 };
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::chisei::promotion::CandidateStore;
+use crate::chisei::receipt::{
+    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    ReceiptEventKind, ReceiptSurface, UncoveredSurface,
+};
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::sekai::SekaiDb;
@@ -48,6 +52,142 @@ const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
+const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
+
+fn authenticated_actor<T>(request: &Request<T>) -> String {
+    request
+        .metadata()
+        .get("x-principal")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local")
+        .to_string()
+}
+
+fn content_hash(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_ref());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn receipt_event(
+    operation_id: &str,
+    suffix: &str,
+    parent_suffix: Option<&str>,
+    timestamp_ms: i64,
+    kind: ReceiptEventKind,
+    actor: &str,
+    attributes: BTreeMap<String, String>,
+) -> OperationReceiptEvent {
+    OperationReceiptEvent {
+        event_id: format!("{operation_id}:{suffix}"),
+        operation_id: operation_id.to_string(),
+        parent_event_id: parent_suffix.map(|parent| format!("{operation_id}:{parent}")),
+        timestamp_ms,
+        surface: kind.surface(),
+        kind,
+        actor: actor.to_string(),
+        references: Vec::new(),
+        attributes,
+    }
+}
+
+fn record_completed_operation_on(
+    db: &SekaiDb,
+    plan: &ExecutionPlan,
+    actor: &str,
+    response: &PlannedChatResponse,
+    completed_at_ms: i64,
+) -> Result<(), String> {
+    let mut receipt = db
+        .get_operation_receipt(&plan.plan_id)?
+        .ok_or_else(|| format!("operation receipt {} not found", plan.plan_id))?;
+    let parent = if receipt
+        .events
+        .iter()
+        .any(|event| event.event_id.ends_with(":egress"))
+    {
+        "egress"
+    } else {
+        "budget"
+    };
+    receipt.events.extend([
+        receipt_event(
+            &receipt.operation_id,
+            "attempt-1",
+            Some(parent),
+            completed_at_ms,
+            ReceiptEventKind::AttemptStarted,
+            actor,
+            BTreeMap::from([("attempt".into(), "1".into())]),
+        ),
+        receipt_event(
+            &receipt.operation_id,
+            "model-call-1",
+            Some("attempt-1"),
+            completed_at_ms,
+            ReceiptEventKind::ModelCalled,
+            "chisei.llm",
+            BTreeMap::from([
+                ("provider".into(), response.provider.clone()),
+                ("model".into(), plan.resolved_model.clone()),
+                ("input_tokens".into(), response.input_tokens.to_string()),
+                ("output_tokens".into(), response.output_tokens.to_string()),
+            ]),
+        ),
+        receipt_event(
+            &receipt.operation_id,
+            "artifact-1",
+            Some("model-call-1"),
+            completed_at_ms,
+            ReceiptEventKind::ArtifactProduced,
+            "chisei.llm",
+            BTreeMap::from([
+                ("artifact_type".into(), "model_response".into()),
+                (
+                    "content_hash".into(),
+                    content_hash([response.content.as_bytes()]),
+                ),
+                ("content_stored".into(), "false".into()),
+            ]),
+        ),
+        receipt_event(
+            &receipt.operation_id,
+            "verification",
+            Some("artifact-1"),
+            completed_at_ms,
+            ReceiptEventKind::VerificationRecorded,
+            "chisei.execution",
+            BTreeMap::from([("status".into(), "not_requested".into())]),
+        ),
+        receipt_event(
+            &receipt.operation_id,
+            "outcome",
+            Some("verification"),
+            completed_at_ms,
+            ReceiptEventKind::OutcomeRecorded,
+            actor,
+            BTreeMap::from([
+                ("status".into(), "succeeded".into()),
+                ("completion_reason".into(), response.stop_reason.clone()),
+                (
+                    "latency_ms".into(),
+                    completed_at_ms
+                        .saturating_sub(receipt.started_at_ms)
+                        .to_string(),
+                ),
+            ]),
+        ),
+    ]);
+    receipt.completed_at_ms = Some(completed_at_ms);
+    receipt.uncovered_surfaces.clear();
+    db.put_operation_receipt(&receipt)
+}
 
 fn pipeline_context_expansion_profile_key(namespace: &str) -> String {
     format!(
@@ -745,6 +885,173 @@ impl ChiseiServiceImpl {
         let inserted_plan_id = plan.plan_id.clone();
         plans.insert(inserted_plan_id.clone(), plan);
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
+    }
+
+    fn record_planned_operation(&self, plan: &ExecutionPlan, actor: &str) -> Result<(), String> {
+        let input = plan
+            .input
+            .as_ref()
+            .ok_or_else(|| "plan input required".to_string())?;
+        let operation_id = plan.plan_id.clone();
+        let policy_version = self
+            .policy
+            .effective_policy(&input.namespace)
+            .map(|policy| policy.version())
+            .unwrap_or_else(|| "implicit-allow/v1".to_string());
+        let started = plan.created_at;
+        let mut events = vec![
+            receipt_event(
+                &operation_id,
+                "intent",
+                None,
+                started,
+                ReceiptEventKind::IntentRecorded,
+                actor,
+                BTreeMap::from([
+                    ("request_id".into(), input.request_id.clone()),
+                    ("task_type".into(), input.task_type.clone()),
+                    ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
+                ]),
+            ),
+            receipt_event(
+                &operation_id,
+                "context",
+                Some("intent"),
+                started,
+                ReceiptEventKind::ContextGoverned,
+                "chisei.pipeline",
+                BTreeMap::from([
+                    (
+                        "prepared_context_hash".into(),
+                        content_hash(
+                            std::iter::once(plan.prepared_system.as_bytes()).chain(
+                                plan.prepared_messages
+                                    .iter()
+                                    .map(|message| message.content.as_bytes()),
+                            ),
+                        ),
+                    ),
+                    ("raw_context_stored".into(), "false".into()),
+                ]),
+            ),
+            receipt_event(
+                &operation_id,
+                "policy",
+                Some("context"),
+                started,
+                ReceiptEventKind::PolicyDecided,
+                "chisei.policy",
+                BTreeMap::from([
+                    ("policy_version".into(), policy_version.clone()),
+                    ("executable".into(), plan.executable.to_string()),
+                    ("risk_score".into(), plan.risk_score.to_string()),
+                ]),
+            ),
+            receipt_event(
+                &operation_id,
+                "route",
+                Some("policy"),
+                started,
+                ReceiptEventKind::RouteSelected,
+                "chisei.routing",
+                BTreeMap::from([
+                    ("runtime".into(), plan.resolved_runtime.clone()),
+                    ("model".into(), plan.resolved_model.clone()),
+                ]),
+            ),
+            receipt_event(
+                &operation_id,
+                "budget",
+                Some("route"),
+                started,
+                ReceiptEventKind::BudgetDecided,
+                "chisei.budget",
+                BTreeMap::from([
+                    (
+                        "allowed".into(),
+                        plan.budget
+                            .as_ref()
+                            .is_some_and(|budget| budget.allowed)
+                            .to_string(),
+                    ),
+                    (
+                        "estimated_tokens".into(),
+                        input.estimated_tokens.to_string(),
+                    ),
+                ]),
+            ),
+        ];
+        let mut context = GovernedReference {
+            kind: "execution_context".into(),
+            reference: format!("operation:{operation_id}:context"),
+            content_hash: events[1].attributes.get("prepared_context_hash").cloned(),
+            disclosed_fields: vec!["system".into(), "messages.content".into()],
+            omitted: true,
+            omission_reason: Some("raw private context is not copied into receipts".into()),
+        };
+        context.disclosed_fields.sort();
+        events[1].references.push(context);
+        if !plan.egress_decisions.is_empty() {
+            events.push(receipt_event(
+                &operation_id,
+                "egress",
+                Some("budget"),
+                started,
+                ReceiptEventKind::EgressDecided,
+                "chisei.egress",
+                BTreeMap::from([
+                    (
+                        "decision_count".into(),
+                        plan.egress_decisions.len().to_string(),
+                    ),
+                    (
+                        "redacted_field_count".into(),
+                        plan.egress_decisions
+                            .iter()
+                            .map(|decision| decision.redacted.len())
+                            .sum::<usize>()
+                            .to_string(),
+                    ),
+                ]),
+            ));
+        }
+        self.db.put_operation_receipt(&OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id,
+            parent_operation_id: None,
+            namespace: input.namespace.clone(),
+            operation_class: "model_inference".into(),
+            initiating_actor: actor.to_string(),
+            schema_version: EXECUTION_SCHEMA_VERSION.into(),
+            policy_version,
+            started_at_ms: started,
+            completed_at_ms: None,
+            events,
+            uncovered_surfaces: vec![
+                UncoveredSurface {
+                    surface: ReceiptSurface::Attempt,
+                    reason: "operation is planned but has not started".into(),
+                },
+                UncoveredSurface {
+                    surface: ReceiptSurface::ModelCall,
+                    reason: "operation is planned but has not called a model".into(),
+                },
+                UncoveredSurface {
+                    surface: ReceiptSurface::Outcome,
+                    reason: "operation is planned but has no terminal outcome".into(),
+                },
+            ],
+        })
+    }
+
+    fn record_completed_operation(
+        &self,
+        plan: &ExecutionPlan,
+        actor: &str,
+        response: &PlannedChatResponse,
+        completed_at_ms: i64,
+    ) -> Result<(), String> {
+        record_completed_operation_on(&self.db, plan, actor, response, completed_at_ms)
     }
 
     async fn resolve_model_for_run(
@@ -2489,6 +2796,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<PlanExecutionRequest>,
     ) -> Result<Response<PlanExecutionResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let input = req
             .into_inner()
             .input
@@ -2511,6 +2819,8 @@ impl ChiseiService for ChiseiServiceImpl {
             )
             .map_err(Status::internal)?;
         }
+        self.record_planned_operation(&plan, &actor)
+            .map_err(Status::internal)?;
         self.cache_plan(plan.clone());
         Ok(Response::new(PlanExecutionResponse { plan: Some(plan) }))
     }
@@ -2519,6 +2829,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ExecutePlanRequest>,
     ) -> Result<Response<ExecutePlanResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let requested_plan = req
             .into_inner()
             .plan
@@ -2700,24 +3011,28 @@ impl ChiseiService for ChiseiServiceImpl {
                         });
             }
         }
+        let response = PlannedChatResponse {
+            content: chat.content,
+            tool_calls: chat
+                .tool_calls
+                .into_iter()
+                .map(|tc| ToolCall {
+                    id: tc.id,
+                    name: tc.name,
+                    args_json: tc.args_json,
+                })
+                .collect(),
+            input_tokens: chat.input_tokens,
+            output_tokens: chat.output_tokens,
+            stop_reason: chat.stop_reason,
+            provider,
+        };
+        let completed_at_ms = chrono::Utc::now().timestamp_millis();
+        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
+            .map_err(Status::internal)?;
         Ok(Response::new(ExecutePlanResponse {
-            response: Some(PlannedChatResponse {
-                content: chat.content,
-                tool_calls: chat
-                    .tool_calls
-                    .into_iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id,
-                        name: tc.name,
-                        args_json: tc.args_json,
-                    })
-                    .collect(),
-                input_tokens: chat.input_tokens,
-                output_tokens: chat.output_tokens,
-                stop_reason: chat.stop_reason,
-                provider,
-            }),
-            executed_at: chrono::Utc::now().timestamp(),
+            response: Some(response),
+            executed_at: completed_at_ms / 1000,
         }))
     }
 
@@ -2725,6 +3040,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ExecutePlanRequest>,
     ) -> Result<Response<Self::ExecutePlanStreamStream>, Status> {
+        let actor = authenticated_actor(&req);
         let requested_plan = req
             .into_inner()
             .plan
@@ -2822,6 +3138,7 @@ impl ChiseiService for ChiseiServiceImpl {
         let sample_rate = plan.sample_rate;
         let sample_reason = plan.sample_reason.clone();
         let scoring_enabled = self.config.scoring_enabled;
+        let receipt_plan = plan.clone();
         // `plan.task_class` holds the *privacy* class here (see `plan_from_input`); the routing/
         // cost-tier class the caller supplied is on the original `input`.
         let task_class = crate::chisei::scoring::normalize_task_class(&input.task_class);
@@ -2893,11 +3210,22 @@ impl ChiseiService for ChiseiServiceImpl {
                         response: &response,
                     };
                     let _ = finish_streamed_execution(&execution);
+                    let completed_at_ms = chrono::Utc::now().timestamp_millis();
+                    if let Err(error) = record_completed_operation_on(
+                        &db,
+                        &receipt_plan,
+                        &actor,
+                        &response,
+                        completed_at_ms,
+                    ) {
+                        yield Err(Status::internal(error));
+                        return;
+                    }
                     yield Ok(ExecutePlanStreamEvent {
                         content_delta: chunk.content_delta,
                         response: Some(response),
                         done: true,
-                        executed_at: chrono::Utc::now().timestamp(),
+                        executed_at: completed_at_ms / 1000,
                     });
                 } else {
                     yield Ok(ExecutePlanStreamEvent {
@@ -2940,11 +3268,22 @@ impl ChiseiService for ChiseiServiceImpl {
                     response: &response,
                 };
                 let _ = finish_streamed_execution(&execution);
+                let completed_at_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(error) = record_completed_operation_on(
+                    &db,
+                    &receipt_plan,
+                    &actor,
+                    &response,
+                    completed_at_ms,
+                ) {
+                    yield Err(Status::internal(error));
+                    return;
+                }
                 yield Ok(ExecutePlanStreamEvent {
                     content_delta: String::new(),
                     response: Some(response),
                     done: true,
-                    executed_at: chrono::Utc::now().timestamp(),
+                    executed_at: completed_at_ms / 1000,
                 });
             }
         };
@@ -5000,6 +5339,90 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
+        let svc = memory_service();
+        let mut request = Request::new(PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: "receipt-task-1".into(),
+                namespace: "receipt-ns".into(),
+                spec: "summarize governed context".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                task_type: "summary".into(),
+                priority: 0,
+                user_id: "caller-supplied-actor".into(),
+                estimated_tokens: 0,
+                messages: vec![],
+                tools: vec![],
+                system: "do not disclose raw context".into(),
+                max_tokens: 128,
+                task_class: String::new(),
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "agent:authenticated".parse().unwrap());
+        let plan = svc
+            .plan_execution(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .expect("planned receipt");
+        assert_eq!(receipt.initiating_actor, "agent:authenticated");
+        assert_eq!(receipt.operation_id, plan.plan_id);
+        assert_eq!(receipt.namespace, "receipt-ns");
+        assert!(receipt.completed_at_ms.is_none());
+        assert!(!receipt.completeness().complete);
+        assert!(receipt.events.iter().all(|event| {
+            event.operation_id == receipt.operation_id
+                && !event.attributes.values().any(|value| {
+                    value.contains("summarize governed context")
+                        || value.contains("do not disclose raw context")
+                })
+        }));
+
+        svc.record_completed_operation(
+            &plan,
+            "agent:authenticated",
+            &PlannedChatResponse {
+                content: "private response body".into(),
+                tool_calls: Vec::new(),
+                input_tokens: 10,
+                output_tokens: 4,
+                stop_reason: "end_turn".into(),
+                provider: "native".into(),
+            },
+            plan.created_at + 25,
+        )
+        .unwrap();
+        let completed = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .expect("completed receipt");
+        assert!(completed.completeness().complete);
+        assert_eq!(completed.completed_at_ms, Some(plan.created_at + 25));
+        assert!(completed.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.parent_event_id.as_deref()
+                    == Some(format!("{}:verification", plan.plan_id).as_str())
+        }));
+        assert!(completed.events.iter().all(|event| {
+            !event
+                .attributes
+                .values()
+                .any(|value| value.contains("private response body"))
+        }));
     }
 
     #[tokio::test]

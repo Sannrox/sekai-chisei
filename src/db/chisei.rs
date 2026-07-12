@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use rusqlite::{OptionalExtension, params};
 
 use super::sekai::SekaiDb;
-use crate::chisei::{eval, evolve};
+use crate::chisei::{eval, evolve, receipt::OperationReceipt};
 
 impl SekaiDb {
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
@@ -63,7 +63,15 @@ impl SekaiDb {
                 task_class TEXT NOT NULL DEFAULT '',
                 cost_usd_micros INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);",
+            CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);
+            CREATE TABLE IF NOT EXISTS chisei_operation_receipts (
+                operation_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chisei_operation_receipts_namespace
+                ON chisei_operation_receipts(namespace, updated_at);",
         )
         .map_err(|e| e.to_string())?;
         match conn.execute(
@@ -200,6 +208,45 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO chisei_operation_receipts(operation_id, namespace, receipt_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                namespace=excluded.namespace,
+                receipt_json=excluded.receipt_json,
+                updated_at=excluded.updated_at",
+            params![
+                receipt.operation_id,
+                receipt.namespace,
+                receipt_json,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_operation_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<OperationReceipt>, String> {
+        let conn = self.conn();
+        let receipt_json = conn
+            .query_row(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id=?1",
+                params![operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        receipt_json
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
     }
 
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
