@@ -90,6 +90,8 @@ Configuration is read from environment variables:
 | `NATIVE_LLM_URL` | unset | Native local LLM endpoint |
 | `OPENAI_API_KEY` | unset | OpenAI API key |
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
+| `CHISEI_SECRET_COMMAND` | unset | External secrets-manager adapter used by builds with `secret-command`; receives one opaque reference argument and returns the secret on stdout |
+| `CHISEI_OPENAI_API_KEY_SECRET` / `CHISEI_ANTHROPIC_API_KEY_SECRET` | unset | Provider-key references resolved through `CHISEI_SECRET_COMMAND`; direct API-key environment variables take precedence |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | unset | Comma-separated providers whose upstream auth is supplied by the gateway (e.g. `openai`); model routing treats them as available without a server-side key |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models; defaults to `http://localhost:11434/v1` |
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound LLM/gateway upstream TCP connect timeout |

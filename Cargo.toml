@@ -6,6 +6,10 @@ license = "Apache-2.0"
 readme = "README.md"
 description = "Local-first Rust control plane for policy-governed AI-assisted software delivery."
 
+[features]
+default = []
+secret-command = []
+
 [dependencies]
 # gRPC
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }

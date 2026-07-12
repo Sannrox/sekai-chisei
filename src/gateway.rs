@@ -83,7 +83,8 @@ impl GatewayConfig {
         let openai_base_url = std::env::var("CHISEI_OPENAI_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
-        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let openai_api_key =
+            crate::secrets::resolve_optional("OPENAI_API_KEY", "CHISEI_OPENAI_API_KEY_SECRET")?;
         // Resolve the gateway's own Anthropic upstream from CHISEI_ANTHROPIC_BASE_URL
         // then the built-in default only. ANTHROPIC_BASE_URL is intentionally NOT a
         // fallback here: it is the *client*-facing variable that points clients at
@@ -93,7 +94,10 @@ impl GatewayConfig {
             &std::env::var("CHISEI_ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
         );
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let anthropic_api_key = crate::secrets::resolve_optional(
+            "ANTHROPIC_API_KEY",
+            "CHISEI_ANTHROPIC_API_KEY_SECRET",
+        )?;
         let ollama_base_url = std::env::var("CHISEI_OLLAMA_BASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
