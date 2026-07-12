@@ -92,7 +92,7 @@ Configuration is read from environment variables:
 | `ANTHROPIC_API_KEY` | unset | Anthropic API key |
 | `CHISEI_SECRET_COMMAND` | unset | External secrets-manager adapter used by builds with `secret-command`; receives one opaque reference argument and returns the secret on stdout |
 | `CHISEI_OPENAI_API_KEY_SECRET` / `CHISEI_ANTHROPIC_API_KEY_SECRET` | unset | Provider-key references resolved through `CHISEI_SECRET_COMMAND`; direct API-key environment variables take precedence |
-| `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `8388608` | Maximum buffered gateway request body size |
+| `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `33554432` | Maximum buffered gateway request body size; oversized requests return HTTP 413 |
 | `CHISEI_GATEWAY_RATE_LIMIT_REQUESTS` | `120` | Requests allowed independently per virtual key and agent per window |
 | `CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS` | `1200` | Gateway-wide requests allowed per window; prevents identity rotation from bypassing limits |
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed-window rate-limit duration |
@@ -104,6 +104,10 @@ Configuration is read from environment variables:
 | `LLM_HTTP_REQUEST_TIMEOUT_SECS` | `120` | Total timeout for unary provider `chat()` calls; streaming and gateway passthrough paths do not use this total cap |
 
 See [.env.example](.env.example) for a local template.
+
+Attachment-heavy or multimodal clients may need a larger
+`CHISEI_GATEWAY_MAX_REQUEST_BYTES`; raise it deliberately for that deployment
+rather than removing the gateway body cap.
 
 Sekai object RPC mutations and object-mutating built-in actions write audit rows
 in the same SQLite transaction as the object mutation. Updates emit one row per
