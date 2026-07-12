@@ -608,13 +608,13 @@ TTL. After key rotation or revocation, running gateways can clear the cache
 without restart:
 
 ```bash
-CHISEI_GATEWAY_ADMIN_TOKEN=change-me \
+CHISEI_GATEWAY_ADMIN_TOKEN='<random-32-byte-minimum-token>' \
 cargo run --bin chisei-gateway -- refresh
 ```
 
-If `CHISEI_GATEWAY_ADMIN_TOKEN` is unset, the local admin refresh endpoint is
-open to callers that can reach the gateway bind address. Set it before binding
-the gateway outside trusted localhost development.
+`CHISEI_GATEWAY_ADMIN_TOKEN` must be at least 32 bytes. If it is unset, the
+admin refresh endpoint is disabled. Non-loopback gateway binds additionally
+require at least one `GATEWAY_KEYS` entry, fail-closed governance, and preflight.
 
 Governance calls fail open by default so local Codex sessions keep working while
 the control plane restarts. Set `GATEWAY_GOVERNANCE_FAILURE=closed` to fail
