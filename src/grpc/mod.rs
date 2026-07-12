@@ -216,6 +216,10 @@ pub async fn run(
     let credential_store = Arc::new(PrincipalCredentialStore::new());
     credential_store.load(&active_credentials);
 
+    if let Some(socket_path) = config.sekai_socket.as_deref() {
+        ensure_local_gateway_credential(socket_path, &db)?;
+    }
+
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     spawn_health_reporter(health_reporter, db.clone());
@@ -274,6 +278,43 @@ pub async fn run(
         health_service,
     )
     .await
+}
+
+fn ensure_local_gateway_credential(socket_path: &str, db: &SekaiDb) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let token_path = format!("{socket_path}.gateway-token");
+    if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token = token.trim();
+        if !token.is_empty()
+            && db
+                .get_principal_credential(&hash_gateway_key(token))
+                .map_err(std::io::Error::other)?
+                .is_some_and(|credential| credential.principal == "chisei-gateway")
+        {
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = std::path::Path::new(&token_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let token = format!("sekai-gateway-{}", uuid::Uuid::new_v4().simple());
+    db.rotate_principal_credential("chisei-gateway", &hash_gateway_key(&token))
+        .map_err(std::io::Error::other)?;
+    let temporary = format!("{token_path}.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(temporary, token_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,6 +657,27 @@ mod tests {
             "gateway-prod"
         );
         assert_eq!(request.metadata().get(AUTH_SOURCE_HEADER).unwrap(), "token");
+    }
+
+    #[test]
+    fn local_gateway_credential_is_persisted_for_uds_authentication() {
+        let db = in_memory_db();
+        let socket_path = std::env::temp_dir().join(format!(
+            "sekai-gateway-credential-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let socket_path = socket_path.to_string_lossy().to_string();
+        let token_path = format!("{socket_path}.gateway-token");
+
+        ensure_local_gateway_credential(&socket_path, &db).unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let credential = db
+            .get_principal_credential(&hash_gateway_key(token.trim()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.principal, "chisei-gateway");
+
+        std::fs::remove_file(token_path).unwrap();
     }
 
     #[test]
