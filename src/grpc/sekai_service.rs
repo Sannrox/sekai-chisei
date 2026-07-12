@@ -11,6 +11,7 @@ use super::pb::sekai::*;
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::sekai::SekaiDb;
 use crate::domain;
+use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
@@ -5094,6 +5095,156 @@ impl SekaiService for SekaiServiceImpl {
                 head_hash: ledger.head_hash,
             }),
         }))
+    }
+
+    async fn create_credential(
+        &self,
+        req: Request<CreateCredentialRequest>,
+    ) -> Result<Response<CreateCredentialResponse>, Status> {
+        require_credential_admin(&caller_principals(&req))?;
+        let principal = validate_credential_principal(&req.into_inner().principal)?;
+        if !self
+            .db
+            .list_credentials(Some(&principal), Some("active"))
+            .map_err(Status::internal)?
+            .is_empty()
+        {
+            return Err(Status::already_exists(format!(
+                "active credential already exists for {principal:?}; rotate it instead"
+            )));
+        }
+        let token = new_credential_token();
+        let credential = self
+            .db
+            .create_principal_credential(
+                &principal,
+                &hash_gateway_key(&token),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(Status::internal)?;
+        Ok(Response::new(CreateCredentialResponse {
+            token,
+            credential: Some(to_proto_credential(credential)),
+        }))
+    }
+
+    async fn rotate_credential(
+        &self,
+        req: Request<RotateCredentialRequest>,
+    ) -> Result<Response<RotateCredentialResponse>, Status> {
+        require_credential_admin(&caller_principals(&req))?;
+        let principal = validate_credential_principal(&req.into_inner().principal)?;
+        if self
+            .db
+            .list_credentials(Some(&principal), Some("active"))
+            .map_err(Status::internal)?
+            .is_empty()
+        {
+            return Err(Status::not_found(format!(
+                "no active credential for {principal:?}"
+            )));
+        }
+        let token = new_credential_token();
+        let credential = self
+            .db
+            .rotate_principal_credential(&principal, &hash_gateway_key(&token))
+            .map_err(Status::internal)?;
+        Ok(Response::new(RotateCredentialResponse {
+            token,
+            credential: Some(to_proto_credential(credential)),
+        }))
+    }
+
+    async fn revoke_credential(
+        &self,
+        req: Request<RevokeCredentialRequest>,
+    ) -> Result<Response<RevokeCredentialResponse>, Status> {
+        require_credential_admin(&caller_principals(&req))?;
+        let principal = validate_credential_principal(&req.into_inner().principal)?;
+        let credential = self
+            .db
+            .revoke_principal_credential(&principal)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
+        Ok(Response::new(RevokeCredentialResponse {
+            credential: Some(to_proto_credential(credential)),
+        }))
+    }
+
+    async fn list_credentials(
+        &self,
+        req: Request<ListCredentialsRequest>,
+    ) -> Result<Response<ListCredentialsResponse>, Status> {
+        require_credential_admin(&caller_principals(&req))?;
+        let credentials = self
+            .db
+            .list_credentials(None, None)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(to_proto_credential)
+            .collect();
+        Ok(Response::new(ListCredentialsResponse { credentials }))
+    }
+
+    async fn get_provenance_report(
+        &self,
+        req: Request<GetProvenanceReportRequest>,
+    ) -> Result<Response<GetProvenanceReportResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let work_unit_id = req.into_inner().work_unit_id.trim().to_string();
+        if work_unit_id.is_empty() {
+            return Err(Status::invalid_argument("work_unit_id required"));
+        }
+        check_read(&self.security, &work_unit_id, &principals)?;
+        let report = crate::provenance::assemble_report(&self.db, &work_unit_id)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetProvenanceReportResponse {
+            report: crate::provenance::render_text(&report),
+        }))
+    }
+}
+
+fn require_credential_admin(principals: &[String]) -> Result<(), Status> {
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("credential admin required"))
+}
+
+fn validate_credential_principal(principal: &str) -> Result<String, Status> {
+    let principal = principal.trim();
+    if principal.is_empty()
+        || !principal
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+    {
+        return Err(Status::invalid_argument(
+            "principal must match [a-zA-Z0-9._-]+",
+        ));
+    }
+    Ok(principal.to_string())
+}
+
+fn new_credential_token() -> String {
+    format!(
+        "sekai_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn to_proto_credential(credential: crate::db::sekai::PrincipalCredential) -> CredentialRecord {
+    CredentialRecord {
+        id: credential.id,
+        principal: credential.principal,
+        status: credential.status,
+        created: credential.created,
+        rotated_at: credential.rotated_at,
+        revoked_at: credential.revoked_at,
     }
 }
 
@@ -11598,6 +11749,88 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn credential_rpcs_manage_credentials_without_exposing_hashes() {
+        let svc = service();
+        let created = svc
+            .create_credential(with_named_principal(
+                CreateCredentialRequest {
+                    principal: "agent-a".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(created.token.starts_with("sekai_"));
+        assert_eq!(created.credential.unwrap().principal, "agent-a");
+
+        let rotated = svc
+            .rotate_credential(with_named_principal(
+                RotateCredentialRequest {
+                    principal: "agent-a".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(rotated.token, created.token);
+
+        let listed = svc
+            .list_credentials(with_named_principal(ListCredentialsRequest {}, "local"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.credentials.len(), 2);
+        assert_eq!(
+            listed
+                .credentials
+                .iter()
+                .filter(|credential| credential.status == "active")
+                .count(),
+            1
+        );
+
+        let revoked = svc
+            .revoke_credential(with_named_principal(
+                RevokeCredentialRequest {
+                    principal: "agent-a".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .credential
+            .unwrap();
+        assert_eq!(revoked.status, "revoked");
+    }
+
+    #[tokio::test]
+    async fn credential_rpcs_require_control_plane_admin() {
+        let error = service()
+            .list_credentials(with_named_principal(ListCredentialsRequest {}, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn provenance_report_is_served_without_direct_database_access() {
+        let response = service()
+            .get_provenance_report(with_named_principal(
+                GetProvenanceReportRequest {
+                    work_unit_id: "work-unit-1".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.report.contains("work-unit-1"));
     }
 
     #[test]
