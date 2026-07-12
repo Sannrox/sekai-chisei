@@ -366,19 +366,19 @@ impl PostgresDb {
             match row_to_sample_observation(row) {
                 Ok(observation) => observations.push(observation),
                 Err(error) => {
-                    connection
-                        .execute(
-                            "UPDATE chisei_sample_observations
+                    match connection.execute(
+                        "UPDATE chisei_sample_observations
                              SET scored = -1, lease_owner = '', lease_expires_at = 0
                              WHERE request_id = $1",
-                            &[&request_id],
-                        )
-                        .map_err(|quarantine_error| {
-                            format!(
-                                "{error}; quarantine observation {request_id}: {quarantine_error}"
-                            )
-                        })?;
-                    tracing::error!(%error, request_id, "quarantined invalid PostgreSQL sample observation");
+                        &[&request_id],
+                    ) {
+                        Ok(_) => {
+                            tracing::error!(%error, request_id, "quarantined invalid PostgreSQL sample observation")
+                        }
+                        Err(quarantine_error) => {
+                            tracing::error!(%error, %quarantine_error, request_id, "failed to quarantine invalid PostgreSQL sample observation")
+                        }
+                    }
                 }
             }
         }
