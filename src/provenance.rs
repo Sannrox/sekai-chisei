@@ -164,7 +164,9 @@ impl ProvenanceReport {
     pub fn data_egress(&self) -> Vec<DataEgress> {
         self.decisions
             .iter()
-            .filter(|decision| decision.actor == "chisei.egress")
+            .filter(|decision| {
+                decision.actor == "chisei.egress" || decision.action == "gateway.egress"
+            })
             .map(|decision| DataEgress {
                 decision_id: decision.id.clone(),
                 request_id: decision.target_id.clone(),
@@ -173,7 +175,13 @@ impl ProvenanceReport {
                     .get("provider")
                     .cloned()
                     .unwrap_or_default(),
-                model: decision.evidence.get("model").cloned().unwrap_or_default(),
+                model: decision
+                    .evidence
+                    .get("model")
+                    .or_else(|| decision.evidence.get("resolved_model"))
+                    .or_else(|| decision.evidence.get("requested_model"))
+                    .cloned()
+                    .unwrap_or_default(),
                 included_fields: evidence_i64(decision, "included_count"),
                 redacted_fields: evidence_i64(decision, "redacted_count"),
                 included: evidence_list(decision, "included_fields"),
