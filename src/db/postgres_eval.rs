@@ -338,7 +338,8 @@ impl PostgresDb {
         let now = chrono::Utc::now().timestamp_millis();
         let lease_expires_at = now.saturating_add(SAMPLE_LEASE_MS);
         let lease_owner = format!("scorer-{}", uuid::Uuid::new_v4().simple());
-        self.connection()?
+        let mut connection = self.connection()?;
+        let rows = connection
             .query(
                 "WITH candidates AS (
                     SELECT request_id FROM chisei_sample_observations
@@ -358,22 +359,35 @@ impl PostgresDb {
                            observations.task_class, observations.cost_usd_micros",
                 &[&effective_limit, &now, &lease_owner, &lease_expires_at],
             )
-            .map(|rows| {
-                let mut observations = Vec::new();
-                for row in rows {
-                    match row_to_sample_observation(row) {
-                        Ok(observation) => observations.push(observation),
-                        Err(error) => tracing::warn!(%error, "invalid PostgreSQL sample observation; skipping row"),
-                    }
+            .map_err(|error| error.to_string())?;
+        let mut observations = Vec::new();
+        for row in rows {
+            let request_id: String = row.get(0);
+            match row_to_sample_observation(row) {
+                Ok(observation) => observations.push(observation),
+                Err(error) => {
+                    connection
+                        .execute(
+                            "UPDATE chisei_sample_observations
+                             SET scored = -1, lease_owner = '', lease_expires_at = 0
+                             WHERE request_id = $1",
+                            &[&request_id],
+                        )
+                        .map_err(|quarantine_error| {
+                            format!(
+                                "{error}; quarantine observation {request_id}: {quarantine_error}"
+                            )
+                        })?;
+                    tracing::error!(%error, request_id, "quarantined invalid PostgreSQL sample observation");
                 }
-                observations.sort_by(|left, right| {
-                    left.timestamp
-                        .cmp(&right.timestamp)
-                        .then_with(|| left.request_id.cmp(&right.request_id))
-                });
-                observations
-            })
-            .map_err(|error| error.to_string())
+            }
+        }
+        observations.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.request_id.cmp(&right.request_id))
+        });
+        Ok(observations)
     }
 
     pub fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
