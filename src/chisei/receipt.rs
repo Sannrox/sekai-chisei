@@ -161,6 +161,12 @@ pub struct UncoveredSurface {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationReporterGrant {
+    pub principal: String,
+    pub event_kinds: Vec<ReceiptEventKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationReceipt {
     pub version: String,
     pub operation_id: String,
@@ -178,6 +184,8 @@ pub struct OperationReceipt {
     pub events: Vec<OperationReceiptEvent>,
     #[serde(default)]
     pub uncovered_surfaces: Vec<UncoveredSurface>,
+    #[serde(default)]
+    pub reporter_grants: Vec<OperationReporterGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +402,7 @@ mod tests {
                 ),
             ],
             uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
         }
     }
 
