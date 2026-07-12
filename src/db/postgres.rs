@@ -12,6 +12,7 @@ use crate::db::sekai::PrincipalCredential;
 
 const MIGRATION_LOCK_ID: i64 = 0x5345_4b41_4948_4101;
 const CONTROL_PLANE_SCHEMA: &str = include_str!("postgres/0001_control_plane.sql");
+const SAMPLE_LEASE_SCHEMA: &str = include_str!("postgres/0002_sample_leases.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -247,6 +248,24 @@ impl PostgresDb {
                 )
                 .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
         }
+        let sample_leases_applied = transaction
+            .query_opt(
+                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
+                &[&2_i64],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
+            .is_some();
+        if !sample_leases_applied {
+            transaction
+                .batch_execute(SAMPLE_LEASE_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL sample leases: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                    &[&2_i64, &"sample_leases", &chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -323,5 +342,7 @@ mod tests {
         }
         assert!(!CONTROL_PLANE_SCHEMA.contains("AUTOINCREMENT"));
         assert!(!CONTROL_PLANE_SCHEMA.contains("INSERT OR"));
+        assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
+        assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
     }
 }
