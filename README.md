@@ -635,7 +635,8 @@ cargo run --bin chisei-gateway -- refresh
 
 `CHISEI_GATEWAY_ADMIN_TOKEN` must be at least 32 bytes. If it is unset, the
 admin refresh endpoint is disabled. Non-loopback gateway binds additionally
-require at least one `GATEWAY_KEYS` entry, fail-closed governance, and preflight.
+require at least one `GATEWAY_KEYS` entry, fail-closed governance, preflight, and
+passthrough authentication to be disabled.
 
 Governance calls fail open by default so local Codex sessions keep working while
 the control plane restarts. Set `GATEWAY_GOVERNANCE_FAILURE=closed` to fail

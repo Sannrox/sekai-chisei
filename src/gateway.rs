@@ -173,6 +173,7 @@ impl GatewayConfig {
             &gateway_keys,
             fail_closed,
             no_preflight,
+            allow_auth_passthrough,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
         )?;
 
@@ -203,6 +204,7 @@ fn validate_gateway_security(
     gateway_keys: &HashMap<String, GatewayIdentity>,
     fail_closed: bool,
     no_preflight: bool,
+    allow_auth_passthrough: bool,
     admin_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(token) = admin_token.map(str::trim).filter(|token| !token.is_empty())
@@ -225,6 +227,11 @@ fn validate_gateway_security(
         }
         if no_preflight {
             return Err("CHISEI_GATEWAY_NO_PREFLIGHT cannot be used on an exposed gateway".into());
+        }
+        if allow_auth_passthrough {
+            return Err(
+                "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH cannot be used on an exposed gateway".into(),
+            );
         }
     }
     Ok(())
@@ -5521,12 +5528,17 @@ mod tests {
     fn rejects_weak_admin_tokens() {
         let bind = "127.0.0.1:8788".parse().unwrap();
         let keys = HashMap::new();
-        assert!(validate_gateway_security(bind, &keys, false, false, Some("change-me")).is_err());
-        assert!(validate_gateway_security(bind, &keys, false, false, Some("too-short")).is_err());
+        assert!(
+            validate_gateway_security(bind, &keys, false, false, false, Some("change-me")).is_err()
+        );
+        assert!(
+            validate_gateway_security(bind, &keys, false, false, false, Some("too-short")).is_err()
+        );
         assert!(
             validate_gateway_security(
                 bind,
                 &keys,
+                false,
                 false,
                 false,
                 Some("0123456789abcdef0123456789abcdef"),
@@ -5539,7 +5551,7 @@ mod tests {
     fn exposed_gateway_requires_keys_fail_closed_and_preflight() {
         let bind = "0.0.0.0:8788".parse().unwrap();
         let mut keys = HashMap::new();
-        assert!(validate_gateway_security(bind, &keys, true, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, false, None).is_err());
         keys.insert(
             "hash".to_string(),
             GatewayIdentity {
@@ -5550,9 +5562,10 @@ mod tests {
                 tier: DEFAULT_GATEWAY_TIER.to_string(),
             },
         );
-        assert!(validate_gateway_security(bind, &keys, false, false, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, true, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, false, None).is_ok());
+        assert!(validate_gateway_security(bind, &keys, false, false, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, true, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, true, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, false, None).is_ok());
     }
 
     #[test]
