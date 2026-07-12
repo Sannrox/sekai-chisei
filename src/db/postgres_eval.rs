@@ -301,6 +301,8 @@ impl PostgresDb {
         &self,
         observation: &crate::chisei::scoring::SampleObservation,
     ) -> Result<(), String> {
+        let input_tokens = i64::from(observation.input_tokens);
+        let output_tokens = i64::from(observation.output_tokens);
         self.connection()?
             .execute(
                 "INSERT INTO chisei_sample_observations
@@ -316,8 +318,8 @@ impl PostgresDb {
                     &observation.resolved_model,
                     &observation.output_content,
                     &observation.sample_reason,
-                    &observation.input_tokens,
-                    &observation.output_tokens,
+                    &input_tokens,
+                    &output_tokens,
                     &observation.stop_reason,
                     &observation.timestamp,
                     &observation.task_class,
@@ -357,8 +359,13 @@ impl PostgresDb {
                 &[&effective_limit, &now, &lease_owner, &lease_expires_at],
             )
             .map(|rows| {
-                let mut observations: Vec<_> =
-                    rows.into_iter().map(row_to_sample_observation).collect();
+                let mut observations = Vec::new();
+                for row in rows {
+                    match row_to_sample_observation(row) {
+                        Ok(observation) => observations.push(observation),
+                        Err(error) => tracing::warn!(%error, "invalid PostgreSQL sample observation; skipping row"),
+                    }
+                }
                 observations.sort_by(|left, right| {
                     left.timestamp
                         .cmp(&right.timestamp)
@@ -445,23 +452,30 @@ fn row_to_eval_iteration(row: postgres::Row) -> eval::Iteration {
     }
 }
 
-fn row_to_sample_observation(row: postgres::Row) -> crate::chisei::scoring::SampleObservation {
+fn row_to_sample_observation(
+    row: postgres::Row,
+) -> Result<crate::chisei::scoring::SampleObservation, String> {
+    let request_id: String = row.get(0);
+    let input_tokens = i32::try_from(row.get::<_, i64>(6))
+        .map_err(|_| format!("input_tokens out of range for observation {request_id}"))?;
+    let output_tokens = i32::try_from(row.get::<_, i64>(7))
+        .map_err(|_| format!("output_tokens out of range for observation {request_id}"))?;
     let scored: i64 = row.get(10);
-    crate::chisei::scoring::SampleObservation {
-        request_id: row.get(0),
+    Ok(crate::chisei::scoring::SampleObservation {
+        request_id,
         namespace: row.get(1),
         spec: row.get(2),
         resolved_model: row.get(3),
         output_content: row.get(4),
         sample_reason: row.get(5),
-        input_tokens: row.get(6),
-        output_tokens: row.get(7),
+        input_tokens,
+        output_tokens,
         stop_reason: row.get(8),
         timestamp: row.get(9),
         scored: scored != 0,
         task_class: row.get(11),
         cost_usd_micros: row.get(12),
-    }
+    })
 }
 
 #[cfg(test)]
