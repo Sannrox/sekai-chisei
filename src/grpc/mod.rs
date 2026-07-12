@@ -142,6 +142,22 @@ impl Default for LocalInterceptor {
     }
 }
 
+#[derive(Clone)]
+struct LocalOrTokenAuthInterceptor {
+    local: LocalInterceptor,
+    token: TokenAuthInterceptor,
+}
+
+impl tonic::service::Interceptor for LocalOrTokenAuthInterceptor {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        if req.metadata().get("authorization").is_some() {
+            self.token.call(req)
+        } else {
+            self.local.call(req)
+        }
+    }
+}
+
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
@@ -209,7 +225,14 @@ pub async fn run(
             socket_path,
             sekai_svc.clone(),
             chisei_svc.clone(),
-            LocalInterceptor::new(false),
+            LocalOrTokenAuthInterceptor {
+                local: LocalInterceptor::new(false),
+                token: TokenAuthInterceptor::new(
+                    credential_store.clone(),
+                    db.clone(),
+                    config.auth_token.clone(),
+                ),
+            },
             health_service.clone(),
         );
 
@@ -560,6 +583,39 @@ mod tests {
                 .unwrap(),
             "root"
         );
+    }
+
+    #[test]
+    fn uds_interceptor_authenticates_bearer_tokens() {
+        let db = in_memory_db();
+        let store = PrincipalCredentialStore::new();
+        let token_hash = hash_gateway_key("gateway-token");
+        db.create_principal_credential("gateway-prod", &token_hash, 1)
+            .unwrap();
+        store.load(&db.list_active_credentials().unwrap());
+        let mut interceptor = LocalOrTokenAuthInterceptor {
+            local: LocalInterceptor::new(false),
+            token: TokenAuthInterceptor::new(Arc::new(store), db, None),
+        };
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer gateway-token"),
+        );
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("root"));
+        request
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("local"));
+        let request = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            request.metadata().get("x-principal").unwrap(),
+            "gateway-prod"
+        );
+        assert_eq!(request.metadata().get(AUTH_SOURCE_HEADER).unwrap(), "token");
     }
 
     #[test]
