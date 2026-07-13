@@ -1449,8 +1449,8 @@ mod tests {
             .unwrap();
         let missing_report = verify_bundle(&missing, &trusted_keys());
         assert_eq!(
-            missing_report.policy.missing_artifacts,
-            [attestation.id.clone()]
+            missing_report.policy.missing_artifacts.as_slice(),
+            std::slice::from_ref(&attestation.id)
         );
         assert!(!missing_report.policy.compliant);
 
