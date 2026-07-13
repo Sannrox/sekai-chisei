@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>]\n  sekaictl attest verify <bundle> [--trusted-key <file>]"
+    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>]\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id>] [--integrity-only]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,9 @@ struct ExportConfig {
 struct VerifyConfig {
     bundle: PathBuf,
     trusted_key: PathBuf,
+    identity: String,
+    key_id: String,
+    integrity_only: bool,
 }
 
 pub async fn run_attest_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -63,21 +66,19 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
 
 fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     let bundle: AttestationBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
-    let signature = bundle
-        .signature
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("bundle is unsigned"))?;
     let mut trusted_keys = TrustedKeyring::new();
     trusted_keys.trust(
-        signature.signer.identity.clone(),
-        signature.signer.key_id.clone(),
+        config.identity,
+        config.key_id,
         load_verifying_key(&config.trusted_key)?,
     )?;
     let report = verify_bundle(&bundle, &trusted_keys);
     println!("integrity: {}", report.integrity.valid);
     println!("policy_compliant: {}", report.policy.compliant);
-    println!("signer: {}", signature.signer.identity);
-    println!("key_id: {}", signature.signer.key_id);
+    if let Some(signature) = &bundle.signature {
+        println!("signer: {}", signature.signer.identity);
+        println!("key_id: {}", signature.signer.key_id);
+    }
     for error in &report.integrity.errors {
         println!("integrity_error: {error}");
     }
@@ -92,6 +93,9 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     }
     if !report.integrity.valid {
         return Err(std::io::Error::other("attestation integrity verification failed").into());
+    }
+    if !config.integrity_only && !report.policy.compliant {
+        return Err(std::io::Error::other("attestation policy verification failed").into());
     }
     Ok(())
 }
@@ -140,9 +144,18 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("SHOMEI_TRUSTED_KEY_FILE").map(PathBuf::from))
         .ok_or_else(|| "--trusted-key or SHOMEI_TRUSTED_KEY_FILE is required".to_string())?;
+    let identity = flag(args, "--identity")
+        .or_else(|| std::env::var("SHOMEI_TRUSTED_IDENTITY").ok())
+        .ok_or_else(|| "--identity or SHOMEI_TRUSTED_IDENTITY is required".to_string())?;
+    let key_id = flag(args, "--key-id")
+        .or_else(|| std::env::var("SHOMEI_TRUSTED_KEY_ID").ok())
+        .ok_or_else(|| "--key-id or SHOMEI_TRUSTED_KEY_ID is required".to_string())?;
     Ok(VerifyConfig {
         bundle,
         trusted_key,
+        identity,
+        key_id,
+        integrity_only: args.iter().any(|arg| arg == "--integrity-only"),
     })
 }
 
@@ -270,5 +283,16 @@ mod tests {
     fn hex_key_decoder_is_strict() {
         assert_eq!(decode_hex_key("key", &"07".repeat(32)).unwrap(), [7; 32]);
         assert!(decode_hex_key("key", "zz").is_err());
+    }
+
+    #[test]
+    fn verify_parser_requires_trusted_identity_metadata() {
+        let error = parse_verify(&[
+            "bundle.json".into(),
+            "--trusted-key".into(),
+            "key.pub".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error, "--identity or SHOMEI_TRUSTED_IDENTITY is required");
     }
 }
