@@ -9,10 +9,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const EVIDENCE_CONTRACT_VERSION: &str = "sekai.evidence/v1";
@@ -269,9 +269,10 @@ pub fn prepare_delivery_in(
 }
 
 fn load_delivery(path: PathBuf) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
-    restrict_file(&path)?;
-    let bytes =
-        fs::read(&path).map_err(|error| format!("failed to read adapter outbox entry: {error}"))?;
+    let mut file = open_delivery_file(&path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read adapter outbox entry: {error}"))?;
     let envelope = EvidenceEnvelope::decode(bytes.as_slice())
         .map_err(|error| format!("adapter outbox entry is corrupt: {error}"))?;
     Ok((envelope, OutboxReceipt { path }))
@@ -291,7 +292,21 @@ fn sync_directory(_path: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 fn restrict_directory(path: &Path) -> Result<(), String> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    let expected = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect adapter outbox directory: {error}"))?;
+    if !expected.file_type().is_dir() {
+        return Err("adapter outbox path is not a real directory".into());
+    }
+    let directory = File::open(path)
+        .map_err(|error| format!("failed to open adapter outbox directory: {error}"))?;
+    let actual = directory
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened adapter outbox directory: {error}"))?;
+    if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        return Err("adapter outbox directory changed while opening".into());
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("failed to protect adapter outbox directory: {error}"))
 }
 
@@ -300,15 +315,29 @@ fn restrict_directory(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn restrict_file(path: &Path) -> Result<(), String> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("failed to protect adapter outbox entry: {error}"))
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn open_delivery_file(path: &Path) -> Result<File, String> {
+    let expected = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect adapter outbox entry: {error}"))?;
+    if !expected.file_type().is_file() {
+        return Err("adapter outbox entry is not a regular file".into());
+    }
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open adapter outbox entry: {error}"))?;
+    let actual = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened adapter outbox entry: {error}"))?;
+    if !actual.is_file() {
+        return Err("adapter outbox entry is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            return Err("adapter outbox entry changed while opening".into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("failed to protect adapter outbox entry: {error}"))?;
+    }
+    Ok(file)
 }
 
 pub async fn submit(

@@ -45,7 +45,7 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     let (envelope, receipt) =
         sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_000_000).unwrap();
     assert_eq!(envelope.contract_version, sdk::EVIDENCE_CONTRACT_VERSION);
-    assert_eq!(envelope.source_record_id, "88201");
+    assert!(envelope.source_record_id.starts_with("88201:"));
     assert_eq!(envelope.source_version, "2026-07-13T08:02:31Z");
     assert_eq!(envelope.namespace, "acme");
     assert_eq!(envelope.target_external_id, "service:payments");
@@ -54,6 +54,22 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     assert_eq!(envelope.intent, "upsert");
     receipt.acknowledge().unwrap();
     std::fs::remove_dir(outbox).unwrap();
+}
+
+#[test]
+fn github_same_second_updates_keep_distinct_source_identity() {
+    let input = include_bytes!("../adapters/fixtures/github_check_run.completed.json");
+    let first = github_check_webhook::translate(github_check_webhook::parse(input).unwrap())
+        .expect("translate webhook");
+    let mut changed: serde_json::Value = serde_json::from_slice(input).unwrap();
+    changed["check_run"]["conclusion"] = serde_json::json!("failure");
+    let second = github_check_webhook::translate(
+        github_check_webhook::parse(&serde_json::to_vec(&changed).unwrap()).unwrap(),
+    )
+    .expect("translate same-second update");
+
+    assert_eq!(first.source_sequence, second.source_sequence);
+    assert_ne!(first.source_record_id, second.source_record_id);
 }
 
 #[test]
@@ -102,6 +118,52 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
     }
     first_receipt.acknowledge().unwrap();
     replay_receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn outbox_rejects_symlink_entries_without_changing_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let input = include_bytes!("../adapters/fixtures/http_health.degraded.json");
+    let draft = http_health_poll::translate(
+        http_health_poll::parse(input).unwrap(),
+        "payments-health",
+        Some("etag-17"),
+        300_000,
+    )
+    .unwrap();
+    let outbox = outbox("symlink");
+    let (_, receipt) = sdk::prepare_delivery_in(&outbox, &config(), draft.clone(), 1_000).unwrap();
+    let entry_name = std::fs::read_dir(&outbox)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.path().extension().is_some_and(|value| value == "bin"))
+        .unwrap()
+        .file_name();
+    receipt.acknowledge().unwrap();
+
+    let target = outbox.with_extension("target");
+    std::fs::write(&target, b"not an envelope").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    symlink(&target, outbox.join(entry_name)).unwrap();
+
+    assert!(sdk::prepare_delivery_in(&outbox, &config(), draft, 2_000).is_err());
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    std::fs::remove_file(
+        std::fs::read_dir(&outbox)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    std::fs::remove_file(target).unwrap();
     std::fs::remove_dir(outbox).unwrap();
 }
 
