@@ -2,8 +2,8 @@
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::evidence::{
-    EvidenceClassification, EvidenceEnvelope, EvidenceIntent, EvidenceLifecycleState,
-    EvidenceLimits,
+    DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES, EvidenceClassification, EvidenceEnvelope,
+    EvidenceIntent, EvidenceLifecycleState, EvidenceLimits,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -415,7 +415,9 @@ impl SekaiDb {
             .as_ref()
             .map_or_else(EvidenceLimits::default, |capability| EvidenceLimits {
                 max_content_bytes: capability.max_payload_bytes,
-                max_envelope_bytes: capability.max_payload_bytes,
+                max_envelope_bytes: capability
+                    .max_payload_bytes
+                    .saturating_add(DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES),
                 max_relationships: capability.max_relationships,
                 max_subject_references: capability.max_relationships,
             });

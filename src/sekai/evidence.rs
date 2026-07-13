@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 pub const EVIDENCE_ENVELOPE_VERSION: &str = "sekai.evidence/v1";
 pub const DEFAULT_MAX_EVIDENCE_BYTES: usize = 256 * 1024;
+pub const DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_RELATIONSHIPS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +144,10 @@ pub struct EvidenceTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceRelationship {
     pub relation: String,
+    #[serde(default)]
+    pub target_source_type: String,
+    #[serde(default)]
+    pub target_source_instance: String,
     pub target_source_record_id: String,
 }
 
@@ -212,7 +217,8 @@ impl Default for EvidenceLimits {
     fn default() -> Self {
         Self {
             max_content_bytes: DEFAULT_MAX_EVIDENCE_BYTES,
-            max_envelope_bytes: DEFAULT_MAX_EVIDENCE_BYTES + 64 * 1024,
+            max_envelope_bytes: DEFAULT_MAX_EVIDENCE_BYTES
+                + DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES,
             max_relationships: DEFAULT_MAX_RELATIONSHIPS,
             max_subject_references: DEFAULT_MAX_RELATIONSHIPS,
         }
@@ -295,6 +301,8 @@ impl EvidenceEnvelope {
         }
         if self.relationships.iter().any(|relationship| {
             relationship.relation.trim().is_empty()
+                || relationship.target_source_type.trim().is_empty()
+                || relationship.target_source_instance.trim().is_empty()
                 || relationship.target_source_record_id.trim().is_empty()
         }) {
             errors.push("relationships require relation and target source record".to_string());
@@ -351,6 +359,8 @@ mod tests {
             content: json!({"result": "accepted"}),
             relationships: vec![EvidenceRelationship {
                 relation: "verifies".into(),
+                target_source_type: "build_system".into(),
+                target_source_instance: "builds-primary".into(),
                 target_source_record_id: "build-7".into(),
             }],
             producer_identity: "producer:change-adapter".into(),
@@ -385,6 +395,8 @@ mod tests {
         evidence.content = json!({"payload": "too large"});
         evidence.relationships.push(EvidenceRelationship {
             relation: "conflicts_with".into(),
+            target_source_type: "change_management".into(),
+            target_source_instance: "engineering-primary".into(),
             target_source_record_id: "record-2".into(),
         });
         let errors = evidence
