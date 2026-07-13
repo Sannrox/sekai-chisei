@@ -30,6 +30,9 @@ pub enum EvidenceLifecycleState {
     Authorized,
     Projected,
     Available,
+    Superseded,
+    Retracted,
+    Stale,
     Rejected,
     Quarantined,
 }
@@ -51,6 +54,9 @@ impl EvidenceLifecycleState {
             Self::Authorized => "authorized",
             Self::Projected => "projected",
             Self::Available => "available",
+            Self::Superseded => "superseded",
+            Self::Retracted => "retracted",
+            Self::Stale => "stale",
             Self::Rejected => "rejected",
             Self::Quarantined => "quarantined",
         }
@@ -64,6 +70,9 @@ impl EvidenceLifecycleState {
             "authorized" => Self::Authorized,
             "projected" => Self::Projected,
             "available" => Self::Available,
+            "superseded" => Self::Superseded,
+            "retracted" => Self::Retracted,
+            "stale" => Self::Stale,
             "rejected" => Self::Rejected,
             "quarantined" => Self::Quarantined,
             _ => return None,
@@ -101,6 +110,20 @@ pub enum EvidenceSignal {
     ResourceUse,
     OperationalHealth,
     Other,
+}
+
+impl EvidenceSignal {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acceptance => "acceptance",
+            Self::Verification => "verification",
+            Self::Delivery => "delivery",
+            Self::Regression => "regression",
+            Self::ResourceUse => "resource_use",
+            Self::OperationalHealth => "operational_health",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +203,7 @@ pub struct EvidenceEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceLimits {
     pub max_content_bytes: usize,
+    pub max_envelope_bytes: usize,
     pub max_relationships: usize,
     pub max_subject_references: usize,
 }
@@ -188,6 +212,7 @@ impl Default for EvidenceLimits {
     fn default() -> Self {
         Self {
             max_content_bytes: DEFAULT_MAX_EVIDENCE_BYTES,
+            max_envelope_bytes: DEFAULT_MAX_EVIDENCE_BYTES + 64 * 1024,
             max_relationships: DEFAULT_MAX_RELATIONSHIPS,
             max_subject_references: DEFAULT_MAX_RELATIONSHIPS,
         }
@@ -251,6 +276,15 @@ impl EvidenceEnvelope {
             errors.push(format!(
                 "content exceeds {} byte limit",
                 limits.max_content_bytes
+            ));
+        }
+        let envelope_bytes = serde_json::to_vec(self)
+            .map(|envelope| envelope.len())
+            .unwrap_or(usize::MAX);
+        if envelope_bytes > limits.max_envelope_bytes {
+            errors.push(format!(
+                "evidence envelope exceeds {} byte limit",
+                limits.max_envelope_bytes
             ));
         }
         if self.relationships.len() > limits.max_relationships {
@@ -356,6 +390,7 @@ mod tests {
         let errors = evidence
             .validate_contract(EvidenceLimits {
                 max_content_bytes: 4,
+                max_envelope_bytes: 1_024,
                 max_relationships: 1,
                 max_subject_references: 1,
             })

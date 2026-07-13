@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod dataset;
 pub mod escalation;
 pub mod evidence;
+pub mod evidence_projection;
 pub mod evidence_store;
 pub mod function;
 pub mod learning;
