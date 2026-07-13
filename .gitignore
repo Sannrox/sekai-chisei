@@ -18,4 +18,5 @@ data/chisei-gateway-budget-reconciliation.tmp
 __pycache__/
 *.pyc
 data/logs/
+data/evidence-adapter-outbox/
 docs/plans/

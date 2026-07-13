@@ -29,6 +29,29 @@ campaigns belong in typed schemas and adapters. Chisei does not introduce a
 separate first-class `application` scope and does not act as a workflow engine
 or agent runtime.
 
+### External evidence authority and retention
+
+Accepted external evidence in `sekai_evidence_submissions` is the authoritative
+retained source record. `external_evidence` graph objects, links, and
+`sekai_evidence_observations` are versioned, rebuildable projections of those
+records. Legacy task observations, Chisei scoring samples, and portfolio
+observations remain internal compatibility or optimized stores; external
+adapters must not write them. In particular, a task observation with
+`status=done` records completion compatibility, not universal correctness.
+
+Conflicting submissions remain distinct, attributable source records rather
+than being collapsed into an aggregate truth. Consumers receive source identity,
+confidence, freshness, classification, and exact submission references so they
+can apply policy for their decision. Chisei admits each evidence class only
+after its configured evaluation gate passes; a single new submission cannot
+itself authorize broader context expansion.
+
+Accepted evidence remains available until an explicit lifecycle transition or
+an operator archival policy removes it. Producer registrations impose a durable
+retained-submission quota in addition to payload, relationship, and rate limits.
+Rejected submissions and per-submission lifecycle histories are bounded so an
+untrusted or noisy source cannot grow local state without limit.
+
 ## Quickstart
 
 ```bash

@@ -5,7 +5,7 @@ use crate::domain::{KIND_EXTERNAL_EVIDENCE, REL_DERIVED_FROM, REL_EVIDENCE_FOR};
 use crate::sekai::audit::{Decision, ObjectChange, insert_object_changes};
 use crate::sekai::evidence::{EvidenceClassification, EvidenceIntent, EvidenceLifecycleState};
 use crate::sekai::evidence_store::{EvidenceSubmissionRecord, get_submission_tx, transition};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -36,7 +36,9 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<EvidenceProjectionOutcome, String> {
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let submission = get_submission_tx(&tx, submission_id)?
             .ok_or_else(|| "evidence submission not found".to_string())?;
 
@@ -631,9 +633,14 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Barrier};
 
     fn setup() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
+        setup_at(":memory:")
+    }
+
+    fn setup_at(path: &str) -> SekaiDb {
+        let db = SekaiDb::new(path).unwrap();
         db.create_object(&Object {
             id: "service-1".into(),
             kind: "service".into(),
@@ -665,6 +672,7 @@ mod tests {
                 max_payload_bytes: 1_024,
                 max_relationships: 4,
                 rate_limit_per_minute: 100,
+                max_retained_submissions: 100_000,
                 revoked: false,
             },
             1,
@@ -810,6 +818,51 @@ mod tests {
                 .lifecycle_state,
             EvidenceLifecycleState::Available
         );
+    }
+
+    #[test]
+    fn concurrent_projection_converges_on_newest_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-evidence-concurrency-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Arc::new(setup_at(path.to_str().unwrap()));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [1_i64, 2_i64].map(|sequence| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let submission_id = admit(
+                    &db,
+                    &envelope("run-concurrent", sequence, EvidenceIntent::Upsert),
+                );
+                barrier.wait();
+                db.project_evidence_submission(&submission_id, 300 + sequence)
+                    .unwrap();
+                submission_id
+            })
+        });
+        let [older, newer] = handles.map(|handle| handle.join().unwrap());
+
+        assert_eq!(
+            db.get_evidence_submission(&older)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            EvidenceLifecycleState::Superseded
+        );
+        assert_eq!(
+            db.get_evidence_submission(&newer)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            EvidenceLifecycleState::Available
+        );
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

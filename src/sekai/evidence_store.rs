@@ -5,10 +5,14 @@ use crate::sekai::evidence::{
     DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES, EvidenceClassification, EvidenceEnvelope,
     EvidenceIntent, EvidenceLifecycleState, EvidenceLimits,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+pub const DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS: u64 = 100_000;
+const MAX_RETAINED_REJECTED_EVIDENCE_SUBMISSIONS: i64 = 10_000;
+const MAX_EVIDENCE_LIFECYCLE_EVENTS: i64 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceProducerCapability {
@@ -27,6 +31,8 @@ pub struct EvidenceProducerCapability {
     pub max_payload_bytes: usize,
     pub max_relationships: usize,
     pub rate_limit_per_minute: u32,
+    #[serde(default = "default_max_retained_submissions")]
+    pub max_retained_submissions: u64,
     pub revoked: bool,
 }
 
@@ -246,7 +252,9 @@ impl SekaiDb {
         let capability_json =
             serde_json::to_string(capability).map_err(|error| error.to_string())?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let mut registrations = tx
             .prepare(
                 "SELECT capability_json FROM sekai_evidence_producers
@@ -375,7 +383,9 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<EvidenceAdmission, String> {
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let envelope_digest = canonical_envelope_digest(envelope)?;
 
         if let Some((submission_id, stored_digest)) = tx
@@ -557,6 +567,24 @@ impl SekaiDb {
                 submission,
                 deduplicated: true,
             });
+        }
+
+        let retained_count = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_evidence_submissions
+                 WHERE producer_identity=?1 AND lifecycle_state!='rejected'",
+                [&capability.producer_identity],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if retained_count > capability.max_retained_submissions as i64 {
+            return reject_existing(
+                tx,
+                &submission_id,
+                now_ms,
+                "retained_capacity_exceeded",
+                "producer retained evidence quota is exhausted",
+            );
         }
 
         transition(
@@ -835,6 +863,10 @@ const fn default_max_clock_skew_ms() -> i64 {
     0
 }
 
+const fn default_max_retained_submissions() -> u64 {
+    DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS
+}
+
 fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), String> {
     if capability.producer_identity.trim().is_empty() {
         return Err("producer identity is required".to_string());
@@ -855,6 +887,8 @@ fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), St
         || capability.max_payload_bytes == 0
         || capability.max_relationships == 0
         || capability.rate_limit_per_minute == 0
+        || capability.max_retained_submissions == 0
+        || capability.max_retained_submissions > 1_000_000
     {
         return Err("producer quotas must be positive".to_string());
     }
@@ -1055,6 +1089,19 @@ pub(crate) fn transition(
         params![submission_id, state.as_str(), reason_code, now_ms],
     )
     .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM sekai_evidence_lifecycle_history
+         WHERE submission_id=?1
+           AND id NOT IN (
+             SELECT MIN(id) FROM sekai_evidence_lifecycle_history WHERE submission_id=?1
+           )
+           AND id NOT IN (
+             SELECT id FROM sekai_evidence_lifecycle_history
+             WHERE submission_id=?1 ORDER BY id DESC LIMIT ?2
+           )",
+        params![submission_id, MAX_EVIDENCE_LIFECYCLE_EVENTS - 1],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1098,6 +1145,7 @@ fn reject_existing(
         Some(code),
         now_ms,
     )?;
+    prune_rejected_submissions(&tx, MAX_RETAINED_REJECTED_EVIDENCE_SUBMISSIONS)?;
     let submission = get_submission_tx(&tx, submission_id)?
         .ok_or_else(|| "rejected submission disappeared".to_string())?;
     tx.commit().map_err(|error| error.to_string())?;
@@ -1106,6 +1154,30 @@ fn reject_existing(
         accepted: false,
         deduplicated: false,
     })
+}
+
+fn prune_rejected_submissions(tx: &Transaction<'_>, max_retained: i64) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM sekai_evidence_lifecycle_history
+         WHERE submission_id IN (
+           SELECT id FROM sekai_evidence_submissions
+           WHERE lifecycle_state='rejected'
+           ORDER BY updated_at_ms DESC, id DESC LIMIT -1 OFFSET ?1
+         )",
+        [max_retained],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM sekai_evidence_submissions
+         WHERE id IN (
+           SELECT id FROM sekai_evidence_submissions
+           WHERE lifecycle_state='rejected'
+           ORDER BY updated_at_ms DESC, id DESC LIMIT -1 OFFSET ?1
+         )",
+        [max_retained],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub(crate) fn get_submission_tx(
@@ -1256,6 +1328,7 @@ mod tests {
                 max_payload_bytes: 1_024,
                 max_relationships: 4,
                 rate_limit_per_minute: 20,
+                max_retained_submissions: 100_000,
                 revoked: false,
             },
             100,
@@ -1337,6 +1410,106 @@ mod tests {
                 EvidenceLifecycleState::Deduplicated,
                 EvidenceLifecycleState::Authorized,
             ]
+        );
+    }
+
+    #[test]
+    fn bounds_retained_submissions_per_producer() {
+        let db = configured_db();
+        let capability = {
+            let mut conn = db.conn();
+            let tx = conn.transaction().unwrap();
+            let capability = load_capability(&tx, "producer:checks").unwrap().unwrap();
+            tx.commit().unwrap();
+            capability
+        };
+        db.upsert_evidence_producer(
+            &EvidenceProducerCapability {
+                config_version: 2,
+                max_retained_submissions: 1,
+                ..capability
+            },
+            200,
+        )
+        .unwrap();
+
+        assert!(
+            db.submit_evidence(&envelope(), "producer:checks", 1_100)
+                .unwrap()
+                .accepted
+        );
+        let mut second = envelope();
+        second.source_record_id = "run-8".into();
+        second.source_version = "attempt-2".into();
+        second.source_sequence = 2;
+        second.idempotency_key = "delivery-8".into();
+        let admission = db
+            .submit_evidence(&second, "producer:checks", 1_200)
+            .unwrap();
+
+        assert!(!admission.accepted);
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("retained_capacity_exceeded")
+        );
+    }
+
+    #[test]
+    fn bounds_lifecycle_history_while_preserving_first_event() {
+        let db = configured_db();
+        let admission = db
+            .submit_evidence(&envelope(), "producer:checks", 1_100)
+            .unwrap();
+        let mut conn = db.conn();
+        let tx = conn.transaction().unwrap();
+        for timestamp in 1_101..1_241 {
+            transition(
+                &tx,
+                &admission.submission.id,
+                EvidenceLifecycleState::Available,
+                None,
+                timestamp,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let history = db
+            .evidence_lifecycle_history(&admission.submission.id)
+            .unwrap();
+        assert_eq!(history.len(), MAX_EVIDENCE_LIFECYCLE_EVENTS as usize);
+        assert_eq!(history.first(), Some(&EvidenceLifecycleState::Received));
+        assert_eq!(history.last(), Some(&EvidenceLifecycleState::Available));
+    }
+
+    #[test]
+    fn prunes_oldest_rejected_submissions_and_their_history() {
+        let db = configured_db();
+        let rejected = (0..3)
+            .map(|index| {
+                let mut invalid = envelope();
+                invalid.idempotency_key = format!("invalid-{index}");
+                invalid.content_digest = "0".repeat(64);
+                db.submit_evidence(&invalid, "producer:checks", 1_100 + index)
+                    .unwrap()
+                    .submission
+                    .id
+            })
+            .collect::<Vec<_>>();
+        let mut conn = db.conn();
+        let tx = conn.transaction().unwrap();
+        prune_rejected_submissions(&tx, 2).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        assert!(db.get_evidence_submission(&rejected[0]).unwrap().is_none());
+        assert!(db.get_evidence_submission(&rejected[1]).unwrap().is_some());
+        assert!(db.get_evidence_submission(&rejected[2]).unwrap().is_some());
+        assert!(
+            db.evidence_lifecycle_history(&rejected[0])
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1514,6 +1687,7 @@ mod tests {
             max_payload_bytes: 1_024,
             max_relationships: 1,
             rate_limit_per_minute: 1,
+            max_retained_submissions: 100_000,
             revoked: false,
         };
         assert!(
