@@ -2132,6 +2132,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "ed25519-dalek",
  "futures-util",
