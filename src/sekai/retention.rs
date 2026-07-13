@@ -9,6 +9,7 @@ pub const LLM_CALLS_DATASET: &str = "llm_calls";
 pub const TASK_OBSERVATIONS_DATASET: &str = "task_observations";
 
 const DAY_MS: i64 = 86_400_000;
+const RETENTION_TOMBSTONE_CONTEXT: &str = r#"{"retention_tombstone":"true"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -24,6 +25,7 @@ pub struct RetentionRun {
     pub audit_deleted: i32,
     pub llm_calls_deleted: i32,
     pub task_observations_deleted: i32,
+    pub task_observations_redacted: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub struct ArchiveRun {
     pub audit_archived: i32,
     pub llm_calls_archived: i32,
     pub task_observations_archived: i32,
+    pub task_observations_redacted: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,6 +73,18 @@ fn archive_payload_hash(dataset: &str, source_key: &str, payload: &str) -> Strin
             .unwrap_or_default()
             .as_bytes(),
     )
+}
+
+fn redact_retained_task_observation(tx: &Transaction<'_>, rowid: i64) -> Result<usize, String> {
+    tx.execute(
+        "UPDATE sekai_task_observations
+         SET request_id='retention-tombstone:' || rowid,
+             namespace='',data_class='unclassified',model='[redacted]',
+             packages_json='[]',context_json=?1
+         WHERE rowid=?2",
+        params![RETENTION_TOMBSTONE_CONTEXT, rowid],
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -2565,6 +2580,7 @@ impl SekaiDb {
         };
         let mut expired_observations =
             std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
+        let mut redacted_observation_ids = Vec::new();
         let mut retained_components = std::collections::BTreeSet::new();
         for (
             rowid,
@@ -2579,7 +2595,8 @@ impl SekaiDb {
             context,
         ) in observation_rows
         {
-            if retained_components.contains(&component_id) {
+            if context == RETENTION_TOMBSTONE_CONTEXT {
+                retained_components.insert(component_id);
                 continue;
             }
             let expired = effective_policy(
@@ -2592,11 +2609,6 @@ impl SekaiDb {
                 timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
             });
             if expired {
-                expired_observations
-                    .entry(component_id.clone())
-                    .or_insert_with(|| (namespace.clone(), Vec::new()))
-                    .1
-                    .push((rowid, status.clone()));
                 records.push(ArchiveRecord {
                     dataset: "task_observations",
                     source_key: serde_json::to_string(&(&request_id, &component_id))
@@ -2608,6 +2620,15 @@ impl SekaiDb {
                     })
                     .to_string(),
                 });
+                if retained_components.contains(&component_id) {
+                    redacted_observation_ids.push(rowid);
+                } else {
+                    expired_observations
+                        .entry(component_id.clone())
+                        .or_insert_with(|| (namespace.clone(), Vec::new()))
+                        .1
+                        .push((rowid, status.clone()));
+                }
             } else {
                 retained_components.insert(component_id);
             }
@@ -2635,10 +2656,11 @@ impl SekaiDb {
                 .filter(|record| record.dataset.starts_with("audit."))
                 .count() as i32,
             llm_calls_archived: llm_ids.len() as i32,
-            task_observations_archived: expired_observations
-                .values()
-                .map(|(_, rows)| rows.len() as i32)
-                .sum(),
+            task_observations_archived: records
+                .iter()
+                .filter(|record| record.dataset == "task_observations")
+                .count() as i32,
+            task_observations_redacted: redacted_observation_ids.len() as i32,
         };
         if records.is_empty() {
             run.batch_id.clear();
@@ -2798,6 +2820,9 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
             }
         }
+        for rowid in redacted_observation_ids {
+            redact_retained_task_observation(&tx, rowid)?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(run)
     }
@@ -2858,7 +2883,8 @@ impl SekaiDb {
         let observation_rows = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT rowid, namespace, data_class, component_id, status, timestamp
+                    "SELECT rowid, namespace, data_class, component_id, status, timestamp,
+                            context_json
                      FROM sekai_task_observations
                      ORDER BY component_id, timestamp, rowid",
                 )
@@ -2871,6 +2897,7 @@ impl SekaiDb {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -2878,11 +2905,13 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?
         };
         let mut expired = std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
+        let mut redacted_observation_ids = Vec::new();
         let mut retained_components = std::collections::BTreeSet::new();
-        for (rowid, namespace, data_class, component_id, status, timestamp_seconds) in
+        for (rowid, namespace, data_class, component_id, status, timestamp_seconds, context) in
             observation_rows
         {
-            if retained_components.contains(&component_id) {
+            if context == RETENTION_TOMBSTONE_CONTEXT {
+                retained_components.insert(component_id);
                 continue;
             }
             let expired_by_policy = effective_policy(
@@ -2895,10 +2924,14 @@ impl SekaiDb {
                 timestamp_seconds < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
             });
             if expired_by_policy {
-                let entry = expired
-                    .entry(component_id)
-                    .or_insert_with(|| (namespace, Vec::new()));
-                entry.1.push((rowid, status));
+                if retained_components.contains(&component_id) {
+                    redacted_observation_ids.push(rowid);
+                } else {
+                    let entry = expired
+                        .entry(component_id)
+                        .or_insert_with(|| (namespace, Vec::new()));
+                    entry.1.push((rowid, status));
+                }
             } else {
                 retained_components.insert(component_id);
             }
@@ -2959,6 +2992,9 @@ impl SekaiDb {
                     )
                     .map_err(|e| e.to_string())? as i32;
             }
+        }
+        for rowid in redacted_observation_ids {
+            run.task_observations_redacted += redact_retained_task_observation(&tx, rowid)? as i32;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(run)
@@ -3331,6 +3367,7 @@ mod tests {
         let run = db.run_retention(2 * DAY_MS).unwrap();
 
         assert_eq!(run.task_observations_deleted, 1);
+        assert_eq!(run.task_observations_redacted, 1);
         let after = crate::sekai::observation::task_observation_stats(&db, "component").unwrap();
         assert_eq!(after, before);
         let remaining = db
@@ -3339,8 +3376,72 @@ mod tests {
         assert!(
             remaining
                 .iter()
-                .any(|row| row.request_id == "sensitive-later")
+                .any(|row| row.request_id.starts_with("retention-tombstone:"))
         );
+        assert!(!remaining.iter().any(|row| {
+            row.request_id == "sensitive-later"
+                || row.namespace == "ns" && row.data_class == "sensitive"
+        }));
+    }
+
+    #[test]
+    fn class_scoped_task_archive_redacts_expired_non_prefix_payloads() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        {
+            let conn = db.conn();
+            for (request_id, data_class, status, timestamp) in [
+                ("sensitive-first", "sensitive", "failed", 1),
+                ("public-success", "public", "done", 2),
+                ("sensitive-later", "sensitive", "failed", 3),
+                ("public-failure", "public", "failed", 4),
+            ] {
+                conn.execute(
+                    "INSERT INTO sekai_task_observations
+                     (request_id,namespace,data_class,component_id,model,status,timestamp,context_json)
+                     VALUES (?1,'ns',?2,'component','private-model',?3,?4,
+                             '{\"subject\":\"private\"}')",
+                    params![request_id, data_class, status, timestamp],
+                )
+                .unwrap();
+            }
+        }
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: TASK_OBSERVATIONS_DATASET.into(),
+            namespace: String::new(),
+            data_class: "sensitive".into(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let before = crate::sekai::observation::task_observation_stats(&db, "component").unwrap();
+
+        let path = archive_path();
+        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+
+        assert_eq!(run.task_observations_archived, 2);
+        assert_eq!(run.task_observations_redacted, 1);
+        assert_eq!(
+            crate::sekai::observation::task_observation_stats(&db, "component").unwrap(),
+            before
+        );
+        let remaining = db
+            .list_task_observations_for_component("component")
+            .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|row| row.request_id.starts_with("retention-tombstone:"))
+        );
+        let archive = Connection::open(path).unwrap();
+        let archived_payload: String = archive
+            .query_row(
+                "SELECT payload FROM archive_records
+                 WHERE dataset='task_observations' AND payload LIKE '%sensitive-later%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(archived_payload.contains("private-model"));
     }
 
     #[test]
