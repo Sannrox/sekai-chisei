@@ -17,3 +17,4 @@ pub mod provenance;
 pub mod receipt_cli;
 pub mod secrets;
 pub mod sekai;
+pub mod shomei;
