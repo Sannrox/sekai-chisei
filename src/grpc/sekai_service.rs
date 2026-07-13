@@ -16,6 +16,13 @@ use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::attestation;
+use crate::sekai::evidence as evidence_domain;
+use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
+use crate::sekai::evidence_store::{
+    EvidenceAdmission, EvidenceProducerCapability as DomainEvidenceProducerCapability,
+    EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition, EvidenceSubmissionFilter,
+    EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
+};
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{audit, compute, coordination, dataset, function, retrieval, security};
@@ -309,6 +316,104 @@ impl SekaiServiceImpl {
             }
         }
     }
+    fn admit_and_project_evidence(
+        &self,
+        envelope: &evidence_domain::EvidenceEnvelope,
+        producer: &str,
+        now_ms: i64,
+    ) -> Result<EvidenceSubmissionResult, Status> {
+        let admission = self
+            .db
+            .submit_evidence(envelope, producer, now_ms)
+            .map_err(|_| Status::internal("evidence admission failed"))?;
+        let projection = if admission.accepted {
+            Some(
+                self.db
+                    .project_evidence_submission(&admission.submission.id, now_ms)
+                    .map_err(|_| Status::internal("evidence projection failed"))?,
+            )
+        } else {
+            None
+        };
+        if let Some(object_id) = projection
+            .as_ref()
+            .and_then(|projection| projection.evidence_object_id.as_deref())
+        {
+            for grant in self.db.list_grants(object_id).map_err(Status::internal)? {
+                self.security.add_grant(&grant);
+            }
+        }
+        evidence_submission_result(&self.db, admission, projection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_evidence_lifecycle_marker(
+        &self,
+        submission_id: String,
+        source_version: String,
+        source_sequence: i64,
+        idempotency_key: String,
+        observed_at_ms: i64,
+        intent: evidence_domain::EvidenceIntent,
+        principals: &[String],
+    ) -> Result<EvidenceSubmissionResult, Status> {
+        let original = self
+            .db
+            .get_evidence_submission(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("evidence submission not found"))?;
+        if !principals.contains(&original.producer_identity) {
+            return Err(Status::permission_denied(
+                "only the authenticated source producer may change evidence lifecycle",
+            ));
+        }
+        if original.intent != evidence_domain::EvidenceIntent::Upsert
+            || original.lifecycle_state != evidence_domain::EvidenceLifecycleState::Available
+        {
+            return Err(Status::failed_precondition(
+                "only currently available source evidence can receive a lifecycle marker",
+            ));
+        }
+        if source_version.trim().is_empty()
+            || idempotency_key.trim().is_empty()
+            || source_sequence <= original.source_sequence
+        {
+            return Err(Status::invalid_argument(
+                "lifecycle marker requires a new source version, idempotency key, and higher source sequence",
+            ));
+        }
+        let now_ms = now_millis();
+        let mut marker = original
+            .envelope
+            .ok_or_else(|| Status::internal("available evidence envelope missing"))?;
+        marker.source_version = source_version;
+        marker.source_sequence = source_sequence;
+        marker.observed_at_ms = if observed_at_ms == 0 {
+            now_ms
+        } else {
+            observed_at_ms
+        };
+        marker.collected_at_ms = now_ms;
+        marker.expires_at_ms = None;
+        marker.relationships.clear();
+        marker.content = serde_json::json!({
+            "lifecycle_intent": match intent {
+                evidence_domain::EvidenceIntent::Retract => "retract",
+                evidence_domain::EvidenceIntent::MarkStale => "mark_stale",
+                evidence_domain::EvidenceIntent::Upsert => "upsert",
+            },
+            "prior_content_digest": original.content_digest,
+        });
+        marker.content_digest =
+            crate::sekai::evidence_store::canonical_content_digest(&marker.content)
+                .map_err(Status::internal)?;
+        marker.idempotency_key = idempotency_key;
+        marker.intent = intent;
+        marker
+            .provenance
+            .insert("lifecycle_marker".into(), "server_constructed".into());
+        self.admit_and_project_evidence(&marker, &original.producer_identity, now_ms)
+    }
 }
 
 fn caller_principals(req: &Request<impl std::any::Any>) -> Vec<String> {
@@ -333,6 +438,220 @@ fn require_authenticated(principals: &[String]) -> Result<(), Status> {
         return Err(Status::unauthenticated("principal required"));
     }
     Ok(())
+}
+
+fn require_evidence_admin(security: &SecurityChecker, principals: &[String]) -> Result<(), Status> {
+    let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+        || security.can_admin("evidence", &refs)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("evidence admin required"))
+}
+
+fn can_operate_evidence_submission(
+    security: &SecurityChecker,
+    submission: &DomainEvidenceSubmissionRecord,
+    principals: &[String],
+) -> bool {
+    principals
+        .iter()
+        .any(|principal| principal == &submission.producer_identity)
+        || require_evidence_admin(security, principals).is_ok()
+}
+
+fn parse_evidence_classification(
+    value: &str,
+) -> Result<evidence_domain::EvidenceClassification, Status> {
+    match value.trim() {
+        "public" => Ok(evidence_domain::EvidenceClassification::Public),
+        "internal" => Ok(evidence_domain::EvidenceClassification::Internal),
+        "confidential" => Ok(evidence_domain::EvidenceClassification::Confidential),
+        "restricted" => Ok(evidence_domain::EvidenceClassification::Restricted),
+        _ => Err(Status::invalid_argument("invalid evidence classification")),
+    }
+}
+
+fn parse_evidence_intent(value: &str) -> Result<evidence_domain::EvidenceIntent, Status> {
+    match value.trim() {
+        "upsert" => Ok(evidence_domain::EvidenceIntent::Upsert),
+        "retract" => Ok(evidence_domain::EvidenceIntent::Retract),
+        "mark_stale" => Ok(evidence_domain::EvidenceIntent::MarkStale),
+        _ => Err(Status::invalid_argument("invalid evidence intent")),
+    }
+}
+
+fn parse_evidence_signal(value: &str) -> Result<evidence_domain::EvidenceSignal, Status> {
+    match value.trim() {
+        "acceptance" => Ok(evidence_domain::EvidenceSignal::Acceptance),
+        "verification" => Ok(evidence_domain::EvidenceSignal::Verification),
+        "delivery" => Ok(evidence_domain::EvidenceSignal::Delivery),
+        "regression" => Ok(evidence_domain::EvidenceSignal::Regression),
+        "resource_use" => Ok(evidence_domain::EvidenceSignal::ResourceUse),
+        "operational_health" => Ok(evidence_domain::EvidenceSignal::OperationalHealth),
+        "other" => Ok(evidence_domain::EvidenceSignal::Other),
+        _ => Err(Status::invalid_argument("invalid evidence signal")),
+    }
+}
+
+fn parse_schema_compatibility(value: &str) -> Result<evidence_domain::SchemaCompatibility, Status> {
+    match value.trim() {
+        "exact" => Ok(evidence_domain::SchemaCompatibility::Exact),
+        "backward_compatible" => Ok(evidence_domain::SchemaCompatibility::BackwardCompatible),
+        _ => Err(Status::invalid_argument(
+            "invalid evidence schema compatibility",
+        )),
+    }
+}
+
+fn optional_nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn from_proto_evidence_envelope(
+    envelope: EvidenceEnvelope,
+) -> Result<evidence_domain::EvidenceEnvelope, Status> {
+    let confidence_bps = u16::try_from(envelope.confidence_bps)
+        .map_err(|_| Status::invalid_argument("confidence_bps out of range"))?;
+    let content = serde_json::from_slice(&envelope.content_json)
+        .map_err(|_| Status::invalid_argument("content_json must contain valid JSON"))?;
+    let causality = envelope
+        .causality
+        .map(|causality| evidence_domain::EvidenceCausality {
+            operation_id: optional_nonempty(causality.operation_id),
+            parent_operation_id: optional_nonempty(causality.parent_operation_id),
+            attempt_id: optional_nonempty(causality.attempt_id),
+            model_call_id: optional_nonempty(causality.model_call_id),
+            subject_references: causality.subject_references,
+            trace_context: causality.trace_context.into_iter().collect(),
+        });
+    Ok(evidence_domain::EvidenceEnvelope {
+        contract_version: envelope.contract_version,
+        source_type: envelope.source_type,
+        source_instance: envelope.source_instance,
+        source_record_id: envelope.source_record_id,
+        source_version: envelope.source_version,
+        source_sequence: envelope.source_sequence,
+        target: evidence_domain::EvidenceTarget {
+            namespace: envelope.namespace,
+            object_external_id: envelope.target_external_id,
+            object_kind: envelope.target_kind,
+        },
+        evidence_type: envelope.evidence_type,
+        signal: parse_evidence_signal(&envelope.signal)?,
+        schema_id: envelope.schema_id,
+        schema_version: envelope.schema_version,
+        schema_compatibility: parse_schema_compatibility(&envelope.schema_compatibility)?,
+        observed_at_ms: envelope.observed_at_ms,
+        collected_at_ms: envelope.collected_at_ms,
+        expires_at_ms: envelope.expires_at_ms,
+        content,
+        relationships: envelope
+            .relationships
+            .into_iter()
+            .map(|relationship| evidence_domain::EvidenceRelationship {
+                relation: relationship.relation,
+                target_source_type: relationship.target_source_type,
+                target_source_instance: relationship.target_source_instance,
+                target_source_record_id: relationship.target_source_record_id,
+            })
+            .collect(),
+        producer_identity: envelope.producer_identity,
+        confidence_bps,
+        classification: parse_evidence_classification(&envelope.classification)?,
+        provenance: envelope.provenance.into_iter().collect(),
+        idempotency_key: envelope.idempotency_key,
+        content_digest: envelope.content_digest,
+        intent: parse_evidence_intent(&envelope.intent)?,
+        causality,
+    })
+}
+
+fn from_proto_evidence_producer(
+    capability: EvidenceProducerCapability,
+) -> Result<DomainEvidenceProducerCapability, Status> {
+    let max_payload_bytes = usize::try_from(capability.max_payload_bytes)
+        .map_err(|_| Status::invalid_argument("max_payload_bytes out of range"))?;
+    let max_relationships = usize::try_from(capability.max_relationships)
+        .map_err(|_| Status::invalid_argument("max_relationships out of range"))?;
+    let allowed_intents = capability
+        .allowed_intents
+        .iter()
+        .map(|intent| parse_evidence_intent(intent))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DomainEvidenceProducerCapability {
+        producer_identity: capability.producer_identity,
+        config_version: capability.config_version,
+        source_instances: capability.source_instances,
+        namespaces: capability.namespaces,
+        evidence_types: capability.evidence_types,
+        target_kinds: capability.target_kinds,
+        classification_ceiling: parse_evidence_classification(&capability.classification_ceiling)?,
+        allowed_intents,
+        allow_operation_attachment: capability.allow_operation_attachment,
+        replay_window_ms: capability.replay_window_ms,
+        max_clock_skew_ms: capability.max_clock_skew_ms,
+        max_payload_bytes,
+        max_relationships,
+        rate_limit_per_minute: capability.rate_limit_per_minute,
+        revoked: capability.revoked,
+    })
+}
+
+fn to_proto_evidence_submission(
+    submission: &DomainEvidenceSubmissionRecord,
+) -> EvidenceSubmissionRecord {
+    EvidenceSubmissionRecord {
+        id: submission.id.clone(),
+        producer_identity: submission.producer_identity.clone(),
+        source_type: submission.source_type.clone(),
+        source_instance: submission.source_instance.clone(),
+        source_record_id: submission.source_record_id.clone(),
+        source_version: submission.source_version.clone(),
+        source_sequence: submission.source_sequence,
+        namespace: submission.namespace.clone(),
+        target_external_id: submission.target_external_id.clone(),
+        target_kind: submission.target_kind.clone(),
+        evidence_type: submission.evidence_type.clone(),
+        schema_id: submission.schema_id.clone(),
+        schema_version: submission.schema_version.clone(),
+        content_digest: submission.content_digest.clone(),
+        classification: submission.classification.as_str().into(),
+        intent: match submission.intent {
+            evidence_domain::EvidenceIntent::Upsert => "upsert",
+            evidence_domain::EvidenceIntent::Retract => "retract",
+            evidence_domain::EvidenceIntent::MarkStale => "mark_stale",
+        }
+        .into(),
+        lifecycle_state: submission.lifecycle_state.as_str().into(),
+        rejection_code: submission.rejection_code.clone().unwrap_or_default(),
+        rejection_summary: submission.rejection_summary.clone().unwrap_or_default(),
+        observed_at_ms: submission.observed_at_ms,
+        collected_at_ms: submission.collected_at_ms,
+        expires_at_ms: submission.expires_at_ms,
+        received_at_ms: submission.received_at_ms,
+        updated_at_ms: submission.updated_at_ms,
+    }
+}
+
+fn evidence_submission_result(
+    db: &SekaiDb,
+    admission: EvidenceAdmission,
+    projection: Option<EvidenceProjectionOutcome>,
+) -> Result<EvidenceSubmissionResult, Status> {
+    let submission = db
+        .get_evidence_submission(&admission.submission.id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::internal("evidence submission disappeared"))?;
+    Ok(EvidenceSubmissionResult {
+        submission: Some(to_proto_evidence_submission(&submission)),
+        admitted: admission.accepted,
+        deduplicated: admission.deduplicated,
+        projected: projection.is_some_and(|projection| projection.projected),
+    })
 }
 
 fn now_millis() -> i64 {
@@ -5185,6 +5504,270 @@ impl SekaiService for SekaiServiceImpl {
             .map(to_proto_credential)
             .collect();
         Ok(Response::new(ListCredentialsResponse { credentials }))
+    }
+
+    async fn register_evidence_producer(
+        &self,
+        req: Request<RegisterEvidenceProducerRequest>,
+    ) -> Result<Response<RegisterEvidenceProducerResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_evidence_admin(&self.security, &principals)?;
+        let capability = req
+            .into_inner()
+            .capability
+            .ok_or_else(|| Status::invalid_argument("capability required"))?;
+        let capability = from_proto_evidence_producer(capability)?;
+        self.db
+            .upsert_evidence_producer(&capability, now_millis())
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(RegisterEvidenceProducerResponse {}))
+    }
+
+    async fn register_evidence_schema(
+        &self,
+        req: Request<RegisterEvidenceSchemaRequest>,
+    ) -> Result<Response<RegisterEvidenceSchemaResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_evidence_admin(&self.security, &principals)?;
+        let definition = req
+            .into_inner()
+            .definition
+            .ok_or_else(|| Status::invalid_argument("definition required"))?;
+        self.db
+            .register_evidence_schema(
+                &DomainEvidenceSchemaDefinition {
+                    schema_id: definition.schema_id,
+                    schema_version: definition.schema_version,
+                    evidence_type: definition.evidence_type,
+                    compatible_versions: definition.compatible_versions,
+                },
+                now_millis(),
+            )
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(RegisterEvidenceSchemaResponse {}))
+    }
+
+    async fn submit_evidence(
+        &self,
+        req: Request<SubmitEvidenceRequest>,
+    ) -> Result<Response<SubmitEvidenceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let envelope = req
+            .into_inner()
+            .envelope
+            .ok_or_else(|| Status::invalid_argument("envelope required"))?;
+        let envelope = from_proto_evidence_envelope(envelope)?;
+        if !principals.contains(&envelope.producer_identity) {
+            return Err(Status::permission_denied(
+                "authenticated producer must match envelope attribution",
+            ));
+        }
+        let result =
+            self.admit_and_project_evidence(&envelope, &envelope.producer_identity, now_millis())?;
+        Ok(Response::new(SubmitEvidenceResponse {
+            result: Some(result),
+        }))
+    }
+
+    async fn submit_evidence_batch(
+        &self,
+        req: Request<SubmitEvidenceBatchRequest>,
+    ) -> Result<Response<SubmitEvidenceBatchResponse>, Status> {
+        const MAX_BATCH: usize = 100;
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let envelopes = req.into_inner().envelopes;
+        if envelopes.is_empty() || envelopes.len() > MAX_BATCH {
+            return Err(Status::invalid_argument(
+                "evidence batch must contain between 1 and 100 envelopes",
+            ));
+        }
+        let envelopes = envelopes
+            .into_iter()
+            .map(from_proto_evidence_envelope)
+            .collect::<Result<Vec<_>, _>>()?;
+        if envelopes
+            .iter()
+            .any(|envelope| !principals.contains(&envelope.producer_identity))
+        {
+            return Err(Status::permission_denied(
+                "authenticated producer must match every envelope attribution",
+            ));
+        }
+        let mut results = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            results.push(self.admit_and_project_evidence(
+                &envelope,
+                &envelope.producer_identity,
+                now_millis(),
+            )?);
+        }
+        Ok(Response::new(SubmitEvidenceBatchResponse { results }))
+    }
+
+    async fn get_evidence_submission(
+        &self,
+        req: Request<GetEvidenceSubmissionRequest>,
+    ) -> Result<Response<GetEvidenceSubmissionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let submission_id = req.into_inner().submission_id;
+        let submission = self
+            .db
+            .get_evidence_submission(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("evidence submission not found"))?;
+        if !can_operate_evidence_submission(&self.security, &submission, &principals) {
+            return Err(Status::permission_denied("evidence access denied"));
+        }
+        let history = self
+            .db
+            .evidence_lifecycle_history(&submission_id)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(|state| state.as_str().to_string())
+            .collect();
+        Ok(Response::new(GetEvidenceSubmissionResponse {
+            submission: Some(to_proto_evidence_submission(&submission)),
+            lifecycle_history: history,
+        }))
+    }
+
+    async fn list_evidence_submissions(
+        &self,
+        req: Request<ListEvidenceSubmissionsRequest>,
+    ) -> Result<Response<ListEvidenceSubmissionsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let is_admin = require_evidence_admin(&self.security, &principals).is_ok();
+        let request = req.into_inner();
+        let producer_identity = if is_admin {
+            optional_nonempty(request.producer_identity)
+        } else {
+            let requested = optional_nonempty(request.producer_identity);
+            if requested
+                .as_ref()
+                .is_some_and(|producer| !principals.contains(producer))
+            {
+                return Err(Status::permission_denied("evidence access denied"));
+            }
+            requested.or_else(|| {
+                principals
+                    .iter()
+                    .find(|principal| principal.as_str() != "anonymous")
+                    .cloned()
+            })
+        };
+        let lifecycle_state = if request.lifecycle_state.trim().is_empty() {
+            None
+        } else {
+            Some(
+                evidence_domain::EvidenceLifecycleState::parse(request.lifecycle_state.trim())
+                    .ok_or_else(|| Status::invalid_argument("invalid lifecycle_state"))?,
+            )
+        };
+        let submissions = self
+            .db
+            .list_evidence_submissions(&EvidenceSubmissionFilter {
+                producer_identity,
+                source_instance: optional_nonempty(request.source_instance),
+                namespace: optional_nonempty(request.namespace),
+                lifecycle_state,
+                target_external_id: optional_nonempty(request.target_external_id),
+                evidence_type: optional_nonempty(request.evidence_type),
+                limit: request.limit,
+                offset: request.offset,
+            })
+            .map_err(Status::internal)?
+            .iter()
+            .map(to_proto_evidence_submission)
+            .collect();
+        Ok(Response::new(ListEvidenceSubmissionsResponse {
+            submissions,
+        }))
+    }
+
+    async fn replay_evidence_submission(
+        &self,
+        req: Request<ReplayEvidenceSubmissionRequest>,
+    ) -> Result<Response<ReplayEvidenceSubmissionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let submission_id = req.into_inner().submission_id;
+        let submission = self
+            .db
+            .get_evidence_submission(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("evidence submission not found"))?;
+        if !can_operate_evidence_submission(&self.security, &submission, &principals) {
+            return Err(Status::permission_denied("evidence replay denied"));
+        }
+        let projection = self
+            .db
+            .project_evidence_submission(&submission_id, now_millis())
+            .map_err(Status::failed_precondition)?;
+        if let Some(object_id) = projection.evidence_object_id.as_deref() {
+            for grant in self.db.list_grants(object_id).map_err(Status::internal)? {
+                self.security.add_grant(&grant);
+            }
+        }
+        let current = self
+            .db
+            .get_evidence_submission(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::internal("evidence submission disappeared"))?;
+        Ok(Response::new(ReplayEvidenceSubmissionResponse {
+            result: Some(EvidenceSubmissionResult {
+                submission: Some(to_proto_evidence_submission(&current)),
+                admitted: current.lifecycle_state
+                    != evidence_domain::EvidenceLifecycleState::Rejected,
+                deduplicated: true,
+                projected: projection.projected,
+            }),
+        }))
+    }
+
+    async fn retract_evidence(
+        &self,
+        req: Request<RetractEvidenceRequest>,
+    ) -> Result<Response<RetractEvidenceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let request = req.into_inner();
+        let result = self.create_evidence_lifecycle_marker(
+            request.submission_id,
+            request.source_version,
+            request.source_sequence,
+            request.idempotency_key,
+            request.observed_at_ms,
+            evidence_domain::EvidenceIntent::Retract,
+            &principals,
+        )?;
+        Ok(Response::new(RetractEvidenceResponse {
+            result: Some(result),
+        }))
+    }
+
+    async fn mark_evidence_stale(
+        &self,
+        req: Request<MarkEvidenceStaleRequest>,
+    ) -> Result<Response<MarkEvidenceStaleResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let request = req.into_inner();
+        let result = self.create_evidence_lifecycle_marker(
+            request.submission_id,
+            request.source_version,
+            request.source_sequence,
+            request.idempotency_key,
+            request.observed_at_ms,
+            evidence_domain::EvidenceIntent::MarkStale,
+            &principals,
+        )?;
+        Ok(Response::new(MarkEvidenceStaleResponse {
+            result: Some(result),
+        }))
     }
 
     async fn get_provenance_report(
@@ -11858,6 +12441,252 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(response.report.contains("work-unit-1"));
+    }
+
+    async fn configured_evidence_service(with_target: bool) -> SekaiServiceImpl {
+        let svc = service();
+        svc.register_evidence_producer(with_named_principal(
+            RegisterEvidenceProducerRequest {
+                capability: Some(EvidenceProducerCapability {
+                    producer_identity: "producer:checks".into(),
+                    config_version: 1,
+                    source_instances: vec!["checks-primary".into()],
+                    namespaces: vec!["acme".into()],
+                    evidence_types: vec!["verification.result".into()],
+                    target_kinds: vec!["service".into()],
+                    classification_ceiling: "confidential".into(),
+                    allowed_intents: vec!["upsert".into(), "retract".into(), "mark_stale".into()],
+                    allow_operation_attachment: false,
+                    replay_window_ms: 60_000,
+                    max_clock_skew_ms: 1_000,
+                    max_payload_bytes: 4_096,
+                    max_relationships: 8,
+                    rate_limit_per_minute: 100,
+                    revoked: false,
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.register_evidence_schema(with_named_principal(
+            RegisterEvidenceSchemaRequest {
+                definition: Some(EvidenceSchemaDefinition {
+                    schema_id: "verification.result".into(),
+                    schema_version: "1.0.0".into(),
+                    evidence_type: "verification.result".into(),
+                    compatible_versions: vec![],
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        if with_target {
+            svc.db
+                .create_object(&domain::Object {
+                    id: "service-1".into(),
+                    kind: "service".into(),
+                    name: "payments".into(),
+                    namespace: "acme".into(),
+                    external_id: "service:payments".into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        svc
+    }
+
+    fn proto_evidence(record: &str, sequence: i64) -> EvidenceEnvelope {
+        let content = serde_json::json!({"result": "passed", "sequence": sequence});
+        EvidenceEnvelope {
+            contract_version: evidence_domain::EVIDENCE_ENVELOPE_VERSION.into(),
+            source_type: "verification_system".into(),
+            source_instance: "checks-primary".into(),
+            source_record_id: record.into(),
+            source_version: format!("v{sequence}"),
+            source_sequence: sequence,
+            namespace: "acme".into(),
+            target_external_id: "service:payments".into(),
+            target_kind: "service".into(),
+            evidence_type: "verification.result".into(),
+            signal: "verification".into(),
+            schema_id: "verification.result".into(),
+            schema_version: "1.0.0".into(),
+            schema_compatibility: "exact".into(),
+            observed_at_ms: now_millis(),
+            collected_at_ms: now_millis(),
+            expires_at_ms: None,
+            content_json: serde_json::to_vec(&content).unwrap(),
+            relationships: vec![],
+            producer_identity: "producer:checks".into(),
+            confidence_bps: 9_000,
+            classification: "internal".into(),
+            provenance: HashMap::new(),
+            idempotency_key: format!("delivery-{record}-{sequence}"),
+            content_digest: crate::sekai::evidence_store::canonical_content_digest(&content)
+                .unwrap(),
+            intent: "upsert".into(),
+            causality: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_control_plane_authenticates_and_filters_inspection() {
+        let svc = configured_evidence_service(true).await;
+        let submitted = svc
+            .submit_evidence(with_named_principal(
+                SubmitEvidenceRequest {
+                    envelope: Some(proto_evidence("run-1", 1)),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(submitted.admitted);
+        assert!(submitted.projected);
+        let submission = submitted.submission.unwrap();
+        assert_eq!(submission.lifecycle_state, "available");
+
+        let inspected = svc
+            .get_evidence_submission(with_named_principal(
+                GetEvidenceSubmissionRequest {
+                    submission_id: submission.id.clone(),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(inspected.lifecycle_history.last().unwrap(), "available");
+        let denied = svc
+            .get_evidence_submission(with_named_principal(
+                GetEvidenceSubmissionRequest {
+                    submission_id: submission.id,
+                },
+                "producer:other",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let listed = svc
+            .list_evidence_submissions(with_named_principal(
+                ListEvidenceSubmissionsRequest {
+                    producer_identity: String::new(),
+                    source_instance: "checks-primary".into(),
+                    namespace: "acme".into(),
+                    lifecycle_state: "available".into(),
+                    target_external_id: "service:payments".into(),
+                    evidence_type: "verification.result".into(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.submissions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evidence_batch_is_bounded_before_mutation() {
+        let svc = configured_evidence_service(true).await;
+        let error = svc
+            .submit_evidence_batch(with_named_principal(
+                SubmitEvidenceBatchRequest {
+                    envelopes: (0..101)
+                        .map(|sequence| proto_evidence("batch", sequence))
+                        .collect(),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            svc.db
+                .list_evidence_submissions(&EvidenceSubmissionFilter::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_replay_and_retraction_preserve_lifecycle_history() {
+        let svc = configured_evidence_service(false).await;
+        let submitted = svc
+            .submit_evidence(with_named_principal(
+                SubmitEvidenceRequest {
+                    envelope: Some(proto_evidence("run-1", 1)),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let submission_id = submitted.submission.unwrap().id;
+        assert!(!submitted.projected);
+        svc.db
+            .create_object(&domain::Object {
+                id: "service-1".into(),
+                kind: "service".into(),
+                name: "payments".into(),
+                namespace: "acme".into(),
+                external_id: "service:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let replayed = svc
+            .replay_evidence_submission(with_named_principal(
+                ReplayEvidenceSubmissionRequest {
+                    submission_id: submission_id.clone(),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(replayed.projected);
+        assert_eq!(replayed.submission.unwrap().lifecycle_state, "available");
+
+        let retracted = svc
+            .retract_evidence(with_named_principal(
+                RetractEvidenceRequest {
+                    submission_id: submission_id.clone(),
+                    source_version: "v2".into(),
+                    source_sequence: 2,
+                    idempotency_key: "retract-run-1".into(),
+                    observed_at_ms: now_millis(),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(retracted.projected);
+        assert_eq!(
+            svc.db
+                .get_evidence_submission(&submission_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            evidence_domain::EvidenceLifecycleState::Retracted
+        );
     }
 
     #[test]
