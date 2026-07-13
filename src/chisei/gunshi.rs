@@ -4,6 +4,8 @@
 //! execution. Callers remain responsible for dispatching an accepted plan.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
@@ -28,14 +30,44 @@ pub struct AgentCapacity {
     pub healthy: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub model: String,
+    pub quality: f64,
+    pub cost_per_attempt_usd_micros: i64,
+    pub latency_ms: i64,
+    pub uncertainty: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapacityEnvelope {
     pub captured_at_ms: i64,
     pub policy_version: String,
     pub agents: Vec<AgentCapacity>,
+    #[serde(default)]
+    pub model_profiles: Vec<ModelProfile>,
     pub budget_remaining_usd_micros: i64,
     pub max_parallel_attempts: u32,
     pub human_attention_minutes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocationRequest {
+    pub capacity: CapacityEnvelope,
+    pub operations: Vec<PendingOperation>,
+    pub strategy: Strategy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnallocatedOperation {
+    pub operation_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineAllocation {
+    pub plans: Vec<AllocationPlan>,
+    pub unallocated: Vec<UnallocatedOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +84,8 @@ pub struct PendingOperation {
     pub budget_ceiling_usd_micros: i64,
     pub acceptance_criteria: Vec<String>,
     pub approval_required: bool,
+    #[serde(default)]
+    pub human_attention_minutes_required: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,8 +198,323 @@ impl CapacityEnvelope {
                 return Err(format!("agent {} has an empty model", agent.agent_id));
             }
         }
+        let mut models = BTreeSet::new();
+        for profile in &self.model_profiles {
+            required("model profile model", &profile.model)?;
+            if !models.insert(profile.model.as_str()) {
+                return Err(format!("duplicate model profile {}", profile.model));
+            }
+            for (name, value) in [
+                ("quality", profile.quality),
+                ("uncertainty", profile.uncertainty),
+            ] {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "model {} {name} must be between 0 and 1",
+                        profile.model
+                    ));
+                }
+            }
+            if profile.cost_per_attempt_usd_micros < 0 || profile.latency_ms < 0 {
+                return Err(format!(
+                    "model {} cost and latency must be non-negative",
+                    profile.model
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// Produce an advisory allocation with no learned optimization. The result is
+/// deterministic for the serialized request, including ordering and ids.
+pub fn recommend_baseline(request: &AllocationRequest) -> Result<BaselineAllocation, String> {
+    request.capacity.validate()?;
+    request.strategy.validate()?;
+    if request.operations.is_empty() {
+        return Err("at least one pending operation is required".into());
+    }
+    let mut operation_ids = BTreeSet::new();
+    for operation in &request.operations {
+        operation.validate()?;
+        if !operation_ids.insert(operation.operation_id.as_str()) {
+            return Err(format!(
+                "duplicate pending operation {}",
+                operation.operation_id
+            ));
+        }
+    }
+
+    let known_classes = request
+        .capacity
+        .agents
+        .iter()
+        .flat_map(|agent| agent.operation_classes.iter())
+        .filter(|class| class.as_str() != "*")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut operations = request
+        .operations
+        .iter()
+        .map(|operation| {
+            let is_fallback = !known_classes.contains(&operation.operation_class);
+            let baseline = if is_fallback {
+                BaselineStrategy::Conservative
+            } else {
+                request.strategy.baseline
+            };
+            (operation, baseline, is_fallback)
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .then_with(|| operation_order(left.0, right.0, left.1))
+    });
+
+    let mut slots = request
+        .capacity
+        .agents
+        .iter()
+        .map(|agent| (agent.agent_id.as_str(), agent.available_slots))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut remaining_budget = request.capacity.budget_remaining_usd_micros;
+    let mut remaining_human_attention = request.capacity.human_attention_minutes;
+    let mut plans = Vec::new();
+    let mut unallocated = Vec::new();
+
+    for (operation, effective_baseline, is_fallback) in operations {
+        if plans.len() >= request.capacity.max_parallel_attempts as usize {
+            unallocated.push(UnallocatedOperation {
+                operation_id: operation.operation_id.clone(),
+                reason: "fleet parallel-attempt capacity exhausted".into(),
+            });
+            continue;
+        }
+        let human_review = operation.approval_required
+            || operation.risk >= OperationRisk::Medium
+            || operation.human_attention_minutes_required > 0;
+        let attention_required = if human_review {
+            operation.human_attention_minutes_required.max(1)
+        } else {
+            0
+        };
+        if attention_required > remaining_human_attention {
+            unallocated.push(UnallocatedOperation {
+                operation_id: operation.operation_id.clone(),
+                reason: "human-attention capacity exhausted".into(),
+            });
+            continue;
+        }
+        let mut choices = eligible_choices(operation, &request.capacity, &slots);
+        choices.sort_by(|left, right| choice_order(left, right, effective_baseline));
+        let Some((agent, profile)) = choices.into_iter().find(|(_, profile)| {
+            profile.cost_per_attempt_usd_micros <= operation.budget_ceiling_usd_micros
+                && profile.cost_per_attempt_usd_micros <= remaining_budget
+        }) else {
+            unallocated.push(UnallocatedOperation {
+                operation_id: operation.operation_id.clone(),
+                reason: "no healthy eligible capacity within policy and budget limits".into(),
+            });
+            continue;
+        };
+
+        let effective_strategy = Strategy {
+            baseline: effective_baseline,
+            ..request.strategy.clone()
+        };
+        let max_attempts = affordable_attempts(operation, profile, remaining_budget);
+        let budget_ceiling = profile
+            .cost_per_attempt_usd_micros
+            .checked_mul(i64::from(max_attempts))
+            .ok_or_else(|| format!("attempt budget overflow for {}", operation.operation_id))?;
+        let fingerprint = input_fingerprint(&AllocationFingerprint {
+            request,
+            operation,
+            strategy: &effective_strategy,
+            agent,
+            profile,
+            remaining_budget,
+            remaining_human_attention,
+            max_attempts,
+            budget_ceiling,
+        })?;
+        let fallback_note = is_fallback.then(|| {
+            format!(
+                "unknown operation class {} uses the conservative baseline",
+                operation.operation_class
+            )
+        });
+        let mut explanation = vec![
+            format!(
+                "selected healthy agent {} with an available slot",
+                agent.agent_id
+            ),
+            format!(
+                "selected model {} within the operation and fleet budget ceilings",
+                profile.model
+            ),
+        ];
+        if let Some(note) = fallback_note {
+            explanation.push(note);
+        }
+        let plan = AllocationPlan {
+            contract_version: ALLOCATION_CONTRACT_VERSION.into(),
+            allocation_id: format!("alloc-{}", &fingerprint[..16]),
+            operation_id: operation.operation_id.clone(),
+            namespace: operation.namespace.clone(),
+            operation_class: operation.operation_class.clone(),
+            priority: operation.priority,
+            strategy: effective_strategy,
+            policy_version: request.capacity.policy_version.clone(),
+            advisory: true,
+            selection: ResourceSelection {
+                agent_id: agent.agent_id.clone(),
+                runtime: agent.runtime.clone(),
+                model: profile.model.clone(),
+                tools: operation.required_tools.iter().cloned().collect(),
+            },
+            attempts: AttemptStrategy {
+                max_attempts,
+                parallel_attempts: 1,
+                speculative: false,
+            },
+            verification: VerificationStrategy {
+                checks: vec!["operation_receipt_complete".into()],
+                acceptance_criteria: operation.acceptance_criteria.clone(),
+                human_review_required: human_review,
+            },
+            budget_ceiling_usd_micros: budget_ceiling,
+            stop_conditions: StopConditions {
+                max_cost_usd_micros: budget_ceiling,
+                max_attempts,
+                deadline_ms: None,
+                stop_on_acceptance: true,
+            },
+            escalation: EscalationRules {
+                approval_required: operation.approval_required,
+                escalate_on_budget_exhaustion: true,
+                escalate_after_failed_attempts: max_attempts,
+            },
+            evidence: Vec::new(),
+            expected: ExpectedOutcome {
+                quality: profile.quality,
+                cost_usd_micros: profile.cost_per_attempt_usd_micros,
+                latency_ms: profile.latency_ms,
+                uncertainty: profile.uncertainty,
+            },
+            explanation,
+            input_fingerprint: fingerprint,
+        };
+        plan.validate()?;
+        *slots
+            .get_mut(agent.agent_id.as_str())
+            .expect("eligible agent has a slot entry") -= 1;
+        remaining_budget -= budget_ceiling;
+        remaining_human_attention -= attention_required;
+        plans.push(plan);
+    }
+
+    Ok(BaselineAllocation { plans, unallocated })
+}
+
+fn affordable_attempts(
+    operation: &PendingOperation,
+    profile: &ModelProfile,
+    remaining_budget: i64,
+) -> u32 {
+    if profile.cost_per_attempt_usd_micros == 0 {
+        return operation.max_attempts;
+    }
+    let affordable = operation.budget_ceiling_usd_micros.min(remaining_budget)
+        / profile.cost_per_attempt_usd_micros;
+    i64::from(operation.max_attempts).min(affordable) as u32
+}
+
+fn operation_order(
+    left: &PendingOperation,
+    right: &PendingOperation,
+    strategy: BaselineStrategy,
+) -> Ordering {
+    match strategy {
+        BaselineStrategy::Conservative => left
+            .risk
+            .cmp(&right.risk)
+            .then_with(|| right.priority.cmp(&left.priority)),
+        BaselineStrategy::PriorityFirst => right.priority.cmp(&left.priority),
+        BaselineStrategy::Throughput => left.submitted_at_ms.cmp(&right.submitted_at_ms),
+    }
+    .then_with(|| left.submitted_at_ms.cmp(&right.submitted_at_ms))
+    .then_with(|| left.operation_id.cmp(&right.operation_id))
+}
+
+fn eligible_choices<'a>(
+    operation: &PendingOperation,
+    capacity: &'a CapacityEnvelope,
+    slots: &std::collections::BTreeMap<&str, u32>,
+) -> Vec<(&'a AgentCapacity, &'a ModelProfile)> {
+    capacity
+        .agents
+        .iter()
+        .filter(|agent| {
+            agent.healthy
+                && slots.get(agent.agent_id.as_str()).copied().unwrap_or(0) > 0
+                && (agent.operation_classes.contains(&operation.operation_class)
+                    || agent.operation_classes.contains("*"))
+                && operation.required_tools.is_subset(&agent.tools)
+        })
+        .flat_map(|agent| {
+            capacity.model_profiles.iter().filter_map(move |profile| {
+                (agent.models.contains(&profile.model)
+                    && (operation.allowed_models.is_empty()
+                        || operation.allowed_models.contains(&profile.model)))
+                .then_some((agent, profile))
+            })
+        })
+        .collect()
+}
+
+fn choice_order(
+    left: &(&AgentCapacity, &ModelProfile),
+    right: &(&AgentCapacity, &ModelProfile),
+    strategy: BaselineStrategy,
+) -> Ordering {
+    let profile_order = match strategy {
+        BaselineStrategy::Conservative | BaselineStrategy::PriorityFirst => {
+            right.1.quality.total_cmp(&left.1.quality).then_with(|| {
+                left.1
+                    .cost_per_attempt_usd_micros
+                    .cmp(&right.1.cost_per_attempt_usd_micros)
+            })
+        }
+        BaselineStrategy::Throughput => left
+            .1
+            .latency_ms
+            .cmp(&right.1.latency_ms)
+            .then_with(|| right.1.quality.total_cmp(&left.1.quality)),
+    };
+    profile_order
+        .then_with(|| left.0.agent_id.cmp(&right.0.agent_id))
+        .then_with(|| left.1.model.cmp(&right.1.model))
+}
+
+#[derive(Serialize)]
+struct AllocationFingerprint<'a> {
+    request: &'a AllocationRequest,
+    operation: &'a PendingOperation,
+    strategy: &'a Strategy,
+    agent: &'a AgentCapacity,
+    profile: &'a ModelProfile,
+    remaining_budget: i64,
+    remaining_human_attention: u32,
+    max_attempts: u32,
+    budget_ceiling: i64,
+}
+
+fn input_fingerprint(input: &AllocationFingerprint<'_>) -> Result<String, String> {
+    let bytes = serde_json::to_vec(input)
+        .map_err(|error| format!("serialize allocation inputs: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 impl PendingOperation {
@@ -275,6 +624,54 @@ mod tests {
             budget_ceiling_usd_micros: 50_000,
             acceptance_criteria: vec!["all tickets classified".into()],
             approval_required: false,
+            human_attention_minutes_required: 0,
+        }
+    }
+
+    fn capacity() -> CapacityEnvelope {
+        CapacityEnvelope {
+            captured_at_ms: 10,
+            policy_version: "policy-v1".into(),
+            agents: vec![AgentCapacity {
+                agent_id: "agent-a".into(),
+                runtime: "native".into(),
+                models: BTreeSet::from(["local-small".into(), "frontier".into()]),
+                tools: BTreeSet::from(["search".into()]),
+                operation_classes: BTreeSet::from(["triage".into(), "*".into()]),
+                available_slots: 2,
+                healthy: true,
+            }],
+            model_profiles: vec![
+                ModelProfile {
+                    model: "local-small".into(),
+                    quality: 0.7,
+                    cost_per_attempt_usd_micros: 10_000,
+                    latency_ms: 100,
+                    uncertainty: 0.2,
+                },
+                ModelProfile {
+                    model: "frontier".into(),
+                    quality: 0.9,
+                    cost_per_attempt_usd_micros: 40_000,
+                    latency_ms: 300,
+                    uncertainty: 0.1,
+                },
+            ],
+            budget_remaining_usd_micros: 60_000,
+            max_parallel_attempts: 2,
+            human_attention_minutes: 30,
+        }
+    }
+
+    fn request() -> AllocationRequest {
+        AllocationRequest {
+            capacity: capacity(),
+            operations: vec![operation()],
+            strategy: Strategy {
+                strategy_id: "baseline".into(),
+                version: "1".into(),
+                baseline: BaselineStrategy::PriorityFirst,
+            },
         }
     }
 
@@ -302,6 +699,7 @@ mod tests {
             captured_at_ms: 10,
             policy_version: "policy-v1".into(),
             agents: Vec::new(),
+            model_profiles: Vec::new(),
             budget_remaining_usd_micros: 0,
             max_parallel_attempts: 0,
             human_attention_minutes: 0,
@@ -310,5 +708,190 @@ mod tests {
             capacity.validate().unwrap_err(),
             "capacity must allow at least one parallel attempt"
         );
+    }
+
+    #[test]
+    fn baseline_is_reproducible_and_respects_eligibility() {
+        let first = recommend_baseline(&request()).unwrap();
+        let second = recommend_baseline(&request()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.plans.len(), 1);
+        let plan = &first.plans[0];
+        assert_eq!(plan.selection.agent_id, "agent-a");
+        assert_eq!(plan.selection.model, "local-small");
+        assert!(plan.advisory);
+        assert!(!plan.attempts.speculative);
+        assert_eq!(plan.attempts.parallel_attempts, 1);
+        assert_eq!(plan.expected.cost_usd_micros, 10_000);
+        assert_eq!(plan.input_fingerprint.len(), 64);
+    }
+
+    #[test]
+    fn priority_and_capacity_determine_which_operation_is_allocated() {
+        let mut request = request();
+        request.capacity.agents[0].available_slots = 1;
+        request.capacity.budget_remaining_usd_micros = 10_000;
+        let mut urgent = operation();
+        urgent.operation_id = "op-urgent".into();
+        urgent.priority = 100;
+        request.operations.push(urgent);
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(result.plans[0].operation_id, "op-urgent");
+        assert_eq!(result.unallocated[0].operation_id, "op-1");
+    }
+
+    #[test]
+    fn unknown_classes_use_only_conservative_wildcard_capacity() {
+        let mut request = request();
+        request.strategy.baseline = BaselineStrategy::Throughput;
+        request.operations[0].operation_class = "novel".into();
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(
+            result.plans[0].strategy.baseline,
+            BaselineStrategy::Conservative
+        );
+        assert!(result.plans[0].explanation[2].contains("unknown operation class novel"));
+    }
+
+    #[test]
+    fn fleet_parallel_limit_caps_plans_across_agents() {
+        let mut request = request();
+        let mut second_agent = request.capacity.agents[0].clone();
+        second_agent.agent_id = "agent-b".into();
+        request.capacity.agents.push(second_agent);
+        request.capacity.max_parallel_attempts = 1;
+        let mut second = operation();
+        second.operation_id = "op-2".into();
+        request.operations.push(second);
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(result.plans.len(), 1);
+        assert_eq!(result.unallocated.len(), 1);
+        assert_eq!(
+            result.unallocated[0].reason,
+            "fleet parallel-attempt capacity exhausted"
+        );
+    }
+
+    #[test]
+    fn aggregate_stop_cost_never_exceeds_fleet_budget() {
+        let mut request = request();
+        let mut second_agent = request.capacity.agents[0].clone();
+        second_agent.agent_id = "agent-b".into();
+        request.capacity.agents.push(second_agent);
+        request.capacity.budget_remaining_usd_micros = 30_000;
+        let mut second = operation();
+        second.operation_id = "op-2".into();
+        request.operations.push(second);
+
+        let result = recommend_baseline(&request).unwrap();
+        let exposure: i64 = result
+            .plans
+            .iter()
+            .map(|plan| plan.stop_conditions.max_cost_usd_micros)
+            .sum();
+        assert_eq!(result.plans.len(), 2);
+        assert_eq!(exposure, 30_000);
+        assert_eq!(result.plans[0].attempts.max_attempts, 2);
+        assert_eq!(result.plans[1].attempts.max_attempts, 1);
+    }
+
+    #[test]
+    fn wildcard_capacity_remains_available_for_known_classes() {
+        let mut request = request();
+        request.capacity.agents[0].healthy = false;
+        let mut wildcard = request.capacity.agents[0].clone();
+        wildcard.agent_id = "agent-wildcard".into();
+        wildcard.healthy = true;
+        wildcard.operation_classes = BTreeSet::from(["*".into()]);
+        request.capacity.agents.push(wildcard);
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(result.plans[0].selection.agent_id, "agent-wildcard");
+        assert_eq!(
+            result.plans[0].strategy.baseline,
+            BaselineStrategy::PriorityFirst
+        );
+    }
+
+    #[test]
+    fn conservative_fallback_is_applied_before_capacity_ordering() {
+        let mut request = request();
+        request.strategy.baseline = BaselineStrategy::Throughput;
+        request.capacity.max_parallel_attempts = 1;
+        let mut unknown = operation();
+        unknown.operation_id = "op-unknown".into();
+        unknown.operation_class = "novel".into();
+        unknown.submitted_at_ms = 0;
+        request.operations.push(unknown);
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(result.plans[0].operation_id, "op-1");
+        assert_eq!(result.unallocated[0].operation_id, "op-unknown");
+    }
+
+    #[test]
+    fn duplicate_pending_operation_ids_are_rejected() {
+        let mut request = request();
+        request.operations.push(operation());
+        assert_eq!(
+            recommend_baseline(&request).unwrap_err(),
+            "duplicate pending operation op-1"
+        );
+    }
+
+    #[test]
+    fn review_required_work_reserves_human_attention() {
+        let mut request = request();
+        request.capacity.human_attention_minutes = 0;
+        request.operations[0].risk = OperationRisk::Medium;
+
+        let result = recommend_baseline(&request).unwrap();
+        assert!(result.plans.is_empty());
+        assert_eq!(
+            result.unallocated[0].reason,
+            "human-attention capacity exhausted"
+        );
+    }
+
+    #[test]
+    fn allocation_id_changes_with_co_scheduled_capacity_consumption() {
+        let mut single = request();
+        single.capacity.budget_remaining_usd_micros = 30_000;
+        let single_plan = recommend_baseline(&single).unwrap().plans.remove(0);
+
+        let mut scheduled = single;
+        let mut earlier = operation();
+        earlier.operation_id = "op-earlier".into();
+        earlier.priority = 100;
+        scheduled.operations.push(earlier);
+        let result = recommend_baseline(&scheduled).unwrap();
+        let changed = result
+            .plans
+            .iter()
+            .find(|plan| plan.operation_id == "op-1")
+            .unwrap();
+
+        assert_eq!(single_plan.attempts.max_attempts, 2);
+        assert_eq!(changed.attempts.max_attempts, 1);
+        assert_ne!(single_plan.allocation_id, changed.allocation_id);
+    }
+
+    #[test]
+    fn conservative_strategy_still_defers_unknown_classes() {
+        let mut request = request();
+        request.strategy.baseline = BaselineStrategy::Conservative;
+        request.capacity.max_parallel_attempts = 1;
+        let mut unknown = operation();
+        unknown.operation_id = "op-unknown".into();
+        unknown.operation_class = "novel".into();
+        unknown.priority = 100;
+        request.operations.push(unknown);
+
+        let result = recommend_baseline(&request).unwrap();
+        assert_eq!(result.plans[0].operation_id, "op-1");
+        assert_eq!(result.unallocated[0].operation_id, "op-unknown");
     }
 }
