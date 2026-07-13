@@ -680,6 +680,154 @@ message ListCredentialsResponse { repeated CredentialRecord credentials = 1; }
 message GetProvenanceReportRequest { string work_unit_id = 1; }
 message GetProvenanceReportResponse { string report = 1; }
 
+message EvidenceRelationship {
+  string relation = 1;
+  string target_source_record_id = 2;
+  string target_source_type = 3;
+  string target_source_instance = 4;
+}
+
+message EvidenceCausality {
+  string operation_id = 1;
+  string parent_operation_id = 2;
+  string attempt_id = 3;
+  string model_call_id = 4;
+  repeated string subject_references = 5;
+  map<string, string> trace_context = 6;
+}
+
+message EvidenceEnvelope {
+  string contract_version = 1;
+  string source_type = 2;
+  string source_instance = 3;
+  string source_record_id = 4;
+  string source_version = 5;
+  int64 source_sequence = 6;
+  string namespace = 7;
+  string target_external_id = 8;
+  string target_kind = 9;
+  string evidence_type = 10;
+  string signal = 11;
+  string schema_id = 12;
+  string schema_version = 13;
+  string schema_compatibility = 14;
+  int64 observed_at_ms = 15;
+  int64 collected_at_ms = 16;
+  optional int64 expires_at_ms = 17;
+  bytes content_json = 18;
+  repeated EvidenceRelationship relationships = 19;
+  string producer_identity = 20;
+  uint32 confidence_bps = 21;
+  string classification = 22;
+  map<string, string> provenance = 23;
+  string idempotency_key = 24;
+  string content_digest = 25;
+  string intent = 26;
+  EvidenceCausality causality = 27;
+}
+
+message EvidenceProducerCapability {
+  string producer_identity = 1;
+  int64 config_version = 2;
+  repeated string source_instances = 3;
+  repeated string namespaces = 4;
+  repeated string evidence_types = 5;
+  repeated string target_kinds = 6;
+  string classification_ceiling = 7;
+  repeated string allowed_intents = 8;
+  bool allow_operation_attachment = 9;
+  int64 replay_window_ms = 10;
+  int64 max_clock_skew_ms = 11;
+  uint64 max_payload_bytes = 12;
+  uint64 max_relationships = 13;
+  uint32 rate_limit_per_minute = 14;
+  bool revoked = 15;
+}
+
+message EvidenceSchemaDefinition {
+  string schema_id = 1;
+  string schema_version = 2;
+  string evidence_type = 3;
+  repeated string compatible_versions = 4;
+}
+
+message EvidenceSubmissionRecord {
+  string id = 1;
+  string producer_identity = 2;
+  string source_type = 3;
+  string source_instance = 4;
+  string source_record_id = 5;
+  string source_version = 6;
+  int64 source_sequence = 7;
+  string namespace = 8;
+  string target_external_id = 9;
+  string target_kind = 10;
+  string evidence_type = 11;
+  string schema_id = 12;
+  string schema_version = 13;
+  string content_digest = 14;
+  string classification = 15;
+  string intent = 16;
+  string lifecycle_state = 17;
+  string rejection_code = 18;
+  string rejection_summary = 19;
+  int64 observed_at_ms = 20;
+  int64 collected_at_ms = 21;
+  optional int64 expires_at_ms = 22;
+  int64 received_at_ms = 23;
+  int64 updated_at_ms = 24;
+}
+
+message EvidenceSubmissionResult {
+  EvidenceSubmissionRecord submission = 1;
+  bool admitted = 2;
+  bool deduplicated = 3;
+  bool projected = 4;
+}
+
+message RegisterEvidenceProducerRequest { EvidenceProducerCapability capability = 1; }
+message RegisterEvidenceProducerResponse {}
+message RegisterEvidenceSchemaRequest { EvidenceSchemaDefinition definition = 1; }
+message RegisterEvidenceSchemaResponse {}
+message SubmitEvidenceRequest { EvidenceEnvelope envelope = 1; }
+message SubmitEvidenceResponse { EvidenceSubmissionResult result = 1; }
+message SubmitEvidenceBatchRequest { repeated EvidenceEnvelope envelopes = 1; }
+message SubmitEvidenceBatchResponse { repeated EvidenceSubmissionResult results = 1; }
+message GetEvidenceSubmissionRequest { string submission_id = 1; }
+message GetEvidenceSubmissionResponse {
+  EvidenceSubmissionRecord submission = 1;
+  repeated string lifecycle_history = 2;
+}
+message ListEvidenceSubmissionsRequest {
+  string producer_identity = 1;
+  string source_instance = 2;
+  string namespace = 3;
+  string lifecycle_state = 4;
+  string target_external_id = 5;
+  string evidence_type = 6;
+  int32 limit = 7;
+  int32 offset = 8;
+}
+message ListEvidenceSubmissionsResponse { repeated EvidenceSubmissionRecord submissions = 1; }
+message ReplayEvidenceSubmissionRequest { string submission_id = 1; }
+message ReplayEvidenceSubmissionResponse { EvidenceSubmissionResult result = 1; }
+message RetractEvidenceRequest {
+  string submission_id = 1;
+  string source_version = 2;
+  int64 source_sequence = 3;
+  string idempotency_key = 4;
+  int64 observed_at_ms = 5;
+}
+message RetractEvidenceResponse { EvidenceSubmissionResult result = 1; }
+message MarkEvidenceStaleRequest {
+  string submission_id = 1;
+  string source_version = 2;
+  int64 source_sequence = 3;
+  string idempotency_key = 4;
+  int64 observed_at_ms = 5;
+}
+message MarkEvidenceStaleResponse { EvidenceSubmissionResult result = 1; }
+
 // --- Service ---
 
 // Durable, namespace-isolated facts for agent operations. Domain-specific
@@ -774,4 +922,13 @@ service SekaiService {
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
+  rpc RegisterEvidenceProducer(RegisterEvidenceProducerRequest) returns (RegisterEvidenceProducerResponse);
+  rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);
+  rpc SubmitEvidence(SubmitEvidenceRequest) returns (SubmitEvidenceResponse);
+  rpc SubmitEvidenceBatch(SubmitEvidenceBatchRequest) returns (SubmitEvidenceBatchResponse);
+  rpc GetEvidenceSubmission(GetEvidenceSubmissionRequest) returns (GetEvidenceSubmissionResponse);
+  rpc ListEvidenceSubmissions(ListEvidenceSubmissionsRequest) returns (ListEvidenceSubmissionsResponse);
+  rpc ReplayEvidenceSubmission(ReplayEvidenceSubmissionRequest) returns (ReplayEvidenceSubmissionResponse);
+  rpc RetractEvidence(RetractEvidenceRequest) returns (RetractEvidenceResponse);
+  rpc MarkEvidenceStale(MarkEvidenceStaleRequest) returns (MarkEvidenceStaleResponse);
 }

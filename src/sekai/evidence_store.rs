@@ -76,6 +76,18 @@ pub struct EvidenceAdmission {
     pub deduplicated: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvidenceSubmissionFilter {
+    pub producer_identity: Option<String>,
+    pub source_instance: Option<String>,
+    pub namespace: Option<String>,
+    pub lifecycle_state: Option<EvidenceLifecycleState>,
+    pub target_external_id: Option<String>,
+    pub evidence_type: Option<String>,
+    pub limit: i32,
+    pub offset: i32,
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_evidence(&self) -> Result<(), String> {
         let conn = self.conn();
@@ -375,7 +387,7 @@ impl SekaiDb {
                 })?;
                 tx.commit().map_err(|error| error.to_string())?;
                 return Ok(EvidenceAdmission {
-                    accepted: submission.lifecycle_state.is_admitted(),
+                    accepted: submission_is_admitted(&submission),
                     submission,
                     deduplicated: true,
                 });
@@ -534,7 +546,7 @@ impl SekaiDb {
                 .ok_or_else(|| "deduplicated source submission disappeared".to_string())?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(EvidenceAdmission {
-                accepted: submission.lifecycle_state.is_admitted(),
+                accepted: submission_is_admitted(&submission),
                 submission,
                 deduplicated: true,
             });
@@ -630,6 +642,60 @@ impl SekaiDb {
             })
         })
         .collect()
+    }
+
+    pub fn list_evidence_submissions(
+        &self,
+        filter: &EvidenceSubmissionFilter,
+    ) -> Result<Vec<EvidenceSubmissionRecord>, String> {
+        let mut sql = "SELECT id, producer_identity, source_type, source_instance, source_record_id, source_version,
+                source_sequence, namespace, target_external_id, target_kind, evidence_type, schema_id,
+                schema_version, idempotency_key, content_digest, classification, intent, lifecycle_state,
+                rejection_code, rejection_summary, observed_at_ms, collected_at_ms, expires_at_ms,
+                received_at_ms, updated_at_ms, envelope_json
+             FROM sekai_evidence_submissions WHERE 1=1"
+            .to_string();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for (column, value) in [
+            ("producer_identity", filter.producer_identity.as_ref()),
+            ("source_instance", filter.source_instance.as_ref()),
+            ("namespace", filter.namespace.as_ref()),
+            ("target_external_id", filter.target_external_id.as_ref()),
+            ("evidence_type", filter.evidence_type.as_ref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(&format!(" AND {column}=?{}", values.len() + 1));
+                values.push(Box::new(value.clone()));
+            }
+        }
+        if let Some(state) = filter.lifecycle_state {
+            sql.push_str(&format!(" AND lifecycle_state=?{}", values.len() + 1));
+            values.push(Box::new(state.as_str().to_string()));
+        }
+        sql.push_str(" ORDER BY received_at_ms DESC, id DESC");
+        let limit = if filter.limit <= 0 {
+            100
+        } else {
+            filter.limit.min(500)
+        };
+        sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            values.len() + 1,
+            values.len() + 2
+        ));
+        values.push(Box::new(limit));
+        values.push(Box::new(filter.offset.max(0)));
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let parameters = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+        let rows = statement
+            .query_map(parameters.as_slice(), row_to_submission)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -750,6 +816,16 @@ fn authorize<'a>(
             "submission collection time exceeds allowed clock skew",
         ));
     }
+    if envelope.observed_at_ms
+        > envelope
+            .collected_at_ms
+            .saturating_add(capability.max_clock_skew_ms)
+    {
+        return Err((
+            "observation_time_in_future",
+            "observation time exceeds collection time and allowed clock skew",
+        ));
+    }
     if recent_count > capability.rate_limit_per_minute {
         return Err(("rate_limited", "producer submission rate exceeded"));
     }
@@ -784,6 +860,15 @@ fn schema_is_accepted(tx: &Transaction<'_>, envelope: &EvidenceEnvelope) -> Resu
         }
     }
     Ok(false)
+}
+
+fn submission_is_admitted(submission: &EvidenceSubmissionRecord) -> bool {
+    submission.lifecycle_state.is_admitted()
+        && (submission.lifecycle_state != EvidenceLifecycleState::Quarantined
+            || submission
+                .rejection_code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("projection_")))
 }
 
 fn insert_received(
@@ -1219,6 +1304,21 @@ mod tests {
         assert_eq!(
             admission.submission.rejection_code.as_deref(),
             Some("collection_time_in_future")
+        );
+    }
+
+    #[test]
+    fn rejects_observation_time_beyond_collection_clock_skew() {
+        let db = configured_db();
+        let mut evidence = envelope();
+        evidence.expires_at_ms = None;
+        evidence.observed_at_ms = evidence.collected_at_ms + 1_001;
+        let admission = db
+            .submit_evidence(&evidence, "producer:checks", 1_100)
+            .unwrap();
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("observation_time_in_future")
         );
     }
 
