@@ -146,6 +146,9 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_actor: String::new(),
+            memory_token_budget: 0,
+            memory_references: vec![],
             allowed_evidence_types: std::collections::HashSet::new(),
         }
     }
