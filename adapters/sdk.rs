@@ -92,11 +92,61 @@ impl EvidenceDraft {
         }
         let content_json = serde_json::to_vec(&self.content).map_err(|error| error.to_string())?;
         let content_digest = format!("{:x}", Sha256::digest(&content_json));
-        let idempotency_material = format!(
-            "{}\0{}\0{}\0{}",
-            config.source_instance, self.source_record_id, self.source_version, content_digest
+        let relationships = self
+            .relationships
+            .iter()
+            .map(|relationship| {
+                serde_json::json!({
+                    "relation": relationship.relation,
+                    "target_source_record_id": relationship.target_source_record_id,
+                    "target_source_type": relationship.target_source_type,
+                    "target_source_instance": relationship.target_source_instance,
+                })
+            })
+            .collect::<Vec<_>>();
+        let causality = self.causality.as_ref().map(|causality| {
+            serde_json::json!({
+                "operation_id": causality.operation_id,
+                "parent_operation_id": causality.parent_operation_id,
+                "attempt_id": causality.attempt_id,
+                "model_call_id": causality.model_call_id,
+                "subject_references": causality.subject_references,
+                "trace_context": causality.trace_context,
+            })
+        });
+        let idempotency_material = serde_json::json!({
+            "contract_version": EVIDENCE_CONTRACT_VERSION,
+            "source_type": self.source_type,
+            "source_instance": config.source_instance,
+            "source_record_id": self.source_record_id,
+            "source_version": self.source_version,
+            "source_sequence": self.source_sequence,
+            "namespace": config.namespace,
+            "target_external_id": config.target_external_id,
+            "target_kind": config.target_kind,
+            "evidence_type": self.evidence_type,
+            "signal": self.signal,
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+            "schema_compatibility": "exact",
+            "observed_at_ms": self.observed_at_ms,
+            "collected_at_ms": collected_at_ms,
+            "expires_at_ms": self.expires_at_ms,
+            "content_digest": content_digest,
+            "relationships": relationships,
+            "producer_identity": config.producer_identity,
+            "confidence_bps": self.confidence_bps,
+            "classification": config.classification,
+            "provenance": self.provenance,
+            "intent": "upsert",
+            "causality": causality,
+        });
+        let idempotency_key = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&idempotency_material).map_err(|error| error.to_string())?
+            )
         );
-        let idempotency_key = format!("{:x}", Sha256::digest(idempotency_material.as_bytes()));
         Ok(EvidenceEnvelope {
             contract_version: EVIDENCE_CONTRACT_VERSION.into(),
             source_type: self.source_type,
