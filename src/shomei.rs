@@ -1,6 +1,9 @@
 //! Portable, independently verifiable operation attestations.
 
-use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent};
+use crate::chisei::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    ReceiptSurface,
+};
 use crate::sekai::attestation::{
     PolicyAttestation, attestation_content_hash, policy_version, replay_decision,
 };
@@ -907,12 +910,16 @@ fn receipt_links_policy_attestation(
     attestation: &PolicyAttestation,
 ) -> bool {
     receipt.events.iter().any(|event| {
-        event.references.iter().any(|reference| {
-            reference.kind == "policy_attestation"
-                && reference.reference == attestation.id
-                && reference.content_hash.as_deref() == Some(attestation.content_hash.as_str())
-        }) || (event.attributes.get("attestation_id") == Some(&attestation.id)
-            && event.attributes.get("attestation_hash") == Some(&attestation.content_hash))
+        event.kind == ReceiptEventKind::PolicyDecided
+            && event.surface == ReceiptSurface::Policy
+            && event.actor == "chisei.policy"
+            && event.event_id == format!("{}:policy", receipt.operation_id)
+            && (event.references.iter().any(|reference| {
+                reference.kind == "policy_attestation"
+                    && reference.reference == attestation.id
+                    && reference.content_hash.as_deref() == Some(attestation.content_hash.as_str())
+            }) || (event.attributes.get("attestation_id") == Some(&attestation.id)
+                && event.attributes.get("attestation_hash") == Some(&attestation.content_hash)))
     })
 }
 
@@ -1085,13 +1092,17 @@ mod tests {
             ("outcome", Some("budget"), ReceiptEventKind::OutcomeRecorded),
         ] {
             events.push(OperationReceiptEvent {
-                event_id: id.into(),
+                event_id: format!("op-1:{id}"),
                 operation_id: "op-1".into(),
-                parent_event_id: parent.map(str::to_string),
+                parent_event_id: parent.map(|parent| format!("op-1:{parent}")),
                 timestamp_ms: 1,
                 kind,
                 surface: kind.surface(),
-                actor: "agent:test".into(),
+                actor: if kind == ReceiptEventKind::PolicyDecided {
+                    "chisei.policy".into()
+                } else {
+                    "agent:test".into()
+                },
                 references: vec![],
                 attributes: BTreeMap::new(),
             });
@@ -1497,6 +1508,29 @@ mod tests {
         assert!(!missing_report.policy.compliant);
 
         let mut source = receipt();
+        let mut reporter_controlled = source.clone();
+        reporter_controlled.events[2]
+            .references
+            .push(crate::chisei::receipt::GovernedReference {
+                kind: "policy_attestation".into(),
+                reference: attestation.id.clone(),
+                content_hash: Some(attestation.content_hash.clone()),
+                disclosed_fields: vec![],
+                omitted: false,
+                omission_reason: None,
+            });
+        reporter_controlled.events[2]
+            .attributes
+            .insert("attestation_id".into(), attestation.id.clone());
+        reporter_controlled.events[2]
+            .attributes
+            .insert("attestation_hash".into(), attestation.content_hash.clone());
+        let mut rejected_link = AttestationBundle::unsigned(reporter_controlled).unwrap();
+        let error = rejected_link
+            .attach_policy_attestation(attestation.clone())
+            .unwrap_err();
+        assert!(error.contains("not linked by the receipt"));
+
         source.events[1]
             .references
             .push(crate::chisei::receipt::GovernedReference {
