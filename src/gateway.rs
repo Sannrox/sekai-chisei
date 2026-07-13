@@ -6573,6 +6573,7 @@ async fn ensure_llm_calls_dataset(
     .map(|name| ColumnDef {
         name: name.to_string(),
         r#type: "string".to_string(),
+        classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
     })
     .collect();
 
