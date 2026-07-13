@@ -385,7 +385,7 @@ pub fn is_restricted_property_classification(value: &str) -> bool {
     )
 }
 
-fn is_valid_property_classification(value: &str) -> bool {
+pub fn is_valid_property_classification(value: &str) -> bool {
     matches!(
         normalize_property_classification(value),
         "public" | "internal" | "sensitive"

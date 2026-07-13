@@ -169,7 +169,8 @@ impl SekaiDb {
             "CREATE TABLE IF NOT EXISTS sekai_decisions (
                 id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, actor TEXT NOT NULL,
                 action TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '{}',
-                target_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT ''
+                target_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '', data_class TEXT NOT NULL DEFAULT 'unclassified'
             );
             CREATE TABLE IF NOT EXISTS sekai_object_changes (
                 id TEXT PRIMARY KEY, object_id TEXT NOT NULL, field TEXT NOT NULL,
@@ -177,9 +178,81 @@ impl SekaiDb {
                 changed_by TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_changes_object ON sekai_object_changes(object_id);
-            CREATE INDEX IF NOT EXISTS idx_decisions_target ON sekai_decisions(target_id, timestamp);"
+            CREATE INDEX IF NOT EXISTS idx_decisions_target ON sekai_decisions(target_id, timestamp);
+            CREATE TABLE IF NOT EXISTS sekai_schema_migrations (
+                name TEXT PRIMARY KEY
+            );"
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let mut added_lifecycle_column = false;
+        for column in [
+            "namespace TEXT NOT NULL DEFAULT ''",
+            "data_class TEXT NOT NULL DEFAULT 'unclassified'",
+        ] {
+            match conn.execute(
+                &format!("ALTER TABLE sekai_decisions ADD COLUMN {column}"),
+                [],
+            ) {
+                Ok(_) => added_lifecycle_column = true,
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let tombstone_backfill_pending: bool = conn
+            .query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM sekai_schema_migrations
+                    WHERE name='audit_lifecycle_tombstones_v1'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !added_lifecycle_column && !tombstone_backfill_pending {
+            return Ok(());
+        }
+        let legacy = {
+            let mut stmt = conn
+                .prepare("SELECT id,evidence FROM sekai_decisions")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        for (id, evidence) in legacy {
+            let evidence: HashMap<String, String> =
+                serde_json::from_str(&evidence).unwrap_or_default();
+            let erasure_tombstone = evidence
+                .get("erasure_tombstone")
+                .is_some_and(|value| value == "true");
+            if !added_lifecycle_column && !erasure_tombstone {
+                continue;
+            }
+            let namespace = evidence
+                .get("namespace")
+                .or_else(|| evidence.get("project"))
+                .cloned()
+                .unwrap_or_default();
+            let data_class = evidence
+                .get("data_class")
+                .cloned()
+                .unwrap_or_else(|| "unclassified".into());
+            conn.execute(
+                "UPDATE sekai_decisions SET namespace=?1,data_class=?2 WHERE id=?3",
+                params![namespace, data_class, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO sekai_schema_migrations(name)
+             VALUES ('audit_lifecycle_tombstones_v1')",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn record_decision(&self, d: &Decision) -> Result<(), String> {
@@ -614,6 +687,159 @@ mod tests {
             })
             .unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn persists_decision_lifecycle_classification_from_evidence() {
+        let db = setup();
+        db.record_decision(&Decision {
+            id: "classified".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::from([
+                ("project".into(), "namespace-a".into()),
+                ("data_class".into(), "sensitive".into()),
+            ]),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+
+        let stored: (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT namespace,data_class FROM sekai_decisions WHERE id='classified'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("namespace-a".into(), "sensitive".into()));
+    }
+
+    #[test]
+    fn one_time_migration_normalizes_legacy_tombstone_projections() {
+        let db = setup();
+        db.record_decision(&Decision {
+            id: "erased".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::from([
+                ("project".into(), "namespace-a".into()),
+                ("data_class".into(), "sensitive".into()),
+            ]),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        let tombstone = serde_json::to_string(&HashMap::from([(
+            "erasure_tombstone".to_string(),
+            "true".to_string(),
+        )]))
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET evidence=?1 WHERE id='erased'",
+                params![tombstone],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM sekai_schema_migrations
+                 WHERE name='audit_lifecycle_tombstones_v1'",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_audit().unwrap();
+
+        let stored: (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT namespace,data_class FROM sekai_decisions WHERE id='erased'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (String::new(), "unclassified".into()));
+    }
+
+    #[test]
+    fn completed_migration_preserves_tombstone_tamper_evidence() {
+        let db = setup();
+        db.record_decision(&Decision {
+            id: "erased".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::from([("erasure_tombstone".into(), "true".into())]),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions
+                 SET namespace='namespace-a',data_class='sensitive'
+                 WHERE id='erased'",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_audit().unwrap();
+
+        let stored: (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT namespace,data_class FROM sekai_decisions WHERE id='erased'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("namespace-a".into(), "sensitive".into()));
+        assert!(!db.verify_ledger().unwrap().ok);
+    }
+
+    #[test]
+    fn migration_preserves_projection_tamper_evidence() {
+        let db = setup();
+        db.record_decision(&Decision {
+            id: "classified".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::from([
+                ("project".into(), "namespace-a".into()),
+                ("data_class".into(), "sensitive".into()),
+            ]),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET namespace='' WHERE id='classified'",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_audit().unwrap();
+
+        let stored_namespace: String = db
+            .conn()
+            .query_row(
+                "SELECT namespace FROM sekai_decisions WHERE id='classified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_namespace.is_empty());
+        assert!(!db.verify_ledger().unwrap().ok);
     }
 
     #[test]
