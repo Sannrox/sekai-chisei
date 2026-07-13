@@ -96,6 +96,17 @@ fn context_evidence_reference(
     }
 }
 
+fn memory_context_reference(reference: &pipe::MemoryContextReference) -> MemoryContextReference {
+    MemoryContextReference {
+        memory_id: reference.memory_id.clone(),
+        memory_version: reference.memory_version,
+        classification: reference.classification.clone(),
+        confidence_bps: u32::from(reference.confidence_bps),
+        applicability: reference.applicability.clone(),
+        evidence_operation_ids: reference.evidence_operation_ids.clone(),
+    }
+}
+
 fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
     match auth_source(request).as_deref() {
         Some("token") => true,
@@ -788,7 +799,11 @@ impl ChiseiServiceImpl {
         }
     }
 
-    async fn plan_from_input(&self, input: ExecutionInput) -> Result<ExecutionPlan, Status> {
+    async fn plan_from_input(
+        &self,
+        input: ExecutionInput,
+        authenticated_actor: &str,
+    ) -> Result<ExecutionPlan, Status> {
         let normalized_user_id = if input.user_id.is_empty() {
             "default".to_string()
         } else {
@@ -819,6 +834,9 @@ impl ChiseiServiceImpl {
             template_only,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_actor: authenticated_actor.into(),
+            memory_token_budget: 512,
+            memory_references: vec![],
             allowed_evidence_types: std::collections::HashSet::new(),
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
@@ -876,6 +894,9 @@ impl ChiseiServiceImpl {
                     template_only,
                     expanded_context_items: 0,
                     evidence_references: vec![],
+                    memory_actor: authenticated_actor.into(),
+                    memory_token_budget: 512,
+                    memory_references: vec![],
                     allowed_evidence_types: std::collections::HashSet::new(),
                 };
                 let local_run = self.pipeline.run_with_context_admission(
@@ -2979,6 +3000,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RunPipelineRequest>,
     ) -> Result<Response<RunPipelineResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let r = req
             .into_inner()
             .request
@@ -2999,6 +3021,9 @@ impl ChiseiService for ChiseiServiceImpl {
             template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_actor: actor,
+            memory_token_budget: 512,
+            memory_references: vec![],
             allowed_evidence_types: std::collections::HashSet::new(),
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
@@ -3049,6 +3074,11 @@ impl ChiseiService for ChiseiServiceImpl {
                     .evidence_references
                     .iter()
                     .map(context_evidence_reference)
+                    .collect(),
+                memory_references: result
+                    .memory_references
+                    .iter()
+                    .map(memory_context_reference)
                     .collect(),
             }),
         }))
@@ -3229,7 +3259,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .into_inner()
             .input
             .ok_or(Status::invalid_argument("input required"))?;
-        let plan = self.plan_from_input(input).await?;
+        let plan = self.plan_from_input(input, &actor).await?;
         if let Some(plan_input) = &plan.input {
             let namespace_hint = plan_input.namespace.trim().to_string();
             self.record_evolve_task(
