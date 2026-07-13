@@ -179,6 +179,7 @@ pub struct MemoryOutcomeObservation {
     pub memory_id: String,
     pub memory_version: u32,
     pub operation_id: String,
+    pub request_id: String,
     pub memory_applied: bool,
     pub outcome_metric: String,
     pub outcome_value: f64,
@@ -1004,6 +1005,7 @@ impl SekaiDb {
         observation: &MemoryOutcomeObservation,
     ) -> Result<(), String> {
         if observation.operation_id.trim().is_empty()
+            || observation.request_id.trim().is_empty()
             || observation.outcome_metric.trim().is_empty()
             || !observation.outcome_value.is_finite()
         {
@@ -1023,23 +1025,25 @@ impl SekaiDb {
             return Err("outcome metric does not match memory evidence".into());
         }
         let conn = self.conn();
-        let injection_reason = format!("pipeline request {}", observation.operation_id.trim());
-        let injected: bool = conn
+        let assignment_reason = format!("pipeline request {}", observation.request_id.trim());
+        let (injected, held_out): (bool, bool) = conn
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM chisei_kioku_lifecycle_events
-                    WHERE memory_id=?1 AND memory_version=?2
-                      AND action='injected' AND reason=?3
-                )",
+                "SELECT
+                    EXISTS(SELECT 1 FROM chisei_kioku_lifecycle_events
+                        WHERE memory_id=?1 AND memory_version=?2
+                          AND action='injected' AND reason=?3),
+                    EXISTS(SELECT 1 FROM chisei_kioku_lifecycle_events
+                        WHERE memory_id=?1 AND memory_version=?2
+                          AND action='held_out' AND reason=?3)",
                 params![
                     observation.memory_id,
                     observation.memory_version,
-                    injection_reason
+                    assignment_reason
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
-        if injected != observation.memory_applied {
+        if injected == held_out || injected != observation.memory_applied {
             return Err(
                 "memory outcome treatment assignment does not match injection audit".into(),
             );
@@ -1062,6 +1066,35 @@ impl SekaiDb {
         )
         .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if request_id.trim().is_empty() || actor.trim().is_empty() {
+            return Err("holdout request and actor are required".into());
+        }
+        let memory = self
+            .get_kioku_memory(id, version)?
+            .ok_or_else(|| "memory version not found".to_string())?;
+        if memory.state != MemoryLifecycleState::Active {
+            return Err("only active memories can be assigned to holdout".into());
+        }
+        self.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+            memory_id: id.into(),
+            memory_version: version,
+            action: "held_out".into(),
+            from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+            to_state: MemoryLifecycleState::Active.as_str().into(),
+            actor: actor.trim().into(),
+            reason: format!("pipeline request {}", request_id.trim()),
+            recorded_at_ms: now_ms,
+        })
     }
 
     pub fn evaluate_kioku_impact(
@@ -1848,6 +1881,7 @@ mod tests {
             EvidenceClassification::Internal,
         );
         for operation_id in ["treatment-1", "treatment-2"] {
+            let request_id = format!("request-{operation_id}");
             db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
                 memory_id: "regressing".into(),
                 memory_version: 1,
@@ -1855,7 +1889,7 @@ mod tests {
                 from_state: Some("active".into()),
                 to_state: "active".into(),
                 actor: "agent:planner".into(),
-                reason: format!("pipeline request {operation_id}"),
+                reason: format!("pipeline request {request_id}"),
                 recorded_at_ms: 140,
             })
             .unwrap();
@@ -1863,6 +1897,7 @@ mod tests {
                 memory_id: "regressing".into(),
                 memory_version: 1,
                 operation_id: operation_id.into(),
+                request_id,
                 memory_applied: true,
                 outcome_metric: "verification_pass_rate".into(),
                 outcome_value: 0.0,
@@ -1872,10 +1907,14 @@ mod tests {
             .unwrap();
         }
         for operation_id in ["control-1", "control-2"] {
+            let request_id = format!("request-{operation_id}");
+            db.record_kioku_holdout("regressing", 1, &request_id, "kioku:evaluator", 140)
+                .unwrap();
             db.record_kioku_outcome(&MemoryOutcomeObservation {
                 memory_id: "regressing".into(),
                 memory_version: 1,
                 operation_id: operation_id.into(),
+                request_id,
                 memory_applied: false,
                 outcome_metric: "verification_pass_rate".into(),
                 outcome_value: 1.0,
