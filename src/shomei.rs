@@ -1,6 +1,7 @@
 //! Portable, independently verifiable operation attestations.
 
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -72,10 +73,213 @@ impl AttestationBundle {
     }
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut unsigned = self.clone();
-        unsigned.signature = None;
-        canonical_json(&unsigned)
+        let mut signing_form = self.clone();
+        if let Some(signature) = &mut signing_form.signature {
+            signature.value.clear();
+        }
+        canonical_json(&signing_form)
     }
+
+    pub fn sign(
+        &mut self,
+        signing_key: &SigningKey,
+        identity: impl Into<String>,
+        key_id: impl Into<String>,
+        signed_at_ms: i64,
+    ) -> Result<(), String> {
+        if self.signature.is_some() {
+            return Err("attestation bundle is already signed".into());
+        }
+        let signer = SignerIdentity {
+            identity: required("signer identity", identity.into())?,
+            algorithm: SIGNATURE_ALGORITHM.into(),
+            key_id: required("signer key id", key_id.into())?,
+            public_key: encode_hex(signing_key.verifying_key().as_bytes()),
+            signed_at_ms,
+        };
+        self.signature = Some(BundleSignature {
+            signer,
+            value: String::new(),
+        });
+        let signature = signing_key.sign(&self.signing_bytes()?);
+        self.signature
+            .as_mut()
+            .expect("signature metadata exists")
+            .value = encode_hex(&signature.to_bytes());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityVerification {
+    pub valid: bool,
+    pub versions_supported: bool,
+    pub receipt_digest_valid: bool,
+    pub event_chain_valid: bool,
+    pub signature_valid: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyVerification {
+    pub compliant: bool,
+    pub receipt_complete: bool,
+    #[serde(default)]
+    pub missing_surfaces: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationReport {
+    pub integrity: IntegrityVerification,
+    pub policy: PolicyVerification,
+}
+
+pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
+    let mut errors = Vec::new();
+    let versions_supported = [
+        ("bundle", bundle.bundle_version.as_str(), BUNDLE_VERSION),
+        (
+            "canonicalization",
+            bundle.canonicalization.as_str(),
+            CANONICALIZATION_VERSION,
+        ),
+        (
+            "verification policy",
+            bundle.verification_policy_version.as_str(),
+            VERIFICATION_POLICY_VERSION,
+        ),
+        (
+            "digest algorithm",
+            bundle.digest_algorithm.as_str(),
+            DIGEST_ALGORITHM,
+        ),
+        (
+            "signature algorithm",
+            bundle.signature_algorithm.as_str(),
+            SIGNATURE_ALGORITHM,
+        ),
+    ]
+    .into_iter()
+    .all(|(field, actual, expected)| {
+        if actual == expected {
+            true
+        } else {
+            errors.push(format!("unsupported {field} {actual}"));
+            false
+        }
+    }) && if bundle.receipt_schema_version == bundle.receipt.version {
+        true
+    } else {
+        errors.push("receipt schema version does not match embedded receipt".into());
+        false
+    };
+
+    let receipt_digest_valid = match receipt_digest(&bundle.receipt) {
+        Ok(digest) if digest == bundle.receipt_digest => true,
+        Ok(_) => {
+            errors.push("receipt digest mismatch".into());
+            false
+        }
+        Err(error) => {
+            errors.push(format!("receipt digest could not be reproduced: {error}"));
+            false
+        }
+    };
+    let event_chain_valid = match receipt_event_chain(&bundle.receipt.events) {
+        Ok(chain) if chain == bundle.event_chain => true,
+        Ok(_) => {
+            errors.push("event digest chain mismatch".into());
+            false
+        }
+        Err(error) => {
+            errors.push(format!("event chain could not be reproduced: {error}"));
+            false
+        }
+    };
+    let signature_valid = verify_signature(bundle, &mut errors);
+    let valid = versions_supported
+        && receipt_digest_valid
+        && event_chain_valid
+        && signature_valid
+        && errors.is_empty();
+
+    let completeness = bundle.receipt.completeness();
+    let receipt_complete = completeness.complete;
+    let policy_errors = completeness.errors;
+    let missing_surfaces = completeness
+        .missing_surfaces
+        .into_iter()
+        .map(|surface| surface.as_str().to_string())
+        .collect::<Vec<_>>();
+    VerificationReport {
+        integrity: IntegrityVerification {
+            valid,
+            versions_supported,
+            receipt_digest_valid,
+            event_chain_valid,
+            signature_valid,
+            errors,
+        },
+        policy: PolicyVerification {
+            compliant: receipt_complete && missing_surfaces.is_empty() && policy_errors.is_empty(),
+            receipt_complete,
+            missing_surfaces,
+            errors: policy_errors,
+        },
+    }
+}
+
+fn verify_signature(bundle: &AttestationBundle, errors: &mut Vec<String>) -> bool {
+    let Some(signature) = &bundle.signature else {
+        errors.push("bundle is unsigned".into());
+        return false;
+    };
+    if signature.signer.algorithm != SIGNATURE_ALGORITHM {
+        errors.push(format!(
+            "unsupported signer algorithm {}",
+            signature.signer.algorithm
+        ));
+        return false;
+    }
+    let public_key = match decode_hex::<32>("signer public key", &signature.signer.public_key) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(error);
+            return false;
+        }
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&public_key) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(format!("invalid signer public key: {error}"));
+            return false;
+        }
+    };
+    let signature_bytes = match decode_hex::<64>("bundle signature", &signature.value) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(error);
+            return false;
+        }
+    };
+    let signing_bytes = match bundle.signing_bytes() {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(format!("signed bytes could not be reproduced: {error}"));
+            return false;
+        }
+    };
+    if verifying_key
+        .verify_strict(&signing_bytes, &Signature::from_bytes(&signature_bytes))
+        .is_err()
+    {
+        errors.push("bundle signature verification failed".into());
+        return false;
+    }
+    true
 }
 
 /// Canonical bytes for a complete Shomei bundle.
@@ -155,10 +359,39 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn decode_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
+    if value.len() != N * 2 || !value.is_ascii() {
+        return Err(format!("{field} must contain {} hexadecimal bytes", N));
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).map_err(|_| format!("{field} is not hexadecimal"))?;
+        decoded[index] =
+            u8::from_str_radix(pair, 16).map_err(|_| format!("{field} is not hexadecimal"))?;
+    }
+    Ok(decoded)
+}
+
+fn required(field: &str, value: String) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} is required"))
+    } else {
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, ReceiptEventKind};
+
+    fn signed_bundle() -> AttestationBundle {
+        let mut bundle = AttestationBundle::unsigned(receipt()).unwrap();
+        bundle
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        bundle
+    }
 
     fn receipt() -> OperationReceipt {
         let mut events = Vec::new();
@@ -244,5 +477,47 @@ mod tests {
     #[test]
     fn finite_float_values_are_rejected() {
         assert!(canonical_json(&serde_json::json!({"score": 1.5})).is_err());
+    }
+
+    #[test]
+    fn complete_native_receipt_signs_and_verifies_offline() {
+        let report = verify_bundle(&signed_bundle());
+        assert!(report.integrity.valid, "{:?}", report.integrity.errors);
+        assert!(report.policy.compliant, "{:?}", report.policy.errors);
+    }
+
+    #[test]
+    fn modified_removed_inserted_and_reordered_events_fail_integrity() {
+        let bundle = signed_bundle();
+        let mut variants = Vec::new();
+
+        let mut modified = bundle.clone();
+        modified.receipt.events[1].actor = "attacker".into();
+        variants.push(modified);
+
+        let mut removed = bundle.clone();
+        removed.receipt.events.remove(1);
+        variants.push(removed);
+
+        let mut inserted = bundle.clone();
+        let mut event = inserted.receipt.events[1].clone();
+        event.event_id = "inserted".into();
+        inserted.receipt.events.insert(2, event);
+        variants.push(inserted);
+
+        let mut reordered = bundle;
+        reordered.receipt.events.swap(1, 2);
+        variants.push(reordered);
+
+        for variant in variants {
+            assert!(!verify_bundle(&variant).integrity.valid);
+        }
+    }
+
+    #[test]
+    fn signer_identity_is_covered_by_the_signature() {
+        let mut bundle = signed_bundle();
+        bundle.signature.as_mut().unwrap().signer.key_id = "key-2".into();
+        assert!(!verify_bundle(&bundle).integrity.signature_valid);
     }
 }
