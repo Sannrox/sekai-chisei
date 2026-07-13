@@ -365,6 +365,19 @@ fn normalize_governance_label(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
+fn effective_data_class(caller: &str, resolved: Option<&str>) -> String {
+    if caller.eq_ignore_ascii_case("sensitive")
+        || resolved.is_some_and(|value| value.eq_ignore_ascii_case("sensitive"))
+    {
+        "sensitive".to_string()
+    } else {
+        resolved
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(caller)
+            .to_string()
+    }
+}
+
 #[derive(Clone)]
 struct GatewayRuntime {
     key_cache: Arc<RwLock<HashMap<String, KeyCacheEntry>>>,
@@ -511,6 +524,7 @@ struct CachedPolicyDecision {
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
+    data_class: Option<String>,
     cached_at: Instant,
 }
 
@@ -1259,6 +1273,7 @@ async fn proxy_gateway(
         policy_scope: None,
         policy_version: None,
         task_class: task_class.clone(),
+        data_class: failure_posture.data_class.clone(),
         request_hash: request_hash.clone(),
         budget_subject: None,
         budget_status: "not_evaluated".into(),
@@ -1320,6 +1335,7 @@ async fn proxy_gateway(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
+            data_class: None,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -1409,6 +1425,25 @@ async fn proxy_gateway(
         preflight_context.policy_scope = resolved.policy_scope.clone();
         preflight_context.policy_version = resolved.policy_version.clone();
         preflight_context.egress_applied = true;
+        let path = uri.path();
+        let model_metadata_path = matches!(path, "/v1/models" | "/models")
+            || path.starts_with("/v1/models/")
+            || path.starts_with("/models/");
+        let model_metadata_request =
+            matches!(method, Method::GET | Method::HEAD) && model_metadata_path && body.is_empty();
+        if failure_posture.data_class == "sensitive"
+            && !model_metadata_request
+            && resolved.data_class.as_deref() != Some("sensitive")
+        {
+            let rejection = GatewayRejection::json(
+                StatusCode::FORBIDDEN,
+                "data_class_conflict",
+                "request data classification is stricter than the resolved namespace policy",
+            );
+            record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                .await;
+            return rejection.response();
+        }
         let egress = match apply_context_egress(
             &state.config,
             &state.runtime,
@@ -1507,6 +1542,10 @@ async fn proxy_gateway(
         policy_scope: resolved.policy_scope,
         policy_version: resolved.policy_version,
         task_class,
+        data_class: effective_data_class(
+            &failure_posture.data_class,
+            resolved.data_class.as_deref(),
+        ),
         request_hash,
         budget_subject: budget
             .as_ref()
@@ -1638,6 +1677,7 @@ struct UsageContext {
     policy_scope: Option<String>,
     policy_version: Option<String>,
     task_class: String,
+    data_class: String,
     request_hash: String,
     budget_subject: Option<String>,
     budget_status: String,
@@ -2015,6 +2055,7 @@ struct PolicyPreflight {
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
+    data_class: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2324,6 +2365,7 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
             route_bias: decision.route_bias.clone(),
             policy_scope: decision.policy_scope.clone(),
             policy_version: decision.policy_version.clone(),
+            data_class: decision.data_class.clone(),
             cached_at: Instant::now(),
         },
     );
@@ -2357,6 +2399,7 @@ async fn cached_policy_decision(
         route_bias: cached.route_bias.clone(),
         policy_scope: cached.policy_scope.clone(),
         policy_version: cached.policy_version.clone(),
+        data_class: cached.data_class.clone(),
     })
 }
 
@@ -2606,6 +2649,7 @@ async fn resolve_policy_preflight(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
+            data_class: None,
         });
     };
     let cache_key = policy_cache_key(identity, provider, requested_model, task_class, budget);
@@ -2617,6 +2661,7 @@ async fn resolve_policy_preflight(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
+            data_class: None,
         });
     };
     match connect_governance(runtime, target).await {
@@ -2754,6 +2799,8 @@ async fn resolve_policy_preflight(
                             .filter(|scope| !scope.is_empty()),
                         policy_version: Some(resolution.policy_version)
                             .filter(|version| !version.is_empty()),
+                        data_class: Some(resolution.data_class)
+                            .filter(|data_class| !data_class.is_empty()),
                     };
                     cache_policy_decision(runtime, cache_key, &decision).await;
                     Ok(decision)
@@ -2852,6 +2899,7 @@ async fn resolve_policy_preflight(
                         route_bias: None,
                         policy_scope: None,
                         policy_version: None,
+                        data_class: None,
                     })
                 }
             }
@@ -2894,6 +2942,7 @@ async fn resolve_policy_preflight(
                 route_bias: None,
                 policy_scope: None,
                 policy_version: None,
+                data_class: None,
             })
         }
     }
@@ -5837,6 +5886,7 @@ async fn record_usage_and_append(
             );
             values.insert("agent".to_string(), identity.agent.clone());
             values.insert("project".to_string(), identity.project.clone());
+            values.insert("data_class".to_string(), context.data_class.clone());
             values.insert("user_id".to_string(), identity.user_id.clone());
             if !identity.key_id.is_empty() {
                 values.insert("key_id".to_string(), identity.key_id.clone());
@@ -6067,6 +6117,7 @@ async fn record_refusal_with_usage_and_append(
     );
     values.insert("agent".to_string(), identity.agent.clone());
     values.insert("project".to_string(), identity.project.clone());
+    values.insert("data_class".to_string(), context.data_class.clone());
     values.insert("user_id".to_string(), identity.user_id.clone());
     if !identity.key_id.is_empty() {
         values.insert("key_id".to_string(), identity.key_id.clone());
@@ -6492,6 +6543,7 @@ async fn ensure_llm_calls_dataset(
         "timestamp_ms",
         "agent",
         "project",
+        "data_class",
         "user_id",
         "key_id",
         "provider",
@@ -8056,6 +8108,7 @@ mod tests {
             policy_scope: Some("project-a".into()),
             policy_version: Some("policy-v1".into()),
             task_class: "primary".into(),
+            data_class: "sensitive".into(),
             request_hash: "request-hash".into(),
             budget_subject: Some("project:project-a".into()),
             budget_status: "allowed".into(),
@@ -8110,6 +8163,7 @@ mod tests {
             policy_scope: None,
             policy_version: None,
             task_class: "primary".into(),
+            data_class: "unclassified".into(),
             request_hash: "request-hash".into(),
             budget_subject: None,
             budget_status: "not_evaluated".into(),
@@ -8557,6 +8611,7 @@ mod tests {
             route_bias: None,
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
+            data_class: Some("sensitive".into()),
         };
         cache_policy_decision(&runtime, "policy".into(), &policy).await;
         cache_egress_decision(
@@ -9900,12 +9955,32 @@ mod tests {
         let upstream_body = r#"{"object":"list","data":[{"id":"gpt-5.5","object":"model"}]}"#;
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
-        let gateway_base = spawn_gateway(upstream_base).await;
+        let (chisei_target, _) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: None,
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
 
         let resp = reqwest::Client::new()
             .get(format!("{gateway_base}/v1/models?client_version=0.141.0"))
             .bearer_auth("sk-chisei-codex-app")
-            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-data-class", "sensitive")
             .header("x-chisei-action-risk", "low")
             .send()
             .await
@@ -9914,14 +9989,47 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), upstream_body);
 
+        let detail = reqwest::Client::new()
+            .get(format!("{gateway_base}/models/gpt-5.5"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "sensitive")
+            .header("x-chisei-action-risk", "low")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+
+        let prefixed_body = reqwest::Client::new()
+            .post(format!("{gateway_base}/models-export"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "sensitive")
+            .header("x-chisei-action-risk", "low")
+            .json(&serde_json::json!({"input": "classified"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(prefixed_body.status(), StatusCode::FORBIDDEN);
+
+        let metadata_body = reqwest::Client::new()
+            .get(format!("{gateway_base}/models/gpt-5.5"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "sensitive")
+            .header("x-chisei-action-risk", "low")
+            .body("classified")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metadata_body.status(), StatusCode::FORBIDDEN);
+
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].path, "/v1/models");
         assert_eq!(requests[0].query.as_deref(), Some("client_version=0.141.0"));
         assert_eq!(
             requests[0].authorization.as_deref(),
             Some("Bearer real-openai-key")
         );
+        assert_eq!(requests[1].path, "/v1/models/gpt-5.5");
     }
 
     #[tokio::test]
@@ -10143,6 +10251,18 @@ mod tests {
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
         let (chisei_target, db) = spawn_control_plane().await;
+        let channel = connect_sekai(&chisei_target).await.unwrap();
+        ChiseiServiceClient::new(channel)
+            .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
+                namespace: "default".to_string(),
+                allowed_runtimes: vec!["anthropic".to_string()],
+                allowed_models: vec!["claude-sonnet-4-6".to_string()],
+                default_runtime: "anthropic".to_string(),
+                default_model: "claude-sonnet-4-6".to_string(),
+                data_class: "open".to_string(),
+            }))
+            .await
+            .unwrap();
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -10168,6 +10288,7 @@ mod tests {
             .post(format!("{gateway_base}/v1/messages"))
             .bearer_auth("sk-chisei-claude-code")
             .header("anthropic-version", "2023-06-01")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "open")
             // Claude Code advertises compression; the gateway must strip it.
             .header(ACCEPT_ENCODING.as_str(), "gzip, deflate, br, zstd")
             .json(&serde_json::json!({
@@ -10198,6 +10319,38 @@ mod tests {
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("8"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("6"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("14"));
+        assert_eq!(rows[0].get("data_class").map(String::as_str), Some("open"));
+
+        let downgraded = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .bearer_auth("sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "sensitive")
+            .json(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "classified"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(downgraded.status(), StatusCode::FORBIDDEN);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let unclassified_body = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .bearer_auth("sk-chisei-claude-code")
+            .header("anthropic-version", "2023-06-01")
+            .header(X_CHISEI_DATA_CLASS.as_str(), "sensitive")
+            .json(&serde_json::json!({
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "classified"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unclassified_body.status(), StatusCode::FORBIDDEN);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
