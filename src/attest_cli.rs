@@ -265,11 +265,13 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
         successor_key_id: flag(args, "--successor-key-id")
             .or_else(|| std::env::var("SHOMEI_SUCCESSOR_KEY_ID").ok()),
     };
-    let format = flag(args, "--format")
-        .as_deref()
-        .map(parse_report_format)
-        .transpose()?
-        .unwrap_or(ReportFormat::Text);
+    let format = if args.iter().any(|arg| arg == "--format") {
+        parse_report_format(
+            &flag(args, "--format").ok_or_else(|| "--format requires a value".to_string())?,
+        )?
+    } else {
+        ReportFormat::Text
+    };
     Ok(VerifyConfig {
         bundle,
         trusted_key,
@@ -506,5 +508,23 @@ mod tests {
             ReportFormat::InToto
         );
         assert!(parse_report_format("sarif").is_err());
+    }
+
+    #[test]
+    fn verify_parser_rejects_missing_report_format_value() {
+        let error = parse_verify(&[
+            "bundle.json".into(),
+            "--trusted-key".into(),
+            "key.pub".into(),
+            "--identity".into(),
+            "node:test".into(),
+            "--key-id".into(),
+            "key-1".into(),
+            "--key-state".into(),
+            "active".into(),
+            "--format".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error, "--format requires a value");
     }
 }
