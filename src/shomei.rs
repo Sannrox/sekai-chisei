@@ -6,6 +6,7 @@ use crate::sekai::attestation::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -337,7 +338,8 @@ pub struct VerificationReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyVerification {
     pub state: KeyState,
-    pub acceptable_at_signing: bool,
+    pub acceptable_at_verification: bool,
+    pub evaluated_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_key_id: Option<String>,
     #[serde(default)]
@@ -363,14 +365,22 @@ struct TrustedKey {
     metadata: KeyMetadata,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TrustedKeyring {
     keys: BTreeMap<(String, String), TrustedKey>,
+    verification_time_ms: i64,
 }
 
 impl TrustedKeyring {
     pub fn new() -> Self {
-        Self::default()
+        Self::at_time(Utc::now().timestamp_millis())
+    }
+
+    pub fn at_time(verification_time_ms: i64) -> Self {
+        Self {
+            keys: BTreeMap::new(),
+            verification_time_ms,
+        }
     }
 
     pub fn trust(
@@ -403,6 +413,12 @@ impl TrustedKeyring {
 
     fn get(&self, identity: &str, key_id: &str) -> Option<&TrustedKey> {
         self.keys.get(&(identity.to_string(), key_id.to_string()))
+    }
+}
+
+impl Default for TrustedKeyring {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -532,7 +548,7 @@ pub fn verify_bundle(
         policy: PolicyVerification {
             compliant: receipt_complete
                 && coverage_complete
-                && key_verification.acceptable_at_signing
+                && key_verification.acceptable_at_verification
                 && policy_attestations_valid
                 && missing_surfaces.is_empty()
                 && policy_errors.is_empty(),
@@ -581,6 +597,18 @@ fn coverage_from_receipt(receipt: &OperationReceipt) -> Vec<CoverageDeclaration>
             })
         })
         .collect::<Vec<_>>();
+    coverage.extend(receipt.events.iter().filter_map(|event| {
+        let id = event.attributes.get("attestation_id")?;
+        let hash = event.attributes.get("attestation_hash")?;
+        Some(CoverageDeclaration {
+            event_id: event.event_id.clone(),
+            kind: "policy_attestation".into(),
+            reference: id.clone(),
+            disposition: CoverageDisposition::Referenced,
+            expected_digest: Some(hash.clone()),
+            reason: None,
+        })
+    }));
     coverage.extend(
         receipt
             .uncovered_surfaces
@@ -720,7 +748,8 @@ fn verify_signature(
 ) -> (bool, bool, KeyVerification) {
     let unknown_key = || KeyVerification {
         state: KeyState::Unknown,
-        acceptable_at_signing: false,
+        acceptable_at_verification: false,
+        evaluated_at_ms: trusted_keys.verification_time_ms,
         successor_key_id: None,
         errors: vec!["key state is unknown".into()],
     };
@@ -758,7 +787,7 @@ fn verify_signature(
         return (false, false, unknown_key());
     };
     let key_verification =
-        verify_key_metadata(&trusted_key.metadata, signature.signer.signed_at_ms);
+        verify_key_metadata(&trusted_key.metadata, trusted_keys.verification_time_ms);
     if trusted_key.key != verifying_key {
         errors.push("embedded signer public key does not match trusted key".into());
         return (false, false, key_verification);
@@ -787,32 +816,34 @@ fn verify_signature(
     (true, true, key_verification)
 }
 
-fn verify_key_metadata(metadata: &KeyMetadata, signed_at_ms: i64) -> KeyVerification {
+fn verify_key_metadata(metadata: &KeyMetadata, verification_time_ms: i64) -> KeyVerification {
     let mut errors = Vec::new();
-    if metadata.state == KeyState::Unknown {
-        errors.push("key state is unknown".into());
+    match metadata.state {
+        KeyState::Active => {}
+        KeyState::Rotated => {
+            errors.push("rotated key requires independently trusted signing-time evidence".into())
+        }
+        KeyState::Revoked => {
+            errors.push("revoked key requires independently trusted signing-time evidence".into())
+        }
+        KeyState::Unknown => errors.push("key state is unknown".into()),
     }
     if metadata
         .valid_from_ms
-        .is_some_and(|valid_from| signed_at_ms < valid_from)
+        .is_some_and(|valid_from| verification_time_ms < valid_from)
     {
-        errors.push("bundle was signed before the key validity window".into());
+        errors.push("key is not yet valid at verification time".into());
     }
     if metadata
         .valid_until_ms
-        .is_some_and(|valid_until| signed_at_ms > valid_until)
+        .is_some_and(|valid_until| verification_time_ms > valid_until)
     {
-        errors.push("bundle was signed after the key validity window".into());
-    }
-    if metadata
-        .revoked_at_ms
-        .is_some_and(|revoked_at| signed_at_ms >= revoked_at)
-    {
-        errors.push("bundle was signed after the key was revoked".into());
+        errors.push("key is expired at verification time".into());
     }
     KeyVerification {
         state: metadata.state,
-        acceptable_at_signing: errors.is_empty(),
+        acceptable_at_verification: errors.is_empty(),
+        evaluated_at_ms: verification_time_ms,
         successor_key_id: metadata.successor_key_id.clone(),
         errors,
     }
@@ -1240,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn key_lifecycle_is_evaluated_at_signing_time() {
+    fn key_lifecycle_is_evaluated_at_verification_time() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let mut revoked = TrustedKeyring::new();
         revoked
@@ -1258,12 +1289,12 @@ mod tests {
             )
             .unwrap();
         let before_revocation = verify_bundle(&signed_bundle(), &revoked);
-        assert!(before_revocation.policy.key.acceptable_at_signing);
+        assert!(!before_revocation.policy.key.acceptable_at_verification);
 
         let mut signed_after = AttestationBundle::unsigned(receipt()).unwrap();
         signed_after.sign(&key, "node:test", "key-1", 20).unwrap();
         let after_revocation = verify_bundle(&signed_after, &revoked);
-        assert!(!after_revocation.policy.key.acceptable_at_signing);
+        assert!(!after_revocation.policy.key.acceptable_at_verification);
         assert!(!after_revocation.policy.compliant);
 
         let mut unknown = TrustedKeyring::new();
@@ -1283,7 +1314,26 @@ mod tests {
             .unwrap();
         let report = verify_bundle(&signed_bundle(), &unknown);
         assert_eq!(report.policy.key.state, KeyState::Unknown);
-        assert!(!report.policy.key.acceptable_at_signing);
+        assert!(!report.policy.key.acceptable_at_verification);
+
+        let mut expired = TrustedKeyring::at_time(30);
+        expired
+            .trust_with_metadata(
+                "node:test",
+                "key-1",
+                key.verifying_key(),
+                KeyMetadata {
+                    state: KeyState::Active,
+                    valid_from_ms: Some(0),
+                    valid_until_ms: Some(20),
+                    revoked_at_ms: None,
+                    successor_key_id: None,
+                },
+            )
+            .unwrap();
+        let backdated = verify_bundle(&signed_bundle(), &expired);
+        assert!(!backdated.policy.key.acceptable_at_verification);
+        assert_eq!(backdated.policy.key.evaluated_at_ms, 30);
     }
 
     #[test]
@@ -1303,6 +1353,24 @@ mod tests {
             decision: ActionDecision::Allow,
             created: 5,
         });
+        let mut attribute_linked = receipt();
+        attribute_linked.events[1]
+            .attributes
+            .insert("attestation_id".into(), attestation.id.clone());
+        attribute_linked.events[1]
+            .attributes
+            .insert("attestation_hash".into(), attestation.content_hash.clone());
+        let mut missing = AttestationBundle::unsigned(attribute_linked).unwrap();
+        missing
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        let missing_report = verify_bundle(&missing, &trusted_keys());
+        assert_eq!(
+            missing_report.policy.missing_artifacts,
+            [attestation.id.clone()]
+        );
+        assert!(!missing_report.policy.compliant);
+
         let mut source = receipt();
         source.events[1]
             .references

@@ -91,8 +91,8 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     println!("policy_compliant: {}", report.policy.compliant);
     println!("key_state: {:?}", report.policy.key.state);
     println!(
-        "key_acceptable_at_signing: {}",
-        report.policy.key.acceptable_at_signing
+        "key_acceptable_at_verification: {}",
+        report.policy.key.acceptable_at_verification
     );
     if let Some(signature) = &bundle.signature {
         println!("signer: {}", signature.signer.identity);
