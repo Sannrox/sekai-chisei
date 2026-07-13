@@ -174,6 +174,36 @@ pub struct RetrievedMemory {
     pub rank_score: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryOutcomeObservation {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub operation_id: String,
+    pub memory_applied: bool,
+    pub outcome_metric: String,
+    pub outcome_value: f64,
+    pub passed: bool,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryImpactEvaluation {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub treatment_samples: usize,
+    pub control_samples: usize,
+    pub treatment_pass_rate: f64,
+    pub control_pass_rate: f64,
+    pub delta: f64,
+    pub retired: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryLifecycleSweep {
+    pub expired: usize,
+    pub purged: usize,
+}
+
 pub fn derive_verified_outcome_candidate(
     input: CandidateDerivation,
 ) -> Result<(KiokuMemory, Vec<KiokuEvidenceLink>), String> {
@@ -458,7 +488,22 @@ impl SekaiDb {
                 recorded_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_kioku_lifecycle_memory
-                ON chisei_kioku_lifecycle_events(memory_id, memory_version, id);",
+                ON chisei_kioku_lifecycle_events(memory_id, memory_version, id);
+            CREATE TABLE IF NOT EXISTS chisei_kioku_outcomes (
+                memory_id TEXT NOT NULL,
+                memory_version INTEGER NOT NULL,
+                operation_id TEXT NOT NULL,
+                memory_applied INTEGER NOT NULL,
+                outcome_metric TEXT NOT NULL,
+                outcome_value REAL NOT NULL,
+                passed INTEGER NOT NULL,
+                recorded_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (memory_id, memory_version, operation_id),
+                FOREIGN KEY (memory_id, memory_version)
+                    REFERENCES chisei_kioku_memories(id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_kioku_outcome_comparison
+                ON chisei_kioku_outcomes(memory_id, memory_version, memory_applied);",
         )
         .map_err(|error| error.to_string())
     }
@@ -676,6 +721,30 @@ impl SekaiDb {
             HumanReviewAction::Promote => MemoryLifecycleState::Active,
             HumanReviewAction::Reject => MemoryLifecycleState::Rejected,
         };
+        let superseded = if review.action == HumanReviewAction::Promote {
+            memory
+                .supersedes
+                .as_ref()
+                .map(|reference| {
+                    let mut prior = self
+                        .get_kioku_memory(&reference.memory_id, reference.version)?
+                        .ok_or_else(|| "superseded memory version not found".to_string())?;
+                    if prior.state != MemoryLifecycleState::Active {
+                        return Err(String::from("superseded memory is not active"));
+                    }
+                    if prior.namespace != memory.namespace
+                        || (prior.id == memory.id && prior.version >= memory.version)
+                    {
+                        return Err(String::from("invalid memory supersession lineage"));
+                    }
+                    prior.state = MemoryLifecycleState::Superseded;
+                    let json = serde_json::to_string(&prior).map_err(|error| error.to_string())?;
+                    Ok((prior, json))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         memory.state = next_state;
         memory.reviewed_at_ms = Some(review.reviewed_at_ms);
         let memory_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
@@ -692,6 +761,32 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         if updated != 1 {
             return Err("memory changed during review".into());
+        }
+        if let Some((prior, prior_json)) = superseded {
+            let updated = tx
+                .execute(
+                    "UPDATE chisei_kioku_memories
+                     SET state='superseded', memory_json=?1
+                     WHERE id=?2 AND version=?3 AND state='active'",
+                    params![prior_json, prior.id, prior.version],
+                )
+                .map_err(|error| error.to_string())?;
+            if updated != 1 {
+                return Err("superseded memory changed during review".into());
+            }
+            insert_lifecycle_event(
+                &tx,
+                &MemoryLifecycleEvent {
+                    memory_id: prior.id,
+                    memory_version: prior.version,
+                    action: "superseded".into(),
+                    from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                    to_state: MemoryLifecycleState::Superseded.as_str().into(),
+                    actor: review.reviewer.trim().into(),
+                    reason: format!("superseded by {id}@{version}: {}", review.rationale.trim()),
+                    recorded_at_ms: review.reviewed_at_ms,
+                },
+            )?;
         }
         insert_lifecycle_event(
             &tx,
@@ -902,6 +997,268 @@ impl SekaiDb {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         insert_lifecycle_event(&tx, event)?;
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn record_kioku_outcome(
+        &self,
+        observation: &MemoryOutcomeObservation,
+    ) -> Result<(), String> {
+        if observation.operation_id.trim().is_empty()
+            || observation.outcome_metric.trim().is_empty()
+            || !observation.outcome_value.is_finite()
+        {
+            return Err("memory outcome requires an operation, metric, and finite value".into());
+        }
+        let memory = self
+            .get_kioku_memory(&observation.memory_id, observation.memory_version)?
+            .ok_or_else(|| "memory version not found".to_string())?;
+        if memory.state != MemoryLifecycleState::Active {
+            return Err("outcomes can only be attributed to active memories".into());
+        }
+        let evidence = self.list_kioku_evidence(&memory.id, memory.version)?;
+        if !evidence
+            .iter()
+            .all(|link| link.outcome_metric.trim() == observation.outcome_metric.trim())
+        {
+            return Err("outcome metric does not match memory evidence".into());
+        }
+        let conn = self.conn();
+        let injection_reason = format!("pipeline request {}", observation.operation_id.trim());
+        let injected: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM chisei_kioku_lifecycle_events
+                    WHERE memory_id=?1 AND memory_version=?2
+                      AND action='injected' AND reason=?3
+                )",
+                params![
+                    observation.memory_id,
+                    observation.memory_version,
+                    injection_reason
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if injected != observation.memory_applied {
+            return Err(
+                "memory outcome treatment assignment does not match injection audit".into(),
+            );
+        }
+        conn.execute(
+            "INSERT INTO chisei_kioku_outcomes
+             (memory_id, memory_version, operation_id, memory_applied, outcome_metric,
+              outcome_value, passed, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                observation.memory_id,
+                observation.memory_version,
+                observation.operation_id.trim(),
+                observation.memory_applied,
+                observation.outcome_metric.trim(),
+                observation.outcome_value,
+                observation.passed,
+                observation.recorded_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn evaluate_kioku_impact(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryImpactEvaluation, String> {
+        if minimum_samples_per_arm == 0
+            || !regression_threshold.is_finite()
+            || regression_threshold < 0.0
+            || actor.trim().is_empty()
+        {
+            return Err(
+                "impact evaluation requires samples, a non-negative threshold, and actor".into(),
+            );
+        }
+        let mut memory = self
+            .get_kioku_memory(id, version)?
+            .ok_or_else(|| "memory version not found".to_string())?;
+        if memory.state != MemoryLifecycleState::Active {
+            return Err("only active memories can be evaluated".into());
+        }
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT memory_applied, passed FROM chisei_kioku_outcomes
+                 WHERE memory_id=?1 AND memory_version=?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![id, version], |row| {
+                Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        drop(conn);
+        let treatment = rows
+            .iter()
+            .filter(|(applied, _)| *applied)
+            .map(|(_, passed)| *passed)
+            .collect::<Vec<_>>();
+        let control = rows
+            .iter()
+            .filter(|(applied, _)| !*applied)
+            .map(|(_, passed)| *passed)
+            .collect::<Vec<_>>();
+        if treatment.len() < minimum_samples_per_arm || control.len() < minimum_samples_per_arm {
+            return Err("insufficient treatment or control samples".into());
+        }
+        let pass_rate = |samples: &[bool]| {
+            samples.iter().filter(|passed| **passed).count() as f64 / samples.len() as f64
+        };
+        let treatment_pass_rate = pass_rate(&treatment);
+        let control_pass_rate = pass_rate(&control);
+        let delta = treatment_pass_rate - control_pass_rate;
+        let retired = delta < -regression_threshold;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        if retired {
+            memory.state = MemoryLifecycleState::Rejected;
+        } else {
+            memory.last_confirmed_at_ms = Some(now_ms);
+        }
+        let memory_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE chisei_kioku_memories SET state=?1, memory_json=?2
+                 WHERE id=?3 AND version=?4 AND state='active'",
+                params![memory.state.as_str(), memory_json, id, version],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("memory changed during impact evaluation".into());
+        }
+        insert_lifecycle_event(
+            &tx,
+            &MemoryLifecycleEvent {
+                memory_id: id.into(),
+                memory_version: version,
+                action: if retired { "regressed" } else { "confirmed" }.into(),
+                from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                to_state: memory.state.as_str().into(),
+                actor: actor.trim().into(),
+                reason: format!(
+                    "treatment_pass_rate={treatment_pass_rate:.6} control_pass_rate={control_pass_rate:.6} delta={delta:.6}"
+                ),
+                recorded_at_ms: now_ms,
+            },
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(MemoryImpactEvaluation {
+            memory_id: id.into(),
+            memory_version: version,
+            treatment_samples: treatment.len(),
+            control_samples: control.len(),
+            treatment_pass_rate,
+            control_pass_rate,
+            delta,
+            retired,
+        })
+    }
+
+    pub fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String> {
+        if actor.trim().is_empty() {
+            return Err("lifecycle sweep actor is required".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let memory_json = {
+            let mut statement = tx
+                .prepare("SELECT memory_json FROM chisei_kioku_memories")
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut sweep = MemoryLifecycleSweep::default();
+        for json in memory_json {
+            let mut memory: KiokuMemory =
+                serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            if memory
+                .retention_until_ms
+                .is_some_and(|retention| retention <= now_ms)
+            {
+                tx.execute(
+                    "DELETE FROM chisei_kioku_outcomes WHERE memory_id=?1 AND memory_version=?2",
+                    params![memory.id, memory.version],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "DELETE FROM chisei_kioku_evidence_links WHERE memory_id=?1 AND memory_version=?2",
+                    params![memory.id, memory.version],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "DELETE FROM chisei_kioku_memories WHERE id=?1 AND version=?2",
+                    params![memory.id, memory.version],
+                )
+                .map_err(|error| error.to_string())?;
+                insert_lifecycle_event(
+                    &tx,
+                    &MemoryLifecycleEvent {
+                        memory_id: memory.id,
+                        memory_version: memory.version,
+                        action: "purged".into(),
+                        from_state: Some(memory.state.as_str().into()),
+                        to_state: "purged".into(),
+                        actor: actor.trim().into(),
+                        reason: "retention period elapsed".into(),
+                        recorded_at_ms: now_ms,
+                    },
+                )?;
+                sweep.purged += 1;
+            } else if memory.state == MemoryLifecycleState::Active
+                && memory
+                    .expires_at_ms
+                    .is_some_and(|expires| expires <= now_ms)
+            {
+                memory.state = MemoryLifecycleState::Rejected;
+                let updated_json =
+                    serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+                tx.execute(
+                    "UPDATE chisei_kioku_memories SET state='rejected', memory_json=?1
+                     WHERE id=?2 AND version=?3 AND state='active'",
+                    params![updated_json, memory.id, memory.version],
+                )
+                .map_err(|error| error.to_string())?;
+                insert_lifecycle_event(
+                    &tx,
+                    &MemoryLifecycleEvent {
+                        memory_id: memory.id,
+                        memory_version: memory.version,
+                        action: "expired".into(),
+                        from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                        to_state: MemoryLifecycleState::Rejected.as_str().into(),
+                        actor: actor.trim().into(),
+                        reason: "memory expiry elapsed".into(),
+                        recorded_at_ms: now_ms,
+                    },
+                )?;
+                sweep.expired += 1;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(sweep)
     }
 }
 
@@ -1477,6 +1834,150 @@ mod tests {
             db.retrieve_kioku_memories(&unauthorized)
                 .unwrap_err()
                 .contains("exceeds actor grant")
+        );
+    }
+
+    #[test]
+    fn retires_regressing_memory_from_held_out_outcomes() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        active_memory(
+            &db,
+            "regressing",
+            "seed-operation",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        for operation_id in ["treatment-1", "treatment-2"] {
+            db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+                memory_id: "regressing".into(),
+                memory_version: 1,
+                action: "injected".into(),
+                from_state: Some("active".into()),
+                to_state: "active".into(),
+                actor: "agent:planner".into(),
+                reason: format!("pipeline request {operation_id}"),
+                recorded_at_ms: 140,
+            })
+            .unwrap();
+            db.record_kioku_outcome(&MemoryOutcomeObservation {
+                memory_id: "regressing".into(),
+                memory_version: 1,
+                operation_id: operation_id.into(),
+                memory_applied: true,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 0.0,
+                passed: false,
+                recorded_at_ms: 150,
+            })
+            .unwrap();
+        }
+        for operation_id in ["control-1", "control-2"] {
+            db.record_kioku_outcome(&MemoryOutcomeObservation {
+                memory_id: "regressing".into(),
+                memory_version: 1,
+                operation_id: operation_id.into(),
+                memory_applied: false,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                passed: true,
+                recorded_at_ms: 150,
+            })
+            .unwrap();
+        }
+
+        let evaluation = db
+            .evaluate_kioku_impact("regressing", 1, 2, 0.05, "kioku:evaluator", 160)
+            .unwrap();
+        assert!(evaluation.retired);
+        assert_eq!(evaluation.delta, -1.0);
+        assert_eq!(
+            db.get_kioku_memory("regressing", 1).unwrap().unwrap().state,
+            MemoryLifecycleState::Rejected
+        );
+        assert_eq!(
+            db.list_kioku_lifecycle_events("regressing", 1)
+                .unwrap()
+                .last()
+                .unwrap()
+                .action,
+            "regressed"
+        );
+    }
+
+    #[test]
+    fn supersedes_atomically_and_sweeps_expiry_and_retention() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        active_memory(
+            &db,
+            "old",
+            "operation-old",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        let mut replacement = candidate();
+        replacement.id = "new".into();
+        replacement.confidence_bps = 10_000;
+        replacement.supersedes = Some(MemoryVersionRef {
+            memory_id: "old".into(),
+            version: 1,
+        });
+        let evidence = KiokuEvidenceLink {
+            memory_id: "new".into(),
+            memory_version: 1,
+            operation_id: "operation-new".into(),
+            verification_event_id: "verify-new".into(),
+            evidence_reference: "evidence:new".into(),
+            evidence_digest: "digest-new".into(),
+            stance: MemoryEvidenceStance::Supporting,
+            outcome_metric: "passed".into(),
+            outcome_value: 1.0,
+            observed_at_ms: 100,
+        };
+        db.insert_kioku_memory(&replacement, &[evidence]).unwrap();
+        db.review_kioku_candidate(
+            "new",
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "newer representative evidence".into(),
+                reviewed_at_ms: 130,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_kioku_memory("old", 1).unwrap().unwrap().state,
+            MemoryLifecycleState::Superseded
+        );
+        assert_eq!(
+            db.list_kioku_lifecycle_events("old", 1)
+                .unwrap()
+                .last()
+                .unwrap()
+                .action,
+            "superseded"
+        );
+
+        let sweep = db.sweep_kioku_lifecycle("kioku:sweeper", 221).unwrap();
+        assert_eq!(sweep.expired, 1);
+        assert_eq!(
+            db.list_kioku_lifecycle_events("new", 1)
+                .unwrap()
+                .last()
+                .unwrap()
+                .action,
+            "expired"
+        );
+        let sweep = db.sweep_kioku_lifecycle("kioku:sweeper", 321).unwrap();
+        assert_eq!(sweep.purged, 2);
+        assert!(db.get_kioku_memory("new", 1).unwrap().is_none());
+        assert_eq!(
+            db.list_kioku_lifecycle_events("new", 1)
+                .unwrap()
+                .last()
+                .unwrap()
+                .action,
+            "purged"
         );
     }
 }
