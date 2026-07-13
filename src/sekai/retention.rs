@@ -933,6 +933,76 @@ impl SekaiDb {
             }
         }
 
+        let matching_virtual_tables = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT rowid,id,name,dataset_id,filters,columns
+                     FROM sekai_virtual_tables",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(
+                |(rowid, id, name, dataset_id, filters_json, columns_json)| {
+                    let filters =
+                        serde_json::from_str::<Vec<(String, String, String)>>(&filters_json)
+                            .unwrap_or_default();
+                    let filter_matches = filters.iter().any(|(column, op, value)| {
+                        if op == "in" {
+                            value.split(',').any(|candidate| {
+                                keyed_value_matches_subject(
+                                    column,
+                                    candidate.trim(),
+                                    &request.subject_kind,
+                                    &request.subject,
+                                )
+                            })
+                        } else {
+                            keyed_value_matches_subject(
+                                column,
+                                value,
+                                &request.subject_kind,
+                                &request.subject,
+                            )
+                        }
+                    });
+                    let metadata_matches =
+                        [id, name, dataset_id, columns_json].iter().any(|value| {
+                            value == &request.subject
+                                || contains_subject_reference(
+                                    value,
+                                    &request.subject_kind,
+                                    &request.subject,
+                                )
+                                || subject_object_ids.iter().any(|object_id| {
+                                    value == object_id || contains_identifier(value, object_id)
+                                })
+                        });
+                    (filter_matches || metadata_matches).then_some(rowid)
+                },
+            )
+            .collect::<Vec<_>>()
+        };
+        for rowid in matching_virtual_tables {
+            tx.execute(
+                "DELETE FROM sekai_virtual_tables WHERE rowid=?1",
+                params![rowid],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
         let observations = {
             let mut stmt = tx
                 .prepare(
@@ -1147,6 +1217,32 @@ impl SekaiDb {
             result.budget_records_deleted += tx
                 .execute(
                     "DELETE FROM chisei_budget_usage WHERE rowid=?1",
+                    params![rowid],
+                )
+                .map_err(|e| e.to_string())? as i32;
+        }
+
+        let matching_usage_events = {
+            let mut stmt = tx
+                .prepare("SELECT rowid,scope_id FROM chisei_budget_usage_events")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|(rowid, scope_id)| {
+                principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
+                    .then_some(rowid)
+            })
+            .collect::<Vec<_>>()
+        };
+        for rowid in matching_usage_events {
+            result.budget_records_deleted += tx
+                .execute(
+                    "DELETE FROM chisei_budget_usage_events WHERE rowid=?1",
                     params![rowid],
                 )
                 .map_err(|e| e.to_string())? as i32;
@@ -3776,6 +3872,50 @@ mod tests {
         );
         assert!(db.verify_ledger().unwrap().ok);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn subject_erasure_removes_saved_filters_and_budget_events() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_budget_usage_events
+                 (idempotency_key,scope_id,metric,amount,created_at)
+                 VALUES ('event','project:p/agent:erase-agent','tokens',1,1)",
+                [],
+            )
+            .unwrap();
+        let filters = serde_json::to_string(&vec![("agent", "eq", "erase-agent")]).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_virtual_tables
+                 (id,name,dataset_id,filters,columns,created)
+                 VALUES ('saved','saved','llm_calls',?1,'[]',1)",
+                params![filters],
+            )
+            .unwrap();
+
+        let result = db
+            .erase_subject(&SubjectErasureRequest {
+                subject_kind: "agent".into(),
+                subject: "erase-agent".into(),
+                requested_by: "admin".into(),
+                reason: "privacy request".into(),
+                timestamp: 2,
+            })
+            .unwrap();
+
+        assert_eq!(result.budget_records_deleted, 1);
+        let budget_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chisei_budget_usage_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(budget_events, 0);
+        assert!(db.list_virtual_tables().unwrap().is_empty());
     }
 
     #[test]
