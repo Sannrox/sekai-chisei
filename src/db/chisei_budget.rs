@@ -204,12 +204,12 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
             transaction
                 .execute(
-                "INSERT INTO chisei_budget_attributions
+                    "INSERT INTO chisei_budget_attributions
                    (source_scope_id,applied_scope_id,metric,period_start,amount_used)
                  VALUES (?1,?2,?3,?4,?5)
                  ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
                  DO UPDATE SET amount_used=amount_used+excluded.amount_used",
-                params![scope_id, scope, metric, period_start, amount],
+                    params![scope_id, scope, metric, period_start, amount],
                 )
                 .map_err(|e| e.to_string())?;
         }
