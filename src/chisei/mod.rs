@@ -9,6 +9,7 @@ pub mod federation;
 pub mod gate;
 pub mod gunshi;
 pub mod gunshi_dispatch;
+pub mod gunshi_optimization;
 pub mod kioku;
 pub mod model_routing;
 pub mod pipeline;
