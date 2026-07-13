@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>]\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id>] [--integrity-only]"
+    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id>] [--integrity-only]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,7 @@ struct ExportConfig {
     signing_key: PathBuf,
     identity: String,
     key_id: String,
+    artifacts: Vec<(String, PathBuf)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +53,11 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         .receipt_json;
     let receipt: OperationReceipt = serde_json::from_str(&receipt_json)?;
     let signing_key = load_signing_key(&config.signing_key)?;
-    let bundle = sign_receipt(
-        receipt,
+    let mut bundle = AttestationBundle::unsigned(receipt)?;
+    for (reference, path) in &config.artifacts {
+        bundle.attach_artifact(reference, None, &std::fs::read(path)?)?;
+    }
+    bundle.sign(
         &signing_key,
         &config.identity,
         &config.key_id,
@@ -91,6 +95,18 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
             report.policy.missing_surfaces.join(",")
         );
     }
+    if !report.policy.missing_artifacts.is_empty() {
+        println!(
+            "missing_artifacts: {}",
+            report.policy.missing_artifacts.join(",")
+        );
+    }
+    for declaration in &report.policy.coverage {
+        println!(
+            "coverage: {:?} {} {}",
+            declaration.disposition, declaration.kind, declaration.reference
+        );
+    }
     if !report.integrity.valid {
         return Err(std::io::Error::other("attestation integrity verification failed").into());
     }
@@ -100,6 +116,7 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+#[cfg(test)]
 fn sign_receipt(
     receipt: OperationReceipt,
     signing_key: &SigningKey,
@@ -127,12 +144,25 @@ fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
     let key_id = flag(args, "--key-id")
         .or_else(|| std::env::var("SHOMEI_KEY_ID").ok())
         .ok_or_else(|| "--key-id or SHOMEI_KEY_ID is required".to_string())?;
+    let artifacts = flags(args, "--artifact")
+        .into_iter()
+        .map(|value| {
+            let (reference, path) = value
+                .split_once('=')
+                .ok_or_else(|| "--artifact must use <reference>=<path>".to_string())?;
+            if reference.trim().is_empty() || path.trim().is_empty() {
+                return Err("--artifact must use <reference>=<path>".into());
+            }
+            Ok((reference.to_string(), PathBuf::from(path)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(ExportConfig {
         operation_id,
         output,
         signing_key,
         identity,
         key_id,
+        artifacts,
     })
 }
 
@@ -184,6 +214,13 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
@@ -281,6 +318,27 @@ mod tests {
     fn export_parser_requires_an_output() {
         let error = parse_export(&["op-1".into()]).unwrap_err();
         assert_eq!(error, "--output is required");
+    }
+
+    #[test]
+    fn export_parser_accepts_repeated_artifacts() {
+        let config = parse_export(&[
+            "op-1".into(),
+            "--output".into(),
+            "bundle.json".into(),
+            "--signing-key".into(),
+            "key.hex".into(),
+            "--identity".into(),
+            "node:test".into(),
+            "--key-id".into(),
+            "key-1".into(),
+            "--artifact".into(),
+            "artifact://one=one.txt".into(),
+            "--artifact".into(),
+            "artifact://two=two.txt".into(),
+        ])
+        .unwrap();
+        assert_eq!(config.artifacts.len(), 2);
     }
 
     #[test]

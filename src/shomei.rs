@@ -1,6 +1,8 @@
 //! Portable, independently verifiable operation attestations.
 
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,6 +39,39 @@ pub struct BundleSignature {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageDisposition {
+    Embedded,
+    Referenced,
+    Redacted,
+    Unavailable,
+    Uncovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageDeclaration {
+    pub event_id: String,
+    pub kind: String,
+    pub reference: String,
+    pub disposition: CoverageDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundledArtifact {
+    pub reference: String,
+    pub digest_algorithm: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    pub content_base64: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationBundle {
     pub bundle_version: String,
@@ -48,6 +83,10 @@ pub struct AttestationBundle {
     pub receipt_digest: String,
     pub event_chain: Vec<EventDigest>,
     pub receipt: OperationReceipt,
+    #[serde(default)]
+    pub coverage: Vec<CoverageDeclaration>,
+    #[serde(default)]
+    pub artifacts: Vec<BundledArtifact>,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +106,8 @@ impl AttestationBundle {
             signature_algorithm: SIGNATURE_ALGORITHM.into(),
             receipt_digest,
             event_chain,
+            coverage: coverage_from_receipt(&receipt),
+            artifacts: Vec::new(),
             receipt,
             extensions: BTreeMap::new(),
             signature: None,
@@ -109,6 +150,56 @@ impl AttestationBundle {
             .value = encode_hex(&signature.to_bytes());
         Ok(())
     }
+
+    pub fn attach_artifact(
+        &mut self,
+        reference: &str,
+        media_type: Option<String>,
+        content: &[u8],
+    ) -> Result<(), String> {
+        if self.signature.is_some() {
+            return Err("cannot attach an artifact after signing".into());
+        }
+        if self
+            .artifacts
+            .iter()
+            .any(|item| item.reference == reference)
+        {
+            return Err(format!("artifact {reference} is already attached"));
+        }
+        let matching = self
+            .coverage
+            .iter_mut()
+            .filter(|entry| entry.reference == reference)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(format!(
+                "artifact {reference} is not referenced by the receipt"
+            ));
+        }
+        let digest = encode_hex(&Sha256::digest(content));
+        for declaration in matching {
+            if let Some(expected) = &declaration.expected_digest
+                && expected != &digest
+            {
+                return Err(format!(
+                    "artifact {reference} digest does not match receipt reference"
+                ));
+            }
+            declaration.disposition = CoverageDisposition::Embedded;
+            declaration.expected_digest = Some(digest.clone());
+            declaration.reason = None;
+        }
+        self.artifacts.push(BundledArtifact {
+            reference: reference.into(),
+            digest_algorithm: DIGEST_ALGORITHM.into(),
+            digest,
+            size_bytes: content.len() as u64,
+            media_type,
+            content_base64: BASE64.encode(content),
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +208,7 @@ pub struct IntegrityVerification {
     pub versions_supported: bool,
     pub receipt_digest_valid: bool,
     pub event_chain_valid: bool,
+    pub artifacts_valid: bool,
     pub signer_trusted: bool,
     pub signature_valid: bool,
     #[serde(default)]
@@ -127,8 +219,13 @@ pub struct IntegrityVerification {
 pub struct PolicyVerification {
     pub compliant: bool,
     pub receipt_complete: bool,
+    pub coverage_complete: bool,
     #[serde(default)]
     pub missing_surfaces: Vec<String>,
+    #[serde(default)]
+    pub missing_artifacts: Vec<String>,
+    #[serde(default)]
+    pub coverage: Vec<CoverageDeclaration>,
     #[serde(default)]
     pub errors: Vec<String>,
 }
@@ -241,10 +338,12 @@ pub fn verify_bundle(
             false
         }
     };
+    let (artifacts_valid, missing_artifacts) = verify_artifacts(bundle, &mut errors);
     let (signer_trusted, signature_valid) = verify_signature(bundle, trusted_keys, &mut errors);
     let valid = versions_supported
         && receipt_digest_valid
         && event_chain_valid
+        && artifacts_valid
         && signer_trusted
         && signature_valid
         && errors.is_empty();
@@ -257,23 +356,191 @@ pub fn verify_bundle(
         .into_iter()
         .map(|surface| surface.as_str().to_string())
         .collect::<Vec<_>>();
+    let coverage_complete = missing_artifacts.is_empty()
+        && bundle.coverage.iter().all(|entry| {
+            !matches!(
+                entry.disposition,
+                CoverageDisposition::Unavailable | CoverageDisposition::Uncovered
+            )
+        });
     VerificationReport {
         integrity: IntegrityVerification {
             valid,
             versions_supported,
             receipt_digest_valid,
             event_chain_valid,
+            artifacts_valid,
             signer_trusted,
             signature_valid,
             errors,
         },
         policy: PolicyVerification {
-            compliant: receipt_complete && missing_surfaces.is_empty() && policy_errors.is_empty(),
+            compliant: receipt_complete
+                && coverage_complete
+                && missing_surfaces.is_empty()
+                && policy_errors.is_empty(),
             receipt_complete,
+            coverage_complete,
             missing_surfaces,
+            missing_artifacts,
+            coverage: bundle.coverage.clone(),
             errors: policy_errors,
         },
     }
+}
+
+fn coverage_from_receipt(receipt: &OperationReceipt) -> Vec<CoverageDeclaration> {
+    let mut coverage = receipt
+        .events
+        .iter()
+        .flat_map(|event| {
+            event.references.iter().map(|reference| {
+                let (disposition, reason) = if reference.omitted {
+                    (
+                        CoverageDisposition::Redacted,
+                        reference
+                            .omission_reason
+                            .clone()
+                            .or_else(|| Some("content was redacted".into())),
+                    )
+                } else if reference.content_hash.is_some() {
+                    (CoverageDisposition::Referenced, None)
+                } else {
+                    (
+                        CoverageDisposition::Unavailable,
+                        Some("reference has no content digest or embedded material".into()),
+                    )
+                };
+                CoverageDeclaration {
+                    event_id: event.event_id.clone(),
+                    kind: reference.kind.clone(),
+                    reference: reference.reference.clone(),
+                    disposition,
+                    expected_digest: reference.content_hash.clone(),
+                    reason,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    coverage.extend(
+        receipt
+            .uncovered_surfaces
+            .iter()
+            .map(|uncovered| CoverageDeclaration {
+                event_id: String::new(),
+                kind: "receipt_surface".into(),
+                reference: uncovered.surface.as_str().into(),
+                disposition: CoverageDisposition::Uncovered,
+                expected_digest: None,
+                reason: Some(uncovered.reason.clone()),
+            }),
+    );
+    coverage
+}
+
+fn verify_artifacts(bundle: &AttestationBundle, errors: &mut Vec<String>) -> (bool, Vec<String>) {
+    let mut valid = true;
+    let mut missing = Vec::new();
+    let expected_coverage = coverage_from_receipt(&bundle.receipt);
+    let mut matched = vec![false; bundle.coverage.len()];
+    for expected in &expected_coverage {
+        let Some((index, _)) = bundle.coverage.iter().enumerate().find(|(index, actual)| {
+            !matched[*index]
+                && actual.event_id == expected.event_id
+                && actual.kind == expected.kind
+                && actual.reference == expected.reference
+                && (actual.expected_digest == expected.expected_digest
+                    || (actual.disposition == CoverageDisposition::Embedded
+                        && expected.expected_digest.is_none()))
+                && (actual.disposition == expected.disposition
+                    || (actual.disposition == CoverageDisposition::Embedded
+                        && matches!(
+                            expected.disposition,
+                            CoverageDisposition::Referenced | CoverageDisposition::Unavailable
+                        )))
+        }) else {
+            errors.push(format!(
+                "receipt reference {} lacks a matching coverage declaration",
+                expected.reference
+            ));
+            valid = false;
+            continue;
+        };
+        matched[index] = true;
+    }
+    if matched.iter().any(|matched| !matched) {
+        errors.push("bundle contains coverage declarations not present in the receipt".into());
+        valid = false;
+    }
+    let artifacts = bundle
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.reference.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if artifacts.len() != bundle.artifacts.len() {
+        errors.push("bundle contains duplicate artifact references".into());
+        valid = false;
+    }
+    for declaration in &bundle.coverage {
+        match declaration.disposition {
+            CoverageDisposition::Embedded => {
+                let Some(artifact) = artifacts.get(declaration.reference.as_str()) else {
+                    missing.push(declaration.reference.clone());
+                    valid = false;
+                    continue;
+                };
+                if artifact.digest_algorithm != DIGEST_ALGORITHM {
+                    errors.push(format!(
+                        "artifact {} uses unsupported digest algorithm {}",
+                        artifact.reference, artifact.digest_algorithm
+                    ));
+                    valid = false;
+                    continue;
+                }
+                let content = match BASE64.decode(&artifact.content_base64) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        errors.push(format!(
+                            "artifact {} content is not valid base64",
+                            artifact.reference
+                        ));
+                        valid = false;
+                        continue;
+                    }
+                };
+                let digest = encode_hex(&Sha256::digest(&content));
+                if digest != artifact.digest
+                    || declaration.expected_digest.as_ref() != Some(&digest)
+                    || artifact.size_bytes != content.len() as u64
+                {
+                    errors.push(format!(
+                        "artifact {} digest or size mismatch",
+                        artifact.reference
+                    ));
+                    valid = false;
+                }
+            }
+            CoverageDisposition::Referenced => missing.push(declaration.reference.clone()),
+            CoverageDisposition::Redacted
+            | CoverageDisposition::Unavailable
+            | CoverageDisposition::Uncovered => {}
+        }
+    }
+    for artifact in &bundle.artifacts {
+        if !bundle.coverage.iter().any(|declaration| {
+            declaration.reference == artifact.reference
+                && declaration.disposition == CoverageDisposition::Embedded
+        }) {
+            errors.push(format!(
+                "artifact {} has no embedded coverage declaration",
+                artifact.reference
+            ));
+            valid = false;
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    (valid, missing)
 }
 
 fn verify_signature(
@@ -629,5 +896,77 @@ mod tests {
             .is_err()
         );
         assert!(verify_bundle(&signed_bundle(), &keys).integrity.valid);
+    }
+
+    #[test]
+    fn embedded_artifact_is_verified_and_missing_reference_is_reported() {
+        let mut source = receipt();
+        source.events[0]
+            .references
+            .push(crate::chisei::receipt::GovernedReference {
+                kind: "input".into(),
+                reference: "artifact://input".into(),
+                content_hash: Some(encode_hex(&Sha256::digest(b"evidence"))),
+                disclosed_fields: vec![],
+                omitted: false,
+                omission_reason: None,
+            });
+        let mut missing = AttestationBundle::unsigned(source.clone()).unwrap();
+        missing
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        let missing_report = verify_bundle(&missing, &trusted_keys());
+        assert!(missing_report.integrity.valid);
+        assert_eq!(
+            missing_report.policy.missing_artifacts,
+            ["artifact://input"]
+        );
+        assert!(!missing_report.policy.compliant);
+
+        let mut embedded = AttestationBundle::unsigned(source).unwrap();
+        embedded
+            .attach_artifact("artifact://input", Some("text/plain".into()), b"evidence")
+            .unwrap();
+        embedded
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        let report = verify_bundle(&embedded, &trusted_keys());
+        assert!(report.integrity.valid, "{:?}", report.integrity.errors);
+        assert!(report.policy.compliant);
+
+        let mut tampered = embedded;
+        tampered.artifacts[0].content_base64 = BASE64.encode(b"tampered");
+        let report = verify_bundle(&tampered, &trusted_keys());
+        assert!(!report.integrity.artifacts_valid);
+        assert!(!report.integrity.valid);
+    }
+
+    #[test]
+    fn omitted_and_uncovered_content_are_declared() {
+        let mut source = receipt();
+        source.events[0]
+            .references
+            .push(crate::chisei::receipt::GovernedReference {
+                kind: "context".into(),
+                reference: "object://secret".into(),
+                content_hash: None,
+                disclosed_fields: vec![],
+                omitted: true,
+                omission_reason: Some("private field".into()),
+            });
+        source
+            .uncovered_surfaces
+            .push(crate::chisei::receipt::UncoveredSurface {
+                surface: crate::chisei::receipt::ReceiptSurface::Action,
+                reason: "external executor".into(),
+            });
+        let bundle = AttestationBundle::unsigned(source).unwrap();
+        assert!(bundle.coverage.iter().any(|entry| {
+            entry.disposition == CoverageDisposition::Redacted
+                && entry.reference == "object://secret"
+        }));
+        assert!(bundle.coverage.iter().any(|entry| {
+            entry.disposition == CoverageDisposition::Uncovered && entry.reference == "action"
+        }));
     }
 }
