@@ -87,6 +87,16 @@ message PipelineRunResult {
   int64 timestamp = 3;
   string prepared_spec = 4;
   repeated ContextEvidenceReference evidence_references = 5;
+  repeated MemoryContextReference memory_references = 6;
+}
+
+message MemoryContextReference {
+  string memory_id = 1;
+  uint32 memory_version = 2;
+  string classification = 3;
+  uint32 confidence_bps = 4;
+  string applicability = 5;
+  repeated string evidence_operation_ids = 6;
 }
 
 message ContextEvidenceReference {

@@ -24,6 +24,9 @@ pub struct PipelineRequest {
     pub template_only: bool,
     pub expanded_context_items: usize,
     pub evidence_references: Vec<EvidenceContextReference>,
+    pub memory_actor: String,
+    pub memory_token_budget: usize,
+    pub memory_references: Vec<MemoryContextReference>,
     pub allowed_evidence_types: HashSet<String>,
 }
 
@@ -42,6 +45,16 @@ pub struct EvidenceContextReference {
     pub classification: String,
     pub projection_version: String,
     pub disclosed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryContextReference {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub classification: String,
+    pub confidence_bps: u16,
+    pub applicability: String,
+    pub evidence_operation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +85,7 @@ pub struct RunResult {
     pub egress_records: Vec<egress::ContextEgressRecord>,
     pub expanded_context_items: usize,
     pub evidence_references: Vec<EvidenceContextReference>,
+    pub memory_references: Vec<MemoryContextReference>,
 }
 
 impl RunResult {
@@ -742,6 +756,7 @@ impl Pipeline {
     ) -> RunResult {
         req.expanded_context_items = 0;
         req.evidence_references.clear();
+        req.memory_references.clear();
         req.allowed_evidence_types = allowed_evidence_types;
         let decisions: Vec<StepDecision> = self
             .steps
@@ -763,7 +778,178 @@ impl Pipeline {
             egress_records: req.egress_records.clone(),
             expanded_context_items: req.expanded_context_items,
             evidence_references: req.evidence_references.clone(),
+            memory_references: req.memory_references.clone(),
         }
+    }
+}
+
+pub struct KiokuEnrichStep;
+
+impl Step for KiokuEnrichStep {
+    fn name(&self) -> &str {
+        "kioku_enrich"
+    }
+
+    fn run(&self, req: &mut PipelineRequest, db: &SekaiDb) -> StepDecision {
+        run_kioku_enrich(req, db, false)
+    }
+
+    fn run_with_context_expansion(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        context_expansion_allowed: bool,
+    ) -> StepDecision {
+        run_kioku_enrich(req, db, context_expansion_allowed)
+    }
+}
+
+fn run_kioku_enrich(
+    req: &mut PipelineRequest,
+    db: &SekaiDb,
+    context_expansion_allowed: bool,
+) -> StepDecision {
+    if req.template_only {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "template_only sanitization contract".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    if !context_expansion_allowed {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "context expansion has not passed the eval gate".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    if req.memory_token_budget == 0 || req.memory_actor.trim().is_empty() {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: "memory context has no authenticated actor or token budget".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    let context_object_ids = resolve_context_objects(req, db)
+        .into_iter()
+        .map(|object| object.id)
+        .collect();
+    let classification_ceiling = if req.external_egress {
+        EvidenceClassification::Public
+    } else {
+        EvidenceClassification::Internal
+    };
+    let retrieved =
+        match db.retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
+            namespace: req.namespace.clone(),
+            operation_class: req.task_type.clone(),
+            context_object_ids,
+            classification_ceiling,
+            min_confidence_bps: 0,
+            max_results: 16,
+            actor: req.memory_actor.clone(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }) {
+            Ok(retrieved) => retrieved,
+            Err(error) => {
+                return StepDecision {
+                    step: String::new(),
+                    action: "skipped".into(),
+                    reasoning: format!("memory retrieval denied: {error}"),
+                    confidence: 1.0,
+                    suggestion: String::new(),
+                    value: String::new(),
+                };
+            }
+        };
+
+    let mut remaining_tokens = req.memory_token_budget.saturating_sub(2);
+    let mut lines = Vec::new();
+    for item in retrieved {
+        let line = format!(
+            "- {} [memory:{}@{}]",
+            item.memory.claim, item.memory.id, item.memory.version
+        );
+        let estimated_tokens = line.split_whitespace().count().max(1);
+        if estimated_tokens > remaining_tokens {
+            continue;
+        }
+        let evidence_operation_ids = item
+            .evidence
+            .iter()
+            .map(|link| link.operation_id.clone())
+            .collect::<Vec<_>>();
+        if db
+            .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
+                memory_id: item.memory.id.clone(),
+                memory_version: item.memory.version,
+                action: "injected".into(),
+                from_state: Some("active".into()),
+                to_state: "active".into(),
+                actor: req.memory_actor.clone(),
+                reason: format!("pipeline request {}", req.request_id),
+                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .is_err()
+        {
+            continue;
+        }
+        remaining_tokens -= estimated_tokens;
+        lines.push(line);
+        req.memory_references.push(MemoryContextReference {
+            memory_id: item.memory.id.clone(),
+            memory_version: item.memory.version,
+            classification: item.memory.classification.as_str().into(),
+            confidence_bps: item.memory.confidence_bps,
+            applicability: item.applicability.clone(),
+            evidence_operation_ids,
+        });
+        req.egress_records.push(egress::ContextEgressRecord {
+            object_ref: format!("kioku:{}@{}", item.memory.id, item.memory.version),
+            included_fields: vec!["claim".into()],
+            redacted_fields: vec![],
+            reasons: vec![format!(
+                "memory classification {} admitted for governed context",
+                item.memory.classification.as_str()
+            )],
+        });
+    }
+    if lines.is_empty() {
+        return StepDecision {
+            step: String::new(),
+            action: "none".into(),
+            reasoning: "no applicable memory fit the governed token budget".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
+    req.expanded_context_items = req
+        .expanded_context_items
+        .saturating_add(req.memory_references.len());
+    req.spec
+        .push_str(&format!("\n\n[Governed memory]\n{}", lines.join("\n")));
+    StepDecision {
+        step: String::new(),
+        action: "enrich".into(),
+        reasoning: format!("injected {} governed memories", lines.len()),
+        confidence: 1.0,
+        suggestion: "apply only within the recorded memory applicability".into(),
+        value: req
+            .memory_references
+            .iter()
+            .map(|reference| format!("{}@{}", reference.memory_id, reference.memory_version))
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 
@@ -1268,6 +1454,7 @@ pub fn default_pipeline() -> Pipeline {
 pub fn default_pipeline_with(base_rate: f64, risk_threshold: f64) -> Pipeline {
     Pipeline::new(vec![
         Box::new(ObjectContextEnrichStep),
+        Box::new(KiokuEnrichStep),
         Box::new(LearningsEnrichStep),
         Box::new(SpecEnrichStep),
         Box::new(RiskStep),
@@ -1300,6 +1487,10 @@ fn decode_review_policy(steps: &[StepDecision]) -> Option<ReviewPolicy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::kioku::{
+        HumanMemoryReview, HumanReviewAction, KIOKU_MEMORY_VERSION, KiokuEvidenceLink, KiokuMemory,
+        MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
+    };
     use crate::domain::{Link, Object};
     use crate::sekai::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
@@ -1309,6 +1500,7 @@ mod tests {
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
     };
     use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
+    use crate::sekai::security::{Grant, Role};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 
@@ -1369,8 +1561,128 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_actor: String::new(),
+            memory_token_budget: 0,
+            memory_references: vec![],
             allowed_evidence_types: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn kioku_injection_is_eval_gated_scoped_and_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for object in [
+            Object {
+                id: "namespace-payments".into(),
+                kind: "namespace".into(),
+                name: "payments".into(),
+                namespace: "payments".into(),
+                external_id: "namespace:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            Object {
+                id: "component:migrations".into(),
+                kind: "component".into(),
+                name: "migrations".into(),
+                namespace: "payments".into(),
+                external_id: "component:migrations".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+        ] {
+            db.create_object(&object).unwrap();
+            db.create_grant(&Grant {
+                id: format!("grant-{}", object.id),
+                object_id: object.id,
+                principal: "agent:planner".into(),
+                role: Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+        }
+        let memory = KiokuMemory {
+            contract_version: KIOKU_MEMORY_VERSION.into(),
+            id: "memory-migrations".into(),
+            version: 1,
+            kind: MemoryKind::Recommendation,
+            claim: "Run migration verification before deployment".into(),
+            namespace: "payments".into(),
+            operation_classes: vec!["schema_change".into()],
+            affinity_object_ids: vec!["component:migrations".into()],
+            outcome_definition: "verification pass rate".into(),
+            confidence_bps: 10_000,
+            sample_size: 1,
+            uncertainty: "one supporting verified outcome".into(),
+            producer_identity: "kioku:test".into(),
+            derivation_method: "verified_binary_outcomes/v1".into(),
+            classification: EvidenceClassification::Internal,
+            retention_until_ms: Some(i64::MAX),
+            state: MemoryLifecycleState::Candidate,
+            created_at_ms: 100,
+            reviewed_at_ms: None,
+            expires_at_ms: Some(i64::MAX - 1),
+            last_confirmed_at_ms: Some(100),
+            supersedes: None,
+        };
+        db.insert_kioku_memory(
+            &memory,
+            &[KiokuEvidenceLink {
+                memory_id: memory.id.clone(),
+                memory_version: 1,
+                operation_id: "operation-1".into(),
+                verification_event_id: "verify-1".into(),
+                evidence_reference: "evidence:operation-1".into(),
+                evidence_digest: "digest-1".into(),
+                stance: MemoryEvidenceStance::Supporting,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                observed_at_ms: 90,
+            }],
+        )
+        .unwrap();
+        db.review_kioku_candidate(
+            "memory-migrations",
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "representative evidence".into(),
+                reviewed_at_ms: 110,
+            },
+        )
+        .unwrap();
+
+        let pipeline = Pipeline::new(vec![Box::new(KiokuEnrichStep)]);
+        let mut request = make_req();
+        request.namespace = "payments".into();
+        request.task_type = "schema_change".into();
+        request.spec = "change component:{migrations}".into();
+        request.external_egress = false;
+        request.memory_actor = "agent:planner".into();
+        request.memory_token_budget = 32;
+        let result = pipeline.run_with_context_expansion(&mut request, &db, true);
+        assert!(result.prepared_spec.contains("Governed memory"));
+        assert_eq!(result.memory_references.len(), 1);
+        assert_eq!(result.memory_references[0].memory_id, "memory-migrations");
+        assert_eq!(result.egress_records[0].included_fields, vec!["claim"]);
+        assert_eq!(
+            db.list_kioku_lifecycle_events("memory-migrations", 1)
+                .unwrap()
+                .last()
+                .unwrap()
+                .action,
+            "injected"
+        );
+
+        let mut external = request;
+        external.spec = "change component:{migrations}".into();
+        external.external_egress = true;
+        let result = pipeline.run_with_context_expansion(&mut external, &db, true);
+        assert!(result.memory_references.is_empty());
+        assert!(!result.prepared_spec.contains("Governed memory"));
     }
 
     fn configure_evidence(db: &SekaiDb) {
@@ -1588,9 +1900,10 @@ mod tests {
         let p = default_pipeline();
         let mut req = make_req();
         let result = p.run(&mut req, &db);
-        assert_eq!(result.steps.len(), 8);
+        assert_eq!(result.steps.len(), 9);
         assert_eq!(result.steps[0].step, "object_context_enrich");
-        assert_eq!(result.steps[7].step, "sampling");
+        assert_eq!(result.steps[1].step, "kioku_enrich");
+        assert_eq!(result.steps[8].step, "sampling");
     }
 
     #[test]
@@ -1648,8 +1961,8 @@ mod tests {
         let mut req = make_req();
         req.namespace = "component:service".into();
         let result = p.run_with_context_expansion(&mut req, &db, true);
-        assert_eq!(result.steps[1].step, "learnings_enrich");
-        assert_eq!(result.steps[1].action, "enrich");
+        assert_eq!(result.steps[2].step, "learnings_enrich");
+        assert_eq!(result.steps[2].action, "enrich");
         assert!(result.prepared_spec.contains("Known pitfalls"));
         assert!(result.expanded_context_items > 0);
     }
@@ -1742,6 +2055,9 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_actor: String::new(),
+            memory_token_budget: 0,
+            memory_references: vec![],
             allowed_evidence_types: HashSet::new(),
         };
         let result = p.run(&mut req, &db);
