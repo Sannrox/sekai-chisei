@@ -1125,7 +1125,8 @@ mod tests {
             observed_at_ms: 90,
         };
 
-        db.insert_kioku_memory(&memory, &[link.clone()]).unwrap();
+        db.insert_kioku_memory(&memory, std::slice::from_ref(&link))
+            .unwrap();
 
         assert_eq!(db.get_kioku_memory("memory-1", 1).unwrap(), Some(memory));
         assert_eq!(db.list_kioku_evidence("memory-1", 1).unwrap(), vec![link]);
