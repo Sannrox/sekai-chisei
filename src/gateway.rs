@@ -6800,7 +6800,8 @@ async fn response_from_upstream(
                         }
                     }
                     Err(err) => {
-                        stream_error = Some(err.to_string());
+                        stream_error =
+                            Some(safe_upstream_error_reason(context.provider, "stream", &err));
                         if !client_gone {
                             let _ = tx.send(Err(err)).await;
                         }
