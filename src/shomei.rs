@@ -335,6 +335,27 @@ pub struct VerificationReport {
     pub policy: PolicyVerification,
 }
 
+pub fn in_toto_verification_statement(
+    bundle: &AttestationBundle,
+    report: &VerificationReport,
+) -> Value {
+    serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{
+            "name": bundle.receipt.operation_id,
+            "digest": { "sha256": bundle.receipt_digest },
+        }],
+        "predicateType": "https://sekai.local/shomei/verification/v1",
+        "predicate": {
+            "bundleVersion": bundle.bundle_version,
+            "receiptSchemaVersion": bundle.receipt_schema_version,
+            "verificationPolicyVersion": bundle.verification_policy_version,
+            "signer": bundle.signature.as_ref().map(|signature| &signature.signer),
+            "report": report,
+        },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyVerification {
     pub state: KeyState,
@@ -1459,5 +1480,19 @@ mod tests {
         let report = verify_bundle(&altered, &trusted_keys());
         assert!(!report.integrity.valid);
         assert!(!report.policy.policy_attestations[0].valid);
+    }
+
+    #[test]
+    fn in_toto_report_preserves_subject_and_separate_verdicts() {
+        let bundle = signed_bundle();
+        let report = verify_bundle(&bundle, &trusted_keys());
+        let statement = in_toto_verification_statement(&bundle, &report);
+        assert_eq!(statement["_type"], "https://in-toto.io/Statement/v1");
+        assert_eq!(statement["subject"][0]["name"], "op-1");
+        assert_eq!(statement["predicate"]["report"]["integrity"]["valid"], true);
+        assert_eq!(
+            statement["predicate"]["report"]["policy"]["compliant"],
+            true
+        );
     }
 }
