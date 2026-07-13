@@ -1429,8 +1429,10 @@ async fn proxy_gateway(
         let model_metadata_path = matches!(path, "/v1/models" | "/models")
             || path.starts_with("/v1/models/")
             || path.starts_with("/models/");
-        let model_metadata_request =
-            matches!(method, Method::GET | Method::HEAD) && model_metadata_path && body.is_empty();
+        let model_metadata_request = matches!(method, Method::GET | Method::HEAD)
+            && model_metadata_path
+            && uri.query().is_none()
+            && body.is_empty();
         if failure_posture.data_class == "sensitive"
             && !model_metadata_request
             && resolved.data_class.as_deref() != Some("sensitive")
@@ -9981,6 +9983,17 @@ mod tests {
             .get(format!("{gateway_base}/v1/models?client_version=0.141.0"))
             .bearer_auth("sk-chisei-codex-app")
             .header("x-chisei-data-class", "sensitive")
+            .header("x-chisei-action-risk", "low")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = reqwest::Client::new()
+            .get(format!("{gateway_base}/v1/models?client_version=0.141.0"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
             .header("x-chisei-action-risk", "low")
             .send()
             .await
