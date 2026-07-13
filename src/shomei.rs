@@ -1,6 +1,9 @@
 //! Portable, independently verifiable operation attestations.
 
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent};
+use crate::sekai::attestation::{
+    PolicyAttestation, attestation_content_hash, policy_version, replay_decision,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -10,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-pub const BUNDLE_VERSION: &str = "shomei.bundle/v2";
+pub const BUNDLE_VERSION: &str = "shomei.bundle/v3";
 pub const CANONICALIZATION_VERSION: &str = "shomei.canonical-json/v1";
 pub const VERIFICATION_POLICY_VERSION: &str = "shomei.verify/v1";
 pub const DIGEST_ALGORITHM: &str = "sha-256";
@@ -72,6 +75,60 @@ pub struct BundledArtifact {
     pub content_base64: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyState {
+    Active,
+    Rotated,
+    Revoked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyMetadata {
+    pub state: KeyState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_key_id: Option<String>,
+}
+
+impl KeyMetadata {
+    pub fn active() -> Self {
+        Self {
+            state: KeyState::Active,
+            valid_from_ms: None,
+            valid_until_ms: None,
+            revoked_at_ms: None,
+            successor_key_id: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let (Some(from), Some(until)) = (self.valid_from_ms, self.valid_until_ms)
+            && from > until
+        {
+            return Err("key validity window starts after it ends".into());
+        }
+        if self.state == KeyState::Rotated
+            && self
+                .successor_key_id
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("rotated key metadata requires a successor key id".into());
+        }
+        if self.state == KeyState::Revoked && self.revoked_at_ms.is_none() {
+            return Err("revoked key metadata requires revoked_at_ms".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationBundle {
     pub bundle_version: String,
@@ -87,6 +144,8 @@ pub struct AttestationBundle {
     pub coverage: Vec<CoverageDeclaration>,
     #[serde(default)]
     pub artifacts: Vec<BundledArtifact>,
+    #[serde(default)]
+    pub policy_attestations: Vec<PolicyAttestation>,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +167,7 @@ impl AttestationBundle {
             event_chain,
             coverage: coverage_from_receipt(&receipt),
             artifacts: Vec::new(),
+            policy_attestations: Vec::new(),
             receipt,
             extensions: BTreeMap::new(),
             signature: None,
@@ -200,6 +260,41 @@ impl AttestationBundle {
         });
         Ok(())
     }
+
+    pub fn attach_policy_attestation(
+        &mut self,
+        attestation: PolicyAttestation,
+    ) -> Result<(), String> {
+        if self.signature.is_some() {
+            return Err("cannot attach a policy attestation after signing".into());
+        }
+        if self
+            .policy_attestations
+            .iter()
+            .any(|item| item.id == attestation.id)
+        {
+            return Err(format!(
+                "policy attestation {} is already attached",
+                attestation.id
+            ));
+        }
+        if !receipt_links_policy_attestation(&self.receipt, &attestation) {
+            return Err(format!(
+                "policy attestation {} is not linked by the receipt",
+                attestation.id
+            ));
+        }
+        for declaration in self
+            .coverage
+            .iter_mut()
+            .filter(|entry| entry.kind == "policy_attestation" && entry.reference == attestation.id)
+        {
+            declaration.disposition = CoverageDisposition::Embedded;
+            declaration.reason = None;
+        }
+        self.policy_attestations.push(attestation);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +321,9 @@ pub struct PolicyVerification {
     pub missing_artifacts: Vec<String>,
     #[serde(default)]
     pub coverage: Vec<CoverageDeclaration>,
+    pub key: KeyVerification,
+    #[serde(default)]
+    pub policy_attestations: Vec<PolicyAttestationVerification>,
     #[serde(default)]
     pub errors: Vec<String>,
 }
@@ -236,9 +334,38 @@ pub struct VerificationReport {
     pub policy: PolicyVerification,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyVerification {
+    pub state: KeyState,
+    pub acceptable_at_signing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_key_id: Option<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyAttestationVerification {
+    pub id: String,
+    pub content_hash_valid: bool,
+    pub policy_version_valid: bool,
+    pub receipt_linked: bool,
+    pub replay_valid: bool,
+    pub replayed_decision: String,
+    pub valid: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TrustedKey {
+    key: VerifyingKey,
+    metadata: KeyMetadata,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrustedKeyring {
-    keys: BTreeMap<(String, String), VerifyingKey>,
+    keys: BTreeMap<(String, String), TrustedKey>,
 }
 
 impl TrustedKeyring {
@@ -252,18 +379,29 @@ impl TrustedKeyring {
         key_id: impl Into<String>,
         key: VerifyingKey,
     ) -> Result<(), String> {
+        self.trust_with_metadata(identity, key_id, key, KeyMetadata::active())
+    }
+
+    pub fn trust_with_metadata(
+        &mut self,
+        identity: impl Into<String>,
+        key_id: impl Into<String>,
+        key: VerifyingKey,
+        metadata: KeyMetadata,
+    ) -> Result<(), String> {
         let identity = required("trusted signer identity", identity.into())?;
         let key_id = required("trusted signer key id", key_id.into())?;
+        metadata.validate()?;
         match self.keys.entry((identity, key_id)) {
             Entry::Vacant(entry) => {
-                entry.insert(key);
+                entry.insert(TrustedKey { key, metadata });
                 Ok(())
             }
             Entry::Occupied(_) => Err("trusted signer key already exists".into()),
         }
     }
 
-    fn get(&self, identity: &str, key_id: &str) -> Option<&VerifyingKey> {
+    fn get(&self, identity: &str, key_id: &str) -> Option<&TrustedKey> {
         self.keys.get(&(identity.to_string(), key_id.to_string()))
     }
 }
@@ -339,7 +477,8 @@ pub fn verify_bundle(
         }
     };
     let (artifacts_valid, missing_artifacts) = verify_artifacts(bundle, &mut errors);
-    let (signer_trusted, signature_valid) = verify_signature(bundle, trusted_keys, &mut errors);
+    let (signer_trusted, signature_valid, key_verification) =
+        verify_signature(bundle, trusted_keys, &mut errors);
     let valid = versions_supported
         && receipt_digest_valid
         && event_chain_valid
@@ -363,6 +502,22 @@ pub fn verify_bundle(
                 CoverageDisposition::Unavailable | CoverageDisposition::Uncovered
             )
         });
+    let mut seen_attestations = std::collections::BTreeSet::new();
+    let policy_attestations = bundle
+        .policy_attestations
+        .iter()
+        .map(|attestation| {
+            let mut verification = verify_policy_attestation(&bundle.receipt, attestation);
+            if !seen_attestations.insert(attestation.id.as_str()) {
+                verification.valid = false;
+                verification
+                    .errors
+                    .push("duplicate policy attestation id".into());
+            }
+            verification
+        })
+        .collect::<Vec<_>>();
+    let policy_attestations_valid = policy_attestations.iter().all(|item| item.valid);
     VerificationReport {
         integrity: IntegrityVerification {
             valid,
@@ -377,6 +532,8 @@ pub fn verify_bundle(
         policy: PolicyVerification {
             compliant: receipt_complete
                 && coverage_complete
+                && key_verification.acceptable_at_signing
+                && policy_attestations_valid
                 && missing_surfaces.is_empty()
                 && policy_errors.is_empty(),
             receipt_complete,
@@ -384,6 +541,8 @@ pub fn verify_bundle(
             missing_surfaces,
             missing_artifacts,
             coverage: bundle.coverage.clone(),
+            key: key_verification,
+            policy_attestations,
             errors: policy_errors,
         },
     }
@@ -484,6 +643,17 @@ fn verify_artifacts(bundle: &AttestationBundle, errors: &mut Vec<String>) -> (bo
     for declaration in &bundle.coverage {
         match declaration.disposition {
             CoverageDisposition::Embedded => {
+                if declaration.kind == "policy_attestation" {
+                    if !bundle.policy_attestations.iter().any(|attestation| {
+                        attestation.id == declaration.reference
+                            && Some(&attestation.content_hash)
+                                == declaration.expected_digest.as_ref()
+                    }) {
+                        missing.push(declaration.reference.clone());
+                        valid = false;
+                    }
+                    continue;
+                }
                 let Some(artifact) = artifacts.get(declaration.reference.as_str()) else {
                     missing.push(declaration.reference.clone());
                     valid = false;
@@ -547,30 +717,36 @@ fn verify_signature(
     bundle: &AttestationBundle,
     trusted_keys: &TrustedKeyring,
     errors: &mut Vec<String>,
-) -> (bool, bool) {
+) -> (bool, bool, KeyVerification) {
+    let unknown_key = || KeyVerification {
+        state: KeyState::Unknown,
+        acceptable_at_signing: false,
+        successor_key_id: None,
+        errors: vec!["key state is unknown".into()],
+    };
     let Some(signature) = &bundle.signature else {
         errors.push("bundle is unsigned".into());
-        return (false, false);
+        return (false, false, unknown_key());
     };
     if signature.signer.algorithm != SIGNATURE_ALGORITHM {
         errors.push(format!(
             "unsupported signer algorithm {}",
             signature.signer.algorithm
         ));
-        return (false, false);
+        return (false, false, unknown_key());
     }
     let public_key = match decode_hex::<32>("signer public key", &signature.signer.public_key) {
         Ok(value) => value,
         Err(error) => {
             errors.push(error);
-            return (false, false);
+            return (false, false, unknown_key());
         }
     };
     let verifying_key = match VerifyingKey::from_bytes(&public_key) {
         Ok(value) => value,
         Err(error) => {
             errors.push(format!("invalid signer public key: {error}"));
-            return (false, false);
+            return (false, false, unknown_key());
         }
     };
     let Some(trusted_key) = trusted_keys.get(&signature.signer.identity, &signature.signer.key_id)
@@ -579,24 +755,26 @@ fn verify_signature(
             "signer {} key {} is not trusted",
             signature.signer.identity, signature.signer.key_id
         ));
-        return (false, false);
+        return (false, false, unknown_key());
     };
-    if trusted_key != &verifying_key {
+    let key_verification =
+        verify_key_metadata(&trusted_key.metadata, signature.signer.signed_at_ms);
+    if trusted_key.key != verifying_key {
         errors.push("embedded signer public key does not match trusted key".into());
-        return (false, false);
+        return (false, false, key_verification);
     }
     let signature_bytes = match decode_hex::<64>("bundle signature", &signature.value) {
         Ok(value) => value,
         Err(error) => {
             errors.push(error);
-            return (true, false);
+            return (true, false, key_verification);
         }
     };
     let signing_bytes = match bundle.signing_bytes() {
         Ok(value) => value,
         Err(error) => {
             errors.push(format!("signed bytes could not be reproduced: {error}"));
-            return (true, false);
+            return (true, false, key_verification);
         }
     };
     if verifying_key
@@ -604,9 +782,91 @@ fn verify_signature(
         .is_err()
     {
         errors.push("bundle signature verification failed".into());
-        return (true, false);
+        return (true, false, key_verification);
     }
-    (true, true)
+    (true, true, key_verification)
+}
+
+fn verify_key_metadata(metadata: &KeyMetadata, signed_at_ms: i64) -> KeyVerification {
+    let mut errors = Vec::new();
+    if metadata.state == KeyState::Unknown {
+        errors.push("key state is unknown".into());
+    }
+    if metadata
+        .valid_from_ms
+        .is_some_and(|valid_from| signed_at_ms < valid_from)
+    {
+        errors.push("bundle was signed before the key validity window".into());
+    }
+    if metadata
+        .valid_until_ms
+        .is_some_and(|valid_until| signed_at_ms > valid_until)
+    {
+        errors.push("bundle was signed after the key validity window".into());
+    }
+    if metadata
+        .revoked_at_ms
+        .is_some_and(|revoked_at| signed_at_ms >= revoked_at)
+    {
+        errors.push("bundle was signed after the key was revoked".into());
+    }
+    KeyVerification {
+        state: metadata.state,
+        acceptable_at_signing: errors.is_empty(),
+        successor_key_id: metadata.successor_key_id.clone(),
+        errors,
+    }
+}
+
+fn receipt_links_policy_attestation(
+    receipt: &OperationReceipt,
+    attestation: &PolicyAttestation,
+) -> bool {
+    receipt.events.iter().any(|event| {
+        event.references.iter().any(|reference| {
+            reference.kind == "policy_attestation"
+                && reference.reference == attestation.id
+                && reference.content_hash.as_deref() == Some(attestation.content_hash.as_str())
+        }) || (event.attributes.get("attestation_id") == Some(&attestation.id)
+            && event.attributes.get("attestation_hash") == Some(&attestation.content_hash))
+    })
+}
+
+fn verify_policy_attestation(
+    receipt: &OperationReceipt,
+    attestation: &PolicyAttestation,
+) -> PolicyAttestationVerification {
+    let mut errors = Vec::new();
+    let content_hash_valid = attestation_content_hash(attestation) == attestation.content_hash;
+    if !content_hash_valid {
+        errors.push("policy attestation content hash mismatch".into());
+    }
+    let policy_version_valid =
+        policy_version(&attestation.policy_snapshot) == attestation.policy_version;
+    if !policy_version_valid {
+        errors.push("policy attestation version hash mismatch".into());
+    }
+    let receipt_linked = receipt_links_policy_attestation(receipt, attestation);
+    if !receipt_linked {
+        errors.push("policy attestation is not linked by the receipt".into());
+    }
+    let (replay_valid, replayed_decision) = replay_decision(attestation);
+    if !replay_valid {
+        errors.push(format!(
+            "policy replay produced {replayed_decision}, expected {}",
+            attestation.decision
+        ));
+    }
+    PolicyAttestationVerification {
+        id: attestation.id.clone(),
+        content_hash_valid,
+        policy_version_valid,
+        receipt_linked,
+        replay_valid,
+        replayed_decision,
+        valid: errors.is_empty(),
+        errors,
+    }
 }
 
 /// Canonical bytes for a complete Shomei bundle.
@@ -977,5 +1237,97 @@ mod tests {
         assert!(bundle.coverage.iter().any(|entry| {
             entry.disposition == CoverageDisposition::Uncovered && entry.reference == "action"
         }));
+    }
+
+    #[test]
+    fn key_lifecycle_is_evaluated_at_signing_time() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut revoked = TrustedKeyring::new();
+        revoked
+            .trust_with_metadata(
+                "node:test",
+                "key-1",
+                key.verifying_key(),
+                KeyMetadata {
+                    state: KeyState::Revoked,
+                    valid_from_ms: Some(0),
+                    valid_until_ms: None,
+                    revoked_at_ms: Some(20),
+                    successor_key_id: Some("key-2".into()),
+                },
+            )
+            .unwrap();
+        let before_revocation = verify_bundle(&signed_bundle(), &revoked);
+        assert!(before_revocation.policy.key.acceptable_at_signing);
+
+        let mut signed_after = AttestationBundle::unsigned(receipt()).unwrap();
+        signed_after.sign(&key, "node:test", "key-1", 20).unwrap();
+        let after_revocation = verify_bundle(&signed_after, &revoked);
+        assert!(!after_revocation.policy.key.acceptable_at_signing);
+        assert!(!after_revocation.policy.compliant);
+
+        let mut unknown = TrustedKeyring::new();
+        unknown
+            .trust_with_metadata(
+                "node:test",
+                "key-1",
+                key.verifying_key(),
+                KeyMetadata {
+                    state: KeyState::Unknown,
+                    valid_from_ms: None,
+                    valid_until_ms: None,
+                    revoked_at_ms: None,
+                    successor_key_id: None,
+                },
+            )
+            .unwrap();
+        let report = verify_bundle(&signed_bundle(), &unknown);
+        assert_eq!(report.policy.key.state, KeyState::Unknown);
+        assert!(!report.policy.key.acceptable_at_signing);
+    }
+
+    #[test]
+    fn linked_policy_attestation_replays_offline() {
+        use crate::sekai::action::RiskClass;
+        use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
+        use crate::sekai::attestation::{ActionAttestationInput, build_action_attestation};
+
+        let policy = ActionPolicy::allow_all("default");
+        let attestation = build_action_attestation(ActionAttestationInput {
+            decision_id: "decision-1",
+            policy: &policy,
+            action: "read_object",
+            actor: "agent:test",
+            risk: RiskClass::Read,
+            namespace: "default",
+            decision: ActionDecision::Allow,
+            created: 5,
+        });
+        let mut source = receipt();
+        source.events[1]
+            .references
+            .push(crate::chisei::receipt::GovernedReference {
+                kind: "policy_attestation".into(),
+                reference: attestation.id.clone(),
+                content_hash: Some(attestation.content_hash.clone()),
+                disclosed_fields: vec![],
+                omitted: false,
+                omission_reason: None,
+            });
+        let mut bundle = AttestationBundle::unsigned(source).unwrap();
+        bundle.attach_policy_attestation(attestation).unwrap();
+        bundle
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        let report = verify_bundle(&bundle, &trusted_keys());
+        assert!(report.integrity.valid, "{:?}", report.integrity.errors);
+        assert!(report.policy.compliant, "{:?}", report.policy);
+        assert!(report.policy.policy_attestations[0].replay_valid);
+
+        let mut altered = bundle;
+        altered.policy_attestations[0].decision = "deny".into();
+        let report = verify_bundle(&altered, &trusted_keys());
+        assert!(!report.integrity.valid);
+        assert!(!report.policy.policy_attestations[0].valid);
     }
 }

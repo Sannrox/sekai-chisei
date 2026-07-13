@@ -13,6 +13,7 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,7 +23,7 @@ pub const ACTION_POLICY_KIND: &str = "action_policy";
 pub const EVIDENCE_ATTESTATION_ID: &str = "attestation_id";
 pub const EVIDENCE_ATTESTATION_HASH: &str = "attestation_hash";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyAttestation {
     pub id: String,
     /// The hash-chained audit decision this attestation authorizes.
@@ -291,7 +292,7 @@ impl SekaiDb {
 }
 
 /// Re-derive the decision from the pinned snapshot and recorded inputs.
-fn replay_decision(attestation: &PolicyAttestation) -> (bool, String) {
+pub fn replay_decision(attestation: &PolicyAttestation) -> (bool, String) {
     let Ok(properties) =
         serde_json::from_str::<HashMap<String, String>>(&attestation.policy_snapshot)
     else {
