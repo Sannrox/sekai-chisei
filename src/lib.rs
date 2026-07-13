@@ -1,4 +1,5 @@
 pub mod action_cli;
+pub mod attest_cli;
 pub mod chisei;
 pub mod config;
 pub mod cost_estimate;
