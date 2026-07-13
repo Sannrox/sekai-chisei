@@ -1,6 +1,6 @@
 //! Portable, independently verifiable operation attestations.
 
-use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent};
+use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -116,6 +116,7 @@ pub struct IntegrityVerification {
     pub versions_supported: bool,
     pub receipt_digest_valid: bool,
     pub event_chain_valid: bool,
+    pub signer_trusted: bool,
     pub signature_valid: bool,
     #[serde(default)]
     pub errors: Vec<String>,
@@ -137,7 +138,39 @@ pub struct VerificationReport {
     pub policy: PolicyVerification,
 }
 
-pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
+#[derive(Debug, Clone, Default)]
+pub struct TrustedKeyring {
+    keys: BTreeMap<(String, String), VerifyingKey>,
+}
+
+impl TrustedKeyring {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn trust(
+        &mut self,
+        identity: impl Into<String>,
+        key_id: impl Into<String>,
+        key: VerifyingKey,
+    ) -> Result<(), String> {
+        let identity = required("trusted signer identity", identity.into())?;
+        let key_id = required("trusted signer key id", key_id.into())?;
+        if self.keys.insert((identity, key_id), key).is_some() {
+            return Err("trusted signer key already exists".into());
+        }
+        Ok(())
+    }
+
+    fn get(&self, identity: &str, key_id: &str) -> Option<&VerifyingKey> {
+        self.keys.get(&(identity.to_string(), key_id.to_string()))
+    }
+}
+
+pub fn verify_bundle(
+    bundle: &AttestationBundle,
+    trusted_keys: &TrustedKeyring,
+) -> VerificationReport {
     let mut errors = Vec::new();
     let versions_supported = [
         ("bundle", bundle.bundle_version.as_str(), BUNDLE_VERSION),
@@ -160,6 +193,11 @@ pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
             "signature algorithm",
             bundle.signature_algorithm.as_str(),
             SIGNATURE_ALGORITHM,
+        ),
+        (
+            "receipt schema",
+            bundle.receipt_schema_version.as_str(),
+            OPERATION_RECEIPT_VERSION,
         ),
     ]
     .into_iter()
@@ -199,10 +237,11 @@ pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
             false
         }
     };
-    let signature_valid = verify_signature(bundle, &mut errors);
+    let (signer_trusted, signature_valid) = verify_signature(bundle, trusted_keys, &mut errors);
     let valid = versions_supported
         && receipt_digest_valid
         && event_chain_valid
+        && signer_trusted
         && signature_valid
         && errors.is_empty();
 
@@ -220,6 +259,7 @@ pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
             versions_supported,
             receipt_digest_valid,
             event_chain_valid,
+            signer_trusted,
             signature_valid,
             errors,
         },
@@ -232,44 +272,60 @@ pub fn verify_bundle(bundle: &AttestationBundle) -> VerificationReport {
     }
 }
 
-fn verify_signature(bundle: &AttestationBundle, errors: &mut Vec<String>) -> bool {
+fn verify_signature(
+    bundle: &AttestationBundle,
+    trusted_keys: &TrustedKeyring,
+    errors: &mut Vec<String>,
+) -> (bool, bool) {
     let Some(signature) = &bundle.signature else {
         errors.push("bundle is unsigned".into());
-        return false;
+        return (false, false);
     };
     if signature.signer.algorithm != SIGNATURE_ALGORITHM {
         errors.push(format!(
             "unsupported signer algorithm {}",
             signature.signer.algorithm
         ));
-        return false;
+        return (false, false);
     }
     let public_key = match decode_hex::<32>("signer public key", &signature.signer.public_key) {
         Ok(value) => value,
         Err(error) => {
             errors.push(error);
-            return false;
+            return (false, false);
         }
     };
     let verifying_key = match VerifyingKey::from_bytes(&public_key) {
         Ok(value) => value,
         Err(error) => {
             errors.push(format!("invalid signer public key: {error}"));
-            return false;
+            return (false, false);
         }
     };
+    let Some(trusted_key) = trusted_keys.get(&signature.signer.identity, &signature.signer.key_id)
+    else {
+        errors.push(format!(
+            "signer {} key {} is not trusted",
+            signature.signer.identity, signature.signer.key_id
+        ));
+        return (false, false);
+    };
+    if trusted_key != &verifying_key {
+        errors.push("embedded signer public key does not match trusted key".into());
+        return (false, false);
+    }
     let signature_bytes = match decode_hex::<64>("bundle signature", &signature.value) {
         Ok(value) => value,
         Err(error) => {
             errors.push(error);
-            return false;
+            return (true, false);
         }
     };
     let signing_bytes = match bundle.signing_bytes() {
         Ok(value) => value,
         Err(error) => {
             errors.push(format!("signed bytes could not be reproduced: {error}"));
-            return false;
+            return (true, false);
         }
     };
     if verifying_key
@@ -277,9 +333,9 @@ fn verify_signature(bundle: &AttestationBundle, errors: &mut Vec<String>) -> boo
         .is_err()
     {
         errors.push("bundle signature verification failed".into());
-        return false;
+        return (true, false);
     }
-    true
+    (true, true)
 }
 
 /// Canonical bytes for a complete Shomei bundle.
@@ -393,6 +449,17 @@ mod tests {
         bundle
     }
 
+    fn trusted_keys() -> TrustedKeyring {
+        let mut keys = TrustedKeyring::new();
+        keys.trust(
+            "node:test",
+            "key-1",
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        )
+        .unwrap();
+        keys
+    }
+
     fn receipt() -> OperationReceipt {
         let mut events = Vec::new();
         for (id, parent, kind) in [
@@ -481,7 +548,7 @@ mod tests {
 
     #[test]
     fn complete_native_receipt_signs_and_verifies_offline() {
-        let report = verify_bundle(&signed_bundle());
+        let report = verify_bundle(&signed_bundle(), &trusted_keys());
         assert!(report.integrity.valid, "{:?}", report.integrity.errors);
         assert!(report.policy.compliant, "{:?}", report.policy.errors);
     }
@@ -510,7 +577,7 @@ mod tests {
         variants.push(reordered);
 
         for variant in variants {
-            assert!(!verify_bundle(&variant).integrity.valid);
+            assert!(!verify_bundle(&variant, &trusted_keys()).integrity.valid);
         }
     }
 
@@ -518,6 +585,31 @@ mod tests {
     fn signer_identity_is_covered_by_the_signature() {
         let mut bundle = signed_bundle();
         bundle.signature.as_mut().unwrap().signer.key_id = "key-2".into();
-        assert!(!verify_bundle(&bundle).integrity.signature_valid);
+        assert!(
+            !verify_bundle(&bundle, &trusted_keys())
+                .integrity
+                .signature_valid
+        );
+    }
+
+    #[test]
+    fn embedded_key_is_not_a_trust_anchor() {
+        let report = verify_bundle(&signed_bundle(), &TrustedKeyring::new());
+        assert!(!report.integrity.signer_trusted);
+        assert!(!report.integrity.valid);
+    }
+
+    #[test]
+    fn unsupported_receipt_schema_fails_integrity() {
+        let mut bundle = AttestationBundle::unsigned(receipt()).unwrap();
+        bundle.receipt.version = "operation.receipt/v2".into();
+        bundle.receipt_schema_version = bundle.receipt.version.clone();
+        bundle.receipt_digest = receipt_digest(&bundle.receipt).unwrap();
+        bundle
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
+        let report = verify_bundle(&bundle, &trusted_keys());
+        assert!(!report.integrity.versions_supported);
+        assert!(!report.integrity.valid);
     }
 }
