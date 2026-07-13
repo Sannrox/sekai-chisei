@@ -54,6 +54,7 @@ impl SekaiDb {
                 timestamp INTEGER NOT NULL,
                 packages_json TEXT NOT NULL DEFAULT '[]',
                 context_json TEXT NOT NULL DEFAULT '{}',
+                retention_tombstone INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (request_id, component_id)
             );
             CREATE INDEX IF NOT EXISTS idx_task_observations_component_time
@@ -70,13 +71,17 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
-        if let Err(error) = conn.execute(
-            "ALTER TABLE sekai_task_observations
-             ADD COLUMN data_class TEXT NOT NULL DEFAULT 'unclassified'",
-            [],
-        ) && !error.to_string().contains("duplicate column name")
-        {
-            return Err(error.to_string());
+        for column in [
+            "data_class TEXT NOT NULL DEFAULT 'unclassified'",
+            "retention_tombstone INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(error) = conn.execute(
+                &format!("ALTER TABLE sekai_task_observations ADD COLUMN {column}"),
+                [],
+            ) && !error.to_string().contains("duplicate column name")
+            {
+                return Err(error.to_string());
+            }
         }
         let legacy = {
             let mut stmt = conn

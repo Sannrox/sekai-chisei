@@ -80,7 +80,7 @@ fn redact_retained_task_observation(tx: &Transaction<'_>, rowid: i64) -> Result<
         "UPDATE sekai_task_observations
          SET request_id='retention-tombstone:' || rowid,
              namespace='',data_class='unclassified',model='[redacted]',
-             packages_json='[]',context_json=?1
+             packages_json='[]',context_json=?1,retention_tombstone=1
          WHERE rowid=?2",
         params![RETENTION_TOMBSTONE_CONTEXT, rowid],
     )
@@ -975,15 +975,37 @@ impl SekaiDb {
                         serde_json::from_str::<Vec<(String, String, String)>>(&filters_json)
                             .unwrap_or_default();
                     let filter_matches = filters.iter().any(|(column, op, value)| {
+                        let column = column.rsplit('.').next().unwrap_or(column);
+                        let object_reference_column = matches!(
+                            column,
+                            "object"
+                                | "object_id"
+                                | "owner"
+                                | "owner_id"
+                                | "principal"
+                                | "principal_id"
+                                | "subject"
+                                | "subject_id"
+                                | "target"
+                                | "target_id"
+                                | "agent"
+                                | "agent_id"
+                                | "user"
+                                | "user_id"
+                                | "work_unit"
+                                | "work_unit_id"
+                        );
                         let candidate_matches = |candidate: &str| {
                             keyed_value_matches_subject(
                                 column,
                                 candidate,
                                 &request.subject_kind,
                                 &request.subject,
-                            ) || subject_object_ids.iter().any(|object_id| {
-                                candidate == object_id || contains_identifier(candidate, object_id)
-                            })
+                            ) || object_reference_column
+                                && subject_object_ids.iter().any(|object_id| {
+                                    candidate == object_id
+                                        || contains_identifier(candidate, object_id)
+                                })
                         };
                         if op == "in" {
                             value
@@ -2556,7 +2578,8 @@ impl SekaiDb {
         let observation_rows = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT rowid,request_id,namespace,data_class,component_id,model,status,timestamp,packages_json,context_json
+                    "SELECT rowid,request_id,namespace,data_class,component_id,model,status,timestamp,
+                            packages_json,context_json,retention_tombstone
                      FROM sekai_task_observations ORDER BY component_id,timestamp,rowid",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2572,6 +2595,7 @@ impl SekaiDb {
                     row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, bool>(10)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -2593,9 +2617,10 @@ impl SekaiDb {
             timestamp,
             packages,
             context,
+            retention_tombstone,
         ) in observation_rows
         {
-            if context == RETENTION_TOMBSTONE_CONTEXT {
+            if retention_tombstone {
                 retained_components.insert(component_id);
                 continue;
             }
@@ -2884,7 +2909,7 @@ impl SekaiDb {
             let mut stmt = tx
                 .prepare(
                     "SELECT rowid, namespace, data_class, component_id, status, timestamp,
-                            context_json
+                            retention_tombstone
                      FROM sekai_task_observations
                      ORDER BY component_id, timestamp, rowid",
                 )
@@ -2897,7 +2922,7 @@ impl SekaiDb {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, bool>(6)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -2907,10 +2932,17 @@ impl SekaiDb {
         let mut expired = std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
         let mut redacted_observation_ids = Vec::new();
         let mut retained_components = std::collections::BTreeSet::new();
-        for (rowid, namespace, data_class, component_id, status, timestamp_seconds, context) in
-            observation_rows
+        for (
+            rowid,
+            namespace,
+            data_class,
+            component_id,
+            status,
+            timestamp_seconds,
+            retention_tombstone,
+        ) in observation_rows
         {
-            if context == RETENTION_TOMBSTONE_CONTEXT {
+            if retention_tombstone {
                 retained_components.insert(component_id);
                 continue;
             }
@@ -3445,6 +3477,36 @@ mod tests {
     }
 
     #[test]
+    fn caller_context_cannot_forge_a_retention_tombstone() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_task_observations
+                 (request_id,namespace,data_class,component_id,model,status,timestamp,context_json)
+                 VALUES ('forged','ns','sensitive','component','private','done',1,?1)",
+                params![RETENTION_TOMBSTONE_CONTEXT],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: TASK_OBSERVATIONS_DATASET.into(),
+            namespace: String::new(),
+            data_class: "sensitive".into(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+        let run = db.run_retention(2 * DAY_MS).unwrap();
+
+        assert_eq!(run.task_observations_deleted, 1);
+        assert!(
+            db.list_task_observations_for_component("component")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn audit_retention_records_a_verifiable_anchor() {
         let db = SekaiDb::new(":memory:").unwrap();
         db.record_decision(&Decision {
@@ -3501,7 +3563,6 @@ mod tests {
                 [],
             )
             .unwrap();
-
         let error = db.run_retention(2 * DAY_MS).unwrap_err();
 
         assert!(error.contains("audit ledger verification failed"));
@@ -4016,6 +4077,16 @@ mod tests {
                 params![filters],
             )
             .unwrap();
+        let unrelated_filters =
+            serde_json::to_string(&vec![("status", "eq", "agent-object")]).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_virtual_tables
+                 (id,name,dataset_id,filters,columns,created)
+                 VALUES ('unrelated','unrelated','llm_calls',?1,'[]',1)",
+                params![unrelated_filters],
+            )
+            .unwrap();
 
         let result = db
             .erase_subject(&SubjectErasureRequest {
@@ -4037,7 +4108,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(budget_events, 0);
-        assert!(db.list_virtual_tables().unwrap().is_empty());
+        let remaining = db.list_virtual_tables().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "unrelated");
     }
 
     #[test]
