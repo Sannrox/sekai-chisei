@@ -105,7 +105,13 @@ fn role_for(kind: &str) -> String {
 fn is_lineage_relation(rel: &str) -> bool {
     matches!(
         rel,
-        "contains" | "produces" | "targets" | "executed" | "depends_on"
+        "contains"
+            | "produces"
+            | "targets"
+            | "executed"
+            | "depends_on"
+            | "evidence_for"
+            | "derived_from"
     )
 }
 
