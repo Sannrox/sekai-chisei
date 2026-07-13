@@ -114,6 +114,7 @@ impl SekaiDb {
         self.migrate_datasets()?;
         self.migrate_functions()?;
         self.migrate_chisei()?;
+        self.migrate_kioku()?;
         self.migrate_action_types()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
