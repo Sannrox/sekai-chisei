@@ -24,6 +24,7 @@ pub struct PipelineRequest {
     pub template_only: bool,
     pub expanded_context_items: usize,
     pub evidence_references: Vec<EvidenceContextReference>,
+    pub allowed_evidence_types: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +209,12 @@ fn collect_external_evidence_context(
     let mut lines = Vec::new();
     for item in evidence {
         let submission = item.submission;
+        if !req
+            .allowed_evidence_types
+            .contains(&submission.evidence_type)
+        {
+            continue;
+        }
         if !evidence_classification_allowed(submission.classification, req.external_egress) {
             continue;
         }
@@ -253,6 +260,20 @@ fn collect_external_evidence_context(
         });
     }
     lines
+}
+
+pub fn applicable_evidence_types(
+    req: &PipelineRequest,
+    db: &SekaiDb,
+) -> Result<Vec<String>, String> {
+    let target_object_ids = resolve_context_objects(req, db)
+        .into_iter()
+        .map(|object| object.id)
+        .collect::<Vec<_>>();
+    db.list_usable_evidence_types_for_targets(
+        &target_object_ids,
+        chrono::Utc::now().timestamp_millis(),
+    )
 }
 
 fn object_implements(db: &SekaiDb, obj: &Object, interface_name: &str) -> bool {
@@ -708,8 +729,19 @@ impl Pipeline {
         db: &SekaiDb,
         context_expansion_allowed: bool,
     ) -> RunResult {
+        self.run_with_context_admission(req, db, context_expansion_allowed, HashSet::new())
+    }
+
+    pub fn run_with_context_admission(
+        &self,
+        req: &mut PipelineRequest,
+        db: &SekaiDb,
+        context_expansion_allowed: bool,
+        allowed_evidence_types: HashSet<String>,
+    ) -> RunResult {
         req.expanded_context_items = 0;
         req.evidence_references.clear();
+        req.allowed_evidence_types = allowed_evidence_types;
         let decisions: Vec<StepDecision> = self
             .steps
             .iter()
@@ -1336,6 +1368,7 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            allowed_evidence_types: HashSet::new(),
         }
     }
 
@@ -1466,7 +1499,12 @@ mod tests {
 
         let mut external = make_req();
         external.namespace = "service:payments".into();
-        let external_result = pipeline.run_with_context_expansion(&mut external, &db, true);
+        let external_result = pipeline.run_with_context_admission(
+            &mut external,
+            &db,
+            true,
+            HashSet::from(["verification.result".into()]),
+        );
         assert!(
             external_result
                 .prepared_spec
@@ -1497,7 +1535,12 @@ mod tests {
         let mut local = make_req();
         local.namespace = "service:payments".into();
         local.external_egress = false;
-        let local_result = pipeline.run_with_context_expansion(&mut local, &db, true);
+        let local_result = pipeline.run_with_context_admission(
+            &mut local,
+            &db,
+            true,
+            HashSet::from(["verification.result".into()]),
+        );
         assert_eq!(local_result.evidence_references.len(), 2);
         assert!(
             local_result
@@ -1668,6 +1711,7 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            allowed_evidence_types: HashSet::new(),
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");

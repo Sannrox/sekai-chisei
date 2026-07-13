@@ -339,6 +339,18 @@ related verdicts. Its stable profile is
 `chisei.context_expansion` audit action. Explicit object fields remain
 available when that profile has no passing candidate evidence.
 
+External evidence is admitted one `evidence_type` at a time after the namespace
+profile passes. The class profile is
+`context-expansion:pipeline-v1:<namespace>:evidence:<evidence_type>`. Its
+baseline run must use config ref
+`evidence-context:pipeline-v1:without:<evidence_type>` and its candidate must use
+`evidence-context:pipeline-v1:with:<evidence_type>`. Both runs need at least
+three matching cases; missing, mismatched, or regressed comparisons deny that
+class. `GetEvidenceContextGate` returns the expected profile/config refs and the
+current verdict. Each decision is recorded under
+`chisei.evidence_context_admission` with the compared run IDs and number of
+evidence records actually used.
+
 ### One-command launch
 
 ```bash
