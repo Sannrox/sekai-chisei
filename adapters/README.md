@@ -36,7 +36,9 @@ Common environment variables:
 - `EVIDENCE_CLASSIFICATION` (defaults to `internal`)
 
 The GitHub adapter uses evidence type `source_control.check_run` and schema
-`adapter.github.check_run@1.0.0`:
+`adapter.github.check_run@1.0.0`. Because GitHub timestamps do not provide a
+strict event sequence, distinct same-second payloads are retained as separate,
+attributable observations instead of being forced into a false version order:
 
 ```sh
 cargo run --example evidence_github_check_webhook < check_run.json
