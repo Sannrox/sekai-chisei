@@ -3,6 +3,7 @@
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
 use crate::sekai::evidence::EvidenceClassification;
+use crate::sekai::security::Role;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -761,6 +762,7 @@ impl SekaiDb {
         if request.max_results == 0 {
             return Ok(Vec::new());
         }
+        self.authorize_kioku_retrieval(request)?;
 
         let conn = self.conn();
         let mut statement = conn
@@ -814,10 +816,13 @@ impl SekaiDb {
             } else {
                 affinity_hits as f64 / memory.affinity_object_ids.len() as f64
             };
-            let freshness = memory
-                .last_confirmed_at_ms
-                .unwrap_or(memory.created_at_ms)
-                .max(0) as u64;
+            const FRESHNESS_WINDOW_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+            let confirmed_at = memory.last_confirmed_at_ms.unwrap_or(memory.created_at_ms);
+            let age_ms = request.now_ms.saturating_sub(confirmed_at).max(0) as u64;
+            let freshness = FRESHNESS_WINDOW_MS
+                .saturating_sub(age_ms.min(FRESHNESS_WINDOW_MS))
+                .saturating_mul(999_999)
+                / FRESHNESS_WINDOW_MS;
             let rank_score = (affinity_hits as u64 * 10_000_000_000)
                 .saturating_add(u64::from(memory.confidence_bps) * 1_000_000)
                 .saturating_add(freshness.min(999_999));
@@ -852,6 +857,47 @@ impl SekaiDb {
             })?;
         }
         Ok(retrieved)
+    }
+
+    fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String> {
+        let actor = request.actor.trim();
+        if matches!(actor, "root" | "local") {
+            return Ok(());
+        }
+        let namespace = request.namespace.trim();
+        let namespace_object = self
+            .find_by_external_id(&format!("namespace:{namespace}"))?
+            .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
+        let grants = self.list_grants(&namespace_object.id)?;
+        let authorized_ceiling = if grants.is_empty() {
+            EvidenceClassification::Public
+        } else {
+            let role = grants
+                .iter()
+                .find(|grant| grant.principal == actor)
+                .map(|grant| &grant.role)
+                .ok_or_else(|| "actor is not authorized for memory namespace".to_string())?;
+            match role {
+                Role::Viewer => EvidenceClassification::Internal,
+                Role::Editor => EvidenceClassification::Confidential,
+                Role::Admin => EvidenceClassification::Restricted,
+            }
+        };
+        if request.classification_ceiling > authorized_ceiling {
+            return Err("requested memory classification exceeds actor grant".into());
+        }
+        for object_id in &request.context_object_ids {
+            if self.get_object(object_id)?.is_none() {
+                return Err(format!("context object {object_id} not found"));
+            }
+            let grants = self.list_grants(object_id)?;
+            if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+                return Err(format!(
+                    "actor is not authorized for context object {object_id}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
@@ -922,7 +968,9 @@ mod tests {
     use crate::chisei::receipt::{
         GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceiptEvent, ReceiptEventKind,
     };
-    use std::collections::BTreeMap;
+    use crate::domain::Object;
+    use crate::sekai::security::Grant;
+    use std::collections::{BTreeMap, HashMap};
 
     fn candidate() -> KiokuMemory {
         KiokuMemory {
@@ -1310,6 +1358,65 @@ mod tests {
     #[test]
     fn retrieves_active_memories_by_scope_affinity_and_classification() {
         let db = SekaiDb::new(":memory:").unwrap();
+        for object in [
+            Object {
+                id: "namespace-payments".into(),
+                kind: "namespace".into(),
+                name: "payments".into(),
+                namespace: "payments".into(),
+                external_id: "namespace:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            Object {
+                id: "namespace-other".into(),
+                kind: "namespace".into(),
+                name: "other".into(),
+                namespace: "other".into(),
+                external_id: "namespace:other".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            Object {
+                id: "component:migrations".into(),
+                kind: "component".into(),
+                name: "migrations".into(),
+                namespace: "payments".into(),
+                external_id: "component:migrations".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+        ] {
+            db.create_object(&object).unwrap();
+        }
+        for grant in [
+            Grant {
+                id: "grant-payments".into(),
+                object_id: "namespace-payments".into(),
+                principal: "agent:planner".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+            Grant {
+                id: "grant-other".into(),
+                object_id: "namespace-other".into(),
+                principal: "agent:other".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+            Grant {
+                id: "grant-component".into(),
+                object_id: "component:migrations".into(),
+                principal: "agent:planner".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+        ] {
+            db.create_grant(&grant).unwrap();
+        }
         active_memory(
             &db,
             "generic",
@@ -1354,8 +1461,15 @@ mod tests {
         unauthorized.namespace = "other".into();
         assert!(
             db.retrieve_kioku_memories(&unauthorized)
-                .unwrap()
-                .is_empty()
+                .unwrap_err()
+                .contains("not authorized")
+        );
+        unauthorized.namespace = "payments".into();
+        unauthorized.classification_ceiling = EvidenceClassification::Restricted;
+        assert!(
+            db.retrieve_kioku_memories(&unauthorized)
+                .unwrap_err()
+                .contains("exceeds actor grant")
         );
     }
 }
