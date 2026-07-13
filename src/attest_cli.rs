@@ -2,7 +2,10 @@ use crate::chisei::receipt::OperationReceipt;
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::shomei::{AttestationBundle, TrustedKeyring, canonical_bundle_bytes, verify_bundle};
+use crate::sekai::attestation::PolicyAttestation;
+use crate::shomei::{
+    AttestationBundle, KeyMetadata, KeyState, TrustedKeyring, canonical_bundle_bytes, verify_bundle,
+};
 use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::{Path, PathBuf};
@@ -10,7 +13,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id>] [--integrity-only]"
+    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +24,7 @@ struct ExportConfig {
     identity: String,
     key_id: String,
     artifacts: Vec<(String, PathBuf)>,
+    policy_attestations: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +34,7 @@ struct VerifyConfig {
     identity: String,
     key_id: String,
     integrity_only: bool,
+    key_metadata: KeyMetadata,
 }
 
 pub async fn run_attest_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -57,6 +62,10 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     for (reference, path) in &config.artifacts {
         bundle.attach_artifact(reference, None, &std::fs::read(path)?)?;
     }
+    for path in &config.policy_attestations {
+        let attestation: PolicyAttestation = serde_json::from_slice(&std::fs::read(path)?)?;
+        bundle.attach_policy_attestation(attestation)?;
+    }
     bundle.sign(
         &signing_key,
         &config.identity,
@@ -71,14 +80,20 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
 fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     let bundle: AttestationBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
     let mut trusted_keys = TrustedKeyring::new();
-    trusted_keys.trust(
+    trusted_keys.trust_with_metadata(
         config.identity,
         config.key_id,
         load_verifying_key(&config.trusted_key)?,
+        config.key_metadata,
     )?;
     let report = verify_bundle(&bundle, &trusted_keys);
     println!("integrity: {}", report.integrity.valid);
     println!("policy_compliant: {}", report.policy.compliant);
+    println!("key_state: {:?}", report.policy.key.state);
+    println!(
+        "key_acceptable_at_signing: {}",
+        report.policy.key.acceptable_at_signing
+    );
     if let Some(signature) = &bundle.signature {
         println!("signer: {}", signature.signer.identity);
         println!("key_id: {}", signature.signer.key_id);
@@ -88,6 +103,18 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     }
     for error in &report.policy.errors {
         println!("policy_error: {error}");
+    }
+    for error in &report.policy.key.errors {
+        println!("key_error: {error}");
+    }
+    for attestation in &report.policy.policy_attestations {
+        println!(
+            "policy_attestation: {} valid={} replay={}",
+            attestation.id, attestation.valid, attestation.replayed_decision
+        );
+        for error in &attestation.errors {
+            println!("policy_attestation_error: {} {error}", attestation.id);
+        }
     }
     if !report.policy.missing_surfaces.is_empty() {
         println!(
@@ -156,6 +183,10 @@ fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
             Ok((reference.to_string(), PathBuf::from(path)))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let policy_attestations = flags(args, "--policy-attestation")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
     Ok(ExportConfig {
         operation_id,
         output,
@@ -163,6 +194,7 @@ fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
         identity,
         key_id,
         artifacts,
+        policy_attestations,
     })
 }
 
@@ -180,12 +212,34 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
     let key_id = flag(args, "--key-id")
         .or_else(|| std::env::var("SHOMEI_TRUSTED_KEY_ID").ok())
         .ok_or_else(|| "--key-id or SHOMEI_TRUSTED_KEY_ID is required".to_string())?;
+    let key_state = flag(args, "--key-state")
+        .or_else(|| std::env::var("SHOMEI_TRUSTED_KEY_STATE").ok())
+        .ok_or_else(|| "--key-state or SHOMEI_TRUSTED_KEY_STATE is required".to_string())?;
+    let parse_optional_time = |flag_name: &str, env_name: &str| -> Result<Option<i64>, String> {
+        flag(args, flag_name)
+            .or_else(|| std::env::var(env_name).ok())
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| format!("{flag_name} must be an integer timestamp"))
+            })
+            .transpose()
+    };
+    let key_metadata = KeyMetadata {
+        state: parse_key_state(&key_state)?,
+        valid_from_ms: parse_optional_time("--valid-from-ms", "SHOMEI_KEY_VALID_FROM_MS")?,
+        valid_until_ms: parse_optional_time("--valid-until-ms", "SHOMEI_KEY_VALID_UNTIL_MS")?,
+        revoked_at_ms: parse_optional_time("--revoked-at-ms", "SHOMEI_KEY_REVOKED_AT_MS")?,
+        successor_key_id: flag(args, "--successor-key-id")
+            .or_else(|| std::env::var("SHOMEI_SUCCESSOR_KEY_ID").ok()),
+    };
     Ok(VerifyConfig {
         bundle,
         trusted_key,
         identity,
         key_id,
         integrity_only: args.iter().any(|arg| arg == "--integrity-only"),
+        key_metadata,
     })
 }
 
@@ -221,6 +275,16 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
         .filter(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
         .collect()
+}
+
+fn parse_key_state(value: &str) -> Result<KeyState, String> {
+    match value.trim() {
+        "active" => Ok(KeyState::Active),
+        "rotated" => Ok(KeyState::Rotated),
+        "revoked" => Ok(KeyState::Revoked),
+        "unknown" => Ok(KeyState::Unknown),
+        _ => Err("--key-state must be active, rotated, revoked, or unknown".into()),
+    }
 }
 
 fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
@@ -368,10 +432,21 @@ mod tests {
             "node:test".into(),
             "--key-id".into(),
             "key-1".into(),
+            "--key-state".into(),
+            "active".into(),
             "bundle.json".into(),
         ])
         .unwrap();
         assert_eq!(config.bundle, PathBuf::from("bundle.json"));
         assert!(config.integrity_only);
+    }
+
+    #[test]
+    fn key_state_parser_supports_lifecycle_states() {
+        assert_eq!(parse_key_state("active").unwrap(), KeyState::Active);
+        assert_eq!(parse_key_state("rotated").unwrap(), KeyState::Rotated);
+        assert_eq!(parse_key_state("revoked").unwrap(), KeyState::Revoked);
+        assert_eq!(parse_key_state("unknown").unwrap(), KeyState::Unknown);
+        assert!(parse_key_state("compromised").is_err());
     }
 }
