@@ -1393,6 +1393,7 @@ mod tests {
                 max_payload_bytes: 1_024,
                 max_relationships: 4,
                 rate_limit_per_minute: 20,
+                max_retained_submissions: 100_000,
                 revoked: false,
             },
             1,
