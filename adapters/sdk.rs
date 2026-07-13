@@ -1,3 +1,4 @@
+use prost::Message;
 use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -8,6 +9,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub const EVIDENCE_CONTRACT_VERSION: &str = "sekai.evidence/v1";
 
@@ -66,7 +70,7 @@ pub struct EvidenceDraft {
 }
 
 impl EvidenceDraft {
-    pub fn into_envelope(
+    fn into_envelope(
         self,
         config: &AdapterConfig,
         collected_at_ms: i64,
@@ -177,6 +181,87 @@ impl EvidenceDraft {
             causality: self.causality,
         })
     }
+}
+
+#[derive(Debug)]
+pub struct OutboxReceipt {
+    path: PathBuf,
+}
+
+impl OutboxReceipt {
+    pub fn acknowledge(self) -> Result<(), String> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to acknowledge adapter outbox entry: {error}"
+            )),
+        }
+    }
+}
+
+pub fn prepare_delivery(
+    config: &AdapterConfig,
+    draft: EvidenceDraft,
+    collected_at_ms: i64,
+) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
+    let outbox = env::var("EVIDENCE_OUTBOX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/evidence-adapter-outbox"));
+    prepare_delivery_in(&outbox, config, draft, collected_at_ms)
+}
+
+pub fn prepare_delivery_in(
+    outbox: &Path,
+    config: &AdapterConfig,
+    draft: EvidenceDraft,
+    collected_at_ms: i64,
+) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
+    fs::create_dir_all(outbox)
+        .map_err(|error| format!("failed to create adapter outbox: {error}"))?;
+    let stable_identity = draft.clone().into_envelope(config, 0)?.idempotency_key;
+    let path = outbox.join(format!("{stable_identity}.bin"));
+    if path.exists() {
+        return load_delivery(path);
+    }
+
+    let envelope = draft.into_envelope(config, collected_at_ms)?;
+    let temporary = outbox.join(format!(".{stable_identity}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("failed to create adapter outbox entry: {error}"))?;
+    if let Err(error) = file
+        .write_all(&envelope.encode_to_vec())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("failed to persist adapter outbox entry: {error}"));
+    }
+    match fs::hard_link(&temporary, &path) {
+        Ok(()) => {
+            fs::remove_file(&temporary)
+                .map_err(|error| format!("failed to finalize adapter outbox entry: {error}"))?;
+            Ok((envelope, OutboxReceipt { path }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            load_delivery(path)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!("failed to publish adapter outbox entry: {error}"))
+        }
+    }
+}
+
+fn load_delivery(path: PathBuf) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read adapter outbox entry: {error}"))?;
+    let envelope = EvidenceEnvelope::decode(bytes.as_slice())
+        .map_err(|error| format!("adapter outbox entry is corrupt: {error}"))?;
+    Ok((envelope, OutboxReceipt { path }))
 }
 
 pub async fn submit(
