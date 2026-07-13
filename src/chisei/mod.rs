@@ -7,6 +7,7 @@ pub mod eval;
 pub mod evolve;
 pub mod federation;
 pub mod gate;
+pub mod kioku;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;
