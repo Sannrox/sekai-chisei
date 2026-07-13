@@ -2,6 +2,7 @@ use crate::sdk::EvidenceDraft;
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub const EVIDENCE_TYPE: &str = "source_control.check_run";
@@ -56,9 +57,17 @@ pub fn translate(payload: CheckRunWebhook) -> Result<EvidenceDraft, String> {
         "completed_at": payload.check_run.completed_at,
         "details_url": payload.check_run.html_url,
     });
+    let content_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&content).map_err(|error| error.to_string())?)
+    );
+    let check_run_id = payload.check_run.id.to_string();
     Ok(EvidenceDraft {
         source_type: "github_check_run".into(),
-        source_record_id: payload.check_run.id.to_string(),
+        // GitHub check_run timestamps are not a strict event sequence. Treat each
+        // distinct payload as an immutable observation instead of claiming that
+        // same-second updates are ordered versions of one record.
+        source_record_id: format!("{check_run_id}:{content_fingerprint}"),
         source_version: payload.check_run.updated_at,
         source_sequence: updated_at_ms,
         evidence_type: EVIDENCE_TYPE.into(),
@@ -77,6 +86,7 @@ pub fn translate(payload: CheckRunWebhook) -> Result<EvidenceDraft, String> {
         provenance: HashMap::from([
             ("adapter".into(), "github_check_webhook/v1".into()),
             ("delivery".into(), "webhook".into()),
+            ("check_run_id".into(), check_run_id),
         ]),
         causality: None,
     })
