@@ -78,6 +78,21 @@ impl AttestationBundle {
     }
 }
 
+/// Canonical bytes for a complete Shomei bundle.
+pub fn canonical_bundle_bytes(bundle: &AttestationBundle) -> Result<Vec<u8>, String> {
+    canonical_json(bundle)
+}
+
+/// Stable digest for the supported operation-receipt schema.
+pub fn receipt_digest(receipt: &OperationReceipt) -> Result<String, String> {
+    digest_serializable(receipt)
+}
+
+/// Ordered causal digest chain for the supported receipt-event schema.
+pub fn receipt_event_chain(events: &[OperationReceiptEvent]) -> Result<Vec<EventDigest>, String> {
+    event_digest_chain(events)
+}
+
 /// Canonical JSON used by Shomei v1. Object keys are sorted lexicographically,
 /// arrays retain their declared order, and strings use serde_json escaping.
 /// Shomei v1 bundle schemas contain integer numeric fields only; extensions
@@ -187,6 +202,18 @@ mod tests {
     fn canonical_encoding_and_digests_are_stable() {
         let first = AttestationBundle::unsigned(receipt()).unwrap();
         let second = AttestationBundle::unsigned(receipt()).unwrap();
+        assert_eq!(
+            receipt_digest(&first.receipt).unwrap(),
+            first.receipt_digest
+        );
+        assert_eq!(
+            receipt_event_chain(&first.receipt.events).unwrap(),
+            first.event_chain
+        );
+        assert_eq!(
+            canonical_bundle_bytes(&first).unwrap(),
+            canonical_json(&first).unwrap()
+        );
         assert_eq!(first.receipt_digest, second.receipt_digest);
         assert_eq!(first.event_chain, second.event_chain);
         assert_eq!(
