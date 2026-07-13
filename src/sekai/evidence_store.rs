@@ -161,6 +161,32 @@ impl SekaiDb {
             );
             CREATE INDEX IF NOT EXISTS idx_evidence_lifecycle_submission
                 ON sekai_evidence_lifecycle_history(submission_id, id);
+            CREATE TABLE IF NOT EXISTS sekai_evidence_projections (
+                submission_id TEXT PRIMARY KEY,
+                evidence_object_id TEXT NOT NULL,
+                target_object_id TEXT NOT NULL,
+                projection_version TEXT NOT NULL,
+                source_sequence INTEGER NOT NULL,
+                projected_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_evidence_observations (
+                submission_id TEXT PRIMARY KEY,
+                evidence_object_id TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                confidence_bps INTEGER NOT NULL,
+                observed_at_ms INTEGER NOT NULL,
+                projection_version TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_evidence_relationship_projections (
+                submission_id TEXT NOT NULL,
+                related_submission_id TEXT NOT NULL,
+                source_relation TEXT NOT NULL,
+                PRIMARY KEY (submission_id, related_submission_id, source_relation)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_evidence_operation_links (
+                submission_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL
+            );
             INSERT OR IGNORE INTO sekai_evidence_source_identity
                 (source_type, source_instance, source_record_id, source_sequence, source_version,
                  content_digest, submission_id)
@@ -389,6 +415,7 @@ impl SekaiDb {
             .as_ref()
             .map_or_else(EvidenceLimits::default, |capability| EvidenceLimits {
                 max_content_bytes: capability.max_payload_bytes,
+                max_envelope_bytes: capability.max_payload_bytes,
                 max_relationships: capability.max_relationships,
                 max_subject_references: capability.max_relationships,
             });
@@ -801,7 +828,7 @@ fn insert_received(
     transition(tx, id, EvidenceLifecycleState::Received, None, now_ms)
 }
 
-fn transition(
+pub(crate) fn transition(
     tx: &Transaction<'_>,
     submission_id: &str,
     state: EvidenceLifecycleState,
@@ -872,7 +899,7 @@ fn reject_existing(
     })
 }
 
-fn get_submission_tx(
+pub(crate) fn get_submission_tx(
     tx: &Transaction<'_>,
     submission_id: &str,
 ) -> Result<Option<EvidenceSubmissionRecord>, String> {
