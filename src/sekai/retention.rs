@@ -976,25 +976,27 @@ impl SekaiDb {
                             .unwrap_or_default();
                     let filter_matches = filters.iter().any(|(column, op, value)| {
                         let column = column.rsplit('.').next().unwrap_or(column);
-                        let object_reference_column = matches!(
-                            column,
-                            "object"
-                                | "object_id"
-                                | "owner"
-                                | "owner_id"
-                                | "principal"
-                                | "principal_id"
-                                | "subject"
-                                | "subject_id"
-                                | "target"
-                                | "target_id"
-                                | "agent"
-                                | "agent_id"
-                                | "user"
-                                | "user_id"
-                                | "work_unit"
-                                | "work_unit_id"
-                        );
+                        let object_reference_column = column.ends_with("_object_id")
+                            || column.ends_with("_principal_id")
+                            || matches!(
+                                column,
+                                "object"
+                                    | "object_id"
+                                    | "owner"
+                                    | "owner_id"
+                                    | "principal"
+                                    | "principal_id"
+                                    | "subject"
+                                    | "subject_id"
+                                    | "target"
+                                    | "target_id"
+                                    | "agent"
+                                    | "agent_id"
+                                    | "user"
+                                    | "user_id"
+                                    | "work_unit"
+                                    | "work_unit_id"
+                            );
                         let candidate_matches = |candidate: &str| {
                             keyed_value_matches_subject(
                                 column,
@@ -4058,8 +4060,12 @@ mod tests {
                 [],
             )
             .unwrap();
-        let object_filters =
-            serde_json::to_string(&vec![("owner_id", "in", "keep-object,agent-object")]).unwrap();
+        let object_filters = serde_json::to_string(&vec![(
+            "target_object_id",
+            "in",
+            "keep-object,agent-object",
+        )])
+        .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO sekai_virtual_tables
