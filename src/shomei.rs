@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 pub const BUNDLE_VERSION: &str = "shomei.bundle/v1";
 pub const CANONICALIZATION_VERSION: &str = "shomei.canonical-json/v1";
@@ -156,10 +157,13 @@ impl TrustedKeyring {
     ) -> Result<(), String> {
         let identity = required("trusted signer identity", identity.into())?;
         let key_id = required("trusted signer key id", key_id.into())?;
-        if self.keys.insert((identity, key_id), key).is_some() {
-            return Err("trusted signer key already exists".into());
+        match self.keys.entry((identity, key_id)) {
+            Entry::Vacant(entry) => {
+                entry.insert(key);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err("trusted signer key already exists".into()),
         }
-        Ok(())
     }
 
     fn get(&self, identity: &str, key_id: &str) -> Option<&VerifyingKey> {
@@ -611,5 +615,19 @@ mod tests {
         let report = verify_bundle(&bundle, &trusted_keys());
         assert!(!report.integrity.versions_supported);
         assert!(!report.integrity.valid);
+    }
+
+    #[test]
+    fn duplicate_trust_entry_preserves_original_key() {
+        let mut keys = trusted_keys();
+        assert!(
+            keys.trust(
+                "node:test",
+                "key-1",
+                SigningKey::from_bytes(&[8; 32]).verifying_key(),
+            )
+            .is_err()
+        );
+        assert!(verify_bundle(&signed_bundle(), &keys).integrity.valid);
     }
 }
