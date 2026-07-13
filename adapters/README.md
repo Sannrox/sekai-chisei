@@ -11,8 +11,12 @@ the Sekai core:
   evidence.
 
 Both use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
-the content digest and replay key, and call `SubmitEvidence`. They never write
-Sekai graph state directly and never inject Chisei context.
+the content digest and replay key, persist the exact delivery in a durable local
+outbox, and call `SubmitEvidence`. Unknown-outcome retries reload the same
+envelope and idempotency key; a returned Sekai result acknowledges the outbox
+entry. `EVIDENCE_OUTBOX_DIR` can override the default
+`data/evidence-adapter-outbox`. The adapters never write Sekai graph state
+directly and never inject Chisei context.
 
 Before running an adapter, an administrator must register its producer
 capability and immutable schema version through the evidence control-plane API.
