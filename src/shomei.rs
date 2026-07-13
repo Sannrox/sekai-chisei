@@ -79,19 +79,24 @@ impl AttestationBundle {
 }
 
 /// Canonical JSON used by Shomei v1. Object keys are sorted lexicographically,
-/// arrays retain their declared order, strings use serde_json escaping, and v1
-/// rejects floating-point numbers to avoid cross-runtime number ambiguity.
-pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+/// arrays retain their declared order, and strings use serde_json escaping.
+/// Shomei v1 bundle schemas contain integer numeric fields only; extensions
+/// use `serde_json::Value`, which cannot represent non-finite numbers. Keeping
+/// this boundary private prevents callers from hashing arbitrary Rust floats
+/// that `serde_json` would normalize before the validation pass.
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
     reject_floats(&value)?;
     serde_json::to_vec(&sort_json(value)).map_err(|error| error.to_string())
 }
 
-pub fn digest_serializable<T: Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn digest_serializable<T: Serialize>(value: &T) -> Result<String, String> {
     Ok(encode_hex(&Sha256::digest(canonical_json(value)?)))
 }
 
-pub fn event_digest_chain(events: &[OperationReceiptEvent]) -> Result<Vec<EventDigest>, String> {
+pub(crate) fn event_digest_chain(
+    events: &[OperationReceiptEvent],
+) -> Result<Vec<EventDigest>, String> {
     let mut previous: Option<String> = None;
     let mut chain = Vec::with_capacity(events.len());
     for event in events {
@@ -207,5 +212,10 @@ mod tests {
             String::from_utf8(canonical_json(&value).unwrap()).unwrap(),
             r#"{"a":{"b":3,"y":2},"z":1}"#
         );
+    }
+
+    #[test]
+    fn finite_float_values_are_rejected() {
+        assert!(canonical_json(&serde_json::json!({"score": 1.5})).is_err());
     }
 }
