@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub const DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS: u64 = 100_000;
 const MAX_RETAINED_REJECTED_EVIDENCE_SUBMISSIONS: i64 = 10_000;
 const MAX_EVIDENCE_LIFECYCLE_EVENTS: i64 = 128;
+const MAX_IDEMPOTENCY_ALIASES_PER_SUBMISSION: i64 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceProducerCapability {
@@ -535,6 +536,22 @@ impl SekaiDb {
                     now_ms,
                     "source_identity_collision",
                     "source record version was already observed with different content",
+                );
+            }
+            let alias_count = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_evidence_idempotency WHERE submission_id=?1",
+                    [&existing_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if alias_count >= MAX_IDEMPOTENCY_ALIASES_PER_SUBMISSION {
+                return reject_existing(
+                    tx,
+                    &submission_id,
+                    now_ms,
+                    "idempotency_alias_capacity_exceeded",
+                    "source submission has exhausted its delivery alias quota",
                 );
             }
             tx.execute(
@@ -1555,6 +1572,44 @@ mod tests {
             .unwrap();
         assert!(replay.deduplicated);
         assert_eq!(replay.submission.id, first.submission.id);
+    }
+
+    #[test]
+    fn bounds_delivery_aliases_for_source_replays() {
+        let db = configured_db();
+        let original = db
+            .submit_evidence(&envelope(), "producer:checks", 1_100)
+            .unwrap();
+        for index in 1..MAX_IDEMPOTENCY_ALIASES_PER_SUBMISSION {
+            let mut replay = envelope();
+            replay.idempotency_key = format!("delivery-alias-{index}");
+            let admission = db
+                .submit_evidence(&replay, "producer:checks", 1_100 + index)
+                .unwrap();
+            assert!(admission.deduplicated);
+            assert_eq!(admission.submission.id, original.submission.id);
+        }
+
+        let mut excess = envelope();
+        excess.idempotency_key = "delivery-alias-excess".into();
+        let admission = db
+            .submit_evidence(&excess, "producer:checks", 1_200)
+            .unwrap();
+        assert!(!admission.accepted);
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("idempotency_alias_capacity_exceeded")
+        );
+        let conn = db.conn();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sekai_evidence_idempotency WHERE submission_id=?1",
+                [&original.submission.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            MAX_IDEMPOTENCY_ALIASES_PER_SUBMISSION
+        );
     }
 
     #[test]

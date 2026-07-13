@@ -49,8 +49,9 @@ itself authorize broader context expansion.
 Accepted evidence remains available until an explicit lifecycle transition or
 an operator archival policy removes it. Producer registrations impose a durable
 retained-submission quota in addition to payload, relationship, and rate limits.
-Rejected submissions and per-submission lifecycle histories are bounded so an
-untrusted or noisy source cannot grow local state without limit.
+Rejected submissions, delivery-key aliases, and per-submission lifecycle
+histories are bounded so an untrusted or noisy source cannot grow local state
+without limit.
 
 ## Quickstart
 
