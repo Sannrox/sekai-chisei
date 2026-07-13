@@ -14,6 +14,7 @@ pub const KIND_MODEL: &str = "model";
 pub const KIND_COMPONENT: &str = "component";
 pub const KIND_LEARNING: &str = "learning";
 pub const KIND_CAPABILITY: &str = "capability";
+pub const KIND_EXTERNAL_EVIDENCE: &str = "external_evidence";
 
 pub const DEFAULT_LIST_LIMIT: i32 = 100;
 pub const MAX_LIST_LIMIT: i32 = 1000;
@@ -38,6 +39,8 @@ pub const REL_EXECUTED: &str = "executed";
 pub const REL_USED_FOR: &str = "used_for";
 pub const REL_RELATION_SOURCE: &str = "relation_source";
 pub const REL_RELATION_TARGET: &str = "relation_target";
+pub const REL_EVIDENCE_FOR: &str = "evidence_for";
+pub const REL_DERIVED_FROM: &str = "derived_from";
 
 pub fn valid_relation(r: &str) -> bool {
     matches!(
@@ -54,6 +57,8 @@ pub fn valid_relation(r: &str) -> bool {
             | REL_USED_FOR
             | REL_RELATION_SOURCE
             | REL_RELATION_TARGET
+            | REL_EVIDENCE_FOR
+            | REL_DERIVED_FROM
     )
 }
 
