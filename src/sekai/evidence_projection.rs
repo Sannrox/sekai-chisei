@@ -784,7 +784,12 @@ mod tests {
             EvidenceLifecycleState::Available
         );
         let usable = db
-            .list_usable_evidence_for_targets(&[projection.target_object_id.unwrap()], 450, 8)
+            .list_usable_evidence_for_targets(
+                &[projection.target_object_id.unwrap()],
+                &["verification.result".into()],
+                450,
+                8,
+            )
             .unwrap();
         assert_eq!(usable.len(), 1);
         assert_eq!(usable[0].submission.id, second);

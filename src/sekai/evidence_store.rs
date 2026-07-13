@@ -708,18 +708,25 @@ impl SekaiDb {
     pub fn list_usable_evidence_for_targets(
         &self,
         target_object_ids: &[String],
+        allowed_evidence_types: &[String],
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<UsableEvidenceContext>, String> {
-        if target_object_ids.is_empty() || limit == 0 {
+        if target_object_ids.is_empty() || allowed_evidence_types.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let placeholders = (1..=target_object_ids.len())
+        let target_placeholders = (1..=target_object_ids.len())
             .map(|index| format!("?{index}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let now_parameter = target_object_ids.len() + 1;
-        let limit_parameter = target_object_ids.len() + 2;
+        let evidence_type_start = target_object_ids.len() + 1;
+        let evidence_type_placeholders = (evidence_type_start
+            ..evidence_type_start + allowed_evidence_types.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let now_parameter = target_object_ids.len() + allowed_evidence_types.len() + 1;
+        let limit_parameter = now_parameter + 1;
         let sql = format!(
             "SELECT s.id, s.producer_identity, s.source_type, s.source_instance,
                     s.source_record_id, s.source_version, s.source_sequence, s.namespace,
@@ -730,7 +737,8 @@ impl SekaiDb {
                     s.updated_at_ms, s.envelope_json, p.target_object_id, p.projection_version
              FROM sekai_evidence_submissions AS s
              JOIN sekai_evidence_projections AS p ON p.submission_id = s.id
-             WHERE p.target_object_id IN ({placeholders})
+             WHERE p.target_object_id IN ({target_placeholders})
+               AND s.evidence_type IN ({evidence_type_placeholders})
                AND s.lifecycle_state = 'available'
                AND s.intent = 'upsert'
                AND (s.expires_at_ms IS NULL OR s.expires_at_ms > ?{now_parameter})
@@ -742,6 +750,12 @@ impl SekaiDb {
             .cloned()
             .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>)
             .collect();
+        values.extend(
+            allowed_evidence_types
+                .iter()
+                .cloned()
+                .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>),
+        );
         values.push(Box::new(now_ms));
         values.push(Box::new(limit.min(32) as i64));
         let parameters = values
