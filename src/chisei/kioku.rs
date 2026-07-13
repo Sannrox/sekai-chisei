@@ -126,6 +126,7 @@ pub fn derive_verified_outcome_candidate(
     }
     let namespace = input.outcomes[0].receipt.namespace.trim().to_string();
     let operation_class = input.outcomes[0].receipt.operation_class.trim().to_string();
+    let outcome_metric = input.outcomes[0].outcome_metric.trim().to_string();
     let mut evidence = Vec::with_capacity(input.outcomes.len());
     let mut supporting = 0_u32;
     let mut last_confirmed_at_ms = None;
@@ -154,6 +155,9 @@ pub fn derive_verified_outcome_candidate(
         if outcome.outcome_metric.trim().is_empty() || !outcome.outcome_value.is_finite() {
             return Err("verified outcome requires a metric and finite value".into());
         }
+        if outcome.outcome_metric.trim() != outcome_metric {
+            return Err("candidate outcomes must share one outcome metric".into());
+        }
         let verification = outcome
             .receipt
             .events
@@ -177,17 +181,24 @@ pub fn derive_verified_outcome_candidate(
                     outcome.receipt.operation_id
                 )
             })?;
-        if !outcome
+        let outcome_event = outcome
             .receipt
             .events
             .iter()
-            .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
-        {
-            return Err(format!(
-                "operation {} lacks an outcome event",
-                outcome.receipt.operation_id
-            ));
-        }
+            .find(|event| {
+                event.kind == ReceiptEventKind::OutcomeRecorded
+                    && event_descends_from(
+                        &outcome.receipt,
+                        event,
+                        verification.0.event_id.as_str(),
+                    )
+            })
+            .ok_or_else(|| {
+                format!(
+                    "operation {} lacks an outcome causally linked to verification",
+                    outcome.receipt.operation_id
+                )
+            })?;
 
         let stance = if outcome.passed {
             supporting = supporting.saturating_add(1);
@@ -210,7 +221,7 @@ pub fn derive_verified_outcome_candidate(
             stance,
             outcome_metric: outcome.outcome_metric.trim().to_string(),
             outcome_value: outcome.outcome_value,
-            observed_at_ms: verification.0.timestamp_ms,
+            observed_at_ms: outcome_event.timestamp_ms,
         });
     }
     if supporting == 0 {
@@ -250,6 +261,29 @@ pub fn derive_verified_outcome_candidate(
         .validate_contract()
         .map_err(|errors| errors.join("; "))?;
     Ok((memory, evidence))
+}
+
+fn event_descends_from(
+    receipt: &OperationReceipt,
+    event: &crate::chisei::receipt::OperationReceiptEvent,
+    ancestor_id: &str,
+) -> bool {
+    let mut parent = event.parent_event_id.as_deref();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent_id) = parent {
+        if parent_id == ancestor_id {
+            return true;
+        }
+        if !visited.insert(parent_id) {
+            return false;
+        }
+        parent = receipt
+            .events
+            .iter()
+            .find(|candidate| candidate.event_id == parent_id)
+            .and_then(|candidate| candidate.parent_event_id.as_deref());
+    }
+    false
 }
 
 impl KiokuMemory {
@@ -709,5 +743,41 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("incomplete"));
+    }
+
+    #[test]
+    fn candidate_derivation_requires_comparable_metrics_and_causal_verification() {
+        let mut mixed = verified_outcome("operation-2", true);
+        mixed.outcome_metric = "latency_ms".into();
+        let input = |outcomes| CandidateDerivation {
+            id: "derived-1".into(),
+            kind: MemoryKind::Warning,
+            claim: "Verify migrations".into(),
+            outcome_definition: "verification pass rate".into(),
+            outcomes,
+            affinity_object_ids: vec![],
+            producer_identity: "kioku:deriver".into(),
+            classification: EvidenceClassification::Internal,
+            created_at_ms: 120,
+            expires_at_ms: Some(220),
+            retention_until_ms: Some(320),
+        };
+        let error = derive_verified_outcome_candidate(input(vec![
+            verified_outcome("operation-1", true),
+            mixed,
+        ]))
+        .unwrap_err();
+        assert!(error.contains("one outcome metric"));
+
+        let mut unbound = verified_outcome("operation-3", true);
+        let outcome = unbound
+            .receipt
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .unwrap();
+        outcome.parent_event_id = Some("operation-3-budget".into());
+        let error = derive_verified_outcome_candidate(input(vec![unbound])).unwrap_err();
+        assert!(error.contains("causally linked"));
     }
 }
