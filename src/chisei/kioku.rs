@@ -449,6 +449,9 @@ impl SekaiDb {
         memory
             .validate_contract()
             .map_err(|errors| errors.join("; "))?;
+        if memory.state != MemoryLifecycleState::Candidate || memory.reviewed_at_ms.is_some() {
+            return Err("new memories must be unreviewed candidates".into());
+        }
         if evidence.is_empty() {
             return Err("at least one evidence link is required".into());
         }
@@ -886,6 +889,28 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         let error = db.insert_kioku_memory(&candidate(), &[]).unwrap_err();
         assert!(error.contains("evidence link"));
+    }
+
+    #[test]
+    fn rejects_direct_active_memory_insertion() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut memory = candidate();
+        memory.state = MemoryLifecycleState::Active;
+        memory.reviewed_at_ms = Some(110);
+        let link = KiokuEvidenceLink {
+            memory_id: memory.id.clone(),
+            memory_version: memory.version,
+            operation_id: "operation-1".into(),
+            verification_event_id: "verify-1".into(),
+            evidence_reference: "evidence:1".into(),
+            evidence_digest: "abc123".into(),
+            stance: MemoryEvidenceStance::Supporting,
+            outcome_metric: "passed".into(),
+            outcome_value: 1.0,
+            observed_at_ms: 90,
+        };
+        let error = db.insert_kioku_memory(&memory, &[link]).unwrap_err();
+        assert!(error.contains("unreviewed candidates"));
     }
 
     #[test]
