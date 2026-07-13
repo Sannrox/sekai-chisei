@@ -1096,6 +1096,36 @@ async fn proxy_gateway(
         }
     }
 
+    let usage_context = UsageContext {
+        request_id,
+        provider: prepared.provider,
+        requested_model,
+        resolved_model: resolved.resolved_model,
+        work_unit_id,
+        pipeline_spec,
+        request_bytes,
+        started_ms,
+        route_bias: resolved.route_bias,
+        policy_scope: resolved.policy_scope,
+        policy_version: resolved.policy_version,
+        task_class,
+        request_hash,
+        budget_subject: budget
+            .as_ref()
+            .and_then(|budget| budget.budget_subject.clone()),
+        budget_status: budget
+            .as_ref()
+            .map(|budget| {
+                if budget.provisional_local_free {
+                    "local_free"
+                } else {
+                    "allowed"
+                }
+            })
+            .unwrap_or("not_evaluated")
+            .into(),
+        egress_applied: !state.config.no_preflight,
+    };
     match upstream.send().await {
         Ok(resp) => {
             response_from_upstream(
@@ -1103,48 +1133,31 @@ async fn proxy_gateway(
                 &state.config,
                 &state.runtime,
                 &identity,
-                UsageContext {
-                    request_id,
-                    provider: prepared.provider,
-                    requested_model,
-                    resolved_model: resolved.resolved_model,
-                    work_unit_id,
-                    pipeline_spec,
-                    request_bytes,
-                    started_ms,
-                    route_bias: resolved.route_bias,
-                    policy_scope: resolved.policy_scope,
-                    policy_version: resolved.policy_version,
-                    task_class,
-                    request_hash,
-                    budget_subject: budget
-                        .as_ref()
-                        .and_then(|budget| budget.budget_subject.clone()),
-                    budget_status: budget
-                        .as_ref()
-                        .map(|budget| {
-                            if budget.provisional_local_free {
-                                "local_free"
-                            } else {
-                                "allowed"
-                            }
-                        })
-                        .unwrap_or("not_evaluated")
-                        .into(),
-                    egress_applied: !state.config.no_preflight,
-                },
+                usage_context,
                 prepared.response_adapter,
             )
             .await
         }
-        Err(err) => json_error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            &classify_reqwest_error(
-                &format!("{} upstream request", prepared.provider.runtime_name()),
-                err,
-            ),
-        ),
+        Err(err) => {
+            let rejection = GatewayRejection {
+                status: StatusCode::BAD_GATEWAY,
+                error_type: "upstream_error".into(),
+                reason: classify_reqwest_error(
+                    &format!("{} upstream request", prepared.provider.runtime_name()),
+                    err,
+                ),
+            };
+            record_refusal_with_usage_and_append(
+                &state.config,
+                &identity,
+                &usage_context,
+                &rejection,
+                None,
+                true,
+            )
+            .await;
+            json_error(rejection.status, &rejection.error_type, &rejection.reason)
+        }
     }
 }
 
@@ -6941,14 +6954,21 @@ async fn response_from_upstream(
             .await;
             response
         }
-        Err(err) => json_error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            &classify_reqwest_error(
-                &format!("{} upstream response", context.provider.runtime_name()),
-                err,
-            ),
-        ),
+        Err(err) => {
+            let rejection = GatewayRejection {
+                status: StatusCode::BAD_GATEWAY,
+                error_type: "upstream_error".into(),
+                reason: classify_reqwest_error(
+                    &format!("{} upstream response", context.provider.runtime_name()),
+                    err,
+                ),
+            };
+            record_refusal_with_usage_and_append(
+                config, identity, &context, &rejection, None, true,
+            )
+            .await;
+            json_error(rejection.status, &rejection.error_type, &rejection.reason)
+        }
     }
 }
 
