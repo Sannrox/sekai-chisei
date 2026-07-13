@@ -22,6 +22,7 @@ pub struct EvidenceProducerCapability {
     pub allowed_intents: Vec<EvidenceIntent>,
     pub allow_operation_attachment: bool,
     pub replay_window_ms: i64,
+    #[serde(default = "default_max_clock_skew_ms")]
     pub max_clock_skew_ms: i64,
     pub max_payload_bytes: usize,
     pub max_relationships: usize,
@@ -159,7 +160,34 @@ impl SekaiDb {
                 recorded_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_evidence_lifecycle_submission
-                ON sekai_evidence_lifecycle_history(submission_id, id);",
+                ON sekai_evidence_lifecycle_history(submission_id, id);
+            INSERT OR IGNORE INTO sekai_evidence_source_identity
+                (source_type, source_instance, source_record_id, source_sequence, source_version,
+                 content_digest, submission_id)
+            SELECT source_type, source_instance, source_record_id, source_sequence, source_version,
+                   content_digest, id
+            FROM sekai_evidence_submissions
+            WHERE lifecycle_state IN ('authorized', 'projected', 'available')
+            ORDER BY received_at_ms, id;
+            INSERT INTO sekai_evidence_lifecycle_history
+                (submission_id, lifecycle_state, reason_code, recorded_at_ms)
+            SELECT submissions.id, 'quarantined', 'source_identity_conflict',
+                   submissions.updated_at_ms
+            FROM sekai_evidence_submissions AS submissions
+            WHERE submissions.lifecycle_state IN ('authorized', 'projected', 'available')
+              AND NOT EXISTS (
+                SELECT 1 FROM sekai_evidence_source_identity AS identity
+                WHERE identity.submission_id = submissions.id
+              );
+            UPDATE sekai_evidence_submissions
+            SET lifecycle_state='quarantined',
+                rejection_code='source_identity_conflict',
+                rejection_summary='source identity conflicts with an earlier admitted submission'
+            WHERE lifecycle_state IN ('authorized', 'projected', 'available')
+              AND NOT EXISTS (
+                SELECT 1 FROM sekai_evidence_source_identity AS identity
+                WHERE identity.submission_id = sekai_evidence_submissions.id
+              );",
         )
         .map_err(|error| error.to_string())
     }
@@ -584,6 +612,10 @@ pub fn canonical_content_digest(content: &serde_json::Value) -> Result<String, S
 pub fn canonical_envelope_digest(envelope: &EvidenceEnvelope) -> Result<String, String> {
     let bytes = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+const fn default_max_clock_skew_ms() -> i64 {
+    0
 }
 
 fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), String> {
@@ -1237,6 +1269,51 @@ mod tests {
             db.upsert_evidence_producer(&conflicting, 200)
                 .unwrap_err()
                 .contains("already owned")
+        );
+    }
+
+    #[test]
+    fn migration_backfills_source_identity_and_defaults_clock_skew() {
+        let db = configured_db();
+        db.submit_evidence(&envelope(), "producer:checks", 1_100)
+            .unwrap();
+        {
+            let conn = db.conn();
+            let capability_json: String = conn
+                .query_row(
+                    "SELECT capability_json FROM sekai_evidence_producers
+                     WHERE producer_identity='producer:checks'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut capability: serde_json::Value = serde_json::from_str(&capability_json).unwrap();
+            capability
+                .as_object_mut()
+                .unwrap()
+                .remove("max_clock_skew_ms");
+            conn.execute(
+                "UPDATE sekai_evidence_producers SET capability_json=?1
+                 WHERE producer_identity='producer:checks'",
+                [serde_json::to_string(&capability).unwrap()],
+            )
+            .unwrap();
+            conn.execute("DROP TABLE sekai_evidence_source_identity", [])
+                .unwrap();
+        }
+
+        db.migrate_evidence().unwrap();
+        let mut collision = envelope();
+        collision.idempotency_key = "post-migration".into();
+        collision.source_version = "renamed".into();
+        collision.content = json!({"result": "failed"});
+        collision.content_digest = canonical_content_digest(&collision.content).unwrap();
+        let admission = db
+            .submit_evidence(&collision, "producer:checks", 1_200)
+            .unwrap();
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("source_identity_collision")
         );
     }
 }
