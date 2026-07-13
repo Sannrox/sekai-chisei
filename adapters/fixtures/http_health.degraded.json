@@ -1,0 +1,9 @@
+{
+  "status": "degraded",
+  "observed_at": "2026-07-13T09:15:00Z",
+  "version": "deploy-42",
+  "checks": {
+    "database": "ok",
+    "queue": "degraded"
+  }
+}

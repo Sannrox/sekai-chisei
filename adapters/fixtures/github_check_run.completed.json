@@ -1,0 +1,16 @@
+{
+  "action": "completed",
+  "check_run": {
+    "id": 88201,
+    "status": "completed",
+    "conclusion": "success",
+    "head_sha": "c0ffee1234",
+    "started_at": "2026-07-13T08:00:00Z",
+    "completed_at": "2026-07-13T08:02:30Z",
+    "updated_at": "2026-07-13T08:02:31Z",
+    "html_url": "https://example.invalid/checks/88201"
+  },
+  "repository": {
+    "full_name": "acme/payments"
+  }
+}
