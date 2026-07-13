@@ -662,16 +662,30 @@ admin refresh endpoint is disabled. Non-loopback gateway binds additionally
 require at least one `GATEWAY_KEYS` entry, fail-closed governance, preflight, and
 passthrough authentication to be disabled.
 
-Governance calls fail open by default so local Codex sessions keep working while
-the control plane restarts. Set `GATEWAY_GOVERNANCE_FAILURE=closed` to fail
-closed instead.
+Governance failures are graded. Missing labels, classified data, elevated-risk
+actions, and identities outside the operator-assigned `low-risk` tier fail
+closed. The narrow availability exception requires both
+`x-chisei-data-class: unclassified` and `x-chisei-action-risk: low|read`.
+`GATEWAY_GOVERNANCE_FAILURE=closed` forces every request closed.
+
+Fresh last-known budget, policy, and egress decisions remain enforceable for up
+to `CHISEI_GATEWAY_GOVERNANCE_CACHE_TTL_SECS`. Outage budget reservations are
+conservative and completed usage is reconciled after recovery. Every degraded
+or fail-open decision is appended to `CHISEI_GATEWAY_AUDIT_SPOOL_PATH` before
+traffic is forwarded; an unwritable spool therefore converts fail-open into a
+safe refusal. The spool rotates to one `.1` backup at
+`CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES` (64 MiB by default), bounding retained
+local audit storage. `/statusz` exposes the current live/degraded posture and aggregate
+cache, circuit, reconciliation, and spool counts. `/healthz` reports process
+health, while `/readyz` independently probes live control-plane governance.
 
 For debugging provider/client behavior independently of Chisei control-plane
 latency or availability, start the gateway with `--no-preflight` or set
 `CHISEI_GATEWAY_NO_PREFLIGHT=1`. This skips `CheckBudget`, `ResolvePolicy`, and
 context-egress preflight, while still authenticating the caller and proxying
-through the configured provider credentials. Do not use it as the normal
-governed mode.
+through the configured provider credentials. It is accepted only for an
+explicitly labeled low-risk request and always creates a durable fail-open audit
+record. Do not use it as the normal governed mode.
 
 Gateway budget, usage, and policy calls send first-class `subject`, `project`,
 `agent`, and `key_id` metadata to Chisei while retaining legacy `user_id`
