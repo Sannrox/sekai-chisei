@@ -19,7 +19,8 @@ use crate::sekai::attestation;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::{
-    EvidenceAdmission, EvidenceProducerCapability as DomainEvidenceProducerCapability,
+    DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS, EvidenceAdmission,
+    EvidenceProducerCapability as DomainEvidenceProducerCapability,
     EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition, EvidenceSubmissionFilter,
     EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
 };
@@ -597,6 +598,11 @@ fn from_proto_evidence_producer(
         max_payload_bytes,
         max_relationships,
         rate_limit_per_minute: capability.rate_limit_per_minute,
+        max_retained_submissions: if capability.max_retained_submissions == 0 {
+            DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS
+        } else {
+            capability.max_retained_submissions
+        },
         revoked: capability.revoked,
     })
 }
@@ -12462,6 +12468,7 @@ mod tests {
                     max_payload_bytes: 4_096,
                     max_relationships: 8,
                     rate_limit_per_minute: 100,
+                    max_retained_submissions: 100_000,
                     revoked: false,
                 }),
             },
