@@ -149,6 +149,16 @@ impl SekaiDb {
 
         let mut resolved_relationships = Vec::with_capacity(envelope.relationships.len());
         for relationship in &envelope.relationships {
+            let target_source_type = if relationship.target_source_type.is_empty() {
+                &envelope.source_type
+            } else {
+                &relationship.target_source_type
+            };
+            let target_source_instance = if relationship.target_source_instance.is_empty() {
+                &envelope.source_instance
+            } else {
+                &relationship.target_source_instance
+            };
             let resolved = tx
                 .query_row(
                     "SELECT identity.submission_id, projection.evidence_object_id
@@ -159,8 +169,8 @@ impl SekaiDb {
                        AND identity.source_record_id=?3
                      ORDER BY identity.source_sequence DESC LIMIT 1",
                     params![
-                        relationship.target_source_type,
-                        relationship.target_source_instance,
+                        target_source_type,
+                        target_source_instance,
                         relationship.target_source_record_id
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -189,10 +199,12 @@ impl SekaiDb {
                  FROM sekai_evidence_submissions AS submissions
                  JOIN sekai_evidence_projections AS projection
                    ON projection.submission_id = submissions.id
-                 WHERE submissions.source_instance=?1 AND submissions.source_record_id=?2
-                   AND submissions.lifecycle_state='available' AND submissions.id != ?3
+                 WHERE submissions.source_type=?1 AND submissions.source_instance=?2
+                   AND submissions.source_record_id=?3
+                   AND submissions.lifecycle_state='available' AND submissions.id != ?4
                  ORDER BY submissions.source_sequence DESC LIMIT 1",
                 params![
+                    envelope.source_type,
                     envelope.source_instance,
                     envelope.source_record_id,
                     submission.id,
@@ -432,15 +444,17 @@ impl SekaiDb {
                          FROM sekai_evidence_submissions AS submissions
                          JOIN sekai_evidence_projections AS projection
                            ON projection.submission_id = submissions.id
-                         WHERE submissions.source_instance=?1
-                           AND submissions.source_record_id=?2
-                           AND submissions.source_sequence<?3
+                         WHERE submissions.source_type=?1
+                           AND submissions.source_instance=?2
+                           AND submissions.source_record_id=?3
+                           AND submissions.source_sequence<?4
                            AND submissions.lifecycle_state='available'",
                     )
                     .map_err(|error| error.to_string())?;
                 let older = statement
                     .query_map(
                         params![
+                            envelope.source_type,
                             envelope.source_instance,
                             envelope.source_record_id,
                             envelope.source_sequence,
@@ -912,6 +926,20 @@ mod tests {
         other_type.idempotency_key = "other-type".into();
         let other = admit(&db, &other_type);
         db.project_evidence_submission(&other, 310).unwrap();
+        assert_eq!(
+            db.get_evidence_submission(&correct)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            EvidenceLifecycleState::Available
+        );
+        assert_eq!(
+            db.get_evidence_submission(&other)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            EvidenceLifecycleState::Available
+        );
 
         let mut dependent = envelope("dependent", 3, EvidenceIntent::Upsert);
         dependent.relationships = vec![EvidenceRelationship {
