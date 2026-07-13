@@ -101,6 +101,14 @@ impl SekaiDb {
                 metric TEXT NOT NULL,
                 amount INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chisei_budget_attributions (
+                source_scope_id TEXT NOT NULL,
+                applied_scope_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                period_start INTEGER NOT NULL,
+                amount_used INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source_scope_id, applied_scope_id, metric, period_start)
             );",
         )
         .map_err(|e| e.to_string())
@@ -194,6 +202,16 @@ impl SekaiDb {
                     params![scope, metric, period_start, amount],
                 )
                 .map_err(|e| e.to_string())?;
+            transaction
+                .execute(
+                "INSERT INTO chisei_budget_attributions
+                   (source_scope_id,applied_scope_id,metric,period_start,amount_used)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
+                 DO UPDATE SET amount_used=amount_used+excluded.amount_used",
+                params![scope_id, scope, metric, period_start, amount],
+                )
+                .map_err(|e| e.to_string())?;
         }
         transaction.commit().map_err(|e| e.to_string())
     }
@@ -278,6 +296,15 @@ impl SekaiDb {
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET amount_used = excluded.amount_used",
                 params![scope, metric, period_start, updated],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO chisei_budget_attributions
+                   (source_scope_id,applied_scope_id,metric,period_start,amount_used)
+                 VALUES (?1,?2,?3,?4,MAX(0,?5))
+                 ON CONFLICT(source_scope_id,applied_scope_id,metric,period_start)
+                 DO UPDATE SET amount_used=MAX(0,amount_used+?5)",
+                params![scope_id, scope, metric, period_start, delta],
             )
             .map_err(|e| e.to_string())?;
         }
