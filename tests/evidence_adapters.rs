@@ -60,13 +60,20 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
     assert_eq!(draft.provenance["delivery"], "poll");
     assert_eq!(draft.expires_at_ms, Some(draft.observed_at_ms + 300_000));
 
+    let exact_retry = draft
+        .clone()
+        .into_envelope(&config(), 1_752_394_000_000)
+        .unwrap();
     let first = draft
         .clone()
         .into_envelope(&config(), 1_752_394_000_000)
         .unwrap();
     let replay = draft.into_envelope(&config(), 1_752_394_999_999).unwrap();
+    assert_eq!(first.idempotency_key, exact_retry.idempotency_key);
     assert_eq!(first.content_digest, replay.content_digest);
-    assert_eq!(first.idempotency_key, replay.idempotency_key);
+    assert_ne!(first.idempotency_key, replay.idempotency_key);
+    assert_eq!(first.source_record_id, replay.source_record_id);
+    assert_eq!(first.source_version, replay.source_version);
 }
 
 #[test]
