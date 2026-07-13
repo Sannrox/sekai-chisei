@@ -167,6 +167,8 @@ impl SekaiDb {
                 submission_id TEXT NOT NULL,
                 PRIMARY KEY (producer_identity, idempotency_key)
             );
+            CREATE INDEX IF NOT EXISTS idx_evidence_idempotency_submission
+                ON sekai_evidence_idempotency(submission_id);
             CREATE TABLE IF NOT EXISTS sekai_evidence_source_identity (
                 source_type TEXT NOT NULL,
                 source_instance TEXT NOT NULL,
