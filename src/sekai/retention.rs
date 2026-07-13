@@ -975,22 +975,22 @@ impl SekaiDb {
                         serde_json::from_str::<Vec<(String, String, String)>>(&filters_json)
                             .unwrap_or_default();
                     let filter_matches = filters.iter().any(|(column, op, value)| {
-                        if op == "in" {
-                            value.split(',').any(|candidate| {
-                                keyed_value_matches_subject(
-                                    column,
-                                    candidate.trim(),
-                                    &request.subject_kind,
-                                    &request.subject,
-                                )
-                            })
-                        } else {
+                        let candidate_matches = |candidate: &str| {
                             keyed_value_matches_subject(
                                 column,
-                                value,
+                                candidate,
                                 &request.subject_kind,
                                 &request.subject,
-                            )
+                            ) || subject_object_ids.iter().any(|object_id| {
+                                candidate == object_id || contains_identifier(candidate, object_id)
+                            })
+                        };
+                        if op == "in" {
+                            value
+                                .split(',')
+                                .any(|candidate| candidate_matches(candidate.trim()))
+                        } else {
+                            candidate_matches(value)
                         }
                     });
                     let metadata_matches =
@@ -3978,12 +3978,33 @@ mod tests {
     #[test]
     fn subject_erasure_removes_saved_filters_and_budget_events() {
         let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&crate::domain::Object {
+            id: "agent-object".into(),
+            kind: "agent".into(),
+            name: "erase-agent".into(),
+            namespace: "ns".into(),
+            external_id: "agent:erase-agent".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO chisei_budget_usage_events
                  (idempotency_key,scope_id,metric,amount,created_at)
                  VALUES ('event','project:p/agent:erase-agent','tokens',1,1)",
                 [],
+            )
+            .unwrap();
+        let object_filters =
+            serde_json::to_string(&vec![("owner_id", "in", "keep-object,agent-object")]).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_virtual_tables
+                 (id,name,dataset_id,filters,columns,created)
+                 VALUES ('saved-object','saved-object','llm_calls',?1,'[]',1)",
+                params![object_filters],
             )
             .unwrap();
         let filters = serde_json::to_string(&vec![("agent", "eq", "erase-agent")]).unwrap();
