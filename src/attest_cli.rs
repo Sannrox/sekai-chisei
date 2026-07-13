@@ -163,6 +163,10 @@ fn positional(args: &[String], wanted: usize) -> Option<String> {
     let mut position = 0;
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--integrity-only" {
+            index += 1;
+            continue;
+        }
         if args[index].starts_with('-') {
             index += 2;
             continue;
@@ -294,5 +298,22 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error, "--identity or SHOMEI_TRUSTED_IDENTITY is required");
+    }
+
+    #[test]
+    fn verify_parser_accepts_boolean_flag_before_bundle() {
+        let config = parse_verify(&[
+            "--integrity-only".into(),
+            "--trusted-key".into(),
+            "key.pub".into(),
+            "--identity".into(),
+            "node:test".into(),
+            "--key-id".into(),
+            "key-1".into(),
+            "bundle.json".into(),
+        ])
+        .unwrap();
+        assert_eq!(config.bundle, PathBuf::from("bundle.json"));
+        assert!(config.integrity_only);
     }
 }
