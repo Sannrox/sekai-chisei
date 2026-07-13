@@ -287,10 +287,12 @@ impl AttestationBundle {
                 attestation.id
             ));
         }
-        if !receipt_links_policy_attestation(&self.receipt, &attestation) {
+        let verification = verify_policy_attestation(&self.receipt, &attestation);
+        if !verification.valid {
             return Err(format!(
-                "policy attestation {} is not linked by the receipt",
-                attestation.id
+                "policy attestation {} is invalid: {}",
+                attestation.id,
+                verification.errors.join("; ")
             ));
         }
         for declaration in self
@@ -1505,6 +1507,17 @@ mod tests {
                 omitted: false,
                 omission_reason: None,
             });
+        let mut malformed = attestation.clone();
+        malformed.policy_snapshot.push(' ');
+        let mut rejected = AttestationBundle::unsigned(source.clone()).unwrap();
+        let error = rejected.attach_policy_attestation(malformed).unwrap_err();
+        assert!(error.contains("content hash mismatch"));
+        assert!(rejected.policy_attestations.is_empty());
+        assert!(rejected.coverage.iter().any(|entry| {
+            entry.reference == attestation.id
+                && entry.disposition == CoverageDisposition::Referenced
+        }));
+
         let mut bundle = AttestationBundle::unsigned(source).unwrap();
         bundle.attach_policy_attestation(attestation).unwrap();
         bundle
