@@ -1,6 +1,8 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 pub const AUDIT_DATASET: &str = "audit";
 pub const LLM_CALLS_DATASET: &str = "llm_calls";
@@ -22,6 +24,155 @@ pub struct RetentionRun {
     pub audit_deleted: i32,
     pub llm_calls_deleted: i32,
     pub task_observations_deleted: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveRun {
+    pub batch_id: String,
+    pub content_hash: String,
+    pub audit_archived: i32,
+    pub llm_calls_archived: i32,
+    pub task_observations_archived: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveVerification {
+    pub ok: bool,
+    pub records_checked: i64,
+    pub batches_checked: i64,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveRecord {
+    dataset: &'static str,
+    source_key: String,
+    payload: String,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn archive_record_hash(record: &ArchiveRecord) -> String {
+    archive_payload_hash(record.dataset, &record.source_key, &record.payload)
+}
+
+fn archive_payload_hash(dataset: &str, source_key: &str, payload: &str) -> String {
+    sha256_hex(
+        serde_json::to_string(&(dataset, source_key, payload))
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn resolved_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return path.canonicalize().map_err(|e| e.to_string());
+    }
+    let parent = parent_dir(path);
+    let name = path
+        .file_name()
+        .ok_or_else(|| "archive path must name a file".to_string())?;
+    Ok(parent.canonicalize().map_err(|e| e.to_string())?.join(name))
+}
+
+fn same_file(left: &Path, right: &Path) -> Result<bool, String> {
+    if resolved_path(left)? == resolved_path(right)? {
+        return Ok(true);
+    }
+    if left.exists() && right.exists() {
+        return same_file::is_same_file(left, right).map_err(|e| e.to_string());
+    }
+    Ok(false)
+}
+
+fn belongs_to_database(database: &Path, candidate: &Path) -> Result<bool, String> {
+    if same_file(database, candidate)? {
+        return Ok(true);
+    }
+    let database = database.as_os_str().to_string_lossy();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        if same_file(Path::new(&format!("{database}{suffix}")), candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn open_archive(path: &Path) -> Result<Connection, String> {
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Err("archive path must be a persistent SQLite file".into());
+    }
+    let parent = parent_dir(path);
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    if !path.exists() {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Err(error) = options.open(path)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(error.to_string());
+        }
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::from_bits_retain(rusqlite::ffi::SQLITE_OPEN_NOFOLLOW);
+    let conn = Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS archive_records (
+            dataset TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            archived_at INTEGER NOT NULL,
+            PRIMARY KEY (dataset, source_key)
+         );
+         CREATE TABLE IF NOT EXISTS archive_batches (
+            id TEXT PRIMARY KEY,
+            cutoff INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            record_count INTEGER NOT NULL,
+            created INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS archive_batch_records (
+            batch_id TEXT NOT NULL,
+            dataset TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            PRIMARY KEY (batch_id, dataset, source_key),
+            FOREIGN KEY (batch_id) REFERENCES archive_batches(id),
+            FOREIGN KEY (dataset, source_key) REFERENCES archive_records(dataset, source_key)
+         );",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1906,6 +2057,561 @@ impl SekaiDb {
         Ok(result)
     }
 
+    pub fn verify_archive(archive_path: impl AsRef<Path>) -> Result<ArchiveVerification, String> {
+        let archive_path = archive_path.as_ref();
+        if !archive_path.is_file() {
+            return Err("archive file does not exist".into());
+        }
+        let archive = Connection::open(archive_path).map_err(|e| e.to_string())?;
+        let mut verification = ArchiveVerification {
+            ok: true,
+            ..Default::default()
+        };
+        let records = {
+            let mut stmt = archive
+                .prepare(
+                    "SELECT dataset,source_key,payload,payload_hash
+                     FROM archive_records ORDER BY dataset,source_key",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        for (dataset, source_key, payload, stored_hash) in records {
+            verification.records_checked += 1;
+            if archive_payload_hash(&dataset, &source_key, &payload) != stored_hash {
+                verification.ok = false;
+                verification.error = format!("archive record {dataset}:{source_key} was altered");
+                return Ok(verification);
+            }
+        }
+
+        let broken_references: i64 = archive
+            .query_row(
+                "SELECT COUNT(*) FROM archive_batch_records link
+                 LEFT JOIN archive_batches batch ON batch.id=link.batch_id
+                 LEFT JOIN archive_records record
+                   ON record.dataset=link.dataset AND record.source_key=link.source_key
+                 WHERE batch.id IS NULL OR record.dataset IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if broken_references > 0 {
+            verification.ok = false;
+            verification.error = "archive contains broken manifest references".into();
+            return Ok(verification);
+        }
+        let unbatched_records: i64 = archive
+            .query_row(
+                "SELECT COUNT(*) FROM archive_records r
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM archive_batch_records link
+                    JOIN archive_batches batch ON batch.id=link.batch_id
+                    WHERE link.dataset=r.dataset AND link.source_key=r.source_key
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if unbatched_records > 0 {
+            verification.ok = false;
+            verification.error = "archive contains records without a batch manifest".into();
+            return Ok(verification);
+        }
+
+        let batches = {
+            let mut stmt = archive
+                .prepare("SELECT id,content_hash,record_count FROM archive_batches ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        if batches.is_empty() {
+            verification.ok = false;
+            verification.error = "archive contains no batch manifests".into();
+            return Ok(verification);
+        }
+        for (batch_id, stored_hash, record_count) in batches {
+            verification.batches_checked += 1;
+            let hashes = {
+                let mut stmt = archive
+                    .prepare(
+                        "SELECT r.payload_hash FROM archive_batch_records b
+                         JOIN archive_records r ON r.dataset=b.dataset AND r.source_key=b.source_key
+                         WHERE b.batch_id=?1 ORDER BY b.dataset,b.source_key",
+                    )
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            let computed_hash = sha256_hex(
+                serde_json::to_string(&hashes)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            if hashes.len() as i64 != record_count || computed_hash != stored_hash {
+                verification.ok = false;
+                verification.error = format!("archive batch {batch_id} manifest does not match");
+                return Ok(verification);
+            }
+        }
+        Ok(verification)
+    }
+
+    /// Move records outside their hot-store retention windows into a separate
+    /// SQLite archive before deleting them from the operational database.
+    /// Archive records are content-hashed and keyed by their stable source
+    /// identity, making a retry after an interrupted hot-store commit safe.
+    pub fn archive_retained_records(
+        &self,
+        archive_path: impl AsRef<Path>,
+        now: i64,
+    ) -> Result<ArchiveRun, String> {
+        let archive_path = archive_path.as_ref();
+        if archive_path.as_os_str().is_empty() || archive_path == Path::new(":memory:") {
+            return Err("archive path must be a persistent SQLite file".into());
+        }
+        if std::fs::symlink_metadata(archive_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err("archive path must not be a symbolic link".into());
+        }
+        std::fs::create_dir_all(parent_dir(archive_path)).map_err(|e| e.to_string())?;
+        let archive_resolved = resolved_path(archive_path)?;
+        let policies = self.list_retention_policies()?;
+        let mut conn = self.conn();
+        let hot_path: String = conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !hot_path.is_empty() && belongs_to_database(Path::new(&hot_path), &archive_resolved)? {
+            return Err("archive path must differ from the operational database".into());
+        }
+
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let audit_cutoff = policies
+            .iter()
+            .find(|policy| {
+                policy.dataset == AUDIT_DATASET
+                    && policy.namespace.is_empty()
+                    && policy.data_class.is_empty()
+            })
+            .map(|policy| now - i64::from(policy.retention_days) * DAY_MS);
+        if audit_cutoff.is_some() {
+            verify_decisions_in_transaction(&tx)?;
+        }
+        let prefix_end = if let Some(cutoff) = audit_cutoff {
+            tx.query_row(
+                "SELECT MAX(seq) FROM sekai_decisions
+                 WHERE seq < COALESCE(
+                    (SELECT MIN(seq) FROM sekai_decisions WHERE timestamp >= ?1),
+                    9223372036854775807
+                 )",
+                params![cutoff],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .filter(|seq| *seq > 0)
+        } else {
+            None
+        };
+
+        let mut records = Vec::<ArchiveRecord>::new();
+        if let Some(prefix_end) = prefix_end {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash
+                     FROM sekai_decisions WHERE seq <= ?1 ORDER BY seq",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![prefix_end], |row| {
+                    let id: String = row.get(0)?;
+                    let payload = serde_json::json!({
+                        "id": id, "timestamp": row.get::<_, i64>(1)?,
+                        "actor": row.get::<_, String>(2)?, "action": row.get::<_, String>(3)?,
+                        "reason": row.get::<_, String>(4)?, "evidence": row.get::<_, String>(5)?,
+                        "target_id": row.get::<_, String>(6)?, "outcome": row.get::<_, String>(7)?,
+                        "seq": row.get::<_, i64>(8)?, "prev_hash": row.get::<_, String>(9)?,
+                        "entry_hash": row.get::<_, String>(10)?,
+                    });
+                    Ok(ArchiveRecord {
+                        dataset: "audit.decisions",
+                        source_key: id,
+                        payload: payload.to_string(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            records.extend(rows);
+
+            let mut stmt = tx
+                .prepare(
+                    "SELECT a.id,a.decision_id,a.policy_kind,a.policy_scope,a.policy_version,
+                            a.policy_snapshot,a.inputs,a.decision,a.content_hash,a.created
+                     FROM sekai_attestations a JOIN sekai_decisions d ON d.id=a.decision_id
+                     WHERE d.seq <= ?1 ORDER BY a.id",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![prefix_end], |row| {
+                    let id: String = row.get(0)?;
+                    let payload = serde_json::json!({
+                        "id": id, "decision_id": row.get::<_, String>(1)?,
+                        "policy_kind": row.get::<_, String>(2)?, "policy_scope": row.get::<_, String>(3)?,
+                        "policy_version": row.get::<_, String>(4)?, "policy_snapshot": row.get::<_, String>(5)?,
+                        "inputs": row.get::<_, String>(6)?, "decision": row.get::<_, String>(7)?,
+                        "content_hash": row.get::<_, String>(8)?, "created": row.get::<_, i64>(9)?,
+                    });
+                    Ok(ArchiveRecord {
+                        dataset: "audit.attestations",
+                        source_key: id,
+                        payload: payload.to_string(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            records.extend(rows);
+        }
+        if let Some(cutoff) = audit_cutoff {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp
+                     FROM sekai_object_changes WHERE timestamp < ?1 ORDER BY timestamp,id",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    let id: String = row.get(0)?;
+                    let payload = serde_json::json!({
+                        "id": id, "object_id": row.get::<_, String>(1)?, "field": row.get::<_, String>(2)?,
+                        "old_value": row.get::<_, String>(3)?, "new_value": row.get::<_, String>(4)?,
+                        "changed_by": row.get::<_, String>(5)?, "timestamp": row.get::<_, i64>(6)?,
+                    });
+                    Ok(ArchiveRecord {
+                        dataset: "audit.object_changes",
+                        source_key: id,
+                        payload: payload.to_string(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            records.extend(rows);
+        }
+
+        let llm_rows = {
+            let mut stmt = tx
+                .prepare("SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=?1 ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![LLM_CALLS_DATASET], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        let mut llm_ids = Vec::new();
+        for (id, data) in llm_rows {
+            let row: std::collections::HashMap<String, String> =
+                serde_json::from_str(&data).unwrap_or_default();
+            let namespace = row.get("project").map(String::as_str).unwrap_or_default();
+            let data_class = row
+                .get("data_class")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let timestamp = row
+                .get("timestamp_ms")
+                .and_then(|value| value.parse::<i64>().ok());
+            if let (Some(timestamp), Some(policy)) = (
+                timestamp,
+                effective_policy(&policies, LLM_CALLS_DATASET, namespace, data_class),
+            ) && timestamp < now - i64::from(policy.retention_days) * DAY_MS
+            {
+                llm_ids.push(id);
+                records.push(ArchiveRecord {
+                    dataset: "llm_calls",
+                    source_key: id.to_string(),
+                    payload: data,
+                });
+            }
+        }
+
+        let observation_rows = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT rowid,request_id,namespace,component_id,model,status,timestamp,packages_json,context_json
+                     FROM sekai_task_observations ORDER BY component_id,timestamp,rowid",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        let mut expired_observations =
+            std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
+        for (
+            rowid,
+            request_id,
+            namespace,
+            component_id,
+            model,
+            status,
+            timestamp,
+            packages,
+            context,
+        ) in observation_rows
+        {
+            if let Some(policy) =
+                effective_policy(&policies, TASK_OBSERVATIONS_DATASET, &namespace, "")
+                && timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
+            {
+                expired_observations
+                    .entry(component_id.clone())
+                    .or_insert_with(|| (namespace.clone(), Vec::new()))
+                    .1
+                    .push((rowid, status.clone()));
+                records.push(ArchiveRecord {
+                    dataset: "task_observations",
+                    source_key: serde_json::to_string(&(&request_id, &component_id))
+                        .unwrap_or_default(),
+                    payload: serde_json::json!({
+                        "request_id": request_id, "namespace": namespace, "component_id": component_id,
+                        "model": model, "status": status, "timestamp": timestamp,
+                        "packages_json": packages, "context_json": context,
+                    })
+                    .to_string(),
+                });
+            }
+        }
+
+        records.sort_by(|left, right| {
+            (&left.dataset, &left.source_key).cmp(&(&right.dataset, &right.source_key))
+        });
+        let record_hashes: Vec<String> = records.iter().map(archive_record_hash).collect();
+        let content_hash = sha256_hex(
+            serde_json::to_string(&record_hashes)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        let batch_id = sha256_hex(
+            serde_json::to_string(&(now, &content_hash))
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        let mut run = ArchiveRun {
+            batch_id: batch_id.clone(),
+            content_hash: content_hash.clone(),
+            audit_archived: records
+                .iter()
+                .filter(|record| record.dataset.starts_with("audit."))
+                .count() as i32,
+            llm_calls_archived: llm_ids.len() as i32,
+            task_observations_archived: expired_observations
+                .values()
+                .map(|(_, rows)| rows.len() as i32)
+                .sum(),
+        };
+        if records.is_empty() {
+            run.batch_id.clear();
+            run.content_hash.clear();
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(run);
+        }
+
+        let mut archive = open_archive(&archive_resolved)?;
+        let archive_tx = archive.transaction().map_err(|e| e.to_string())?;
+        archive_tx
+            .execute(
+                "INSERT OR IGNORE INTO archive_batches (id,cutoff,content_hash,record_count,created)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![batch_id, now, content_hash, records.len() as i64, now],
+            )
+            .map_err(|e| e.to_string())?;
+        let batch_matches: bool = archive_tx
+            .query_row(
+                "SELECT cutoff=?2 AND content_hash=?3 AND record_count=?4 FROM archive_batches WHERE id=?1",
+                params![batch_id, now, content_hash, records.len() as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !batch_matches {
+            return Err("archive batch identity conflicts with existing content".into());
+        }
+        for (record, payload_hash) in records.iter().zip(&record_hashes) {
+            archive_tx
+                .execute(
+                    "INSERT OR IGNORE INTO archive_records
+                     (dataset,source_key,payload,payload_hash,archived_at) VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        record.dataset,
+                        record.source_key,
+                        record.payload,
+                        payload_hash,
+                        now
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            let stored_hash: String = archive_tx
+                .query_row(
+                    "SELECT payload_hash FROM archive_records WHERE dataset=?1 AND source_key=?2",
+                    params![record.dataset, record.source_key],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if stored_hash != *payload_hash {
+                return Err(format!(
+                    "archive record {}:{} conflicts with existing content",
+                    record.dataset, record.source_key
+                ));
+            }
+            archive_tx
+                .execute(
+                    "INSERT OR IGNORE INTO archive_batch_records (batch_id,dataset,source_key)
+                     VALUES (?1,?2,?3)",
+                    params![batch_id, record.dataset, record.source_key],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        archive_tx.commit().map_err(|e| e.to_string())?;
+
+        if let Some(prefix_end) = prefix_end {
+            let anchor_hash: String = tx
+                .query_row(
+                    "SELECT entry_hash FROM sekai_decisions WHERE seq=?1",
+                    params![prefix_end],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM sekai_attestations WHERE decision_id IN
+                 (SELECT id FROM sekai_decisions WHERE seq <= ?1)",
+                params![prefix_end],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM sekai_decisions WHERE seq <= ?1",
+                params![prefix_end],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sekai_ledger_anchors (seq,entry_hash,reason,created)
+                 VALUES (?1,?2,?3,?4)",
+                params![
+                    prefix_end,
+                    anchor_hash,
+                    format!("archived before {}", audit_cutoff.unwrap_or(now)),
+                    now
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(cutoff) = audit_cutoff {
+            tx.execute(
+                "DELETE FROM sekai_object_changes WHERE timestamp < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for id in llm_ids {
+            tx.execute("DELETE FROM sekai_dataset_rows WHERE id=?1", params![id])
+                .map_err(|e| e.to_string())?;
+        }
+        for (component_id, (namespace, rows)) in expired_observations {
+            let baseline = tx
+                .query_row(
+                    "SELECT task_total,task_succeeded,consecutive_failures
+                     FROM sekai_task_observation_baselines WHERE component_id=?1",
+                    params![component_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i32>(0)?,
+                            row.get::<_, i32>(1)?,
+                            row.get::<_, i32>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .unwrap_or((0, 0, 0));
+            let succeeded = rows.iter().filter(|(_, status)| status == "done").count() as i32;
+            let trailing_failures = rows
+                .iter()
+                .rev()
+                .take_while(|(_, status)| status != "done")
+                .count() as i32;
+            let consecutive_failures = if trailing_failures == rows.len() as i32 {
+                baseline.2 + trailing_failures
+            } else {
+                trailing_failures
+            };
+            tx.execute(
+                "INSERT INTO sekai_task_observation_baselines
+                 (component_id,namespace,task_total,task_succeeded,consecutive_failures,created)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(component_id) DO UPDATE SET namespace=excluded.namespace,
+                   task_total=excluded.task_total,task_succeeded=excluded.task_succeeded,
+                   consecutive_failures=excluded.consecutive_failures,created=excluded.created",
+                params![
+                    component_id,
+                    namespace,
+                    baseline.0 + rows.len() as i32,
+                    baseline.1 + succeeded,
+                    consecutive_failures,
+                    now / 1000
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            for (rowid, _) in rows {
+                tx.execute(
+                    "DELETE FROM sekai_task_observations WHERE rowid=?1",
+                    params![rowid],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(run)
+    }
+
     pub fn run_retention(&self, now: i64) -> Result<RetentionRun, String> {
         let policies = self.list_retention_policies()?;
         let mut run = RetentionRun::default();
@@ -2056,6 +2762,81 @@ mod tests {
     use crate::sekai::audit::Decision;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use std::collections::HashMap;
+
+    fn archive_path() -> PathBuf {
+        std::env::temp_dir().join(format!("sekai-archive-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn resolves_relative_archive_filename_against_current_directory() {
+        let resolved = resolved_path(Path::new("archive.db")).unwrap();
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().join("archive.db")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hard_link_to_operational_database_as_archive() {
+        let directory =
+            std::env::temp_dir().join(format!("sekai-archive-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let hot_path = directory.join("hot.db");
+        let archive_path = directory.join("archive.db");
+        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+        std::fs::hard_link(&hot_path, &archive_path).unwrap();
+
+        let error = db
+            .archive_retained_records(&archive_path, 2 * DAY_MS)
+            .unwrap_err();
+        assert!(error.contains("must differ"));
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_operational_database_sidecars_as_archives() {
+        let directory =
+            std::env::temp_dir().join(format!("sekai-sidecar-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let hot_path = directory.join("hot.db");
+        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", hot_path.display()));
+            let error = db
+                .archive_retained_records(&sidecar, 2 * DAY_MS)
+                .unwrap_err();
+            assert!(error.contains("must differ"));
+        }
+        db.ping().unwrap();
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_archive_symlink_to_database_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("sekai-symlink-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let hot_path = directory.join("hot.db");
+        let archive_path = directory.join("archive.db");
+        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+        let sidecar = PathBuf::from(format!("{}-journal", hot_path.display()));
+        symlink(&sidecar, &archive_path).unwrap();
+
+        let error = db
+            .archive_retained_records(&archive_path, 2 * DAY_MS)
+            .unwrap_err();
+        assert!(error.contains("symbolic link"));
+        assert!(!sidecar.exists());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn typed_subject_matching_preserves_kind_and_full_scoped_values() {
@@ -2398,6 +3179,371 @@ mod tests {
         let run = db.run_retention(2 * DAY_MS).unwrap();
         assert_eq!(run.audit_deleted, 1);
         assert!(db.list_object_changes("target", 10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archives_aged_records_before_removing_them_from_the_hot_store() {
+        use crate::sekai::audit::ObjectChange;
+
+        let db = SekaiDb::new(":memory:").unwrap();
+        for dataset in [AUDIT_DATASET, LLM_CALLS_DATASET, TASK_OBSERVATIONS_DATASET] {
+            db.set_retention_policy(&RetentionPolicy {
+                dataset: dataset.into(),
+                namespace: String::new(),
+                data_class: String::new(),
+                retention_days: 1,
+                updated: 1,
+            })
+            .unwrap();
+        }
+        for (id, timestamp) in [("old-decision", 1), ("fresh-decision", 2 * DAY_MS)] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp,
+                actor: "actor".into(),
+                action: "test".into(),
+                reason: String::new(),
+                evidence: HashMap::new(),
+                target_id: String::new(),
+                outcome: "ok".into(),
+            })
+            .unwrap();
+        }
+        db.record_object_change(&ObjectChange {
+            id: "old-change".into(),
+            object_id: "object".into(),
+            field: "name".into(),
+            old_value: "old".into(),
+            new_value: "new".into(),
+            changed_by: "actor".into(),
+            timestamp: 1,
+        })
+        .unwrap();
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[
+                HashMap::from([("timestamp_ms".into(), "1".into())]),
+                HashMap::from([("timestamp_ms".into(), (2 * DAY_MS).to_string())]),
+            ],
+        )
+        .unwrap();
+        {
+            let conn = db.conn();
+            for (request_id, timestamp) in [("old-observation", 1), ("fresh-observation", 200_000)]
+            {
+                conn.execute(
+                    "INSERT INTO sekai_task_observations
+                     (request_id,namespace,component_id,model,status,timestamp)
+                     VALUES (?1,'','component','','done',?2)",
+                    params![request_id, timestamp],
+                )
+                .unwrap();
+            }
+        }
+
+        let path = archive_path();
+        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+
+        assert_eq!(run.audit_archived, 2);
+        assert_eq!(run.llm_calls_archived, 1);
+        assert_eq!(run.task_observations_archived, 1);
+        assert!(!run.batch_id.is_empty());
+        assert_eq!(db.list_decisions(&Default::default()).unwrap().len(), 1);
+        assert_eq!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.list_task_observations_for_component("component")
+                .unwrap()
+                .len(),
+            1
+        );
+        let verification = db.verify_ledger().unwrap();
+        assert!(verification.ok, "{}", verification.error);
+        assert_eq!(verification.anchor_seq, 1);
+
+        let archive = Connection::open(&path).unwrap();
+        let archived: i64 = archive
+            .query_row("SELECT COUNT(*) FROM archive_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, 4);
+        let manifest: (String, i64) = archive
+            .query_row(
+                "SELECT content_hash,record_count FROM archive_batches WHERE id=?1",
+                params![run.batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(manifest, (run.content_hash, 4));
+        drop(archive);
+        let verification = SekaiDb::verify_archive(&path).unwrap();
+        assert!(verification.ok, "{}", verification.error);
+        assert_eq!(verification.records_checked, 4);
+        assert_eq!(verification.batches_checked, 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archive_verification_detects_payload_tampering() {
+        let path = archive_path();
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE archive_records SET payload='forged'", [])
+            .unwrap();
+
+        let verification = SekaiDb::verify_archive(&path).unwrap();
+        assert!(!verification.ok);
+        assert!(verification.error.contains("was altered"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archive_verification_detects_removed_batch_manifest() {
+        let path = archive_path();
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
+        let archive = Connection::open(&path).unwrap();
+        archive
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM archive_batches;",
+            )
+            .unwrap();
+        drop(archive);
+
+        let verification = SekaiDb::verify_archive(&path).unwrap();
+        assert!(!verification.ok);
+        assert!(verification.error.contains("broken manifest references"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archive_verification_rejects_total_content_loss() {
+        let path = archive_path();
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM archive_batch_records;
+                 DELETE FROM archive_records;
+                 DELETE FROM archive_batches;",
+            )
+            .unwrap();
+
+        let verification = SekaiDb::verify_archive(&path).unwrap();
+        assert!(!verification.ok);
+        assert!(verification.error.contains("no batch manifests"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_archive_tampered_audit_history() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.record_decision(&Decision {
+            id: "tampered".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET outcome='forged' WHERE id='tampered'",
+                [],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+        let path = archive_path();
+        let error = db.archive_retained_records(&path, 2 * DAY_MS).unwrap_err();
+        assert!(error.contains("audit ledger hash invalid"), "{error}");
+        assert!(db.get_decision("tampered").unwrap().is_some());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn archive_conflicts_leave_hot_records_untouched() {
+        let path = archive_path();
+        for (index, model) in ["first", "changed"].into_iter().enumerate() {
+            let db = SekaiDb::new(":memory:").unwrap();
+            db.create_dataset(&Dataset {
+                id: LLM_CALLS_DATASET.into(),
+                name: "calls".into(),
+                columns: Vec::new(),
+                object_id: String::new(),
+                created: 0,
+            })
+            .unwrap();
+            db.append_rows(
+                LLM_CALLS_DATASET,
+                &[HashMap::from([
+                    ("timestamp_ms".into(), "1".into()),
+                    ("model".into(), model.into()),
+                ])],
+            )
+            .unwrap();
+            db.set_retention_policy(&RetentionPolicy {
+                dataset: LLM_CALLS_DATASET.into(),
+                namespace: String::new(),
+                data_class: String::new(),
+                retention_days: 1,
+                updated: 1,
+            })
+            .unwrap();
+            let result = db.archive_retained_records(&path, 2 * DAY_MS);
+            if index == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("conflicts with existing content")
+                );
+                assert_eq!(
+                    db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archives_non_audit_records_after_ledger_anchor_advances() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.record_decision(&Decision {
+            id: "purged".into(),
+            timestamp: 1,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.run_retention(2 * DAY_MS).unwrap();
+        assert_eq!(db.verify_ledger().unwrap().anchor_seq, 1);
+        db.record_decision(&Decision {
+            id: "fresh".into(),
+            timestamp: 2 * DAY_MS,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+        let path = archive_path();
+        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+        assert_eq!(run.audit_archived, 0);
+        assert_eq!(run.llm_calls_archived, 1);
+        assert!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.verify_ledger().unwrap().ok);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
