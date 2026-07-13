@@ -1551,6 +1551,7 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     crate::domain::KIND_CAPABILITY,
     crate::domain::KIND_EXTERNAL_EVIDENCE,
 ];
+const ERASED_NAMESPACE: &str = "[erased]";
 
 fn is_reserved_governance_kind(kind: &str) -> bool {
     RESERVED_GOVERNANCE_KINDS.contains(&kind)
@@ -3157,8 +3158,16 @@ impl SekaiService for SekaiServiceImpl {
             .resolve_action_policy(&actor, &policy_namespace, &policy_namespace)
             .map_err(Status::internal)?;
         let (decision, policy_scope) = match &resolved_policy {
+            _ if policy_namespace == ERASED_NAMESPACE => {
+                (ActionDecision::Deny, ERASED_NAMESPACE.to_string())
+            }
             Some(policy) => (policy.decide(&r.action, action_risk), policy.scope.clone()),
             None => (ActionDecision::Allow, String::new()),
+        };
+        let attested_policy = if policy_namespace == ERASED_NAMESPACE {
+            None
+        } else {
+            resolved_policy.as_ref()
         };
 
         // Dry-run (Plan 9, Phase B): report the planned ops and the resolved
@@ -3179,7 +3188,7 @@ impl SekaiService for SekaiServiceImpl {
             }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
-                resolved_policy.as_ref(),
+                attested_policy,
                 &decision_id,
                 &r.action,
                 &actor,
@@ -3248,7 +3257,7 @@ impl SekaiService for SekaiServiceImpl {
             }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
-                resolved_policy.as_ref(),
+                attested_policy,
                 &decision_id,
                 &r.action,
                 &actor,
@@ -3294,7 +3303,7 @@ impl SekaiService for SekaiServiceImpl {
             }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
-                resolved_policy.as_ref(),
+                attested_policy,
                 &decision_id,
                 &r.action,
                 &actor,
@@ -3600,12 +3609,18 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .resolve_action_policy(&approval.actor, &namespace, &namespace)
             .map_err(Status::internal)?;
-        if let Some(policy) = &resolved_policy
-            && policy.decide(&approval.action, action_risk) == ActionDecision::Deny
-        {
+        let denying_policy = resolved_policy
+            .as_ref()
+            .filter(|policy| policy.decide(&approval.action, action_risk) == ActionDecision::Deny);
+        if namespace == ERASED_NAMESPACE || denying_policy.is_some() {
             let mut evidence = HashMap::from([
                 ("approval_id".to_string(), approval.id.clone()),
-                ("policy_scope".to_string(), policy.scope.clone()),
+                (
+                    "policy_scope".to_string(),
+                    denying_policy
+                        .map(|policy| policy.scope.clone())
+                        .unwrap_or_else(|| namespace.clone()),
+                ),
                 ("risk_class".to_string(), action_risk.as_str().into()),
                 ("decision".to_string(), "deny".into()),
             ]);
@@ -3614,7 +3629,7 @@ impl SekaiService for SekaiServiceImpl {
             }
             let decision_id = uuid::Uuid::new_v4().to_string();
             let attested = attest_action_decision(
-                Some(policy),
+                denying_policy,
                 &decision_id,
                 &approval.action,
                 &approval.actor,
