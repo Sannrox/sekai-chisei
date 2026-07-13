@@ -3639,6 +3639,7 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         let sensitive_attribute = request.attributes.keys().find(|key| {
             let key = key.to_ascii_lowercase().replace('-', "_");
+            let compact_key = key.replace('_', "");
             [
                 "authorization",
                 "api_key",
@@ -3652,7 +3653,13 @@ impl ChiseiService for ChiseiServiceImpl {
                 "token",
             ]
             .iter()
-            .any(|sensitive| key == *sensitive || key.ends_with(&format!("_{sensitive}")))
+            .any(|sensitive| {
+                let compact_sensitive = sensitive.replace('_', "");
+                key == *sensitive
+                    || key.ends_with(&format!("_{sensitive}"))
+                    || compact_key == compact_sensitive
+                    || compact_key.ends_with(&compact_sensitive)
+            })
         });
         if let Some(key) = sensitive_attribute {
             return Err(Status::invalid_argument(format!(
