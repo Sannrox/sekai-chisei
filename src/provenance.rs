@@ -490,6 +490,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "work_unit_id".into(),
                 col_type: "string".into(),
+                classification: "public".into(),
             }],
             object_id: String::new(),
             created: 1,
