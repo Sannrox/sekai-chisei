@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const EVIDENCE_CONTRACT_VERSION: &str = "sekai.evidence/v1";
@@ -191,7 +193,11 @@ pub struct OutboxReceipt {
 impl OutboxReceipt {
     pub fn acknowledge(self) -> Result<(), String> {
         match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_directory(
+                self.path
+                    .parent()
+                    .ok_or_else(|| "adapter outbox entry has no parent directory".to_string())?,
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!(
                 "failed to acknowledge adapter outbox entry: {error}"
@@ -219,6 +225,7 @@ pub fn prepare_delivery_in(
 ) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
     fs::create_dir_all(outbox)
         .map_err(|error| format!("failed to create adapter outbox: {error}"))?;
+    restrict_directory(outbox)?;
     let stable_identity = draft.clone().into_envelope(config, 0)?.idempotency_key;
     let path = outbox.join(format!("{stable_identity}.bin"));
     if path.exists() {
@@ -227,9 +234,11 @@ pub fn prepare_delivery_in(
 
     let envelope = draft.into_envelope(config, collected_at_ms)?;
     let temporary = outbox.join(format!(".{stable_identity}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&temporary)
         .map_err(|error| format!("failed to create adapter outbox entry: {error}"))?;
     if let Err(error) = file
@@ -241,12 +250,15 @@ pub fn prepare_delivery_in(
     }
     match fs::hard_link(&temporary, &path) {
         Ok(()) => {
+            sync_directory(outbox)?;
             fs::remove_file(&temporary)
                 .map_err(|error| format!("failed to finalize adapter outbox entry: {error}"))?;
+            sync_directory(outbox)?;
             Ok((envelope, OutboxReceipt { path }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&temporary);
+            sync_directory(outbox)?;
             load_delivery(path)
         }
         Err(error) => {
@@ -257,11 +269,46 @@ pub fn prepare_delivery_in(
 }
 
 fn load_delivery(path: PathBuf) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {
+    restrict_file(&path)?;
     let bytes =
         fs::read(&path).map_err(|error| format!("failed to read adapter outbox entry: {error}"))?;
     let envelope = EvidenceEnvelope::decode(bytes.as_slice())
         .map_err(|error| format!("adapter outbox entry is corrupt: {error}"))?;
     Ok((envelope, OutboxReceipt { path }))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync adapter outbox directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("failed to protect adapter outbox directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("failed to protect adapter outbox entry: {error}"))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 pub async fn submit(
