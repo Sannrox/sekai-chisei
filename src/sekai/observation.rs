@@ -71,7 +71,6 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
-        let mut added_retention_tombstone = false;
         for column in [
             "data_class TEXT NOT NULL DEFAULT 'unclassified'",
             "retention_tombstone INTEGER NOT NULL DEFAULT 0",
@@ -80,25 +79,21 @@ impl SekaiDb {
                 &format!("ALTER TABLE sekai_task_observations ADD COLUMN {column}"),
                 [],
             ) {
-                Ok(_) if column.starts_with("retention_tombstone") => {
-                    added_retention_tombstone = true;
-                }
                 Ok(_) => {}
                 Err(error) if error.to_string().contains("duplicate column name") => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
-        if added_retention_tombstone {
-            conn.execute(
-                "UPDATE sekai_task_observations SET retention_tombstone=1
-                 WHERE request_id='retention-tombstone:' || rowid
-                   AND namespace='' AND data_class='unclassified'
-                   AND model='[redacted]' AND packages_json='[]'
-                   AND context_json='{\"retention_tombstone\":\"true\"}'",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        conn.execute(
+            "UPDATE sekai_task_observations SET retention_tombstone=1
+             WHERE retention_tombstone=0
+               AND request_id='retention-tombstone:' || rowid
+               AND namespace='' AND data_class='unclassified'
+               AND model='[redacted]' AND packages_json='[]'
+               AND context_json='{\"retention_tombstone\":\"true\"}'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         let legacy = {
             let mut stmt = conn
                 .prepare(
@@ -693,6 +688,7 @@ mod tests {
                     status TEXT NOT NULL, timestamp INTEGER NOT NULL,
                     packages_json TEXT NOT NULL DEFAULT '[]',
                     context_json TEXT NOT NULL DEFAULT '{}',
+                    retention_tombstone INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (request_id, component_id)
                 );
                 INSERT INTO sekai_task_observations
