@@ -4,7 +4,8 @@ use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::sekai::attestation::PolicyAttestation;
 use crate::shomei::{
-    AttestationBundle, KeyMetadata, KeyState, TrustedKeyring, canonical_bundle_bytes, verify_bundle,
+    AttestationBundle, KeyMetadata, KeyState, TrustedKeyring, VerificationReport,
+    canonical_bundle_bytes, in_toto_verification_statement, verify_bundle,
 };
 use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only]"
+    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,14 @@ struct VerifyConfig {
     key_id: String,
     integrity_only: bool,
     key_metadata: KeyMetadata,
+    format: ReportFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFormat {
+    Text,
+    Json,
+    InToto,
 }
 
 pub async fn run_attest_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -87,6 +96,35 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
         config.key_metadata,
     )?;
     let report = verify_bundle(&bundle, &trusted_keys);
+    render_report(&bundle, &report, config.format)?;
+    if !report.integrity.valid {
+        return Err(std::io::Error::other("attestation integrity verification failed").into());
+    }
+    if !config.integrity_only && !report.policy.compliant {
+        return Err(std::io::Error::other("attestation policy verification failed").into());
+    }
+    Ok(())
+}
+
+fn render_report(
+    bundle: &AttestationBundle,
+    report: &VerificationReport,
+    format: ReportFormat,
+) -> Result<(), BoxErr> {
+    match format {
+        ReportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            return Ok(());
+        }
+        ReportFormat::InToto => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&in_toto_verification_statement(bundle, report))?
+            );
+            return Ok(());
+        }
+        ReportFormat::Text => {}
+    }
     println!("integrity: {}", report.integrity.valid);
     println!("policy_compliant: {}", report.policy.compliant);
     println!("key_state: {:?}", report.policy.key.state);
@@ -133,12 +171,6 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
             "coverage: {:?} {} {}",
             declaration.disposition, declaration.kind, declaration.reference
         );
-    }
-    if !report.integrity.valid {
-        return Err(std::io::Error::other("attestation integrity verification failed").into());
-    }
-    if !config.integrity_only && !report.policy.compliant {
-        return Err(std::io::Error::other("attestation policy verification failed").into());
     }
     Ok(())
 }
@@ -233,6 +265,11 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
         successor_key_id: flag(args, "--successor-key-id")
             .or_else(|| std::env::var("SHOMEI_SUCCESSOR_KEY_ID").ok()),
     };
+    let format = flag(args, "--format")
+        .as_deref()
+        .map(parse_report_format)
+        .transpose()?
+        .unwrap_or(ReportFormat::Text);
     Ok(VerifyConfig {
         bundle,
         trusted_key,
@@ -240,6 +277,7 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
         key_id,
         integrity_only: args.iter().any(|arg| arg == "--integrity-only"),
         key_metadata,
+        format,
     })
 }
 
@@ -284,6 +322,15 @@ fn parse_key_state(value: &str) -> Result<KeyState, String> {
         "revoked" => Ok(KeyState::Revoked),
         "unknown" => Ok(KeyState::Unknown),
         _ => Err("--key-state must be active, rotated, revoked, or unknown".into()),
+    }
+}
+
+fn parse_report_format(value: &str) -> Result<ReportFormat, String> {
+    match value.trim() {
+        "text" => Ok(ReportFormat::Text),
+        "json" => Ok(ReportFormat::Json),
+        "in-toto" => Ok(ReportFormat::InToto),
+        _ => Err("--format must be text, json, or in-toto".into()),
     }
 }
 
@@ -448,5 +495,16 @@ mod tests {
         assert_eq!(parse_key_state("revoked").unwrap(), KeyState::Revoked);
         assert_eq!(parse_key_state("unknown").unwrap(), KeyState::Unknown);
         assert!(parse_key_state("compromised").is_err());
+    }
+
+    #[test]
+    fn report_format_parser_supports_external_formats() {
+        assert_eq!(parse_report_format("text").unwrap(), ReportFormat::Text);
+        assert_eq!(parse_report_format("json").unwrap(), ReportFormat::Json);
+        assert_eq!(
+            parse_report_format("in-toto").unwrap(),
+            ReportFormat::InToto
+        );
+        assert!(parse_report_format("sarif").is_err());
     }
 }
