@@ -955,7 +955,14 @@ fn run_kioku_enrich(
 
 fn estimated_memory_tokens(text: &str) -> usize {
     let word_estimate = text.split_whitespace().count();
-    let char_estimate = text.chars().count().div_ceil(4);
+    let (ascii_chars, non_ascii_chars) = text.chars().fold((0_usize, 0_usize), |counts, ch| {
+        if ch.is_ascii() {
+            (counts.0 + 1, counts.1)
+        } else {
+            (counts.0, counts.1 + 1)
+        }
+    });
+    let char_estimate = ascii_chars.div_ceil(4).saturating_add(non_ascii_chars);
     word_estimate.max(char_estimate).max(1)
 }
 
@@ -1693,7 +1700,7 @@ mod tests {
 
     #[test]
     fn memory_token_estimate_bounds_text_without_whitespace() {
-        assert_eq!(estimated_memory_tokens(&"界".repeat(400)), 100);
+        assert_eq!(estimated_memory_tokens(&"界".repeat(400)), 400);
         assert!(estimated_memory_tokens(&"x".repeat(2_048)) >= 512);
     }
 
