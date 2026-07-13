@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-pub const BUNDLE_VERSION: &str = "shomei.bundle/v1";
+pub const BUNDLE_VERSION: &str = "shomei.bundle/v2";
 pub const CANONICALIZATION_VERSION: &str = "shomei.canonical-json/v1";
 pub const VERIFICATION_POLICY_VERSION: &str = "shomei.verify/v1";
 pub const DIGEST_ALGORITHM: &str = "sha-256";
@@ -879,6 +879,15 @@ mod tests {
         bundle
             .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
             .unwrap();
+        let report = verify_bundle(&bundle, &trusted_keys());
+        assert!(!report.integrity.versions_supported);
+        assert!(!report.integrity.valid);
+    }
+
+    #[test]
+    fn legacy_bundle_version_is_rejected_after_signed_schema_change() {
+        let mut bundle = signed_bundle();
+        bundle.bundle_version = "shomei.bundle/v1".into();
         let report = verify_bundle(&bundle, &trusted_keys());
         assert!(!report.integrity.versions_supported);
         assert!(!report.integrity.valid);
