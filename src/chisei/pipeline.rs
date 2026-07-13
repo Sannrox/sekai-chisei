@@ -879,7 +879,7 @@ fn run_kioku_enrich(
             "- {} [memory:{}@{}]",
             item.memory.claim, item.memory.id, item.memory.version
         );
-        let estimated_tokens = line.split_whitespace().count().max(1);
+        let estimated_tokens = estimated_memory_tokens(&line);
         if estimated_tokens > remaining_tokens {
             continue;
         }
@@ -951,6 +951,12 @@ fn run_kioku_enrich(
             .collect::<Vec<_>>()
             .join(","),
     }
+}
+
+fn estimated_memory_tokens(text: &str) -> usize {
+    let word_estimate = text.split_whitespace().count();
+    let char_estimate = text.chars().count().div_ceil(4);
+    word_estimate.max(char_estimate).max(1)
 }
 
 pub struct LearningsEnrichStep;
@@ -1683,6 +1689,12 @@ mod tests {
         let result = pipeline.run_with_context_expansion(&mut external, &db, true);
         assert!(result.memory_references.is_empty());
         assert!(!result.prepared_spec.contains("Governed memory"));
+    }
+
+    #[test]
+    fn memory_token_estimate_bounds_text_without_whitespace() {
+        assert_eq!(estimated_memory_tokens(&"界".repeat(400)), 100);
+        assert!(estimated_memory_tokens(&"x".repeat(2_048)) >= 512);
     }
 
     fn configure_evidence(db: &SekaiDb) {
