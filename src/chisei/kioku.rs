@@ -1017,6 +1017,25 @@ impl SekaiDb {
         if memory.state != MemoryLifecycleState::Active {
             return Err("outcomes can only be attributed to active memories".into());
         }
+        let receipt = self
+            .get_operation_receipt(observation.operation_id.trim())?
+            .ok_or_else(|| "operation receipt not found".to_string())?;
+        let receipt_request_id = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .and_then(|event| event.attributes.get("request_id"))
+            .map(String::as_str);
+        if !receipt.completeness().complete
+            || receipt_request_id != Some(observation.request_id.trim())
+            || receipt.namespace != memory.namespace
+            || !memory
+                .operation_classes
+                .iter()
+                .any(|class| class == &receipt.operation_class)
+        {
+            return Err("operation receipt does not match memory outcome scope".into());
+        }
         let evidence = self.list_kioku_evidence(&memory.id, memory.version)?;
         if !evidence
             .iter()
@@ -1464,6 +1483,18 @@ mod tests {
         }
     }
 
+    fn persist_outcome_receipt(db: &SekaiDb, operation_id: &str, request_id: &str) {
+        let mut receipt = verified_outcome(operation_id, true).receipt;
+        receipt
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap()
+            .attributes
+            .insert("request_id".into(), request_id.into());
+        db.put_operation_receipt(&receipt).unwrap();
+    }
+
     fn active_memory(
         db: &SekaiDb,
         id: &str,
@@ -1882,6 +1913,7 @@ mod tests {
         );
         for operation_id in ["treatment-1", "treatment-2"] {
             let request_id = format!("request-{operation_id}");
+            persist_outcome_receipt(&db, operation_id, &request_id);
             db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
                 memory_id: "regressing".into(),
                 memory_version: 1,
@@ -1908,6 +1940,7 @@ mod tests {
         }
         for operation_id in ["control-1", "control-2"] {
             let request_id = format!("request-{operation_id}");
+            persist_outcome_receipt(&db, operation_id, &request_id);
             db.record_kioku_holdout("regressing", 1, &request_id, "kioku:evaluator", 140)
                 .unwrap();
             db.record_kioku_outcome(&MemoryOutcomeObservation {
