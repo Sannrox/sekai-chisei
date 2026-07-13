@@ -118,6 +118,40 @@ pub struct CandidateDerivation {
     pub retention_until_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryValidation {
+    pub valid: bool,
+    pub errors: Vec<String>,
+    pub supporting_evidence: usize,
+    pub contradicting_evidence: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanReviewAction {
+    Promote,
+    Reject,
+}
+
+#[derive(Debug, Clone)]
+pub struct HumanMemoryReview {
+    pub action: HumanReviewAction,
+    pub reviewer: String,
+    pub rationale: String,
+    pub reviewed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLifecycleEvent {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub action: String,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub actor: String,
+    pub reason: String,
+    pub recorded_at_ms: i64,
+}
+
 pub fn derive_verified_outcome_candidate(
     input: CandidateDerivation,
 ) -> Result<(KiokuMemory, Vec<KiokuEvidenceLink>), String> {
@@ -389,7 +423,20 @@ impl SekaiDb {
                     REFERENCES chisei_kioku_memories(id, version)
             );
             CREATE INDEX IF NOT EXISTS idx_kioku_evidence_operation
-                ON chisei_kioku_evidence_links(operation_id);",
+                ON chisei_kioku_evidence_links(operation_id);
+            CREATE TABLE IF NOT EXISTS chisei_kioku_lifecycle_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL,
+                memory_version INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_state TEXT,
+                to_state TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                recorded_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kioku_lifecycle_memory
+                ON chisei_kioku_lifecycle_events(memory_id, memory_version, id);",
         )
         .map_err(|error| error.to_string())
     }
@@ -453,6 +500,19 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?;
         }
+        insert_lifecycle_event(
+            &tx,
+            &MemoryLifecycleEvent {
+                memory_id: memory.id.clone(),
+                memory_version: memory.version,
+                action: "created".into(),
+                from_state: None,
+                to_state: memory.state.as_str().into(),
+                actor: memory.producer_identity.clone(),
+                reason: memory.derivation_method.clone(),
+                recorded_at_ms: memory.created_at_ms,
+            },
+        )?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -500,6 +560,189 @@ impl SekaiDb {
         })
         .collect()
     }
+
+    pub fn validate_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<MemoryValidation, String> {
+        let Some(memory) = self.get_kioku_memory(id, version)? else {
+            return Err(format!("memory {id} version {version} not found"));
+        };
+        let evidence = self.list_kioku_evidence(id, version)?;
+        let mut errors = memory.validate_contract().err().unwrap_or_default();
+        if memory.state != MemoryLifecycleState::Candidate {
+            errors.push("only candidate memories can be validated for review".into());
+        }
+        let supporting_evidence = evidence
+            .iter()
+            .filter(|link| link.stance == MemoryEvidenceStance::Supporting)
+            .count();
+        let contradicting_evidence = evidence.len().saturating_sub(supporting_evidence);
+        if supporting_evidence == 0 {
+            errors.push("candidate requires supporting evidence".into());
+        }
+        if evidence.len() != memory.sample_size as usize {
+            errors.push(format!(
+                "sample_size {} does not match {} evidence links",
+                memory.sample_size,
+                evidence.len()
+            ));
+        }
+        let mut operations = std::collections::HashSet::new();
+        let mut metrics = std::collections::HashSet::new();
+        for link in &evidence {
+            if let Err(error) = link.validate(&memory) {
+                errors.push(error);
+            }
+            if !operations.insert(link.operation_id.as_str()) {
+                errors.push(format!(
+                    "duplicate evidence operation {}",
+                    link.operation_id
+                ));
+            }
+            metrics.insert(link.outcome_metric.trim());
+        }
+        if metrics.len() != 1 {
+            errors.push("candidate evidence must share one outcome metric".into());
+        }
+        if memory.derivation_method == "verified_binary_outcomes/v1" && !evidence.is_empty() {
+            let expected = ((supporting_evidence as u64 * 10_000) / evidence.len() as u64) as u16;
+            if memory.confidence_bps != expected {
+                errors.push(format!(
+                    "confidence_bps {} does not match verified outcome rate {expected}",
+                    memory.confidence_bps
+                ));
+            }
+        }
+        errors.sort();
+        errors.dedup();
+        Ok(MemoryValidation {
+            valid: errors.is_empty(),
+            errors,
+            supporting_evidence,
+            contradicting_evidence,
+        })
+    }
+
+    pub fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        if review.reviewer.trim().is_empty() || review.rationale.trim().is_empty() {
+            return Err("reviewer and rationale are required".into());
+        }
+        let validation = self.validate_kioku_candidate(id, version)?;
+        if review.action == HumanReviewAction::Promote && !validation.valid {
+            return Err(format!(
+                "candidate validation failed: {}",
+                validation.errors.join("; ")
+            ));
+        }
+        let mut memory = self
+            .get_kioku_memory(id, version)?
+            .ok_or_else(|| format!("memory {id} version {version} not found"))?;
+        if memory.state != MemoryLifecycleState::Candidate {
+            return Err("memory is no longer awaiting review".into());
+        }
+        let next_state = match review.action {
+            HumanReviewAction::Promote => MemoryLifecycleState::Active,
+            HumanReviewAction::Reject => MemoryLifecycleState::Rejected,
+        };
+        memory.state = next_state;
+        memory.reviewed_at_ms = Some(review.reviewed_at_ms);
+        let memory_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE chisei_kioku_memories
+                 SET state=?1, memory_json=?2
+                 WHERE id=?3 AND version=?4 AND state='candidate'",
+                params![next_state.as_str(), memory_json, id, version],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("memory changed during review".into());
+        }
+        insert_lifecycle_event(
+            &tx,
+            &MemoryLifecycleEvent {
+                memory_id: id.into(),
+                memory_version: version,
+                action: match review.action {
+                    HumanReviewAction::Promote => "promoted",
+                    HumanReviewAction::Reject => "rejected",
+                }
+                .into(),
+                from_state: Some(MemoryLifecycleState::Candidate.as_str().into()),
+                to_state: next_state.as_str().into(),
+                actor: review.reviewer.trim().into(),
+                reason: review.rationale.trim().into(),
+                recorded_at_ms: review.reviewed_at_ms,
+            },
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(memory)
+    }
+
+    pub fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT memory_id, memory_version, action, from_state, to_state, actor, reason,
+                        recorded_at_ms
+                 FROM chisei_kioku_lifecycle_events
+                 WHERE memory_id=?1 AND memory_version=?2 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![id, version], |row| {
+                Ok(MemoryLifecycleEvent {
+                    memory_id: row.get(0)?,
+                    memory_version: row.get(1)?,
+                    action: row.get(2)?,
+                    from_state: row.get(3)?,
+                    to_state: row.get(4)?,
+                    actor: row.get(5)?,
+                    reason: row.get(6)?,
+                    recorded_at_ms: row.get(7)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn insert_lifecycle_event(
+    tx: &rusqlite::Transaction<'_>,
+    event: &MemoryLifecycleEvent,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO chisei_kioku_lifecycle_events
+         (memory_id, memory_version, action, from_state, to_state, actor, reason, recorded_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            event.memory_id,
+            event.memory_version,
+            event.action,
+            event.from_state,
+            event.to_state,
+            event.actor,
+            event.reason,
+            event.recorded_at_ms,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -783,5 +1026,57 @@ mod tests {
         multiple.receipt.events.insert(4, unrelated);
         let (_, links) = derive_verified_outcome_candidate(input(vec![multiple])).unwrap();
         assert_eq!(links[0].verification_event_id, "operation-4-verify");
+    }
+
+    #[test]
+    fn validates_and_promotes_candidate_with_human_audit() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.produce_kioku_candidate(CandidateDerivation {
+            id: "reviewed-1".into(),
+            kind: MemoryKind::Recommendation,
+            claim: "Verify migrations".into(),
+            outcome_definition: "verification pass rate".into(),
+            outcomes: vec![verified_outcome("operation-1", true)],
+            affinity_object_ids: vec![],
+            producer_identity: "kioku:deriver".into(),
+            classification: EvidenceClassification::Internal,
+            created_at_ms: 120,
+            expires_at_ms: Some(220),
+            retention_until_ms: Some(320),
+        })
+        .unwrap();
+
+        let validation = db.validate_kioku_candidate("reviewed-1", 1).unwrap();
+        assert!(validation.valid);
+        let promoted = db
+            .review_kioku_candidate(
+                "reviewed-1",
+                1,
+                HumanMemoryReview {
+                    action: HumanReviewAction::Promote,
+                    reviewer: "human:operator".into(),
+                    rationale: "evidence is representative".into(),
+                    reviewed_at_ms: 130,
+                },
+            )
+            .unwrap();
+        assert_eq!(promoted.state, MemoryLifecycleState::Active);
+        let duplicate_review = db
+            .review_kioku_candidate(
+                "reviewed-1",
+                1,
+                HumanMemoryReview {
+                    action: HumanReviewAction::Reject,
+                    reviewer: "human:operator".into(),
+                    rationale: "late review".into(),
+                    reviewed_at_ms: 140,
+                },
+            )
+            .unwrap_err();
+        assert!(duplicate_review.contains("no longer awaiting review"));
+        let events = db.list_kioku_lifecycle_events("reviewed-1", 1).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].action, "promoted");
+        assert_eq!(events[1].actor, "human:operator");
     }
 }
