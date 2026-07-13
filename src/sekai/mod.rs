@@ -9,6 +9,7 @@ pub mod coordination;
 pub mod credentials;
 pub mod dataset;
 pub mod escalation;
+pub mod evidence;
 pub mod function;
 pub mod learning;
 pub mod ledger;
