@@ -2,6 +2,7 @@ use std::error::Error as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -75,6 +76,7 @@ const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
 const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
+const DEFAULT_AUDIT_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_CONTROL_PLANE_RETRIES: u32 = 2;
 const DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS: u64 = 25;
 const DEFAULT_CONTROL_PLANE_TIMEOUT_MS: u64 = 3_000;
@@ -378,10 +380,15 @@ struct GatewayRuntime {
     governance_cache_ttl: Duration,
     budget_reconciliation_path: Option<PathBuf>,
     budget_reconciliation_lock: Arc<Mutex<()>>,
+    audit_spool_path: Option<PathBuf>,
+    audit_spool_max_bytes: u64,
+    audit_spool_lock: Arc<Mutex<()>>,
     control_plane_circuit: Arc<RwLock<CircuitBreakerState>>,
     readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
     upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
     resilience: ResilienceConfig,
+    spooled_audit_events: Arc<AtomicU64>,
+    last_degraded_at_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -596,12 +603,21 @@ impl GatewayRuntime {
                 .filter(|value| !value.trim().is_empty()),
         )
         .with_governance_cache_ttl(governance_cache_ttl)
+        .with_resilience(resilience)
         .with_budget_reconciliation_path(Some(PathBuf::from(
             std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
                 .unwrap_or_else(|_| "data/chisei-gateway-budget-reconciliation.json".to_string()),
         )))
-        .with_resilience(resilience)
+        .with_audit_spool_path(Some(PathBuf::from(
+            std::env::var("CHISEI_GATEWAY_AUDIT_SPOOL_PATH")
+                .unwrap_or_else(|_| "data/chisei-gateway-audit.jsonl".to_string()),
+        )))
         .with_http_timeouts(HttpTimeouts::from_env());
+        runtime.audit_spool_max_bytes = env_u64(
+            "CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES",
+            DEFAULT_AUDIT_SPOOL_MAX_BYTES,
+        )
+        .max(1);
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
         runtime.rate_limit_requests = positive_env("CHISEI_GATEWAY_RATE_LIMIT_REQUESTS")
@@ -632,10 +648,15 @@ impl GatewayRuntime {
             governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
             budget_reconciliation_path: None,
             budget_reconciliation_lock: Arc::new(Mutex::new(())),
+            audit_spool_path: None,
+            audit_spool_max_bytes: DEFAULT_AUDIT_SPOOL_MAX_BYTES,
+            audit_spool_lock: Arc::new(Mutex::new(())),
             control_plane_circuit: Arc::new(RwLock::new(CircuitBreakerState::default())),
             readiness_probe: Arc::new(Mutex::new(None)),
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
             resilience: ResilienceConfig::default(),
+            spooled_audit_events: Arc::new(AtomicU64::new(0)),
+            last_degraded_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -646,6 +667,11 @@ impl GatewayRuntime {
 
     fn with_http_timeouts(mut self, http_timeouts: HttpTimeouts) -> Self {
         self.http_timeouts = http_timeouts;
+        self
+    }
+
+    fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = resilience;
         self
     }
 
@@ -694,8 +720,14 @@ impl GatewayRuntime {
         }
         self
     }
-    fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
-        self.resilience = resilience;
+    fn with_audit_spool_path(mut self, path: Option<PathBuf>) -> Self {
+        self.audit_spool_path = path;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_audit_spool_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.audit_spool_max_bytes = max_bytes.max(1);
         self
     }
 }
@@ -840,6 +872,7 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(gateway_health))
         .route("/readyz", axum::routing::get(gateway_readiness))
+        .route("/statusz", axum::routing::get(gateway_status))
         .route("/_chisei/admin/refresh", post(refresh_gateway_admin))
         .route("/{*path}", any(proxy_gateway))
         .with_state(state)
@@ -849,12 +882,69 @@ async fn gateway_health() -> Response<Body> {
     json_response(StatusCode::OK, serde_json::json!({"status": "healthy"}))
 }
 
+async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
+    let circuit_open = state.runtime.control_plane_circuit.read().await.is_open();
+    let cache = state.runtime.governance_cache.read().await;
+    let pending_budget_reconciliations = cache.pending_budget_usage.len();
+    let budget_reconciliation_saturated = cache.budget_reconciliation_saturated;
+    let cached_governance_decisions =
+        cache.budgets.len() + cache.policies.len() + cache.egress.len();
+    drop(cache);
+    let last_degraded_at_ms = state.runtime.last_degraded_at_ms.load(Ordering::Relaxed);
+    let recently_degraded = last_degraded_at_ms > 0
+        && Utc::now()
+            .timestamp_millis()
+            .saturating_sub(last_degraded_at_ms as i64)
+            <= state.runtime.governance_cache_ttl.as_millis() as i64;
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": if circuit_open
+                || recently_degraded
+                || pending_budget_reconciliations > 0
+                || budget_reconciliation_saturated
+            {
+                "degraded"
+            } else {
+                "live"
+            },
+            "control_plane_circuit_open": circuit_open,
+            "cached_governance_decisions": cached_governance_decisions,
+            "pending_budget_reconciliations": pending_budget_reconciliations,
+            "budget_reconciliation_saturated": budget_reconciliation_saturated,
+            "spooled_audit_events": state.runtime.spooled_audit_events.load(Ordering::Relaxed),
+            "last_degraded_at_ms": last_degraded_at_ms
+        }),
+    )
+}
+
 async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> {
     if state.config.no_preflight {
-        return json_response(
-            StatusCode::OK,
-            serde_json::json!({"status": "ready", "governance": "disabled"}),
-        );
+        let mut cached_probe = state.runtime.readiness_probe.lock().await;
+        let ready = if let Some((checked_at, ready)) = *cached_probe
+            && checked_at.elapsed() < Duration::from_secs(READINESS_PROBE_CACHE_SECS)
+        {
+            ready
+        } else {
+            let ready = audit_spool_writable(&state.runtime).await;
+            *cached_probe = Some((Instant::now(), ready));
+            ready
+        };
+        return if ready {
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({"status": "ready", "governance": "disabled"}),
+            )
+        } else {
+            json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "status": "not_ready",
+                    "governance": "disabled",
+                    "reason": "audit_spool_unavailable"
+                }),
+            )
+        };
     }
     let Some(target) = state.config.chisei_grpc_target.as_deref() else {
         return json_response(
@@ -916,6 +1006,51 @@ async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> 
             serde_json::json!({"status": "not_ready", "governance": "unavailable"}),
         )
     }
+}
+
+async fn audit_spool_writable(runtime: &GatewayRuntime) -> bool {
+    let Some(path) = runtime.audit_spool_path.clone() else {
+        return false;
+    };
+    let _spool_guard = runtime.audit_spool_lock.lock().await;
+    matches!(
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let created = !path.exists();
+            let mut spool_options = std::fs::OpenOptions::new();
+            spool_options.create(true).append(true);
+            #[cfg(unix)]
+            spool_options.mode(0o600);
+            spool_options.open(&path)?.sync_all()?;
+            if created {
+                sync_parent_directory(&path)?;
+            }
+            let probe = parent.join(format!(".chisei-audit-readiness-{}", uuid::Uuid::new_v4()));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let operation = (|| -> std::io::Result<()> {
+                let mut file = options.open(&probe)?;
+                file.write_all(b"ready")?;
+                file.sync_all()
+            })();
+            let removal = std::fs::remove_file(&probe);
+            operation?;
+            removal?;
+            sync_parent_directory(&path)
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1145,10 +1280,29 @@ async fn proxy_gateway(
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
         return rejection.response();
     }
+    if state.config.no_preflight
+        && !record_resilience_decision(
+            &state.config,
+            &state.runtime,
+            &identity,
+            "gateway.preflight_disabled",
+            "governance preflight disabled by operator configuration",
+            "fail_open",
+            failure_posture.evidence(),
+        )
+        .await
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_audit_unavailable",
+            "cannot forward without a durable governance audit record",
+        );
+    }
     if !state.config.no_preflight
         && state.config.chisei_grpc_target.is_none()
         && let Err(rejection) = governance_error(
             &state.config,
+            &state.runtime,
             &identity,
             &failure_posture,
             "control-plane governance is not configured",
@@ -1625,20 +1779,33 @@ async fn check_budget_preflight(
                         ));
                     }
                     record_control_plane_failure(runtime, &err).await;
-                    if let Some(response) = reserve_cached_budget(runtime, &cache_key, &req).await {
-                        record_gateway_decision(
+                    if let Some(reservation) =
+                        reserve_cached_budget(runtime, &cache_key, &req).await
+                    {
+                        if !record_resilience_decision(
                             config,
+                            runtime,
                             identity,
                             "gateway.budget_last_known",
                             &format!("budget reconciliation unavailable: {err}"),
                             "reserved",
                             HashMap::from([("metric".to_string(), req.metric.clone())]),
                         )
-                        .await;
-                        return Ok(response);
+                        .await
+                        {
+                            rollback_cached_budget_reservation(runtime, &cache_key, &reservation)
+                                .await;
+                            return Err(GatewayRejection::json(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "governance_audit_unavailable",
+                                "cannot use last-known budget without a durable audit record",
+                            ));
+                        }
+                        return Ok(reservation.response);
                     }
                     governance_error(
                         config,
+                        runtime,
                         identity,
                         failure_posture,
                         &format!("budget reconciliation failed: {err}"),
@@ -1725,22 +1892,37 @@ async fn check_budget_preflight(
                             return Err(governance_status_rejection(&err));
                         }
                         record_control_plane_failure(runtime, &err).await;
-                        if let Some(response) =
+                        if let Some(reservation) =
                             reserve_cached_budget(runtime, &cache_key, &req).await
                         {
-                            record_gateway_decision(
+                            if !record_resilience_decision(
                                 config,
+                                runtime,
                                 identity,
                                 "gateway.budget_last_known",
                                 &format!("CheckBudget unavailable: {err}"),
                                 "reserved",
                                 HashMap::from([("metric".to_string(), req.metric.clone())]),
                             )
-                            .await;
-                            return Ok(response);
+                            .await
+                            {
+                                rollback_cached_budget_reservation(
+                                    runtime,
+                                    &cache_key,
+                                    &reservation,
+                                )
+                                .await;
+                                return Err(GatewayRejection::json(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "governance_audit_unavailable",
+                                    "cannot use last-known budget without a durable audit record",
+                                ));
+                            }
+                            return Ok(reservation.response);
                         }
                         governance_error(
                             config,
+                            runtime,
                             identity,
                             failure_posture,
                             &format!("CheckBudget failed: {err}"),
@@ -1757,20 +1939,30 @@ async fn check_budget_preflight(
                 }
             }
             Err(err) => {
-                if let Some(response) = reserve_cached_budget(runtime, &cache_key, &req).await {
-                    record_gateway_decision(
+                if let Some(reservation) = reserve_cached_budget(runtime, &cache_key, &req).await {
+                    if !record_resilience_decision(
                         config,
+                        runtime,
                         identity,
                         "gateway.budget_last_known",
                         &format!("control plane unavailable: {err}"),
                         "reserved",
                         HashMap::from([("metric".to_string(), req.metric.clone())]),
                     )
-                    .await;
-                    return Ok(response);
+                    .await
+                    {
+                        rollback_cached_budget_reservation(runtime, &cache_key, &reservation).await;
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "governance_audit_unavailable",
+                            "cannot use last-known budget without a durable audit record",
+                        ));
+                    }
+                    return Ok(reservation.response);
                 }
                 governance_error(
                     config,
+                    runtime,
                     identity,
                     failure_posture,
                     &format!("failed to connect to Chisei control plane: {err}"),
@@ -1894,11 +2086,18 @@ async fn cache_budget_decision(
     );
 }
 
+struct CachedBudgetReservation {
+    response: CheckBudgetResponse,
+    previous_remaining: Option<i32>,
+    reserved: i32,
+    token_single_use: bool,
+}
+
 async fn reserve_cached_budget(
     runtime: &GatewayRuntime,
     key: &str,
     request: &CheckBudgetRequest,
-) -> Option<CheckBudgetResponse> {
+) -> Option<CachedBudgetReservation> {
     let mut cache = runtime.governance_cache.write().await;
     if cache.budget_reconciliation_saturated {
         return None;
@@ -1907,6 +2106,7 @@ async fn reserve_cached_budget(
     if entry.cached_at.elapsed() >= runtime.governance_cache_ttl {
         return None;
     }
+    let previous_remaining = entry.remaining;
     if let Some(remaining) = entry.remaining.as_mut() {
         if *remaining < request.estimated_tokens {
             return None;
@@ -1923,7 +2123,31 @@ async fn reserve_cached_budget(
     let mut response = entry.response.clone();
     response.warning = true;
     response.degradation_level = "last_known".to_string();
-    Some(response)
+    Some(CachedBudgetReservation {
+        response,
+        previous_remaining,
+        reserved: request.estimated_tokens,
+        token_single_use: request.metric.is_empty(),
+    })
+}
+
+async fn rollback_cached_budget_reservation(
+    runtime: &GatewayRuntime,
+    key: &str,
+    reservation: &CachedBudgetReservation,
+) {
+    let mut cache = runtime.governance_cache.write().await;
+    let Some(entry) = cache.budgets.get_mut(key) else {
+        return;
+    };
+    if reservation.token_single_use {
+        entry.remaining = reservation.previous_remaining;
+    } else if let Some(remaining) = entry.remaining.as_mut() {
+        *remaining = remaining.saturating_add(reservation.reserved);
+        if let Some(previous) = reservation.previous_remaining {
+            *remaining = (*remaining).min(previous);
+        }
+    }
 }
 
 async fn queue_pending_budget_usage(
@@ -1978,7 +2202,6 @@ async fn persist_pending_budget_usage(
             use std::io::Write;
             #[cfg(unix)]
             use std::os::unix::fs::OpenOptionsExt;
-
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -2219,6 +2442,36 @@ async fn cached_egress_decision(
 
 async fn invalidate_cached_egress(runtime: &GatewayRuntime, key: &str) {
     runtime.governance_cache.write().await.egress.remove(key);
+}
+
+async fn fail_open_egress(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    body: &[u8],
+    reason: &str,
+    failure_posture: &GovernanceFailurePosture,
+) -> Result<ContextEgressPreflight, GatewayRejection> {
+    if !record_resilience_decision(
+        config,
+        runtime,
+        identity,
+        "gateway.egress_unavailable",
+        reason,
+        "fail_open",
+        failure_posture.evidence(),
+    )
+    .await
+    {
+        return Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_audit_unavailable",
+            "cannot forward without a durable governance audit record",
+        ));
+    }
+    Ok(ContextEgressPreflight {
+        body: body.to_vec(),
+    })
 }
 
 const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
@@ -2562,8 +2815,9 @@ async fn resolve_policy_preflight(
                     if let Some(decision) =
                         cached_policy_decision(runtime, &cache_key, body, requested_model).await
                     {
-                        record_gateway_decision(
+                        if !record_resilience_decision(
                             config,
+                            runtime,
                             identity,
                             "gateway.policy_last_known",
                             &format!("ResolvePolicy unavailable: {err}"),
@@ -2573,11 +2827,19 @@ async fn resolve_policy_preflight(
                                 requested_model.to_string(),
                             )]),
                         )
-                        .await;
+                        .await
+                        {
+                            return Err(GatewayRejection::json(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "governance_audit_unavailable",
+                                "cannot use last-known policy without a durable audit record",
+                            ));
+                        }
                         return Ok(decision);
                     }
                     governance_error(
                         config,
+                        runtime,
                         identity,
                         failure_posture,
                         &format!("ResolvePolicy failed: {err}"),
@@ -2598,19 +2860,28 @@ async fn resolve_policy_preflight(
             if let Some(decision) =
                 cached_policy_decision(runtime, &cache_key, body, requested_model).await
             {
-                record_gateway_decision(
+                if !record_resilience_decision(
                     config,
+                    runtime,
                     identity,
                     "gateway.policy_last_known",
                     &format!("control plane unavailable: {err}"),
                     "enforced",
                     HashMap::from([("requested_model".to_string(), requested_model.to_string())]),
                 )
-                .await;
+                .await
+                {
+                    return Err(GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_audit_unavailable",
+                        "cannot use last-known policy without a durable audit record",
+                    ));
+                }
                 return Ok(decision);
             }
             governance_error(
                 config,
+                runtime,
                 identity,
                 failure_posture,
                 &format!("failed to connect to Chisei control plane: {err}"),
@@ -3589,15 +3860,23 @@ async fn apply_context_egress(
     let cache_key = egress_cache_key(identity, provider, body, context_request);
     let Some(target) = &config.chisei_grpc_target else {
         if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-            record_gateway_decision(
+            if !record_resilience_decision(
                 config,
+                runtime,
                 identity,
                 "gateway.egress_last_known",
                 "control-plane governance is not configured",
                 "enforced",
                 HashMap::new(),
             )
-            .await;
+            .await
+            {
+                return Err(GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_audit_unavailable",
+                    "cannot use last-known egress without a durable audit record",
+                ));
+            }
             return Ok(decision);
         }
         if context_request.is_some() {
@@ -3607,9 +3886,15 @@ async fn apply_context_egress(
                 "explicit governed context requires a configured control plane",
             ));
         }
-        return Ok(ContextEgressPreflight {
-            body: body.to_vec(),
-        });
+        return fail_open_egress(
+            config,
+            runtime,
+            identity,
+            body,
+            "control-plane governance is not configured",
+            failure_posture,
+        )
+        .await;
     };
     let selections = context_request
         .map(|request| request.objects.clone())
@@ -3631,15 +3916,23 @@ async fn apply_context_egress(
         Ok(channel) => channel,
         Err(error) => {
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                record_gateway_decision(
+                if !record_resilience_decision(
                     config,
+                    runtime,
                     identity,
                     "gateway.egress_last_known",
                     &format!("control plane unavailable: {error}"),
                     "enforced",
                     HashMap::new(),
                 )
-                .await;
+                .await
+                {
+                    return Err(GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_audit_unavailable",
+                        "cannot use last-known egress without a durable audit record",
+                    ));
+                }
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
@@ -3649,9 +3942,15 @@ async fn apply_context_egress(
                     format!("failed to resolve governed context: {error}"),
                 ));
             }
-            return Ok(ContextEgressPreflight {
-                body: body.to_vec(),
-            });
+            return fail_open_egress(
+                config,
+                runtime,
+                identity,
+                body,
+                &format!("control plane unavailable: {error}"),
+                failure_posture,
+            )
+            .await;
         }
     };
     let mut chisei = ChiseiServiceClient::new(channel.clone());
@@ -3679,15 +3978,23 @@ async fn apply_context_egress(
             }
             record_control_plane_failure(runtime, &status).await;
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                record_gateway_decision(
+                if !record_resilience_decision(
                     config,
+                    runtime,
                     identity,
                     "gateway.egress_last_known",
                     &format!("context schema unavailable: {status}"),
                     "enforced",
                     HashMap::new(),
                 )
-                .await;
+                .await
+                {
+                    return Err(GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_audit_unavailable",
+                        "cannot use last-known egress without a durable audit record",
+                    ));
+                }
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
@@ -3697,9 +4004,15 @@ async fn apply_context_egress(
                     format!("failed to resolve context schema: {status}"),
                 ));
             }
-            return Ok(ContextEgressPreflight {
-                body: body.to_vec(),
-            });
+            return fail_open_egress(
+                config,
+                runtime,
+                identity,
+                body,
+                &format!("context schema unavailable: {status}"),
+                failure_posture,
+            )
+            .await;
         }
     };
     let resolution = match resolve_gateway_context(
@@ -3752,15 +4065,23 @@ async fn apply_context_egress(
             }
             record_control_plane_failure(runtime, &status).await;
             if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                record_gateway_decision(
+                if !record_resilience_decision(
                     config,
+                    runtime,
                     identity,
                     "gateway.egress_last_known",
                     &format!("context resolution unavailable: {status}"),
                     "enforced",
                     HashMap::new(),
                 )
-                .await;
+                .await
+                {
+                    return Err(GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_audit_unavailable",
+                        "cannot use last-known egress without a durable audit record",
+                    ));
+                }
                 return Ok(decision);
             }
             if context_request.is_some() || failure_posture.fail_closed {
@@ -3770,9 +4091,15 @@ async fn apply_context_egress(
                     format!("failed to resolve governed context: {status}"),
                 ));
             }
-            return Ok(ContextEgressPreflight {
-                body: body.to_vec(),
-            });
+            return fail_open_egress(
+                config,
+                runtime,
+                identity,
+                body,
+                &format!("context resolution unavailable: {status}"),
+                failure_posture,
+            )
+            .await;
         }
     };
     if context_request.is_some() && resolution.unresolved_roots > 0 {
@@ -4594,12 +4921,14 @@ fn domain_object_from_proto(object: &SekaiObject) -> crate::domain::Object {
 
 async fn governance_error(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     failure_posture: &GovernanceFailurePosture,
     message: &str,
 ) -> Result<(), GatewayRejection> {
-    record_gateway_decision(
+    let recorded = record_resilience_decision(
         config,
+        runtime,
         identity,
         "gateway.governance_unavailable",
         message,
@@ -4611,7 +4940,7 @@ async fn governance_error(
         failure_posture.evidence(),
     )
     .await;
-    if failure_posture.fail_closed {
+    if failure_posture.fail_closed || !recorded {
         Err(GatewayRejection::json(
             StatusCode::SERVICE_UNAVAILABLE,
             "governance_unavailable",
@@ -6609,6 +6938,167 @@ fn sanitize_audit_evidence(evidence: HashMap<String, String>) -> HashMap<String,
         .collect()
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LocalGatewayAuditEvent {
+    id: String,
+    timestamp: i64,
+    actor: String,
+    action: String,
+    reason: String,
+    outcome: String,
+    evidence: HashMap<String, String>,
+}
+
+fn bounded_audit_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+async fn append_resilience_audit(
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    evidence: HashMap<String, String>,
+) -> bool {
+    let Some(path) = runtime.audit_spool_path.clone() else {
+        return false;
+    };
+    let evidence = sanitize_audit_evidence(evidence)
+        .into_iter()
+        .take(32)
+        .map(|(key, value)| {
+            (
+                bounded_audit_text(&key, 128),
+                bounded_audit_text(&value, 512),
+            )
+        })
+        .collect();
+    let event = LocalGatewayAuditEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now().timestamp_millis(),
+        actor: bounded_audit_text(&identity.agent, 256),
+        action: bounded_audit_text(action, 256),
+        reason: bounded_audit_text(reason, 1024),
+        outcome: bounded_audit_text(outcome, 128),
+        evidence,
+    };
+    let Ok(mut line) = serde_json::to_vec(&event) else {
+        return false;
+    };
+    line.push(b'\n');
+    if line.len() as u64 > runtime.audit_spool_max_bytes {
+        error!("chisei-gateway resilience audit event exceeds spool limit");
+        return false;
+    }
+    let _spool_guard = runtime.audit_spool_lock.lock().await;
+    let max_bytes = runtime.audit_spool_max_bytes;
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let current_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if current_bytes > 0 && current_bytes.saturating_add(line.len() as u64) > max_bytes {
+            let rotated = PathBuf::from(format!("{}.1", path.display()));
+            match std::fs::remove_file(&rotated) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::rename(&path, rotated)?;
+            sync_parent_directory(&path)?;
+        }
+        let created = !path.exists();
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        file.write_all(&line)?;
+        file.sync_all()?;
+        if created {
+            sync_parent_directory(&path)?;
+        }
+        Ok(())
+    })
+    .await;
+    if matches!(result, Ok(Ok(()))) {
+        runtime.spooled_audit_events.fetch_add(1, Ordering::Relaxed);
+        runtime.last_degraded_at_ms.store(
+            Utc::now().timestamp_millis().max(0) as u64,
+            Ordering::Relaxed,
+        );
+        true
+    } else {
+        error!("chisei-gateway resilience audit spool write failed");
+        false
+    }
+}
+
+async fn record_resilience_decision(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    evidence: HashMap<String, String>,
+) -> bool {
+    let mut local_evidence = evidence.clone();
+    local_evidence.insert("user_id".to_string(), identity.user_id.clone());
+    local_evidence.insert("project".to_string(), identity.project.clone());
+    local_evidence.insert("tier".to_string(), identity.tier.clone());
+    if !identity.key_id.is_empty() {
+        local_evidence.insert("key_id".to_string(), identity.key_id.clone());
+    }
+    let recorded =
+        append_resilience_audit(runtime, identity, action, reason, outcome, local_evidence).await;
+    let config = config.clone();
+    let identity = identity.clone();
+    let action = action.to_string();
+    if recorded {
+        let reason = reason.to_string();
+        let outcome = outcome.to_string();
+        tokio::spawn(async move {
+            record_gateway_decision(&config, &identity, &action, &reason, &outcome, evidence).await;
+        });
+    } else {
+        let mut refusal_evidence = evidence;
+        refusal_evidence.insert("intended_outcome".to_string(), outcome.to_string());
+        refusal_evidence.insert("refusal_cause".to_string(), "audit_unavailable".to_string());
+        tokio::spawn(async move {
+            record_gateway_decision(
+                &config,
+                &identity,
+                &action,
+                "durable resilience audit unavailable; request refused",
+                "refused",
+                refusal_evidence,
+            )
+            .await;
+        });
+    }
+    recorded
+}
+
 fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     let mut request = GrpcRequest::new(message);
     request
@@ -7862,8 +8352,8 @@ mod tests {
         let response = reserve_cached_budget(&runtime, &key, &outage_request)
             .await
             .expect("last-known headroom should admit a bounded reservation");
-        assert_eq!(response.degradation_level, "last_known");
-        assert!(response.warning);
+        assert_eq!(response.response.degradation_level, "last_known");
+        assert!(response.response.warning);
 
         outage_request.estimated_tokens = 50;
         assert!(
@@ -8126,6 +8616,126 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resilience_audit_spool_is_durable_bounded_and_sanitized() {
+        let path = std::env::temp_dir().join(format!(
+            "chisei-gateway-audit-test-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_audit_spool_path(Some(path.clone()))
+            .with_audit_spool_max_bytes(4_000);
+        let identity = GatewayIdentity {
+            agent: "safe-agent".into(),
+            project: "default".into(),
+            user_id: "agent:safe-agent".into(),
+            key_id: "safe-agent".into(),
+            tier: "low-risk".into(),
+        };
+        assert!(
+            append_resilience_audit(
+                &runtime,
+                &identity,
+                "gateway.governance_unavailable",
+                &"x".repeat(2_000),
+                "fail_open",
+                HashMap::from([
+                    ("authorization".into(), "Bearer secret".into()),
+                    ("data_class".into(), "unclassified".into()),
+                ]),
+            )
+            .await
+        );
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let event: LocalGatewayAuditEvent = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(event.reason.chars().count(), 1_024);
+        assert_eq!(event.evidence.get("data_class").unwrap(), "unclassified");
+        assert!(!event.evidence.contains_key("authorization"));
+        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 1);
+        for _ in 0..5 {
+            assert!(
+                append_resilience_audit(
+                    &runtime,
+                    &identity,
+                    "gateway.governance_unavailable",
+                    &"x".repeat(2_000),
+                    "fail_open",
+                    HashMap::new(),
+                )
+                .await
+            );
+        }
+        let rotated = PathBuf::from(format!("{}.1", path.display()));
+        assert!(tokio::fs::metadata(&path).await.unwrap().len() <= 4_000);
+        assert!(tokio::fs::metadata(&rotated).await.unwrap().len() <= 4_000);
+        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 6);
+        tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_file(rotated).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_open_is_refused_without_durable_audit_storage() {
+        let config = routing_config();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        let identity = GatewayIdentity {
+            agent: "safe-agent".into(),
+            project: "default".into(),
+            user_id: "agent:safe-agent".into(),
+            key_id: "safe-agent".into(),
+            tier: "low-risk".into(),
+        };
+        let posture = GovernanceFailurePosture {
+            data_class: "unclassified".into(),
+            action_risk: "low".into(),
+            fail_closed: false,
+        };
+        assert!(
+            governance_error(&config, &runtime, &identity, &posture, "control plane down")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_resilience_audit_does_not_wait_for_central_replication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(format!("http://{}", listener.local_addr().unwrap()));
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let path = std::env::temp_dir().join(format!(
+            "chisei-gateway-audit-nonblocking-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_audit_spool_path(Some(path.clone()));
+        let identity = GatewayIdentity {
+            agent: "safe-agent".into(),
+            project: "default".into(),
+            user_id: "agent:safe-agent".into(),
+            key_id: "safe-agent".into(),
+            tier: "low-risk".into(),
+        };
+
+        let started = Instant::now();
+        assert!(
+            record_resilience_decision(
+                &config,
+                &runtime,
+                &identity,
+                "gateway.no_preflight",
+                "explicit no-preflight mode",
+                "fail_open",
+                HashMap::new(),
+            )
+            .await
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
     #[test]
     fn circuit_breaker_opens_at_threshold_and_resets_on_success() {
         let resilience = ResilienceConfig {
@@ -8319,6 +8929,98 @@ mod tests {
         let circuit = runtime.control_plane_circuit.read().await;
         assert_eq!(circuit.consecutive_failures, 0);
         assert!(!circuit.is_open());
+    }
+
+    #[tokio::test]
+    async fn no_preflight_readiness_requires_writable_audit_spool() {
+        let parent =
+            std::env::temp_dir().join(format!("chisei-audit-not-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&parent, b"file").unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_audit_spool_path(Some(parent.join("audit.jsonl")));
+        let mut config = routing_config();
+        config.no_preflight = true;
+        let state = GatewayState {
+            client: runtime.http_timeouts.client(),
+            config: Arc::new(config),
+            runtime,
+        };
+
+        assert_eq!(
+            gateway_readiness(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        std::fs::remove_file(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_preflight_readiness_rejects_read_only_audit_spool() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "chisei-audit-read-only-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"existing\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_audit_spool_path(Some(path.clone()));
+        let mut config = routing_config();
+        config.no_preflight = true;
+        let state = GatewayState {
+            client: runtime.http_timeouts.client(),
+            config: Arc::new(config),
+            runtime,
+        };
+
+        assert_eq!(
+            gateway_readiness(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_status_surfaces_recent_degraded_mode() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime
+            .last_degraded_at_ms
+            .store(Utc::now().timestamp_millis() as u64, Ordering::Relaxed);
+        runtime.spooled_audit_events.store(2, Ordering::Relaxed);
+        let gateway_base = spawn_gateway_with_runtime(routing_config(), runtime).await;
+        let response = reqwest::Client::new()
+            .get(format!("{gateway_base}/statusz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["spooled_audit_events"], 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_status_surfaces_sticky_reconciliation_saturation() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime
+            .governance_cache
+            .write()
+            .await
+            .budget_reconciliation_saturated = true;
+        let state = GatewayState {
+            client: runtime.http_timeouts.client(),
+            config: Arc::new(routing_config()),
+            runtime,
+        };
+
+        let response = gateway_status(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["budget_reconciliation_saturated"], true);
     }
 
     #[test]
@@ -8805,7 +9507,16 @@ mod tests {
         .await
     }
 
-    async fn spawn_gateway_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> String {
+    async fn spawn_gateway_with_runtime(
+        config: GatewayConfig,
+        mut runtime: GatewayRuntime,
+    ) -> String {
+        if runtime.audit_spool_path.is_none() {
+            runtime.audit_spool_path = Some(std::env::temp_dir().join(format!(
+                "chisei-gateway-audit-{}.jsonl",
+                uuid::Uuid::new_v4()
+            )));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
