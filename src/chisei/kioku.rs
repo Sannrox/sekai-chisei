@@ -130,6 +130,9 @@ impl KiokuMemory {
         if self.sample_size == 0 {
             errors.push("sample_size must be greater than zero".into());
         }
+        if self.confidence_bps > 10_000 {
+            errors.push("confidence_bps must not exceed 10000".into());
+        }
         if self.claim.chars().count() > 2_048 {
             errors.push("claim exceeds 2048 characters".into());
         }
@@ -219,6 +222,12 @@ impl SekaiDb {
             .map_err(|errors| errors.join("; "))?;
         if evidence.is_empty() {
             return Err("at least one evidence link is required".into());
+        }
+        if !evidence
+            .iter()
+            .any(|link| link.stance == MemoryEvidenceStance::Supporting)
+        {
+            return Err("at least one supporting evidence link is required".into());
         }
         for link in evidence {
             link.validate(memory)?;
@@ -361,5 +370,37 @@ mod tests {
         let db = SekaiDb::new(":memory:").unwrap();
         let error = db.insert_kioku_memory(&candidate(), &[]).unwrap_err();
         assert!(error.contains("evidence link"));
+    }
+
+    #[test]
+    fn rejects_invalid_confidence_and_contradictions_only() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut memory = candidate();
+        memory.confidence_bps = 10_001;
+        assert!(
+            memory
+                .validate_contract()
+                .unwrap_err()
+                .iter()
+                .any(|error| error.contains("confidence_bps"))
+        );
+
+        memory.confidence_bps = 8_000;
+        let contradiction = KiokuEvidenceLink {
+            memory_id: memory.id.clone(),
+            memory_version: memory.version,
+            operation_id: "operation-1".into(),
+            verification_event_id: "verify-1".into(),
+            evidence_reference: "evidence:1".into(),
+            evidence_digest: "abc123".into(),
+            stance: MemoryEvidenceStance::Contradicting,
+            outcome_metric: "passed".into(),
+            outcome_value: 0.0,
+            observed_at_ms: 90,
+        };
+        let error = db
+            .insert_kioku_memory(&memory, &[contradiction])
+            .unwrap_err();
+        assert!(error.contains("supporting evidence"));
     }
 }
