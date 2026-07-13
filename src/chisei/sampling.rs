@@ -146,6 +146,7 @@ mod tests {
             template_only: false,
             expanded_context_items: 0,
             evidence_references: vec![],
+            allowed_evidence_types: std::collections::HashSet::new(),
         }
     }
 

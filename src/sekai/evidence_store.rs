@@ -762,6 +762,49 @@ impl SekaiDb {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     }
+
+    pub fn list_usable_evidence_types_for_targets(
+        &self,
+        target_object_ids: &[String],
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        if target_object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=target_object_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let now_parameter = target_object_ids.len() + 1;
+        let sql = format!(
+            "SELECT DISTINCT s.evidence_type
+             FROM sekai_evidence_submissions AS s
+             JOIN sekai_evidence_projections AS p ON p.submission_id = s.id
+             WHERE p.target_object_id IN ({placeholders})
+               AND s.lifecycle_state = 'available'
+               AND s.intent = 'upsert'
+               AND (s.expires_at_ms IS NULL OR s.expires_at_ms > ?{now_parameter})
+             ORDER BY s.evidence_type
+             LIMIT 64"
+        );
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = target_object_ids
+            .iter()
+            .cloned()
+            .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        values.push(Box::new(now_ms));
+        let parameters = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(parameters.as_slice(), |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub fn canonical_content_digest(content: &serde_json::Value) -> Result<String, String> {

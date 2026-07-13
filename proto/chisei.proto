@@ -615,6 +615,20 @@ message ListEvalIterationsRequest { string suite_id = 1; string changed_file = 2
 message ListEvalIterationsResponse { repeated EvalIteration iterations = 1; }
 message CompareRunsRequest { string baseline_id = 1; string candidate_id = 2; }
 message CompareRunsResponse { GateDecision decision = 1; }
+message GetEvidenceContextGateRequest { string namespace = 1; string evidence_type = 2; }
+message EvidenceContextGate {
+  string evidence_type = 1;
+  string profile_key = 2;
+  bool allowed = 3;
+  string verdict = 4;
+  string reason = 5;
+  string iteration_id = 6;
+  string baseline_run_id = 7;
+  string candidate_run_id = 8;
+  string expected_baseline_config_ref = 9;
+  string expected_candidate_config_ref = 10;
+}
+message GetEvidenceContextGateResponse { EvidenceContextGate gate = 1; }
 message EvalVarianceRequest { string suite_id = 1; string config_ref = 2; }
 message EvalVarianceResponse { EvalVariance variance = 1; }
 message EvalModelCompareRequest { string suite_id = 1; }
@@ -688,6 +702,7 @@ service ChiseiService {
   rpc GetLatestEvalIteration(GetLatestEvalIterationRequest) returns (GetLatestEvalIterationResponse);
   rpc ListEvalIterations(ListEvalIterationsRequest) returns (ListEvalIterationsResponse);
   rpc CompareRuns(CompareRunsRequest) returns (CompareRunsResponse);
+  rpc GetEvidenceContextGate(GetEvidenceContextGateRequest) returns (GetEvidenceContextGateResponse);
   rpc EvalVariance(EvalVarianceRequest) returns (EvalVarianceResponse);
   rpc EvalModelCompare(EvalModelCompareRequest) returns (EvalModelCompareResponse);
 
