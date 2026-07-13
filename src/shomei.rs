@@ -708,8 +708,13 @@ fn verify_artifacts(bundle: &AttestationBundle, errors: &mut Vec<String>) -> (bo
                         attestation.id == declaration.reference
                             && Some(&attestation.content_hash)
                                 == declaration.expected_digest.as_ref()
+                            && attestation_content_hash(attestation) == attestation.content_hash
                     }) {
                         missing.push(declaration.reference.clone());
+                        errors.push(format!(
+                            "policy attestation {} content does not match its receipt digest",
+                            declaration.reference
+                        ));
                         valid = false;
                     }
                     continue;
@@ -1476,8 +1481,14 @@ mod tests {
         assert!(report.policy.policy_attestations[0].replay_valid);
 
         let mut altered = bundle;
+        altered.signature = None;
         altered.policy_attestations[0].decision = "deny".into();
+        altered
+            .sign(&SigningKey::from_bytes(&[7; 32]), "node:test", "key-1", 10)
+            .unwrap();
         let report = verify_bundle(&altered, &trusted_keys());
+        assert!(report.integrity.signature_valid);
+        assert!(!report.integrity.artifacts_valid);
         assert!(!report.integrity.valid);
         assert!(!report.policy.policy_attestations[0].valid);
     }
