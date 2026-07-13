@@ -861,9 +861,6 @@ impl SekaiDb {
 
     fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String> {
         let actor = request.actor.trim();
-        if matches!(actor, "root" | "local") {
-            return Ok(());
-        }
         let namespace = request.namespace.trim();
         let namespace_object = self
             .find_by_external_id(&format!("namespace:{namespace}"))?
@@ -1456,6 +1453,15 @@ mod tests {
         assert!(!retrieved[0].evidence.is_empty());
         let events = db.list_kioku_lifecycle_events("affine", 1).unwrap();
         assert_eq!(events.last().unwrap().action, "retrieved");
+
+        let mut spoofed = request.clone();
+        spoofed.actor = "root".into();
+        spoofed.classification_ceiling = EvidenceClassification::Restricted;
+        assert!(
+            db.retrieve_kioku_memories(&spoofed)
+                .unwrap_err()
+                .contains("not authorized")
+        );
 
         let mut unauthorized = request;
         unauthorized.namespace = "other".into();
