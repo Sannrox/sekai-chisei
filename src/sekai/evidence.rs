@@ -44,7 +44,16 @@ impl EvidenceLifecycleState {
     }
 
     pub const fn is_admitted(self) -> bool {
-        matches!(self, Self::Authorized | Self::Projected | Self::Available)
+        matches!(
+            self,
+            Self::Authorized
+                | Self::Projected
+                | Self::Available
+                | Self::Superseded
+                | Self::Retracted
+                | Self::Stale
+                | Self::Quarantined
+        )
     }
 
     pub const fn as_str(self) -> &'static str {
