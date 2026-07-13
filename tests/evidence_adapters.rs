@@ -7,6 +7,8 @@ mod http_health_poll;
 mod sdk;
 
 use sdk::AdapterConfig;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn config() -> AdapterConfig {
@@ -82,6 +84,22 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
     assert_eq!(first.collected_at_ms, replay.collected_at_ms);
     assert_eq!(first.source_record_id, replay.source_record_id);
     assert_eq!(first.source_version, replay.source_version);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&outbox).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let entry = std::fs::read_dir(&outbox)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().extension().is_some_and(|value| value == "bin"))
+            .unwrap();
+        assert_eq!(
+            entry.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     first_receipt.acknowledge().unwrap();
     replay_receipt.acknowledge().unwrap();
     std::fs::remove_dir(outbox).unwrap();
