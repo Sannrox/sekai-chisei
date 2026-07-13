@@ -2622,6 +2622,13 @@ impl SekaiDb {
         if let Some(policy) = policies.iter().find(|p| {
             p.dataset == AUDIT_DATASET && p.namespace.is_empty() && p.data_class.is_empty()
         }) {
+            let verification = self.verify_ledger()?;
+            if !verification.ok {
+                return Err(format!(
+                    "audit ledger verification failed before retention: {}",
+                    verification.error
+                ));
+            }
             run.audit_deleted =
                 self.purge_old_records(now - i64::from(policy.retention_days) * DAY_MS)?;
         }
@@ -3077,6 +3084,41 @@ mod tests {
         let verification = db.verify_ledger().unwrap();
         assert!(verification.ok);
         assert_eq!(verification.anchor_seq, 1);
+    }
+
+    #[test]
+    fn audit_retention_refuses_to_anchor_tampered_history() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.record_decision(&Decision {
+            id: "old".into(),
+            timestamp: 1,
+            actor: "a".into(),
+            action: "x".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: "target".into(),
+            outcome: String::new(),
+        })
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET outcome='tampered' WHERE id='old'",
+                [],
+            )
+            .unwrap();
+
+        let error = db.run_retention(2 * DAY_MS).unwrap_err();
+
+        assert!(error.contains("audit ledger verification failed"));
+        assert!(db.get_decision("old").unwrap().is_some());
     }
 
     #[test]
