@@ -75,6 +75,26 @@ fn auth_source<T>(request: &Request<T>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn context_evidence_reference(
+    reference: &pipe::EvidenceContextReference,
+) -> ContextEvidenceReference {
+    ContextEvidenceReference {
+        submission_id: reference.submission_id.clone(),
+        source_type: reference.source_type.clone(),
+        source_instance: reference.source_instance.clone(),
+        source_version: reference.source_version.clone(),
+        source_sequence: reference.source_sequence,
+        evidence_type: reference.evidence_type.clone(),
+        schema_id: reference.schema_id.clone(),
+        schema_version: reference.schema_version.clone(),
+        content_digest: reference.content_digest.clone(),
+        observed_at_ms: reference.observed_at_ms,
+        classification: reference.classification.clone(),
+        projection_version: reference.projection_version.clone(),
+        disclosed_fields: reference.disclosed_fields.clone(),
+    }
+}
+
 fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
     match auth_source(request).as_deref() {
         Some("token") => true,
@@ -625,6 +645,7 @@ impl ChiseiServiceImpl {
             external_egress: !safe_only,
             template_only,
             expanded_context_items: 0,
+            evidence_references: vec![],
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
@@ -672,6 +693,7 @@ impl ChiseiServiceImpl {
                     external_egress: false,
                     template_only,
                     expanded_context_items: 0,
+                    evidence_references: vec![],
                 };
                 let local_run = self.pipeline.run_with_context_expansion(
                     &mut local_pipeline_req,
@@ -962,6 +984,11 @@ impl ChiseiServiceImpl {
             sample_reason: sampling.reason,
             egress_decisions,
             task_class: task_class.as_str().into(),
+            evidence_references: run
+                .evidence_references
+                .iter()
+                .map(context_evidence_reference)
+                .collect(),
         })
     }
 
@@ -1080,6 +1107,23 @@ impl ChiseiServiceImpl {
         };
         context.disclosed_fields.sort();
         events[1].references.push(context);
+        events[1]
+            .references
+            .extend(
+                plan.evidence_references
+                    .iter()
+                    .map(|reference| GovernedReference {
+                        kind: "external_evidence".into(),
+                        reference: format!(
+                            "evidence:{}@{}",
+                            reference.submission_id, reference.source_version
+                        ),
+                        content_hash: Some(reference.content_digest.clone()),
+                        disclosed_fields: reference.disclosed_fields.clone(),
+                        omitted: false,
+                        omission_reason: None,
+                    }),
+            );
         if !plan.egress_decisions.is_empty() {
             events.push(receipt_event(
                 &operation_id,
@@ -2764,6 +2808,7 @@ impl ChiseiService for ChiseiServiceImpl {
             external_egress: true,
             template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
             expanded_context_items: 0,
+            evidence_references: vec![],
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
         let result = self.pipeline.run_with_context_expansion(
@@ -2795,6 +2840,11 @@ impl ChiseiService for ChiseiServiceImpl {
                 steps,
                 timestamp: result.timestamp,
                 prepared_spec: result.prepared_spec,
+                evidence_references: result
+                    .evidence_references
+                    .iter()
+                    .map(context_evidence_reference)
+                    .collect(),
             }),
         }))
     }
@@ -6323,6 +6373,55 @@ mod tests {
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
+    #[test]
+    fn planned_receipt_pins_exact_external_evidence_snapshot() {
+        let svc = memory_service();
+        let digest = "a".repeat(64);
+        let plan = ExecutionPlan {
+            plan_id: "plan-with-evidence".into(),
+            input: Some(ExecutionInput {
+                request_id: "request-with-evidence".into(),
+                namespace: "acme".into(),
+                spec: "use governed evidence".into(),
+                task_type: "verification".into(),
+                ..Default::default()
+            }),
+            created_at: 100,
+            evidence_references: vec![ContextEvidenceReference {
+                submission_id: "submission-7".into(),
+                source_version: "attempt-2".into(),
+                content_digest: digest.clone(),
+                disclosed_fields: vec!["content.result".into(), "signal".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        svc.record_planned_operation(&plan, "agent:test").unwrap();
+        let receipt = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .unwrap();
+        let evidence = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::ContextGoverned)
+            .and_then(|event| {
+                event
+                    .references
+                    .iter()
+                    .find(|reference| reference.kind == "external_evidence")
+            })
+            .expect("pinned external evidence reference");
+        assert_eq!(evidence.reference, "evidence:submission-7@attempt-2");
+        assert_eq!(evidence.content_hash.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            evidence.disclosed_fields,
+            vec!["content.result".to_string(), "signal".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn execute_plan_rechecks_regression_gate() {
         let svc = memory_service();
@@ -6998,6 +7097,7 @@ mod tests {
             sample_reason: String::new(),
             egress_decisions: vec![],
             task_class: String::new(),
+            evidence_references: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -7062,6 +7162,7 @@ mod tests {
             sample_reason: String::new(),
             egress_decisions: vec![],
             task_class: String::new(),
+            evidence_references: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -7168,6 +7269,7 @@ mod tests {
                 sample_reason: String::new(),
                 egress_decisions: vec![],
                 task_class: String::new(),
+                evidence_references: vec![],
             });
         }
         let newest = ExecutionPlan {
@@ -7196,6 +7298,7 @@ mod tests {
             sample_reason: String::new(),
             egress_decisions: vec![],
             task_class: String::new(),
+            evidence_references: vec![],
         };
         svc.cache_plan(newest.clone());
 
@@ -7238,6 +7341,7 @@ mod tests {
             sample_reason: String::new(),
             egress_decisions: vec![],
             task_class: String::new(),
+            evidence_references: vec![],
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -7286,6 +7390,7 @@ mod tests {
                 sample_reason: String::new(),
                 egress_decisions: vec![],
                 task_class: String::new(),
+                evidence_references: vec![],
             });
         }
         let inserted = ExecutionPlan {
@@ -7314,6 +7419,7 @@ mod tests {
             sample_reason: String::new(),
             egress_decisions: vec![],
             task_class: String::new(),
+            evidence_references: vec![],
         };
         svc.cache_plan(inserted.clone());
 
