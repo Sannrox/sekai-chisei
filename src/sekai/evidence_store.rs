@@ -221,14 +221,21 @@ impl SekaiDb {
             SELECT source_type, source_instance, source_record_id, source_sequence, source_version,
                    content_digest, id
             FROM sekai_evidence_submissions
-            WHERE lifecycle_state IN ('authorized', 'projected', 'available')
+            WHERE lifecycle_state != 'rejected'
+              AND NOT (
+                lifecycle_state='quarantined' AND rejection_code='source_identity_conflict'
+              )
             ORDER BY received_at_ms, id;
             INSERT INTO sekai_evidence_lifecycle_history
                 (submission_id, lifecycle_state, reason_code, recorded_at_ms)
             SELECT submissions.id, 'quarantined', 'source_identity_conflict',
                    submissions.updated_at_ms
             FROM sekai_evidence_submissions AS submissions
-            WHERE submissions.lifecycle_state IN ('authorized', 'projected', 'available')
+            WHERE submissions.lifecycle_state != 'rejected'
+              AND NOT (
+                submissions.lifecycle_state='quarantined'
+                AND submissions.rejection_code='source_identity_conflict'
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM sekai_evidence_source_identity AS identity
                 WHERE identity.submission_id = submissions.id
@@ -237,7 +244,10 @@ impl SekaiDb {
             SET lifecycle_state='quarantined',
                 rejection_code='source_identity_conflict',
                 rejection_summary='source identity conflicts with an earlier admitted submission'
-            WHERE lifecycle_state IN ('authorized', 'projected', 'available')
+            WHERE lifecycle_state != 'rejected'
+              AND NOT (
+                lifecycle_state='quarantined' AND rejection_code='source_identity_conflict'
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM sekai_evidence_source_identity AS identity
                 WHERE identity.submission_id = sekai_evidence_submissions.id
@@ -1778,6 +1788,11 @@ mod tests {
                 "UPDATE sekai_evidence_producers SET capability_json=?1
                  WHERE producer_identity='producer:checks'",
                 [serde_json::to_string(&capability).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sekai_evidence_submissions SET lifecycle_state='stale'",
+                [],
             )
             .unwrap();
             conn.execute("DROP TABLE sekai_evidence_source_identity", [])
