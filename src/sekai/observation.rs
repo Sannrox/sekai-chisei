@@ -71,17 +71,33 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
+        let mut added_retention_tombstone = false;
         for column in [
             "data_class TEXT NOT NULL DEFAULT 'unclassified'",
             "retention_tombstone INTEGER NOT NULL DEFAULT 0",
         ] {
-            if let Err(error) = conn.execute(
+            match conn.execute(
                 &format!("ALTER TABLE sekai_task_observations ADD COLUMN {column}"),
                 [],
-            ) && !error.to_string().contains("duplicate column name")
-            {
-                return Err(error.to_string());
+            ) {
+                Ok(_) if column.starts_with("retention_tombstone") => {
+                    added_retention_tombstone = true;
+                }
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
             }
+        }
+        if added_retention_tombstone {
+            conn.execute(
+                "UPDATE sekai_task_observations SET retention_tombstone=1
+                 WHERE request_id='retention-tombstone:' || rowid
+                   AND namespace='' AND data_class='unclassified'
+                   AND model='[redacted]' AND packages_json='[]'
+                   AND context_json='{\"retention_tombstone\":\"true\"}'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         }
         let legacy = {
             let mut stmt = conn
@@ -659,5 +675,46 @@ mod tests {
         assert_eq!(comp.properties["task_succeeded"], "1");
         assert_eq!(comp.properties["success_rate"], "50");
         assert_eq!(comp.properties["consecutive_failures"], "1");
+    }
+
+    #[test]
+    fn migration_authenticates_legacy_retention_tombstones() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-observation-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sekai_task_observations (
+                    request_id TEXT NOT NULL, namespace TEXT NOT NULL,
+                    data_class TEXT NOT NULL DEFAULT 'unclassified',
+                    component_id TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                    packages_json TEXT NOT NULL DEFAULT '[]',
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (request_id, component_id)
+                );
+                INSERT INTO sekai_task_observations
+                    (request_id,namespace,data_class,component_id,model,status,timestamp,
+                     packages_json,context_json)
+                VALUES ('retention-tombstone:1','','unclassified','component','[redacted]',
+                        'done',1,'[]','{\"retention_tombstone\":\"true\"}');",
+            )
+            .unwrap();
+        }
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let authenticated: bool = db
+            .conn()
+            .query_row(
+                "SELECT retention_tombstone FROM sekai_task_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(authenticated);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 }
