@@ -365,22 +365,14 @@ struct TrustedKey {
     metadata: KeyMetadata,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrustedKeyring {
     keys: BTreeMap<(String, String), TrustedKey>,
-    verification_time_ms: i64,
 }
 
 impl TrustedKeyring {
     pub fn new() -> Self {
-        Self::at_time(Utc::now().timestamp_millis())
-    }
-
-    pub fn at_time(verification_time_ms: i64) -> Self {
-        Self {
-            keys: BTreeMap::new(),
-            verification_time_ms,
-        }
+        Self::default()
     }
 
     pub fn trust(
@@ -416,15 +408,17 @@ impl TrustedKeyring {
     }
 }
 
-impl Default for TrustedKeyring {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub fn verify_bundle(
     bundle: &AttestationBundle,
     trusted_keys: &TrustedKeyring,
+) -> VerificationReport {
+    verify_bundle_at(bundle, trusted_keys, Utc::now().timestamp_millis())
+}
+
+pub fn verify_bundle_at(
+    bundle: &AttestationBundle,
+    trusted_keys: &TrustedKeyring,
+    verification_time_ms: i64,
 ) -> VerificationReport {
     let mut errors = Vec::new();
     let versions_supported = [
@@ -494,7 +488,7 @@ pub fn verify_bundle(
     };
     let (artifacts_valid, missing_artifacts) = verify_artifacts(bundle, &mut errors);
     let (signer_trusted, signature_valid, key_verification) =
-        verify_signature(bundle, trusted_keys, &mut errors);
+        verify_signature(bundle, trusted_keys, verification_time_ms, &mut errors);
     let valid = versions_supported
         && receipt_digest_valid
         && event_chain_valid
@@ -744,12 +738,13 @@ fn verify_artifacts(bundle: &AttestationBundle, errors: &mut Vec<String>) -> (bo
 fn verify_signature(
     bundle: &AttestationBundle,
     trusted_keys: &TrustedKeyring,
+    verification_time_ms: i64,
     errors: &mut Vec<String>,
 ) -> (bool, bool, KeyVerification) {
     let unknown_key = || KeyVerification {
         state: KeyState::Unknown,
         acceptable_at_verification: false,
-        evaluated_at_ms: trusted_keys.verification_time_ms,
+        evaluated_at_ms: verification_time_ms,
         successor_key_id: None,
         errors: vec!["key state is unknown".into()],
     };
@@ -786,8 +781,7 @@ fn verify_signature(
         ));
         return (false, false, unknown_key());
     };
-    let key_verification =
-        verify_key_metadata(&trusted_key.metadata, trusted_keys.verification_time_ms);
+    let key_verification = verify_key_metadata(&trusted_key.metadata, verification_time_ms);
     if trusted_key.key != verifying_key {
         errors.push("embedded signer public key does not match trusted key".into());
         return (false, false, key_verification);
@@ -839,6 +833,12 @@ fn verify_key_metadata(metadata: &KeyMetadata, verification_time_ms: i64) -> Key
         .is_some_and(|valid_until| verification_time_ms > valid_until)
     {
         errors.push("key is expired at verification time".into());
+    }
+    if metadata
+        .revoked_at_ms
+        .is_some_and(|revoked_at| verification_time_ms >= revoked_at)
+    {
+        errors.push("key is revoked at verification time".into());
     }
     KeyVerification {
         state: metadata.state,
@@ -1316,7 +1316,7 @@ mod tests {
         assert_eq!(report.policy.key.state, KeyState::Unknown);
         assert!(!report.policy.key.acceptable_at_verification);
 
-        let mut expired = TrustedKeyring::at_time(30);
+        let mut expired = TrustedKeyring::new();
         expired
             .trust_with_metadata(
                 "node:test",
@@ -1331,9 +1331,31 @@ mod tests {
                 },
             )
             .unwrap();
-        let backdated = verify_bundle(&signed_bundle(), &expired);
+        let backdated = verify_bundle_at(&signed_bundle(), &expired, 30);
         assert!(!backdated.policy.key.acceptable_at_verification);
         assert_eq!(backdated.policy.key.evaluated_at_ms, 30);
+
+        let mut mislabeled_revoked = TrustedKeyring::new();
+        mislabeled_revoked
+            .trust_with_metadata(
+                "node:test",
+                "key-1",
+                key.verifying_key(),
+                KeyMetadata {
+                    state: KeyState::Active,
+                    valid_from_ms: None,
+                    valid_until_ms: None,
+                    revoked_at_ms: Some(20),
+                    successor_key_id: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            !verify_bundle_at(&signed_bundle(), &mislabeled_revoked, 30)
+                .policy
+                .key
+                .acceptable_at_verification
+        );
     }
 
     #[test]
