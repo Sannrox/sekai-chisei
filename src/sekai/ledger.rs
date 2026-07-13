@@ -27,6 +27,21 @@ use sha2::{Digest, Sha256};
 
 type LedgerRow = (Decision, String, i64, String, String);
 
+pub(crate) fn lifecycle_scope_from_evidence(
+    evidence: &std::collections::HashMap<String, String>,
+) -> (String, String) {
+    let namespace = evidence
+        .get("namespace")
+        .or_else(|| evidence.get("project"))
+        .cloned()
+        .unwrap_or_default();
+    let data_class = evidence
+        .get("data_class")
+        .cloned()
+        .unwrap_or_else(|| "unclassified".into());
+    (namespace, data_class)
+}
+
 /// Verification report for the decision ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerVerification {
@@ -99,10 +114,11 @@ pub(crate) fn insert_chained_decision(conn: &Connection, d: &Decision) -> Result
     let (head_seq, head_hash) = chain_head(conn)?;
     let seq = head_seq + 1;
     let evidence = serde_json::to_string(&d.evidence).unwrap_or_default();
+    let (namespace, data_class) = lifecycle_scope_from_evidence(&d.evidence);
     let hash = entry_hash(seq, &head_hash, d, &evidence);
     conn.execute(
-        "INSERT INTO sekai_decisions (id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        "INSERT INTO sekai_decisions (id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash,namespace,data_class) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             d.id,
             d.timestamp,
@@ -114,7 +130,9 @@ pub(crate) fn insert_chained_decision(conn: &Connection, d: &Decision) -> Result
             d.outcome,
             seq,
             head_hash,
-            hash
+            hash,
+            namespace,
+            data_class
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -259,6 +277,50 @@ impl SekaiDb {
                     head_seq: anchor.0,
                     head_hash: anchor.1,
                 });
+            }
+            let classifications = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT seq,evidence,namespace,data_class FROM sekai_decisions ORDER BY seq",
+                    )
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+            };
+            for (seq, evidence, namespace, data_class) in classifications {
+                let Some(seq) = seq else {
+                    return Ok(LedgerVerification {
+                        ok: false,
+                        entries_checked: 0,
+                        first_bad_seq: anchor.0 + 1,
+                        error: "audit ledger contains incomplete chain metadata".into(),
+                        anchor_seq: anchor.0,
+                        head_seq: anchor.0,
+                        head_hash: anchor.1,
+                    });
+                };
+                let evidence = serde_json::from_str(&evidence).unwrap_or_default();
+                let expected = lifecycle_scope_from_evidence(&evidence);
+                if (namespace, data_class) != expected {
+                    return Ok(LedgerVerification {
+                        ok: false,
+                        entries_checked: 0,
+                        first_bad_seq: seq,
+                        error: "lifecycle classification differs from hashed evidence".into(),
+                        anchor_seq: anchor.0,
+                        head_seq: anchor.0,
+                        head_hash: anchor.1,
+                    });
+                }
             }
             anchor
         };
@@ -502,6 +564,35 @@ mod tests {
         assert!(!report.ok);
         assert_eq!(report.first_bad_seq, 2);
         assert!(report.error.contains("altered"));
+    }
+
+    #[test]
+    fn tampering_with_lifecycle_classification_is_detected() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.record_decision(&Decision {
+            id: "classified".into(),
+            timestamp: 100,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::from([
+                ("project".into(), "namespace".into()),
+                ("data_class".into(), "sensitive".into()),
+            ]),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET data_class='public' WHERE id='classified'",
+                [],
+            )
+            .unwrap();
+
+        let report = db.verify_ledger().unwrap();
+        assert!(!report.ok);
+        assert!(report.error.contains("classification differs"));
     }
 
     #[test]

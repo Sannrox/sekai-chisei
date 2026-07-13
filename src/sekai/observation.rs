@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub struct TaskObservation {
     pub request_id: String,
     pub namespace: String,
+    pub data_class: String,
     pub component_id: String,
     pub model: String,
     pub status: String,
@@ -46,6 +47,7 @@ impl SekaiDb {
             "CREATE TABLE IF NOT EXISTS sekai_task_observations (
                 request_id TEXT NOT NULL,
                 namespace TEXT NOT NULL,
+                data_class TEXT NOT NULL DEFAULT 'unclassified',
                 component_id TEXT NOT NULL,
                 model TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
@@ -68,6 +70,39 @@ impl SekaiDb {
             );",
         )
         .map_err(|e| e.to_string())?;
+        if let Err(error) = conn.execute(
+            "ALTER TABLE sekai_task_observations
+             ADD COLUMN data_class TEXT NOT NULL DEFAULT 'unclassified'",
+            [],
+        ) && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error.to_string());
+        }
+        let legacy = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid,context_json FROM sekai_task_observations
+                     WHERE data_class='unclassified'",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        for (rowid, context) in legacy {
+            let context: HashMap<String, String> =
+                serde_json::from_str(&context).unwrap_or_default();
+            if let Some(data_class) = context.get("data_class") {
+                conn.execute(
+                    "UPDATE sekai_task_observations SET data_class=?1 WHERE rowid=?2",
+                    params![data_class, rowid],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
@@ -79,11 +114,12 @@ impl SekaiDb {
         let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sekai_task_observations
-             (request_id, namespace, component_id, model, status, timestamp, packages_json, context_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (request_id, namespace, data_class, component_id, model, status, timestamp, packages_json, context_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 observation.request_id,
                 observation.namespace,
+                observation.data_class,
                 observation.component_id,
                 observation.model,
                 observation.status,
@@ -103,7 +139,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT request_id, namespace, component_id, model, status, timestamp, packages_json, context_json
+                "SELECT request_id, namespace, data_class, component_id, model, status, timestamp, packages_json, context_json
                  FROM sekai_task_observations
                  WHERE component_id = ?1
                  ORDER BY timestamp, rowid",
@@ -163,17 +199,18 @@ impl SekaiDb {
 }
 
 fn row_to_task_observation(row: &rusqlite::Row) -> Result<TaskObservation, rusqlite::Error> {
-    let packages_json: String = row.get(6)?;
-    let context_json: String = row.get(7)?;
+    let packages_json: String = row.get(7)?;
+    let context_json: String = row.get(8)?;
     let packages = serde_json::from_str(&packages_json).unwrap_or_default();
     let context = serde_json::from_str(&context_json).unwrap_or_default();
     Ok(TaskObservation {
         request_id: row.get(0)?,
         namespace: row.get(1)?,
-        component_id: row.get(2)?,
-        model: row.get(3)?,
-        status: row.get(4)?,
-        timestamp: row.get(5)?,
+        data_class: row.get(2)?,
+        component_id: row.get(3)?,
+        model: row.get(4)?,
+        status: row.get(5)?,
+        timestamp: row.get(6)?,
         packages,
         context,
     })
@@ -266,6 +303,11 @@ pub fn on_task_completed(db: &SekaiDb, event: &TaskCompletion) {
         let observation = TaskObservation {
             request_id: request_id.clone(),
             namespace: event.namespace.clone(),
+            data_class: event
+                .context
+                .get("data_class")
+                .cloned()
+                .unwrap_or_else(|| "unclassified".into()),
             component_id: comp.id.clone(),
             model: event.model.clone(),
             status: event.status.clone(),
@@ -443,6 +485,26 @@ mod tests {
         assert_eq!(task_succeeded(&db, "c1").unwrap(), 1);
         assert_eq!(success_rate(&db, "c1").unwrap(), 50);
         assert_eq!(consecutive_failures(&db, "c1").unwrap(), 1);
+    }
+
+    #[test]
+    fn persists_task_observation_data_class_from_context() {
+        let db = setup();
+        on_task_completed(
+            &db,
+            &TaskCompletion {
+                request_id: "classified".into(),
+                namespace: "my-namespace".into(),
+                model: "model".into(),
+                status: "done".into(),
+                packages: Vec::new(),
+                context: HashMap::from([("data_class".into(), "sensitive".into())]),
+            },
+        );
+
+        let observations = db.list_task_observations_for_component("c1").unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].data_class, "sensitive");
     }
 
     #[test]

@@ -617,7 +617,7 @@ fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
         let mut stmt = tx
             .prepare(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
-                        seq,prev_hash,entry_hash
+                        seq,prev_hash,entry_hash,namespace,data_class
                  FROM sekai_decisions WHERE seq > ?1 ORDER BY seq",
             )
             .map_err(|e| e.to_string())?;
@@ -638,6 +638,8 @@ fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
                 row.get::<_, i64>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
             ))
         })
         .map_err(|e| e.to_string())?
@@ -646,7 +648,7 @@ fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
     };
     let mut expected_seq = anchor_seq;
     let mut expected_prev = anchor_hash;
-    for (decision, evidence_json, seq, prev_hash, stored_hash) in rows {
+    for (decision, evidence_json, seq, prev_hash, stored_hash, namespace, data_class) in rows {
         if seq != expected_seq + 1 || prev_hash != expected_prev {
             return Err(format!("audit ledger linkage invalid at seq {seq}"));
         }
@@ -654,6 +656,12 @@ fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
             crate::sekai::ledger::entry_hash(seq, &prev_hash, &decision, &evidence_json);
         if stored_hash != expected_hash {
             return Err(format!("audit ledger hash invalid at seq {seq}"));
+        }
+        let expected = crate::sekai::ledger::lifecycle_scope_from_evidence(&decision.evidence);
+        if (namespace, data_class) != expected {
+            return Err(format!(
+                "audit lifecycle classification invalid at seq {seq}"
+            ));
         }
         expected_seq = seq;
         expected_prev = stored_hash;
@@ -714,6 +722,41 @@ fn rechain_decisions(tx: &Transaction<'_>) -> Result<(i64, String), String> {
     Ok((head_seq, prev_hash))
 }
 
+fn expired_audit_prefix(
+    tx: &Transaction<'_>,
+    policies: &[RetentionPolicy],
+    now: i64,
+) -> Result<Option<i64>, String> {
+    let rows = {
+        let mut stmt = tx
+            .prepare("SELECT seq,timestamp,namespace,data_class FROM sekai_decisions ORDER BY seq")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    let mut prefix_end = None;
+    for (seq, timestamp, namespace, data_class) in rows {
+        let Some(policy) = effective_policy(policies, AUDIT_DATASET, &namespace, &data_class)
+        else {
+            break;
+        };
+        if timestamp >= now - i64::from(policy.retention_days) * DAY_MS {
+            break;
+        }
+        prefix_end = Some(seq);
+    }
+    Ok(prefix_end)
+}
+
 fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
     if !matches!(
         policy.dataset.as_str(),
@@ -723,14 +766,6 @@ fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
     }
     if policy.retention_days <= 0 {
         return Err("retention_days must be positive".into());
-    }
-    if policy.dataset == AUDIT_DATASET
-        && (!policy.namespace.is_empty() || !policy.data_class.is_empty())
-    {
-        return Err("scoped audit retention requires classified audit records".into());
-    }
-    if policy.dataset == TASK_OBSERVATIONS_DATASET && !policy.data_class.is_empty() {
-        return Err("data-class task retention requires classified task observations".into());
     }
     Ok(())
 }
@@ -1829,7 +1864,8 @@ impl SekaiDb {
             tx.execute(
                 "UPDATE sekai_decisions SET id=?1, actor='[erased]', action='[erased]',
                  reason='subject content erased', evidence=?2,
-                 target_id='[erased]', outcome='[erased]' WHERE id=?3",
+                 target_id='[erased]', outcome='[erased]', namespace='',
+                 data_class='unclassified' WHERE id=?3",
                 params![
                     replacement_id,
                     serde_json::to_string(&tombstone).map_err(|e| e.to_string())?,
@@ -2057,6 +2093,60 @@ impl SekaiDb {
         Ok(result)
     }
 
+    fn purge_classified_audit_records(
+        &self,
+        policies: &[RetentionPolicy],
+        now: i64,
+    ) -> Result<i32, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        verify_decisions_in_transaction(&tx)?;
+        let prefix_end = expired_audit_prefix(&tx, policies, now)?;
+        let mut deleted = 0;
+        if let Some(prefix_end) = prefix_end {
+            let anchor_hash: String = tx
+                .query_row(
+                    "SELECT entry_hash FROM sekai_decisions WHERE seq=?1",
+                    params![prefix_end],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            deleted += tx
+                .execute(
+                    "DELETE FROM sekai_attestations WHERE decision_id IN
+                     (SELECT id FROM sekai_decisions WHERE seq <= ?1)",
+                    params![prefix_end],
+                )
+                .map_err(|e| e.to_string())? as i32;
+            deleted += tx
+                .execute(
+                    "DELETE FROM sekai_decisions WHERE seq <= ?1",
+                    params![prefix_end],
+                )
+                .map_err(|e| e.to_string())? as i32;
+            tx.execute(
+                "INSERT OR REPLACE INTO sekai_ledger_anchors (seq,entry_hash,reason,created)
+                 VALUES (?1,?2,?3,?4)",
+                params![prefix_end, anchor_hash, "classified retention purge", now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(policy) = policies.iter().find(|policy| {
+            policy.dataset == AUDIT_DATASET
+                && policy.namespace.is_empty()
+                && policy.data_class.is_empty()
+        }) {
+            deleted += tx
+                .execute(
+                    "DELETE FROM sekai_object_changes WHERE timestamp < ?1",
+                    params![now - i64::from(policy.retention_days) * DAY_MS],
+                )
+                .map_err(|e| e.to_string())? as i32;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted)
+    }
+
     pub fn verify_archive(archive_path: impl AsRef<Path>) -> Result<ArchiveVerification, String> {
         let archive_path = archive_path.as_ref();
         if !archive_path.is_file() {
@@ -2220,30 +2310,19 @@ impl SekaiDb {
                     && policy.data_class.is_empty()
             })
             .map(|policy| now - i64::from(policy.retention_days) * DAY_MS);
-        if audit_cutoff.is_some() {
+        if policies
+            .iter()
+            .any(|policy| policy.dataset == AUDIT_DATASET)
+        {
             verify_decisions_in_transaction(&tx)?;
         }
-        let prefix_end = if let Some(cutoff) = audit_cutoff {
-            tx.query_row(
-                "SELECT MAX(seq) FROM sekai_decisions
-                 WHERE seq < COALESCE(
-                    (SELECT MIN(seq) FROM sekai_decisions WHERE timestamp >= ?1),
-                    9223372036854775807
-                 )",
-                params![cutoff],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map_err(|e| e.to_string())?
-            .filter(|seq| *seq > 0)
-        } else {
-            None
-        };
+        let prefix_end = expired_audit_prefix(&tx, &policies, now)?;
 
         let mut records = Vec::<ArchiveRecord>::new();
         if let Some(prefix_end) = prefix_end {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash
+                    "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash,namespace,data_class
                      FROM sekai_decisions WHERE seq <= ?1 ORDER BY seq",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2257,6 +2336,7 @@ impl SekaiDb {
                         "target_id": row.get::<_, String>(6)?, "outcome": row.get::<_, String>(7)?,
                         "seq": row.get::<_, i64>(8)?, "prev_hash": row.get::<_, String>(9)?,
                         "entry_hash": row.get::<_, String>(10)?,
+                        "namespace": row.get::<_, String>(11)?, "data_class": row.get::<_, String>(12)?,
                     });
                     Ok(ArchiveRecord {
                         dataset: "audit.decisions",
@@ -2365,7 +2445,7 @@ impl SekaiDb {
         let observation_rows = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT rowid,request_id,namespace,component_id,model,status,timestamp,packages_json,context_json
+                    "SELECT rowid,request_id,namespace,data_class,component_id,model,status,timestamp,packages_json,context_json
                      FROM sekai_task_observations ORDER BY component_id,timestamp,rowid",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2377,9 +2457,10 @@ impl SekaiDb {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -2388,10 +2469,12 @@ impl SekaiDb {
         };
         let mut expired_observations =
             std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
+        let mut retained_components = std::collections::BTreeSet::new();
         for (
             rowid,
             request_id,
             namespace,
+            data_class,
             component_id,
             model,
             status,
@@ -2400,10 +2483,19 @@ impl SekaiDb {
             context,
         ) in observation_rows
         {
-            if let Some(policy) =
-                effective_policy(&policies, TASK_OBSERVATIONS_DATASET, &namespace, "")
-                && timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
-            {
+            if retained_components.contains(&component_id) {
+                continue;
+            }
+            let expired = effective_policy(
+                &policies,
+                TASK_OBSERVATIONS_DATASET,
+                &namespace,
+                &data_class,
+            )
+            .is_some_and(|policy| {
+                timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
+            });
+            if expired {
                 expired_observations
                     .entry(component_id.clone())
                     .or_insert_with(|| (namespace.clone(), Vec::new()))
@@ -2415,11 +2507,13 @@ impl SekaiDb {
                         .unwrap_or_default(),
                     payload: serde_json::json!({
                         "request_id": request_id, "namespace": namespace, "component_id": component_id,
-                        "model": model, "status": status, "timestamp": timestamp,
+                        "data_class": data_class, "model": model, "status": status, "timestamp": timestamp,
                         "packages_json": packages, "context_json": context,
                     })
                     .to_string(),
                 });
+            } else {
+                retained_components.insert(component_id);
             }
         }
 
@@ -2616,12 +2710,10 @@ impl SekaiDb {
         let policies = self.list_retention_policies()?;
         let mut run = RetentionRun::default();
 
-        // Audit entries are chained, so only a contiguous expired prefix can
-        // be removed. Scoped audit classification is added to the stored
-        // record before scoped policies can safely participate here.
-        if let Some(policy) = policies.iter().find(|p| {
-            p.dataset == AUDIT_DATASET && p.namespace.is_empty() && p.data_class.is_empty()
-        }) {
+        if policies
+            .iter()
+            .any(|policy| policy.dataset == AUDIT_DATASET)
+        {
             let verification = self.verify_ledger()?;
             if !verification.ok {
                 return Err(format!(
@@ -2629,8 +2721,7 @@ impl SekaiDb {
                     verification.error
                 ));
             }
-            run.audit_deleted =
-                self.purge_old_records(now - i64::from(policy.retention_days) * DAY_MS)?;
+            run.audit_deleted = self.purge_classified_audit_records(&policies, now)?;
         }
 
         let mut conn = self.conn();
@@ -2671,7 +2762,7 @@ impl SekaiDb {
         let observation_rows = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT rowid, namespace, component_id, status, timestamp
+                    "SELECT rowid, namespace, data_class, component_id, status, timestamp
                      FROM sekai_task_observations
                      ORDER BY component_id, timestamp, rowid",
                 )
@@ -2682,7 +2773,8 @@ impl SekaiDb {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -2690,15 +2782,29 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?
         };
         let mut expired = std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
-        for (rowid, namespace, component_id, status, timestamp_seconds) in observation_rows {
-            if let Some(policy) =
-                effective_policy(&policies, TASK_OBSERVATIONS_DATASET, &namespace, "")
-                && timestamp_seconds < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
-            {
+        let mut retained_components = std::collections::BTreeSet::new();
+        for (rowid, namespace, data_class, component_id, status, timestamp_seconds) in
+            observation_rows
+        {
+            if retained_components.contains(&component_id) {
+                continue;
+            }
+            let expired_by_policy = effective_policy(
+                &policies,
+                TASK_OBSERVATIONS_DATASET,
+                &namespace,
+                &data_class,
+            )
+            .is_some_and(|policy| {
+                timestamp_seconds < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
+            });
+            if expired_by_policy {
                 let entry = expired
                     .entry(component_id)
                     .or_insert_with(|| (namespace, Vec::new()));
                 entry.1.push((rowid, status));
+            } else {
+                retained_components.insert(component_id);
             }
         }
         for (component_id, (namespace, rows)) in expired {
@@ -2931,6 +3037,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "timestamp_ms".into(),
                 col_type: "string".into(),
+                classification: "public".into(),
             }],
             object_id: String::new(),
             created: 0,
@@ -3028,33 +3135,116 @@ mod tests {
     }
 
     #[test]
-    fn rejects_scoped_audit_policy_until_audit_records_are_classified() {
+    fn scoped_audit_policy_expires_classified_prefix() {
         let db = SekaiDb::new(":memory:").unwrap();
-        let error = db
-            .set_retention_policy(&RetentionPolicy {
-                dataset: AUDIT_DATASET.into(),
-                namespace: "legal".into(),
-                data_class: String::new(),
-                retention_days: 365,
-                updated: 1,
+        for (id, data_class) in [("sensitive", "sensitive"), ("public", "public")] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp: 1,
+                actor: "actor".into(),
+                action: "test".into(),
+                reason: String::new(),
+                evidence: HashMap::from([
+                    ("project".into(), "legal".into()),
+                    ("data_class".into(), data_class.into()),
+                ]),
+                target_id: String::new(),
+                outcome: "ok".into(),
             })
-            .unwrap_err();
-        assert!(error.contains("classified audit records"));
+            .unwrap();
+        }
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: "legal".into(),
+            data_class: "sensitive".into(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+        let run = db.run_retention(2 * DAY_MS).unwrap();
+        assert_eq!(run.audit_deleted, 1);
+        assert!(db.get_decision("sensitive").unwrap().is_none());
+        assert!(db.get_decision("public").unwrap().is_some());
+        assert!(db.verify_ledger().unwrap().ok);
     }
 
     #[test]
-    fn rejects_class_scoped_task_policy_until_observations_are_classified() {
+    fn class_scoped_task_policy_preserves_other_classes() {
         let db = SekaiDb::new(":memory:").unwrap();
-        let error = db
-            .set_retention_policy(&RetentionPolicy {
-                dataset: TASK_OBSERVATIONS_DATASET.into(),
-                namespace: String::new(),
-                data_class: "sensitive".into(),
-                retention_days: 7,
-                updated: 1,
-            })
-            .unwrap_err();
-        assert!(error.contains("classified task observations"));
+        {
+            let conn = db.conn();
+            for (request_id, data_class) in [("remove", "sensitive"), ("keep", "public")] {
+                conn.execute(
+                    "INSERT INTO sekai_task_observations
+                     (request_id,namespace,data_class,component_id,model,status,timestamp)
+                     VALUES (?1,'ns',?2,'component','','done',1)",
+                    params![request_id, data_class],
+                )
+                .unwrap();
+            }
+        }
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: TASK_OBSERVATIONS_DATASET.into(),
+            namespace: String::new(),
+            data_class: "sensitive".into(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+
+        let run = db.run_retention(2 * DAY_MS).unwrap();
+        assert_eq!(run.task_observations_deleted, 1);
+        let remaining = db
+            .list_task_observations_for_component("component")
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].data_class, "public");
+    }
+
+    #[test]
+    fn class_scoped_task_retention_only_folds_contiguous_prefix() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        {
+            let conn = db.conn();
+            for (request_id, data_class, status, timestamp) in [
+                ("sensitive-first", "sensitive", "failed", 1),
+                ("public-success", "public", "done", 2),
+                ("sensitive-later", "sensitive", "failed", 3),
+                ("public-failure", "public", "failed", 4),
+            ] {
+                conn.execute(
+                    "INSERT INTO sekai_task_observations
+                     (request_id,namespace,data_class,component_id,model,status,timestamp)
+                     VALUES (?1,'ns',?2,'component','',?3,?4)",
+                    params![request_id, data_class, status, timestamp],
+                )
+                .unwrap();
+            }
+        }
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: TASK_OBSERVATIONS_DATASET.into(),
+            namespace: String::new(),
+            data_class: "sensitive".into(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let before = crate::sekai::observation::task_observation_stats(&db, "component").unwrap();
+
+        let run = db.run_retention(2 * DAY_MS).unwrap();
+
+        assert_eq!(run.task_observations_deleted, 1);
+        let after = crate::sekai::observation::task_observation_stats(&db, "component").unwrap();
+        assert_eq!(after, before);
+        let remaining = db
+            .list_task_observations_for_component("component")
+            .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|row| row.request_id == "sensitive-later")
+        );
     }
 
     #[test]
