@@ -144,9 +144,9 @@ pub struct EvidenceTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceRelationship {
     pub relation: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_source_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_source_instance: String,
     pub target_source_record_id: String,
 }
@@ -301,9 +301,9 @@ impl EvidenceEnvelope {
         }
         if self.relationships.iter().any(|relationship| {
             relationship.relation.trim().is_empty()
-                || relationship.target_source_type.trim().is_empty()
-                || relationship.target_source_instance.trim().is_empty()
                 || relationship.target_source_record_id.trim().is_empty()
+                || (relationship.target_source_type.trim().is_empty()
+                    != relationship.target_source_instance.trim().is_empty())
         }) {
             errors.push("relationships require relation and target source record".to_string());
         }
@@ -416,5 +416,20 @@ mod tests {
         assert!(EvidenceLifecycleState::Available.is_usable());
         assert!(!EvidenceLifecycleState::Authorized.is_usable());
         assert!(!EvidenceLifecycleState::Rejected.is_usable());
+    }
+
+    #[test]
+    fn legacy_relationship_identity_remains_v1_compatible() {
+        let mut evidence = envelope();
+        evidence.relationships[0].target_source_type.clear();
+        evidence.relationships[0].target_source_instance.clear();
+        assert_eq!(
+            evidence.validate_contract(EvidenceLimits::default()),
+            Ok(())
+        );
+        let serialized = serde_json::to_value(&evidence).unwrap();
+        let relationship = &serialized["relationships"][0];
+        assert!(relationship.get("target_source_type").is_none());
+        assert!(relationship.get("target_source_instance").is_none());
     }
 }
