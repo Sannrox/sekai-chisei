@@ -22,6 +22,7 @@ pub struct EvidenceProducerCapability {
     pub allowed_intents: Vec<EvidenceIntent>,
     pub allow_operation_attachment: bool,
     pub replay_window_ms: i64,
+    pub max_clock_skew_ms: i64,
     pub max_payload_bytes: usize,
     pub max_relationships: usize,
     pub rate_limit_per_minute: u32,
@@ -138,6 +139,17 @@ impl SekaiDb {
                 envelope_digest TEXT NOT NULL,
                 submission_id TEXT NOT NULL,
                 PRIMARY KEY (producer_identity, idempotency_key)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_evidence_source_identity (
+                source_type TEXT NOT NULL,
+                source_instance TEXT NOT NULL,
+                source_record_id TEXT NOT NULL,
+                source_sequence INTEGER NOT NULL,
+                source_version TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                submission_id TEXT NOT NULL,
+                PRIMARY KEY (source_type, source_instance, source_record_id, source_sequence),
+                UNIQUE (source_type, source_instance, source_record_id, source_version)
             );
             CREATE TABLE IF NOT EXISTS sekai_evidence_lifecycle_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,16 +426,16 @@ impl SekaiDb {
 
         let source_collision = tx
             .query_row(
-                "SELECT id, content_digest FROM sekai_evidence_submissions
+                "SELECT submission_id, content_digest FROM sekai_evidence_source_identity
                  WHERE source_type=?1 AND source_instance=?2 AND source_record_id=?3
-                   AND source_version=?4 AND lifecycle_state != 'rejected' AND id != ?5
+                   AND (source_sequence=?4 OR source_version=?5)
                  LIMIT 1",
                 params![
                     envelope.source_type,
                     envelope.source_instance,
                     envelope.source_record_id,
+                    envelope.source_sequence,
                     envelope.source_version,
-                    submission_id,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -493,6 +505,22 @@ impl SekaiDb {
                 authenticated_producer,
                 envelope.idempotency_key,
                 envelope_digest,
+                submission_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_evidence_source_identity
+             (source_type, source_instance, source_record_id, source_sequence, source_version,
+              content_digest, submission_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                envelope.source_type,
+                envelope.source_instance,
+                envelope.source_record_id,
+                envelope.source_sequence,
+                envelope.source_version,
+                envelope.content_digest,
                 submission_id,
             ],
         )
@@ -574,6 +602,7 @@ fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), St
         return Err("producer capabilities must be explicit and non-empty".to_string());
     }
     if capability.replay_window_ms <= 0
+        || capability.max_clock_skew_ms < 0
         || capability.max_payload_bytes == 0
         || capability.max_relationships == 0
         || capability.rate_limit_per_minute == 0
@@ -652,6 +681,12 @@ fn authorize<'a>(
         return Err((
             "replay_window_expired",
             "submission falls outside replay window",
+        ));
+    }
+    if envelope.collected_at_ms > now_ms.saturating_add(capability.max_clock_skew_ms) {
+        return Err((
+            "collection_time_in_future",
+            "submission collection time exceeds allowed clock skew",
         ));
     }
     if recent_count > capability.rate_limit_per_minute {
@@ -949,6 +984,7 @@ mod tests {
                 ],
                 allow_operation_attachment: true,
                 replay_window_ms: 10_000,
+                max_clock_skew_ms: 1_000,
                 max_payload_bytes: 1_024,
                 max_relationships: 4,
                 rate_limit_per_minute: 20,
@@ -1112,12 +1148,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_collection_time_beyond_registered_clock_skew() {
+        let db = configured_db();
+        let mut evidence = envelope();
+        evidence.collected_at_ms = 2_101;
+        let admission = db
+            .submit_evidence(&evidence, "producer:checks", 1_100)
+            .unwrap();
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("collection_time_in_future")
+        );
+    }
+
+    #[test]
     fn rejects_source_version_content_collision() {
         let db = configured_db();
         db.submit_evidence(&envelope(), "producer:checks", 1_100)
             .unwrap();
         let mut collision = envelope();
         collision.idempotency_key = "delivery-other".into();
+        collision.content = json!({"result": "failed"});
+        collision.content_digest = canonical_content_digest(&collision.content).unwrap();
+        let admission = db
+            .submit_evidence(&collision, "producer:checks", 1_200)
+            .unwrap();
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("source_identity_collision")
+        );
+    }
+
+    #[test]
+    fn rejects_same_source_sequence_under_a_different_version() {
+        let db = configured_db();
+        db.submit_evidence(&envelope(), "producer:checks", 1_100)
+            .unwrap();
+        let mut collision = envelope();
+        collision.idempotency_key = "delivery-other".into();
+        collision.source_version = "renamed-attempt".into();
         collision.content = json!({"result": "failed"});
         collision.content_digest = canonical_content_digest(&collision.content).unwrap();
         let admission = db
@@ -1158,6 +1227,7 @@ mod tests {
             allowed_intents: vec![EvidenceIntent::Upsert],
             allow_operation_attachment: false,
             replay_window_ms: 1_000,
+            max_clock_skew_ms: 100,
             max_payload_bytes: 1_024,
             max_relationships: 1,
             rate_limit_per_minute: 1,
