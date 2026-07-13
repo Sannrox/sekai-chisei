@@ -742,6 +742,7 @@ message EvidenceProducerCapability {
   uint64 max_relationships = 13;
   uint32 rate_limit_per_minute = 14;
   bool revoked = 15;
+  uint64 max_retained_submissions = 16;
 }
 
 message EvidenceSchemaDefinition {
