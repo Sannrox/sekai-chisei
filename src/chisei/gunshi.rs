@@ -6,7 +6,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::db::sekai::SekaiDb;
+use crate::domain::{KIND_LEARNING, ListFilter};
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
 
@@ -68,6 +71,41 @@ pub struct UnallocatedOperation {
 pub struct BaselineAllocation {
     pub plans: Vec<AllocationPlan>,
     pub unallocated: Vec<UnallocatedOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KiokuEvidence {
+    pub memory_id: String,
+    pub namespace: String,
+    pub operation_class: String,
+    pub model: String,
+    pub score: f64,
+    pub passed: bool,
+    pub status: String,
+    pub observed_at_ms: i64,
+    pub receipt_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvisoryPolicy {
+    pub max_memory_age_ms: i64,
+    pub min_score: f64,
+    pub max_evidence_references: usize,
+}
+
+impl AdvisoryPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_memory_age_ms < 0 {
+            return Err("maximum memory age must be non-negative".into());
+        }
+        if !self.min_score.is_finite() || !(0.0..=1.0).contains(&self.min_score) {
+            return Err("minimum evidence score must be between 0 and 1".into());
+        }
+        if self.max_evidence_references == 0 {
+            return Err("at least one evidence reference must be allowed".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +456,225 @@ pub fn recommend_baseline(request: &AllocationRequest) -> Result<BaselineAllocat
     Ok(BaselineAllocation { plans, unallocated })
 }
 
+/// Refine baseline plans using current, governed Kioku evidence. Evidence may
+/// change the selected model, but never expands the resources or budget already
+/// admitted by the baseline allocator.
+pub fn recommend_advisory(
+    request: &AllocationRequest,
+    evidence: &[KiokuEvidence],
+    policy: &AdvisoryPolicy,
+) -> Result<BaselineAllocation, String> {
+    policy.validate()?;
+    for memory in evidence {
+        validate_kioku_evidence(memory)?;
+    }
+    let mut allocation = recommend_baseline(request)?;
+    for plan in &mut allocation.plans {
+        let operation = request
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == plan.operation_id)
+            .expect("baseline plan belongs to a validated request operation");
+        let agent = request
+            .capacity
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == plan.selection.agent_id)
+            .expect("baseline plan selects a validated request agent");
+        let current = current_evidence(
+            evidence,
+            &plan.namespace,
+            &plan.operation_class,
+            request.capacity.captured_at_ms,
+            policy,
+        );
+        let mut by_model = BTreeMap::<&str, Vec<&KiokuEvidence>>::new();
+        for memory in current {
+            by_model.entry(&memory.model).or_default().push(memory);
+        }
+        let mut candidates = request
+            .capacity
+            .model_profiles
+            .iter()
+            .filter(|profile| {
+                agent.models.contains(&profile.model)
+                    && (operation.allowed_models.is_empty()
+                        || operation.allowed_models.contains(&profile.model))
+                    && profile
+                        .cost_per_attempt_usd_micros
+                        .checked_mul(i64::from(plan.attempts.max_attempts))
+                        .is_some_and(|cost| cost <= plan.budget_ceiling_usd_micros)
+                    && by_model.contains_key(profile.model.as_str())
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            evidence_score(&by_model[right.model.as_str()])
+                .total_cmp(&evidence_score(&by_model[left.model.as_str()]))
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        let Some(selected) = candidates.first() else {
+            plan.explanation
+                .push("no current trusted Kioku evidence changed the baseline".into());
+            continue;
+        };
+        let selected_evidence = &by_model[selected.model.as_str()];
+        let observed_quality = evidence_score(selected_evidence);
+        plan.selection.model = selected.model.clone();
+        plan.expected.quality = observed_quality;
+        plan.expected.cost_usd_micros = selected.cost_per_attempt_usd_micros;
+        plan.expected.latency_ms = selected.latency_ms;
+        plan.expected.uncertainty = selected
+            .uncertainty
+            .min(1.0 / (selected_evidence.len() as f64 + 1.0));
+        plan.evidence = evidence_references(selected_evidence, policy.max_evidence_references);
+        plan.explanation.push(format!(
+            "selected model {} from {} current Kioku observations",
+            selected.model,
+            selected_evidence.len()
+        ));
+        refresh_advisory_identity(plan)?;
+        plan.validate()?;
+    }
+    Ok(allocation)
+}
+
+/// Load governed learning objects without bypassing their namespace/status
+/// metadata. Invalid legacy rows are ignored rather than trusted implicitly.
+pub fn load_kioku_evidence(
+    db: &SekaiDb,
+    namespace: &str,
+    operation_class: &str,
+) -> Result<Vec<KiokuEvidence>, String> {
+    let objects = db.list_all_objects(&ListFilter {
+        kind: Some(KIND_LEARNING.into()),
+        namespace: Some(namespace.trim().to_string()),
+        ..Default::default()
+    })?;
+    let mut evidence = objects
+        .into_iter()
+        .filter_map(|object| {
+            let memory = KiokuEvidence {
+                memory_id: object.id,
+                namespace: object.namespace,
+                operation_class: object.properties.get("task_class")?.clone(),
+                model: object.properties.get("model")?.clone(),
+                score: object.properties.get("score")?.parse::<f64>().ok()? / 100.0,
+                passed: object.properties.get("passed")?.parse().ok()?,
+                status: object.properties.get("status")?.clone(),
+                observed_at_ms: object.updated.saturating_mul(1_000),
+                receipt_reference: object.properties.get("source_request_id").cloned(),
+            };
+            (memory.operation_class == operation_class && validate_kioku_evidence(&memory).is_ok())
+                .then_some(memory)
+        })
+        .collect::<Vec<_>>();
+    evidence.sort_by(|left, right| {
+        right
+            .observed_at_ms
+            .cmp(&left.observed_at_ms)
+            .then_with(|| left.memory_id.cmp(&right.memory_id))
+    });
+    Ok(evidence)
+}
+
+fn validate_kioku_evidence(memory: &KiokuEvidence) -> Result<(), String> {
+    for (name, value) in [
+        ("memory_id", memory.memory_id.as_str()),
+        ("namespace", memory.namespace.as_str()),
+        ("operation_class", memory.operation_class.as_str()),
+        ("model", memory.model.as_str()),
+        ("status", memory.status.as_str()),
+    ] {
+        required(name, value)?;
+    }
+    if !memory.score.is_finite() || !(0.0..=1.0).contains(&memory.score) {
+        return Err(format!(
+            "Kioku memory {} score must be between 0 and 1",
+            memory.memory_id
+        ));
+    }
+    Ok(())
+}
+
+fn current_evidence<'a>(
+    evidence: &'a [KiokuEvidence],
+    namespace: &str,
+    operation_class: &str,
+    now_ms: i64,
+    policy: &AdvisoryPolicy,
+) -> Vec<&'a KiokuEvidence> {
+    evidence
+        .iter()
+        .filter(|memory| {
+            memory.namespace == namespace
+                && memory.operation_class == operation_class
+                && memory.status == "active"
+                && memory.passed
+                && memory.score >= policy.min_score
+                && memory.observed_at_ms <= now_ms
+                && now_ms.saturating_sub(memory.observed_at_ms) <= policy.max_memory_age_ms
+        })
+        .collect()
+}
+
+fn evidence_score(evidence: &[&KiokuEvidence]) -> f64 {
+    evidence.iter().map(|memory| memory.score).sum::<f64>() / evidence.len() as f64
+}
+
+fn evidence_references(
+    evidence: &[&KiokuEvidence],
+    max_references: usize,
+) -> Vec<EvidenceReference> {
+    let mut ordered = evidence.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .observed_at_ms
+            .cmp(&left.observed_at_ms)
+            .then_with(|| left.memory_id.cmp(&right.memory_id))
+    });
+    let mut references = Vec::new();
+    for memory in ordered.into_iter().take(max_references) {
+        if references.len() == max_references {
+            break;
+        }
+        references.push(EvidenceReference {
+            kind: "kioku_memory".into(),
+            reference: memory.memory_id.clone(),
+            reason: format!(
+                "observed model {} quality {:.3}",
+                memory.model, memory.score
+            ),
+        });
+        if let Some(receipt) = memory
+            .receipt_reference
+            .as_deref()
+            .filter(|reference| !reference.trim().is_empty())
+            && references.len() < max_references
+        {
+            references.push(EvidenceReference {
+                kind: "operation_receipt".into(),
+                reference: receipt.to_string(),
+                reason: format!("source receipt for memory {}", memory.memory_id),
+            });
+        }
+    }
+    references
+}
+
+fn refresh_advisory_identity(plan: &mut AllocationPlan) -> Result<(), String> {
+    let bytes = serde_json::to_vec(&(
+        plan.input_fingerprint.as_str(),
+        &plan.selection,
+        &plan.expected,
+        &plan.evidence,
+    ))
+    .map_err(|error| format!("serialize advisory inputs: {error}"))?;
+    let fingerprint = format!("{:x}", Sha256::digest(bytes));
+    plan.allocation_id = format!("alloc-{}", &fingerprint[..16]);
+    plan.input_fingerprint = fingerprint;
+    Ok(())
+}
+
 fn affordable_attempts(
     operation: &PendingOperation,
     profile: &ModelProfile,
@@ -675,6 +932,28 @@ mod tests {
         }
     }
 
+    fn memory(id: &str, model: &str, score: f64, observed_at_ms: i64) -> KiokuEvidence {
+        KiokuEvidence {
+            memory_id: id.into(),
+            namespace: "support".into(),
+            operation_class: "triage".into(),
+            model: model.into(),
+            score,
+            passed: true,
+            status: "active".into(),
+            observed_at_ms,
+            receipt_reference: Some(format!("receipt-{id}")),
+        }
+    }
+
+    fn advisory_policy() -> AdvisoryPolicy {
+        AdvisoryPolicy {
+            max_memory_age_ms: 1_000,
+            min_score: 0.5,
+            max_evidence_references: 4,
+        }
+    }
+
     #[test]
     fn contracts_round_trip_without_losing_hard_constraints() {
         let original = operation();
@@ -893,5 +1172,87 @@ mod tests {
         let result = recommend_baseline(&request).unwrap();
         assert_eq!(result.plans[0].operation_id, "op-1");
         assert_eq!(result.unallocated[0].operation_id, "op-unknown");
+    }
+
+    #[test]
+    fn advisory_uses_current_kioku_evidence_with_receipt_citations() {
+        let mut request = request();
+        request.strategy.baseline = BaselineStrategy::Throughput;
+        request.operations[0]
+            .allowed_models
+            .insert("frontier".into());
+        request.operations[0].max_attempts = 1;
+        request.capacity.model_profiles[1].cost_per_attempt_usd_micros = 10_000;
+        let baseline = recommend_baseline(&request).unwrap();
+        assert_eq!(baseline.plans[0].selection.model, "local-small");
+
+        let advisory = recommend_advisory(
+            &request,
+            &[
+                memory("frontier-1", "frontier", 0.95, 9),
+                memory("local-1", "local-small", 0.6, 9),
+            ],
+            &advisory_policy(),
+        )
+        .unwrap();
+        let plan = &advisory.plans[0];
+        assert_eq!(plan.selection.model, "frontier");
+        assert_eq!(plan.expected.quality, 0.95);
+        assert_eq!(plan.evidence[0].kind, "kioku_memory");
+        assert_eq!(plan.evidence[1].kind, "operation_receipt");
+        assert_ne!(plan.allocation_id, baseline.plans[0].allocation_id);
+    }
+
+    #[test]
+    fn stale_kioku_evidence_cannot_change_the_baseline() {
+        let mut request = request();
+        request.capacity.captured_at_ms = 10_000;
+        request.strategy.baseline = BaselineStrategy::Throughput;
+        request.operations[0]
+            .allowed_models
+            .insert("frontier".into());
+        request.operations[0].max_attempts = 1;
+        request.capacity.model_profiles[1].cost_per_attempt_usd_micros = 10_000;
+
+        let advisory = recommend_advisory(
+            &request,
+            &[memory("old", "frontier", 1.0, 1)],
+            &advisory_policy(),
+        )
+        .unwrap();
+        assert_eq!(advisory.plans[0].selection.model, "local-small");
+        assert!(advisory.plans[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn governed_learning_objects_load_as_kioku_evidence() {
+        use crate::domain::Object;
+        use std::collections::HashMap;
+
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&Object {
+            id: "learning-1".into(),
+            kind: KIND_LEARNING.into(),
+            name: "Scored learning".into(),
+            namespace: "support".into(),
+            external_id: "learning-1".into(),
+            properties: HashMap::from([
+                ("task_class".into(), "triage".into()),
+                ("model".into(), "local-small".into()),
+                ("score".into(), "87".into()),
+                ("passed".into(), "true".into()),
+                ("status".into(), "active".into()),
+                ("source_request_id".into(), "receipt-1".into()),
+            ]),
+            created: 1,
+            updated: 2,
+        })
+        .unwrap();
+
+        let loaded = load_kioku_evidence(&db, "support", "triage").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].score, 0.87);
+        assert_eq!(loaded[0].observed_at_ms, 2_000);
+        assert_eq!(loaded[0].receipt_reference.as_deref(), Some("receipt-1"));
     }
 }
