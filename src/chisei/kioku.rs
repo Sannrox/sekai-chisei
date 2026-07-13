@@ -172,30 +172,20 @@ pub fn derive_verified_outcome_candidate(
                     {
                         return None;
                     }
-                    Some((event, reference, digest.to_string()))
+                    let outcome_event = outcome.receipt.events.iter().find(|candidate| {
+                        candidate.kind == ReceiptEventKind::OutcomeRecorded
+                            && event_descends_from(
+                                &outcome.receipt,
+                                candidate,
+                                event.event_id.as_str(),
+                            )
+                    })?;
+                    Some((event, reference, digest.to_string(), outcome_event))
                 })
             })
             .ok_or_else(|| {
                 format!(
-                    "operation {} lacks a disclosed hashed verification reference",
-                    outcome.receipt.operation_id
-                )
-            })?;
-        let outcome_event = outcome
-            .receipt
-            .events
-            .iter()
-            .find(|event| {
-                event.kind == ReceiptEventKind::OutcomeRecorded
-                    && event_descends_from(
-                        &outcome.receipt,
-                        event,
-                        verification.0.event_id.as_str(),
-                    )
-            })
-            .ok_or_else(|| {
-                format!(
-                    "operation {} lacks an outcome causally linked to verification",
+                    "operation {} lacks a disclosed hashed verification linked to its outcome",
                     outcome.receipt.operation_id
                 )
             })?;
@@ -221,7 +211,7 @@ pub fn derive_verified_outcome_candidate(
             stance,
             outcome_metric: outcome.outcome_metric.trim().to_string(),
             outcome_value: outcome.outcome_value,
-            observed_at_ms: outcome_event.timestamp_ms,
+            observed_at_ms: verification.3.timestamp_ms,
         });
     }
     if supporting == 0 {
@@ -778,6 +768,20 @@ mod tests {
             .unwrap();
         outcome.parent_event_id = Some("operation-3-budget".into());
         let error = derive_verified_outcome_candidate(input(vec![unbound])).unwrap_err();
-        assert!(error.contains("causally linked"));
+        assert!(error.contains("linked to its outcome"));
+
+        let mut multiple = verified_outcome("operation-4", true);
+        let mut unrelated = multiple
+            .receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::VerificationRecorded)
+            .unwrap()
+            .clone();
+        unrelated.event_id = "operation-4-unrelated-verify".into();
+        unrelated.parent_event_id = Some("operation-4-budget".into());
+        multiple.receipt.events.insert(4, unrelated);
+        let (_, links) = derive_verified_outcome_candidate(input(vec![multiple])).unwrap();
+        assert_eq!(links[0].verification_event_id, "operation-4-verify");
     }
 }
