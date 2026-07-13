@@ -238,6 +238,14 @@ impl AttestationBundle {
                 "artifact {reference} is not referenced by the receipt"
             ));
         }
+        if matching
+            .iter()
+            .any(|declaration| declaration.disposition == CoverageDisposition::Redacted)
+        {
+            return Err(format!(
+                "artifact {reference} is redacted by the receipt and cannot be attached"
+            ));
+        }
         let digest = encode_hex(&Sha256::digest(content));
         for declaration in matching {
             if let Some(expected) = &declaration.expected_digest
@@ -1310,6 +1318,33 @@ mod tests {
         }));
         assert!(bundle.coverage.iter().any(|entry| {
             entry.disposition == CoverageDisposition::Uncovered && entry.reference == "action"
+        }));
+    }
+
+    #[test]
+    fn redacted_artifacts_cannot_be_attached() {
+        let mut source = receipt();
+        source.events[0]
+            .references
+            .push(crate::chisei::receipt::GovernedReference {
+                kind: "context".into(),
+                reference: "object://secret".into(),
+                content_hash: Some(encode_hex(&Sha256::digest(b"secret"))),
+                disclosed_fields: vec![],
+                omitted: true,
+                omission_reason: Some("private field".into()),
+            });
+        let mut bundle = AttestationBundle::unsigned(source).unwrap();
+
+        let error = bundle
+            .attach_artifact("object://secret", None, b"secret")
+            .unwrap_err();
+
+        assert!(error.contains("redacted"));
+        assert!(bundle.artifacts.is_empty());
+        assert!(bundle.coverage.iter().any(|entry| {
+            entry.reference == "object://secret"
+                && entry.disposition == CoverageDisposition::Redacted
         }));
     }
 
