@@ -155,10 +155,12 @@ impl SekaiDb {
                      FROM sekai_evidence_source_identity AS identity
                      JOIN sekai_evidence_projections AS projection
                        ON projection.submission_id = identity.submission_id
-                     WHERE identity.source_instance=?1 AND identity.source_record_id=?2
+                     WHERE identity.source_type=?1 AND identity.source_instance=?2
+                       AND identity.source_record_id=?3
                      ORDER BY identity.source_sequence DESC LIMIT 1",
                     params![
-                        envelope.source_instance,
+                        relationship.target_source_type,
+                        relationship.target_source_instance,
                         relationship.target_source_record_id
                     ],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -233,6 +235,7 @@ impl SekaiDb {
 
         let evidence_object_id = format!("evidence-object-{}", submission.id);
         let source_identity_hash = source_identity_hash(
+            &envelope.source_type,
             &envelope.source_instance,
             &envelope.source_record_id,
             envelope.source_sequence,
@@ -586,9 +589,14 @@ fn update_object_lifecycle(
     Ok(())
 }
 
-fn source_identity_hash(source_instance: &str, source_record_id: &str, sequence: i64) -> String {
-    let bytes =
-        serde_json::to_vec(&(source_instance, source_record_id, sequence)).unwrap_or_default();
+fn source_identity_hash(
+    source_type: &str,
+    source_instance: &str,
+    source_record_id: &str,
+    sequence: i64,
+) -> String {
+    let bytes = serde_json::to_vec(&(source_type, source_instance, source_record_id, sequence))
+        .unwrap_or_default();
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -601,8 +609,8 @@ mod tests {
     use super::*;
     use crate::domain::Object;
     use crate::sekai::evidence::{
-        EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceSignal, EvidenceTarget,
-        SchemaCompatibility,
+        EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceRelationship, EvidenceSignal,
+        EvidenceTarget, SchemaCompatibility,
     };
     use crate::sekai::evidence_store::{
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
@@ -892,5 +900,37 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn relationship_projection_uses_complete_source_identity() {
+        let db = setup();
+        let correct = admit(&db, &envelope("shared", 1, EvidenceIntent::Upsert));
+        db.project_evidence_submission(&correct, 300).unwrap();
+        let mut other_type = envelope("shared", 2, EvidenceIntent::Upsert);
+        other_type.source_type = "other_verification_system".into();
+        other_type.idempotency_key = "other-type".into();
+        let other = admit(&db, &other_type);
+        db.project_evidence_submission(&other, 310).unwrap();
+
+        let mut dependent = envelope("dependent", 3, EvidenceIntent::Upsert);
+        dependent.relationships = vec![EvidenceRelationship {
+            relation: "verified_by".into(),
+            target_source_type: "verification_system".into(),
+            target_source_instance: "checks-primary".into(),
+            target_source_record_id: "shared".into(),
+        }];
+        let dependent_id = admit(&db, &dependent);
+        db.project_evidence_submission(&dependent_id, 320).unwrap();
+        let conn = db.conn();
+        let related: String = conn
+            .query_row(
+                "SELECT related_submission_id FROM sekai_evidence_relationship_projections
+                 WHERE submission_id=?1",
+                [&dependent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(related, correct);
     }
 }
