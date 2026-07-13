@@ -43,7 +43,7 @@ use crate::grpc::pb::sekai::{
     FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject,
     RetrieveContextRequest, Row,
 };
-use crate::llm::{HttpTimeouts, classify_reqwest_error};
+use crate::llm::HttpTimeouts;
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -1142,10 +1142,7 @@ async fn proxy_gateway(
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
-                reason: classify_reqwest_error(
-                    &format!("{} upstream request", prepared.provider.runtime_name()),
-                    err,
-                ),
+                reason: safe_upstream_error_reason(prepared.provider, "request", &err),
             };
             record_refusal_with_usage_and_append(
                 &state.config,
@@ -6958,10 +6955,7 @@ async fn response_from_upstream(
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
-                reason: classify_reqwest_error(
-                    &format!("{} upstream response", context.provider.runtime_name()),
-                    err,
-                ),
+                reason: safe_upstream_error_reason(context.provider, "response", &err),
             };
             record_refusal_with_usage_and_append(
                 config, identity, &context, &rejection, None, true,
@@ -6970,6 +6964,25 @@ async fn response_from_upstream(
             json_error(rejection.status, &rejection.error_type, &rejection.reason)
         }
     }
+}
+
+fn safe_upstream_error_reason(
+    provider: ProviderKind,
+    stage: &str,
+    error: &reqwest::Error,
+) -> String {
+    let failure = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_body() {
+        "body transfer failed"
+    } else if error.is_decode() {
+        "response decoding failed"
+    } else {
+        "failed"
+    };
+    format!("{} upstream {stage} {failure}", provider.runtime_name())
 }
 
 fn should_forward_request_header(name: &HeaderName, auth_mode: UpstreamAuthMode) -> bool {
