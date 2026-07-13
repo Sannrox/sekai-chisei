@@ -133,6 +133,7 @@ message Dataset {
 message ColumnDef {
   string name = 1;
   string type = 2;
+  string classification = 3;
 }
 
 message RowFilter {

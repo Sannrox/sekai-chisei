@@ -1840,6 +1840,7 @@ fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
             .map(|c| ColumnDef {
                 name: c.name.clone(),
                 r#type: c.col_type.clone(),
+                classification: c.classification.clone(),
             })
             .collect(),
         object_id: d.object_id.clone(),
@@ -1857,6 +1858,7 @@ fn from_proto_dataset(d: &Dataset) -> dataset::Dataset {
             .map(|c| dataset::ColumnDef {
                 name: c.name.clone(),
                 col_type: c.r#type.clone(),
+                classification: c.classification.clone(),
             })
             .collect(),
         object_id: d.object_id.clone(),
@@ -8020,6 +8022,7 @@ mod tests {
                     columns: vec![ColumnDef {
                         name: "value".into(),
                         r#type: "int".into(),
+                        classification: "public".into(),
                     }],
                     object_id: "".into(),
                     created: 1,

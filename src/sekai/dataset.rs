@@ -6,6 +6,29 @@ use std::collections::HashMap;
 pub struct ColumnDef {
     pub name: String,
     pub col_type: String,
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatasetRedaction {
+    pub rows_updated: i32,
+    pub fields_redacted: i32,
+}
+
+pub fn llm_call_column_classification(name: &str) -> &'static str {
+    if matches!(
+        name,
+        "request_id" | "agent" | "user_id" | "key_id" | "work_unit_id" | "refusal_reason"
+    ) {
+        "sensitive"
+    } else if matches!(
+        name,
+        "project" | "route_bias" | "policy_scope" | "policy_version"
+    ) {
+        "internal"
+    } else {
+        "public"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +65,28 @@ pub struct VirtualTable {
     pub created: i64,
 }
 
+fn parse_columns(value: &str) -> Vec<ColumnDef> {
+    if let Ok(columns) = serde_json::from_str::<Vec<(String, String, String)>>(value) {
+        return columns
+            .into_iter()
+            .map(|(name, col_type, classification)| ColumnDef {
+                name,
+                col_type,
+                classification,
+            })
+            .collect();
+    }
+    serde_json::from_str::<Vec<(String, String)>>(value)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, col_type)| ColumnDef {
+            name,
+            col_type,
+            classification: crate::sekai::schema::default_property_classification(),
+        })
+        .collect()
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_datasets(&self) -> Result<(), String> {
         let conn = self.conn();
@@ -61,15 +106,70 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT columns FROM sekai_datasets WHERE id='llm_calls'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(stored) = stored {
+            let mut columns = parse_columns(&stored);
+            if !columns.iter().any(|column| column.name == "data_class") {
+                let insert_at = columns
+                    .iter()
+                    .position(|column| column.name == "project")
+                    .map_or(columns.len(), |index| index + 1);
+                columns.insert(
+                    insert_at,
+                    ColumnDef {
+                        name: "data_class".into(),
+                        col_type: "string".into(),
+                        classification: llm_call_column_classification("data_class").into(),
+                    },
+                );
+            }
+            for column in &mut columns {
+                column.classification = llm_call_column_classification(&column.name).into();
+            }
+            let columns = serde_json::to_string(
+                &columns
+                    .iter()
+                    .map(|column| (&column.name, &column.col_type, &column.classification))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE sekai_datasets SET columns=?1 WHERE id='llm_calls'",
+                params![columns],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn create_dataset(&self, d: &Dataset) -> Result<(), String> {
+        for column in &d.columns {
+            if !crate::sekai::schema::is_valid_property_classification(&column.classification) {
+                return Err(format!(
+                    "column {} has invalid classification: {}",
+                    column.name, column.classification
+                ));
+            }
+        }
         let conn = self.conn();
         let cols = serde_json::to_string(
             &d.columns
                 .iter()
-                .map(|c| (&c.name, &c.col_type))
+                .map(|c| {
+                    (
+                        &c.name,
+                        &c.col_type,
+                        crate::sekai::schema::normalize_property_classification(&c.classification),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -85,18 +185,10 @@ impl SekaiDb {
             params![id],
             |row| {
                 let cols_str: String = row.get(2)?;
-                let cols: Vec<(String, String)> =
-                    serde_json::from_str(&cols_str).unwrap_or_default();
                 Ok(Dataset {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    columns: cols
-                        .into_iter()
-                        .map(|(n, t)| ColumnDef {
-                            name: n,
-                            col_type: t,
-                        })
-                        .collect(),
+                    columns: parse_columns(&cols_str),
                     object_id: row.get(3)?,
                     created: row.get(4)?,
                 })
@@ -115,17 +207,10 @@ impl SekaiDb {
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let cols_str: String = row.get(2).map_err(|e| e.to_string())?;
-            let cols: Vec<(String, String)> = serde_json::from_str(&cols_str).unwrap_or_default();
             results.push(Dataset {
                 id: row.get(0).map_err(|e| e.to_string())?,
                 name: row.get(1).map_err(|e| e.to_string())?,
-                columns: cols
-                    .into_iter()
-                    .map(|(n, t)| ColumnDef {
-                        name: n,
-                        col_type: t,
-                    })
-                    .collect(),
+                columns: parse_columns(&cols_str),
                 object_id: row.get(3).map_err(|e| e.to_string())?,
                 created: row.get(4).map_err(|e| e.to_string())?,
             });
@@ -187,6 +272,93 @@ impl SekaiDb {
             }
         }
         Ok(results)
+    }
+
+    pub fn redact_dataset_fields(
+        &self,
+        dataset_id: &str,
+        classification: &str,
+        filters: &[RowFilter],
+    ) -> Result<DatasetRedaction, String> {
+        if !crate::sekai::schema::is_restricted_property_classification(classification) {
+            return Err("classification must be internal or sensitive".into());
+        }
+        let classification =
+            crate::sekai::schema::normalize_property_classification(classification);
+        let dataset = self
+            .get_dataset(dataset_id)?
+            .ok_or_else(|| "dataset not found".to_string())?;
+        for filter in filters {
+            if !dataset
+                .columns
+                .iter()
+                .any(|column| column.name == filter.column)
+            {
+                return Err(format!("unknown filter column: {}", filter.column));
+            }
+            if !matches!(
+                filter.op.as_str(),
+                "eq" | "neq" | "gt" | "lt" | "gte" | "lte"
+            ) {
+                return Err(format!("unsupported filter operator: {}", filter.op));
+            }
+        }
+        let fields: Vec<&str> = dataset
+            .columns
+            .iter()
+            .filter(|column| {
+                crate::sekai::schema::normalize_property_classification(&column.classification)
+                    == classification
+            })
+            .map(|column| column.name.as_str())
+            .collect();
+        if fields.is_empty() {
+            return Ok(DatasetRedaction::default());
+        }
+
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let rows = {
+            let mut stmt = tx
+                .prepare("SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=?1 ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![dataset_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        let mut result = DatasetRedaction::default();
+        for (id, data) in rows {
+            let mut values: HashMap<String, String> =
+                serde_json::from_str(&data).map_err(|e| e.to_string())?;
+            if !matches_row_filters(&values, filters) {
+                continue;
+            }
+            let mut changed = 0;
+            for field in &fields {
+                if let Some(value) = values.get_mut(*field)
+                    && value != "[redacted]"
+                {
+                    *value = "[redacted]".into();
+                    changed += 1;
+                }
+            }
+            if changed == 0 {
+                continue;
+            }
+            let data = serde_json::to_string(&values).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE sekai_dataset_rows SET data=?1 WHERE id=?2 AND dataset_id=?3",
+                params![data, id, dataset_id],
+            )
+            .map_err(|e| e.to_string())?;
+            result.rows_updated += 1;
+            result.fields_redacted += changed;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
     }
 
     pub fn create_virtual_table(&self, vt: &VirtualTable) -> Result<(), String> {
@@ -262,7 +434,7 @@ fn matches_row_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> 
             "lt" => val.parse::<f64>().unwrap_or(0.0) < f.value.parse::<f64>().unwrap_or(0.0),
             "gte" => val.parse::<f64>().unwrap_or(0.0) >= f.value.parse::<f64>().unwrap_or(0.0),
             "lte" => val.parse::<f64>().unwrap_or(0.0) <= f.value.parse::<f64>().unwrap_or(0.0),
-            _ => true,
+            _ => false,
         };
         if !ok {
             return false;
@@ -291,10 +463,12 @@ mod tests {
                 ColumnDef {
                     name: "ts".into(),
                     col_type: "int".into(),
+                    classification: "public".into(),
                 },
                 ColumnDef {
                     name: "val".into(),
                     col_type: "float".into(),
+                    classification: "public".into(),
                 },
             ],
             object_id: "".into(),
@@ -344,6 +518,127 @@ mod tests {
     }
 
     #[test]
+    fn loads_legacy_dataset_columns_as_public() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
+                 VALUES ('legacy','legacy','[[\"value\",\"string\"]]','',1)",
+                [],
+            )
+            .unwrap();
+
+        let dataset = db.get_dataset("legacy").unwrap().unwrap();
+        assert_eq!(dataset.columns[0].classification, "public");
+    }
+
+    #[test]
+    fn migrates_legacy_llm_call_column_classifications() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
+                 VALUES ('llm_calls','calls','[[\"user_id\",\"string\"],[\"status\",\"string\"]]','',1)",
+                [],
+            )
+            .unwrap();
+        db.migrate_datasets().unwrap();
+
+        let dataset = db.get_dataset("llm_calls").unwrap().unwrap();
+        assert_eq!(dataset.columns[0].classification, "sensitive");
+        assert_eq!(dataset.columns[1].classification, "public");
+        let data_class = dataset
+            .columns
+            .iter()
+            .find(|column| column.name == "data_class")
+            .unwrap();
+        assert_eq!(data_class.col_type, "string");
+        assert_eq!(data_class.classification, "public");
+    }
+
+    #[test]
+    fn redacts_only_matching_classified_dataset_fields() {
+        let db = setup();
+        db.create_dataset(&Dataset {
+            id: "classified".into(),
+            name: "classified".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "namespace".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "identity".into(),
+                    col_type: "string".into(),
+                    classification: "sensitive".into(),
+                },
+                ColumnDef {
+                    name: "metric".into(),
+                    col_type: "int".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "classified",
+            &[
+                HashMap::from([
+                    ("namespace".into(), "redact".into()),
+                    ("identity".into(), "alice".into()),
+                    ("metric".into(), "1".into()),
+                ]),
+                HashMap::from([
+                    ("namespace".into(), "keep".into()),
+                    ("identity".into(), "bob".into()),
+                    ("metric".into(), "2".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+
+        let error = db
+            .redact_dataset_fields(
+                "classified",
+                "sensitive",
+                &[RowFilter {
+                    column: "namespace".into(),
+                    op: "contains".into(),
+                    value: "redact".into(),
+                }],
+            )
+            .unwrap_err();
+        assert!(error.contains("unsupported filter operator"));
+
+        let result = db
+            .redact_dataset_fields(
+                "classified",
+                "sensitive",
+                &[RowFilter {
+                    column: "namespace".into(),
+                    op: "eq".into(),
+                    value: "redact".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+        assert_eq!(result.fields_redacted, 1);
+        let rows = db.query_rows("classified", &RowQuery::default()).unwrap();
+        assert_eq!(rows[0]["identity"], "[redacted]");
+        assert_eq!(rows[0]["metric"], "1");
+        assert_eq!(rows[1]["identity"], "bob");
+        assert_eq!(
+            db.redact_dataset_fields("classified", "sensitive", &[])
+                .unwrap()
+                .rows_updated,
+            1
+        );
+    }
+
+    #[test]
     fn test_virtual_table() {
         let db = setup();
         let ds = Dataset {
@@ -352,6 +647,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "x".into(),
                 col_type: "int".into(),
+                classification: "public".into(),
             }],
             object_id: "".into(),
             created: 0,
