@@ -768,7 +768,7 @@ mod tests {
         let first = admit(&db, &envelope("run-1", 1, EvidenceIntent::Upsert));
         db.project_evidence_submission(&first, 300).unwrap();
         let second = admit(&db, &envelope("run-1", 2, EvidenceIntent::Upsert));
-        db.project_evidence_submission(&second, 400).unwrap();
+        let projection = db.project_evidence_submission(&second, 400).unwrap();
         assert_eq!(
             db.get_evidence_submission(&first)
                 .unwrap()
@@ -783,6 +783,11 @@ mod tests {
                 .lifecycle_state,
             EvidenceLifecycleState::Available
         );
+        let usable = db
+            .list_usable_evidence_for_targets(&[projection.target_object_id.unwrap()], 450, 8)
+            .unwrap();
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].submission.id, second);
     }
 
     #[test]

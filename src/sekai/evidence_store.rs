@@ -70,6 +70,13 @@ pub struct EvidenceSubmissionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct UsableEvidenceContext {
+    pub submission: EvidenceSubmissionRecord,
+    pub target_object_id: String,
+    pub projection_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceAdmission {
     pub submission: EvidenceSubmissionRecord,
     pub accepted: bool,
@@ -693,6 +700,64 @@ impl SekaiDb {
             .collect::<Vec<&dyn rusqlite::types::ToSql>>();
         let rows = statement
             .query_map(parameters.as_slice(), row_to_submission)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_usable_evidence_for_targets(
+        &self,
+        target_object_ids: &[String],
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<UsableEvidenceContext>, String> {
+        if target_object_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=target_object_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let now_parameter = target_object_ids.len() + 1;
+        let limit_parameter = target_object_ids.len() + 2;
+        let sql = format!(
+            "SELECT s.id, s.producer_identity, s.source_type, s.source_instance,
+                    s.source_record_id, s.source_version, s.source_sequence, s.namespace,
+                    s.target_external_id, s.target_kind, s.evidence_type, s.schema_id,
+                    s.schema_version, s.idempotency_key, s.content_digest, s.classification,
+                    s.intent, s.lifecycle_state, s.rejection_code, s.rejection_summary,
+                    s.observed_at_ms, s.collected_at_ms, s.expires_at_ms, s.received_at_ms,
+                    s.updated_at_ms, s.envelope_json, p.target_object_id, p.projection_version
+             FROM sekai_evidence_submissions AS s
+             JOIN sekai_evidence_projections AS p ON p.submission_id = s.id
+             WHERE p.target_object_id IN ({placeholders})
+               AND s.lifecycle_state = 'available'
+               AND s.intent = 'upsert'
+               AND (s.expires_at_ms IS NULL OR s.expires_at_ms > ?{now_parameter})
+             ORDER BY s.observed_at_ms DESC, s.id DESC
+             LIMIT ?{limit_parameter}"
+        );
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = target_object_ids
+            .iter()
+            .cloned()
+            .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        values.push(Box::new(now_ms));
+        values.push(Box::new(limit.min(32) as i64));
+        let parameters = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(parameters.as_slice(), |row| {
+                Ok(UsableEvidenceContext {
+                    submission: row_to_submission(row)?,
+                    target_object_id: row.get(26)?,
+                    projection_version: row.get(27)?,
+                })
+            })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())

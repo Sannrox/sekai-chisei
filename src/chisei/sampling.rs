@@ -145,6 +145,7 @@ mod tests {
             external_egress: true,
             template_only: false,
             expanded_context_items: 0,
+            evidence_references: vec![],
         }
     }
 
