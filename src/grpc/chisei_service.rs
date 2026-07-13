@@ -532,18 +532,6 @@ impl ChiseiServiceImpl {
             let expected_baseline = evidence_context_config_ref(evidence_type, false);
             let expected_candidate = evidence_context_config_ref(evidence_type, true);
             let invalid_reason = match (baseline.as_ref(), candidate.as_ref()) {
-                (Some(baseline), Some(candidate))
-                    if baseline.config_ref != expected_baseline
-                        || candidate.config_ref != expected_candidate =>
-                {
-                    Some("evidence comparison must use the expected without/with config refs")
-                }
-                (Some(baseline), Some(candidate))
-                    if baseline.results.len() < MIN_EVIDENCE_CONTEXT_EVAL_CASES
-                        || candidate.results.len() < MIN_EVIDENCE_CONTEXT_EVAL_CASES =>
-                {
-                    Some("evidence comparison has too few matched cases")
-                }
                 (Some(baseline), Some(candidate)) => {
                     let baseline_cases = baseline
                         .results
@@ -555,9 +543,23 @@ impl ChiseiServiceImpl {
                         .iter()
                         .map(|result| result.case_id.as_str())
                         .collect::<HashSet<_>>();
-                    (baseline_cases != candidate_cases
-                        || baseline_cases.len() < MIN_EVIDENCE_CONTEXT_EVAL_CASES)
-                        .then_some("evidence comparison cases do not match")
+                    if baseline.config_ref != expected_baseline
+                        || candidate.config_ref != expected_candidate
+                    {
+                        Some("evidence comparison must use the expected without/with config refs")
+                    } else if baseline_cases.len() != baseline.results.len()
+                        || candidate_cases.len() != candidate.results.len()
+                    {
+                        Some("evidence comparison contains duplicate case results")
+                    } else if baseline_cases.len() < MIN_EVIDENCE_CONTEXT_EVAL_CASES
+                        || candidate_cases.len() < MIN_EVIDENCE_CONTEXT_EVAL_CASES
+                    {
+                        Some("evidence comparison has too few matched cases")
+                    } else if baseline_cases != candidate_cases {
+                        Some("evidence comparison cases do not match")
+                    } else {
+                        None
+                    }
                 }
                 _ => Some("evidence comparison runs are unavailable"),
             };
@@ -5544,6 +5546,33 @@ mod tests {
                 && decision.evidence["allowed"] == "true"
                 && decision.evidence["expanded_context_items"] != "0"
         }));
+    }
+
+    #[tokio::test]
+    async fn evidence_context_gate_rejects_duplicate_case_results() {
+        let svc = memory_service();
+        create_suite(&svc, "acme").await;
+        let evidence_type = "verification.result";
+        let profile = evidence_context_profile_key("acme", evidence_type);
+        let baseline = evidence_eval_run("duplicate-base", "suite-1", evidence_type, false, 90, 1);
+        let mut candidate =
+            evidence_eval_run("duplicate-pass", "suite-1", evidence_type, true, 95, 2);
+        candidate.results.push(candidate.results[0].clone());
+        for run in [baseline, candidate] {
+            let id = run.id.clone();
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(run),
+                changed_file: profile.clone(),
+                diff_hash: format!("hash-{id}"),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let gate = svc.evidence_context_gate("acme", evidence_type, true);
+        assert!(!gate.effective_allowed);
+        assert_eq!(gate.gate.verdict, "invalid_comparison");
+        assert!(gate.gate.reason.contains("duplicate"));
     }
 
     #[tokio::test]
