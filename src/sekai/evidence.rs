@@ -300,10 +300,14 @@ impl EvidenceEnvelope {
             ));
         }
         if self.relationships.iter().any(|relationship| {
+            let source_type_omitted = relationship.target_source_type.is_empty();
+            let source_instance_omitted = relationship.target_source_instance.is_empty();
             relationship.relation.trim().is_empty()
                 || relationship.target_source_record_id.trim().is_empty()
-                || (relationship.target_source_type.trim().is_empty()
-                    != relationship.target_source_instance.trim().is_empty())
+                || source_type_omitted != source_instance_omitted
+                || (!source_type_omitted
+                    && (relationship.target_source_type.trim().is_empty()
+                        || relationship.target_source_instance.trim().is_empty()))
         }) {
             errors.push("relationships require relation and target source record".to_string());
         }
@@ -431,5 +435,16 @@ mod tests {
         let relationship = &serialized["relationships"][0];
         assert!(relationship.get("target_source_type").is_none());
         assert!(relationship.get("target_source_instance").is_none());
+    }
+
+    #[test]
+    fn whitespace_relationship_identity_is_not_treated_as_omitted() {
+        let mut evidence = envelope();
+        evidence.relationships[0].target_source_type = " ".into();
+        evidence.relationships[0].target_source_instance = "\t".into();
+        let errors = evidence
+            .validate_contract(EvidenceLimits::default())
+            .unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("relationships")));
     }
 }
