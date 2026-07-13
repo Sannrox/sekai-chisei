@@ -93,6 +93,67 @@ pub struct AdvisoryPolicy {
     pub max_evidence_references: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorResponse {
+    Accepted,
+    Modified,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorChoice {
+    pub operation_id: String,
+    pub allocation_id: String,
+    pub response: OperatorResponse,
+    pub selected_resources: Option<ResourceSelection>,
+    pub max_attempts: Option<u32>,
+    pub budget_ceiling_usd_micros: Option<i64>,
+    pub rationale: String,
+    pub decided_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservedOutcome {
+    pub operation_id: String,
+    pub receipt_reference: String,
+    pub accepted: bool,
+    pub quality: f64,
+    pub cost_usd_micros: i64,
+    pub latency_ms: i64,
+    pub attempts: u32,
+    pub completed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvisoryComparison {
+    pub allocation_id: String,
+    pub operation_id: String,
+    pub operator_response: OperatorResponse,
+    pub resource_selection_matched: bool,
+    pub attempt_limit_delta: i64,
+    pub budget_ceiling_delta_usd_micros: i64,
+    pub outcome_receipt_reference: Option<String>,
+    pub outcome_accepted: Option<bool>,
+    pub quality_error: Option<f64>,
+    pub cost_error_usd_micros: Option<i64>,
+    pub latency_error_ms: Option<i64>,
+    pub recommendation_evidence: Vec<EvidenceReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvisoryScorecard {
+    pub comparisons: usize,
+    pub accepted: usize,
+    pub modified: usize,
+    pub rejected: usize,
+    pub resource_selection_agreement_rate: f64,
+    pub observed_outcomes: usize,
+    pub mean_absolute_quality_error: Option<f64>,
+    pub mean_absolute_cost_error_usd_micros: Option<f64>,
+    pub mean_absolute_latency_error_ms: Option<f64>,
+}
+
 impl AdvisoryPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_memory_age_ms < 0 {
@@ -575,6 +636,168 @@ pub fn load_kioku_evidence(
             .then_with(|| left.memory_id.cmp(&right.memory_id))
     });
     Ok(evidence)
+}
+
+pub fn compare_advisory(
+    plan: &AllocationPlan,
+    choice: &OperatorChoice,
+    outcome: Option<&ObservedOutcome>,
+) -> Result<AdvisoryComparison, String> {
+    plan.validate()?;
+    validate_operator_choice(plan, choice)?;
+    if let Some(outcome) = outcome {
+        validate_observed_outcome(plan, outcome)?;
+    }
+    let selected = match choice.response {
+        OperatorResponse::Accepted => Some(&plan.selection),
+        OperatorResponse::Modified => choice.selected_resources.as_ref().or(Some(&plan.selection)),
+        OperatorResponse::Rejected => None,
+    };
+    let selected_attempts = choice.max_attempts.unwrap_or(plan.attempts.max_attempts);
+    let selected_budget = choice
+        .budget_ceiling_usd_micros
+        .unwrap_or(plan.budget_ceiling_usd_micros);
+    Ok(AdvisoryComparison {
+        allocation_id: plan.allocation_id.clone(),
+        operation_id: plan.operation_id.clone(),
+        operator_response: choice.response,
+        resource_selection_matched: selected
+            .is_some_and(|value| resource_selections_match(value, &plan.selection)),
+        attempt_limit_delta: i64::from(selected_attempts) - i64::from(plan.attempts.max_attempts),
+        budget_ceiling_delta_usd_micros: selected_budget - plan.budget_ceiling_usd_micros,
+        outcome_receipt_reference: outcome.map(|value| value.receipt_reference.clone()),
+        outcome_accepted: outcome.map(|value| value.accepted),
+        quality_error: outcome.map(|value| value.quality - plan.expected.quality),
+        cost_error_usd_micros: outcome
+            .map(|value| value.cost_usd_micros - plan.expected.cost_usd_micros),
+        latency_error_ms: outcome.map(|value| value.latency_ms - plan.expected.latency_ms),
+        recommendation_evidence: plan.evidence.clone(),
+    })
+}
+
+fn resource_selections_match(left: &ResourceSelection, right: &ResourceSelection) -> bool {
+    left.agent_id == right.agent_id
+        && left.runtime == right.runtime
+        && left.model == right.model
+        && left.tools.iter().collect::<BTreeSet<_>>() == right.tools.iter().collect::<BTreeSet<_>>()
+}
+
+pub fn score_advisory_comparisons(comparisons: &[AdvisoryComparison]) -> AdvisoryScorecard {
+    let accepted = comparisons
+        .iter()
+        .filter(|value| value.operator_response == OperatorResponse::Accepted)
+        .count();
+    let modified = comparisons
+        .iter()
+        .filter(|value| value.operator_response == OperatorResponse::Modified)
+        .count();
+    let rejected = comparisons
+        .iter()
+        .filter(|value| value.operator_response == OperatorResponse::Rejected)
+        .count();
+    let observed = comparisons
+        .iter()
+        .filter(|value| value.outcome_receipt_reference.is_some())
+        .collect::<Vec<_>>();
+    AdvisoryScorecard {
+        comparisons: comparisons.len(),
+        accepted,
+        modified,
+        rejected,
+        resource_selection_agreement_rate: ratio(
+            comparisons
+                .iter()
+                .filter(|value| value.resource_selection_matched)
+                .count(),
+            comparisons.len(),
+        ),
+        observed_outcomes: observed.len(),
+        mean_absolute_quality_error: mean_absolute(
+            observed.iter().filter_map(|value| value.quality_error),
+        ),
+        mean_absolute_cost_error_usd_micros: mean_absolute(
+            observed
+                .iter()
+                .filter_map(|value| value.cost_error_usd_micros.map(|error| error as f64)),
+        ),
+        mean_absolute_latency_error_ms: mean_absolute(
+            observed
+                .iter()
+                .filter_map(|value| value.latency_error_ms.map(|error| error as f64)),
+        ),
+    }
+}
+
+fn validate_operator_choice(plan: &AllocationPlan, choice: &OperatorChoice) -> Result<(), String> {
+    if choice.operation_id != plan.operation_id || choice.allocation_id != plan.allocation_id {
+        return Err("operator choice does not reference the allocation plan".into());
+    }
+    required("operator rationale", &choice.rationale)?;
+    match choice.response {
+        OperatorResponse::Accepted
+            if choice.selected_resources.is_some()
+                || choice.max_attempts.is_some()
+                || choice.budget_ceiling_usd_micros.is_some() =>
+        {
+            return Err("accepted choices cannot carry allocation overrides".into());
+        }
+        OperatorResponse::Modified
+            if choice.selected_resources.is_none()
+                && choice.max_attempts.is_none()
+                && choice.budget_ceiling_usd_micros.is_none() =>
+        {
+            return Err("modified choices require at least one allocation override".into());
+        }
+        OperatorResponse::Rejected
+            if choice.selected_resources.is_some()
+                || choice.max_attempts.is_some()
+                || choice.budget_ceiling_usd_micros.is_some() =>
+        {
+            return Err("rejected choices cannot carry allocation overrides".into());
+        }
+        _ => {}
+    }
+    if choice.max_attempts == Some(0) {
+        return Err("operator max attempts must be positive".into());
+    }
+    if choice
+        .budget_ceiling_usd_micros
+        .is_some_and(|value| value < 0)
+    {
+        return Err("operator budget ceiling must be non-negative".into());
+    }
+    Ok(())
+}
+
+fn validate_observed_outcome(
+    plan: &AllocationPlan,
+    outcome: &ObservedOutcome,
+) -> Result<(), String> {
+    if outcome.operation_id != plan.operation_id {
+        return Err("observed outcome does not belong to the allocation operation".into());
+    }
+    required("outcome receipt reference", &outcome.receipt_reference)?;
+    if !outcome.quality.is_finite() || !(0.0..=1.0).contains(&outcome.quality) {
+        return Err("observed outcome quality must be between 0 and 1".into());
+    }
+    if outcome.cost_usd_micros < 0 || outcome.latency_ms < 0 || outcome.attempts == 0 {
+        return Err("observed outcome cost, latency, and attempts must be valid".into());
+    }
+    Ok(())
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn mean_absolute(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let values = values.collect::<Vec<_>>();
+    (!values.is_empty())
+        .then(|| values.iter().map(|value| value.abs()).sum::<f64>() / values.len() as f64)
 }
 
 fn validate_kioku_evidence(memory: &KiokuEvidence) -> Result<(), String> {
@@ -1254,5 +1477,185 @@ mod tests {
         assert_eq!(loaded[0].score, 0.87);
         assert_eq!(loaded[0].observed_at_ms, 2_000);
         assert_eq!(loaded[0].receipt_reference.as_deref(), Some("receipt-1"));
+    }
+
+    #[test]
+    fn operator_modifications_are_compared_with_receipted_outcomes() {
+        let plan = recommend_baseline(&request()).unwrap().plans.remove(0);
+        let choice = OperatorChoice {
+            operation_id: plan.operation_id.clone(),
+            allocation_id: plan.allocation_id.clone(),
+            response: OperatorResponse::Modified,
+            selected_resources: Some(ResourceSelection {
+                model: "frontier".into(),
+                ..plan.selection.clone()
+            }),
+            max_attempts: Some(1),
+            budget_ceiling_usd_micros: Some(15_000),
+            rationale: "operator preferred the frontier model".into(),
+            decided_at_ms: 20,
+        };
+        let outcome = ObservedOutcome {
+            operation_id: plan.operation_id.clone(),
+            receipt_reference: "receipt-op-1".into(),
+            accepted: true,
+            quality: 0.8,
+            cost_usd_micros: 12_000,
+            latency_ms: 150,
+            attempts: 1,
+            completed_at_ms: 30,
+        };
+
+        let comparison = compare_advisory(&plan, &choice, Some(&outcome)).unwrap();
+        assert!(!comparison.resource_selection_matched);
+        assert_eq!(comparison.attempt_limit_delta, -1);
+        assert_eq!(comparison.budget_ceiling_delta_usd_micros, -5_000);
+        assert!((comparison.quality_error.unwrap() - 0.1).abs() < f64::EPSILON);
+        assert_eq!(
+            comparison.outcome_receipt_reference.as_deref(),
+            Some("receipt-op-1")
+        );
+    }
+
+    #[test]
+    fn scorecard_keeps_decision_and_prediction_measures_separate() {
+        let plan = recommend_baseline(&request()).unwrap().plans.remove(0);
+        let accepted = compare_advisory(
+            &plan,
+            &OperatorChoice {
+                operation_id: plan.operation_id.clone(),
+                allocation_id: plan.allocation_id.clone(),
+                response: OperatorResponse::Accepted,
+                selected_resources: None,
+                max_attempts: None,
+                budget_ceiling_usd_micros: None,
+                rationale: "accepted as proposed".into(),
+                decided_at_ms: 20,
+            },
+            Some(&ObservedOutcome {
+                operation_id: plan.operation_id.clone(),
+                receipt_reference: "receipt-op-1".into(),
+                accepted: true,
+                quality: 0.8,
+                cost_usd_micros: 11_000,
+                latency_ms: 120,
+                attempts: 1,
+                completed_at_ms: 30,
+            }),
+        )
+        .unwrap();
+        let rejected = compare_advisory(
+            &plan,
+            &OperatorChoice {
+                operation_id: plan.operation_id.clone(),
+                allocation_id: plan.allocation_id.clone(),
+                response: OperatorResponse::Rejected,
+                selected_resources: None,
+                max_attempts: None,
+                budget_ceiling_usd_micros: None,
+                rationale: "operation no longer needed".into(),
+                decided_at_ms: 21,
+            },
+            None,
+        )
+        .unwrap();
+
+        let scorecard = score_advisory_comparisons(&[accepted, rejected]);
+        assert_eq!(scorecard.accepted, 1);
+        assert_eq!(scorecard.rejected, 1);
+        assert_eq!(scorecard.observed_outcomes, 1);
+        assert_eq!(scorecard.resource_selection_agreement_rate, 0.5);
+        assert!((scorecard.mean_absolute_quality_error.unwrap() - 0.1).abs() < f64::EPSILON);
+        assert_eq!(scorecard.mean_absolute_cost_error_usd_micros, Some(1_000.0));
+        assert_eq!(scorecard.mean_absolute_latency_error_ms, Some(20.0));
+    }
+
+    #[test]
+    fn comparison_rejects_mismatched_receipt_outcomes() {
+        let plan = recommend_baseline(&request()).unwrap().plans.remove(0);
+        let choice = OperatorChoice {
+            operation_id: plan.operation_id.clone(),
+            allocation_id: plan.allocation_id.clone(),
+            response: OperatorResponse::Accepted,
+            selected_resources: None,
+            max_attempts: None,
+            budget_ceiling_usd_micros: None,
+            rationale: "accepted".into(),
+            decided_at_ms: 20,
+        };
+        let outcome = ObservedOutcome {
+            operation_id: "other".into(),
+            receipt_reference: "receipt-other".into(),
+            accepted: false,
+            quality: 0.0,
+            cost_usd_micros: 0,
+            latency_ms: 1,
+            attempts: 1,
+            completed_at_ms: 30,
+        };
+        assert_eq!(
+            compare_advisory(&plan, &choice, Some(&outcome)).unwrap_err(),
+            "observed outcome does not belong to the allocation operation"
+        );
+    }
+
+    #[test]
+    fn accepted_choices_cannot_hide_attempt_or_budget_changes() {
+        let plan = recommend_baseline(&request()).unwrap().plans.remove(0);
+        let choice = OperatorChoice {
+            operation_id: plan.operation_id.clone(),
+            allocation_id: plan.allocation_id.clone(),
+            response: OperatorResponse::Accepted,
+            selected_resources: None,
+            max_attempts: Some(1),
+            budget_ceiling_usd_micros: None,
+            rationale: "accepted with a hidden override".into(),
+            decided_at_ms: 20,
+        };
+        assert_eq!(
+            compare_advisory(&plan, &choice, None).unwrap_err(),
+            "accepted choices cannot carry allocation overrides"
+        );
+    }
+
+    #[test]
+    fn attempt_only_modifications_keep_the_recommended_resources() {
+        let plan = recommend_baseline(&request()).unwrap().plans.remove(0);
+        let choice = OperatorChoice {
+            operation_id: plan.operation_id.clone(),
+            allocation_id: plan.allocation_id.clone(),
+            response: OperatorResponse::Modified,
+            selected_resources: None,
+            max_attempts: Some(1),
+            budget_ceiling_usd_micros: None,
+            rationale: "one attempt is sufficient".into(),
+            decided_at_ms: 20,
+        };
+        let comparison = compare_advisory(&plan, &choice, None).unwrap();
+        assert!(comparison.resource_selection_matched);
+        assert_eq!(comparison.attempt_limit_delta, -1);
+    }
+
+    #[test]
+    fn resource_comparison_treats_tool_order_as_set_semantics() {
+        let mut request = request();
+        request.operations[0].required_tools.insert("shell".into());
+        request.capacity.agents[0].tools.insert("shell".into());
+        let plan = recommend_baseline(&request).unwrap().plans.remove(0);
+        let mut reordered = plan.selection.clone();
+        reordered.tools.reverse();
+        let choice = OperatorChoice {
+            operation_id: plan.operation_id.clone(),
+            allocation_id: plan.allocation_id.clone(),
+            response: OperatorResponse::Modified,
+            selected_resources: Some(reordered),
+            max_attempts: None,
+            budget_ceiling_usd_micros: None,
+            rationale: "same tools supplied in operator order".into(),
+            decided_at_ms: 20,
+        };
+
+        let comparison = compare_advisory(&plan, &choice, None).unwrap();
+        assert!(comparison.resource_selection_matched);
     }
 }
