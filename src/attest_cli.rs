@@ -97,11 +97,19 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     )?;
     let report = verify_bundle(&bundle, &trusted_keys);
     render_report(&bundle, &report, config.format)?;
+    enforce_verification(&report, config.integrity_only).map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn enforce_verification(report: &VerificationReport, integrity_only: bool) -> Result<(), String> {
     if !report.integrity.valid {
-        return Err(std::io::Error::other("attestation integrity verification failed").into());
+        return Err("attestation integrity verification failed".into());
     }
-    if !config.integrity_only && !report.policy.compliant {
-        return Err(std::io::Error::other("attestation policy verification failed").into());
+    if !report.policy.key.acceptable_at_verification {
+        return Err("attestation signing key is not acceptable".into());
+    }
+    if !integrity_only && !report.policy.compliant {
+        return Err("attestation policy verification failed".into());
     }
     Ok(())
 }
@@ -508,6 +516,37 @@ mod tests {
             ReportFormat::InToto
         );
         assert!(parse_report_format("sarif").is_err());
+    }
+
+    #[test]
+    fn integrity_only_never_bypasses_unacceptable_keys() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let bundle = sign_receipt(
+            receipt("chisei.execution/v1"),
+            &signing_key,
+            "node:test",
+            "key-1",
+            10,
+        )
+        .unwrap();
+        let mut trusted = TrustedKeyring::at_time(30);
+        trusted
+            .trust_with_metadata(
+                "node:test",
+                "key-1",
+                signing_key.verifying_key(),
+                KeyMetadata {
+                    state: KeyState::Revoked,
+                    valid_from_ms: None,
+                    valid_until_ms: None,
+                    revoked_at_ms: Some(20),
+                    successor_key_id: None,
+                },
+            )
+            .unwrap();
+        let report = verify_bundle(&bundle, &trusted);
+        assert!(report.integrity.valid);
+        assert!(enforce_verification(&report, true).is_err());
     }
 
     #[test]
