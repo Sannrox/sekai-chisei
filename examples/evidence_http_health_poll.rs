@@ -31,8 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ttl_ms,
     )?;
     let config = sdk::AdapterConfig::from_env()?;
-    let envelope = draft.into_envelope(&config, chrono::Utc::now().timestamp_millis())?;
+    let (envelope, outbox) =
+        sdk::prepare_delivery(&config, draft, chrono::Utc::now().timestamp_millis())?;
     let result = sdk::submit(&config, envelope).await?;
+    outbox.acknowledge()?;
     let submission = result
         .submission
         .ok_or("Sekai returned no evidence submission")?;

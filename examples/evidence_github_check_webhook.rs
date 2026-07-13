@@ -11,8 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::io::stdin().read_to_end(&mut input)?;
     let config = sdk::AdapterConfig::from_env()?;
     let draft = github_check_webhook::translate(github_check_webhook::parse(&input)?)?;
-    let envelope = draft.into_envelope(&config, chrono::Utc::now().timestamp_millis())?;
+    let (envelope, outbox) =
+        sdk::prepare_delivery(&config, draft, chrono::Utc::now().timestamp_millis())?;
     let result = sdk::submit(&config, envelope).await?;
+    outbox.acknowledge()?;
     let submission = result
         .submission
         .ok_or("Sekai returned no evidence submission")?;

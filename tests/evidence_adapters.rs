@@ -7,6 +7,7 @@ mod http_health_poll;
 mod sdk;
 
 use sdk::AdapterConfig;
+use std::path::PathBuf;
 
 fn config() -> AdapterConfig {
     AdapterConfig {
@@ -20,6 +21,13 @@ fn config() -> AdapterConfig {
     }
 }
 
+fn outbox(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "sekai-evidence-adapter-{name}-{}",
+        uuid::Uuid::new_v4()
+    ))
+}
+
 #[test]
 fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     let input = include_bytes!("../adapters/fixtures/github_check_run.completed.json");
@@ -31,7 +39,9 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     assert_eq!(draft.content["outcome"], "success");
     assert_eq!(draft.provenance["delivery"], "webhook");
 
-    let envelope = draft.into_envelope(&config(), 1_752_394_000_000).unwrap();
+    let outbox = outbox("github");
+    let (envelope, receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_000_000).unwrap();
     assert_eq!(envelope.contract_version, sdk::EVIDENCE_CONTRACT_VERSION);
     assert_eq!(envelope.source_record_id, "88201");
     assert_eq!(envelope.source_version, "2026-07-13T08:02:31Z");
@@ -40,6 +50,8 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     assert_eq!(envelope.content_digest.len(), 64);
     assert_eq!(envelope.idempotency_key.len(), 64);
     assert_eq!(envelope.intent, "upsert");
+    receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
 }
 
 #[test]
@@ -60,20 +72,19 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
     assert_eq!(draft.provenance["delivery"], "poll");
     assert_eq!(draft.expires_at_ms, Some(draft.observed_at_ms + 300_000));
 
-    let exact_retry = draft
-        .clone()
-        .into_envelope(&config(), 1_752_394_000_000)
-        .unwrap();
-    let first = draft
-        .clone()
-        .into_envelope(&config(), 1_752_394_000_000)
-        .unwrap();
-    let replay = draft.into_envelope(&config(), 1_752_394_999_999).unwrap();
-    assert_eq!(first.idempotency_key, exact_retry.idempotency_key);
+    let outbox = outbox("health");
+    let (first, first_receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft.clone(), 1_752_394_000_000).unwrap();
+    let (replay, replay_receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_999_999).unwrap();
     assert_eq!(first.content_digest, replay.content_digest);
-    assert_ne!(first.idempotency_key, replay.idempotency_key);
+    assert_eq!(first.idempotency_key, replay.idempotency_key);
+    assert_eq!(first.collected_at_ms, replay.collected_at_ms);
     assert_eq!(first.source_record_id, replay.source_record_id);
     assert_eq!(first.source_version, replay.source_version);
+    first_receipt.acknowledge().unwrap();
+    replay_receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
 }
 
 #[test]
