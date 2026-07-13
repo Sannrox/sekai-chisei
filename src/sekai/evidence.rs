@@ -38,6 +38,37 @@ impl EvidenceLifecycleState {
     pub const fn is_usable(self) -> bool {
         matches!(self, Self::Available)
     }
+
+    pub const fn is_admitted(self) -> bool {
+        matches!(self, Self::Authorized | Self::Projected | Self::Available)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Validated => "validated",
+            Self::Deduplicated => "deduplicated",
+            Self::Authorized => "authorized",
+            Self::Projected => "projected",
+            Self::Available => "available",
+            Self::Rejected => "rejected",
+            Self::Quarantined => "quarantined",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "received" => Self::Received,
+            "validated" => Self::Validated,
+            "deduplicated" => Self::Deduplicated,
+            "authorized" => Self::Authorized,
+            "projected" => Self::Projected,
+            "available" => Self::Available,
+            "rejected" => Self::Rejected,
+            "quarantined" => Self::Quarantined,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -47,6 +78,17 @@ pub enum EvidenceClassification {
     Internal,
     Confidential,
     Restricted,
+}
+
+impl EvidenceClassification {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Confidential => "confidential",
+            Self::Restricted => "restricted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +146,9 @@ pub struct EvidenceEnvelope {
     pub source_instance: String,
     pub source_record_id: String,
     pub source_version: String,
+    /// Monotonic sequence assigned by the source instance. This is the only
+    /// ordering signal used for supersession; source version labels are opaque.
+    pub source_sequence: i64,
     pub target: EvidenceTarget,
     pub evidence_type: String,
     pub signal: EvidenceSignal,
@@ -112,6 +157,8 @@ pub struct EvidenceEnvelope {
     pub schema_compatibility: SchemaCompatibility,
     pub observed_at_ms: i64,
     pub collected_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
     pub content: Value,
     #[serde(default)]
     pub relationships: Vec<EvidenceRelationship>,
@@ -123,7 +170,7 @@ pub struct EvidenceEnvelope {
     #[serde(default)]
     pub provenance: BTreeMap<String, String>,
     pub idempotency_key: String,
-    /// Lowercase SHA-256 digest of the canonical submission content.
+    /// Lowercase SHA-256 digest of the canonical structured content.
     pub content_digest: String,
     pub intent: EvidenceIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +226,15 @@ impl EvidenceEnvelope {
         }
         if self.confidence_bps > 10_000 {
             errors.push("confidence_bps must be at most 10000".to_string());
+        }
+        if self.source_sequence < 0 {
+            errors.push("source_sequence must not be negative".to_string());
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at < self.observed_at_ms)
+        {
+            errors.push("expires_at_ms cannot precede observed_at_ms".to_string());
         }
         if self.content_digest.len() != 64
             || !self
@@ -244,6 +300,7 @@ mod tests {
             source_instance: "engineering-primary".into(),
             source_record_id: "change-42".into(),
             source_version: "3".into(),
+            source_sequence: 3,
             target: EvidenceTarget {
                 namespace: "acme".into(),
                 object_external_id: "service:payments".into(),
@@ -256,6 +313,7 @@ mod tests {
             schema_compatibility: SchemaCompatibility::Exact,
             observed_at_ms: 100,
             collected_at_ms: 110,
+            expires_at_ms: Some(1_000),
             content: json!({"result": "accepted"}),
             relationships: vec![EvidenceRelationship {
                 relation: "verifies".into(),
