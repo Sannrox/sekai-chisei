@@ -5,6 +5,8 @@ data/*.db
 data/*.db-*
 data/*.sqlite
 data/*.sqlite-*
+data/chisei-gateway-audit.jsonl*
+data/chisei-gateway-budget-reconciliation.json*
 .env
 .env.*
 !.env.example
