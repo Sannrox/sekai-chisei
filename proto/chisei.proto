@@ -86,6 +86,23 @@ message PipelineRunResult {
   repeated StepDecision steps = 2;
   int64 timestamp = 3;
   string prepared_spec = 4;
+  repeated ContextEvidenceReference evidence_references = 5;
+}
+
+message ContextEvidenceReference {
+  string submission_id = 1;
+  string source_type = 2;
+  string source_instance = 3;
+  string source_version = 4;
+  int64 source_sequence = 5;
+  string evidence_type = 6;
+  string schema_id = 7;
+  string schema_version = 8;
+  string content_digest = 9;
+  int64 observed_at_ms = 10;
+  string classification = 11;
+  string projection_version = 12;
+  repeated string disclosed_fields = 13;
 }
 
 message ChatMessage {
@@ -164,6 +181,7 @@ message ExecutionPlan {
   string sample_reason = 23;
   repeated EgressDecision egress_decisions = 24;
   string task_class = 25;
+  repeated ContextEvidenceReference evidence_references = 26;
 }
 
 message EgressDecision {
