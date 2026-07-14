@@ -833,4 +833,4 @@ Report security issues using the process in [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [GNU Affero General Public License, Version 3](LICENSE).
