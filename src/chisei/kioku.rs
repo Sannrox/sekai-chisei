@@ -3,6 +3,7 @@
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
 use crate::sekai::evidence::EvidenceClassification;
+use crate::sekai::security::Role;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +151,27 @@ pub struct MemoryLifecycleEvent {
     pub actor: String,
     pub reason: String,
     pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryRetrievalRequest {
+    pub namespace: String,
+    pub operation_class: String,
+    pub context_object_ids: Vec<String>,
+    pub classification_ceiling: EvidenceClassification,
+    pub min_confidence_bps: u16,
+    pub max_results: usize,
+    pub actor: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievedMemory {
+    pub memory: KiokuMemory,
+    pub evidence: Vec<KiokuEvidenceLink>,
+    pub applicability: String,
+    pub graph_affinity: f64,
+    pub rank_score: u64,
 }
 
 pub fn derive_verified_outcome_candidate(
@@ -723,6 +745,195 @@ impl SekaiDb {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     }
+
+    pub fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if request.namespace.trim().is_empty()
+            || request.operation_class.trim().is_empty()
+            || request.actor.trim().is_empty()
+        {
+            return Err("retrieval namespace, operation class, and actor are required".into());
+        }
+        if request.min_confidence_bps > 10_000 {
+            return Err("min_confidence_bps must not exceed 10000".into());
+        }
+        if request.max_results == 0 {
+            return Ok(Vec::new());
+        }
+        self.authorize_kioku_retrieval(request)?;
+
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT memory_json FROM chisei_kioku_memories
+                 WHERE namespace=?1 AND state='active'
+                   AND (expires_at_ms IS NULL OR expires_at_ms>?2)",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![request.namespace.trim(), request.now_ms], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let memory_json = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        drop(conn);
+
+        let context_ids = request
+            .context_object_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let mut retrieved = Vec::new();
+        for json in memory_json {
+            let memory: KiokuMemory =
+                serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            if !memory
+                .operation_classes
+                .iter()
+                .any(|class| class == request.operation_class.trim())
+                || memory.classification > request.classification_ceiling
+                || memory.confidence_bps < request.min_confidence_bps
+                || memory
+                    .retention_until_ms
+                    .is_some_and(|retention| retention <= request.now_ms)
+            {
+                continue;
+            }
+            let evidence = self.list_kioku_evidence(&memory.id, memory.version)?;
+            validate_resolvable_evidence(&memory, &evidence)?;
+            let affinity_hits = memory
+                .affinity_object_ids
+                .iter()
+                .filter(|id| context_ids.contains(id.as_str()))
+                .count();
+            let graph_affinity = if memory.affinity_object_ids.is_empty() {
+                0.0
+            } else {
+                affinity_hits as f64 / memory.affinity_object_ids.len() as f64
+            };
+            const FRESHNESS_WINDOW_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+            let confirmed_at = memory.last_confirmed_at_ms.unwrap_or(memory.created_at_ms);
+            let age_ms = request.now_ms.saturating_sub(confirmed_at).max(0) as u64;
+            let freshness = FRESHNESS_WINDOW_MS
+                .saturating_sub(age_ms.min(FRESHNESS_WINDOW_MS))
+                .saturating_mul(999_999)
+                / FRESHNESS_WINDOW_MS;
+            let rank_score = (affinity_hits as u64 * 10_000_000_000)
+                .saturating_add(u64::from(memory.confidence_bps) * 1_000_000)
+                .saturating_add(freshness.min(999_999));
+            retrieved.push(RetrievedMemory {
+                applicability: format!(
+                    "namespace={} operation_class={} affinity_hits={affinity_hits}",
+                    memory.namespace, request.operation_class
+                ),
+                memory,
+                evidence,
+                graph_affinity,
+                rank_score,
+            });
+        }
+        retrieved.sort_by(|left, right| {
+            right
+                .rank_score
+                .cmp(&left.rank_score)
+                .then_with(|| left.memory.id.cmp(&right.memory.id))
+        });
+        retrieved.truncate(request.max_results.min(100));
+        for item in &retrieved {
+            self.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+                memory_id: item.memory.id.clone(),
+                memory_version: item.memory.version,
+                action: "retrieved".into(),
+                from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                to_state: MemoryLifecycleState::Active.as_str().into(),
+                actor: request.actor.trim().into(),
+                reason: item.applicability.clone(),
+                recorded_at_ms: request.now_ms,
+            })?;
+        }
+        Ok(retrieved)
+    }
+
+    fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String> {
+        let actor = request.actor.trim();
+        let namespace = request.namespace.trim();
+        let namespace_object = self
+            .find_by_external_id(&format!("namespace:{namespace}"))?
+            .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
+        let grants = self.list_grants(&namespace_object.id)?;
+        let authorized_ceiling = if grants.is_empty() {
+            EvidenceClassification::Public
+        } else {
+            let role = grants
+                .iter()
+                .find(|grant| grant.principal == actor)
+                .map(|grant| &grant.role)
+                .ok_or_else(|| "actor is not authorized for memory namespace".to_string())?;
+            match role {
+                Role::Viewer => EvidenceClassification::Internal,
+                Role::Editor => EvidenceClassification::Confidential,
+                Role::Admin => EvidenceClassification::Restricted,
+            }
+        };
+        if request.classification_ceiling > authorized_ceiling {
+            return Err("requested memory classification exceeds actor grant".into());
+        }
+        for object_id in &request.context_object_ids {
+            if self.get_object(object_id)?.is_none() {
+                return Err(format!("context object {object_id} not found"));
+            }
+            let grants = self.list_grants(object_id)?;
+            if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+                return Err(format!(
+                    "actor is not authorized for context object {object_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        insert_lifecycle_event(&tx, event)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+}
+
+fn validate_resolvable_evidence(
+    memory: &KiokuMemory,
+    evidence: &[KiokuEvidenceLink],
+) -> Result<(), String> {
+    if evidence.len() != memory.sample_size as usize {
+        return Err(format!(
+            "memory {} version {} has unresolved evidence",
+            memory.id, memory.version
+        ));
+    }
+    let mut supporting = false;
+    let mut operations = std::collections::HashSet::new();
+    for link in evidence {
+        link.validate(memory)?;
+        supporting |= link.stance == MemoryEvidenceStance::Supporting;
+        if !operations.insert(link.operation_id.as_str()) {
+            return Err(format!(
+                "memory {} version {} repeats operation evidence",
+                memory.id, memory.version
+            ));
+        }
+    }
+    if !supporting {
+        return Err(format!(
+            "memory {} version {} lacks supporting evidence",
+            memory.id, memory.version
+        ));
+    }
+    Ok(())
 }
 
 fn insert_lifecycle_event(
@@ -754,7 +965,9 @@ mod tests {
     use crate::chisei::receipt::{
         GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceiptEvent, ReceiptEventKind,
     };
-    use std::collections::BTreeMap;
+    use crate::domain::Object;
+    use crate::sekai::security::Grant;
+    use std::collections::{BTreeMap, HashMap};
 
     fn candidate() -> KiokuMemory {
         KiokuMemory {
@@ -859,6 +1072,40 @@ mod tests {
             outcome_metric: "verification_pass_rate".into(),
             outcome_value: if passed { 1.0 } else { 0.0 },
         }
+    }
+
+    fn active_memory(
+        db: &SekaiDb,
+        id: &str,
+        operation_id: &str,
+        affinity_object_ids: Vec<String>,
+        classification: EvidenceClassification,
+    ) {
+        db.produce_kioku_candidate(CandidateDerivation {
+            id: id.into(),
+            kind: MemoryKind::Recommendation,
+            claim: format!("Apply guidance from {id}"),
+            outcome_definition: "verification pass rate".into(),
+            outcomes: vec![verified_outcome(operation_id, true)],
+            affinity_object_ids,
+            producer_identity: "kioku:deriver".into(),
+            classification,
+            created_at_ms: 120,
+            expires_at_ms: Some(220),
+            retention_until_ms: Some(320),
+        })
+        .unwrap();
+        db.review_kioku_candidate(
+            id,
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "representative evidence".into(),
+                reviewed_at_ms: 130,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1103,5 +1350,132 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].action, "promoted");
         assert_eq!(events[1].actor, "human:operator");
+    }
+
+    #[test]
+    fn retrieves_active_memories_by_scope_affinity_and_classification() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for object in [
+            Object {
+                id: "namespace-payments".into(),
+                kind: "namespace".into(),
+                name: "payments".into(),
+                namespace: "payments".into(),
+                external_id: "namespace:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            Object {
+                id: "namespace-other".into(),
+                kind: "namespace".into(),
+                name: "other".into(),
+                namespace: "other".into(),
+                external_id: "namespace:other".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+            Object {
+                id: "component:migrations".into(),
+                kind: "component".into(),
+                name: "migrations".into(),
+                namespace: "payments".into(),
+                external_id: "component:migrations".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            },
+        ] {
+            db.create_object(&object).unwrap();
+        }
+        for grant in [
+            Grant {
+                id: "grant-payments".into(),
+                object_id: "namespace-payments".into(),
+                principal: "agent:planner".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+            Grant {
+                id: "grant-other".into(),
+                object_id: "namespace-other".into(),
+                principal: "agent:other".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+            Grant {
+                id: "grant-component".into(),
+                object_id: "component:migrations".into(),
+                principal: "agent:planner".into(),
+                role: Role::Viewer,
+                created: 1,
+            },
+        ] {
+            db.create_grant(&grant).unwrap();
+        }
+        active_memory(
+            &db,
+            "generic",
+            "operation-1",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        active_memory(
+            &db,
+            "affine",
+            "operation-2",
+            vec!["component:migrations".into()],
+            EvidenceClassification::Internal,
+        );
+        active_memory(
+            &db,
+            "restricted",
+            "operation-3",
+            vec!["component:migrations".into()],
+            EvidenceClassification::Restricted,
+        );
+        let request = MemoryRetrievalRequest {
+            namespace: "payments".into(),
+            operation_class: "schema_change".into(),
+            context_object_ids: vec!["component:migrations".into()],
+            classification_ceiling: EvidenceClassification::Internal,
+            min_confidence_bps: 5_000,
+            max_results: 10,
+            actor: "agent:planner".into(),
+            now_ms: 150,
+        };
+
+        let retrieved = db.retrieve_kioku_memories(&request).unwrap();
+        assert_eq!(retrieved.len(), 2);
+        assert_eq!(retrieved[0].memory.id, "affine");
+        assert_eq!(retrieved[0].graph_affinity, 1.0);
+        assert!(!retrieved[0].evidence.is_empty());
+        let events = db.list_kioku_lifecycle_events("affine", 1).unwrap();
+        assert_eq!(events.last().unwrap().action, "retrieved");
+
+        let mut spoofed = request.clone();
+        spoofed.actor = "root".into();
+        spoofed.classification_ceiling = EvidenceClassification::Restricted;
+        assert!(
+            db.retrieve_kioku_memories(&spoofed)
+                .unwrap_err()
+                .contains("not authorized")
+        );
+
+        let mut unauthorized = request;
+        unauthorized.namespace = "other".into();
+        assert!(
+            db.retrieve_kioku_memories(&unauthorized)
+                .unwrap_err()
+                .contains("not authorized")
+        );
+        unauthorized.namespace = "payments".into();
+        unauthorized.classification_ceiling = EvidenceClassification::Restricted;
+        assert!(
+            db.retrieve_kioku_memories(&unauthorized)
+                .unwrap_err()
+                .contains("exceeds actor grant")
+        );
     }
 }
