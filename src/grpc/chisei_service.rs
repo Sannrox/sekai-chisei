@@ -4400,6 +4400,58 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn list_kioku_candidates(
+        &self,
+        req: Request<ListKiokuCandidatesRequest>,
+    ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
+        require_eval_admin(&req)?;
+        let request = req.into_inner();
+        if request.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let limit = match request.limit {
+            0 => 50,
+            1..=100 => request.limit as usize,
+            _ => return Err(Status::invalid_argument("limit must not exceed 100")),
+        };
+        let operation_class = (!request.operation_class.trim().is_empty())
+            .then_some(request.operation_class.as_str());
+        let memories = self
+            .db
+            .list_kioku_candidates(&request.namespace, operation_class, limit)
+            .map_err(Status::internal)?;
+        let candidates = memories
+            .into_iter()
+            .map(|memory| -> Result<KiokuCandidateRecord, Status> {
+                let evidence = self
+                    .db
+                    .list_kioku_evidence(&memory.id, memory.version)
+                    .map_err(Status::internal)?;
+                let validation = self
+                    .db
+                    .validate_kioku_candidate(&memory.id, memory.version)
+                    .map_err(Status::internal)?;
+                Ok(KiokuCandidateRecord {
+                    memory_json: serde_json::to_string(&memory).map_err(|error| {
+                        Status::internal(format!("failed to serialize memory: {error}"))
+                    })?,
+                    evidence_json: evidence
+                        .iter()
+                        .map(serde_json::to_string)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            Status::internal(format!("failed to serialize evidence: {error}"))
+                        })?,
+                    valid: validation.valid,
+                    validation_errors: validation.errors,
+                    supporting_evidence: validation.supporting_evidence as u32,
+                    contradicting_evidence: validation.contradicting_evidence as u32,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(ListKiokuCandidatesResponse { candidates }))
+    }
+
     async fn report_operation_event(
         &self,
         req: Request<ReportOperationEventRequest>,
