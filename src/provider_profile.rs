@@ -345,6 +345,27 @@ pub fn update_registry_lifecycle_with_outcome(
     reason: &str,
     changed_at: &str,
 ) -> Result<RegistryLifecycleMutation, String> {
+    update_registry_lifecycle_with_expected_version(
+        state_path,
+        target_kind,
+        target,
+        state,
+        actor,
+        reason,
+        (changed_at, None),
+    )
+}
+
+fn update_registry_lifecycle_with_expected_version(
+    state_path: &Path,
+    target_kind: &str,
+    target: &str,
+    state: &str,
+    actor: &str,
+    reason: &str,
+    commit: (&str, Option<u64>),
+) -> Result<RegistryLifecycleMutation, String> {
+    let (changed_at, expected_state_version) = commit;
     validate_lifecycle_update_fields(target_kind, target, state, actor, reason)?;
     let locks = open_registry_locks(state_path)?;
     locks.lock()?;
@@ -353,6 +374,9 @@ pub fn update_registry_lifecycle_with_outcome(
         locks.legacy_state_is_ambiguous()?,
         legacy_registry_initialization_allowed(),
     )?;
+    if expected_state_version.is_some_and(|expected| registry.state_version != expected) {
+        return Err("provider registry changed after lifecycle preconditions were verified".into());
+    }
     registry.validate_lifecycle_target(target_kind, target)?;
     if state == "enabled" {
         let provider = match target_kind {
@@ -425,17 +449,18 @@ pub async fn update_registry_lifecycle_async(
     state: String,
     actor: String,
     reason: String,
-    changed_at: String,
+    commit: (String, Option<u64>),
 ) -> Result<RegistryLifecycleMutation, String> {
     tokio::task::spawn_blocking(move || {
-        update_registry_lifecycle_with_outcome(
+        let (changed_at, expected_state_version) = commit;
+        update_registry_lifecycle_with_expected_version(
             &state_path,
             &target_kind,
             &target,
             &state,
             &actor,
             &reason,
-            &changed_at,
+            (&changed_at, expected_state_version),
         )
     })
     .await
@@ -973,6 +998,18 @@ pub struct ResolvedProviderModel {
 }
 
 impl ProviderRegistry {
+    pub fn lifecycle_state_for_target(&self, target_kind: &str, target: &str) -> Option<&str> {
+        let canonical;
+        let target = if target_kind == "model" {
+            canonical = canonical_model_target(target).ok()?;
+            canonical.as_str()
+        } else {
+            target
+        };
+        self.latest_lifecycle_override(target_kind, target)
+            .map(|lifecycle| lifecycle.state.as_str())
+    }
+
     pub fn built_in() -> Self {
         Self {
             version: PROVIDER_REGISTRY_VERSION.into(),
@@ -1121,7 +1158,12 @@ impl ProviderRegistry {
             {
                 continue;
             }
-            if lifecycle_override.state == "disabled"
+            let canary_admitted = REQUEST_CANARY_ADMISSION
+                .try_with(|allowed| *allowed)
+                .unwrap_or(false);
+            if (lifecycle_override.state == "disabled"
+                || lifecycle_override.state == "experimental"
+                || (lifecycle_override.state == "canary" && !canary_admitted))
                 && let Some((target_provider, capability)) =
                     lifecycle_override.target.split_once(':')
                 && target_provider == profile.provider
@@ -1155,14 +1197,22 @@ impl ProviderRegistry {
             ));
         }
         if let Some(lifecycle_override) = self.latest_lifecycle_override("model", &canonical_model)
-            && lifecycle_override.state == "disabled"
         {
-            return Err(format!(
-                "{} {:?} is disabled at registry state version {}",
-                lifecycle_override.target_kind,
-                lifecycle_override.target,
-                lifecycle_override.version
-            ));
+            let canary_admitted = REQUEST_CANARY_ADMISSION
+                .try_with(|allowed| *allowed)
+                .unwrap_or(false);
+            if lifecycle_override.state == "disabled"
+                || lifecycle_override.state == "experimental"
+                || (lifecycle_override.state == "canary" && !canary_admitted)
+            {
+                return Err(format!(
+                    "{} {:?} is {} at registry state version {}",
+                    lifecycle_override.target_kind,
+                    lifecycle_override.target,
+                    lifecycle_override.state,
+                    lifecycle_override.version
+                ));
+            }
         }
         Ok(ResolvedProviderModel {
             provider: provider.into(),
@@ -2094,6 +2144,55 @@ mod tests {
         })
         .await;
         assert!(admitted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn scoped_canary_overrides_require_request_admission() {
+        let mut registry = ProviderRegistry::built_in();
+        registry.lifecycle_overrides.extend([
+            RegistryLifecycleOverride {
+                target_kind: "model".into(),
+                target: "openai/gpt-5.5".into(),
+                state: "canary".into(),
+                version: 1,
+                actor: "operator".into(),
+                reason: "bounded model validation".into(),
+                changed_at: "2026-07-14T00:00:00Z".into(),
+            },
+            RegistryLifecycleOverride {
+                target_kind: "capability".into(),
+                target: "openai:responses".into(),
+                state: "canary".into(),
+                version: 2,
+                actor: "operator".into(),
+                reason: "bounded capability validation".into(),
+                changed_at: "2026-07-14T00:00:00Z".into(),
+            },
+        ]);
+        registry.state_version = 2;
+        assert!(registry.resolve_model("openai/gpt-5.5").is_err());
+        assert!(
+            !registry
+                .effective_profile("openai")
+                .unwrap()
+                .capabilities
+                .responses
+        );
+        with_provider_registry_snapshot(registry, async {
+            with_canary_admission(async {
+                let snapshot = provider_registry_snapshot();
+                assert!(snapshot.resolve_model("openai/gpt-5.5").is_ok());
+                assert!(
+                    snapshot
+                        .effective_profile("openai")
+                        .unwrap()
+                        .capabilities
+                        .responses
+                );
+            })
+            .await
+        })
+        .await;
     }
 
     #[test]

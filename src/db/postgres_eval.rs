@@ -9,18 +9,35 @@ const SAMPLE_LEASE_MS: i64 = 30 * 60 * 1000;
 impl PostgresDb {
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
         let cases_json = serde_json::to_string(&suite.cases).map_err(|error| error.to_string())?;
-        self.connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "INSERT INTO chisei_eval_suites (id, name, description, cases_json)
                  VALUES ($1, $2, $3, $4)
                  ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     description = excluded.description,
-                    cases_json = excluded.cases_json",
+                    cases_json = excluded.cases_json
+                 WHERE excluded.id LIKE 'sampling-%'",
                 &[&suite.id, &suite.name, &suite.description, &cases_json],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let stored = transaction
+            .query_one(
+                "SELECT name, description, cases_json FROM chisei_eval_suites WHERE id = $1",
+                &[&suite.id],
+            )
+            .map_err(|error| error.to_string())?;
+        let matches = stored.get::<_, String>(0) == suite.name
+            && stored.get::<_, String>(1) == suite.description
+            && stored.get::<_, String>(2) == cases_json;
+        if !matches {
+            return Err(format!("eval suite {:?} is immutable", suite.id));
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
@@ -49,15 +66,15 @@ impl PostgresDb {
     pub fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
         let results_json =
             serde_json::to_string(&run.results).map_err(|error| error.to_string())?;
-        self.connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "INSERT INTO chisei_eval_runs (id, suite_id, config_ref, results_json, timestamp)
                  VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT(id) DO UPDATE SET
-                    suite_id = excluded.suite_id,
-                    config_ref = excluded.config_ref,
-                    results_json = excluded.results_json,
-                    timestamp = excluded.timestamp",
+                 ON CONFLICT(id) DO NOTHING",
                 &[
                     &run.id,
                     &run.suite_id,
@@ -66,8 +83,21 @@ impl PostgresDb {
                     &run.timestamp,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let stored = transaction
+            .query_one(
+                "SELECT suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs WHERE id = $1",
+                &[&run.id],
+            )
+            .map_err(|error| error.to_string())?;
+        let matches = stored.get::<_, String>(0) == run.suite_id
+            && stored.get::<_, String>(1) == run.config_ref
+            && stored.get::<_, String>(2) == results_json
+            && stored.get::<_, i64>(3) == run.timestamp;
+        if !matches {
+            return Err(format!("eval run {:?} is immutable", run.id));
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
