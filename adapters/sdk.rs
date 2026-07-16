@@ -71,6 +71,53 @@ pub struct EvidenceDraft {
     pub causality: Option<EvidenceCausality>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformanceProfile {
+    pub source_type: &'static str,
+    pub evidence_type: &'static str,
+    pub signal: &'static str,
+    pub schema_id: &'static str,
+    pub schema_version: &'static str,
+    pub delivery: &'static str,
+    pub requires_expiry: bool,
+}
+
+impl ConformanceProfile {
+    pub fn validate(self, draft: &EvidenceDraft) -> Result<(), String> {
+        for (field, actual, expected) in [
+            ("source_type", draft.source_type.as_str(), self.source_type),
+            (
+                "evidence_type",
+                draft.evidence_type.as_str(),
+                self.evidence_type,
+            ),
+            ("signal", draft.signal.as_str(), self.signal),
+            ("schema_id", draft.schema_id.as_str(), self.schema_id),
+            (
+                "schema_version",
+                draft.schema_version.as_str(),
+                self.schema_version,
+            ),
+        ] {
+            if actual != expected {
+                return Err(format!(
+                    "adapter {field} {actual:?} does not match conformance profile {expected:?}"
+                ));
+            }
+        }
+        if draft.provenance.get("delivery").map(String::as_str) != Some(self.delivery) {
+            return Err(format!(
+                "adapter delivery provenance does not match conformance profile {:?}",
+                self.delivery
+            ));
+        }
+        if self.requires_expiry && draft.expires_at_ms.is_none() {
+            return Err("adapter conformance profile requires bounded freshness".into());
+        }
+        Ok(())
+    }
+}
+
 impl EvidenceDraft {
     fn into_envelope(
         self,

@@ -40,6 +40,9 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
     assert_eq!(draft.evidence_type, github_check_webhook::EVIDENCE_TYPE);
     assert_eq!(draft.content["outcome"], "success");
     assert_eq!(draft.provenance["delivery"], "webhook");
+    github_check_webhook::CONFORMANCE_PROFILE
+        .validate(&draft)
+        .unwrap();
 
     let outbox = outbox("github");
     let (envelope, receipt) =
@@ -89,6 +92,9 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
     assert_eq!(draft.content["status"], "degraded");
     assert_eq!(draft.provenance["delivery"], "poll");
     assert_eq!(draft.expires_at_ms, Some(draft.observed_at_ms + 300_000));
+    http_health_poll::CONFORMANCE_PROFILE
+        .validate(&draft)
+        .unwrap();
 
     let outbox = outbox("health");
     let (first, first_receipt) =
@@ -173,4 +179,32 @@ fn adapters_reject_malformed_source_inputs_before_submission() {
     let input = br#"{"status":"ok","observed_at":"not-a-time"}"#;
     let payload = http_health_poll::parse(input).unwrap();
     assert!(http_health_poll::translate(payload, "health", None, 1_000).is_err());
+}
+
+#[test]
+fn conformance_profiles_reject_adapter_contract_drift() {
+    let input = include_bytes!("../adapters/fixtures/http_health.degraded.json");
+    let mut draft = http_health_poll::translate(
+        http_health_poll::parse(input).unwrap(),
+        "payments-health",
+        Some("etag-17"),
+        300_000,
+    )
+    .unwrap();
+    draft.evidence_type = github_check_webhook::EVIDENCE_TYPE.into();
+    assert!(
+        http_health_poll::CONFORMANCE_PROFILE
+            .validate(&draft)
+            .unwrap_err()
+            .contains("evidence_type")
+    );
+
+    draft.evidence_type = http_health_poll::EVIDENCE_TYPE.into();
+    draft.expires_at_ms = None;
+    assert!(
+        http_health_poll::CONFORMANCE_PROFILE
+            .validate(&draft)
+            .unwrap_err()
+            .contains("bounded freshness")
+    );
 }

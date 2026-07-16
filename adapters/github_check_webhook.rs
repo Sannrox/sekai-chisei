@@ -1,4 +1,4 @@
-use crate::sdk::EvidenceDraft;
+use crate::sdk::{ConformanceProfile, EvidenceDraft};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,6 +8,15 @@ use std::collections::HashMap;
 pub const EVIDENCE_TYPE: &str = "source_control.check_run";
 pub const SCHEMA_ID: &str = "adapter.github.check_run";
 pub const SCHEMA_VERSION: &str = "1.0.0";
+pub const CONFORMANCE_PROFILE: ConformanceProfile = ConformanceProfile {
+    source_type: "github_check_run",
+    evidence_type: EVIDENCE_TYPE,
+    signal: "verification",
+    schema_id: SCHEMA_ID,
+    schema_version: SCHEMA_VERSION,
+    delivery: "webhook",
+    requires_expiry: false,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct CheckRunWebhook {
@@ -62,7 +71,7 @@ pub fn translate(payload: CheckRunWebhook) -> Result<EvidenceDraft, String> {
         Sha256::digest(serde_json::to_vec(&content).map_err(|error| error.to_string())?)
     );
     let check_run_id = payload.check_run.id.to_string();
-    Ok(EvidenceDraft {
+    let draft = EvidenceDraft {
         source_type: "github_check_run".into(),
         // GitHub check_run timestamps are not a strict event sequence. Treat each
         // distinct payload as an immutable observation instead of claiming that
@@ -89,7 +98,9 @@ pub fn translate(payload: CheckRunWebhook) -> Result<EvidenceDraft, String> {
             ("check_run_id".into(), check_run_id),
         ]),
         causality: None,
-    })
+    };
+    CONFORMANCE_PROFILE.validate(&draft)?;
+    Ok(draft)
 }
 
 pub fn parse(input: &[u8]) -> Result<CheckRunWebhook, String> {
