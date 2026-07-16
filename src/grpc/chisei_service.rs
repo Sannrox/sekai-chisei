@@ -4417,20 +4417,128 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn reserve_gateway_request_alias(
+        &self,
+        req: Request<ReserveGatewayRequestAliasRequest>,
+    ) -> Result<Response<ReserveGatewayRequestAliasResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let auth_source = req
+            .metadata()
+            .get(AUTH_SOURCE_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let configured_gateway = self
+            .config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor)
+            && auth_source == Some("token");
+        if !configured_gateway && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
+            return Err(Status::permission_denied(
+                "gateway request alias reservation requires a gateway service principal",
+            ));
+        }
+        let request = req.into_inner();
+        if request.caller_scope.trim().is_empty()
+            || request.request_alias.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.operation_id.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "caller_scope, request_alias, request_id, and operation_id are required",
+            ));
+        }
+        let reserved = self
+            .db
+            .reserve_gateway_request_alias(
+                &request.caller_scope,
+                &request.request_alias,
+                &request.request_id,
+                &request.operation_id,
+            )
+            .map_err(Status::internal)?;
+        Ok(Response::new(ReserveGatewayRequestAliasResponse {
+            reserved,
+        }))
+    }
+
     async fn get_operation_receipt(
         &self,
         req: Request<GetOperationReceiptRequest>,
     ) -> Result<Response<GetOperationReceiptResponse>, Status> {
         let actor = authenticated_actor(&req);
         let request = req.into_inner();
-        if request.operation_id.trim().is_empty() {
-            return Err(Status::invalid_argument("operation_id required"));
+        let operation_id = request.operation_id.trim();
+        let request_id = request.request_id.trim();
+        let caller_scope = request.caller_scope.trim();
+        let attempt = (request.attempt > 0).then_some(request.attempt);
+        if operation_id.is_empty() == request_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "exactly one of operation_id or request_id is required",
+            ));
         }
-        let receipt = self
-            .db
-            .get_operation_receipt(&request.operation_id)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("operation receipt not found"))?;
+        let receipt = if !operation_id.is_empty() {
+            if let Some(attempt) = attempt {
+                match self
+                    .db
+                    .find_gateway_receipt_by_logical_operation_id(operation_id, Some(attempt))
+                {
+                    Ok(Some(receipt)) => Ok(Some(receipt)),
+                    Ok(None) if attempt == 1 => self.db.get_operation_receipt(operation_id),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            } else {
+                let exact = self.db.get_operation_receipt(operation_id);
+                let derived = self
+                    .db
+                    .find_gateway_receipt_by_logical_operation_id(operation_id, None);
+                match (exact, derived) {
+                    (Ok(Some(_)), Ok(Some(_))) => Err(
+                        "logical operation id matches multiple legacy and attempt receipts".into(),
+                    ),
+                    (Ok(Some(receipt)), Ok(None)) | (Ok(None), Ok(Some(receipt))) => {
+                        Ok(Some(receipt))
+                    }
+                    (Ok(None), Ok(None)) => Ok(None),
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                }
+            }
+        } else {
+            let privileged = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
+            if !privileged {
+                return Err(Status::permission_denied(
+                    "opaque request alias lookup requires administrative inspection access",
+                ));
+            }
+            let alias_lookup = || {
+                self.db.find_operation_receipt_by_lookup_request_id(
+                    request_id,
+                    (!caller_scope.is_empty()).then_some(caller_scope),
+                    None,
+                )
+            };
+            if caller_scope.is_empty() {
+                match self.db.find_operation_receipt_by_request_id(request_id) {
+                    Ok(Some(receipt)) => Ok(Some(receipt)),
+                    Ok(None) => alias_lookup(),
+                    Err(error) => Err(error),
+                }
+            } else {
+                match alias_lookup() {
+                    Ok(Some(receipt)) => Ok(Some(receipt)),
+                    Ok(None) => self.db.find_operation_receipt_by_request_id(request_id),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        .map_err(|error| {
+            if error.contains("matches multiple") {
+                Status::failed_precondition(error)
+            } else {
+                Status::internal(error)
+            }
+        })?
+        .ok_or(Status::not_found("operation receipt not found"))?;
         if actor != receipt.initiating_actor
             // The UDS interceptor assigns `local`; local socket access is the
             // administrative inspection boundary used by sekaictl. This
@@ -7241,6 +7349,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_gateway_principal_can_reserve_request_aliases() {
+        let mut svc = memory_service();
+        svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
+        let reservation = ReserveGatewayRequestAliasRequest {
+            caller_scope: "gateway:prod".into(),
+            request_alias: "attempt-1".into(),
+            request_id: "request-1".into(),
+            operation_id: "operation-1".into(),
+        };
+        let mut configured = Request::new(reservation.clone());
+        configured
+            .metadata_mut()
+            .insert("x-principal", "Gateway-Prod".parse().unwrap());
+        configured
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+        assert!(
+            svc.reserve_gateway_request_alias(configured)
+                .await
+                .unwrap()
+                .into_inner()
+                .reserved
+        );
+
+        let mut intruder = Request::new(ReserveGatewayRequestAliasRequest {
+            request_alias: "attempt-2".into(),
+            request_id: "request-2".into(),
+            ..reservation
+        });
+        intruder
+            .metadata_mut()
+            .insert("x-principal", "agent:intruder".parse().unwrap());
+        assert_eq!(
+            svc.reserve_gateway_request_alias(intruder)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
     async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
         let mut svc = memory_service();
         svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
@@ -7623,6 +7773,9 @@ mod tests {
 
         let mut get_request = Request::new(GetOperationReceiptRequest {
             operation_id: plan.plan_id.clone(),
+            request_id: String::new(),
+            caller_scope: String::new(),
+            attempt: 0,
         });
         get_request
             .metadata_mut()
@@ -7632,6 +7785,9 @@ mod tests {
 
         let mut initiator_get = Request::new(GetOperationReceiptRequest {
             operation_id: plan.plan_id.clone(),
+            request_id: String::new(),
+            caller_scope: String::new(),
+            attempt: 0,
         });
         initiator_get
             .metadata_mut()
@@ -7646,6 +7802,9 @@ mod tests {
         assert!(
             svc.get_operation_receipt(Request::new(GetOperationReceiptRequest {
                 operation_id: plan.plan_id.clone(),
+                request_id: String::new(),
+                caller_scope: String::new(),
+                attempt: 0,
             }))
             .await
             .unwrap()
@@ -7655,11 +7814,29 @@ mod tests {
 
         let mut denied_get = Request::new(GetOperationReceiptRequest {
             operation_id: plan.plan_id.clone(),
+            request_id: String::new(),
+            caller_scope: String::new(),
+            attempt: 0,
         });
         denied_get
             .metadata_mut()
             .insert("x-principal", "agent:intruder".parse().unwrap());
         let denied = svc.get_operation_receipt(denied_get).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let mut configured_writer_get = Request::new(GetOperationReceiptRequest {
+            operation_id: plan.plan_id.clone(),
+            request_id: String::new(),
+            caller_scope: String::new(),
+            attempt: 0,
+        });
+        configured_writer_get
+            .metadata_mut()
+            .insert("x-principal", "Gateway-Prod".parse().unwrap());
+        let denied = svc
+            .get_operation_receipt(configured_writer_get)
+            .await
+            .unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
         let mut unauthorized_report = report();
