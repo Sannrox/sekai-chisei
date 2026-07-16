@@ -76,10 +76,21 @@ pub struct OperationReport {
     #[serde(default)]
     pub governance: GovernanceProjection,
     pub claims: AssuranceClaims,
+    #[serde(default)]
+    pub external_evidence_versions: Vec<ExternalEvidenceVersion>,
     pub sections: BTreeMap<String, Vec<ReportEvent>>,
     pub missing_surfaces: Vec<ReceiptSurface>,
     pub uncovered_surfaces: Vec<UncoveredSurface>,
     pub structural_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalEvidenceVersion {
+    pub submission_id: String,
+    pub source_version: String,
+    pub content_digest: String,
+    pub disclosed_fields: Vec<String>,
+    pub receipt_event_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +115,8 @@ impl OperationReport {
         let mut sections = BTreeMap::<String, Vec<ReportEvent>>::new();
         let mut retention_redactions = 0usize;
         let mut tombstone_redactions = 0usize;
+        let mut external_evidence_versions = Vec::new();
+        let mut evidence_projection_errors = Vec::new();
         for event in causally_ordered_events(receipt) {
             let projected = project_event(event);
             for reference in projected
@@ -114,6 +127,16 @@ impl OperationReport {
                 let reason = reference.omission_reason.as_deref().unwrap_or_default();
                 retention_redactions += reason.contains("retention") as usize;
                 tombstone_redactions += reason.contains("tombstone") as usize;
+            }
+            for reference in projected
+                .references
+                .iter()
+                .filter(|reference| reference.kind == "external_evidence" && !reference.omitted)
+            {
+                match external_evidence_version(&projected.event_id, reference) {
+                    Ok(version) => external_evidence_versions.push(version),
+                    Err(error) => evidence_projection_errors.push(error),
+                }
             }
             sections
                 .entry(event.surface.as_str().into())
@@ -127,6 +150,20 @@ impl OperationReport {
         if duration_ms.is_some_and(|duration| duration < 0) {
             structural_errors.push("completed_at_ms precedes started_at_ms".into());
         }
+        external_evidence_versions.sort_by(|left, right| {
+            (
+                &left.submission_id,
+                &left.source_version,
+                &left.receipt_event_id,
+            )
+                .cmp(&(
+                    &right.submission_id,
+                    &right.source_version,
+                    &right.receipt_event_id,
+                ))
+        });
+        external_evidence_versions.dedup();
+        structural_errors.extend(evidence_projection_errors);
         Self {
             version: OPERATION_REPORT_VERSION.into(),
             source_receipt_version: receipt.version.clone(),
@@ -151,12 +188,59 @@ impl OperationReport {
                 integrity: ClaimState::NotVerified,
                 policy_compliance: ClaimState::NotVerified,
             },
+            external_evidence_versions,
             sections,
             missing_surfaces: completeness.missing_surfaces,
             uncovered_surfaces: receipt.uncovered_surfaces.clone(),
             structural_errors,
         }
     }
+}
+
+fn external_evidence_version(
+    event_id: &str,
+    reference: &GovernedReference,
+) -> Result<ExternalEvidenceVersion, String> {
+    let value = reference
+        .reference
+        .strip_prefix("evidence:")
+        .ok_or_else(|| {
+            format!(
+                "external evidence reference {} has no evidence prefix",
+                reference.reference
+            )
+        })?;
+    let (submission_id, source_version) = value
+        .split_once('@')
+        .filter(|(submission_id, source_version)| {
+            !submission_id.trim().is_empty() && !source_version.trim().is_empty()
+        })
+        .ok_or_else(|| {
+            format!(
+                "external evidence reference {} does not pin a source version",
+                reference.reference
+            )
+        })?;
+    let content_digest = reference
+        .content_hash
+        .as_deref()
+        .filter(|digest| !digest.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "external evidence reference {} does not pin a content digest",
+                reference.reference
+            )
+        })?;
+    let mut disclosed_fields = reference.disclosed_fields.clone();
+    disclosed_fields.sort();
+    disclosed_fields.dedup();
+    Ok(ExternalEvidenceVersion {
+        submission_id: submission_id.into(),
+        source_version: source_version.into(),
+        content_digest: content_digest.into(),
+        disclosed_fields,
+        receipt_event_id: event_id.into(),
+    })
 }
 
 fn project_event(event: &OperationReceiptEvent) -> ReportEvent {
@@ -453,5 +537,56 @@ mod tests {
         json.as_object_mut().unwrap().remove("governance");
         let restored: OperationReport = serde_json::from_value(json).unwrap();
         assert_eq!(restored.governance, GovernanceProjection::default());
+        assert!(restored.external_evidence_versions.is_empty());
+    }
+
+    #[test]
+    fn report_projects_exact_external_evidence_versions() {
+        let mut source = receipt();
+        let intent = source
+            .events
+            .iter_mut()
+            .find(|event| event.event_id == "intent")
+            .unwrap();
+        intent.references.push(GovernedReference {
+            kind: "external_evidence".into(),
+            reference: "evidence:submission-7@attempt-2".into(),
+            content_hash: Some("abc123".into()),
+            disclosed_fields: vec!["status".into(), "status".into(), "outcome".into()],
+            omitted: false,
+            omission_reason: None,
+        });
+        let report = OperationReport::from_authorized_receipt(&source);
+        assert_eq!(
+            report.external_evidence_versions,
+            vec![ExternalEvidenceVersion {
+                submission_id: "submission-7".into(),
+                source_version: "attempt-2".into(),
+                content_digest: "abc123".into(),
+                disclosed_fields: vec!["outcome".into(), "status".into()],
+                receipt_event_id: "intent".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_external_evidence_reference_prevents_completeness_claim() {
+        let mut source = receipt();
+        source.events[0].references.push(GovernedReference {
+            kind: "external_evidence".into(),
+            reference: "evidence:submission-without-version".into(),
+            content_hash: Some("abc123".into()),
+            disclosed_fields: vec![],
+            omitted: false,
+            omission_reason: None,
+        });
+        let report = OperationReport::from_receipt(&source);
+        assert!(!report.claims.evidence_complete);
+        assert!(
+            report
+                .structural_errors
+                .iter()
+                .any(|error| error.contains("does not pin a source version"))
+        );
     }
 }
