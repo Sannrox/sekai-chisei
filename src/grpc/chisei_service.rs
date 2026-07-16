@@ -4452,6 +4452,82 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(ListKiokuCandidatesResponse { candidates }))
     }
 
+    async fn review_kioku_memory(
+        &self,
+        req: Request<ReviewKiokuMemoryRequest>,
+    ) -> Result<Response<ReviewKiokuMemoryResponse>, Status> {
+        require_eval_admin(&req)?;
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        if request.memory_id.trim().is_empty()
+            || request.memory_version == 0
+            || request.rationale.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "memory id, version, and rationale are required",
+            ));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let memory = match request.action.as_str() {
+            "promote" | "reject" | "supersede" => {
+                let memory = self
+                    .db
+                    .get_kioku_memory(&request.memory_id, request.memory_version)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::not_found("memory version not found"))?;
+                if request.action == "supersede" && memory.supersedes.is_none() {
+                    return Err(Status::failed_precondition(
+                        "supersede requires candidate lineage to an active memory",
+                    ));
+                }
+                self.db
+                    .review_kioku_candidate(
+                        &request.memory_id,
+                        request.memory_version,
+                        crate::chisei::kioku::HumanMemoryReview {
+                            action: if request.action == "reject" {
+                                crate::chisei::kioku::HumanReviewAction::Reject
+                            } else {
+                                crate::chisei::kioku::HumanReviewAction::Promote
+                            },
+                            reviewer: actor,
+                            rationale: request.rationale,
+                            reviewed_at_ms: now_ms,
+                        },
+                    )
+                    .map_err(Status::failed_precondition)?
+            }
+            "disable" => self
+                .db
+                .disable_kioku_memory(
+                    &request.memory_id,
+                    request.memory_version,
+                    &actor,
+                    &request.rationale,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "action must be promote, reject, supersede, or disable",
+                ));
+            }
+        };
+        let lifecycle_events = self
+            .db
+            .list_kioku_lifecycle_events(&memory.id, memory.version)
+            .map_err(Status::internal)?;
+        Ok(Response::new(ReviewKiokuMemoryResponse {
+            memory_json: serde_json::to_string(&memory)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            lifecycle_events_json: lifecycle_events
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
     async fn report_operation_event(
         &self,
         req: Request<ReportOperationEventRequest>,

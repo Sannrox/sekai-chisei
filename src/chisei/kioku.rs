@@ -931,6 +931,54 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String> {
+        if actor.trim().is_empty() || rationale.trim().is_empty() {
+            return Err("disable actor and rationale are required".into());
+        }
+        let mut memory = self
+            .get_kioku_memory(id, version)?
+            .ok_or_else(|| format!("memory {id} version {version} not found"))?;
+        if memory.state != MemoryLifecycleState::Active {
+            return Err("only active memories can be disabled".into());
+        }
+        memory.state = MemoryLifecycleState::Rejected;
+        let memory_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE chisei_kioku_memories SET state='rejected', memory_json=?1
+                 WHERE id=?2 AND version=?3 AND state='active'",
+                params![memory_json, id, version],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("memory changed while it was being disabled".into());
+        }
+        insert_lifecycle_event(
+            &tx,
+            &MemoryLifecycleEvent {
+                memory_id: id.into(),
+                memory_version: version,
+                action: "disabled".into(),
+                from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                to_state: MemoryLifecycleState::Rejected.as_str().into(),
+                actor: actor.trim().into(),
+                reason: rationale.trim().into(),
+                recorded_at_ms,
+            },
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(memory)
+    }
+
     pub fn retrieve_kioku_memories(
         &self,
         request: &MemoryRetrievalRequest,
@@ -1563,6 +1611,36 @@ mod tests {
             db.list_kioku_candidates("payments", Some("incident"), 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn disabling_active_memory_is_audited_and_removes_it_from_retrieval() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut memory = candidate();
+        memory.confidence_bps = 10_000;
+        db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
+            .unwrap();
+        db.review_kioku_candidate(
+            &memory.id,
+            memory.version,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "reviewer".into(),
+                rationale: "verified".into(),
+                reviewed_at_ms: 120,
+            },
+        )
+        .unwrap();
+        let disabled = db
+            .disable_kioku_memory(&memory.id, memory.version, "reviewer", "regressed", 130)
+            .unwrap();
+        assert_eq!(disabled.state, MemoryLifecycleState::Rejected);
+        assert!(
+            db.list_kioku_lifecycle_events(&memory.id, memory.version)
+                .unwrap()
+                .iter()
+                .any(|event| event.action == "disabled")
         );
     }
 
