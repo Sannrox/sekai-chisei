@@ -68,6 +68,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Ok(())
         }
+        "smoke" => {
+            sekai_chisei::launch::load_local_env();
+            let model = args.get(1).map(String::as_str).unwrap_or("gpt-5.5");
+            if args.len() > 2 {
+                return Err(std::io::Error::other("usage: sekaictl smoke [model]").into());
+            }
+            print!(
+                "{}",
+                sekai_chisei::onboarding::run_smoke(model)
+                    .await
+                    .map_err(std::io::Error::other)?
+            );
+            Ok(())
+        }
         "provenance" => {
             sekai_chisei::launch::load_local_env();
             let work_unit = args
@@ -210,7 +224,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|action|attest|estimate|provenance|receipt> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -221,6 +235,7 @@ fn print_root_usage() {
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
     println!("\nDiagnostics:\n  sekaictl doctor [codex-app|claude-code]");
+    println!("\nFirst governed operation:\n  sekaictl smoke [model]");
     println!("\nCost estimate:");
     println!("  {}", estimate_usage());
     println!("\nGoverned action commands:");
