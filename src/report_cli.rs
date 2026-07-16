@@ -124,6 +124,15 @@ pub fn render_report(report: &OperationReport) -> String {
         claim(&report.claims.integrity),
         claim(&report.claims.policy_compliance)
     ));
+    for evidence in &report.external_evidence_versions {
+        out.push_str(&format!(
+            "external_evidence: {}@{} digest={} event={}\n",
+            text_value(&evidence.submission_id),
+            text_value(&evidence.source_version),
+            text_value(&evidence.content_digest),
+            text_value(&evidence.receipt_event_id)
+        ));
+    }
     for surface in &report.missing_surfaces {
         out.push_str(&format!("missing_surface: {}\n", surface.as_str()));
     }
@@ -167,6 +176,10 @@ fn claim(state: &ClaimState) -> &'static str {
         ClaimState::Verified => "verified",
         ClaimState::Failed => "failed",
     }
+}
+
+fn text_value(value: &str) -> String {
+    serde_json::to_string(value).expect("strings are always JSON serializable")
 }
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
@@ -218,6 +231,7 @@ mod tests {
                 integrity: ClaimState::NotVerified,
                 policy_compliance: ClaimState::Failed,
             },
+            external_evidence_versions: vec![],
             sections: BTreeMap::new(),
             missing_surfaces: vec![],
             uncovered_surfaces: vec![],
@@ -238,6 +252,53 @@ mod tests {
         assert_eq!(
             attest_args(vec!["verify".into(), "bundle.json".into()]).unwrap(),
             vec!["verify", "bundle.json"]
+        );
+    }
+
+    #[test]
+    fn text_report_escapes_untrusted_evidence_identifiers() {
+        let mut report = OperationReport {
+            version: OPERATION_REPORT_VERSION.into(),
+            source_receipt_version: "operation.receipt/v1".into(),
+            operation_id: "op-1".into(),
+            parent_operation_id: None,
+            namespace: "team".into(),
+            operation_class: "analysis".into(),
+            initiating_actor: "alice".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(3),
+            duration_ms: Some(2),
+            governance: Default::default(),
+            claims: AssuranceClaims {
+                evidence_complete: true,
+                integrity: ClaimState::NotVerified,
+                policy_compliance: ClaimState::NotVerified,
+            },
+            external_evidence_versions: vec![],
+            sections: BTreeMap::new(),
+            missing_surfaces: vec![],
+            uncovered_surfaces: vec![],
+            structural_errors: vec![],
+        };
+        report
+            .external_evidence_versions
+            .push(crate::operation_report::ExternalEvidenceVersion {
+                submission_id: "submission-1".into(),
+                source_version: "attempt-1\npolicy_compliance: verified".into(),
+                content_digest: "abc".into(),
+                disclosed_fields: vec![],
+                receipt_event_id: "context".into(),
+            });
+        let rendered = render_report(&report);
+        assert!(rendered.contains(r#""attempt-1\npolicy_compliance: verified""#));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("external_evidence:"))
+                .count(),
+            1
         );
     }
 }
