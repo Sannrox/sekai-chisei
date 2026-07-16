@@ -213,6 +213,7 @@ impl CapabilityRequirements {
             .and_then(|tools| tools.as_array())
             .cloned()
             .unwrap_or_default();
+        let has_tool_outputs = value.get("input").is_some_and(contains_tool_call_output);
         let built_in_tools = tools
             .iter()
             .filter_map(|tool| tool.get("type").and_then(|value| value.as_str()))
@@ -223,13 +224,21 @@ impl CapabilityRequirements {
         collect_modalities(&value, &mut modalities);
         modalities.sort();
         modalities.dedup();
+        let max_output_tokens = match value.get("max_output_tokens") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| "max_output_tokens must be an unsigned integer".to_string())?,
+            ),
+        };
         Ok(Self {
             responses: true,
             streaming: value
                 .get("stream")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false),
-            tools: !tools.is_empty(),
+            tools: !tools.is_empty() || has_tool_outputs,
             parallel_tools: !tools.is_empty()
                 && value
                     .get("parallel_tool_calls")
@@ -242,9 +251,7 @@ impl CapabilityRequirements {
                 .is_some_and(|value| !value.is_null()),
             modalities,
             built_in_tools,
-            max_output_tokens: value
-                .get("max_output_tokens")
-                .and_then(|value| value.as_u64()),
+            max_output_tokens,
         })
     }
 
@@ -336,6 +343,20 @@ fn collect_modalities(value: &serde_json::Value, modalities: &mut Vec<String>) {
     }
 }
 
+fn contains_tool_call_output(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_tool_call_output),
+        serde_json::Value::Object(values) => {
+            values
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.ends_with("_call_output"))
+                || values.values().any(contains_tool_call_output)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +438,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_outputs_require_tool_capability_without_new_schemas() {
+        let required = CapabilityRequirements::from_responses_body(
+            br#"{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}"#,
+        )
+        .unwrap();
+        assert!(required.tools);
+        assert_eq!(
+            required.unsupported_by(CapabilityMatrix::built_in().capabilities("native").unwrap()),
+            vec!["tools"]
+        );
+    }
+
+    #[test]
     fn output_limits_are_enforced_before_provider_contact() {
         let required = CapabilityRequirements::from_responses_body(
             br#"{"max_output_tokens":64000,"input":"hello"}"#,
@@ -433,6 +467,21 @@ mod tests {
                 .unsupported_by(matrix.capabilities("openai").unwrap())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn non_integer_output_limits_are_rejected() {
+        for body in [
+            br#"{"max_output_tokens":64000.0}"#.as_slice(),
+            br#"{"max_output_tokens":6.4e4}"#.as_slice(),
+            br#"{"max_output_tokens":-1}"#.as_slice(),
+            br#"{"max_output_tokens":"64000"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                CapabilityRequirements::from_responses_body(body),
+                Err("max_output_tokens must be an unsigned integer".to_string())
+            );
+        }
     }
 
     #[test]
