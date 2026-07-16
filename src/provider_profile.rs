@@ -327,6 +327,7 @@ fn profile(
         "openai" => vec!["*".into()],
         "ollama" => vec!["ollama/*".into()],
         "anthropic" => vec!["claude*".into()],
+        "native" => vec!["native-*".into(), "fallback:*".into()],
         _ => vec!["fallback:*".into()],
     };
     let excluded_model_prefixes = if provider == "openai" {
@@ -339,6 +340,8 @@ fn profile(
             "anthropic",
             "azure",
             "cohere",
+            "ollama/",
+            "native-",
         ]
         .into_iter()
         .map(str::to_string)
