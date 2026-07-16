@@ -49,7 +49,10 @@ use crate::grpc::pb::sekai::{
     RetrieveContextRequest, Row,
 };
 use crate::llm::HttpTimeouts;
-use crate::provider_profile::{CapabilityMatrix, CapabilityRequirements};
+use crate::provider_profile::{
+    CapabilityMatrix, CapabilityRequirements, normalize_responses_request,
+    validate_responses_request_fields,
+};
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -1259,10 +1262,13 @@ fn gateway_correlation_scope(identity: &GatewayIdentity) -> String {
 fn scoped_operation_id(value: &str, caller_scope: &str) -> Result<String, String> {
     let prefix = format!("chisei:{caller_scope}:");
     if value.starts_with("chisei:") {
-        return value
-            .starts_with(&prefix)
-            .then(|| value.to_string())
-            .ok_or_else(|| "operation id belongs to a different caller scope".to_string());
+        let suffix = value
+            .strip_prefix(&prefix)
+            .ok_or_else(|| "operation id belongs to a different caller scope".to_string())?;
+        if suffix.is_empty() {
+            return Err("operation id requires a non-empty scoped identifier".into());
+        }
+        return Ok(value.to_string());
     }
     if value.len().saturating_add(prefix.len()) > 128 {
         return Err("operation id is too long after caller scoping".into());
@@ -1540,7 +1546,7 @@ async fn proxy_gateway_inner(
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
         return rejection.response();
     }
-    let (resolved, egress, budget) = if state.config.no_preflight {
+    let (resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_model.clone(),
@@ -1683,6 +1689,21 @@ async fn proxy_gateway_inner(
         };
         (resolved, egress, Some(budget))
     };
+    if responses_create {
+        egress.body = match normalize_responses_request(&egress.body) {
+            Ok(body) => body,
+            Err(reason) => {
+                let rejection = GatewayRejection::json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    reason,
+                );
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
+        };
+    }
     if responses_create
         && let Err(rejection) =
             enforce_provider_capabilities(resolved.resolved_provider, &egress.body)
@@ -5902,6 +5923,9 @@ fn enforce_provider_capabilities(
     provider: ProviderKind,
     body: &[u8],
 ) -> Result<(), GatewayRejection> {
+    validate_responses_request_fields(body).map_err(|reason| {
+        GatewayRejection::json(StatusCode::BAD_REQUEST, "invalid_request_error", reason)
+    })?;
     let requirements = CapabilityRequirements::from_responses_body(body).map_err(|reason| {
         GatewayRejection::json(
             StatusCode::BAD_REQUEST,
@@ -8452,7 +8476,7 @@ fn is_chisei_header(name: &HeaderName) -> bool {
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
-    !is_hop_by_hop(name) && name != CONTENT_LENGTH
+    !is_hop_by_hop(name) && name != CONTENT_LENGTH && !is_chisei_header(name) && name != TRACEPARENT
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -8650,6 +8674,7 @@ mod tests {
             canonical
         );
         assert!(scoped_operation_id(&"a".repeat(105), "0123456789abcdef").is_err());
+        assert!(scoped_operation_id("chisei:0123456789abcdef:", "0123456789abcdef").is_err());
     }
 
     #[test]
@@ -8706,6 +8731,16 @@ mod tests {
         assert!(matrix.capabilities("openai").unwrap().parallel_tools);
         assert!(!matrix.capabilities("ollama").unwrap().parallel_tools);
         assert!(!matrix.capabilities("anthropic").unwrap().responses);
+    }
+
+    #[test]
+    fn upstream_cannot_supply_gateway_correlation_headers() {
+        assert!(!should_forward_response_header(&X_CHISEI_OPERATION_ID));
+        assert!(!should_forward_response_header(
+            &X_CHISEI_PARENT_OPERATION_ID
+        ));
+        assert!(!should_forward_response_header(&TRACEPARENT));
+        assert!(should_forward_response_header(&CONTENT_TYPE));
     }
 
     #[test]
