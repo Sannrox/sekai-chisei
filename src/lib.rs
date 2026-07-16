@@ -16,6 +16,7 @@ pub mod launch;
 pub mod llm;
 pub mod obs;
 pub mod provenance;
+pub mod provider_profile;
 pub mod receipt_cli;
 pub mod secrets;
 pub mod sekai;

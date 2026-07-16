@@ -25,6 +25,14 @@ gateway identity. The gateway returns their canonical `chisei:<scope>:<id>` form
 clients reuse that returned value on later calls. An identifier from another caller
 scope is rejected rather than attached to receipt lineage.
 
+Authenticated clients discover the versioned provider matrix with
+`GET /v1/chisei/capabilities`. Chisei derives required streaming, tool,
+parallel-tool, structured-output, reasoning, modality, continuation, and built-in
+tool capabilities from each Responses request. A route that cannot preserve every
+requirement fails with `capability_unsupported` before upstream provider contact.
+Built-in search, code, or MCP tools remain unavailable unless the selected profile
+declares the exact external capability.
+
 ## Stream contract
 
 SSE frames are ordered as received. Clients assemble text from
