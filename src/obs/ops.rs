@@ -4,29 +4,40 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-pub fn router(db: Arc<SekaiDb>) -> Router {
+#[derive(Clone)]
+struct OpsState {
+    db: Arc<SekaiDb>,
+    provider_registry_state_path: PathBuf,
+}
+
+pub fn router(db: Arc<SekaiDb>, provider_registry_state_path: PathBuf) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .with_state(db)
+        .with_state(OpsState {
+            db,
+            provider_registry_state_path,
+        })
 }
 
 pub async fn bind_and_spawn(
     bind: &str,
     port: u16,
     db: Arc<SekaiDb>,
+    provider_registry_state_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::obs::metrics::handle();
     crate::obs::metrics::spawn_upkeep_task();
 
     let listener = TcpListener::bind((bind, port)).await?;
     let actual_addr = listener.local_addr()?;
-    let app = router(db);
+    let app = router(db, provider_registry_state_path);
 
     info!(addr = %actual_addr, "ops listener serving health and metrics");
     tokio::spawn(async move {
@@ -49,8 +60,14 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn readyz(State(db): State<Arc<SekaiDb>>) -> impl IntoResponse {
-    match tokio::task::spawn_blocking(move || db.ping()).await {
+async fn readyz(State(state): State<OpsState>) -> impl IntoResponse {
+    match tokio::task::spawn_blocking(move || {
+        state.db.ping().map_err(std::io::Error::other)?;
+        crate::provider_profile::refresh_provider_registry(&state.provider_registry_state_path)
+            .map_err(std::io::Error::other)
+    })
+    .await
+    {
         Ok(Ok(())) => (StatusCode::OK, "ok").into_response(),
         Ok(Err(err)) => {
             warn!(error = %err, "readiness check failed");

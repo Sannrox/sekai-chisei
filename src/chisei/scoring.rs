@@ -747,8 +747,16 @@ impl Judge for LlmJudge {
         spec: &str,
         output: &str,
     ) -> Result<JudgeVerdict, JudgeError> {
-        let provider = llm::resolve(
+        let registry_state_path =
+            crate::provider_profile::provider_registry_state_path(&self.config.db_path);
+        let registry =
+            crate::provider_profile::refresh_provider_registry_async(&registry_state_path)
+                .await
+                .map_err(JudgeError::Transient)?;
+        let provider = llm::resolve_with_registry(
             model,
+            &registry,
+            Some(&registry_state_path),
             self.config.anthropic_api_key.as_deref(),
             self.config.openai_api_key.as_deref(),
             &self.config.ollama_url,
@@ -814,7 +822,7 @@ impl Judge for LlmJudge {
             Err(e) => {
                 self.budget.adjust(user_id, estimated, 0);
                 // Provider/network failures are transient and uniform across records.
-                return Err(JudgeError::Transient(e));
+                return Err(JudgeError::Transient(e.to_string()));
             }
         };
         self.budget
