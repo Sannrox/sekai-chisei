@@ -39,9 +39,13 @@ pub async fn connect_sekai_with_timeout(
     target: &str,
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
-    let auth_token = std::env::var("SEKAI_AUTH_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let auth_token = if target.starts_with("http://") || target.starts_with("https://") {
+        std::env::var("SEKAI_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        None
+    };
     connect_sekai_with_token(target, auth_token, timeout).await
 }
 
