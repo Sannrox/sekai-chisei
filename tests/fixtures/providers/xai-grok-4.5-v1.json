@@ -1,0 +1,19 @@
+{
+  "profile_version": "xai.grok-4.5/v1",
+  "model": "grok-4.5",
+  "request": {
+    "model": "grok-4.5",
+    "input": "Return the supplied value through the echo tool.",
+    "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}],
+    "parallel_tool_calls": true,
+    "reasoning": {"effort": "low"},
+    "stream": true,
+    "store": false
+  },
+  "response": {
+    "type": "response.completed",
+    "response": {"id": "resp_fixture_xai", "status": "completed", "usage": {"input_tokens": 20, "output_tokens": 10}}
+  },
+  "error": {"status": 429, "type": "rate_limit_error"},
+  "sse_events": ["response.created", "response.function_call_arguments.delta", "response.output_item.done", "response.completed"]
+}

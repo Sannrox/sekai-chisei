@@ -175,10 +175,15 @@ impl GatewayConfig {
                 .as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
-        if openai_api_key.is_none() && anthropic_api_key.is_none() && !allow_auth_passthrough {
-            return Err(
-                "OPENAI_API_KEY or ANTHROPIC_API_KEY must be set for chisei-gateway".into(),
-            );
+        let hosted_key_configured = ["XAI_API_KEY", "META_MODEL_API_KEY"]
+            .iter()
+            .any(|variable| std::env::var(variable).is_ok_and(|value| !value.trim().is_empty()));
+        if openai_api_key.is_none()
+            && anthropic_api_key.is_none()
+            && !hosted_key_configured
+            && !allow_auth_passthrough
+        {
+            return Err("a configured provider API key is required for chisei-gateway".into());
         }
         let chisei_grpc_target = std::env::var("CHISEI_GRPC_URL")
             .or_else(|_| std::env::var("SEKAI_SOCKET"))
@@ -2185,9 +2190,14 @@ async fn proxy_gateway_inner_scoped(
         identity_context.upstream_auth,
         prepared.provider,
     );
-    let resolved_to_local = matches!(
+    let resolved_to_isolated_openai_backend = matches!(
         prepared.provider,
-        ProviderKind::OpenAi(OpenAiRuntime::Ollama | OpenAiRuntime::Native)
+        ProviderKind::OpenAi(
+            OpenAiRuntime::Ollama
+                | OpenAiRuntime::Native
+                | OpenAiRuntime::Xai
+                | OpenAiRuntime::Meta
+        )
     );
     // Cross-provider requests were translated to a different provider family, so
     // the client's credential (e.g. an Anthropic subscription token) must never
@@ -2195,7 +2205,7 @@ async fn proxy_gateway_inner_scoped(
     // gateway auth instead (a no-op for Ollama/native) and strip client auth
     // headers below regardless of the passthrough mode.
     if prepared.cross_provider
-        || resolved_to_local
+        || resolved_to_isolated_openai_backend
         || upstream_auth_mode == UpstreamAuthMode::GatewayKey
     {
         upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
@@ -2204,7 +2214,7 @@ async fn proxy_gateway_inner_scoped(
         };
     }
     for (name, value) in headers.iter() {
-        let strip_client_auth = (prepared.cross_provider || resolved_to_local)
+        let strip_client_auth = (prepared.cross_provider || resolved_to_isolated_openai_backend)
             && (name == AUTHORIZATION || name == X_API_KEY);
         if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
             upstream = upstream.header(name, value);
@@ -4203,7 +4213,7 @@ fn upstream_url_for_provider(config: &GatewayConfig, uri: &Uri, provider: Provid
     // Keep the client's wire path but send it to the resolved provider's backend,
     // so e.g. a Responses request resolved to an Ollama model hits the Ollama base.
     match upstream_path(uri) {
-        Some((_, path)) => build_upstream_url(base_url_for_provider(config, provider), &path, uri),
+        Some((_, path)) => build_upstream_url(&base_url_for_provider(config, provider), &path, uri),
         None => openai_chat_completions_url(config, uri),
     }
 }
@@ -6541,6 +6551,8 @@ enum OpenAiRuntime {
     OpenAi,
     Ollama,
     Native,
+    Xai,
+    Meta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6726,6 +6738,8 @@ impl ProviderKind {
             "openai" => Some(Self::OpenAi(OpenAiRuntime::OpenAi)),
             "ollama" => Some(Self::OpenAi(OpenAiRuntime::Ollama)),
             "native" => Some(Self::OpenAi(OpenAiRuntime::Native)),
+            "xai" => Some(Self::OpenAi(OpenAiRuntime::Xai)),
+            "meta" => Some(Self::OpenAi(OpenAiRuntime::Meta)),
             "anthropic" => Some(Self::Anthropic),
             _ => None,
         }
@@ -6740,6 +6754,8 @@ impl ProviderKind {
             "ollama" => Ok(Self::OpenAi(OpenAiRuntime::Ollama)),
             "native" => Ok(Self::OpenAi(OpenAiRuntime::Native)),
             "openai" => Ok(Self::OpenAi(OpenAiRuntime::OpenAi)),
+            "xai" => Ok(Self::OpenAi(OpenAiRuntime::Xai)),
+            "meta" => Ok(Self::OpenAi(OpenAiRuntime::Meta)),
             provider => Err(format!("unsupported provider {provider:?}")),
         }
     }
@@ -6765,6 +6781,8 @@ fn capability_provider_id(provider: ProviderKind) -> &'static str {
         ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => "openai",
         ProviderKind::OpenAi(OpenAiRuntime::Ollama) => "ollama",
         ProviderKind::OpenAi(OpenAiRuntime::Native) => "native",
+        ProviderKind::OpenAi(OpenAiRuntime::Xai) => "xai",
+        ProviderKind::OpenAi(OpenAiRuntime::Meta) => "meta",
         ProviderKind::Anthropic => "anthropic",
     }
 }
@@ -6995,15 +7013,23 @@ fn normalize_anthropic_base_url(base: &str) -> String {
 /// Base URL for a provider's backend. This is what makes per-model routing work:
 /// a request resolved to an Ollama or native model is sent to that backend
 /// instead of the OpenAI upstream.
-fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> &str {
+fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> String {
     match provider {
-        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => &config.openai_base_url,
-        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => &config.ollama_base_url,
+        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => config.openai_base_url.clone(),
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => config.ollama_base_url.clone(),
         ProviderKind::OpenAi(OpenAiRuntime::Native) => config
             .native_base_url
-            .as_deref()
-            .unwrap_or(&config.openai_base_url),
-        ProviderKind::Anthropic => &config.anthropic_base_url,
+            .clone()
+            .unwrap_or_else(|| config.openai_base_url.clone()),
+        ProviderKind::OpenAi(OpenAiRuntime::Xai) => std::env::var("CHISEI_XAI_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "https://api.x.ai/v1".into()),
+        ProviderKind::OpenAi(OpenAiRuntime::Meta) => std::env::var("CHISEI_META_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_default(),
+        ProviderKind::Anthropic => config.anthropic_base_url.clone(),
     }
 }
 
@@ -7081,6 +7107,26 @@ fn apply_provider_auth(
                     "ANTHROPIC_API_KEY is not configured",
                 ))
             }),
+        ProviderKind::OpenAi(OpenAiRuntime::Xai | OpenAiRuntime::Meta) => {
+            let (variable, provider_name) = match provider {
+                ProviderKind::OpenAi(OpenAiRuntime::Xai) => ("XAI_API_KEY", "xAI"),
+                ProviderKind::OpenAi(OpenAiRuntime::Meta) => {
+                    ("META_MODEL_API_KEY", "Meta Model API")
+                }
+                _ => unreachable!(),
+            };
+            std::env::var(variable)
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+                .map(|key| upstream.bearer_auth(key))
+                .ok_or_else(|| {
+                    Box::new(json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "gateway_config_error",
+                        &format!("{variable} is not configured for {provider_name}"),
+                    ))
+                })
+        }
     }
 }
 
@@ -7094,6 +7140,12 @@ fn upstream_auth_mode(
         && config.rewrite_openai_passthrough_auth
         && config.openai_api_key.is_some()
     {
+        return UpstreamAuthMode::GatewayKey;
+    }
+    if matches!(
+        provider,
+        ProviderKind::OpenAi(OpenAiRuntime::Xai | OpenAiRuntime::Meta)
+    ) {
         return UpstreamAuthMode::GatewayKey;
     }
     requested_mode
@@ -11398,6 +11450,14 @@ mod tests {
         assert_eq!(
             upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Native)),
             "http://localhost:9999/v1/responses"
+        );
+        assert_eq!(
+            ProviderKind::from_model("xai/grok-4.5"),
+            Ok(ProviderKind::OpenAi(OpenAiRuntime::Xai))
+        );
+        assert_eq!(
+            ProviderKind::from_model("meta/muse-spark-1.1"),
+            Ok(ProviderKind::OpenAi(OpenAiRuntime::Meta))
         );
     }
 

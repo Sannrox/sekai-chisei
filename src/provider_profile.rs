@@ -82,7 +82,7 @@ pub struct ProviderCapabilities {
     pub reports_usage: bool,
     pub partial_usage: bool,
     pub context_tokens: u64,
-    pub output_tokens: u64,
+    pub output_tokens: Option<u64>,
     #[serde(default)]
     pub built_in_tools: Vec<String>,
 }
@@ -969,7 +969,7 @@ impl ProviderRegistry {
                         reports_usage: true,
                         partial_usage: true,
                         context_tokens: 400_000,
-                        output_tokens: 128_000,
+                        output_tokens: Some(128_000),
                         built_in_tools: vec![],
                     },
                 ),
@@ -996,7 +996,7 @@ impl ProviderRegistry {
                         reports_usage: true,
                         partial_usage: false,
                         context_tokens: 128_000,
-                        output_tokens: 32_000,
+                        output_tokens: Some(32_000),
                         built_in_tools: vec![],
                     },
                 ),
@@ -1019,7 +1019,7 @@ impl ProviderRegistry {
                         reports_usage: true,
                         partial_usage: false,
                         context_tokens: 128_000,
-                        output_tokens: 32_000,
+                        output_tokens: Some(32_000),
                         built_in_tools: vec![],
                     },
                 ),
@@ -1046,10 +1046,12 @@ impl ProviderRegistry {
                         reports_usage: true,
                         partial_usage: true,
                         context_tokens: 200_000,
-                        output_tokens: 64_000,
+                        output_tokens: Some(64_000),
                         built_in_tools: vec![],
                     },
                 ),
+                xai_profile(),
+                meta_profile(),
             ],
             state_version: 0,
             lifecycle_overrides: Vec::new(),
@@ -1107,6 +1109,20 @@ impl ProviderRegistry {
             .ok_or_else(|| format!("provider profile {provider:?} is not registered"))?;
         self.ensure_provider_available(provider)?;
         let canonical_model = format!("{provider}/{upstream_model}");
+        if !profile
+            .accepted_model_patterns
+            .iter()
+            .any(|pattern| model_pattern_matches(pattern, requested, &canonical_model))
+            || profile
+                .excluded_model_prefixes
+                .iter()
+                .any(|prefix| requested.starts_with(prefix) || canonical_model.starts_with(prefix))
+        {
+            return Err(format!(
+                "model {requested:?} is not admitted by provider profile {:?}",
+                profile.profile_version
+            ));
+        }
         if let Some(lifecycle_override) = self.latest_lifecycle_override("model", &canonical_model)
             && lifecycle_override.state == "disabled"
         {
@@ -1157,6 +1173,11 @@ impl ProviderRegistry {
             .ok_or_else(|| format!("provider profile {provider:?} is not registered"))?;
         if profile.lifecycle == "disabled" {
             return Err(format!("provider {provider:?} is disabled"));
+        }
+        if profile.lifecycle == "experimental" {
+            return Err(format!(
+                "provider {provider:?} is experimental and requires an explicit lifecycle promotion"
+            ));
         }
         Ok(())
     }
@@ -1228,6 +1249,13 @@ impl ProviderRegistry {
     }
 }
 
+fn model_pattern_matches(pattern: &str, requested: &str, canonical: &str) -> bool {
+    pattern.strip_suffix('*').map_or_else(
+        || requested == pattern || canonical == pattern,
+        |prefix| requested.starts_with(prefix) || canonical.starts_with(prefix),
+    )
+}
+
 fn canonical_model_target(model: &str) -> Result<String, String> {
     validate_model_identifier(model)?;
     let (provider, upstream_model) = resolve_provider_model(model)?;
@@ -1256,6 +1284,8 @@ fn resolve_provider_model(model: &str) -> Result<(&'static str, &str), String> {
             "anthropic" => Ok(("anthropic", upstream_model)),
             "ollama" => Ok(("ollama", upstream_model)),
             "native" => Ok(("native", upstream_model)),
+            "xai" => Ok(("xai", upstream_model)),
+            "meta" => Ok(("meta", upstream_model)),
             _ => Err(format!("unknown provider namespace {namespace:?}")),
         };
     }
@@ -1416,7 +1446,7 @@ fn profile(
     let (base_url_env, default_base_url, api_key_env) = endpoint;
     let reports_reasoning = capabilities.reasoning_controls;
     let reports_partial = capabilities.partial_usage;
-    let reports_cache_reads = matches!(provider, "openai" | "anthropic");
+    let reports_cache_reads = matches!(provider, "openai" | "anthropic" | "xai" | "meta");
     let reports_cache_writes = provider == "anthropic";
     let accepted_model_patterns = match provider {
         "openai" => std::iter::once("openai/*".to_string())
@@ -1429,6 +1459,8 @@ fn profile(
         "ollama" => vec!["ollama/*".into()],
         "anthropic" => vec!["anthropic/*".into(), "claude*".into()],
         "native" => vec!["native/*".into(), "native-*".into(), "fallback:*".into()],
+        "xai" => vec!["xai/grok-4.5".into()],
+        "meta" => vec!["meta/muse-spark-1.1".into()],
         _ => vec!["fallback:*".into()],
     };
     let excluded_model_prefixes = Vec::new();
@@ -1481,6 +1513,94 @@ fn profile(
             terms_version: None,
         },
     }
+}
+
+fn xai_profile() -> ProviderProfile {
+    let mut profile = profile(
+        "xai",
+        "openai-compatible",
+        Some("xai/"),
+        (
+            "CHISEI_XAI_BASE_URL",
+            Some("https://api.x.ai/v1"),
+            Some("XAI_API_KEY"),
+        ),
+        &["responses", "chat_completions", "models"],
+        &[],
+        ProviderCapabilities {
+            responses: true,
+            streaming: true,
+            tools: true,
+            parallel_tools: true,
+            structured_output: true,
+            reasoning_controls: true,
+            modalities: vec!["text".into(), "image".into()],
+            provider_continuation: false,
+            reports_usage: true,
+            partial_usage: true,
+            context_tokens: 500_000,
+            output_tokens: None,
+            built_in_tools: Vec::new(),
+        },
+    );
+    profile.profile_version = "xai.grok-4.5/v1".into();
+    profile
+        .request_adaptations
+        .push("built_in_tools_require_explicit_admission".into());
+    profile.pricing = PricingProfile {
+        version: "xai.grok-4.5/2026-07-09".into(),
+        source: "https://docs.x.ai/developers/models/grok-4.5".into(),
+        observed_at: Some("2026-07-14T00:00:00Z".into()),
+        dimensions: vec![
+            "input_tokens_usd_per_million=2.00".into(),
+            "cached_input_tokens_usd_per_million=0.50".into(),
+            "output_tokens_usd_per_million=6.00".into(),
+            "higher_context_pricing_above_tokens=200000".into(),
+        ],
+    };
+    profile.governance.metadata_status = "partial".into();
+    profile.governance.regions = vec!["us-east-1".into(), "us-west-2".into()];
+    profile
+}
+
+fn meta_profile() -> ProviderProfile {
+    let mut profile = profile(
+        "meta",
+        "openai-compatible-preview",
+        Some("meta/"),
+        ("CHISEI_META_BASE_URL", None, Some("META_MODEL_API_KEY")),
+        &["responses", "chat_completions"],
+        &[],
+        ProviderCapabilities {
+            responses: true,
+            streaming: true,
+            tools: true,
+            parallel_tools: true,
+            structured_output: true,
+            reasoning_controls: true,
+            modalities: vec!["text".into(), "image".into(), "video".into()],
+            provider_continuation: false,
+            reports_usage: true,
+            partial_usage: false,
+            context_tokens: 1_000_000,
+            output_tokens: None,
+            built_in_tools: Vec::new(),
+        },
+    );
+    profile.profile_version = "meta.muse-spark-1.1/preview-v1".into();
+    profile.lifecycle = "experimental".into();
+    profile
+        .request_adaptations
+        .push("built_in_tools_require_explicit_admission".into());
+    profile.pricing = PricingProfile {
+        version: "meta.muse-spark-1.1/unverified-preview-v1".into(),
+        source: "https://ai.meta.com/blog/introducing-muse-spark-meta-model-api/".into(),
+        observed_at: Some("2026-07-14T00:00:00Z".into()),
+        dimensions: Vec::new(),
+    };
+    profile.governance.metadata_status = "preview_unknown".into();
+    profile.governance.contractual_status = Some("public_preview".into());
+    profile
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1691,13 +1811,14 @@ impl CapabilityRequirements {
                 missing.push(format!("built_in_tool:{tool}"));
             }
         }
-        if let Some(requested) = self.max_output_tokens
-            && requested > capabilities.output_tokens
-        {
-            missing.push(format!(
-                "max_output_tokens:{requested}>{}",
-                capabilities.output_tokens
-            ));
+        if let Some(requested) = self.max_output_tokens {
+            match capabilities.output_tokens {
+                Some(supported) if requested > supported => {
+                    missing.push(format!("max_output_tokens:{requested}>{supported}"));
+                }
+                None => missing.push(format!("max_output_tokens:{requested}>unknown")),
+                Some(_) => {}
+            }
         }
         missing
     }
@@ -1865,6 +1986,78 @@ mod tests {
                 .protocol_surfaces
                 .contains(&"messages".to_string())
         );
+        let xai = registry.profile("xai").unwrap();
+        let meta = registry.profile("meta").unwrap();
+        assert_eq!(xai.endpoint.api_key_env.as_deref(), Some("XAI_API_KEY"));
+        assert_eq!(
+            xai.endpoint.default_base_url.as_deref(),
+            Some("https://api.x.ai/v1")
+        );
+        assert_ne!(xai.endpoint.api_key_env, openai.endpoint.api_key_env);
+        assert_ne!(xai.endpoint.base_url_env, openai.endpoint.base_url_env);
+        assert_eq!(xai.capabilities.context_tokens, 500_000);
+        assert_eq!(meta.lifecycle, "experimental");
+        assert_eq!(meta.endpoint.default_base_url, None);
+        assert_eq!(
+            meta.governance.contractual_status.as_deref(),
+            Some("public_preview")
+        );
+    }
+
+    #[test]
+    fn hosted_models_are_exactly_admitted_and_preview_requires_promotion() {
+        let mut registry = ProviderRegistry::built_in();
+        let xai = registry.resolve_model("xai/grok-4.5").unwrap();
+        assert_eq!(xai.provider, "xai");
+        assert_eq!(xai.upstream_model, "grok-4.5");
+        assert!(registry.resolve_model("xai/grok-future").is_err());
+        assert!(registry.resolve_model("meta/muse-spark-1.1").is_err());
+
+        registry
+            .lifecycle_overrides
+            .push(RegistryLifecycleOverride {
+                target_kind: "provider".into(),
+                target: "meta".into(),
+                state: "enabled".into(),
+                version: 1,
+                actor: "operator".into(),
+                reason: "explicit preview opt-in".into(),
+                changed_at: "2026-07-14T00:00:00Z".into(),
+            });
+        registry.state_version = 1;
+        let meta = registry.resolve_model("meta/muse-spark-1.1").unwrap();
+        assert_eq!(meta.provider, "meta");
+        assert!(registry.resolve_model("meta/muse-spark-2").is_err());
+    }
+
+    #[test]
+    fn hosted_profile_fixtures_match_registry_contracts() {
+        let registry = ProviderRegistry::built_in();
+        for fixture in [
+            include_str!("../tests/fixtures/providers/xai-grok-4.5-v1.json"),
+            include_str!("../tests/fixtures/providers/meta-muse-spark-1.1-preview-v1.json"),
+        ] {
+            let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let profile_version = fixture["profile_version"].as_str().unwrap();
+            let profile = registry
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_version == profile_version)
+                .unwrap();
+            let request = serde_json::to_vec(&fixture["request"]).unwrap();
+            let requirements = CapabilityRequirements::from_responses_body(&request).unwrap();
+            assert!(
+                requirements
+                    .unsupported_by(&profile.capabilities)
+                    .is_empty()
+            );
+            assert_eq!(fixture["request"]["store"], false);
+            assert!(fixture["error"]["status"].as_u64().is_some());
+            assert_eq!(
+                fixture["sse_events"].as_array().unwrap().last().unwrap(),
+                "response.completed"
+            );
+        }
     }
 
     #[test]

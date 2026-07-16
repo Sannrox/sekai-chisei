@@ -47,10 +47,18 @@ the same profile capabilities.
 
 Registry v3 is the model-resolution authority for both the gateway and direct LLM
 execution. Canonical model identifiers are `openai/<model>`,
-`anthropic/<model>`, `ollama/<model>`, and `native/<model>`. Existing unprefixed
+`anthropic/<model>`, `ollama/<model>`, `native/<model>`, `xai/grok-4.5`, and
+`meta/muse-spark-1.1`. Existing unprefixed
 provider aliases remain accepted at the client boundary and are recorded as the
 requested alias, while the canonical identifier and upstream model name are
 resolved before policy or provider contact. Unknown namespaces fail closed.
+
+xAI uses only `XAI_API_KEY` and `CHISEI_XAI_BASE_URL`; it never reuses OpenAI's
+credential or endpoint. Meta's public-preview profile requires both
+`META_MODEL_API_KEY` and an explicit `CHISEI_META_BASE_URL`. It is published as
+`experimental` and cannot resolve until an operator explicitly promotes its
+lifecycle. Provider-owned search and code tools remain disabled until separately
+admitted as governed capabilities.
 
 An operator with the separately configured gateway admin credential may change a
 provider, profile version, model, or capability lifecycle through
