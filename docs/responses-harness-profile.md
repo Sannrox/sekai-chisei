@@ -9,10 +9,12 @@ decisions around each model call.
 
 Clients may rely on `model`, `input`, `instructions`, `tools`, `tool_choice`,
 `parallel_tool_calls`, `max_output_tokens`, `stream`, `metadata`, and
-`previous_response_id`. Unknown request fields are forwarded only when the selected
-provider profile declares them safe. Tool results use `function_call_output` input
-items and identify the matching `call_id`. A request may contain multiple tool
-results.
+`previous_response_id`, plus `reasoning`, `text`, `temperature`, `top_p`, and
+`truncation`. Chisei inserts `store: false`; caller-supplied `store: false` is
+accepted and any other value is rejected. Other request fields are rejected before
+upstream contact, so callers cannot opt into provider retention or select an
+ungoverned service tier. Tool results use `function_call_output` input items and
+identify the matching `call_id`. A request may contain multiple tool results.
 
 This profile version rejects `Idempotency-Key` with `capability_unsupported` rather
 than forwarding a key it cannot enforce. Clients must use a new attempt number for
