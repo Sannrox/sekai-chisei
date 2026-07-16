@@ -209,8 +209,16 @@ pub async fn run(
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let provider_registry_state_path =
+        crate::provider_profile::provider_registry_state_path(&config.db_path);
     if let Some(ops_port) = config.ops_port {
-        crate::obs::ops::bind_and_spawn(&config.ops_bind, ops_port, db.clone()).await?;
+        crate::obs::ops::bind_and_spawn(
+            &config.ops_bind,
+            ops_port,
+            db.clone(),
+            provider_registry_state_path.clone(),
+        )
+        .await?;
     }
 
     let credential_store = Arc::new(PrincipalCredentialStore::new());
@@ -222,7 +230,7 @@ pub async fn run(
 
     let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    spawn_health_reporter(health_reporter, db.clone());
+    spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
 
     if let Some(socket_path) = config.sekai_socket.clone() {
         let uds_server = serve_uds(
@@ -496,13 +504,24 @@ fn build_services(
     (sekai_svc, chisei_svc)
 }
 
-fn spawn_health_reporter(health_reporter: HealthReporter, db: Arc<SekaiDb>) {
+fn spawn_health_reporter(
+    health_reporter: HealthReporter,
+    db: Arc<SekaiDb>,
+    provider_registry_state_path: std::path::PathBuf,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             let ready = tokio::task::spawn_blocking({
                 let db = db.clone();
-                move || db.ping().is_ok()
+                let provider_registry_state_path = provider_registry_state_path.clone();
+                move || {
+                    db.ping().is_ok()
+                        && crate::provider_profile::refresh_provider_registry(
+                            &provider_registry_state_path,
+                        )
+                        .is_ok()
+                }
             })
             .await
             .unwrap_or(false);

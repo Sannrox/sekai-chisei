@@ -66,7 +66,10 @@ impl HttpBody for TestBody {
 #[tokio::test]
 async fn ops_routes_report_health_readiness_and_metrics() {
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
-    let app = sekai_chisei::obs::ops::router(db);
+    let directory =
+        std::env::temp_dir().join(format!("sekai-ops-registry-{}", uuid::Uuid::new_v4()));
+    let registry_path = directory.join("provider-registry.json");
+    let app = sekai_chisei::obs::ops::router(db, registry_path.clone());
 
     let health = app
         .clone()
@@ -92,6 +95,19 @@ async fn ops_routes_report_health_readiness_and_metrics() {
         .expect("ready route");
     assert_eq!(ready.status(), StatusCode::OK);
 
+    std::fs::remove_file(&registry_path).expect("remove registry state");
+    let unavailable = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("unavailable readiness route");
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
     let metrics = app
         .oneshot(
             Request::builder()
@@ -107,6 +123,7 @@ async fn ops_routes_report_health_readiness_and_metrics() {
         .expect("metrics body");
     let body = String::from_utf8(body.to_vec()).expect("utf8 metrics");
     assert!(body.contains("sekai_build_info"));
+    std::fs::remove_dir_all(directory).expect("remove registry fixture");
 }
 
 #[tokio::test]

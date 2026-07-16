@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +47,7 @@ pub struct ChiseiServiceImpl {
     active_promotions: Arc<ActivePromotions>,
     db: Arc<SekaiDb>,
     config: Config,
+    provider_registry_state_path: Option<PathBuf>,
 }
 
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
@@ -489,6 +491,8 @@ fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> R
 
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
+        let provider_registry_state_path = (config.db_path != ":memory:")
+            .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
@@ -517,6 +521,7 @@ impl ChiseiServiceImpl {
             active_promotions: Arc::new(ActivePromotions::new()),
             db,
             config,
+            provider_registry_state_path,
         }
     }
 
@@ -768,6 +773,8 @@ impl ChiseiServiceImpl {
     }
 
     pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
+        let provider_registry_state_path = (config.db_path != ":memory:")
+            .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
@@ -796,6 +803,7 @@ impl ChiseiServiceImpl {
             active_promotions: Arc::new(ActivePromotions::new()),
             db,
             config,
+            provider_registry_state_path,
         }
     }
 
@@ -1460,6 +1468,8 @@ impl ChiseiServiceImpl {
             .resolve_live_model(&model, policy, route_bias, safe_only, safe_providers)
             .await
             .map_err(Status::failed_precondition)?;
+        let runtime = final_runtime_for_model(policy, &runtime, &model)
+            .map_err(Status::failed_precondition)?;
         Ok((runtime, model))
     }
 
@@ -1680,8 +1690,28 @@ impl ChiseiServiceImpl {
             );
             return Some("local leak reviewer was skipped because its model is not safe".into());
         }
-        let Ok(reviewer) = crate::llm::resolve(
+        let registry_state_path =
+            crate::provider_profile::provider_registry_state_path(&self.config.db_path);
+        let registry =
+            match crate::provider_profile::refresh_provider_registry_async(&registry_state_path)
+                .await
+            {
+                Ok(registry) => registry,
+                Err(_) => {
+                    self.record_leak_reviewer_audit(
+                        request_id,
+                        provider,
+                        model,
+                        "reviewer_error",
+                        "provider registry is unavailable",
+                    );
+                    return Some("local leak reviewer could not run".into());
+                }
+            };
+        let Ok(reviewer) = crate::llm::resolve_with_registry(
             model,
+            &registry,
+            Some(&registry_state_path),
             self.config.anthropic_api_key.as_deref(),
             self.config.openai_api_key.as_deref(),
             &self.config.ollama_url,
@@ -1769,6 +1799,7 @@ impl ChiseiServiceImpl {
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
     ) -> Result<String, String> {
+        validate_explicit_requested_model(model)?;
         let empty_allowed = Vec::new();
         let allowed_models = policy
             .map(|policy| policy.allowed_models.as_slice())
@@ -1800,6 +1831,17 @@ impl ChiseiServiceImpl {
             ollama_models: &ollama_models,
             ..base_context
         })
+    }
+
+    async fn refresh_provider_registry_for_resolution(
+        &self,
+    ) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+        let Some(path) = self.provider_registry_state_path.as_deref() else {
+            return Ok(crate::provider_profile::provider_registry_snapshot());
+        };
+        crate::provider_profile::refresh_provider_registry_async(path)
+            .await
+            .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
     }
 
     fn evolve_tasks(&self) -> Vec<crate::chisei::evolve::TaskRecord> {
@@ -2021,6 +2063,10 @@ fn is_known_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic")
 }
 
+fn is_registry_provider_runtime(runtime: &str) -> bool {
+    matches!(runtime.trim(), "openai" | "anthropic" | "ollama" | "native")
+}
+
 fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
     policy.is_none_or(|policy| {
         policy.allowed_models.is_empty()
@@ -2066,6 +2112,52 @@ fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str) -> Option<
         }
         Some(_) => None,
     }
+}
+
+fn final_runtime_for_model(
+    policy: Option<&Policy>,
+    current_runtime: &str,
+    model: &str,
+) -> Result<String, String> {
+    let explicitly_registry_routed = ["openai/", "anthropic/", "ollama/", "native/"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix));
+    if !is_registry_provider_runtime(current_runtime) && !explicitly_registry_routed {
+        if model.contains('/') {
+            crate::chisei::policy::validate_resolved_route(current_runtime, model)?;
+            return Ok(current_runtime.to_string());
+        }
+        let identity =
+            crate::provider_profile::ProviderRegistry::built_in().resolve_model(model)?;
+        if identity.provider == "native" {
+            crate::provider_profile::resolve_registered_model(model)?;
+            return Ok("native".to_string());
+        }
+    }
+    let runtime = crate::llm::provider_name(model);
+    if runtime == "unknown" {
+        return Err(format!(
+            "model {model:?} has no registered provider runtime"
+        ));
+    }
+    if policy.is_some_and(|policy| {
+        !(policy.allowed_runtimes.is_empty()
+            || policy
+                .allowed_runtimes
+                .iter()
+                .any(|allowed| allowed == runtime)
+            || runtime == "native"
+                && policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == "kiro"))
+    }) {
+        return Err(format!(
+            "model runtime {runtime:?} is not allowed by policy"
+        ));
+    }
+    crate::chisei::policy::validate_resolved_route(runtime, model)?;
+    Ok(runtime.to_string())
 }
 
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
@@ -2117,7 +2209,10 @@ fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
             if namespace.is_empty() {
                 continue;
             }
-            resolver.set_namespace_policy(&namespace, policy_from_properties(&obj.properties));
+            resolver.set_namespace_policy(
+                &namespace,
+                normalize_persisted_legacy_policy(policy_from_properties(&obj.properties)),
+            );
         }
     }
 }
@@ -2166,6 +2261,222 @@ fn policy_from_request(r: &SetNamespacePolicyRequest) -> Policy {
         default_runtime: r.default_runtime.clone(),
         default_model: r.default_model.clone(),
         data_class: DataClass::parse(&r.data_class).as_str().into(),
+    }
+}
+
+fn normalize_legacy_policy_provider_pairs(mut policy: Policy) -> Policy {
+    let provider_for = |model: &str| {
+        let explicitly_native = model.starts_with("native/")
+            || model.starts_with("native-")
+            || model.starts_with("fallback:");
+        let explicitly_ollama = model.starts_with("ollama/");
+        crate::provider_profile::resolve_provider_id(model)
+            .ok()
+            .filter(|provider| {
+                (*provider == "native" && explicitly_native)
+                    || (*provider == "ollama" && explicitly_ollama)
+            })
+            .map(str::to_string)
+    };
+    if policy.default_runtime == "openai"
+        && let Some(provider) = provider_for(&policy.default_model)
+        && matches!(provider.as_str(), "ollama" | "native")
+    {
+        policy.default_runtime = provider;
+    }
+    if policy
+        .allowed_runtimes
+        .iter()
+        .any(|runtime| runtime == "openai")
+    {
+        let mut providers = policy
+            .allowed_models
+            .iter()
+            .filter_map(|model| provider_for(model))
+            .filter(|provider| matches!(provider.as_str(), "ollama" | "native"))
+            .collect::<Vec<_>>();
+        if matches!(policy.default_runtime.as_str(), "ollama" | "native") {
+            providers.push(policy.default_runtime.clone());
+        }
+        for provider in providers {
+            if !policy.allowed_runtimes.contains(&provider) {
+                policy.allowed_runtimes.push(provider);
+            }
+        }
+    }
+    policy
+}
+
+fn normalize_persisted_legacy_policy(mut policy: Policy) -> Policy {
+    let runtime_unspecified =
+        policy.default_runtime.is_empty() && policy.allowed_runtimes.is_empty();
+    let openai_only_allowed = !policy.allowed_runtimes.is_empty()
+        && policy
+            .allowed_runtimes
+            .iter()
+            .all(|runtime| runtime == "openai");
+    let legacy_namespace = if policy.default_runtime == "openai"
+        || policy.default_runtime.is_empty() && openai_only_allowed
+    {
+        Some("openai")
+    } else if runtime_unspecified
+        || matches!(policy.default_runtime.as_str(), "native" | "kiro")
+        || policy
+            .allowed_runtimes
+            .iter()
+            .any(|runtime| matches!(runtime.as_str(), "native" | "kiro"))
+    {
+        Some("native")
+    } else {
+        None
+    };
+    let canonicalize = |model: &mut String| {
+        if let Some(namespace) = legacy_namespace
+            && !model.is_empty()
+            && !model.contains('/')
+            && !model.eq_ignore_ascii_case("kiro")
+            && model != "auto"
+            && crate::provider_profile::resolve_provider_id(model).is_err()
+        {
+            *model = format!("{namespace}/{model}");
+        }
+    };
+    canonicalize(&mut policy.default_model);
+    for model in &mut policy.allowed_models {
+        canonicalize(model);
+    }
+    if policy.default_runtime == "kiro" {
+        policy.default_runtime = "native".into();
+    }
+    for runtime in &mut policy.allowed_runtimes {
+        if runtime == "kiro" {
+            *runtime = "native".into();
+        }
+    }
+    policy.allowed_runtimes.sort();
+    policy.allowed_runtimes.dedup();
+    normalize_legacy_policy_provider_pairs(policy)
+}
+
+fn validate_policy_provider_pairs(policy: &Policy) -> Result<(), String> {
+    for model in policy
+        .allowed_models
+        .iter()
+        .chain((!policy.default_model.is_empty()).then_some(&policy.default_model))
+    {
+        validate_policy_model_alias(model)?;
+    }
+    for runtime in policy
+        .allowed_runtimes
+        .iter()
+        .chain((!policy.default_runtime.is_empty()).then_some(&policy.default_runtime))
+    {
+        if !matches!(
+            runtime.as_str(),
+            "openai" | "anthropic" | "ollama" | "native"
+        ) {
+            return Err(format!("unsupported policy runtime {runtime:?}"));
+        }
+    }
+    if !policy.default_runtime.is_empty()
+        && !policy.allowed_runtimes.is_empty()
+        && !policy.allowed_runtimes.contains(&policy.default_runtime)
+    {
+        return Err(format!(
+            "default runtime {:?} is not in allowed runtimes",
+            policy.default_runtime
+        ));
+    }
+    if !policy.default_model.is_empty()
+        && !policy.allowed_models.is_empty()
+        && !policy
+            .allowed_models
+            .iter()
+            .any(|allowed| models_have_same_identity(allowed, &policy.default_model))
+    {
+        return Err(format!(
+            "default model {:?} is not in allowed models",
+            policy.default_model
+        ));
+    }
+    if !policy.default_model.is_empty() && !policy.default_runtime.is_empty() {
+        crate::chisei::policy::validate_resolved_route(
+            &policy.default_runtime,
+            &policy.default_model,
+        )?;
+    } else if !policy.default_model.is_empty() {
+        let provider =
+            crate::provider_profile::resolve_registered_model(&policy.default_model)?.provider;
+        if !policy.allowed_runtimes.is_empty() && !policy.allowed_runtimes.contains(&provider) {
+            return Err(format!(
+                "default model provider {provider:?} is not in allowed runtimes"
+            ));
+        }
+    }
+    for model in &policy.allowed_models {
+        if policy.allowed_runtimes.is_empty() {
+            if let Some((runtime, _)) = model.split_once('/') {
+                crate::chisei::policy::validate_resolved_route(runtime, model)?;
+            } else {
+                crate::provider_profile::resolve_registered_model(model)?;
+            }
+            continue;
+        }
+        if !policy
+            .allowed_runtimes
+            .iter()
+            .any(|runtime| crate::chisei::policy::validate_resolved_route(runtime, model).is_ok())
+        {
+            return Err(format!(
+                "allowed model {model:?} cannot be routed by any allowed runtime"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_model_alias(model: &str) -> Result<(), String> {
+    let provider = crate::provider_profile::resolve_provider_id(model)?;
+    if provider == "native"
+        && !model.starts_with("native/")
+        && !model.starts_with("native-")
+        && !model.starts_with("fallback:")
+    {
+        return Err(format!(
+            "native policy model {model:?} must use an advertised native alias"
+        ));
+    }
+    Ok(())
+}
+
+fn models_have_same_identity(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let registry = crate::provider_profile::ProviderRegistry::built_in();
+    match (registry.resolve_model(left), registry.resolve_model(right)) {
+        (Ok(left), Ok(right)) => left.canonical_model == right.canonical_model,
+        _ => false,
+    }
+}
+
+fn validate_explicit_requested_model(model: &str) -> Result<(), String> {
+    if model.is_empty() || model == "auto" {
+        return Ok(());
+    }
+    let Some((namespace, _)) = model.split_once('/') else {
+        return crate::provider_profile::resolve_registered_model(model).map(|_| ());
+    };
+    match crate::provider_profile::resolve_registered_model(model) {
+        Ok(_) => Ok(()),
+        Err(error)
+            if crate::provider_profile::ProviderRegistry::built_in()
+                .profile(namespace)
+                .is_some() =>
+        {
+            Err(error)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2600,37 +2911,53 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<SetNamespacePolicyRequest>,
     ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
-        let r = req.into_inner();
-        if r.namespace.trim().is_empty() {
-            return Err(Status::invalid_argument("namespace required"));
-        }
-        let policy = policy_from_request(&r);
-        let policy_data_class = policy.data_class.clone();
-        let policy_version = policy.version();
-        persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
-        self.policy.set_namespace_policy(&r.namespace, policy);
-        let (runtime, model) = self
-            .policy
-            .resolve(&r.namespace, &r.default_runtime, &r.default_model)
-            .map_err(Status::invalid_argument)?;
-        Ok(Response::new(SetNamespacePolicyResponse {
-            resolution: Some(PolicyResolution {
-                runtime,
-                model,
-                data_class: policy_data_class,
-                eval_regressed: false,
-                eval_regression_reason: String::new(),
-                route_bias: String::new(),
-                policy_scope: r.namespace,
-                policy_version,
-            }),
-        }))
+        let registry = self.refresh_provider_registry_for_resolution().await?;
+        let validated_registry_version = registry.state_version;
+        crate::provider_profile::with_provider_registry_snapshot(registry, async {
+            let r = req.into_inner();
+            if r.namespace.trim().is_empty() {
+                return Err(Status::invalid_argument("namespace required"));
+            }
+            let policy = normalize_legacy_policy_provider_pairs(policy_from_request(&r));
+            validate_policy_provider_pairs(&policy).map_err(Status::invalid_argument)?;
+            let policy_data_class = policy.data_class.clone();
+            let policy_version = policy.version();
+            let current_registry = self.refresh_provider_registry_for_resolution().await?;
+            if current_registry.state_version != validated_registry_version {
+                return Err(Status::aborted(
+                    "provider registry changed while validating namespace policy",
+                ));
+            }
+            persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
+            let default_runtime = policy.default_runtime.clone();
+            let default_model = policy.default_model.clone();
+            self.policy.set_namespace_policy(&r.namespace, policy);
+            let (runtime, model) = self
+                .policy
+                .resolve(&r.namespace, &default_runtime, &default_model)
+                .map_err(Status::invalid_argument)?;
+            Ok(Response::new(SetNamespacePolicyResponse {
+                resolution: Some(PolicyResolution {
+                    runtime,
+                    model,
+                    data_class: policy_data_class,
+                    eval_regressed: false,
+                    eval_regression_reason: String::new(),
+                    route_bias: String::new(),
+                    policy_scope: r.namespace,
+                    policy_version,
+                }),
+            }))
+        })
+        .await
     }
 
     async fn resolve_policy(
         &self,
         req: Request<ResolvePolicyRequest>,
     ) -> Result<Response<ResolvePolicyResponse>, Status> {
+        let registry = self.refresh_provider_registry_for_resolution().await?;
+        crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let r = req.into_inner();
         let scopes = policy_scopes(&r);
         let (policy_scope, effective_policy) = self
@@ -2679,13 +3006,16 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         let eval_regressed = !regression_reasons.is_empty();
         let eval_regression_reason = regression_reasons.join(" | ");
+        validate_explicit_requested_model(&r.preferred_model).map_err(Status::invalid_argument)?;
+        let requested_preferred_model = &r.preferred_model;
         let preferred_model = eval_regressed
             .then_some(())
             .as_ref()
             .and(effective_policy.as_ref())
             .map(|policy| policy.default_model.as_str())
             .filter(|model| !model.is_empty())
-            .unwrap_or(&r.preferred_model);
+            .unwrap_or(requested_preferred_model);
+        validate_explicit_requested_model(preferred_model).map_err(Status::invalid_argument)?;
         let (mut runtime, model) = if let Some(policy) = effective_policy.as_ref() {
             self.policy
                 .apply_policy(policy, &r.preferred_runtime, preferred_model)
@@ -2702,8 +3032,27 @@ impl ChiseiService for ChiseiServiceImpl {
         let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
         // Resolve the capable-tier model first; this is the baseline the request
         // would get with no cost tiering.
-        let capable_model = self
-            .resolve_live_model(
+        let capable_model = if r.preferred_model == "auto" && effective_policy.is_none() {
+            let resolved = crate::provider_profile::resolve_registered_model(&model)
+                .map_err(Status::failed_precondition)?;
+            if resolved.provider != runtime {
+                return Err(Status::failed_precondition(
+                    "automatic model default does not match the requested runtime",
+                ));
+            }
+            if safe_only
+                && !crate::chisei::privacy::provider_safe_to_send(
+                    &resolved.provider,
+                    &safe_providers,
+                )
+            {
+                return Err(Status::permission_denied(
+                    crate::chisei::privacy::gate_reason(data_class, task_class, &resolved.provider),
+                ));
+            }
+            resolved.canonical_model
+        } else {
+            self.resolve_live_model(
                 &model,
                 effective_policy.as_ref(),
                 None,
@@ -2720,7 +3069,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 } else {
                     Status::failed_precondition(err)
                 }
-            })?;
+            })?
+        };
 
         // Eval-gated cost tiering: only explicit bulk task classes route to the
         // cheaper tier, and only while no eval regression is active for the
@@ -2800,10 +3150,7 @@ impl ChiseiService for ChiseiServiceImpl {
         // strictly cheaper cost tier, so the audited route_bias reflects
         // realized cost reductions rather than intent or equal-cost swaps.
         let (mut model, mut route_bias) = match local_free_model {
-            Some((local_runtime, local_model)) => {
-                runtime = local_runtime;
-                (local_model, Some("local_free"))
-            }
+            Some((_local_runtime, local_model)) => (local_model, Some("local_free")),
             None => match cheap_model {
                 Some(cheap)
                     if crate::chisei::model_routing::named_model_cost_rank(&cheap)
@@ -2913,16 +3260,15 @@ impl ChiseiService for ChiseiServiceImpl {
                         &objective,
                         "shifted",
                     );
-                    runtime =
-                        portfolio_runtime_for_model(effective_policy.as_ref(), &runtime, &selected)
-                            .expect("portfolio runtime was validated before selection");
                     model = selected;
                     route_bias = Some("portfolio");
                 }
             }
         }
 
-        let provider = crate::llm::provider_name(&model);
+        runtime = final_runtime_for_model(effective_policy.as_ref(), &runtime, &model)
+            .map_err(Status::failed_precondition)?;
+        let provider = runtime.as_str();
         if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
             return Err(Status::permission_denied(
                 crate::chisei::privacy::gate_reason(data_class, task_class, provider),
@@ -2947,6 +3293,8 @@ impl ChiseiService for ChiseiServiceImpl {
                     .unwrap_or_default(),
             }),
         }))
+        })
+        .await
     }
 
     async fn check_egress(
@@ -3254,33 +3602,37 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<PlanExecutionRequest>,
     ) -> Result<Response<PlanExecutionResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req
-            .into_inner()
-            .input
-            .ok_or(Status::invalid_argument("input required"))?;
-        let plan = self.plan_from_input(input, &actor).await?;
-        if let Some(plan_input) = &plan.input {
-            let namespace_hint = plan_input.namespace.trim().to_string();
-            self.record_evolve_task(
-                &plan_input.request_id,
-                &namespace_hint,
-                &plan.enriched_spec,
-                self.tracked_original_spec(
+        let registry = self.refresh_provider_registry_for_resolution().await?;
+        crate::provider_profile::with_provider_registry_snapshot(registry, async {
+            let actor = authenticated_actor(&req);
+            let input = req
+                .into_inner()
+                .input
+                .ok_or(Status::invalid_argument("input required"))?;
+            let plan = self.plan_from_input(input, &actor).await?;
+            if let Some(plan_input) = &plan.input {
+                let namespace_hint = plan_input.namespace.trim().to_string();
+                self.record_evolve_task(
                     &plan_input.request_id,
-                    &plan_input.spec,
+                    &namespace_hint,
                     &plan.enriched_spec,
+                    self.tracked_original_spec(
+                        &plan_input.request_id,
+                        &plan_input.spec,
+                        &plan.enriched_spec,
+                    )
+                    .as_deref(),
+                    if plan.executable { "planned" } else { "failed" },
+                    plan_input.estimated_tokens,
                 )
-                .as_deref(),
-                if plan.executable { "planned" } else { "failed" },
-                plan_input.estimated_tokens,
-            )
-            .map_err(Status::internal)?;
-        }
-        self.record_planned_operation(&plan, &actor)
-            .map_err(Status::internal)?;
-        self.cache_plan(plan.clone());
-        Ok(Response::new(PlanExecutionResponse { plan: Some(plan) }))
+                .map_err(Status::internal)?;
+            }
+            self.record_planned_operation(&plan, &actor)
+                .map_err(Status::internal)?;
+            self.cache_plan(plan.clone());
+            Ok(Response::new(PlanExecutionResponse { plan: Some(plan) }))
+        })
+        .await
     }
 
     async fn execute_plan(
@@ -4716,6 +5068,215 @@ mod tests {
     }
 
     #[test]
+    fn final_runtime_tracks_live_model_provider() {
+        let policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec![
+                "openai".into(),
+                "anthropic".into(),
+                "native".into(),
+                "ollama".into(),
+            ],
+            allowed_models: vec!["gpt-5.5".into(), "claude-sonnet-4".into()],
+            default_runtime: String::new(),
+            default_model: "gpt-5.5".into(),
+            data_class: String::new(),
+        };
+
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "openai", "anthropic/claude-sonnet-4").unwrap(),
+            "anthropic"
+        );
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "anthropic", "openai/gpt-5.5").unwrap(),
+            "openai"
+        );
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "kiro", "native/native-default").unwrap(),
+            "native"
+        );
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "kiro", "ollama/qwen:14b").unwrap(),
+            "ollama"
+        );
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "kiro", "gpt-5.5").unwrap(),
+            "openai"
+        );
+        assert!(final_runtime_for_model(Some(&policy), "kiro", "kiro/claude-sonnet-4").is_err());
+    }
+
+    #[test]
+    fn policy_validation_handles_empty_and_opaque_runtimes() {
+        let invalid_implicit = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["native-default".into()],
+            default_runtime: String::new(),
+            default_model: "native-default".into(),
+            data_class: String::new(),
+        };
+        assert!(validate_policy_provider_pairs(&invalid_implicit).is_err());
+
+        let opaque = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["kiro".into()],
+            allowed_models: vec!["kiro/private-model".into()],
+            default_runtime: "kiro".into(),
+            default_model: "kiro/private-model".into(),
+            data_class: String::new(),
+        };
+        assert!(validate_policy_provider_pairs(&opaque).is_err());
+        let unknown_runtime = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["bogus".into()],
+            allowed_models: vec![],
+            default_runtime: "bogus".into(),
+            default_model: String::new(),
+            data_class: String::new(),
+        };
+        assert!(validate_explicit_requested_model("bogus/model").is_err());
+        assert!(validate_policy_provider_pairs(&unknown_runtime).is_err());
+
+        let mut disallowed_opaque = opaque;
+        disallowed_opaque.allowed_runtimes = vec!["openai".into()];
+        assert!(validate_policy_provider_pairs(&disallowed_opaque).is_err());
+        disallowed_opaque.default_model.clear();
+        assert!(validate_policy_provider_pairs(&disallowed_opaque).is_err());
+
+        let unroutable_allowlist = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["kiro".into()],
+            allowed_models: vec!["gpt-5.5".into()],
+            default_runtime: "kiro".into(),
+            default_model: String::new(),
+            data_class: String::new(),
+        };
+        assert!(validate_policy_provider_pairs(&unroutable_allowlist).is_err());
+
+        let default_outside_allowlist = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5-mini".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        assert!(validate_policy_provider_pairs(&default_outside_allowlist).is_err());
+
+        let canonical_alias = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        assert_eq!(validate_policy_provider_pairs(&canonical_alias), Ok(()));
+    }
+
+    #[test]
+    fn legacy_openai_family_policies_normalize_to_exact_providers() {
+        let normalized = normalize_legacy_policy_provider_pairs(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec![
+                "gpt-5.5".into(),
+                "native-default".into(),
+                "fallback:cheap".into(),
+                "ollama/qwen:14b".into(),
+            ],
+            default_runtime: "openai".into(),
+            default_model: "native-default".into(),
+            data_class: String::new(),
+        });
+
+        assert_eq!(normalized.default_runtime, "native");
+        assert!(normalized.allowed_runtimes.contains(&"openai".to_string()));
+        assert!(normalized.allowed_runtimes.contains(&"native".to_string()));
+        assert!(normalized.allowed_runtimes.contains(&"ollama".to_string()));
+        assert_eq!(validate_policy_provider_pairs(&normalized), Ok(()));
+
+        let fallback = normalize_legacy_policy_provider_pairs(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["fallback:cheap".into()],
+            default_runtime: "openai".into(),
+            default_model: "fallback:cheap".into(),
+            data_class: String::new(),
+        });
+        assert_eq!(fallback.default_runtime, "native");
+        assert!(fallback.allowed_runtimes.contains(&"native".to_string()));
+        assert_eq!(validate_policy_provider_pairs(&fallback), Ok(()));
+
+        let kiro = normalize_legacy_policy_provider_pairs(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["kiro".into()],
+            default_runtime: "openai".into(),
+            default_model: "kiro".into(),
+            data_class: String::new(),
+        });
+        assert_eq!(kiro.default_runtime, "openai");
+        assert_eq!(kiro.allowed_runtimes, vec!["openai"]);
+        assert!(validate_policy_provider_pairs(&kiro).is_err());
+
+        let mixed = normalize_legacy_policy_provider_pairs(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["fallback:cheap".into(), "Kiro".into()],
+            default_runtime: "openai".into(),
+            default_model: "fallback:cheap".into(),
+            data_class: String::new(),
+        });
+        assert!(mixed.allowed_runtimes.contains(&"native".to_string()));
+        assert!(validate_policy_provider_pairs(&mixed).is_err());
+    }
+
+    #[test]
+    fn persisted_bare_native_models_are_canonicalized_without_accepting_kiro() {
+        let migrated = normalize_persisted_legacy_policy(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["kiro".into()],
+            allowed_models: vec!["mistral".into(), "Kiro".into()],
+            default_runtime: "kiro".into(),
+            default_model: "mistral".into(),
+            data_class: String::new(),
+        });
+
+        assert_eq!(migrated.default_runtime, "native");
+        assert_eq!(migrated.default_model, "native/mistral");
+        assert!(migrated.allowed_models.contains(&"native/mistral".into()));
+        assert!(migrated.allowed_models.contains(&"Kiro".into()));
+        assert!(validate_policy_provider_pairs(&migrated).is_err());
+
+        let model_only = normalize_persisted_legacy_policy(crate::chisei::policy::Policy {
+            allowed_runtimes: vec![],
+            allowed_models: vec!["mistral".into()],
+            default_runtime: String::new(),
+            default_model: "mistral".into(),
+            data_class: String::new(),
+        });
+        assert_eq!(model_only.default_model, "native/mistral");
+        assert_eq!(model_only.allowed_models, vec!["native/mistral"]);
+        assert_eq!(validate_policy_provider_pairs(&model_only), Ok(()));
+
+        let openai = normalize_persisted_legacy_policy(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["mistral-large".into()],
+            default_runtime: "openai".into(),
+            default_model: "mistral-large".into(),
+            data_class: String::new(),
+        });
+        assert_eq!(openai.default_model, "openai/mistral-large");
+        assert_eq!(openai.allowed_models, vec!["openai/mistral-large"]);
+        assert_eq!(validate_policy_provider_pairs(&openai), Ok(()));
+
+        let duplicate_openai = normalize_persisted_legacy_policy(crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into(), "openai".into()],
+            allowed_models: vec!["mistral-large".into()],
+            default_runtime: String::new(),
+            default_model: "mistral-large".into(),
+            data_class: String::new(),
+        });
+        assert_eq!(duplicate_openai.default_model, "openai/mistral-large");
+        assert_eq!(
+            duplicate_openai.allowed_models,
+            vec!["openai/mistral-large"]
+        );
+        assert_eq!(duplicate_openai.allowed_runtimes, vec!["openai"]);
+        assert_eq!(validate_policy_provider_pairs(&duplicate_openai), Ok(()));
+    }
+
+    #[test]
     fn budget_metric_accepts_tokens_and_requests_case_insensitive() {
         assert_eq!(budget_metric("").unwrap(), METRIC_TOKENS);
         assert_eq!(budget_metric("tokens").unwrap(), METRIC_TOKENS);
@@ -4752,6 +5313,137 @@ mod tests {
             local_free_runtime_for_model(Some(&cloud_only), "ollama/qwen:14b"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_rejects_unknown_explicit_provider_without_policy() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+        let request = resolve_policy_request("unscoped", "bogus", "bogus/model");
+
+        let error = svc.resolve_policy(Request::new(request)).await.unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("unknown provider namespace"));
+
+        svc.policy.set_namespace_policy(
+            "unscoped",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: String::new(),
+                default_model: String::new(),
+                data_class: String::new(),
+            },
+        );
+        let request = resolve_policy_request("unscoped", "bogus", "bogus/model");
+        let error = svc.resolve_policy(Request::new(request)).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("unknown provider namespace"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_keeps_auto_provider_compatible_without_policy() {
+        let svc = memory_service();
+
+        let resolution = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "unscoped", "openai", "auto",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolution.runtime, "openai");
+        assert_eq!(resolution.model, "openai/gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_refreshes_registry_before_policy_validation() {
+        let directory = std::env::temp_dir().join(format!(
+            "sekai-chisei-provider-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = directory.join("sekai.db");
+        let db_path = db_path.to_str().expect("temporary database path is UTF-8");
+        let registry_path = crate::provider_profile::provider_registry_state_path(db_path);
+        crate::provider_profile::refresh_provider_registry(&registry_path).unwrap();
+        let svc = file_service(db_path);
+        std::fs::remove_file(&registry_path).unwrap();
+
+        let error = svc
+            .resolve_policy(Request::new(resolve_policy_request(
+                "unscoped",
+                "bogus",
+                "bogus/model",
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("provider registry unavailable"));
+        drop(svc);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_model_resolution_rejects_unknown_explicit_provider() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+
+        let error = svc
+            .resolve_live_model(
+                "bogus/model",
+                None,
+                None,
+                false,
+                &std::collections::HashSet::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("unknown provider namespace"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_normalizes_loaded_legacy_native_runtime() {
+        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+        svc.policy.set_namespace_policy(
+            "private",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["kiro".into()],
+                allowed_models: vec!["native-default".into()],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: String::new(),
+            },
+        );
+        let request = resolve_policy_request("private", "kiro", "native-default");
+
+        let resolution = svc
+            .resolve_policy(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolution.runtime, "native");
+        assert_eq!(resolution.model, "native-default");
+
+        let request = resolve_policy_request("private", "native", "native/native-default");
+        let resolution = svc
+            .resolve_policy(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+        assert_eq!(resolution.runtime, "native");
+        assert_eq!(resolution.model, "native/native-default");
     }
 
     #[tokio::test]
@@ -4868,6 +5560,11 @@ mod tests {
         assert_eq!(reverted.route_bias, "");
         assert!(reverted.eval_regressed);
         assert!(reverted.eval_regression_reason.contains("background"));
+
+        let mut invalid = resolve_policy_request("proj", "openai", "bad model");
+        invalid.task_class = "background".into();
+        let error = svc.resolve_policy(Request::new(invalid)).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
         let mut bulk = resolve_policy_request("proj", "openai", "gpt-5.5");
         bulk.task_class = "bulk".into();
@@ -6035,9 +6732,9 @@ mod tests {
         let svc = memory_service();
         svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
             namespace: "sekai-chisei".into(),
-            allowed_runtimes: vec!["openai".into()],
+            allowed_runtimes: vec!["native".into()],
             allowed_models: vec!["native-default".into()],
-            default_runtime: "openai".into(),
+            default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
         }))
@@ -6056,10 +6753,58 @@ mod tests {
             .resolution
             .unwrap();
 
-        assert_eq!(resolved.runtime, "openai");
+        assert_eq!(resolved.runtime, "native");
         assert_eq!(resolved.model, "native-default");
         assert_eq!(resolved.policy_scope, "sekai-chisei");
         assert_eq!(resolved.policy_version.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn set_namespace_policy_normalizes_legacy_openai_family_defaults() {
+        let svc = memory_service();
+        let resolution = svc
+            .set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+                namespace: "sekai-chisei".into(),
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["native-default".into()],
+                default_runtime: "openai".into(),
+                default_model: "native-default".into(),
+                data_class: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .resolution
+            .unwrap();
+
+        assert_eq!(resolution.runtime, "native");
+        assert_eq!(resolution.model, "native-default");
+        assert_eq!(
+            svc.policy
+                .effective_policy_for_scopes(&["sekai-chisei".into()])
+                .unwrap()
+                .1
+                .default_runtime,
+            "native"
+        );
+
+        let error = svc
+            .set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+                namespace: "opaque-hosted".into(),
+                allowed_runtimes: vec!["kiro".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "kiro".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            svc.policy
+                .effective_policy_for_scopes(&["opaque-hosted".into()])
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6324,7 +7069,7 @@ mod tests {
             .resolution
             .unwrap();
 
-        assert_eq!(resolved.runtime, "openai");
+        assert_eq!(resolved.runtime, "native");
         assert_eq!(resolved.model, "native-default");
         let _ = fs::remove_file(path);
     }
@@ -7200,9 +7945,9 @@ mod tests {
         let response = svc
             .set_namespace_policy(Request::new(SetNamespacePolicyRequest {
                 namespace: "alpha".into(),
-                allowed_runtimes: vec!["kiro".into()],
+                allowed_runtimes: vec!["native".into()],
                 allowed_models: vec!["native-default".into()],
-                default_runtime: "kiro".into(),
+                default_runtime: "native".into(),
                 default_model: "native-default".into(),
                 data_class: "sensitive".into(),
             }))
@@ -7231,8 +7976,8 @@ mod tests {
             crate::chisei::policy::Policy {
                 allowed_runtimes: vec![],
                 allowed_models: vec![],
-                default_runtime: "kiro".into(),
-                default_model: "native-default".into(),
+                default_runtime: "anthropic".into(),
+                default_model: "anthropic/claude-sonnet-4".into(),
                 data_class: "sensitive".into(),
             },
         );
@@ -7279,8 +8024,8 @@ mod tests {
         let err = svc
             .resolve_policy(Request::new(ResolvePolicyRequest {
                 namespace: "alpha".into(),
-                preferred_runtime: "kiro".into(),
-                preferred_model: "native-default".into(),
+                preferred_runtime: "anthropic".into(),
+                preferred_model: "anthropic/claude-sonnet-4".into(),
                 subject: String::new(),
                 project: String::new(),
                 agent: String::new(),
