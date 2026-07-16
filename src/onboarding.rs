@@ -310,7 +310,12 @@ fn check_socket() -> DoctorCheck {
 }
 
 fn check_gateway_port() -> DoctorCheck {
-    let bind = std::env::var("GATEWAY_BIND").unwrap_or_else(|_| "127.0.0.1:8788".into());
+    let bind = std::env::var("GATEWAY_BIND").unwrap_or_else(|_| {
+        format!(
+            "127.0.0.1:{}",
+            std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "8788".into())
+        )
+    });
     let address = match bind.parse::<std::net::SocketAddr>() {
         Ok(address) => address,
         Err(error) => {
@@ -435,6 +440,84 @@ fn check_harness_contract(agent: Option<&str>) -> DoctorCheck {
             "pass a harness name to doctor",
         ),
     }
+}
+
+pub async fn run_smoke(model: &str) -> Result<String, String> {
+    let openai_model = model.starts_with("gpt-") || model.starts_with("openai/");
+    let gateway_credential_known = ["OPENAI_API_KEY", "CHISEI_OPENAI_API_KEY_SECRET"]
+        .into_iter()
+        .any(|key| {
+            std::env::var(key)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        || std::env::var("CHISEI_SMOKE_ASSUME_GATEWAY_CREDENTIAL")
+            .ok()
+            .as_deref()
+            == Some("1");
+    if openai_model && !gateway_credential_known {
+        return Err("direct smoke uses gateway-key authentication, but no gateway-owned OpenAI credential is visible. For Codex subscription passthrough, launch codex-app and send: Reply with exactly: chisei onboarding ok. If the running gateway owns a credential from another environment, set CHISEI_SMOKE_ASSUME_GATEWAY_CREDENTIAL=1".into());
+    }
+    let bind = std::env::var("GATEWAY_BIND").unwrap_or_else(|_| {
+        format!(
+            "127.0.0.1:{}",
+            std::env::var("GATEWAY_PORT").unwrap_or_else(|_| "8788".into())
+        )
+    });
+    let address = bind.replace("0.0.0.0", "127.0.0.1");
+    let request_id = format!("first-hour-smoke-{}", Uuid::new_v4().simple());
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/responses"))
+        .bearer_auth(crate::gateway_keys::default_virtual_key("codex-app"))
+        .header("x-chisei-request-id", request_id)
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Reply with exactly: chisei onboarding ok",
+            "stream": false,
+            "store": false
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            format!("gateway request failed: {error}; run `sekaictl doctor codex-app`")
+        })?;
+    let status = response.status();
+    let operation_id = response
+        .headers()
+        .get("x-chisei-operation-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unavailable")
+        .to_string();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("gateway returned an invalid response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "smoke operation was denied or failed ({status}): {body}; verify the running gateway owns a credential for {model}"
+        ));
+    }
+    let text = body
+        .get("output")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(|value| value.as_array()))
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(|value| value.as_str()))
+        .collect::<String>();
+    if text.trim() != "chisei onboarding ok" {
+        return Err(format!(
+            "smoke response text did not match the deterministic contract: {text:?}"
+        ));
+    }
+    let usage = body
+        .get("usage")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(format!(
+        "governed response: ok\noperation_id: {operation_id}\nreceipt: canonical control-plane receipt\npolicy: allowed\nusage: {usage}\ninspect: sekaictl receipt {operation_id}\n"
+    ))
 }
 
 #[cfg(test)]
