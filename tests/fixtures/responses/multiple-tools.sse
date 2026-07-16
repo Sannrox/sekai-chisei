@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_tools"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"call_a","output_index":0,"delta":"{\"city\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"call_b","output_index":1,"delta":"{\"query\":\"docs\"}"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"call_a","output_index":0,"delta":"\"Berlin\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_tools","status":"completed","usage":{"input_tokens":8,"output_tokens":12}}}
+

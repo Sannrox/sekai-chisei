@@ -1,0 +1,12 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture"}}
+
+event: response.future.delta
+data: {"type":"response.future.delta","opaque":{"version":2}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"hello"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}
+
