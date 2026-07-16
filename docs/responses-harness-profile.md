@@ -35,6 +35,15 @@ requirement fails with `capability_unsupported` before upstream provider contact
 Built-in search, code, or MCP tools remain unavailable unless the selected profile
 declares the exact external capability.
 
+The discovery document also carries `registry_version` and versioned `profiles`.
+Each profile publishes its provider and model namespace, lifecycle, protocol
+surfaces, endpoint configuration source, request and response adaptations, usage
+and error normalization versions, capability limits, pricing-metadata version, and
+governance-metadata status. API-key environment names may be advertised, but
+credential values are never part of capability discovery, policy, receipts, or
+correlation metadata. Existing `paths` entries remain the compatibility view of
+the same profile capabilities.
+
 ## Stream contract
 
 SSE frames are ordered as received. Clients assemble text from
