@@ -201,6 +201,7 @@ pub struct CapabilityRequirements {
     pub modalities: Vec<String>,
     pub provider_continuation: bool,
     pub built_in_tools: Vec<String>,
+    pub max_output_tokens: Option<u64>,
 }
 
 impl CapabilityRequirements {
@@ -241,6 +242,9 @@ impl CapabilityRequirements {
                 .is_some_and(|value| !value.is_null()),
             modalities,
             built_in_tools,
+            max_output_tokens: value
+                .get("max_output_tokens")
+                .and_then(|value| value.as_u64()),
         })
     }
 
@@ -284,6 +288,14 @@ impl CapabilityRequirements {
             if !capabilities.built_in_tools.contains(tool) {
                 missing.push(format!("built_in_tool:{tool}"));
             }
+        }
+        if let Some(requested) = self.max_output_tokens
+            && requested > capabilities.output_tokens
+        {
+            missing.push(format!(
+                "max_output_tokens:{requested}>{}",
+                capabilities.output_tokens
+            ));
         }
         missing
     }
@@ -400,6 +412,25 @@ mod tests {
         assert!(
             required
                 .unsupported_by(matrix.capabilities("ollama").unwrap())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_limits_are_enforced_before_provider_contact() {
+        let required = CapabilityRequirements::from_responses_body(
+            br#"{"max_output_tokens":64000,"input":"hello"}"#,
+        )
+        .unwrap();
+        let matrix = CapabilityMatrix::built_in();
+        assert!(
+            required
+                .unsupported_by(matrix.capabilities("ollama").unwrap())
+                .contains(&"max_output_tokens:64000>32000".to_string())
+        );
+        assert!(
+            required
+                .unsupported_by(matrix.capabilities("openai").unwrap())
                 .is_empty()
         );
     }
