@@ -100,6 +100,7 @@ message MemoryContextReference {
   uint32 confidence_bps = 4;
   string applicability = 5;
   repeated string evidence_operation_ids = 6;
+  string content_digest = 7;
 }
 
 message ContextEvidenceReference {
@@ -196,6 +197,7 @@ message ExecutionPlan {
   string task_class = 25;
   repeated ContextEvidenceReference evidence_references = 26;
   repeated MemoryContextReference memory_references = 27;
+  string planning_actor = 28;
 }
 
 message EgressDecision {
@@ -608,6 +610,16 @@ message ReserveGatewayRequestAliasRequest {
 message ReserveGatewayRequestAliasResponse {
   bool reserved = 1;
 }
+message ClaimGatewayRequestAliasDispatchRequest {
+  string caller_scope = 1;
+  string request_alias = 2;
+  string request_id = 3;
+  string operation_id = 4;
+  string dispatch_token = 5;
+}
+message ClaimGatewayRequestAliasDispatchResponse {
+  bool claimed = 1;
+}
 message GetOperationReceiptResponse {
   string receipt_json = 1;
   bool complete = 2;
@@ -723,6 +735,7 @@ service ChiseiService {
   rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
+  rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);

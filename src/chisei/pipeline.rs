@@ -61,6 +61,7 @@ pub struct MemoryContextReference {
     pub confidence_bps: u16,
     pub applicability: String,
     pub evidence_operation_ids: Vec<String>,
+    pub content_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -861,10 +862,24 @@ fn run_kioku_enrich(
         .into_iter()
         .map(|object| object.id)
         .collect();
+    let actor_ceiling =
+        match db.kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor) {
+            Ok(ceiling) => ceiling,
+            Err(error) => {
+                return StepDecision {
+                    step: String::new(),
+                    action: "skipped".into(),
+                    reasoning: format!("memory retrieval denied: {error}"),
+                    confidence: 1.0,
+                    suggestion: String::new(),
+                    value: String::new(),
+                };
+            }
+        };
     let classification_ceiling = if req.external_egress {
-        EvidenceClassification::Public
+        actor_ceiling.min(EvidenceClassification::Public)
     } else {
-        EvidenceClassification::Internal
+        actor_ceiling
     };
     let retrieved =
         match db.retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
@@ -915,6 +930,7 @@ fn run_kioku_enrich(
             confidence_bps: item.memory.confidence_bps,
             applicability: item.applicability.clone(),
             evidence_operation_ids,
+            content_digest: crate::chisei::kioku::memory_claim_digest(&item.memory),
         });
         req.egress_records.push(egress::ContextEgressRecord {
             object_ref: format!("kioku:{}@{}", item.memory.id, item.memory.version),

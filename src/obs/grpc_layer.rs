@@ -275,6 +275,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "AuthorizeOperationReporter"
                 | "GetOperationReceipt"
                 | "ReserveGatewayRequestAlias"
+                | "ClaimGatewayRequestAliasDispatch"
                 | "GetAffinity"
                 | "CreateEvalSuite"
                 | "ListEvalSuites"
@@ -373,6 +374,7 @@ mod tests {
             "AuthorizeOperationReporter",
             "GetOperationReceipt",
             "ReserveGatewayRequestAlias",
+            "ClaimGatewayRequestAliasDispatch",
         ] {
             assert_eq!(
                 parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
