@@ -37,7 +37,7 @@ use crate::grpc::client::{
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, GatewayAuditEvent,
-    GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
+    GetEvalRunRequest, GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
     RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
     ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
 };
@@ -73,6 +73,7 @@ const X_CHISEI_PROJECT: HeaderName = HeaderName::from_static("x-chisei-project")
 const X_CHISEI_WORK_UNIT: HeaderName = HeaderName::from_static("x-chisei-work-unit");
 const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id");
 const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
+const X_CHISEI_ADMISSION: HeaderName = HeaderName::from_static("x-chisei-admission");
 const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
 const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
@@ -467,6 +468,19 @@ struct CircuitBreakerState {
     consecutive_failures: u32,
     open_until: Option<Instant>,
     last_failure: Option<String>,
+    health: ProviderHealth,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderHealth {
+    #[default]
+    Unknown,
+    Healthy,
+    RateLimited,
+    QuotaExhausted,
+    Overloaded,
+    Unavailable,
 }
 
 impl CircuitBreakerState {
@@ -478,13 +492,40 @@ impl CircuitBreakerState {
         self.consecutive_failures = 0;
         self.open_until = None;
         self.last_failure = None;
+        self.health = ProviderHealth::Healthy;
     }
 
     fn record_failure(&mut self, error: String, config: &ResilienceConfig) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_failure = Some(error);
+        self.health = ProviderHealth::Unavailable;
         if self.consecutive_failures >= config.circuit_failure_threshold {
             self.open_until = Some(Instant::now() + config.circuit_cooldown);
+        }
+    }
+
+    fn record_http_signal(
+        &mut self,
+        signal: ProviderHealth,
+        retry_after: Option<Duration>,
+        config: &ResilienceConfig,
+    ) {
+        match signal {
+            ProviderHealth::Healthy | ProviderHealth::Unknown => self.record_success(),
+            ProviderHealth::RateLimited | ProviderHealth::QuotaExhausted => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.health = signal;
+                self.last_failure = Some(format!("provider health is {signal:?}"));
+                self.open_until =
+                    Some(Instant::now() + retry_after.unwrap_or(config.circuit_cooldown));
+            }
+            ProviderHealth::Overloaded | ProviderHealth::Unavailable => {
+                self.record_failure(format!("provider health is {signal:?}"), config);
+                self.health = signal;
+                if let Some(retry_after) = retry_after {
+                    self.open_until = Some(Instant::now() + retry_after);
+                }
+            }
         }
     }
 }
@@ -558,7 +599,7 @@ struct CachedPolicyDecision {
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
-    data_class: Option<String>,
+    fallback_models: Vec<String>,
     cached_at: Instant,
 }
 
@@ -1006,10 +1047,29 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
             .timestamp_millis()
             .saturating_sub(last_degraded_at_ms as i64)
             <= state.runtime.governance_cache_ttl.as_millis() as i64;
+    let provider_health = state
+        .runtime
+        .upstream_circuits
+        .read()
+        .await
+        .iter()
+        .map(|(provider, circuit)| {
+            serde_json::json!({
+                "provider": provider,
+                "health": circuit.health,
+                "circuit_open": circuit.is_open(),
+                "consecutive_failures": circuit.consecutive_failures,
+            })
+        })
+        .collect::<Vec<_>>();
+    let provider_circuit_open = provider_health
+        .iter()
+        .any(|provider| provider["circuit_open"] == true);
     json_response(
         StatusCode::OK,
         serde_json::json!({
             "status": if circuit_open
+                || provider_circuit_open
                 || recently_degraded
                 || pending_budget_reconciliations > 0
                 || budget_reconciliation_saturated
@@ -1023,7 +1083,8 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
             "pending_budget_reconciliations": pending_budget_reconciliations,
             "budget_reconciliation_saturated": budget_reconciliation_saturated,
             "spooled_audit_events": state.runtime.spooled_audit_events.load(Ordering::Relaxed),
-            "last_degraded_at_ms": last_degraded_at_ms
+            "last_degraded_at_ms": last_degraded_at_ms,
+            "provider_health": provider_health
         }),
     )
 }
@@ -1269,6 +1330,10 @@ struct ProviderLifecycleRequest {
     target: String,
     state: String,
     reason: String,
+    #[serde(default)]
+    baseline_run_id: String,
+    #[serde(default)]
+    candidate_run_id: String,
 }
 
 async fn update_provider_lifecycle_admin(
@@ -1326,11 +1391,33 @@ async fn update_provider_lifecycle_admin(
     ) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &reason);
     }
-    let audit_evidence = HashMap::from([
+    if let Err(reason) = verify_provider_lifecycle_promotion(&state, &request).await {
+        record_gateway_event(
+            &state.config,
+            "chisei-gateway-admin",
+            "gateway.provider_lifecycle",
+            &reason,
+            "denied",
+            HashMap::from([
+                ("target_kind".into(), request.target_kind.clone()),
+                ("target".into(), request.target.clone()),
+                ("state".into(), request.state.clone()),
+            ]),
+        )
+        .await;
+        return json_error(StatusCode::CONFLICT, "governance_precondition", &reason);
+    }
+    let mut audit_evidence = HashMap::from([
         ("target_kind".to_string(), request.target_kind.clone()),
         ("target".to_string(), request.target.clone()),
         ("state".to_string(), request.state.clone()),
     ]);
+    if !request.baseline_run_id.is_empty() {
+        audit_evidence.insert("baseline_run_id".into(), request.baseline_run_id.clone());
+    }
+    if !request.candidate_run_id.is_empty() {
+        audit_evidence.insert("candidate_run_id".into(), request.candidate_run_id.clone());
+    }
     if !record_gateway_event(
         &state.config,
         "chisei-gateway-admin",
@@ -1369,6 +1456,98 @@ async fn update_provider_lifecycle_admin(
     }
     })
     .await
+}
+
+async fn verify_provider_lifecycle_promotion(
+    state: &GatewayState,
+    request: &ProviderLifecycleRequest,
+) -> Result<(), String> {
+    let registry = provider_registry_snapshot();
+    let provider = match request.target_kind.as_str() {
+        "provider" => Some(request.target.clone()),
+        "profile" => registry
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_version == request.target)
+            .map(|profile| profile.provider.clone()),
+        "model" => request
+            .target
+            .split_once('/')
+            .map(|(provider, _)| provider.to_string()),
+        "capability" => request
+            .target
+            .split_once(':')
+            .map(|(provider, _)| provider.to_string()),
+        _ => None,
+    };
+    let requires_gate = provider
+        .as_deref()
+        .and_then(|provider| registry.profile(provider))
+        .is_some_and(|profile| {
+            matches!(profile.lifecycle.as_str(), "experimental" | "canary")
+                || registry
+                    .effective_profile(&profile.provider)
+                    .is_some_and(|profile| profile.lifecycle == "canary")
+        });
+    if request.state != "enabled" || !requires_gate {
+        return Ok(());
+    }
+    if request.baseline_run_id.trim().is_empty() || request.candidate_run_id.trim().is_empty() {
+        return Err("promotion to enabled requires baseline_run_id and candidate_run_id".into());
+    }
+    let target = state
+        .config
+        .chisei_grpc_target
+        .as_deref()
+        .ok_or_else(|| "promotion to enabled requires the policy control plane".to_string())?;
+    let channel = connect_governance(&state.runtime, target)
+        .await
+        .map_err(|error| format!("promotion evaluation is unavailable: {error}"))?;
+    let mut client = ChiseiServiceClient::new(channel);
+    let baseline = client
+        .get_eval_run(gateway_request(GetEvalRunRequest {
+            id: request.baseline_run_id.clone(),
+        }))
+        .await
+        .map_err(|error| format!("baseline evaluation run is unavailable: {error}"))?
+        .into_inner()
+        .run
+        .ok_or_else(|| "baseline evaluation run is missing".to_string())?;
+    let candidate = client
+        .get_eval_run(gateway_request(GetEvalRunRequest {
+            id: request.candidate_run_id.clone(),
+        }))
+        .await
+        .map_err(|error| format!("candidate evaluation run is unavailable: {error}"))?
+        .into_inner()
+        .run
+        .ok_or_else(|| "candidate evaluation run is missing".to_string())?;
+    if baseline.suite_id != candidate.suite_id {
+        return Err("promotion evaluation runs must belong to the same suite".into());
+    }
+    if candidate.config_ref != request.target {
+        return Err(format!(
+            "candidate evaluation config {:?} does not match lifecycle target {:?}",
+            candidate.config_ref, request.target
+        ));
+    }
+    let decision = client
+        .compare_runs(gateway_request(CompareRunsRequest {
+            baseline_id: baseline.id,
+            candidate_id: candidate.id,
+        }))
+        .await
+        .map_err(|error| format!("promotion evaluation comparison failed: {error}"))?
+        .into_inner()
+        .decision
+        .ok_or_else(|| "promotion evaluation returned no gate decision".to_string())?;
+    if decision.verdict != "pass" {
+        return Err(format!(
+            "promotion evaluation did not pass: {}",
+            decision.reason
+        ));
+    }
+    Ok(())
 }
 
 fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
@@ -1593,18 +1772,33 @@ async fn proxy_gateway_inner(
             );
         }
     };
-    crate::provider_profile::with_provider_registry_snapshot(
-        registry,
-        proxy_gateway_inner_scoped(
-            state,
-            uri,
-            method,
-            headers,
-            request,
-            correlation,
-            identity_context,
-        ),
-    )
+    let canary_requested = header_str(&headers, &X_CHISEI_ADMISSION) == Some("canary");
+    if canary_requested
+        && !header_str(&headers, &X_CHISEI_TASK_CLASS)
+            .is_some_and(crate::chisei::model_routing::is_cheap_eligible_task_class)
+    {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            "canary admission requires an explicit bounded low-risk task class",
+        );
+    }
+    let scoped = proxy_gateway_inner_scoped(
+        state,
+        uri,
+        method,
+        headers,
+        request,
+        correlation,
+        identity_context,
+    );
+    crate::provider_profile::with_provider_registry_snapshot(registry, async move {
+        if canary_requested {
+            crate::provider_profile::with_canary_admission(scoped).await
+        } else {
+            scoped.await
+        }
+    })
     .await
 }
 
@@ -1923,7 +2117,7 @@ async fn proxy_gateway_inner_scoped(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
-            data_class: None,
+            fallback_models: Vec::new(),
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -2022,6 +2216,43 @@ async fn proxy_gateway_inner_scoped(
                 return rejection.response();
             }
         };
+        let originally_resolved_model = resolved.resolved_model.clone();
+        let resolved = match select_healthy_policy_fallback(
+            &state.runtime,
+            &built_in_registry,
+            resolved,
+            capability_surface,
+            state.config.allow_cross_provider,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(rejection) => {
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
+        };
+        if resolved.resolved_model != originally_resolved_model {
+            record_gateway_decision(
+                &state.config,
+                &identity,
+                "gateway.health_fallback",
+                "policy-authorized equivalent fallback selected for unhealthy provider",
+                "routed",
+                HashMap::from([
+                    (
+                        "requested_route".into(),
+                        originally_resolved_model.unwrap_or_default(),
+                    ),
+                    (
+                        "fallback_route".into(),
+                        resolved.resolved_model.clone().unwrap_or_default(),
+                    ),
+                ]),
+            )
+            .await;
+        }
         preflight_context.provider = resolved.resolved_provider;
         preflight_context.resolved_model = resolved.resolved_model.clone();
         let effective_profile = resolved
@@ -2330,13 +2561,19 @@ async fn proxy_gateway_inner_scoped(
             .await;
             rejection.response()
         }
-        Err(UpstreamSendError::CircuitOpen) => {
+        Err(UpstreamSendError::CircuitOpen { health }) => {
+            let error_type = match health {
+                ProviderHealth::RateLimited => "upstream_rate_limited",
+                ProviderHealth::QuotaExhausted => "upstream_quota_exhausted",
+                _ => "upstream_unavailable",
+            };
             let rejection = GatewayRejection {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                error_type: "upstream_unavailable".into(),
+                error_type: error_type.into(),
                 reason: format!(
-                    "{} upstream circuit is open",
-                    prepared.provider.runtime_name()
+                    "{} upstream is temporarily in {:?} health state",
+                    prepared.provider.runtime_name(),
+                    health
                 ),
                 rejected_route: None,
             };
@@ -2904,7 +3141,97 @@ struct PolicyPreflight {
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
-    data_class: Option<String>,
+    fallback_models: Vec<String>,
+}
+
+async fn select_healthy_policy_fallback(
+    runtime: &GatewayRuntime,
+    registry: &ProviderRegistry,
+    mut decision: PolicyPreflight,
+    surface: Option<CapabilityRequestSurface>,
+    allow_cross_provider: bool,
+) -> Result<PolicyPreflight, GatewayRejection> {
+    let selected_key = capability_provider_id(decision.resolved_provider);
+    let circuits = runtime.upstream_circuits.read().await;
+    let selected_unhealthy = circuits
+        .get(selected_key)
+        .is_some_and(CircuitBreakerState::is_open);
+    if !selected_unhealthy {
+        return Ok(decision);
+    }
+    let selected_profile = registry.effective_profile(selected_key).ok_or_else(|| {
+        GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            format!("selected provider {selected_key:?} has no effective profile"),
+        )
+    })?;
+    let requirements = surface
+        .map(|surface| match surface {
+            CapabilityRequestSurface::Responses => {
+                CapabilityRequirements::from_responses_body(&decision.body)
+            }
+            CapabilityRequestSurface::OpenAiChat => {
+                CapabilityRequirements::from_openai_chat_body(&decision.body)
+            }
+            CapabilityRequestSurface::AnthropicMessages => {
+                CapabilityRequirements::from_anthropic_messages_body(&decision.body)
+            }
+        })
+        .transpose()
+        .map_err(|reason| {
+            GatewayRejection::json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("cannot derive fallback requirements: {reason}"),
+            )
+        })?;
+    for candidate in &decision.fallback_models {
+        let Ok(resolved) = registry.resolve_model(candidate) else {
+            continue;
+        };
+        let Some(provider) = ProviderKind::from_runtime(&resolved.provider) else {
+            continue;
+        };
+        if !decision.resolved_provider.same_family(provider) && !allow_cross_provider {
+            continue;
+        }
+        if circuits
+            .get(capability_provider_id(provider))
+            .is_some_and(CircuitBreakerState::is_open)
+        {
+            continue;
+        }
+        let Some(profile) = registry.effective_profile(&resolved.provider) else {
+            continue;
+        };
+        if profile.governance != selected_profile.governance
+            || requirements
+                .as_ref()
+                .is_some_and(|required| !required.unsupported_by(&profile.capabilities).is_empty())
+        {
+            continue;
+        }
+        decision.body =
+            rewrite_request_model(&decision.body, &resolved.canonical_model).map_err(|error| {
+                GatewayRejection::json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("could not rewrite fallback model: {error}"),
+                )
+            })?;
+        decision.resolved_model = Some(resolved.canonical_model);
+        decision.resolved_provider = provider;
+        decision.route_bias = Some("health_fallback".into());
+        return Ok(decision);
+    }
+    Err(GatewayRejection::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upstream_unavailable",
+        format!(
+            "provider {selected_key:?} is unhealthy and no policy-authorized capability and governance equivalent fallback is eligible"
+        ),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -3219,7 +3546,7 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
             route_bias: decision.route_bias.clone(),
             policy_scope: decision.policy_scope.clone(),
             policy_version: decision.policy_version.clone(),
-            data_class: decision.data_class.clone(),
+            fallback_models: decision.fallback_models.clone(),
             cached_at: Instant::now(),
         },
     );
@@ -3264,7 +3591,7 @@ async fn cached_policy_decision(
         route_bias: cached.route_bias.clone(),
         policy_scope: cached.policy_scope.clone(),
         policy_version: cached.policy_version.clone(),
-        data_class: cached.data_class.clone(),
+        fallback_models: cached.fallback_models.clone(),
     })
 }
 
@@ -3514,7 +3841,7 @@ async fn resolve_policy_preflight(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
-            data_class: None,
+            fallback_models: Vec::new(),
         });
     };
     let requested_registry_model = if requested_model == "auto" {
@@ -3566,7 +3893,7 @@ async fn resolve_policy_preflight(
             route_bias: None,
             policy_scope: None,
             policy_version: None,
-            data_class: None,
+            fallback_models: Vec::new(),
         });
     };
     match connect_governance(runtime, target).await {
@@ -3738,8 +4065,7 @@ async fn resolve_policy_preflight(
                             .filter(|scope| !scope.is_empty()),
                         policy_version: Some(resolution.policy_version)
                             .filter(|version| !version.is_empty()),
-                        data_class: Some(resolution.data_class)
-                            .filter(|data_class| !data_class.is_empty()),
+                        fallback_models: resolution.fallback_models,
                     };
                     cache_policy_decision(runtime, cache_key, &decision).await;
                     Ok(decision)
@@ -3845,7 +4171,7 @@ async fn resolve_policy_preflight(
                         route_bias: None,
                         policy_scope: None,
                         policy_version: None,
-                        data_class: None,
+                        fallback_models: Vec::new(),
                     })
                 }
             }
@@ -3895,7 +4221,7 @@ async fn resolve_policy_preflight(
                 route_bias: None,
                 policy_scope: None,
                 policy_version: None,
-                data_class: None,
+                fallback_models: Vec::new(),
             })
         }
     }
@@ -6563,7 +6889,9 @@ enum ProviderKind {
 
 #[derive(Debug)]
 enum UpstreamSendError {
-    CircuitOpen,
+    CircuitOpen {
+        health: ProviderHealth,
+    },
     Request {
         error: reqwest::Error,
         snapshot_version: String,
@@ -6666,7 +6994,7 @@ async fn send_upstream_with_resilience(
     request: reqwest::RequestBuilder,
     contact_guard: &ProviderContactGuard,
 ) -> Result<(reqwest::Response, String), UpstreamSendError> {
-    let circuit_key = format!("{provider:?}");
+    let circuit_key = capability_provider_id(provider).to_string();
     if runtime
         .upstream_circuits
         .read()
@@ -6674,7 +7002,14 @@ async fn send_upstream_with_resilience(
         .get(&circuit_key)
         .is_some_and(CircuitBreakerState::is_open)
     {
-        return Err(UpstreamSendError::CircuitOpen);
+        let health = runtime
+            .upstream_circuits
+            .read()
+            .await
+            .get(&circuit_key)
+            .map(|circuit| circuit.health)
+            .unwrap_or(ProviderHealth::Unavailable);
+        return Err(UpstreamSendError::CircuitOpen { health });
     }
 
     let mut request = request;
@@ -6695,13 +7030,15 @@ async fn send_upstream_with_resilience(
         model_attempted = true;
         match request.send().await {
             Ok(response) => {
+                let signal = provider_health_from_response(&response);
+                let retry_after = retry_after_duration(response.headers());
                 runtime
                     .upstream_circuits
                     .write()
                     .await
                     .entry(circuit_key)
                     .or_default()
-                    .record_success();
+                    .record_http_signal(signal, retry_after, &runtime.resilience);
                 return Ok((response, contact_snapshot_version));
             }
             Err(error)
@@ -6730,6 +7067,32 @@ async fn send_upstream_with_resilience(
         }
     }
     unreachable!("upstream retry loop always returns")
+}
+
+fn provider_health_from_response(response: &reqwest::Response) -> ProviderHealth {
+    provider_health_from_status(response.status())
+}
+
+fn provider_health_from_status(status: reqwest::StatusCode) -> ProviderHealth {
+    match status.as_u16() {
+        402 => ProviderHealth::QuotaExhausted,
+        408 => ProviderHealth::Unavailable,
+        429 => ProviderHealth::RateLimited,
+        502..=504 => ProviderHealth::Overloaded,
+        500..=599 => ProviderHealth::Unavailable,
+        _ => ProviderHealth::Healthy,
+    }
+}
+
+fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 impl ProviderKind {
@@ -9640,6 +10003,8 @@ fn stable_gateway_error_code(error_type: &str) -> &'static str {
             "request_conflict"
         }
         "rate_limited" | "rate_limit_exceeded" => "rate_limited",
+        "upstream_rate_limited" => "rate_limited",
+        "upstream_quota_exhausted" => "quota_exhausted",
         "upstream_timeout" => "upstream_timeout",
         "upstream_unavailable"
         | "upstream_error"
@@ -10657,7 +11022,7 @@ mod tests {
             route_bias: None,
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
-            data_class: Some("sensitive".into()),
+            fallback_models: Vec::new(),
         };
         cache_policy_decision(&runtime, "policy".into(), &policy).await;
         cache_egress_decision(
@@ -10687,6 +11052,7 @@ mod tests {
             route_bias: None,
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
+            fallback_models: Vec::new(),
         };
         cache_policy_decision(&runtime, "policy".into(), &policy).await;
         runtime
@@ -10727,6 +11093,7 @@ mod tests {
             route_bias: None,
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
+            fallback_models: Vec::new(),
         };
 
         assert_eq!(policy_registry_state(&policy, &registry), None);
@@ -10907,6 +11274,107 @@ mod tests {
         circuit.record_success();
         assert!(!circuit.is_open());
         assert_eq!(circuit.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn provider_health_normalizes_quota_rate_limit_and_overload() {
+        assert_eq!(
+            provider_health_from_status(reqwest::StatusCode::PAYMENT_REQUIRED),
+            ProviderHealth::QuotaExhausted
+        );
+        assert_eq!(
+            provider_health_from_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            ProviderHealth::RateLimited
+        );
+        assert_eq!(
+            provider_health_from_status(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            ProviderHealth::Overloaded
+        );
+        assert_eq!(
+            provider_health_from_status(reqwest::StatusCode::BAD_REQUEST),
+            ProviderHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn quota_and_rate_limit_signals_immediately_reduce_eligibility() {
+        let resilience = ResilienceConfig {
+            circuit_failure_threshold: 10,
+            circuit_cooldown: Duration::from_secs(60),
+            ..ResilienceConfig::default()
+        };
+        for health in [ProviderHealth::RateLimited, ProviderHealth::QuotaExhausted] {
+            let mut circuit = CircuitBreakerState::default();
+            circuit.record_http_signal(health, Some(Duration::from_secs(30)), &resilience);
+            assert!(circuit.is_open());
+            assert_eq!(circuit.health, health);
+        }
+    }
+
+    #[tokio::test]
+    async fn unhealthy_routes_use_only_policy_authorized_equivalent_fallbacks() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.upstream_circuits.write().await.insert(
+            "openai".into(),
+            CircuitBreakerState {
+                consecutive_failures: 1,
+                open_until: Some(Instant::now() + Duration::from_secs(60)),
+                last_failure: Some("rate limited".into()),
+                health: ProviderHealth::RateLimited,
+            },
+        );
+        let decision = PolicyPreflight {
+            body: br#"{"model":"openai/gpt-5.5","input":"hello"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["ollama/llama3.2".into()],
+        };
+        let selected = select_healthy_policy_fallback(
+            &runtime,
+            &ProviderRegistry::built_in(),
+            decision,
+            Some(CapabilityRequestSurface::Responses),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.resolved_model.as_deref(), Some("ollama/llama3.2"));
+        assert_eq!(selected.route_bias.as_deref(), Some("health_fallback"));
+    }
+
+    #[tokio::test]
+    async fn health_fallback_fails_when_capabilities_are_not_equivalent() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.upstream_circuits.write().await.insert(
+            "openai".into(),
+            CircuitBreakerState {
+                consecutive_failures: 1,
+                open_until: Some(Instant::now() + Duration::from_secs(60)),
+                last_failure: Some("unavailable".into()),
+                health: ProviderHealth::Unavailable,
+            },
+        );
+        let decision = PolicyPreflight {
+            body: br#"{"model":"openai/gpt-5.5","input":"hello","tools":[{"type":"function","name":"read"}]}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["native/native-default".into()],
+        };
+        let result = select_healthy_policy_fallback(
+            &runtime,
+            &ProviderRegistry::built_in(),
+            decision,
+            Some(CapabilityRequestSurface::Responses),
+            false,
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

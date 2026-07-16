@@ -194,6 +194,7 @@ static ASYNC_PROVIDER_REGISTRY_REFRESH: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 tokio::task_local! {
     static REQUEST_PROVIDER_REGISTRY: ProviderRegistry;
+    static REQUEST_CANARY_ADMISSION: bool;
 }
 
 pub async fn with_provider_registry_snapshot<F, T>(registry: ProviderRegistry, future: F) -> T
@@ -201,6 +202,13 @@ where
     F: std::future::Future<Output = T>,
 {
     REQUEST_PROVIDER_REGISTRY.scope(registry, future).await
+}
+
+pub async fn with_canary_admission<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    REQUEST_CANARY_ADMISSION.scope(true, future).await
 }
 
 pub fn provider_registry_snapshot() -> ProviderRegistry {
@@ -346,6 +354,29 @@ pub fn update_registry_lifecycle_with_outcome(
         legacy_registry_initialization_allowed(),
     )?;
     registry.validate_lifecycle_target(target_kind, target)?;
+    if state == "enabled" {
+        let provider = match target_kind {
+            "provider" => Some(target),
+            "profile" => registry
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_version == target)
+                .map(|profile| profile.provider.as_str()),
+            "model" | "capability" => target.split_once(['/', ':']).map(|(provider, _)| provider),
+            _ => None,
+        };
+        if provider
+            .and_then(|provider| registry.profile(provider))
+            .is_some_and(|profile| profile.lifecycle == "experimental")
+            && !provider.is_some_and(|provider| {
+                registry
+                    .effective_profile(provider)
+                    .is_some_and(|profile| profile.lifecycle == "canary")
+            })
+        {
+            return Err("experimental providers must enter canary before enabled promotion".into());
+        }
+    }
     let target = if target_kind == "model" {
         canonical_model_target(target)?
     } else {
@@ -1177,6 +1208,15 @@ impl ProviderRegistry {
         if profile.lifecycle == "experimental" {
             return Err(format!(
                 "provider {provider:?} is experimental and requires an explicit lifecycle promotion"
+            ));
+        }
+        if profile.lifecycle == "canary"
+            && !REQUEST_CANARY_ADMISSION
+                .try_with(|allowed| *allowed)
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "provider {provider:?} is canary-only and requires explicit bounded admission"
             ));
         }
         Ok(())
@@ -2030,6 +2070,32 @@ mod tests {
         assert!(registry.resolve_model("meta/muse-spark-2").is_err());
     }
 
+    #[tokio::test]
+    async fn canary_models_require_request_scoped_bounded_admission() {
+        let mut registry = ProviderRegistry::built_in();
+        registry
+            .lifecycle_overrides
+            .push(RegistryLifecycleOverride {
+                target_kind: "provider".into(),
+                target: "meta".into(),
+                state: "canary".into(),
+                version: 1,
+                actor: "operator".into(),
+                reason: "bounded validation".into(),
+                changed_at: "2026-07-14T00:00:00Z".into(),
+            });
+        registry.state_version = 1;
+        assert!(registry.resolve_model("meta/muse-spark-1.1").is_err());
+        let admitted = with_provider_registry_snapshot(registry, async {
+            with_canary_admission(async {
+                provider_registry_snapshot().resolve_model("meta/muse-spark-1.1")
+            })
+            .await
+        })
+        .await;
+        assert!(admitted.is_ok());
+    }
+
     #[test]
     fn hosted_profile_fixtures_match_registry_contracts() {
         let registry = ProviderRegistry::built_in();
@@ -2342,6 +2408,45 @@ mod tests {
                 .unwrap_err()
                 .contains("provider")
         );
+    }
+
+    #[test]
+    fn experimental_provider_cannot_skip_canary_admission() {
+        let directory =
+            std::env::temp_dir().join(format!("sekai-provider-admission-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("registry.json");
+        refresh_provider_registry(&path).unwrap();
+        let direct = update_registry_lifecycle(
+            &path,
+            "provider",
+            "meta",
+            "enabled",
+            "operator",
+            "direct promotion",
+            "2026-07-14T00:00:00Z",
+        );
+        assert!(direct.unwrap_err().contains("must enter canary"));
+        update_registry_lifecycle(
+            &path,
+            "provider",
+            "meta",
+            "canary",
+            "operator",
+            "bounded admission",
+            "2026-07-14T00:01:00Z",
+        )
+        .unwrap();
+        update_registry_lifecycle(
+            &path,
+            "provider",
+            "meta",
+            "enabled",
+            "operator",
+            "evaluation passed",
+            "2026-07-14T00:02:00Z",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
