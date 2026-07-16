@@ -49,6 +49,7 @@ use crate::grpc::pb::sekai::{
     RetrieveContextRequest, Row,
 };
 use crate::llm::HttpTimeouts;
+use crate::provider_profile::{CapabilityMatrix, CapabilityRequirements};
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -1371,6 +1372,20 @@ async fn proxy_gateway_inner(
     correlation: GatewayCorrelation,
     identity_context: IdentityContext,
 ) -> Response<Body> {
+    if uri.path() == "/v1/chisei/capabilities" {
+        if method != Method::GET {
+            return json_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                "capability discovery requires GET",
+            );
+        }
+        return json_response(
+            StatusCode::OK,
+            serde_json::to_value(CapabilityMatrix::built_in())
+                .expect("built-in capability matrix is serializable"),
+        );
+    }
     let Some((client_provider, normalized_path)) = upstream_path(&uri) else {
         return json_error(
             StatusCode::NOT_FOUND,
@@ -1379,6 +1394,7 @@ async fn proxy_gateway_inner(
         );
     };
     let responses_profile = normalized_path.starts_with("/responses");
+    let responses_create = is_responses_create(&method, &normalized_path);
     if let Err(reason) = validate_harness_request_headers(responses_profile, &headers) {
         return json_error(StatusCode::BAD_REQUEST, "capability_unsupported", &reason);
     }
@@ -1667,6 +1683,28 @@ async fn proxy_gateway_inner(
         };
         (resolved, egress, Some(budget))
     };
+    if responses_create
+        && let Err(rejection) =
+            enforce_provider_capabilities(resolved.resolved_provider, &egress.body)
+    {
+        record_gateway_decision(
+            &state.config,
+            &identity,
+            "gateway.capability_denied",
+            &rejection.reason,
+            "denied",
+            HashMap::from([
+                (
+                    "provider".into(),
+                    capability_provider_id(resolved.resolved_provider).into(),
+                ),
+                ("request_id".into(), request_id.clone()),
+            ]),
+        )
+        .await;
+        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        return rejection.response();
+    }
     let prepared = match prepare_upstream_request(
         &state.config,
         &identity,
@@ -1829,6 +1867,10 @@ fn validate_harness_request_headers(
         return Err("Idempotency-Key is not supported by this gateway profile version".into());
     }
     Ok(())
+}
+
+fn is_responses_create(method: &Method, normalized_path: &str) -> bool {
+    method == Method::POST && normalized_path == "/responses"
 }
 
 async fn rate_limit_rejection(
@@ -5847,6 +5889,49 @@ impl ProviderKind {
     }
 }
 
+fn capability_provider_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => "openai",
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => "ollama",
+        ProviderKind::OpenAi(OpenAiRuntime::Native) => "native",
+        ProviderKind::Anthropic => "anthropic",
+    }
+}
+
+fn enforce_provider_capabilities(
+    provider: ProviderKind,
+    body: &[u8],
+) -> Result<(), GatewayRejection> {
+    let requirements = CapabilityRequirements::from_responses_body(body).map_err(|reason| {
+        GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("cannot derive Responses capabilities: {reason}"),
+        )
+    })?;
+    let provider_id = capability_provider_id(provider);
+    let matrix = CapabilityMatrix::built_in();
+    let capabilities = matrix.capabilities(provider_id).ok_or_else(|| {
+        GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "capability_unsupported",
+            format!("provider {provider_id} has no capability profile"),
+        )
+    })?;
+    let missing = requirements.unsupported_by(capabilities);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(GatewayRejection::json(
+        StatusCode::BAD_REQUEST,
+        "capability_unsupported",
+        format!(
+            "provider {provider_id} cannot preserve required capabilities: {}",
+            missing.join(", ")
+        ),
+    ))
+}
+
 /// Normalizes a gateway Anthropic upstream base URL so it ends in `/v1`.
 ///
 /// `upstream_path` strips the leading `/v1` from the client path and
@@ -8581,6 +8666,46 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn capability_preflight_rejects_unsupported_paths() {
+        assert!(is_responses_create(&Method::POST, "/responses"));
+        assert!(!is_responses_create(&Method::GET, "/responses/resp_1"));
+        assert!(!is_responses_create(
+            &Method::POST,
+            "/responses/resp_1/cancel"
+        ));
+        let parallel_tools = br#"{
+            "model":"ollama/model",
+            "tools":[{"type":"function","name":"read"}],
+            "parallel_tool_calls":true
+        }"#;
+        let rejection = enforce_provider_capabilities(
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+            parallel_tools,
+        )
+        .unwrap_err();
+        assert_eq!(rejection.error_type, "capability_unsupported");
+        assert!(rejection.reason.contains("parallel_tools"));
+
+        let built_in = br#"{"model":"gpt-5.5","tools":[{"type":"web_search"}]}"#;
+        let rejection =
+            enforce_provider_capabilities(ProviderKind::OpenAi(OpenAiRuntime::OpenAi), built_in)
+                .unwrap_err();
+        assert!(rejection.reason.contains("built_in_tool:web_search"));
+    }
+
+    #[test]
+    fn capability_discovery_is_versioned_and_provider_specific() {
+        let matrix = CapabilityMatrix::built_in();
+        assert_eq!(
+            matrix.version,
+            crate::provider_profile::CAPABILITY_MATRIX_VERSION
+        );
+        assert!(matrix.capabilities("openai").unwrap().parallel_tools);
+        assert!(!matrix.capabilities("ollama").unwrap().parallel_tools);
+        assert!(!matrix.capabilities("anthropic").unwrap().responses);
     }
 
     #[test]
