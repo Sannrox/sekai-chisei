@@ -22,6 +22,7 @@ pub enum ReceiptSurface {
     Verification,
     Intervention,
     Outcome,
+    Memory,
 }
 
 impl ReceiptSurface {
@@ -41,6 +42,7 @@ impl ReceiptSurface {
             Self::Verification => "verification",
             Self::Intervention => "intervention",
             Self::Outcome => "outcome",
+            Self::Memory => "memory",
         }
     }
 }
@@ -62,6 +64,7 @@ pub enum ReceiptEventKind {
     VerificationRecorded,
     HumanIntervened,
     OutcomeRecorded,
+    MemoryOutcomeRecorded,
 }
 
 impl ReceiptEventKind {
@@ -81,6 +84,7 @@ impl ReceiptEventKind {
             "verification_recorded" => Self::VerificationRecorded,
             "human_intervened" => Self::HumanIntervened,
             "outcome_recorded" => Self::OutcomeRecorded,
+            "memory_outcome_recorded" => Self::MemoryOutcomeRecorded,
             _ => return None,
         })
     }
@@ -101,6 +105,7 @@ impl ReceiptEventKind {
             Self::VerificationRecorded => "verification_recorded",
             Self::HumanIntervened => "human_intervened",
             Self::OutcomeRecorded => "outcome_recorded",
+            Self::MemoryOutcomeRecorded => "memory_outcome_recorded",
         }
     }
 
@@ -120,6 +125,7 @@ impl ReceiptEventKind {
             Self::VerificationRecorded => ReceiptSurface::Verification,
             Self::HumanIntervened => ReceiptSurface::Intervention,
             Self::OutcomeRecorded => ReceiptSurface::Outcome,
+            Self::MemoryOutcomeRecorded => ReceiptSurface::Memory,
         }
     }
 }

@@ -58,6 +58,365 @@ const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
 const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
+const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
+const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
+const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
+
+fn record_reported_memory_outcomes(
+    db: &SekaiDb,
+    receipt: &OperationReceipt,
+    actor: &str,
+    now_ms: i64,
+    require_trusted_outcome: bool,
+    outcome_event_id: Option<&str>,
+    validate_only: bool,
+) -> Result<Vec<crate::chisei::kioku::MemoryImpactEvaluation>, String> {
+    let request_id = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+        .and_then(|event| event.attributes.get("request_id"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+        .ok_or_else(|| "Kioku receipt lacks a non-empty request_id".to_string())?;
+    let selected_outcome_metric = outcome_event_id
+        .map(|event_id| {
+            receipt
+                .events
+                .iter()
+                .find(|event| event.event_id == event_id)
+                .and_then(|event| event.attributes.get("outcome_metric"))
+                .map(|metric| metric.trim().to_string())
+                .ok_or_else(|| format!("Kioku outcome event {event_id} has no outcome metric"))
+        })
+        .transpose()?;
+    let mut outcomes = HashMap::new();
+    for outcome in receipt.events.iter().filter(|event| {
+        matches!(
+            event.kind,
+            ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+        ) && ["outcome_metric", "outcome_value", "passed"]
+            .iter()
+            .all(|attribute| event.attributes.contains_key(*attribute))
+            && (!require_trusted_outcome
+                || event
+                    .attributes
+                    .get(KIOKU_TRUSTED_OUTCOME_ATTRIBUTE)
+                    .is_some_and(|value| value == "true"))
+    }) {
+        let outcome_metric = outcome.attributes["outcome_metric"].trim().to_string();
+        let outcome_value = outcome.attributes["outcome_value"]
+            .parse::<f64>()
+            .map_err(|_| "Kioku outcome value must be finite".to_string())?;
+        if !outcome_value.is_finite() {
+            return Err("Kioku outcome value must be finite".into());
+        }
+        let passed = outcome.attributes["passed"]
+            .parse::<bool>()
+            .map_err(|_| "Kioku outcome passed flag must be boolean".to_string())?;
+        if outcomes
+            .insert(outcome_metric.clone(), (outcome_value, passed))
+            .is_some_and(|previous| previous != (outcome_value, passed))
+        {
+            return Err(format!(
+                "conflicting Kioku outcomes for metric {outcome_metric}"
+            ));
+        }
+    }
+    if outcomes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let attempt_recorded_at_ms = receipt
+        .events
+        .iter()
+        .filter(|event| event.kind == ReceiptEventKind::AttemptStarted)
+        .map(|event| event.timestamp_ms)
+        .min();
+    let mut assignments = db
+        .list_kioku_outcome_assignments(&receipt.operation_id)?
+        .into_iter()
+        .map(|assignment| {
+            (
+                (assignment.memory_id, assignment.memory_version),
+                assignment.memory_applied,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let assignment_reason = format!("pipeline operation {}", receipt.operation_id);
+    let legacy_assignment_reason = format!("pipeline request {request_id}");
+    let mut pending_lifecycle_events = Vec::new();
+    for ((memory_id, memory_version), memory_applied) in assignments.clone() {
+        let Some(memory) = db.get_kioku_memory(&memory_id, memory_version)? else {
+            assignments.remove(&(memory_id, memory_version));
+            continue;
+        };
+        if receipt.namespace != memory.namespace
+            || !memory
+                .operation_classes
+                .iter()
+                .any(|class| class == &receipt.operation_class)
+        {
+            return Err(format!(
+                "memory {memory_id}@{memory_version} does not match receipt scope"
+            ));
+        }
+        let lifecycle = db.list_kioku_lifecycle_events(&memory_id, memory_version)?;
+        let assignment_action = if memory_applied {
+            "injected"
+        } else {
+            "held_out"
+        };
+        let assignment_recorded_at_ms = lifecycle
+            .iter()
+            .filter(|event| event.action == assignment_action && event.reason == assignment_reason)
+            .map(|event| event.recorded_at_ms)
+            .max()
+            .or_else(|| {
+                lifecycle
+                    .iter()
+                    .filter(|event| {
+                        event.action == assignment_action
+                            && event.reason == legacy_assignment_reason
+                    })
+                    .map(|event| event.recorded_at_ms)
+                    .max()
+            });
+        let Some(assignment_recorded_at_ms) = assignment_recorded_at_ms else {
+            assignments.remove(&(memory_id, memory_version));
+            continue;
+        };
+        let eligibility_recorded_at_ms = if memory_applied {
+            assignment_recorded_at_ms
+        } else {
+            attempt_recorded_at_ms
+                .ok_or_else(|| "Kioku receipt lacks an attempt-start event".to_string())?
+        };
+        let active_at_eligibility = lifecycle
+            .into_iter()
+            .filter(|event| event.recorded_at_ms <= eligibility_recorded_at_ms)
+            .filter(|event| event.from_state.as_deref() != Some(event.to_state.as_str()))
+            .max_by_key(|event| event.recorded_at_ms)
+            .is_some_and(|event| event.to_state == "active");
+        if !active_at_eligibility
+            || memory.created_at_ms > eligibility_recorded_at_ms
+            || memory
+                .expires_at_ms
+                .is_some_and(|expires| expires <= eligibility_recorded_at_ms)
+            || memory
+                .retention_until_ms
+                .is_some_and(|retention| retention <= eligibility_recorded_at_ms)
+        {
+            pending_lifecycle_events.push(crate::chisei::kioku::MemoryLifecycleEvent {
+                memory_id: memory_id.clone(),
+                memory_version,
+                action: "assignment_invalidated".into(),
+                from_state: Some(memory.state.as_str().into()),
+                to_state: memory.state.as_str().into(),
+                actor: actor.into(),
+                reason: format!("pipeline operation {}", receipt.operation_id),
+                recorded_at_ms: now_ms,
+            });
+            assignments.remove(&(memory_id, memory_version));
+        }
+    }
+    let governed_memories = receipt
+        .events
+        .iter()
+        .filter(|event| event.kind == ReceiptEventKind::ContextGoverned)
+        .flat_map(|event| {
+            event
+                .references
+                .iter()
+                .map(move |reference| (event.timestamp_ms, reference))
+        })
+        .filter(|(_, reference)| reference.kind == "kioku_memory" && !reference.omitted)
+        .collect::<Vec<_>>();
+    if assignments.is_empty() && governed_memories.is_empty() {
+        return Err("Kioku outcome matches no eligible memory assignment".into());
+    }
+    let attempt_recorded_at_ms = attempt_recorded_at_ms
+        .ok_or_else(|| "Kioku receipt lacks an attempt-start event".to_string())?;
+    for (context_recorded_at_ms, reference) in governed_memories {
+        if context_recorded_at_ms > attempt_recorded_at_ms {
+            return Err("Kioku context was recorded after execution started".into());
+        }
+        let Some(pinned) = reference.reference.strip_prefix("memory:") else {
+            return Err(format!(
+                "memory reference {} has no memory prefix",
+                reference.reference
+            ));
+        };
+        let Some((memory_id, version)) = pinned.rsplit_once('@') else {
+            return Err(format!(
+                "memory reference {} does not pin a version",
+                reference.reference
+            ));
+        };
+        let version = version.parse::<u32>().map_err(|_| {
+            format!(
+                "memory reference {} has an invalid version",
+                reference.reference
+            )
+        })?;
+        let key = (memory_id.to_string(), version);
+        if assignments.get(&key) == Some(&false) {
+            return Err(format!(
+                "memory {memory_id}@{version} is both held out and present in the receipt"
+            ));
+        }
+        if assignments.get(&key) == Some(&true) {
+            continue;
+        }
+        let memory = db
+            .get_kioku_memory(memory_id, version)?
+            .ok_or_else(|| format!("memory {memory_id}@{version} not found"))?;
+        if receipt.namespace != memory.namespace
+            || !memory
+                .operation_classes
+                .iter()
+                .any(|class| class == &receipt.operation_class)
+        {
+            return Err(format!(
+                "memory {memory_id}@{version} does not match receipt scope"
+            ));
+        }
+        let active_at_context = db
+            .list_kioku_lifecycle_events(memory_id, version)?
+            .into_iter()
+            .filter(|event| event.recorded_at_ms <= context_recorded_at_ms)
+            .filter(|event| event.from_state.as_deref() != Some(event.to_state.as_str()))
+            .max_by_key(|event| event.recorded_at_ms)
+            .is_some_and(|event| event.to_state == "active");
+        let active_at_attempt = db
+            .list_kioku_lifecycle_events(memory_id, version)?
+            .into_iter()
+            .filter(|event| event.recorded_at_ms <= attempt_recorded_at_ms)
+            .filter(|event| event.from_state.as_deref() != Some(event.to_state.as_str()))
+            .max_by_key(|event| event.recorded_at_ms)
+            .is_some_and(|event| event.to_state == "active");
+        if !active_at_context
+            || !active_at_attempt
+            || memory.created_at_ms > context_recorded_at_ms
+            || memory
+                .expires_at_ms
+                .is_some_and(|expires| expires <= context_recorded_at_ms)
+            || memory
+                .retention_until_ms
+                .is_some_and(|retention| retention <= context_recorded_at_ms)
+            || memory
+                .expires_at_ms
+                .is_some_and(|expires| expires <= attempt_recorded_at_ms)
+            || memory
+                .retention_until_ms
+                .is_some_and(|retention| retention <= attempt_recorded_at_ms)
+        {
+            return Err(format!(
+                "memory {memory_id}@{version} was not active when execution started"
+            ));
+        }
+        let authorized_ceiling = db
+            .kioku_authorized_classification_ceiling(&memory.namespace, &receipt.initiating_actor)
+            .map_err(|_| {
+                format!("initiating actor is not authorized for memory {memory_id}@{version}")
+            })?;
+        if memory.classification > authorized_ceiling {
+            return Err(format!(
+                "memory {memory_id}@{version} exceeds initiating actor authorization"
+            ));
+        }
+        if reference.content_hash.as_deref()
+            != Some(crate::chisei::kioku::memory_claim_digest(&memory).as_str())
+        {
+            return Err(format!(
+                "memory {memory_id}@{version} digest does not match"
+            ));
+        }
+        pending_lifecycle_events.push(crate::chisei::kioku::MemoryLifecycleEvent {
+            memory_id: memory_id.into(),
+            memory_version: version,
+            action: "injected".into(),
+            from_state: Some("active".into()),
+            to_state: "active".into(),
+            actor: receipt.initiating_actor.clone(),
+            reason: format!("pipeline operation {}", receipt.operation_id),
+            recorded_at_ms: context_recorded_at_ms,
+        });
+        assignments.insert(key, true);
+    }
+    let mut assignment_metrics = HashMap::new();
+    let mut known_metrics = HashSet::new();
+    for (memory_id, memory_version) in assignments.keys() {
+        let evidence = db.list_kioku_evidence(memory_id, *memory_version)?;
+        let outcome_metric = evidence
+            .first()
+            .map(|link| link.outcome_metric.trim())
+            .filter(|metric| !metric.is_empty())
+            .ok_or_else(|| format!("memory {memory_id}@{memory_version} has no outcome metric"))?;
+        if !evidence
+            .iter()
+            .all(|link| link.outcome_metric.trim() == outcome_metric)
+        {
+            return Err(format!(
+                "memory {memory_id}@{memory_version} has conflicting outcome metrics"
+            ));
+        }
+        known_metrics.insert(outcome_metric.to_string());
+        assignment_metrics.insert(
+            (memory_id.clone(), *memory_version),
+            outcome_metric.to_string(),
+        );
+    }
+    if let Some(unmatched_metric) = outcomes
+        .keys()
+        .find(|metric| !known_metrics.contains(*metric))
+    {
+        return Err(format!(
+            "Kioku outcome metric {unmatched_metric} matches no assigned memory"
+        ));
+    }
+    if let Some(selected_outcome_metric) = selected_outcome_metric {
+        outcomes.retain(|metric, _| metric == &selected_outcome_metric);
+    }
+    if validate_only {
+        return Ok(Vec::new());
+    }
+    for event in pending_lifecycle_events {
+        db.record_kioku_lifecycle_event(&event)?;
+    }
+    let mut evaluations = Vec::new();
+    for ((memory_id, memory_version), memory_applied) in assignments {
+        let outcome_metric = &assignment_metrics[&(memory_id.clone(), memory_version)];
+        let Some(&(outcome_value, passed)) = outcomes.get(outcome_metric) else {
+            continue;
+        };
+        let recorded =
+            db.record_kioku_outcome(&crate::chisei::kioku::MemoryOutcomeObservation {
+                memory_id: memory_id.clone(),
+                memory_version,
+                operation_id: receipt.operation_id.clone(),
+                request_id: request_id.into(),
+                memory_applied,
+                outcome_metric: outcome_metric.clone(),
+                outcome_value,
+                passed,
+                recorded_at_ms: now_ms,
+            })?;
+        if recorded
+            && let Some(evaluation) = db.evaluate_kioku_impact_if_ready(
+                &memory_id,
+                memory_version,
+                KIOKU_MIN_SAMPLES_PER_ARM,
+                KIOKU_REGRESSION_THRESHOLD,
+                actor,
+                now_ms,
+            )?
+        {
+            evaluations.push(evaluation);
+        }
+    }
+    Ok(evaluations)
+}
 
 fn authenticated_actor<T>(request: &Request<T>) -> String {
     request
@@ -201,6 +560,7 @@ fn record_completed_operation_on(
     plan: &ExecutionPlan,
     actor: &str,
     response: &PlannedChatResponse,
+    attempt_started_at_ms: i64,
     completed_at_ms: i64,
 ) -> Result<(), String> {
     db.update_operation_receipt(&plan.plan_id, |receipt| {
@@ -220,7 +580,7 @@ fn record_completed_operation_on(
                 &receipt.operation_id,
                 "attempt-1",
                 Some(parent),
-                completed_at_ms,
+                attempt_started_at_ms,
                 ReceiptEventKind::AttemptStarted,
                 actor,
                 BTreeMap::from([("attempt".into(), "1".into())]),
@@ -868,6 +1228,7 @@ impl ChiseiServiceImpl {
         input: ExecutionInput,
         authenticated_actor: &str,
     ) -> Result<ExecutionPlan, Status> {
+        let plan_id = uuid::Uuid::new_v4().to_string();
         let normalized_user_id = if input.user_id.is_empty() {
             "default".to_string()
         } else {
@@ -899,7 +1260,9 @@ impl ChiseiServiceImpl {
             expanded_context_items: 0,
             evidence_references: vec![],
             memory_references: vec![],
+            memory_holdouts: vec![],
             memory_actor: authenticated_actor.into(),
+            memory_assignment_id: plan_id.clone(),
             memory_token_budget: 512,
             allowed_evidence_classes: std::collections::HashSet::new(),
         };
@@ -962,7 +1325,9 @@ impl ChiseiServiceImpl {
                     expanded_context_items: 0,
                     evidence_references: vec![],
                     memory_references: vec![],
+                    memory_holdouts: vec![],
                     memory_actor: authenticated_actor.into(),
+                    memory_assignment_id: plan_id.clone(),
                     memory_token_budget: 512,
                     allowed_evidence_classes: std::collections::HashSet::new(),
                 };
@@ -1216,7 +1581,7 @@ impl ChiseiServiceImpl {
             &egress_decisions,
         );
         Ok(ExecutionPlan {
-            plan_id: uuid::Uuid::new_v4().to_string(),
+            plan_id,
             input: Some(normalized_input),
             resolved_runtime,
             resolved_model: resolved_model.clone(),
@@ -1273,6 +1638,16 @@ impl ChiseiServiceImpl {
                 .map(memory_context_reference)
                 .collect(),
             planning_actor: authenticated_actor.into(),
+            memory_holdouts: run
+                .memory_holdouts
+                .iter()
+                .map(|holdout| super::pb::chisei::MemoryHoldoutReference {
+                    memory_id: holdout.memory_id.clone(),
+                    memory_version: holdout.memory_version,
+                    classification: holdout.classification.clone(),
+                    content_digest: holdout.content_digest.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -1289,7 +1664,7 @@ impl ChiseiServiceImpl {
 
     fn record_execution_memory_injections(
         &self,
-        request_id: &str,
+        operation_id: &str,
         actor: &str,
         references: &[MemoryContextReference],
     ) -> Result<(), Status> {
@@ -1338,10 +1713,55 @@ impl ChiseiServiceImpl {
                     from_state: Some("active".into()),
                     to_state: "active".into(),
                     actor: actor.into(),
-                    reason: format!("pipeline request {request_id}"),
+                    reason: format!("pipeline operation {operation_id}"),
                     recorded_at_ms: now_ms,
                 })
                 .map_err(Status::internal)?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_ineligible_execution_memory_holdouts(
+        &self,
+        operation_id: &str,
+        actor: &str,
+        references: &[super::pb::chisei::MemoryHoldoutReference],
+    ) -> Result<(), Status> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for reference in references {
+            let Some(memory) = self
+                .db
+                .get_kioku_memory(&reference.memory_id, reference.memory_version)
+                .map_err(Status::internal)?
+            else {
+                continue;
+            };
+            let authorized = self
+                .db
+                .kioku_authorized_classification_ceiling(&memory.namespace, actor)
+                .is_ok_and(|ceiling| memory.classification <= ceiling);
+            let eligible = memory_lifecycle_allows_execution(
+                memory.state,
+                memory.expires_at_ms,
+                memory.retention_until_ms,
+                now_ms,
+            ) && authorized
+                && memory.classification.as_str() == reference.classification
+                && crate::chisei::kioku::memory_claim_digest(&memory) == reference.content_digest;
+            if !eligible {
+                self.db
+                    .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
+                        memory_id: reference.memory_id.clone(),
+                        memory_version: reference.memory_version,
+                        action: "holdout_invalidated".into(),
+                        from_state: Some(memory.state.as_str().into()),
+                        to_state: memory.state.as_str().into(),
+                        actor: actor.into(),
+                        reason: format!("pipeline operation {operation_id}"),
+                        recorded_at_ms: now_ms,
+                    })
+                    .map_err(Status::internal)?;
+            }
         }
         Ok(())
     }
@@ -1547,12 +1967,16 @@ impl ChiseiServiceImpl {
             ));
             (Some(started), Vec::new())
         };
-        self.db.put_operation_receipt(&OperationReceipt {
+        let receipt = OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id,
             parent_operation_id: None,
             namespace: input.namespace.clone(),
-            operation_class: "model_inference".into(),
+            operation_class: if input.task_type.trim().is_empty() {
+                "model_inference".into()
+            } else {
+                input.task_type.trim().into()
+            },
             initiating_actor: actor.to_string(),
             schema_version: EXECUTION_SCHEMA_VERSION.into(),
             policy_version,
@@ -1561,7 +1985,15 @@ impl ChiseiServiceImpl {
             events,
             uncovered_surfaces,
             reporter_grants: Vec::new(),
-        })
+        };
+        let holdouts = plan
+            .memory_holdouts
+            .iter()
+            .map(|holdout| (holdout.memory_id.clone(), holdout.memory_version))
+            .collect::<Vec<_>>();
+        self.db
+            .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
+        Ok(())
     }
 
     fn record_completed_operation(
@@ -1569,9 +2001,17 @@ impl ChiseiServiceImpl {
         plan: &ExecutionPlan,
         actor: &str,
         response: &PlannedChatResponse,
+        attempt_started_at_ms: i64,
         completed_at_ms: i64,
     ) -> Result<(), String> {
-        record_completed_operation_on(&self.db, plan, actor, response, completed_at_ms)
+        record_completed_operation_on(
+            &self.db,
+            plan,
+            actor,
+            response,
+            attempt_started_at_ms,
+            completed_at_ms,
+        )
     }
 
     async fn resolve_model_for_run(
@@ -3533,7 +3973,9 @@ impl ChiseiService for ChiseiServiceImpl {
             expanded_context_items: 0,
             evidence_references: vec![],
             memory_references: vec![],
+            memory_holdouts: vec![],
             memory_actor: actor.clone(),
+            memory_assignment_id: String::new(),
             memory_token_budget: 512,
             allowed_evidence_classes: std::collections::HashSet::new(),
         };
@@ -3733,19 +4175,71 @@ impl ChiseiService for ChiseiServiceImpl {
                     completeness.missing_surfaces, completeness.errors
                 )));
             }
-            if let Some(existing) = self
+            let has_kioku_context = receipt.events.iter().any(|receipt_event| {
+                receipt_event.kind == ReceiptEventKind::ContextGoverned
+                    && receipt_event
+                        .references
+                        .iter()
+                        .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
+            }) || !self
+                .db
+                .list_kioku_outcome_assignments(&receipt.operation_id)
+                .map_err(Status::internal)?
+                .is_empty();
+            let existing = self
                 .db
                 .get_operation_receipt(&receipt.operation_id)
-                .map_err(Status::internal)?
-                && existing != receipt
+                .map_err(Status::internal)?;
+            if existing
+                .as_ref()
+                .is_some_and(|existing| existing != &receipt)
             {
                 return Err(Status::already_exists(
                     "operation receipt already exists with different evidence",
                 ));
             }
+            if existing.is_none() && has_kioku_context {
+                record_reported_memory_outcomes(
+                    &self.db,
+                    &receipt,
+                    &authenticated_principal,
+                    now,
+                    false,
+                    None,
+                    true,
+                )
+                .map_err(|error| {
+                    Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
+                })?;
+            }
             self.db
                 .put_operation_receipt(&receipt)
                 .map_err(Status::internal)?;
+            if has_kioku_context
+                && let Err(error) = record_reported_memory_outcomes(
+                    &self.db,
+                    &receipt,
+                    &authenticated_principal,
+                    now,
+                    false,
+                    None,
+                    false,
+                )
+            {
+                let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    actor: "chisei.kioku".into(),
+                    action: "kioku.outcome_attribution".into(),
+                    reason: error,
+                    evidence: std::collections::HashMap::from([
+                        ("operation_id".into(), receipt.operation_id.clone()),
+                        ("gateway_audit_event_id".into(), event.id.clone()),
+                    ]),
+                    target_id: receipt.operation_id.clone(),
+                    outcome: "failed".into(),
+                });
+            }
         }
         self.db
             .record_decision(&crate::sekai::audit::Decision {
@@ -3950,11 +4444,13 @@ impl ChiseiService for ChiseiServiceImpl {
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
-        self.record_execution_memory_injections(
-            &input.request_id,
+        let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
+        self.invalidate_ineligible_execution_memory_holdouts(
+            &plan.plan_id,
             &actor,
-            &plan.memory_references,
+            &plan.memory_holdouts,
         )?;
+        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
         let chat = match execute_chat_request(&self.config, self.budget.clone(), llm_req).await {
             Ok(chat) => chat,
             Err(status) => {
@@ -3993,8 +4489,14 @@ impl ChiseiService for ChiseiServiceImpl {
             return Err(Status::internal(error));
         }
         let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        self.record_completed_operation(&plan, &actor, &response, completed_at_ms)
-            .map_err(Status::internal)?;
+        self.record_completed_operation(
+            &plan,
+            &actor,
+            &response,
+            attempt_started_at_ms,
+            completed_at_ms,
+        )
+        .map_err(Status::internal)?;
         // Sampling consumption: a sampled request was selected for deeper
         // observation, so capture its actual execution outcome as a durable
         // audit record keyed to the request. Unsampled executions skip this —
@@ -4155,11 +4657,13 @@ impl ChiseiService for ChiseiServiceImpl {
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
-        self.record_execution_memory_injections(
-            &input.request_id,
+        let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
+        self.invalidate_ineligible_execution_memory_holdouts(
+            &plan.plan_id,
             &actor,
-            &plan.memory_references,
+            &plan.memory_holdouts,
         )?;
+        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
         let chat_stream =
             match execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await {
                 Ok(stream) => stream,
@@ -4272,6 +4776,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         &receipt_plan,
                         &actor,
                         &response,
+                        attempt_started_at_ms,
                         completed_at_ms,
                     ) {
                         yield Err(Status::internal(error));
@@ -4330,6 +4835,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     &receipt_plan,
                     &actor,
                     &response,
+                    attempt_started_at_ms,
                     completed_at_ms,
                 ) {
                     yield Err(Status::internal(error));
@@ -4533,12 +5039,23 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ReportOperationEventRequest>,
     ) -> Result<Response<ReportOperationEventResponse>, Status> {
         let actor = authenticated_actor(&req);
+        let request_auth_source = auth_source(&req);
+        let configured_gateway = self
+            .config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor);
+        let trusted_outcome_reporter = (request_auth_source.as_deref() == Some("token")
+            && (configured_gateway || matches!(actor.as_str(), "chisei-gateway" | "root")))
+            || (self.config.insecure
+                && request_auth_source.as_deref() == Some("local")
+                && actor == "chisei-gateway");
         if !receipt_mutation_transport_allowed(&req, &self.config) {
             return Err(Status::permission_denied(
                 "operation event reporting requires authenticated transport",
             ));
         }
-        let request = req.into_inner();
+        let mut request = req.into_inner();
         if request.operation_id.trim().is_empty() {
             return Err(Status::invalid_argument("operation_id required"));
         }
@@ -4547,6 +5064,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
+        let receipt_was_complete = receipt.completeness().complete;
         let kind = ReceiptEventKind::parse(&request.kind)
             .ok_or(Status::invalid_argument("unsupported operation event kind"))?;
         if !reportable_receipt_kind(kind) {
@@ -4554,11 +5072,97 @@ impl ChiseiService for ChiseiServiceImpl {
                 "event kind is not reportable through this API",
             ));
         }
+        let receipt_has_kioku_context = !self
+            .db
+            .list_kioku_outcome_assignments(&receipt.operation_id)
+            .map_err(Status::internal)?
+            .is_empty()
+            || receipt.events.iter().any(|event| {
+                event.kind == ReceiptEventKind::ContextGoverned
+                    && event
+                        .references
+                        .iter()
+                        .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
+            });
+        let supplies_kioku_outcome = ["outcome_metric", "outcome_value"]
+            .iter()
+            .any(|attribute| request.attributes.contains_key(*attribute));
+        let complete_kioku_outcome = ["outcome_metric", "outcome_value", "passed"]
+            .iter()
+            .all(|attribute| request.attributes.contains_key(*attribute));
+        if kind == ReceiptEventKind::OutcomeRecorded
+            && receipt_has_kioku_context
+            && supplies_kioku_outcome
+            && !complete_kioku_outcome
+        {
+            return Err(Status::invalid_argument(
+                "Kioku outcomes require outcome_metric, outcome_value, and passed",
+            ));
+        }
+        if kind == ReceiptEventKind::OutcomeRecorded
+            && receipt_has_kioku_context
+            && complete_kioku_outcome
+        {
+            let outcome_metric = request.attributes["outcome_metric"].trim().to_string();
+            if outcome_metric.is_empty() {
+                return Err(Status::invalid_argument(
+                    "Kioku outcome_metric must not be empty",
+                ));
+            }
+            request
+                .attributes
+                .insert("outcome_metric".into(), outcome_metric);
+            let outcome_value = request.attributes["outcome_value"]
+                .parse::<f64>()
+                .map_err(|_| Status::invalid_argument("Kioku outcome_value must be finite"))?;
+            if !outcome_value.is_finite() {
+                return Err(Status::invalid_argument(
+                    "Kioku outcome_value must be finite",
+                ));
+            }
+            request.attributes["passed"]
+                .parse::<bool>()
+                .map_err(|_| Status::invalid_argument("Kioku passed must be boolean"))?;
+        }
+        if kind == ReceiptEventKind::OutcomeRecorded
+            && receipt_has_kioku_context
+            && supplies_kioku_outcome
+            && !trusted_outcome_reporter
+        {
+            return Err(Status::permission_denied(
+                "Kioku outcome reporting requires a trusted gateway principal",
+            ));
+        }
+        let stored_kind = if let Some(existing_kind) = receipt
+            .events
+            .iter()
+            .find(|event| event.event_id == request.event_id)
+            .map(|event| event.kind)
+        {
+            existing_kind
+        } else if kind == ReceiptEventKind::OutcomeRecorded
+            && receipt_was_complete
+            && receipt_has_kioku_context
+            && complete_kioku_outcome
+            && trusted_outcome_reporter
+        {
+            ReceiptEventKind::MemoryOutcomeRecorded
+        } else {
+            kind
+        };
         let explicitly_granted = receipt
             .reporter_grants
             .iter()
             .any(|grant| grant.principal == actor && grant.event_kinds.contains(&kind));
-        if actor != receipt.initiating_actor && actor != "root" && !explicitly_granted {
+        let trusted_kioku_outcome = kind == ReceiptEventKind::OutcomeRecorded
+            && receipt_has_kioku_context
+            && complete_kioku_outcome
+            && trusted_outcome_reporter;
+        if actor != receipt.initiating_actor
+            && actor != "root"
+            && !explicitly_granted
+            && !trusted_kioku_outcome
+        {
             return Err(Status::permission_denied(
                 "operation event reporter is not authorized for this event kind",
             ));
@@ -4678,17 +5282,67 @@ impl ChiseiService for ChiseiServiceImpl {
                 "reported event_id must start with {reported_event_prefix:?}"
             )));
         };
+        let mut attributes = request.attributes.into_iter().collect::<BTreeMap<_, _>>();
+        attributes.remove(KIOKU_TRUSTED_OUTCOME_ATTRIBUTE);
+        if matches!(
+            stored_kind,
+            ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+        ) && trusted_outcome_reporter
+            && complete_kioku_outcome
+        {
+            attributes.insert(KIOKU_TRUSTED_OUTCOME_ATTRIBUTE.into(), "true".into());
+        }
         let event = OperationReceiptEvent {
             event_id: event_id.clone(),
             operation_id: request.operation_id.clone(),
             parent_event_id: Some(request.parent_event_id),
             timestamp_ms,
-            kind,
-            surface: kind.surface(),
-            actor,
+            kind: stored_kind,
+            surface: stored_kind.surface(),
+            actor: actor.clone(),
             references,
-            attributes: request.attributes.into_iter().collect(),
+            attributes,
         };
+        let mut prospective_receipt = receipt.clone();
+        let prospective_event_recorded = !prospective_receipt
+            .events
+            .iter()
+            .any(|existing| existing.event_id == event.event_id);
+        if prospective_event_recorded {
+            prospective_receipt
+                .uncovered_surfaces
+                .retain(|entry| entry.surface != event.surface);
+            if event.kind == ReceiptEventKind::OutcomeRecorded {
+                prospective_receipt.completed_at_ms = Some(event.timestamp_ms);
+            }
+            prospective_receipt.events.push(event.clone());
+        }
+        let prospective_completeness = prospective_receipt.completeness();
+        let should_preflight_attribution = prospective_event_recorded
+            && receipt_has_kioku_context
+            && prospective_completeness.complete
+            && ((!receipt_was_complete)
+                || (trusted_outcome_reporter
+                    && complete_kioku_outcome
+                    && matches!(
+                        stored_kind,
+                        ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+                    )));
+        if should_preflight_attribution {
+            record_reported_memory_outcomes(
+                &self.db,
+                &prospective_receipt,
+                &actor,
+                now,
+                true,
+                (stored_kind == ReceiptEventKind::MemoryOutcomeRecorded)
+                    .then_some(event_id.as_str()),
+                true,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("Kioku outcome attribution invalid: {error}"))
+            })?;
+        }
         let (receipt, recorded) = self
             .db
             .append_operation_receipt_event(&request.operation_id, event)
@@ -4702,6 +5356,41 @@ impl ChiseiService for ChiseiServiceImpl {
                 }
             })?;
         let completeness = receipt.completeness();
+        let should_attribute = receipt_has_kioku_context
+            && completeness.complete
+            && ((recorded && !receipt_was_complete)
+                || (trusted_outcome_reporter
+                    && complete_kioku_outcome
+                    && matches!(
+                        stored_kind,
+                        ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+                    )));
+        if should_attribute
+            && let Err(error) = record_reported_memory_outcomes(
+                &self.db,
+                &receipt,
+                &actor,
+                now,
+                true,
+                (stored_kind == ReceiptEventKind::MemoryOutcomeRecorded)
+                    .then_some(event_id.as_str()),
+                false,
+            )
+        {
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now,
+                actor: "chisei.kioku".into(),
+                action: "kioku.outcome_attribution".into(),
+                reason: error,
+                evidence: std::collections::HashMap::from([
+                    ("operation_id".into(), receipt.operation_id.clone()),
+                    ("receipt_event_id".into(), event_id.clone()),
+                ]),
+                target_id: receipt.operation_id.clone(),
+                outcome: "failed".into(),
+            });
+        }
         Ok(Response::new(ReportOperationEventResponse {
             event_id,
             recorded,
@@ -8099,6 +8788,7 @@ mod tests {
                 provider: "native".into(),
             },
             plan.created_at,
+            plan.created_at,
         )
         .unwrap();
         let completed = svc
@@ -8115,6 +8805,7 @@ mod tests {
         }));
         assert!(completed.events.iter().any(|event| {
             event.event_id.ends_with(":attempt-1")
+                && event.timestamp_ms == plan.created_at
                 && event.parent_event_id.as_deref()
                     == Some(format!("{}:budget", plan.plan_id).as_str())
         }));
@@ -8479,7 +9170,7 @@ mod tests {
                 request_id: "request-with-evidence".into(),
                 namespace: "acme".into(),
                 spec: "use governed evidence".into(),
-                task_type: "verification".into(),
+                task_type: " verification ".into(),
                 ..Default::default()
             }),
             created_at: 100,
@@ -8508,6 +9199,7 @@ mod tests {
             .get_operation_receipt(&plan.plan_id)
             .unwrap()
             .unwrap();
+        assert_eq!(receipt.operation_class, "verification");
         let evidence = receipt
             .events
             .iter()
@@ -8576,6 +9268,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn missing_execution_memory_holdout_does_not_block_execution() {
+        let svc = memory_service();
+        svc.invalidate_ineligible_execution_memory_holdouts(
+            "operation-1",
+            "agent:test",
+            &[MemoryHoldoutReference {
+                memory_id: "purged-memory".into(),
+                memory_version: 4,
+                classification: "internal".into(),
+                content_digest: "c".repeat(64),
+            }],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -9286,6 +9994,7 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: "local".into(),
+            memory_holdouts: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -9303,6 +10012,7 @@ mod tests {
         let plan = ExecutionPlan {
             plan_id: "actor-bound-plan".into(),
             planning_actor: "agent:planner".into(),
+            memory_holdouts: vec![],
             executable: true,
             created_at: chrono::Utc::now().timestamp_millis(),
             ..Default::default()
@@ -9379,6 +10089,7 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: "local".into(),
+            memory_holdouts: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -9488,6 +10199,7 @@ mod tests {
                 evidence_references: vec![],
                 memory_references: vec![],
                 planning_actor: String::new(),
+                memory_holdouts: vec![],
             });
         }
         let newest = ExecutionPlan {
@@ -9519,6 +10231,7 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            memory_holdouts: vec![],
         };
         svc.cache_plan(newest.clone());
 
@@ -9564,6 +10277,7 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            memory_holdouts: vec![],
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -9615,6 +10329,7 @@ mod tests {
                 evidence_references: vec![],
                 memory_references: vec![],
                 planning_actor: String::new(),
+                memory_holdouts: vec![],
             });
         }
         let inserted = ExecutionPlan {
@@ -9646,6 +10361,7 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            memory_holdouts: vec![],
         };
         svc.cache_plan(inserted.clone());
 

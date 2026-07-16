@@ -103,6 +103,13 @@ message MemoryContextReference {
   string content_digest = 7;
 }
 
+message MemoryHoldoutReference {
+  string memory_id = 1;
+  uint32 memory_version = 2;
+  string classification = 3;
+  string content_digest = 4;
+}
+
 message ContextEvidenceReference {
   string submission_id = 1;
   string source_type = 2;
@@ -198,6 +205,7 @@ message ExecutionPlan {
   repeated ContextEvidenceReference evidence_references = 26;
   repeated MemoryContextReference memory_references = 27;
   string planning_actor = 28;
+  repeated MemoryHoldoutReference memory_holdouts = 29;
 }
 
 message EgressDecision {
