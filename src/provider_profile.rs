@@ -3,6 +3,62 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_MATRIX_VERSION: &str = "chisei.provider-capabilities/v1";
+pub const RESPONSES_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "max_output_tokens",
+    "stream",
+    "metadata",
+    "previous_response_id",
+    "reasoning",
+    "text",
+    "temperature",
+    "top_p",
+    "truncation",
+    "store",
+];
+
+pub fn normalize_responses_request(body: &[u8]) -> Result<Vec<u8>, String> {
+    validate_responses_request_fields(body)?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
+    if object
+        .get("store")
+        .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return Err("Responses store must be false".into());
+    }
+    object.insert("store".into(), serde_json::Value::Bool(false));
+    serde_json::to_vec(&value).map_err(|error| error.to_string())
+}
+
+pub fn validate_responses_request_fields(body: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
+    let mut unsupported = object
+        .keys()
+        .filter(|field| !RESPONSES_REQUEST_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported Responses request fields: {}",
+        unsupported.join(", ")
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -345,6 +401,39 @@ mod tests {
             required
                 .unsupported_by(matrix.capabilities("ollama").unwrap())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn request_field_allowlist_blocks_retention_and_provider_extensions() {
+        assert!(
+            validate_responses_request_fields(
+                br#"{"model":"gpt-5.5","input":"hi","service_tier":"flex"}"#
+            )
+            .unwrap_err()
+            .contains("service_tier")
+        );
+        assert!(
+            validate_responses_request_fields(
+                br#"{"model":"gpt-5.5","input":"hi","stream":true,"reasoning":{"effort":"high"}}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn responses_requests_are_forced_to_disable_provider_storage() {
+        let normalized =
+            normalize_responses_request(br#"{"model":"gpt-5.5","input":"hi"}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(value["store"], false);
+        assert!(
+            normalize_responses_request(br#"{"model":"gpt-5.5","input":"hi","store":false}"#)
+                .is_ok()
+        );
+        assert!(
+            normalize_responses_request(br#"{"model":"gpt-5.5","input":"hi","store":true}"#)
+                .is_err()
         );
     }
 }
