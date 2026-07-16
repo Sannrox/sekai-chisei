@@ -27,7 +27,13 @@ pub struct PipelineRequest {
     pub memory_actor: String,
     pub memory_token_budget: usize,
     pub memory_references: Vec<MemoryContextReference>,
-    pub allowed_evidence_types: HashSet<String>,
+    pub allowed_evidence_classes: HashSet<EvidenceContextClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EvidenceContextClass {
+    pub source_type: String,
+    pub evidence_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,16 +219,19 @@ fn collect_external_evidence_context(
     target_object_ids: &[String],
 ) -> Vec<String> {
     const DISCLOSABLE_FIELDS: [&str; 5] = ["status", "result", "outcome", "state", "value"];
-    let mut allowed_evidence_types = req
-        .allowed_evidence_types
+    let mut allowed_evidence_classes = req
+        .allowed_evidence_classes
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    allowed_evidence_types.sort();
+    allowed_evidence_classes.sort();
     let evidence = db
         .list_usable_evidence_for_targets(
             target_object_ids,
-            &allowed_evidence_types,
+            &allowed_evidence_classes
+                .iter()
+                .map(|class| (class.source_type.clone(), class.evidence_type.clone()))
+                .collect::<Vec<_>>(),
             chrono::Utc::now().timestamp_millis(),
             8,
         )
@@ -277,18 +286,27 @@ fn collect_external_evidence_context(
     lines
 }
 
-pub fn applicable_evidence_types(
+pub fn applicable_evidence_classes(
     req: &PipelineRequest,
     db: &SekaiDb,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<EvidenceContextClass>, String> {
     let target_object_ids = resolve_context_objects(req, db)
         .into_iter()
         .map(|object| object.id)
         .collect::<Vec<_>>();
-    db.list_usable_evidence_types_for_targets(
+    db.list_usable_evidence_classes_for_targets(
         &target_object_ids,
         chrono::Utc::now().timestamp_millis(),
     )
+    .map(|classes| {
+        classes
+            .into_iter()
+            .map(|(source_type, evidence_type)| EvidenceContextClass {
+                source_type,
+                evidence_type,
+            })
+            .collect()
+    })
 }
 
 fn object_implements(db: &SekaiDb, obj: &Object, interface_name: &str) -> bool {
@@ -752,12 +770,12 @@ impl Pipeline {
         req: &mut PipelineRequest,
         db: &SekaiDb,
         context_expansion_allowed: bool,
-        allowed_evidence_types: HashSet<String>,
+        allowed_evidence_classes: HashSet<EvidenceContextClass>,
     ) -> RunResult {
         req.expanded_context_items = 0;
         req.evidence_references.clear();
         req.memory_references.clear();
-        req.allowed_evidence_types = allowed_evidence_types;
+        req.allowed_evidence_classes = allowed_evidence_classes;
         let decisions: Vec<StepDecision> = self
             .steps
             .iter()
@@ -888,21 +906,6 @@ fn run_kioku_enrich(
             .iter()
             .map(|link| link.operation_id.clone())
             .collect::<Vec<_>>();
-        if db
-            .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
-                memory_id: item.memory.id.clone(),
-                memory_version: item.memory.version,
-                action: "injected".into(),
-                from_state: Some("active".into()),
-                to_state: "active".into(),
-                actor: req.memory_actor.clone(),
-                reason: format!("pipeline request {}", req.request_id),
-                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
-            })
-            .is_err()
-        {
-            continue;
-        }
         remaining_tokens -= estimated_tokens;
         lines.push(line);
         req.memory_references.push(MemoryContextReference {
@@ -1577,12 +1580,12 @@ mod tests {
             memory_actor: String::new(),
             memory_token_budget: 0,
             memory_references: vec![],
-            allowed_evidence_types: HashSet::new(),
+            allowed_evidence_classes: HashSet::new(),
         }
     }
 
     #[test]
-    fn kioku_injection_is_eval_gated_scoped_and_audited() {
+    fn kioku_enrichment_is_eval_gated_scoped_and_side_effect_free() {
         let db = SekaiDb::new(":memory:").unwrap();
         for object in [
             Object {
@@ -1681,13 +1684,11 @@ mod tests {
         assert_eq!(result.memory_references.len(), 1);
         assert_eq!(result.memory_references[0].memory_id, "memory-migrations");
         assert_eq!(result.egress_records[0].included_fields, vec!["claim"]);
-        assert_eq!(
+        assert!(
             db.list_kioku_lifecycle_events("memory-migrations", 1)
                 .unwrap()
-                .last()
-                .unwrap()
-                .action,
-            "injected"
+                .iter()
+                .all(|event| event.action != "injected")
         );
 
         let mut external = request;
@@ -1709,6 +1710,7 @@ mod tests {
             &EvidenceProducerCapability {
                 producer_identity: "producer:checks".into(),
                 config_version: 1,
+                source_types: vec!["verification_system".into()],
                 source_instances: vec!["checks-primary".into()],
                 namespaces: vec!["acme".into()],
                 evidence_types: vec![
@@ -1865,7 +1867,10 @@ mod tests {
             &mut external,
             &db,
             true,
-            HashSet::from(["verification.result".into()]),
+            HashSet::from([EvidenceContextClass {
+                source_type: "verification_system".into(),
+                evidence_type: "verification.result".into(),
+            }]),
         );
         assert!(
             external_result
@@ -1901,7 +1906,10 @@ mod tests {
             &mut local,
             &db,
             true,
-            HashSet::from(["verification.result".into()]),
+            HashSet::from([EvidenceContextClass {
+                source_type: "verification_system".into(),
+                evidence_type: "verification.result".into(),
+            }]),
         );
         assert_eq!(local_result.evidence_references.len(), 2);
         assert!(
@@ -2077,7 +2085,7 @@ mod tests {
             memory_actor: String::new(),
             memory_token_budget: 0,
             memory_references: vec![],
-            allowed_evidence_types: HashSet::new(),
+            allowed_evidence_classes: HashSet::new(),
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");

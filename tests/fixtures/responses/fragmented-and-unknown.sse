@@ -7,6 +7,9 @@ data: {"type":"response.future.delta","opaque":{"version":2}}
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"delta":"hello"}
 
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","content":[{"type":"output_text","text":"hello"}]}}
+
 event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_fixture","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}
 

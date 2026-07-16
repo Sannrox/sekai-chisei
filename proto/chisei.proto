@@ -195,6 +195,7 @@ message ExecutionPlan {
   repeated EgressDecision egress_decisions = 24;
   string task_class = 25;
   repeated ContextEvidenceReference evidence_references = 26;
+  repeated MemoryContextReference memory_references = 27;
 }
 
 message EgressDecision {
@@ -644,7 +645,11 @@ message ListEvalIterationsRequest { string suite_id = 1; string changed_file = 2
 message ListEvalIterationsResponse { repeated EvalIteration iterations = 1; }
 message CompareRunsRequest { string baseline_id = 1; string candidate_id = 2; }
 message CompareRunsResponse { GateDecision decision = 1; }
-message GetEvidenceContextGateRequest { string namespace = 1; string evidence_type = 2; }
+message GetEvidenceContextGateRequest {
+  string namespace = 1;
+  string evidence_type = 2;
+  string source_type = 3;
+}
 message EvidenceContextGate {
   string evidence_type = 1;
   string profile_key = 2;
@@ -656,6 +661,7 @@ message EvidenceContextGate {
   string candidate_run_id = 8;
   string expected_baseline_config_ref = 9;
   string expected_candidate_config_ref = 10;
+  string source_type = 11;
 }
 message GetEvidenceContextGateResponse { EvidenceContextGate gate = 1; }
 message EvalVarianceRequest { string suite_id = 1; string config_ref = 2; }
