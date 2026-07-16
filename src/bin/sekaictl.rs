@@ -49,6 +49,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map_err(std::io::Error::other)?;
             run_launch(config).await
         }
+        "doctor" => {
+            sekai_chisei::launch::load_local_env();
+            let agent = args.get(1).map(String::as_str);
+            if args.len() > 2 {
+                return Err(std::io::Error::other(
+                    "usage: sekaictl doctor [codex-app|claude-code]",
+                )
+                .into());
+            }
+            let checks = sekai_chisei::onboarding::run_doctor(agent);
+            print!("{}", sekai_chisei::onboarding::render_doctor(&checks));
+            if checks
+                .iter()
+                .any(|check| check.status == sekai_chisei::onboarding::CheckStatus::Failed)
+            {
+                return Err(std::io::Error::other("doctor found blocking failures").into());
+            }
+            Ok(())
+        }
         "provenance" => {
             sekai_chisei::launch::load_local_env();
             let work_unit = args
@@ -191,7 +210,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|action|attest|estimate|provenance|receipt> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|action|attest|estimate|provenance|receipt> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -201,6 +220,7 @@ fn print_root_usage() {
     println!("  sekaictl gateway report [...]");
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
+    println!("\nDiagnostics:\n  sekaictl doctor [codex-app|claude-code]");
     println!("\nCost estimate:");
     println!("  {}", estimate_usage());
     println!("\nGoverned action commands:");
