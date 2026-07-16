@@ -223,6 +223,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "ListFunctions"
                 | "ExecuteFunction"
                 | "CreateDataset"
+                | "UpdateDataset"
                 | "ListDatasets"
                 | "AppendRows"
                 | "QueryRows"

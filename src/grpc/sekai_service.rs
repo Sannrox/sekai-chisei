@@ -39,10 +39,18 @@ pub struct SekaiServiceImpl {
     schema_unavailable_error: Arc<RwLock<Option<String>>>,
     schema_load_errors: Arc<RwLock<std::collections::HashMap<String, String>>>,
     budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
+    gateway_schema_principals: Vec<String>,
 }
 
 impl SekaiServiceImpl {
     pub fn new(db: Arc<SekaiDb>) -> Self {
+        Self::new_with_gateway_schema_principals(db, Vec::new())
+    }
+
+    pub fn new_with_gateway_schema_principals(
+        db: Arc<SekaiDb>,
+        gateway_schema_principals: Vec<String>,
+    ) -> Self {
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
@@ -90,6 +98,7 @@ impl SekaiServiceImpl {
             schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
             schema_load_errors: Arc::new(RwLock::new(schema_load_errors)),
             budget: None,
+            gateway_schema_principals,
         }
     }
 
@@ -100,6 +109,16 @@ impl SekaiServiceImpl {
         budget: Arc<crate::chisei::budget::BudgetTracker>,
     ) -> Self {
         let mut svc = Self::new(db);
+        svc.budget = Some(budget);
+        svc
+    }
+
+    pub fn with_budget_and_gateway_schema_principals(
+        db: Arc<SekaiDb>,
+        budget: Arc<crate::chisei::budget::BudgetTracker>,
+        gateway_schema_principals: Vec<String>,
+    ) -> Self {
+        let mut svc = Self::new_with_gateway_schema_principals(db, gateway_schema_principals);
         svc.budget = Some(budget);
         svc
     }
@@ -4817,6 +4836,45 @@ impl SekaiService for SekaiServiceImpl {
             dataset: Some(to_proto_dataset(&parsed)),
         }))
     }
+    async fn update_dataset(
+        &self,
+        req: Request<UpdateDatasetRequest>,
+    ) -> Result<Response<UpdateDatasetResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let dataset = req
+            .into_inner()
+            .dataset
+            .ok_or(Status::invalid_argument("dataset required"))?;
+        let parsed = from_proto_dataset(&dataset);
+        let existing = self
+            .db
+            .get_dataset(&parsed.id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("dataset not found"))?;
+        if existing.object_id.is_empty() {
+            let trusted_gateway = principals.iter().any(|principal| {
+                matches!(principal.as_str(), "chisei-gateway" | "root")
+                    || self.gateway_schema_principals.contains(principal)
+            });
+            if !trusted_gateway {
+                return Err(Status::permission_denied(
+                    "unbound dataset updates require the gateway service principal",
+                ));
+            }
+        } else {
+            check_write(&self.security, &existing.object_id, &principals)?;
+        }
+        self.db.update_dataset(&parsed).map_err(Status::internal)?;
+        let updated = self
+            .db
+            .get_dataset(&parsed.id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("dataset not found"))?;
+        Ok(Response::new(UpdateDatasetResponse {
+            dataset: Some(to_proto_dataset(&updated)),
+        }))
+    }
     async fn list_datasets(
         &self,
         req: Request<ListDatasetsRequest>,
@@ -8069,6 +8127,101 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(queried.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_dataset_requires_write_access_to_existing_binding() {
+        let svc = service();
+        svc.create_dataset(with_principal(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "protected-dataset".into(),
+                name: "original".into(),
+                columns: vec![ColumnDef {
+                    name: "value".into(),
+                    r#type: "string".into(),
+                }],
+                object_id: "protected-object".into(),
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        let grant = security::Grant {
+            id: "dataset-owner".into(),
+            object_id: "protected-object".into(),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+
+        let error = svc
+            .update_dataset(with_named_principal(
+                UpdateDatasetRequest {
+                    dataset: Some(Dataset {
+                        id: "protected-dataset".into(),
+                        name: "hijacked".into(),
+                        columns: vec![],
+                        object_id: String::new(),
+                        created: 999,
+                    }),
+                },
+                "intruder",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let stored = svc.db.get_dataset("protected-dataset").unwrap().unwrap();
+        assert_eq!(stored.name, "original");
+        assert_eq!(stored.object_id, "protected-object");
+    }
+
+    #[tokio::test]
+    async fn update_unbound_dataset_requires_gateway_service_principal() {
+        let mut svc = service();
+        svc.gateway_schema_principals = vec!["gateway-prod".into()];
+        svc.create_dataset(with_principal(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "system-dataset".into(),
+                name: "original".into(),
+                columns: vec![],
+                object_id: String::new(),
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        let update = UpdateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "system-dataset".into(),
+                name: "updated".into(),
+                columns: vec![ColumnDef {
+                    name: "receipt_id".into(),
+                    r#type: "string".into(),
+                }],
+                object_id: String::new(),
+                created: 999,
+            }),
+        };
+
+        let error = svc
+            .update_dataset(with_principal(update.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let updated = svc
+            .update_dataset(with_named_principal(update, "gateway-prod"))
+            .await
+            .unwrap()
+            .into_inner()
+            .dataset
+            .unwrap();
+        assert_eq!(updated.name, "updated");
+        assert_eq!(updated.columns[0].name, "receipt_id");
+        assert_eq!(updated.created, 1);
     }
 
     #[tokio::test]

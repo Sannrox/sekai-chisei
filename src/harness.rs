@@ -343,14 +343,11 @@ impl SseDecoder {
         Ok(events)
     }
 
-    pub fn finish(mut self) -> Result<Vec<HarnessEvent>, String> {
+    pub fn finish(self) -> Result<Vec<HarnessEvent>, String> {
         if self.buffer.iter().all(u8::is_ascii_whitespace) {
             return Ok(Vec::new());
         }
-        let frame = std::mem::take(&mut self.buffer);
-        let frame =
-            std::str::from_utf8(&frame).map_err(|_| "responses stream is not valid UTF-8")?;
-        Ok(parse_frame(frame)?.into_iter().collect())
+        Err("responses stream ended within an SSE frame".into())
     }
 }
 
@@ -421,10 +418,23 @@ mod tests {
         for chunk in fixture.chunks(7) {
             events.extend(decoder.push(chunk).unwrap());
         }
+        events.extend(decoder.push(b"\n").unwrap());
         events.extend(decoder.finish().unwrap());
         assert_eq!(events.len(), 4);
         assert_eq!(events[1].event, "response.future.delta");
         assert_eq!(events.last().unwrap().event, "response.completed");
+    }
+
+    #[test]
+    fn rejects_unterminated_frame_at_eof() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(b"data: {\"type\":\"response.completed\"}")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder.finish().is_err());
     }
 
     #[test]
@@ -438,6 +448,7 @@ mod tests {
         ] {
             let mut decoder = SseDecoder::default();
             let mut events = decoder.push(fixture).unwrap();
+            events.extend(decoder.push(b"\n").unwrap());
             events.extend(decoder.finish().unwrap());
             let terminals = events
                 .iter()
@@ -461,6 +472,7 @@ mod tests {
         let fixture = include_bytes!("../tests/fixtures/responses/multiple-tools.sse");
         let mut decoder = SseDecoder::default();
         let mut events = decoder.push(fixture).unwrap();
+        events.extend(decoder.push(b"\n").unwrap());
         events.extend(decoder.finish().unwrap());
         let assembly = StreamAssembly::from_events(&events).unwrap();
         assert_eq!(assembly.terminal.as_deref(), Some("response.completed"));
