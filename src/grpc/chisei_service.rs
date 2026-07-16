@@ -116,7 +116,19 @@ fn memory_context_reference(reference: &pipe::MemoryContextReference) -> MemoryC
         confidence_bps: u32::from(reference.confidence_bps),
         applicability: reference.applicability.clone(),
         evidence_operation_ids: reference.evidence_operation_ids.clone(),
+        content_digest: reference.content_digest.clone(),
     }
+}
+
+fn memory_lifecycle_allows_execution(
+    state: crate::chisei::kioku::MemoryLifecycleState,
+    expires_at_ms: Option<i64>,
+    retention_until_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    state == crate::chisei::kioku::MemoryLifecycleState::Active
+        && expires_at_ms.is_none_or(|expires_at_ms| expires_at_ms > now_ms)
+        && retention_until_ms.is_none_or(|retention_until_ms| retention_until_ms > now_ms)
 }
 
 fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
@@ -1260,6 +1272,7 @@ impl ChiseiServiceImpl {
                 .iter()
                 .map(memory_context_reference)
                 .collect(),
+            planning_actor: authenticated_actor.into(),
         })
     }
 
@@ -1280,6 +1293,42 @@ impl ChiseiServiceImpl {
         actor: &str,
         references: &[MemoryContextReference],
     ) -> Result<(), Status> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for reference in references {
+            let memory = self
+                .db
+                .get_kioku_memory(&reference.memory_id, reference.memory_version)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::failed_precondition("planned memory version not found"))?;
+            if !memory_lifecycle_allows_execution(
+                memory.state,
+                memory.expires_at_ms,
+                memory.retention_until_ms,
+                now_ms,
+            ) {
+                return Err(Status::failed_precondition(
+                    "planned memory version is no longer active",
+                ));
+            }
+            let authorized_ceiling = self
+                .db
+                .kioku_authorized_classification_ceiling(&memory.namespace, actor)
+                .map_err(|_| {
+                    Status::permission_denied(
+                        "executing actor is not authorized for planned memory",
+                    )
+                })?;
+            if memory.classification > authorized_ceiling {
+                return Err(Status::permission_denied(
+                    "planned memory classification exceeds executing actor grant",
+                ));
+            }
+            if crate::chisei::kioku::memory_claim_digest(&memory) != reference.content_digest {
+                return Err(Status::failed_precondition(
+                    "planned memory digest no longer matches the cached reference",
+                ));
+            }
+        }
         for reference in references {
             self.db
                 .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
@@ -1290,7 +1339,7 @@ impl ChiseiServiceImpl {
                     to_state: "active".into(),
                     actor: actor.into(),
                     reason: format!("pipeline request {request_id}"),
-                    recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                    recorded_at_ms: now_ms,
                 })
                 .map_err(Status::internal)?;
         }
@@ -1429,7 +1478,7 @@ impl ChiseiServiceImpl {
                             "memory:{}@{}",
                             reference.memory_id, reference.memory_version
                         ),
-                        content_hash: None,
+                        content_hash: Some(reference.content_digest.clone()),
                         disclosed_fields: vec!["claim".into()],
                         omitted: false,
                         omission_reason: None,
@@ -3767,9 +3816,15 @@ impl ChiseiService for ChiseiServiceImpl {
                 .lock()
                 .expect("planned executions poisoned");
             prune_cached_plans(&mut plans);
-            plans
-                .remove(&requested_plan.plan_id)
-                .ok_or(Status::not_found("execution plan not found"))?
+            let plan = plans
+                .get(&requested_plan.plan_id)
+                .ok_or(Status::not_found("execution plan not found"))?;
+            if plan.planning_actor != actor {
+                return Err(Status::permission_denied(
+                    "execution plan belongs to a different planning principal",
+                ));
+            }
+            plans.remove(&requested_plan.plan_id).unwrap()
         };
         if !plan.executable {
             return Err(Status::failed_precondition(
@@ -4011,9 +4066,15 @@ impl ChiseiService for ChiseiServiceImpl {
                 .lock()
                 .expect("planned executions poisoned");
             prune_cached_plans(&mut plans);
-            plans
-                .remove(&requested_plan.plan_id)
-                .ok_or(Status::not_found("execution plan not found"))?
+            let plan = plans
+                .get(&requested_plan.plan_id)
+                .ok_or(Status::not_found("execution plan not found"))?;
+            if plan.planning_actor != actor {
+                return Err(Status::permission_denied(
+                    "execution plan belongs to a different planning principal",
+                ));
+            }
+            plans.remove(&requested_plan.plan_id).unwrap()
         };
         if !plan.executable {
             return Err(Status::failed_precondition(
@@ -4566,6 +4627,52 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::internal)?;
         Ok(Response::new(ReserveGatewayRequestAliasResponse {
             reserved,
+        }))
+    }
+
+    async fn claim_gateway_request_alias_dispatch(
+        &self,
+        req: Request<ClaimGatewayRequestAliasDispatchRequest>,
+    ) -> Result<Response<ClaimGatewayRequestAliasDispatchResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let auth_source = req
+            .metadata()
+            .get(AUTH_SOURCE_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let configured_gateway = self
+            .config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor)
+            && auth_source == Some("token");
+        if !configured_gateway && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
+            return Err(Status::permission_denied(
+                "gateway request alias dispatch requires a gateway service principal",
+            ));
+        }
+        let request = req.into_inner();
+        if request.caller_scope.trim().is_empty()
+            || request.request_alias.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.operation_id.trim().is_empty()
+            || request.dispatch_token.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "caller_scope, request_alias, request_id, operation_id, and dispatch_token are required",
+            ));
+        }
+        let claimed = self
+            .db
+            .claim_gateway_request_alias_dispatch(
+                &request.caller_scope,
+                &request.request_alias,
+                &request.request_id,
+                &request.operation_id,
+                &request.dispatch_token,
+            )
+            .map_err(Status::internal)?;
+        Ok(Response::new(ClaimGatewayRequestAliasDispatchResponse {
+            claimed,
         }))
     }
 
@@ -8262,6 +8369,7 @@ mod tests {
                 confidence_bps: 9_000,
                 applicability: "verification".into(),
                 evidence_operation_ids: vec!["operation-7".into()],
+                content_digest: "b".repeat(64),
             }],
             ..Default::default()
         };
@@ -8301,6 +8409,10 @@ mod tests {
             })
             .expect("pinned memory reference");
         assert_eq!(memory.reference, "memory:memory-7@3");
+        assert_eq!(
+            memory.content_hash.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
         assert_eq!(memory.disclosed_fields, ["claim"]);
         assert!(
             svc.db
@@ -8309,6 +8421,63 @@ mod tests {
                 .is_empty(),
             "planning must not record a treatment assignment"
         );
+    }
+
+    #[test]
+    fn execution_memory_injection_revalidates_cached_versions() {
+        let svc = memory_service();
+        let error = svc
+            .record_execution_memory_injections(
+                "request-stale-memory",
+                "agent:test",
+                &[MemoryContextReference {
+                    memory_id: "purged-memory".into(),
+                    memory_version: 4,
+                    classification: "internal".into(),
+                    confidence_bps: 9_000,
+                    applicability: "verification".into(),
+                    evidence_operation_ids: vec![],
+                    content_digest: "c".repeat(64),
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.db
+                .list_kioku_lifecycle_events("purged-memory", 4)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cached_memory_must_remain_active_unexpired_and_retained() {
+        use crate::chisei::kioku::MemoryLifecycleState;
+
+        assert!(memory_lifecycle_allows_execution(
+            MemoryLifecycleState::Active,
+            Some(201),
+            Some(201),
+            200,
+        ));
+        assert!(!memory_lifecycle_allows_execution(
+            MemoryLifecycleState::Active,
+            Some(200),
+            Some(201),
+            200,
+        ));
+        assert!(!memory_lifecycle_allows_execution(
+            MemoryLifecycleState::Active,
+            Some(201),
+            Some(200),
+            200,
+        ));
+        assert!(!memory_lifecycle_allows_execution(
+            MemoryLifecycleState::Rejected,
+            None,
+            None,
+            200,
+        ));
     }
 
     #[tokio::test]
@@ -8988,6 +9157,7 @@ mod tests {
             task_class: String::new(),
             evidence_references: vec![],
             memory_references: vec![],
+            planning_actor: "local".into(),
         };
         svc.cache_plan(plan.clone());
 
@@ -8997,6 +9167,32 @@ mod tests {
             .expect_err("external plan without egress decisions should be rejected");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("missing egress decisions"));
+    }
+
+    #[tokio::test]
+    async fn cached_plans_remain_bound_to_the_planning_principal() {
+        let svc = memory_service();
+        let plan = ExecutionPlan {
+            plan_id: "actor-bound-plan".into(),
+            planning_actor: "agent:planner".into(),
+            executable: true,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
+        svc.cache_plan(plan.clone());
+        let mut request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        request
+            .metadata_mut()
+            .insert("x-principal", "agent:intruder".parse().unwrap());
+
+        let error = svc.execute_plan(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(
+            svc.planned_executions
+                .lock()
+                .unwrap()
+                .contains_key("actor-bound-plan")
+        );
     }
 
     #[tokio::test]
@@ -9054,6 +9250,7 @@ mod tests {
             task_class: String::new(),
             evidence_references: vec![],
             memory_references: vec![],
+            planning_actor: "local".into(),
         };
         svc.cache_plan(plan.clone());
 
@@ -9162,6 +9359,7 @@ mod tests {
                 task_class: String::new(),
                 evidence_references: vec![],
                 memory_references: vec![],
+                planning_actor: String::new(),
             });
         }
         let newest = ExecutionPlan {
@@ -9192,6 +9390,7 @@ mod tests {
             task_class: String::new(),
             evidence_references: vec![],
             memory_references: vec![],
+            planning_actor: String::new(),
         };
         svc.cache_plan(newest.clone());
 
@@ -9236,6 +9435,7 @@ mod tests {
             task_class: String::new(),
             evidence_references: vec![],
             memory_references: vec![],
+            planning_actor: String::new(),
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -9286,6 +9486,7 @@ mod tests {
                 task_class: String::new(),
                 evidence_references: vec![],
                 memory_references: vec![],
+                planning_actor: String::new(),
             });
         }
         let inserted = ExecutionPlan {
@@ -9316,6 +9517,7 @@ mod tests {
             task_class: String::new(),
             evidence_references: vec![],
             memory_references: vec![],
+            planning_actor: String::new(),
         };
         svc.cache_plan(inserted.clone());
 

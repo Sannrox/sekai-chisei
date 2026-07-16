@@ -8142,6 +8142,7 @@ mod tests {
                 columns: vec![ColumnDef {
                     name: "value".into(),
                     r#type: "string".into(),
+                    classification: "public".into(),
                 }],
                 object_id: "protected-object".into(),
                 created: 1,
@@ -8203,6 +8204,7 @@ mod tests {
                 columns: vec![ColumnDef {
                     name: "receipt_id".into(),
                     r#type: "string".into(),
+                    classification: "public".into(),
                 }],
                 object_id: String::new(),
                 created: 999,
