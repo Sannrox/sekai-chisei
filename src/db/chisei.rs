@@ -403,14 +403,30 @@ impl SekaiDb {
     }
 
     pub fn put_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
-        let conn = self.conn();
         let cases_json = serde_json::to_string(&suite.cases).map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR REPLACE INTO chisei_eval_suites (id, name, description, cases_json) VALUES (?1, ?2, ?3, ?4)",
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT INTO chisei_eval_suites (id, name, description, cases_json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, cases_json=excluded.cases_json
+             WHERE substr(excluded.id, 1, 9) = 'sampling-'",
             params![suite.id, suite.name, suite.description, cases_json],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        let stored: (String, String, String) = transaction
+            .query_row(
+                "SELECT name, description, cases_json FROM chisei_eval_suites WHERE id = ?1",
+                params![suite.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored == (suite.name.clone(), suite.description.clone(), cases_json) {
+            transaction.commit().map_err(|error| error.to_string())
+        } else {
+            Err(format!("eval suite {:?} is immutable", suite.id))
+        }
     }
 
     pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
@@ -454,14 +470,35 @@ impl SekaiDb {
     }
 
     pub fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
-        let conn = self.conn();
         let results_json = serde_json::to_string(&run.results).map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR REPLACE INTO chisei_eval_runs (id, suite_id, config_ref, results_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO chisei_eval_runs (id, suite_id, config_ref, results_json, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![run.id, run.suite_id, run.config_ref, results_json, run.timestamp],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        let stored: (String, String, String, i64) = transaction
+            .query_row(
+                "SELECT suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs WHERE id = ?1",
+                params![run.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if stored
+            == (
+                run.suite_id.clone(),
+                run.config_ref.clone(),
+                results_json,
+                run.timestamp,
+            )
+        {
+            transaction.commit().map_err(|error| error.to_string())
+        } else {
+            Err(format!("eval run {:?} is immutable", run.id))
+        }
     }
 
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
@@ -985,4 +1022,102 @@ fn legacy_case_namespace(case: &serde_json::Value) -> Option<String> {
 
 fn is_legacy_case_namespace_key(key: &str) -> bool {
     !matches!(key, "id" | "name" | "assertions" | "spec")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn eval_writers_wait_for_active_transactions_and_preserve_outcomes() {
+        let path =
+            std::env::temp_dir().join(format!("sekai-eval-lock-{}.db", uuid::Uuid::new_v4()));
+        let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let suite = eval::Suite {
+            id: "sampling-live".into(),
+            name: "initial".into(),
+            description: String::new(),
+            cases: Vec::new(),
+        };
+        first.put_eval_suite(&suite).unwrap();
+
+        let mut connection = first.conn();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE chisei_eval_suites SET name='held' WHERE id='sampling-live'",
+                [],
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut competing = suite.clone();
+        competing.name = "competing".into();
+        let writer = second.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(writer.put_eval_suite(&competing)).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        transaction.commit().unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        handle.join().unwrap();
+        assert_eq!(
+            first
+                .get_eval_suite_record("sampling-live")
+                .unwrap()
+                .unwrap()
+                .name,
+            "competing"
+        );
+
+        let run = eval::Run {
+            id: "immutable-run".into(),
+            suite_id: "promotion-suite".into(),
+            config_ref: "v1".into(),
+            results: Vec::new(),
+            timestamp: 1,
+        };
+        let mut connection = first.conn();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO chisei_eval_runs (id, suite_id, config_ref, results_json, timestamp) VALUES (?1, ?2, ?3, '[]', ?4)",
+                params![run.id, run.suite_id, run.config_ref, run.timestamp],
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut competing = run.clone();
+        competing.config_ref = "v2".into();
+        let writer = second.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(writer.put_eval_run(&competing)).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        transaction.commit().unwrap();
+        let error = rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("immutable-run") && error.contains("immutable"));
+        handle.join().unwrap();
+        assert_eq!(
+            first
+                .get_eval_run_record("immutable-run")
+                .unwrap()
+                .unwrap()
+                .config_ref,
+            "v1"
+        );
+
+        drop((first, second));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
 }
