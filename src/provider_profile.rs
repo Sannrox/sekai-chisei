@@ -1416,7 +1416,7 @@ fn resolve_provider_model(model: &str) -> Result<(&'static str, &str), String> {
             _ => Err(format!("unknown provider namespace {namespace:?}")),
         };
     }
-    if model.starts_with("claude") {
+    if model.starts_with("claude") || ANTHROPIC_BARE_ALIASES.contains(&model) {
         Ok(("anthropic", model))
     } else if model.starts_with("native-") || model.starts_with("fallback:") {
         Ok(("native", model))
@@ -1428,6 +1428,8 @@ fn resolve_provider_model(model: &str) -> Result<(&'static str, &str), String> {
         ))
     }
 }
+
+const ANTHROPIC_BARE_ALIASES: &[&str] = &["sonnet", "haiku", "opus", "fable"];
 
 const OPENAI_ALIAS_PREFIXES: &[&str] = &[
     "gpt-",
@@ -1584,7 +1586,10 @@ fn profile(
             )
             .collect(),
         "ollama" => vec!["ollama/*".into()],
-        "anthropic" => vec!["anthropic/*".into(), "claude*".into()],
+        "anthropic" => std::iter::once("anthropic/*".to_string())
+            .chain(std::iter::once("claude*".to_string()))
+            .chain(ANTHROPIC_BARE_ALIASES.iter().map(|alias| (*alias).into()))
+            .collect(),
         "native" => vec!["native/*".into(), "native-*".into(), "fallback:*".into()],
         "xai" => vec!["xai/grok-4.5".into()],
         "meta" => vec!["meta/muse-spark-1.1".into()],
@@ -1994,6 +1999,7 @@ fn collect_modalities(value: &serde_json::Value, modalities: &mut Vec<String>) {
                     "input_image" | "image_url" | "image" => modalities.push("image".into()),
                     "input_audio" | "audio" => modalities.push("audio".into()),
                     "input_video" | "video_url" | "video" => modalities.push("video".into()),
+                    "input_file" | "file_url" | "file" => modalities.push("file".into()),
                     _ => {}
                 }
             }
@@ -2132,6 +2138,30 @@ mod tests {
 
         let metadata_only = CapabilityRequirements::from_responses_body(
             br#"{"input":"hello","metadata":{"type":"video"}}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata_only.modalities, vec!["text"]);
+    }
+
+    #[test]
+    fn derives_file_capability_and_rejects_unadvertised_file_inputs() {
+        let required = CapabilityRequirements::from_responses_body(
+            br#"{"input":[{"role":"user","content":[{"type":"input_file","file_id":"file_1"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(required.modalities, vec!["file", "text"]);
+        assert_eq!(
+            required.unsupported_by(
+                &ProviderRegistry::built_in()
+                    .profile("openai")
+                    .unwrap()
+                    .capabilities
+            ),
+            vec!["modality:file"]
+        );
+
+        let metadata_only = CapabilityRequirements::from_responses_body(
+            br#"{"input":"hello","metadata":{"type":"file"}}"#,
         )
         .unwrap();
         assert_eq!(metadata_only.modalities, vec!["text"]);
@@ -2363,6 +2393,10 @@ mod tests {
                 "anthropic/claude-sonnet-4",
                 "claude-sonnet-4",
             ),
+            ("sonnet", "anthropic", "anthropic/sonnet", "sonnet"),
+            ("haiku", "anthropic", "anthropic/haiku", "haiku"),
+            ("opus", "anthropic", "anthropic/opus", "opus"),
+            ("fable", "anthropic", "anthropic/fable", "fable"),
             ("ollama/llama3.2", "ollama", "ollama/llama3.2", "llama3.2"),
             ("native/mistral", "native", "native/mistral", "mistral"),
             (
@@ -2403,6 +2437,12 @@ mod tests {
             assert_eq!(resolved.canonical_model, canonical);
             assert_eq!(resolved.upstream_model, upstream);
         }
+        assert!(
+            registry
+                .resolve_model("unadvertised-anthropic-alias")
+                .unwrap_err()
+                .contains("unregistered bare model identifier")
+        );
     }
 
     #[tokio::test]

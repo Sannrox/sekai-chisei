@@ -10,6 +10,7 @@ use crate::chisei::gunshi::{
     AdvisoryScorecard, AllocationPlan, CapacityEnvelope, OperationRisk, PendingOperation,
     load_kioku_evidence,
 };
+use crate::chisei::receipt::ReceiptEventKind;
 use crate::db::sekai::SekaiDb;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,21 +201,35 @@ pub fn authorize_dispatch(
     }
     if policy.require_governed_evidence {
         let governed = load_kioku_evidence(db, &operation.namespace, &operation.operation_class)?;
-        let has_governed_evidence = plan.evidence.iter().any(|reference| {
-            reference.kind == "kioku_memory"
-                && governed.iter().any(|memory| {
-                    memory.memory_id == reference.reference
-                        && memory.model == plan.selection.model
-                        && memory.status == "active"
-                        && memory.passed
-                        && memory.score >= policy.minimum_evidence_score
-                        && memory.observed_at_ms <= capacity.captured_at_ms
-                        && capacity
-                            .captured_at_ms
-                            .saturating_sub(memory.observed_at_ms)
-                            <= policy.maximum_evidence_age_ms
-                })
-        });
+        let mut has_governed_evidence = false;
+        for reference in plan
+            .evidence
+            .iter()
+            .filter(|reference| reference.kind == "kioku_memory")
+        {
+            for memory in governed
+                .iter()
+                .filter(|memory| memory.memory_id == reference.reference)
+            {
+                if memory.model == plan.selection.model
+                    && memory.status == "active"
+                    && memory.passed
+                    && memory.score >= policy.minimum_evidence_score
+                    && memory.observed_at_ms <= capacity.captured_at_ms
+                    && capacity
+                        .captured_at_ms
+                        .saturating_sub(memory.observed_at_ms)
+                        <= policy.maximum_evidence_age_ms
+                    && dispatch_evidence_matches_receipt(db, memory)?
+                {
+                    has_governed_evidence = true;
+                    break;
+                }
+            }
+            if has_governed_evidence {
+                break;
+            }
+        }
         if !has_governed_evidence {
             reasons.push("allocation lacks current governed recommendation evidence".into());
         }
@@ -274,6 +289,49 @@ pub fn authorize_dispatch(
     })
 }
 
+fn dispatch_evidence_matches_receipt(
+    db: &SekaiDb,
+    evidence: &crate::chisei::gunshi::KiokuEvidence,
+) -> Result<bool, String> {
+    let Some(request_id) = evidence.receipt_reference.as_deref() else {
+        return Ok(false);
+    };
+    let Some(receipt) = db.find_operation_receipt_by_request_id(request_id)? else {
+        return Ok(false);
+    };
+    if !receipt.completeness().complete
+        || receipt.completed_at_ms.is_none()
+        || receipt.namespace != evidence.namespace
+        || receipt.operation_class != evidence.operation_class
+    {
+        return Ok(false);
+    }
+    let routed_model = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+        .and_then(|event| {
+            event
+                .attributes
+                .get("resolved_model")
+                .or_else(|| event.attributes.get("model"))
+        });
+    let outcome = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded);
+    let recorded_passed = outcome
+        .and_then(|event| event.attributes.get("passed"))
+        .and_then(|value| value.parse::<bool>().ok());
+    let recorded_score = outcome
+        .and_then(|event| event.attributes.get("score"))
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|score| score / 100.0);
+    Ok(routed_model.is_some_and(|model| model == &evidence.model)
+        && recorded_passed == Some(evidence.passed)
+        && recorded_score.is_some_and(|score| (score - evidence.score).abs() < f64::EPSILON))
+}
+
 fn validate_scorecard(scorecard: &AdvisoryScorecard) -> Result<(), String> {
     let classified = scorecard
         .accepted
@@ -313,8 +371,11 @@ mod tests {
         AdvisoryPolicy, AgentCapacity, AllocationRequest, BaselineStrategy, EvidenceReference,
         ModelProfile, Strategy, recommend_advisory,
     };
+    use crate::chisei::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    };
     use crate::domain::Object;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn operation() -> PendingOperation {
         PendingOperation {
@@ -428,6 +489,71 @@ mod tests {
             ]),
             created: 1,
             updated: 2,
+        })
+        .unwrap();
+        let event =
+            |id: &str,
+             parent: Option<&str>,
+             kind: ReceiptEventKind,
+             attributes: BTreeMap<String, String>| OperationReceiptEvent {
+                event_id: id.into(),
+                operation_id: "receipt-op-1".into(),
+                parent_event_id: parent.map(str::to_string),
+                timestamp_ms: 1,
+                kind,
+                surface: kind.surface(),
+                actor: "agent:test".into(),
+                references: Vec::new(),
+                attributes,
+            };
+        db.put_operation_receipt(&OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: "receipt-op-1".into(),
+            parent_operation_id: None,
+            namespace: "support".into(),
+            operation_class: "triage".into(),
+            initiating_actor: "agent:test".into(),
+            schema_version: "schema-v1".into(),
+            policy_version: "governance-v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(2),
+            events: vec![
+                event(
+                    "intent",
+                    None,
+                    ReceiptEventKind::IntentRecorded,
+                    BTreeMap::from([("request_id".into(), "receipt-1".into())]),
+                ),
+                event(
+                    "policy",
+                    Some("intent"),
+                    ReceiptEventKind::PolicyDecided,
+                    BTreeMap::new(),
+                ),
+                event(
+                    "route",
+                    Some("policy"),
+                    ReceiptEventKind::RouteSelected,
+                    BTreeMap::from([("resolved_model".into(), "local".into())]),
+                ),
+                event(
+                    "budget",
+                    Some("route"),
+                    ReceiptEventKind::BudgetDecided,
+                    BTreeMap::new(),
+                ),
+                event(
+                    "outcome",
+                    Some("budget"),
+                    ReceiptEventKind::OutcomeRecorded,
+                    BTreeMap::from([
+                        ("passed".into(), "true".into()),
+                        ("score".into(), "90".into()),
+                    ]),
+                ),
+            ],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
         })
         .unwrap();
         db

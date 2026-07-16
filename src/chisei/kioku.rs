@@ -6,8 +6,23 @@ use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::security::Role;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const KIOKU_MEMORY_VERSION: &str = "kioku.memory/v1";
+
+pub fn memory_claim_digest(memory: &KiokuMemory) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        memory.contract_version.as_bytes(),
+        memory.id.as_bytes(),
+        memory.claim.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(memory.version.to_be_bytes());
+    format!("{:x}", digest.finalize())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -984,6 +999,29 @@ impl SekaiDb {
     fn authorize_kioku_retrieval(&self, request: &MemoryRetrievalRequest) -> Result<(), String> {
         let actor = request.actor.trim();
         let namespace = request.namespace.trim();
+        let authorized_ceiling = self.kioku_authorized_classification_ceiling(namespace, actor)?;
+        if request.classification_ceiling > authorized_ceiling {
+            return Err("requested memory classification exceeds actor grant".into());
+        }
+        for object_id in &request.context_object_ids {
+            if self.get_object(object_id)?.is_none() {
+                return Err(format!("context object {object_id} not found"));
+            }
+            let grants = self.list_grants(object_id)?;
+            if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+                return Err(format!(
+                    "actor is not authorized for context object {object_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String> {
         let namespace_object = self
             .find_by_external_id(&format!("namespace:{namespace}"))?
             .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
@@ -1002,21 +1040,7 @@ impl SekaiDb {
                 Role::Admin => EvidenceClassification::Restricted,
             }
         };
-        if request.classification_ceiling > authorized_ceiling {
-            return Err("requested memory classification exceeds actor grant".into());
-        }
-        for object_id in &request.context_object_ids {
-            if self.get_object(object_id)?.is_none() {
-                return Err(format!("context object {object_id} not found"));
-            }
-            let grants = self.list_grants(object_id)?;
-            if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
-                return Err(format!(
-                    "actor is not authorized for context object {object_id}"
-                ));
-            }
-        }
-        Ok(())
+        Ok(authorized_ceiling)
     }
 
     pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
