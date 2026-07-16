@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_cancelled"}}
+
+event: response.cancelled
+data: {"type":"response.cancelled","response":{"id":"resp_cancelled","status":"cancelled","usage":{"input_tokens":4,"output_tokens":0}}}
+
