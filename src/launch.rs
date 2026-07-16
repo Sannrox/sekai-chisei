@@ -267,6 +267,13 @@ pub async fn run_launch(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".into());
+    if config.kind().is_some() {
+        let contract = validate_launch_contract(&config, &db_path)?;
+        println!(
+            "validated {} against provider profile {} ({})",
+            contract.harness, contract.profile_version, contract.canonical_model
+        );
+    }
     let credential = crate::onboarding::ensure_local_credential(
         &db_path,
         &config.socket,
@@ -310,6 +317,70 @@ pub async fn run_launch(
         // Unknown agents without --no-app are rejected in `from_env_and_args`.
         None => Err(format!("no app launcher for agent {:?}", config.agent).into()),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedLaunchContract {
+    harness: String,
+    canonical_model: String,
+    profile_version: String,
+}
+
+fn validate_launch_contract(
+    config: &LaunchConfig,
+    db_path: &str,
+) -> Result<ValidatedLaunchContract, String> {
+    let harness = match config.agent.as_str() {
+        "codex-app" => "chisei.responses-harness/v1",
+        "claude-code" => "chisei.anthropic-messages/v1",
+        other => {
+            return Err(format!(
+                "harness {other:?} has no verified onboarding capability contract; use codex-app or claude-code"
+            ));
+        }
+    };
+    let state_path = crate::provider_profile::provider_registry_state_path(db_path);
+    crate::provider_profile::validate_provider_registry_storage(&state_path)?;
+    crate::provider_profile::refresh_provider_registry(&state_path)?;
+    let registry = crate::provider_profile::provider_registry_snapshot();
+    let resolved = registry.resolve_model(&config.model).map_err(|error| {
+        format!(
+            "provider profile rejected model {:?}: {error}",
+            config.model
+        )
+    })?;
+    let profile = registry
+        .effective_profile(&resolved.provider)
+        .ok_or_else(|| format!("provider profile {:?} is unavailable", resolved.provider))?;
+    if !profile.capabilities.streaming || !profile.capabilities.reports_usage {
+        return Err(format!(
+            "provider profile {} lacks required streaming or usage capabilities",
+            profile.profile_version
+        ));
+    }
+    if config.agent == "codex-app" && !profile.capabilities.responses {
+        return Err(format!(
+            "provider profile {} does not support the Responses harness",
+            profile.profile_version
+        ));
+    }
+    if config.agent == "claude-code"
+        && resolved.provider != "anthropic"
+        && std::env::var("CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return Err(format!(
+            "claude-code model {:?} resolves to provider {:?}; select an Anthropic model or explicitly enable a verified cross-provider gateway",
+            config.model, resolved.provider
+        ));
+    }
+    Ok(ValidatedLaunchContract {
+        harness: harness.into(),
+        canonical_model: resolved.canonical_model,
+        profile_version: resolved.profile_version,
+    })
 }
 
 async fn ensure_server(
@@ -1455,5 +1526,25 @@ mod tests {
     fn rewrites_wildcard_bind_for_connect() {
         assert_eq!(connect_addr("0.0.0.0:8788"), "127.0.0.1:8788");
         assert_eq!(connect_addr("127.0.0.1:8788"), "127.0.0.1:8788");
+    }
+
+    #[test]
+    fn validates_harness_and_provider_contract_before_launch() {
+        let config = LaunchConfig::from_env_and_args(["codex-app".into()]).unwrap();
+        let root = std::env::temp_dir().join(format!("launch-contract-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("sekai.db");
+        let contract = validate_launch_contract(&config, db_path.to_str().unwrap()).unwrap();
+        assert_eq!(contract.harness, "chisei.responses-harness/v1");
+        assert_eq!(contract.canonical_model, "openai/gpt-5.5");
+
+        let mut incompatible = config;
+        incompatible.model = "anthropic/claude-sonnet-4-6".into();
+        assert!(
+            validate_launch_contract(&incompatible, db_path.to_str().unwrap())
+                .unwrap_err()
+                .contains("does not support the Responses harness")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
