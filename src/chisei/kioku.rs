@@ -220,6 +220,13 @@ pub struct MemoryLifecycleSweep {
     pub purged: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryOutcomeAssignment {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub memory_applied: bool,
+}
+
 pub fn derive_verified_outcome_candidate(
     input: CandidateDerivation,
 ) -> Result<(KiokuMemory, Vec<KiokuEvidenceLink>), String> {
@@ -1149,7 +1156,7 @@ impl SekaiDb {
     pub fn record_kioku_outcome(
         &self,
         observation: &MemoryOutcomeObservation,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if observation.operation_id.trim().is_empty()
             || observation.request_id.trim().is_empty()
             || observation.outcome_metric.trim().is_empty()
@@ -1160,9 +1167,6 @@ impl SekaiDb {
         let memory = self
             .get_kioku_memory(&observation.memory_id, observation.memory_version)?
             .ok_or_else(|| "memory version not found".to_string())?;
-        if memory.state != MemoryLifecycleState::Active {
-            return Err("outcomes can only be attributed to active memories".into());
-        }
         let receipt = self
             .get_operation_receipt(observation.operation_id.trim())?
             .ok_or_else(|| "operation receipt not found".to_string())?;
@@ -1171,7 +1175,8 @@ impl SekaiDb {
             .iter()
             .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
             .and_then(|event| event.attributes.get("request_id"))
-            .map(String::as_str);
+            .map(String::as_str)
+            .map(str::trim);
         if !receipt.completeness().complete
             || receipt_request_id != Some(observation.request_id.trim())
             || receipt.namespace != memory.namespace
@@ -1192,7 +1197,15 @@ impl SekaiDb {
         let recorded_outcome = receipt
             .events
             .iter()
-            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+                ) && event
+                    .attributes
+                    .get("outcome_metric")
+                    .is_some_and(|metric| metric.trim() == observation.outcome_metric.trim())
+            })
             .ok_or_else(|| "operation receipt lacks an outcome event".to_string())?;
         let recorded_metric = recorded_outcome
             .attributes
@@ -1207,37 +1220,93 @@ impl SekaiDb {
             .attributes
             .get("passed")
             .and_then(|value| value.parse::<bool>().ok());
-        if recorded_metric != observation.outcome_metric.trim()
+        if recorded_metric.trim() != observation.outcome_metric.trim()
             || recorded_value != Some(observation.outcome_value)
             || recorded_passed != Some(observation.passed)
         {
             return Err("memory outcome does not match receipt evidence".into());
         }
-        let conn = self.conn();
-        let assignment_reason = format!("pipeline request {}", observation.request_id.trim());
-        let (injected, held_out): (bool, bool) = conn
-            .query_row(
-                "SELECT
-                    EXISTS(SELECT 1 FROM chisei_kioku_lifecycle_events
-                        WHERE memory_id=?1 AND memory_version=?2
-                          AND action='injected' AND reason=?3),
-                    EXISTS(SELECT 1 FROM chisei_kioku_lifecycle_events
-                        WHERE memory_id=?1 AND memory_version=?2
-                          AND action='held_out' AND reason=?3)",
-                params![
-                    observation.memory_id,
-                    observation.memory_version,
-                    assignment_reason
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| error.to_string())?;
-        if injected == held_out || injected != observation.memory_applied {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let assignment_reason = format!("pipeline operation {}", observation.operation_id.trim());
+        let legacy_assignment_reason =
+            format!("pipeline request {}", observation.request_id.trim());
+        let assignment = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT action FROM chisei_kioku_lifecycle_events
+                     WHERE memory_id=?1 AND memory_version=?2
+                       AND (reason=?3 OR (reason=?4 AND NOT EXISTS (
+                         SELECT 1 FROM chisei_kioku_lifecycle_events
+                         WHERE reason=?3 AND memory_id=?1 AND memory_version=?2
+                       )))
+                       AND action IN
+                         ('injected', 'held_out', 'holdout_invalidated', 'assignment_invalidated')
+                     ORDER BY id",
+                )
+                .map_err(|error| error.to_string())?;
+            let actions = statement
+                .query_map(
+                    params![
+                        observation.memory_id,
+                        observation.memory_version,
+                        assignment_reason,
+                        legacy_assignment_reason,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let mut assignment = None;
+            for action in actions {
+                match action.map_err(|error| error.to_string())?.as_str() {
+                    "holdout_invalidated" | "assignment_invalidated" => assignment = None,
+                    "injected" => assignment = Some(true),
+                    "held_out" => assignment = Some(false),
+                    _ => unreachable!("assignment query filters lifecycle actions"),
+                }
+            }
+            assignment
+        };
+        if assignment != Some(observation.memory_applied) {
             return Err(
                 "memory outcome treatment assignment does not match injection audit".into(),
             );
         }
-        conn.execute(
+        let existing = tx
+            .query_row(
+                "SELECT memory_applied, outcome_metric, outcome_value, passed
+                 FROM chisei_kioku_outcomes
+                 WHERE memory_id=?1 AND memory_version=?2 AND operation_id=?3",
+                params![
+                    observation.memory_id,
+                    observation.memory_version,
+                    observation.operation_id.trim()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = existing {
+            if existing
+                == (
+                    observation.memory_applied,
+                    observation.outcome_metric.trim().to_string(),
+                    observation.outcome_value,
+                    observation.passed,
+                )
+            {
+                return Ok(false);
+            }
+            return Err("memory outcome already exists with different evidence".into());
+        }
+        tx.execute(
             "INSERT INTO chisei_kioku_outcomes
              (memory_id, memory_version, operation_id, memory_applied, outcome_metric,
               outcome_value, passed, recorded_at_ms)
@@ -1254,19 +1323,94 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        Ok(())
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String> {
+        if operation_id.trim().is_empty() {
+            return Err("assignment operation id is required".into());
+        }
+        let reason = format!("pipeline operation {}", operation_id.trim());
+        let legacy_reason = self
+            .get_operation_receipt(operation_id.trim())?
+            .and_then(|receipt| {
+                receipt
+                    .events
+                    .into_iter()
+                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                    .and_then(|event| event.attributes.get("request_id").cloned())
+            })
+            .map(|request_id| format!("pipeline request {}", request_id.trim()));
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT lifecycle.memory_id, lifecycle.memory_version, lifecycle.action
+                 FROM chisei_kioku_lifecycle_events AS lifecycle
+                 WHERE (lifecycle.reason=?1 OR (lifecycle.reason=?2 AND NOT EXISTS (
+                     SELECT 1 FROM chisei_kioku_lifecycle_events AS current
+                     WHERE current.reason=?1
+                       AND current.memory_id=lifecycle.memory_id
+                       AND current.memory_version=lifecycle.memory_version
+                   ))) AND lifecycle.action IN
+                     ('injected', 'held_out', 'holdout_invalidated', 'assignment_invalidated')
+                 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![reason, legacy_reason], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut assignments = std::collections::BTreeMap::new();
+        for row in rows {
+            let (memory_id, memory_version, action) = row.map_err(|error| error.to_string())?;
+            if matches!(
+                action.as_str(),
+                "holdout_invalidated" | "assignment_invalidated"
+            ) {
+                assignments.remove(&(memory_id, memory_version));
+                continue;
+            }
+            let applied = action == "injected";
+            if assignments
+                .insert((memory_id.clone(), memory_version), applied)
+                .is_some_and(|previous| previous != applied)
+            {
+                return Err(format!(
+                    "memory {memory_id}@{memory_version} has conflicting treatment assignments"
+                ));
+            }
+        }
+        Ok(assignments
+            .into_iter()
+            .map(
+                |((memory_id, memory_version), memory_applied)| MemoryOutcomeAssignment {
+                    memory_id,
+                    memory_version,
+                    memory_applied,
+                },
+            )
+            .collect())
     }
 
     pub fn record_kioku_holdout(
         &self,
         id: &str,
         version: u32,
-        request_id: &str,
+        operation_id: &str,
         actor: &str,
         now_ms: i64,
     ) -> Result<(), String> {
-        if request_id.trim().is_empty() || actor.trim().is_empty() {
-            return Err("holdout request and actor are required".into());
+        if operation_id.trim().is_empty() || actor.trim().is_empty() {
+            return Err("holdout operation and actor are required".into());
         }
         let memory = self
             .get_kioku_memory(id, version)?
@@ -1281,7 +1425,7 @@ impl SekaiDb {
             from_state: Some(MemoryLifecycleState::Active.as_str().into()),
             to_state: MemoryLifecycleState::Active.as_str().into(),
             actor: actor.trim().into(),
-            reason: format!("pipeline request {}", request_id.trim()),
+            reason: format!("pipeline operation {}", operation_id.trim()),
             recorded_at_ms: now_ms,
         })
     }
@@ -1390,6 +1534,52 @@ impl SekaiDb {
             delta,
             retired,
         })
+    }
+
+    pub fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String> {
+        if minimum_samples_per_arm == 0 {
+            return Err("impact evaluation requires samples in both arms".into());
+        }
+        let conn = self.conn();
+        let (treatment, control): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN memory_applied=1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN memory_applied=0 THEN 1 ELSE 0 END), 0)
+                 FROM chisei_kioku_outcomes WHERE memory_id=?1 AND memory_version=?2",
+                params![id, version],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        drop(conn);
+        let minimum_samples_per_arm_i64 = i64::try_from(minimum_samples_per_arm)
+            .map_err(|_| "minimum sample count exceeds i64".to_string())?;
+        if treatment < minimum_samples_per_arm_i64 || control < minimum_samples_per_arm_i64 {
+            return Ok(None);
+        }
+        if self
+            .get_kioku_memory(id, version)?
+            .is_none_or(|memory| memory.state != MemoryLifecycleState::Active)
+        {
+            return Ok(None);
+        }
+        self.evaluate_kioku_impact(
+            id,
+            version,
+            minimum_samples_per_arm,
+            regression_threshold,
+            actor,
+            now_ms,
+        )
+        .map(Some)
     }
 
     pub fn sweep_kioku_lifecycle(
@@ -1536,6 +1726,53 @@ fn insert_lifecycle_event(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+impl SekaiDb {
+    pub(crate) fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String> {
+        if actor.trim().is_empty() {
+            return Err("holdout actor is required".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        for (memory_id, memory_version) in holdouts {
+            let state = tx
+                .query_row(
+                    "SELECT state FROM chisei_kioku_memories WHERE id=?1 AND version=?2",
+                    params![memory_id, memory_version],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "memory version not found".to_string())?;
+            if state != MemoryLifecycleState::Active.as_str() {
+                return Err("only active memories can be assigned to holdout".into());
+            }
+        }
+        crate::db::chisei::upsert_operation_receipt(&tx, receipt)?;
+        for (memory_id, memory_version) in holdouts {
+            insert_lifecycle_event(
+                &tx,
+                &MemoryLifecycleEvent {
+                    memory_id: memory_id.clone(),
+                    memory_version: *memory_version,
+                    action: "held_out".into(),
+                    from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                    to_state: MemoryLifecycleState::Active.as_str().into(),
+                    actor: actor.trim().into(),
+                    reason: format!("pipeline operation {}", receipt.operation_id),
+                    recorded_at_ms,
+                },
+            )?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1747,6 +1984,45 @@ mod tests {
             .attributes
             .insert("request_id".into(), request_id.into());
         db.put_operation_receipt(&receipt).unwrap();
+    }
+
+    #[test]
+    fn receipt_and_holdout_assignments_are_atomic() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut memory = candidate();
+        memory.confidence_bps = 10_000;
+        db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
+            .unwrap();
+        db.review_kioku_candidate(
+            &memory.id,
+            memory.version,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "reviewer".into(),
+                rationale: "verified".into(),
+                reviewed_at_ms: 120,
+            },
+        )
+        .unwrap();
+        let receipt = verified_outcome("atomic-plan", true).receipt;
+
+        let error = db
+            .put_operation_receipt_with_kioku_holdouts(
+                &receipt,
+                &[(memory.id.clone(), memory.version), ("missing".into(), 1)],
+                "agent:test",
+                130,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, "memory version not found");
+        assert!(db.get_operation_receipt("atomic-plan").unwrap().is_none());
+        assert!(
+            db.list_kioku_lifecycle_events(&memory.id, memory.version)
+                .unwrap()
+                .iter()
+                .all(|event| event.action != "held_out")
+        );
     }
 
     fn active_memory(
@@ -2156,6 +2432,114 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_assignment_cannot_record_an_outcome() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        active_memory(
+            &db,
+            "invalidated",
+            "seed-operation",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        persist_outcome_receipt(&db, "control-invalidated", "request-control", true);
+        db.record_kioku_holdout(
+            "invalidated",
+            1,
+            "control-invalidated",
+            "kioku:evaluator",
+            140,
+        )
+        .unwrap();
+        db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+            memory_id: "invalidated".into(),
+            memory_version: 1,
+            action: "holdout_invalidated".into(),
+            from_state: Some("active".into()),
+            to_state: "active".into(),
+            actor: "kioku:evaluator".into(),
+            reason: "pipeline operation control-invalidated".into(),
+            recorded_at_ms: 145,
+        })
+        .unwrap();
+
+        let error = db
+            .record_kioku_outcome(&MemoryOutcomeObservation {
+                memory_id: "invalidated".into(),
+                memory_version: 1,
+                operation_id: "control-invalidated".into(),
+                request_id: "request-control".into(),
+                memory_applied: false,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                passed: true,
+                recorded_at_ms: 150,
+            })
+            .unwrap_err();
+        assert!(error.contains("treatment assignment"));
+    }
+
+    #[test]
+    fn outcome_metric_matching_ignores_receipt_whitespace() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        active_memory(
+            &db,
+            "trimmed-metric",
+            "seed-operation",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        let mut receipt = verified_outcome("trimmed-operation", true).receipt;
+        receipt
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap()
+            .attributes
+            .insert("request_id".into(), "request-trimmed".into());
+        receipt
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .unwrap()
+            .attributes
+            .insert("outcome_metric".into(), " verification_pass_rate ".into());
+        db.put_operation_receipt(&receipt).unwrap();
+        db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+            memory_id: "trimmed-metric".into(),
+            memory_version: 1,
+            action: "injected".into(),
+            from_state: Some("active".into()),
+            to_state: "active".into(),
+            actor: "agent:planner".into(),
+            reason: "pipeline request request-trimmed".into(),
+            recorded_at_ms: 140,
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_kioku_outcome_assignments("trimmed-operation")
+                .unwrap(),
+            vec![MemoryOutcomeAssignment {
+                memory_id: "trimmed-metric".into(),
+                memory_version: 1,
+                memory_applied: true,
+            }]
+        );
+
+        db.record_kioku_outcome(&MemoryOutcomeObservation {
+            memory_id: "trimmed-metric".into(),
+            memory_version: 1,
+            operation_id: "trimmed-operation".into(),
+            request_id: "request-trimmed".into(),
+            memory_applied: true,
+            outcome_metric: "verification_pass_rate".into(),
+            outcome_value: 1.0,
+            passed: true,
+            recorded_at_ms: 150,
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn retires_regressing_memory_from_held_out_outcomes() {
         let db = SekaiDb::new(":memory:").unwrap();
         active_memory(
@@ -2175,7 +2559,7 @@ mod tests {
                 from_state: Some("active".into()),
                 to_state: "active".into(),
                 actor: "agent:planner".into(),
-                reason: format!("pipeline request {request_id}"),
+                reason: format!("pipeline operation {operation_id}"),
                 recorded_at_ms: 140,
             })
             .unwrap();
@@ -2195,11 +2579,12 @@ mod tests {
             forged.passed = true;
             assert!(db.record_kioku_outcome(&forged).is_err());
             db.record_kioku_outcome(&observation).unwrap();
+            db.record_kioku_outcome(&observation).unwrap();
         }
         for operation_id in ["control-1", "control-2"] {
             let request_id = format!("request-{operation_id}");
             persist_outcome_receipt(&db, operation_id, &request_id, true);
-            db.record_kioku_holdout("regressing", 1, &request_id, "kioku:evaluator", 140)
+            db.record_kioku_holdout("regressing", 1, operation_id, "kioku:evaluator", 140)
                 .unwrap();
             db.record_kioku_outcome(&MemoryOutcomeObservation {
                 memory_id: "regressing".into(),
@@ -2216,8 +2601,9 @@ mod tests {
         }
 
         let evaluation = db
-            .evaluate_kioku_impact("regressing", 1, 2, 0.05, "kioku:evaluator", 160)
-            .unwrap();
+            .evaluate_kioku_impact_if_ready("regressing", 1, 2, 0.05, "kioku:evaluator", 160)
+            .unwrap()
+            .expect("both evaluation arms are ready");
         assert!(evaluation.retired);
         assert_eq!(evaluation.delta, -1.0);
         assert_eq!(
@@ -2231,6 +2617,41 @@ mod tests {
                 .unwrap()
                 .action,
             "regressed"
+        );
+    }
+
+    #[test]
+    fn holdout_assignments_are_scoped_to_operation_receipts() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        active_memory(
+            &db,
+            "scoped-holdout",
+            "seed-operation",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        db.record_kioku_holdout(
+            "scoped-holdout",
+            1,
+            "preview-operation",
+            "agent:planner",
+            140,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.list_kioku_outcome_assignments("preview-operation")
+                .unwrap(),
+            vec![MemoryOutcomeAssignment {
+                memory_id: "scoped-holdout".into(),
+                memory_version: 1,
+                memory_applied: false,
+            }]
+        );
+        assert!(
+            db.list_kioku_outcome_assignments("completed-operation")
+                .unwrap()
+                .is_empty()
         );
     }
 
