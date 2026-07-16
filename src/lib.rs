@@ -20,6 +20,7 @@ pub mod operation_report;
 pub mod provenance;
 pub mod provider_profile;
 pub mod receipt_cli;
+pub mod report_cli;
 pub mod secrets;
 pub mod sekai;
 pub mod shomei;
