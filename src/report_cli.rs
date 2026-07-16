@@ -2,16 +2,19 @@ use crate::chisei::receipt::OperationReceipt;
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::operation_report::{ClaimState, OperationReport};
+use crate::operation_report::{ClaimState, OperationReport, OperationSummary};
 use std::path::PathBuf;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
+    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
 }
 
 pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
+    if args.first().is_some_and(|arg| arg == "summary") {
+        return summarize(&args[1..]);
+    }
     if matches!(args.first().map(String::as_str), Some("bundle" | "verify")) {
         return crate::attest_cli::run_attest_command(attest_args(args).expect("matched command"))
             .await;
@@ -50,6 +53,53 @@ pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
         print!("{}", render_report(&report));
     }
     Ok(())
+}
+
+fn summarize(args: &[String]) -> Result<(), BoxErr> {
+    let since_ms = flag(args, "--since-ms")
+        .ok_or_else(|| std::io::Error::other("--since-ms is required"))?
+        .parse()?;
+    let until_ms = flag(args, "--until-ms")
+        .ok_or_else(|| std::io::Error::other("--until-ms is required"))?
+        .parse()?;
+    let paths = positional_values(args);
+    if paths.is_empty() {
+        return Err(std::io::Error::other("at least one report artifact is required").into());
+    }
+    let reports = paths
+        .iter()
+        .map(|path| -> Result<OperationReport, BoxErr> {
+            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let namespace = flag(args, "--namespace");
+    let json = serde_json::to_string_pretty(&OperationSummary::from_reports(
+        &reports,
+        namespace.as_deref(),
+        since_ms,
+        until_ms,
+    ))?;
+    if let Some(output) = flag(args, "--output") {
+        std::fs::write(&output, format!("{json}\n"))?;
+        println!("created {output}");
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn positional_values(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index].starts_with('-') {
+            index += 2;
+        } else {
+            values.push(args[index].clone());
+            index += 1;
+        }
+    }
+    values
 }
 
 pub fn render_report(report: &OperationReport) -> String {

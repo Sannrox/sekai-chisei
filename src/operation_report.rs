@@ -7,6 +7,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const OPERATION_REPORT_VERSION: &str = "operation.report/v1";
+pub const OPERATION_SUMMARY_VERSION: &str = "operation.summary/v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationSummary {
+    pub version: String,
+    pub namespace: Option<String>,
+    pub since_ms: i64,
+    pub until_ms: i64,
+    pub operation_count: usize,
+    pub spend_usd_micros: i64,
+    pub budget_pressure_events: usize,
+    pub policy_blocks: usize,
+    pub failure_events: usize,
+    pub degraded_mode_events: usize,
+    pub expensive_operations: Vec<ExpensiveOperation>,
+    pub mean_outcome_quality: Option<f64>,
+    pub complete_evidence_operations: usize,
+    pub evidence_coverage_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpensiveOperation {
+    pub operation_id: String,
+    pub cost_usd_micros: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssuranceClaims {
@@ -104,6 +129,102 @@ impl OperationReport {
             structural_errors,
         }
     }
+}
+
+impl OperationSummary {
+    pub fn from_reports(
+        reports: &[OperationReport],
+        namespace: Option<&str>,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Self {
+        let selected = reports
+            .iter()
+            .filter(|report| {
+                report.started_at_ms >= since_ms
+                    && report.started_at_ms < until_ms
+                    && namespace.is_none_or(|value| report.namespace == value)
+            })
+            .collect::<Vec<_>>();
+        let mut spend = 0i64;
+        let mut budget_pressure = 0usize;
+        let mut policy_blocks = 0usize;
+        let mut failures = 0usize;
+        let mut degraded = 0usize;
+        let mut quality = Vec::new();
+        let mut expensive_operations = Vec::new();
+        for report in &selected {
+            let mut operation_cost = 0i64;
+            for event in report.sections.values().flatten() {
+                operation_cost = operation_cost
+                    .saturating_add(attribute_i64(event, "cost_usd_micros").unwrap_or(0));
+                budget_pressure += attribute_true(event, "budget_pressure") as usize;
+                policy_blocks += (event.kind == "policy_decided"
+                    && ["decision", "status"].iter().any(|key| {
+                        matches!(
+                            event.attributes.get(*key).map(String::as_str),
+                            Some("blocked" | "denied" | "refused")
+                        )
+                    })) as usize;
+                failures += matches!(
+                    event.attributes.get("status").map(String::as_str),
+                    Some("failed" | "error")
+                ) as usize;
+                degraded += attribute_true(event, "degraded_mode") as usize;
+                if event.kind == "outcome_recorded" {
+                    if let Some(value) = attribute_f64(event, "quality_score") {
+                        quality.push(value);
+                    }
+                }
+            }
+            spend = spend.saturating_add(operation_cost);
+            expensive_operations.push(ExpensiveOperation {
+                operation_id: report.operation_id.clone(),
+                cost_usd_micros: operation_cost,
+            });
+        }
+        expensive_operations.sort_by_key(|item| std::cmp::Reverse(item.cost_usd_micros));
+        expensive_operations.truncate(10);
+        let complete = selected
+            .iter()
+            .filter(|report| report.claims.evidence_complete)
+            .count();
+        let count = selected.len();
+        Self {
+            version: OPERATION_SUMMARY_VERSION.into(),
+            namespace: namespace.map(str::to_string),
+            since_ms,
+            until_ms,
+            operation_count: count,
+            spend_usd_micros: spend,
+            budget_pressure_events: budget_pressure,
+            policy_blocks,
+            failure_events: failures,
+            degraded_mode_events: degraded,
+            expensive_operations,
+            mean_outcome_quality: (!quality.is_empty())
+                .then(|| quality.iter().sum::<f64>() / quality.len() as f64),
+            complete_evidence_operations: complete,
+            evidence_coverage_ratio: if count == 0 {
+                0.0
+            } else {
+                complete as f64 / count as f64
+            },
+        }
+    }
+}
+
+fn attribute_i64(event: &ReportEvent, key: &str) -> Option<i64> {
+    event.attributes.get(key)?.parse().ok()
+}
+fn attribute_f64(event: &ReportEvent, key: &str) -> Option<f64> {
+    event.attributes.get(key)?.parse().ok()
+}
+fn attribute_true(event: &ReportEvent, key: &str) -> bool {
+    event
+        .attributes
+        .get(key)
+        .is_some_and(|value| value == "true")
 }
 
 fn causally_ordered_events(receipt: &OperationReceipt) -> Vec<&OperationReceiptEvent> {
@@ -220,5 +341,44 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("precedes"))
         );
+    }
+
+    #[test]
+    fn summary_filters_namespace_and_reports_cost_quality_and_coverage() {
+        let mut first = OperationReport::from_receipt(&receipt());
+        let outcome = first
+            .sections
+            .get_mut("outcome")
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        outcome
+            .attributes
+            .insert("cost_usd_micros".into(), "1200".into());
+        outcome
+            .attributes
+            .insert("quality_score".into(), "0.8".into());
+        first
+            .sections
+            .entry("policy".into())
+            .or_default()
+            .push(ReportEvent {
+                event_id: "policy".into(),
+                parent_event_id: Some("intent".into()),
+                timestamp_ms: 1,
+                kind: "policy_decided".into(),
+                actor: "policy".into(),
+                attributes: BTreeMap::from([("status".into(), "denied".into())]),
+                references: vec![],
+            });
+        let mut second = first.clone();
+        second.operation_id = "op-2".into();
+        second.namespace = "other".into();
+        let summary = OperationSummary::from_reports(&[first, second], Some("team-a"), 0, 100);
+        assert_eq!(summary.operation_count, 1);
+        assert_eq!(summary.spend_usd_micros, 1200);
+        assert_eq!(summary.mean_outcome_quality, Some(0.8));
+        assert_eq!(summary.policy_blocks, 1);
+        assert_eq!(summary.evidence_coverage_ratio, 0.0);
     }
 }
