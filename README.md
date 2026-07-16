@@ -6,6 +6,48 @@ Most agent systems treat LLM calls as isolated events. `sekai-chisei` treats the
 governed operations: context-aware, policy-constrained, budget-tracked, auditable, and
 measurable against a baseline.
 
+## Connect an existing agent in five minutes
+
+Keep your harness, sessions, tool loop, workspace, and approvals. Point its model
+traffic at Chisei to add policy enforcement, budgets, usage accounting, and canonical
+operation receipts.
+
+Requirements: Rust and either Codex or Claude Code installed. Provider credentials can
+come from `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, their documented secret-command
+settings, or the supported client subscription passthrough path.
+
+```bash
+git clone https://github.com/Sannrox/sekai-chisei.git
+cd sekai-chisei
+cp .env.example .env        # optional: add provider credentials
+cargo run --bin sekaictl -- doctor codex-app
+cargo run --bin sekaictl -- launch codex-app
+```
+
+`launch` creates local state, applies migrations, generates a private credential,
+binds local-only endpoints, validates the harness/provider contract, seeds policy and
+budget state, and opens the harness. It does not require `SEKAI_INSECURE=1`.
+
+With a gateway-owned OpenAI credential, run the deterministic CLI check:
+
+```bash
+cargo run --bin sekaictl -- smoke gpt-5.5
+```
+
+For Codex subscription passthrough, send `Reply with exactly: chisei onboarding ok`
+inside the launched Codex session instead. The CLI output includes the operation ID,
+policy result, normalized usage, receipt location, and the exact inspection command:
+
+```bash
+cargo run --bin sekaictl -- receipt <operation_id>
+```
+
+Use Claude Code instead with `doctor claude-code` and `launch claude-code`. A promoted
+and capability-verified provider profile can be selected with `--model`; experimental
+profiles such as `meta/muse-spark-1.1` remain blocked until their lifecycle state is
+explicitly promoted. `xai/grok-4.5` is available when its profile and credential pass
+the same launch checks.
+
 It combines:
 
 - `sekai`: durable facts represented by typed objects and links, lineage, access
@@ -52,33 +94,6 @@ retained-submission quota in addition to payload, relationship, and rate limits.
 Rejected submissions, delivery-key aliases, and per-submission lifecycle
 histories are bounded so an untrusted or noisy source cannot grow local state
 without limit.
-
-## Quickstart
-
-```bash
-git clone https://github.com/Sannrox/sekai-chisei.git
-cd sekai-chisei
-SEKAI_INSECURE=1 cargo run
-```
-
-The server starts on `127.0.0.1:50051` with SQLite at `./data/sekai.db`.
-
-In a second terminal, run the end-to-end demo — it creates a typed-object graph in
-`sekai` and drives the `chisei` budget and decision pipeline:
-
-```bash
-cargo run --example demo_client
-```
-
-To connect a real LLM provider, copy `.env.example` to `.env` and add your key:
-
-```bash
-cp .env.example .env
-# set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env
-SEKAI_INSECURE=1 cargo run
-```
-
-See [examples/README.md](examples/README.md) for what the demo exercises.
 
 ## Status
 
