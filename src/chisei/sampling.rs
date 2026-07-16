@@ -147,8 +147,10 @@ mod tests {
             expanded_context_items: 0,
             evidence_references: vec![],
             memory_actor: String::new(),
+            memory_assignment_id: String::new(),
             memory_token_budget: 0,
             memory_references: vec![],
+            memory_holdouts: vec![],
             allowed_evidence_classes: std::collections::HashSet::new(),
         }
     }
