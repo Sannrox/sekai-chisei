@@ -1,4 +1,4 @@
-use crate::sdk::EvidenceDraft;
+use crate::sdk::{ConformanceProfile, EvidenceDraft};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -7,6 +7,15 @@ use std::collections::HashMap;
 pub const EVIDENCE_TYPE: &str = "operations.health_snapshot";
 pub const SCHEMA_ID: &str = "adapter.http.health_snapshot";
 pub const SCHEMA_VERSION: &str = "1.0.0";
+pub const CONFORMANCE_PROFILE: ConformanceProfile = ConformanceProfile {
+    source_type: "http_health_endpoint",
+    evidence_type: EVIDENCE_TYPE,
+    signal: "operational_health",
+    schema_id: SCHEMA_ID,
+    schema_version: SCHEMA_VERSION,
+    delivery: "poll",
+    requires_expiry: true,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct HealthSnapshot {
@@ -41,7 +50,7 @@ pub fn translate(
         .map(str::to_string)
         .or(payload.version.clone())
         .unwrap_or_else(|| payload.observed_at.clone());
-    Ok(EvidenceDraft {
+    let draft = EvidenceDraft {
         source_type: "http_health_endpoint".into(),
         source_record_id: source_record_id.trim().into(),
         source_version,
@@ -64,7 +73,9 @@ pub fn translate(
             ("delivery".into(), "poll".into()),
         ]),
         causality: None,
-    })
+    };
+    CONFORMANCE_PROFILE.validate(&draft)?;
+    Ok(draft)
 }
 
 pub fn parse(input: &[u8]) -> Result<HealthSnapshot, String> {
