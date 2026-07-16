@@ -1033,7 +1033,10 @@ impl ProviderRegistry {
                         structured_output: true,
                         reasoning_controls: true,
                         modalities: vec!["text".into(), "image".into()],
-                        provider_continuation: true,
+                        // The upstream supports opaque response ids, but the
+                        // gateway cannot safely expose them until ownership is
+                        // bound to the authenticated caller.
+                        provider_continuation: false,
                         reports_usage: true,
                         partial_usage: true,
                         context_tokens: 400_000,
@@ -1751,14 +1754,24 @@ impl CapabilityRequirements {
             .cloned()
             .unwrap_or_default();
         let has_tool_outputs = value.get("input").is_some_and(contains_tool_call_output);
-        let built_in_tools = tools
+        let mut built_in_tools = tools
             .iter()
             .filter_map(|tool| tool.get("type").and_then(|value| value.as_str()))
             .filter(|kind| !matches!(*kind, "function" | "custom"))
             .map(str::to_string)
             .collect::<Vec<_>>();
+        if let Some(input) = value.get("input") {
+            collect_continuation_built_in_tools(input, &mut built_in_tools);
+        }
+        built_in_tools.sort();
+        built_in_tools.dedup();
         let mut modalities = vec!["text".to_string()];
-        collect_modalities(&value, &mut modalities);
+        if let Some(input) = value.get("input") {
+            collect_modalities(input, &mut modalities);
+        }
+        if let Some(variables) = value.pointer("/prompt/variables") {
+            collect_modalities(variables, &mut modalities);
+        }
         modalities.sort();
         modalities.dedup();
         let max_output_tokens = match value.get("max_output_tokens") {
@@ -1821,7 +1834,9 @@ impl CapabilityRequirements {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let mut modalities = vec!["text".to_string()];
-        collect_modalities(&value, &mut modalities);
+        if let Some(messages) = value.get("messages") {
+            collect_modalities(messages, &mut modalities);
+        }
         if matches!(wire, ChatCapabilityWire::OpenAi)
             && let Some(requested) = value
                 .get("modalities")
@@ -1978,6 +1993,7 @@ fn collect_modalities(value: &serde_json::Value, modalities: &mut Vec<String>) {
                 match kind {
                     "input_image" | "image_url" | "image" => modalities.push("image".into()),
                     "input_audio" | "audio" => modalities.push("audio".into()),
+                    "input_video" | "video_url" | "video" => modalities.push("video".into()),
                     _ => {}
                 }
             }
@@ -2000,6 +2016,34 @@ fn contains_tool_call_output(value: &serde_json::Value) -> bool {
                 || values.values().any(contains_tool_call_output)
         }
         _ => false,
+    }
+}
+
+fn collect_continuation_built_in_tools(value: &serde_json::Value, tools: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_continuation_built_in_tools(value, tools);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if let Some(kind) = values.get("type").and_then(serde_json::Value::as_str) {
+                match kind {
+                    "computer_call_output" => tools.push("computer_use_preview".into()),
+                    "mcp_approval_response" | "mcp_call_output" => tools.push("mcp".into()),
+                    kind if kind.ends_with("_call_output")
+                        && !matches!(kind, "function_call_output" | "custom_tool_call_output") =>
+                    {
+                        tools.push(kind.trim_end_matches("_call_output").to_string());
+                    }
+                    _ => {}
+                }
+            }
+            for value in values.values() {
+                collect_continuation_built_in_tools(value, tools);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2076,6 +2120,21 @@ mod tests {
         assert!(required.structured_output);
         assert_eq!(required.modalities, vec!["image", "text"]);
         assert_eq!(required.built_in_tools, vec!["web_search"]);
+    }
+
+    #[test]
+    fn derives_video_capability_from_responses_requests() {
+        let required = CapabilityRequirements::from_responses_body(
+            br#"{"input":[{"role":"user","content":[{"type":"input_video"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(required.modalities, vec!["text", "video"]);
+
+        let metadata_only = CapabilityRequirements::from_responses_body(
+            br#"{"input":"hello","metadata":{"type":"video"}}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata_only.modalities, vec!["text"]);
     }
 
     #[test]
@@ -3377,6 +3436,12 @@ mod tests {
             required.unsupported_by(CapabilityMatrix::built_in().capabilities("native").unwrap()),
             vec!["tools"]
         );
+
+        let built_in = CapabilityRequirements::from_responses_body(
+            br#"{"input":[{"type":"computer_call_output","call_id":"call_2","output":[]},{"type":"mcp_approval_response","approval_request_id":"approval_1","approve":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(built_in.built_in_tools, vec!["computer_use_preview", "mcp"]);
     }
 
     #[test]

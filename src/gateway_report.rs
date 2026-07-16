@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -82,6 +82,8 @@ impl GatewayReportConfig {
 pub enum ReportGroupBy {
     Project,
     Agent,
+    Provider,
+    ProviderModel,
     Model,
     WorkUnit,
     AgentWithinProject,
@@ -92,6 +94,8 @@ impl ReportGroupBy {
         match self {
             Self::Project => "project",
             Self::Agent => "agent",
+            Self::Provider => "provider",
+            Self::ProviderModel => "provider/model",
             Self::Model => "model",
             Self::WorkUnit => "work_unit",
             Self::AgentWithinProject => "agent/project",
@@ -106,11 +110,13 @@ impl std::str::FromStr for ReportGroupBy {
         match value {
             "project" => Ok(Self::Project),
             "agent" => Ok(Self::Agent),
+            "provider" => Ok(Self::Provider),
+            "provider-model" | "provider_model" => Ok(Self::ProviderModel),
             "model" => Ok(Self::Model),
             "work-unit" | "work_unit" => Ok(Self::WorkUnit),
             "agent-within-project" | "agent_within_project" => Ok(Self::AgentWithinProject),
             other => Err(format!(
-                "unsupported report group {other:?}; expected project, agent, model, work-unit, or agent-within-project"
+                "unsupported report group {other:?}; expected project, agent, provider, provider-model, model, work-unit, or agent-within-project"
             )),
         }
     }
@@ -120,6 +126,8 @@ impl std::str::FromStr for ReportGroupBy {
 pub struct GatewayReportRow {
     pub group: String,
     pub calls: i64,
+    pub operations: i64,
+    pub successful_outcomes: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
@@ -129,6 +137,8 @@ pub struct GatewayReportRow {
     pub refusals: i64,
     pub terminal_failures: i64,
     pub models: BTreeMap<String, i64>,
+    pub profile_versions: BTreeMap<String, i64>,
+    pub capability_snapshots: BTreeMap<String, i64>,
     pub budget_used: i64,
     pub budget_limit: i64,
 }
@@ -150,8 +160,12 @@ pub async fn run_report(
                 columns: vec![
                     "project".to_string(),
                     "agent".to_string(),
+                    "operation_id".to_string(),
+                    "provider".to_string(),
                     "model".to_string(),
                     "resolved_model".to_string(),
+                    "profile_version".to_string(),
+                    "capability_snapshot_version".to_string(),
                     "work_unit_id".to_string(),
                     "pipeline_sampled".to_string(),
                     "sample_reason".to_string(),
@@ -264,13 +278,27 @@ pub fn render_egress_csv(rows: &[Row]) -> String {
 
 pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayReportRow> {
     let mut groups: BTreeMap<String, GatewayReportRow> = BTreeMap::new();
-    for row in rows {
+    let mut operations: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
         let group = report_group(&row, group_by);
         let summary = groups.entry(group.clone()).or_insert(GatewayReportRow {
-            group,
+            group: group.clone(),
             ..Default::default()
         });
         summary.calls += 1;
+        let operation_key = row
+            .values
+            .get("operation_id")
+            .filter(|operation_id| !operation_id.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("legacy-row-{row_index}"));
+        operations
+            .entry(group.clone())
+            .or_default()
+            .insert(operation_key);
+        if row_is_successful(&row) {
+            summary.successful_outcomes += 1;
+        }
         summary.input_tokens += parse_i64(row.values.get("input_tokens"));
         summary.output_tokens += parse_i64(row.values.get("output_tokens"));
         summary.total_tokens += parse_i64(row.values.get("total_tokens"));
@@ -306,8 +334,31 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
                 *summary.models.entry(model).or_default() += 1;
             }
         }
+        if let Some(version) = row
+            .values
+            .get("profile_version")
+            .filter(|version| !version.is_empty())
+        {
+            *summary.profile_versions.entry(version.clone()).or_default() += 1;
+        }
+        if let Some(snapshot) = row
+            .values
+            .get("capability_snapshot_version")
+            .filter(|snapshot| !snapshot.is_empty())
+        {
+            *summary
+                .capability_snapshots
+                .entry(snapshot.clone())
+                .or_default() += 1;
+        }
     }
-    let mut summaries = groups.into_values().collect::<Vec<_>>();
+    let mut summaries = groups
+        .into_iter()
+        .map(|(group, mut summary)| {
+            summary.operations = operations.get(&group).map_or(0, BTreeSet::len) as i64;
+            summary
+        })
+        .collect::<Vec<_>>();
     summaries.sort_by(|a, b| {
         b.total_tokens
             .cmp(&a.total_tokens)
@@ -396,6 +447,24 @@ fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
     let value = match group_by {
         ReportGroupBy::Project => row.values.get("project"),
         ReportGroupBy::Agent => row.values.get("agent"),
+        ReportGroupBy::Provider => row.values.get("provider"),
+        ReportGroupBy::ProviderModel => {
+            let provider = row.values.get("provider").filter(|value| !value.is_empty());
+            let model = row
+                .values
+                .get("resolved_model")
+                .filter(|value| !value.is_empty())
+                .or_else(|| row.values.get("model").filter(|value| !value.is_empty()));
+            return match (provider, model) {
+                (Some(provider), Some(model)) if model.starts_with(&format!("{provider}/")) => {
+                    model.clone()
+                }
+                (Some(provider), Some(model)) => format!("{provider}/{model}"),
+                (Some(provider), None) => provider.clone(),
+                (None, Some(model)) => model.clone(),
+                (None, None) => "(unknown)".to_string(),
+            };
+        }
         ReportGroupBy::Model => row
             .values
             .get("resolved_model")
@@ -419,16 +488,37 @@ fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
         .unwrap_or_else(|| "(unknown)".to_string())
 }
 
+fn row_is_successful(row: &Row) -> bool {
+    let status_success = row
+        .values
+        .get("status")
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| (200..300).contains(&status));
+    let terminal_success = row
+        .values
+        .get("terminal_outcome")
+        .is_none_or(|outcome| outcome.is_empty() || outcome == "completed");
+    let refused = row
+        .values
+        .get("refusal_reason")
+        .is_some_and(|reason| !reason.is_empty());
+    status_success && terminal_success && !refused
+}
+
 fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
     if group_by == ReportGroupBy::WorkUnit {
         print_work_unit_report(rows);
         return;
     }
     println!(
-        "{:<24} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+        "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
         group_by.label(),
         "calls",
+        "operations",
+        "successes",
         "failures",
+        "profiles",
+        "capability",
         "input_tokens",
         "output_tokens",
         "total_tokens",
@@ -439,10 +529,14 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
     println!("{}", "-".repeat(126));
     for row in rows {
         println!(
-            "{:<24} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+            "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
             truncate(&row.group, 24),
             row.calls,
+            row.operations,
+            row.successful_outcomes,
             row.terminal_failures,
+            row.profile_versions.len(),
+            row.capability_snapshots.len(),
             row.input_tokens,
             row.output_tokens,
             row.total_tokens,
@@ -497,6 +591,8 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
 pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
     let by_project = summarize_rows(rows.to_vec(), ReportGroupBy::Project);
     let by_agent = summarize_rows(rows.to_vec(), ReportGroupBy::Agent);
+    let by_provider = summarize_rows(rows.to_vec(), ReportGroupBy::Provider);
+    let by_provider_model = summarize_rows(rows.to_vec(), ReportGroupBy::ProviderModel);
     let by_model = summarize_rows(rows.to_vec(), ReportGroupBy::Model);
     let by_work_unit = summarize_rows(rows.to_vec(), ReportGroupBy::WorkUnit);
     let by_agent_within_project = summarize_rows(rows.to_vec(), ReportGroupBy::AgentWithinProject);
@@ -504,6 +600,9 @@ pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
         .iter()
         .fold(GatewayReportRow::default(), |mut total, row| {
             total.calls += 1;
+            if row_is_successful(row) {
+                total.successful_outcomes += 1;
+            }
             total.input_tokens += parse_i64(row.values.get("input_tokens"));
             total.output_tokens += parse_i64(row.values.get("output_tokens"));
             total.total_tokens += parse_i64(row.values.get("total_tokens"));
@@ -555,6 +654,8 @@ tr:last-child td {{ border-bottom:0; }}
 </section>
 {project}
 {agent}
+{provider}
+{provider_model}
 {model}
 {work_unit}
 {agent_within_project}
@@ -566,6 +667,12 @@ tr:last-child td {{ border-bottom:0; }}
         metrics = render_metric_cards(&totals),
         project = render_section("By Project", "project", &by_project),
         agent = render_section("By Agent", "agent", &by_agent),
+        provider = render_section("By Provider", "provider", &by_provider),
+        provider_model = render_section(
+            "By Provider and Model",
+            "provider/model",
+            &by_provider_model
+        ),
         model = render_section("By Model", "model", &by_model),
         work_unit = render_section("By Work Unit", "work_unit", &by_work_unit),
         agent_within_project = render_section(
@@ -579,6 +686,7 @@ tr:last-child td {{ border-bottom:0; }}
 fn render_metric_cards(total: &GatewayReportRow) -> String {
     [
         ("Calls", total.calls.to_string()),
+        ("Successful outcomes", total.successful_outcomes.to_string()),
         ("Terminal failures", total.terminal_failures.to_string()),
         ("Input tokens", total.input_tokens.to_string()),
         ("Output tokens", total.output_tokens.to_string()),
@@ -616,11 +724,15 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
                 0
             };
             format!(
-                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{failures}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
+                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{operations}</td><td>{successes}</td><td>{failures}</td><td>{profiles}</td><td>{capability_snapshots}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
                 group = html_escape(&row.group),
                 width = width,
                 calls = row.calls,
+                operations = row.operations,
+                successes = row.successful_outcomes,
                 failures = row.terminal_failures,
+                profiles = row.profile_versions.len(),
+                capability_snapshots = row.capability_snapshots.len(),
                 input = row.input_tokens,
                 output = row.output_tokens,
                 total = row.total_tokens,
@@ -635,7 +747,7 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
         r#"<section>
 <h2>{title}</h2>
 <table>
-<thead><tr><th>{first_column}</th><th>calls</th><th>terminal failures</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
+<thead><tr><th>{first_column}</th><th>calls</th><th>operations</th><th>successful outcomes</th><th>terminal failures</th><th>profiles</th><th>capability snapshots</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
 <tbody>
 {body}
 </tbody>
@@ -709,7 +821,7 @@ fn gateway_request<T>(message: T) -> GrpcRequest<T> {
 }
 
 pub fn report_usage() -> String {
-    "Usage: chisei-gateway report [--target <grpc-url>] [--by <project|agent|model|work-unit|agent-within-project>] [--since <30m|24h|7d>] [--limit <rows>] [--html <path>]".to_string()
+    "Usage: chisei-gateway report [--target <grpc-url>] [--by <project|agent|provider|provider-model|model|work-unit|agent-within-project>] [--since <30m|24h|7d>] [--limit <rows>] [--html <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -804,6 +916,7 @@ mod tests {
                 GatewayReportRow {
                     group: "gpt-5.5-mini".to_string(),
                     calls: 2,
+                    operations: 2,
                     input_tokens: 17,
                     output_tokens: 7,
                     total_tokens: 24,
@@ -813,6 +926,7 @@ mod tests {
                 GatewayReportRow {
                     group: "claude-opus-4-8".to_string(),
                     calls: 1,
+                    operations: 1,
                     input_tokens: 5,
                     output_tokens: 2,
                     total_tokens: 7,
@@ -903,6 +1017,7 @@ mod tests {
                 GatewayReportRow {
                     group: "wu-a".to_string(),
                     calls: 2,
+                    operations: 2,
                     input_tokens: 18,
                     output_tokens: 8,
                     total_tokens: 26,
@@ -912,6 +1027,7 @@ mod tests {
                 GatewayReportRow {
                     group: "wu-b".to_string(),
                     calls: 1,
+                    operations: 1,
                     input_tokens: 7,
                     output_tokens: 3,
                     total_tokens: 10,
@@ -954,6 +1070,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_concentration_tracks_success_cost_and_governed_dependencies() {
+        let rows = vec![
+            row([
+                ("provider", "xai"),
+                ("operation_id", "operation-1"),
+                ("resolved_model", "xai/grok-4.5"),
+                ("profile_version", "xai.grok-4.5/v1"),
+                ("capability_snapshot_version", "registry-v3:state-7"),
+                ("status", "200"),
+                ("cost_usd_micros", "30"),
+            ]),
+            row([
+                ("provider", "xai"),
+                ("operation_id", "operation-1"),
+                ("resolved_model", "xai/grok-4.5"),
+                ("profile_version", "xai.grok-4.5/v1"),
+                ("capability_snapshot_version", "registry-v3:state-8"),
+                ("status", "200"),
+                ("terminal_outcome", "failed"),
+                ("cost_usd_micros", "20"),
+            ]),
+        ];
+
+        let by_provider = summarize_rows(rows.clone(), ReportGroupBy::Provider);
+        assert_eq!(by_provider[0].group, "xai");
+        assert_eq!(by_provider[0].calls, 2);
+        assert_eq!(by_provider[0].operations, 1);
+        assert_eq!(by_provider[0].successful_outcomes, 1);
+        assert_eq!(by_provider[0].terminal_failures, 1);
+        assert_eq!(by_provider[0].cost_usd_micros, 50);
+        assert_eq!(by_provider[0].profile_versions["xai.grok-4.5/v1"], 2);
+        assert_eq!(by_provider[0].capability_snapshots.len(), 2);
+
+        let by_model = summarize_rows(rows, ReportGroupBy::ProviderModel);
+        assert_eq!(by_model[0].group, "xai/grok-4.5");
+    }
+
+    #[test]
     fn summarize_rows_by_agent_within_project() {
         let rows = vec![
             row([
@@ -989,6 +1143,7 @@ mod tests {
                 GatewayReportRow {
                     group: "sekai-chisei/claude-code".to_string(),
                     calls: 2,
+                    operations: 2,
                     input_tokens: 16,
                     output_tokens: 3,
                     total_tokens: 19,
@@ -998,6 +1153,7 @@ mod tests {
                 GatewayReportRow {
                     group: "sekai-chisei/codex-app".to_string(),
                     calls: 1,
+                    operations: 1,
                     input_tokens: 5,
                     output_tokens: 2,
                     total_tokens: 7,
