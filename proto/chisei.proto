@@ -698,6 +698,21 @@ message EvolveAbResultsResponse { EvolveAbReport report = 1; }
 message EvolveTemplatesRequest {}
 message EvolveTemplatesResponse { repeated EvolveTemplate templates = 1; }
 
+message ListKiokuCandidatesRequest {
+  string namespace = 1;
+  string operation_class = 2;
+  uint32 limit = 3;
+}
+message KiokuCandidateRecord {
+  string memory_json = 1;
+  repeated string evidence_json = 2;
+  bool valid = 3;
+  repeated string validation_errors = 4;
+  uint32 supporting_evidence = 5;
+  uint32 contradicting_evidence = 6;
+}
+message ListKiokuCandidatesResponse { repeated KiokuCandidateRecord candidates = 1; }
+
 // --- Service ---
 
 // Governed decisions for agent operations: context, policy, budgets, routing,
@@ -734,6 +749,7 @@ service ChiseiService {
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
+  rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
   rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 

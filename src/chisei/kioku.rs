@@ -651,6 +651,54 @@ impl SekaiDb {
             .transpose()
     }
 
+    pub fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        if namespace.trim().is_empty() {
+            return Err("candidate namespace is required".into());
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT memory_json FROM chisei_kioku_memories
+                 WHERE namespace=?1 AND state='candidate'
+                 ORDER BY rowid DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([namespace.trim()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let operation_class = operation_class
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        rows.map(|row| {
+            row.map_err(|error| error.to_string())
+                .and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        })
+        .filter_map(|memory: Result<KiokuMemory, String>| match memory {
+            Ok(memory)
+                if operation_class.is_none_or(|class| {
+                    memory
+                        .operation_classes
+                        .iter()
+                        .any(|candidate| candidate == class)
+                }) =>
+            {
+                Some(Ok(memory))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .take(limit)
+        .collect()
+    }
+
     pub fn list_kioku_evidence(
         &self,
         id: &str,
@@ -1477,6 +1525,45 @@ mod tests {
             last_confirmed_at_ms: Some(100),
             supersedes: None,
         }
+    }
+
+    fn candidate_evidence(memory: &KiokuMemory) -> KiokuEvidenceLink {
+        KiokuEvidenceLink {
+            memory_id: memory.id.clone(),
+            memory_version: memory.version,
+            operation_id: "operation-1".into(),
+            verification_event_id: "verify-1".into(),
+            evidence_reference: "artifact://verification".into(),
+            evidence_digest: "abc123".into(),
+            stance: MemoryEvidenceStance::Supporting,
+            outcome_metric: "deployment verification passed".into(),
+            outcome_value: 1.0,
+            observed_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn candidate_listing_is_namespace_scoped_and_operation_filtered() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let first = candidate();
+        db.insert_kioku_memory(&first, &[candidate_evidence(&first)])
+            .unwrap();
+        let mut second = candidate();
+        second.id = "memory-2".into();
+        second.namespace = "other".into();
+        let mut second_evidence = candidate_evidence(&second);
+        second_evidence.operation_id = "operation-2".into();
+        db.insert_kioku_memory(&second, &[second_evidence]).unwrap();
+
+        let listed = db
+            .list_kioku_candidates("payments", Some("schema_change"), 10)
+            .unwrap();
+        assert_eq!(listed, vec![first]);
+        assert!(
+            db.list_kioku_candidates("payments", Some("incident"), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn verified_outcome(operation_id: &str, passed: bool) -> VerifiedOutcome {
