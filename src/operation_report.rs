@@ -73,6 +73,8 @@ pub struct OperationReport {
     pub started_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub governance: GovernanceProjection,
     pub claims: AssuranceClaims,
     pub sections: BTreeMap<String, Vec<ReportEvent>>,
     pub missing_surfaces: Vec<ReceiptSurface>,
@@ -80,23 +82,54 @@ pub struct OperationReport {
     pub structural_errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceProjection {
+    pub authorization_enforced_at_source: bool,
+    pub receipt_disclosures_only: bool,
+    pub retention_redactions: usize,
+    pub tombstone_redactions: usize,
+}
+
+impl Default for GovernanceProjection {
+    fn default() -> Self {
+        Self {
+            authorization_enforced_at_source: false,
+            receipt_disclosures_only: false,
+            retention_redactions: 0,
+            tombstone_redactions: 0,
+        }
+    }
+}
+
 impl OperationReport {
     pub fn from_receipt(receipt: &OperationReceipt) -> Self {
+        Self::project(receipt, false)
+    }
+
+    pub fn from_authorized_receipt(receipt: &OperationReceipt) -> Self {
+        Self::project(receipt, true)
+    }
+
+    fn project(receipt: &OperationReceipt, authorization_enforced_at_source: bool) -> Self {
         let completeness = receipt.completeness();
         let mut sections = BTreeMap::<String, Vec<ReportEvent>>::new();
+        let mut retention_redactions = 0usize;
+        let mut tombstone_redactions = 0usize;
         for event in causally_ordered_events(receipt) {
+            let projected = project_event(event);
+            for reference in projected
+                .references
+                .iter()
+                .filter(|reference| reference.omitted)
+            {
+                let reason = reference.omission_reason.as_deref().unwrap_or_default();
+                retention_redactions += reason.contains("retention") as usize;
+                tombstone_redactions += reason.contains("tombstone") as usize;
+            }
             sections
                 .entry(event.surface.as_str().into())
                 .or_default()
-                .push(ReportEvent {
-                    event_id: event.event_id.clone(),
-                    parent_event_id: event.parent_event_id.clone(),
-                    timestamp_ms: event.timestamp_ms,
-                    kind: event.kind.as_str().into(),
-                    actor: event.actor.clone(),
-                    attributes: event.attributes.clone(),
-                    references: event.references.clone(),
-                });
+                .push(projected);
         }
         let duration_ms = receipt
             .completed_at_ms
@@ -118,6 +151,12 @@ impl OperationReport {
             started_at_ms: receipt.started_at_ms,
             completed_at_ms: receipt.completed_at_ms,
             duration_ms: duration_ms.filter(|duration| *duration >= 0),
+            governance: GovernanceProjection {
+                authorization_enforced_at_source,
+                receipt_disclosures_only: true,
+                retention_redactions,
+                tombstone_redactions,
+            },
             claims: AssuranceClaims {
                 evidence_complete: completeness.complete && structural_errors.is_empty(),
                 integrity: ClaimState::NotVerified,
@@ -128,6 +167,18 @@ impl OperationReport {
             uncovered_surfaces: receipt.uncovered_surfaces.clone(),
             structural_errors,
         }
+    }
+}
+
+fn project_event(event: &OperationReceiptEvent) -> ReportEvent {
+    ReportEvent {
+        event_id: event.event_id.clone(),
+        parent_event_id: event.parent_event_id.clone(),
+        timestamp_ms: event.timestamp_ms,
+        kind: event.kind.as_str().into(),
+        actor: event.actor.clone(),
+        attributes: event.attributes.clone(),
+        references: event.references.clone(),
     }
 }
 
@@ -380,5 +431,38 @@ mod tests {
         assert_eq!(summary.mean_outcome_quality, Some(0.8));
         assert_eq!(summary.policy_blocks, 1);
         assert_eq!(summary.evidence_coverage_ratio, 0.0);
+    }
+
+    #[test]
+    fn canonical_retention_omissions_are_preserved_without_self_redaction() {
+        let mut source = receipt();
+        let outcome = source
+            .events
+            .iter_mut()
+            .find(|event| event.event_id == "outcome")
+            .unwrap();
+        outcome.references.push(GovernedReference {
+            kind: "artifact".into(),
+            reference: "artifact-1".into(),
+            content_hash: None,
+            disclosed_fields: vec![],
+            omitted: true,
+            omission_reason: Some("retention period elapsed".into()),
+        });
+        let report = OperationReport::from_authorized_receipt(&source);
+        let projected = &report.sections["outcome"][0];
+        assert!(projected.references[0].omitted);
+        assert!(projected.references[0].disclosed_fields.is_empty());
+        assert_eq!(report.governance.retention_redactions, 1);
+        assert!(report.governance.authorization_enforced_at_source);
+    }
+
+    #[test]
+    fn legacy_v1_reports_deserialize_without_stronger_governance_claims() {
+        let report = OperationReport::from_receipt(&receipt());
+        let mut json = serde_json::to_value(report).unwrap();
+        json.as_object_mut().unwrap().remove("governance");
+        let restored: OperationReport = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.governance, GovernanceProjection::default());
     }
 }
