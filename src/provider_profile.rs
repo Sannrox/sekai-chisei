@@ -173,10 +173,11 @@ impl CapabilityRequirements {
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false),
             tools: !tools.is_empty(),
-            parallel_tools: value
-                .get("parallel_tool_calls")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false),
+            parallel_tools: !tools.is_empty()
+                && value
+                    .get("parallel_tool_calls")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
             structured_output: requires_structured_output(&value),
             reasoning_controls: value.get("reasoning").is_some(),
             provider_continuation: value
@@ -329,5 +330,21 @@ mod tests {
         )
         .unwrap();
         assert!(required.structured_output);
+    }
+
+    #[test]
+    fn parallel_flag_without_tools_is_not_a_requirement() {
+        let required = CapabilityRequirements::from_responses_body(
+            br#"{"parallel_tool_calls":true,"input":"hello"}"#,
+        )
+        .unwrap();
+        assert!(!required.tools);
+        assert!(!required.parallel_tools);
+        let matrix = CapabilityMatrix::built_in();
+        assert!(
+            required
+                .unsupported_by(matrix.capabilities("ollama").unwrap())
+                .is_empty()
+        );
     }
 }
