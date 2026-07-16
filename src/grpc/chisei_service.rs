@@ -4535,7 +4535,24 @@ impl ChiseiService for ChiseiServiceImpl {
                 id: s.id,
                 name: s.name,
                 description: s.description,
-                cases: vec![],
+                cases: s
+                    .cases
+                    .into_iter()
+                    .map(|case| EvalCase {
+                        id: case.id,
+                        name: case.name,
+                        namespace: case.namespace,
+                        spec: case.spec,
+                        assertions: case
+                            .assertions
+                            .into_iter()
+                            .map(|assertion| EvalAssertion {
+                                r#type: assertion.assert_type,
+                                value: assertion.value,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
             }),
         }))
     }

@@ -17,10 +17,27 @@ ungoverned service tier. Tool results use `function_call_output` input items and
 identify the matching `call_id`. A request may contain multiple tool results.
 
 This profile version rejects `Idempotency-Key` with `capability_unsupported` rather
-than forwarding a key it cannot enforce. Clients must use a new attempt number for
-an ambiguous retry and must assume that a disconnected provider call may have run.
-Replay and conflicting-key detection will be advertised only by a later capability
-revision that persists request hashes and terminal results.
+than forwarding a key it cannot enforce. An ambiguous attempt must not be replayed:
+the host reconciles its outcome or starts a new logical operation and assumes that a
+disconnected provider call may have run. Replay and conflicting-key detection will
+be advertised only by a later capability revision that persists request hashes and
+terminal results.
+
+Retries are limited to failures classified as `rate_limited`,
+`upstream_unavailable`, or a timeout known to occur before provider contact, and
+every retry uses a higher `x-chisei-attempt`. A connection failure before response
+headers is retried by the gateway only when the request body is cloneable. Once a
+request may have reached the provider, a timeout is ambiguous. Once headers or
+stream bytes have arrived, Chisei never replays the request automatically:
+cancellation, disconnect, or interruption may have consumed provider capacity or
+produced effects and remains an ambiguous attempt. Duplicate terminal events and
+events after a terminal event are invalid stream behavior.
+
+Gateway-generated retryable errors expose `x-chisei-retry-safety: safe|ambiguous`
+and the same `error.retry_safety` value. A client retries only when the value is
+`safe`; missing values are not retry permission. A post-header interruption carries
+`retry_safety: ambiguous` inside its terminal SSE error because response headers
+have already been sent.
 
 Caller-supplied operation and parent identifiers are scoped to the authenticated
 gateway identity. The gateway returns their canonical `chisei:<scope>:<id>` form;
@@ -81,6 +98,7 @@ global argument buffer.
 Exactly one terminal event is emitted when Chisei can write one:
 
 - `response.completed`
+- `response.incomplete`
 - `response.failed`
 - `response.cancelled`
 - `chisei.response.interrupted`
@@ -90,8 +108,16 @@ after response headers. A client disconnect may prevent delivery of any terminal
 event. Unknown event types and unknown fields must be preserved or ignored without
 failing the stream state machine.
 
-Terminal events carry normalized usage when known. Partial, failed, and cancelled
-responses may report partial usage. Missing usage means unknown, never zero.
+Terminal events carry normalized usage when known. Incomplete, failed, and
+cancelled responses may report partial usage. Missing usage means unknown, never
+zero.
+
+A host continues tool work by assembling every function call independently by
+`call_id`, validating the completed arguments, executing locally under host policy,
+and sending one or more `function_call_output` items in a new request. The full
+portable input is authoritative. `previous_response_id` may be included only when
+the selected provider profile supports it and must never be the sole copy of the
+conversation or tool results.
 
 ## Error taxonomy
 
