@@ -19,6 +19,8 @@ const MAX_IDEMPOTENCY_ALIASES_PER_SUBMISSION: i64 = 16;
 pub struct EvidenceProducerCapability {
     pub producer_identity: String,
     pub config_version: i64,
+    #[serde(default)]
+    pub source_types: Vec<String>,
     pub source_instances: Vec<String>,
     pub namespaces: Vec<String>,
     pub evidence_types: Vec<String>,
@@ -253,7 +255,63 @@ impl SekaiDb {
                 WHERE identity.submission_id = sekai_evidence_submissions.id
               );",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+        // Producer registrations created before source-type authorization did
+        // not carry this field. Derive the least privilege compatible value
+        // only from evidence that the old registration actually admitted;
+        // registrations without such evidence remain fail-closed.
+        let legacy_producers = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT producer_identity, capability_json
+                     FROM sekai_evidence_producers",
+                )
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (producer_identity, capability_json) in legacy_producers {
+            let mut capability: EvidenceProducerCapability =
+                serde_json::from_str(&capability_json).map_err(|error| error.to_string())?;
+            if !capability.source_types.is_empty() {
+                continue;
+            }
+            let source_types = {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT DISTINCT source_type
+                         FROM sekai_evidence_submissions
+                         WHERE producer_identity=?1 AND lifecycle_state!='rejected'
+                         ORDER BY source_type",
+                    )
+                    .map_err(|error| error.to_string())?;
+                statement
+                    .query_map([&producer_identity], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            if source_types.is_empty() {
+                continue;
+            }
+            capability.source_types = source_types;
+            conn.execute(
+                "UPDATE sekai_evidence_producers SET capability_json=?1
+                 WHERE producer_identity=?2",
+                params![
+                    serde_json::to_string(&capability).map_err(|error| error.to_string())?,
+                    producer_identity,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn upsert_evidence_producer(
@@ -765,24 +823,29 @@ impl SekaiDb {
     pub fn list_usable_evidence_for_targets(
         &self,
         target_object_ids: &[String],
-        allowed_evidence_types: &[String],
+        allowed_evidence_classes: &[(String, String)],
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<UsableEvidenceContext>, String> {
-        if target_object_ids.is_empty() || allowed_evidence_types.is_empty() || limit == 0 {
+        if target_object_ids.is_empty() || allowed_evidence_classes.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let target_placeholders = (1..=target_object_ids.len())
             .map(|index| format!("?{index}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let evidence_type_start = target_object_ids.len() + 1;
-        let evidence_type_placeholders = (evidence_type_start
-            ..evidence_type_start + allowed_evidence_types.len())
-            .map(|index| format!("?{index}"))
+        let evidence_class_start = target_object_ids.len() + 1;
+        let evidence_class_predicates = (0..allowed_evidence_classes.len())
+            .map(|offset| {
+                let source = evidence_class_start + offset * 2;
+                format!(
+                    "(s.source_type=?{source} AND s.evidence_type=?{})",
+                    source + 1
+                )
+            })
             .collect::<Vec<_>>()
-            .join(", ");
-        let now_parameter = target_object_ids.len() + allowed_evidence_types.len() + 1;
+            .join(" OR ");
+        let now_parameter = target_object_ids.len() + allowed_evidence_classes.len() * 2 + 1;
         let limit_parameter = now_parameter + 1;
         let sql = format!(
             "SELECT s.id, s.producer_identity, s.source_type, s.source_instance,
@@ -795,7 +858,7 @@ impl SekaiDb {
              FROM sekai_evidence_submissions AS s
              JOIN sekai_evidence_projections AS p ON p.submission_id = s.id
              WHERE p.target_object_id IN ({target_placeholders})
-               AND s.evidence_type IN ({evidence_type_placeholders})
+               AND ({evidence_class_predicates})
                AND s.lifecycle_state = 'available'
                AND s.intent = 'upsert'
                AND (s.expires_at_ms IS NULL OR s.expires_at_ms > ?{now_parameter})
@@ -807,12 +870,10 @@ impl SekaiDb {
             .cloned()
             .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        values.extend(
-            allowed_evidence_types
-                .iter()
-                .cloned()
-                .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>),
-        );
+        for (source_type, evidence_type) in allowed_evidence_classes {
+            values.push(Box::new(source_type.clone()));
+            values.push(Box::new(evidence_type.clone()));
+        }
         values.push(Box::new(now_ms));
         values.push(Box::new(limit.min(32) as i64));
         let parameters = values
@@ -834,11 +895,11 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    pub fn list_usable_evidence_types_for_targets(
+    pub fn list_usable_evidence_classes_for_targets(
         &self,
         target_object_ids: &[String],
         now_ms: i64,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(String, String)>, String> {
         if target_object_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -848,14 +909,14 @@ impl SekaiDb {
             .join(", ");
         let now_parameter = target_object_ids.len() + 1;
         let sql = format!(
-            "SELECT DISTINCT s.evidence_type
+            "SELECT DISTINCT s.source_type, s.evidence_type
              FROM sekai_evidence_submissions AS s
              JOIN sekai_evidence_projections AS p ON p.submission_id = s.id
              WHERE p.target_object_id IN ({placeholders})
                AND s.lifecycle_state = 'available'
                AND s.intent = 'upsert'
                AND (s.expires_at_ms IS NULL OR s.expires_at_ms > ?{now_parameter})
-             ORDER BY s.evidence_type
+             ORDER BY s.source_type, s.evidence_type
              LIMIT 64"
         );
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = target_object_ids
@@ -871,7 +932,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(parameters.as_slice(), |row| row.get::<_, String>(0))
+            .query_map(parameters.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
@@ -903,7 +964,8 @@ fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), St
     if capability.config_version <= 0 {
         return Err("producer config version must be positive".to_string());
     }
-    if capability.source_instances.is_empty()
+    if capability.source_types.is_empty()
+        || capability.source_instances.is_empty()
         || capability.namespaces.is_empty()
         || capability.evidence_types.is_empty()
         || capability.target_kinds.is_empty()
@@ -947,6 +1009,12 @@ fn authorize<'a>(
 ) -> Result<(), (&'a str, &'a str)> {
     if capability.revoked {
         return Err(("producer_revoked", "producer registration is revoked"));
+    }
+    if !capability.source_types.contains(&envelope.source_type) {
+        return Err((
+            "source_type_forbidden",
+            "producer cannot submit source type",
+        ));
     }
     if !capability
         .source_instances
@@ -1341,6 +1409,7 @@ mod tests {
             &EvidenceProducerCapability {
                 producer_identity: "producer:checks".into(),
                 config_version: 1,
+                source_types: vec!["verification_system".into()],
                 source_instances: vec!["checks-primary".into()],
                 namespaces: vec!["acme".into()],
                 evidence_types: vec!["verification.result".into()],
@@ -1439,6 +1508,22 @@ mod tests {
                 EvidenceLifecycleState::Deduplicated,
                 EvidenceLifecycleState::Authorized,
             ]
+        );
+    }
+
+    #[test]
+    fn producer_cannot_relabel_an_owned_instance_as_an_unregistered_source_type() {
+        let db = configured_db();
+        let mut forged = envelope();
+        forged.source_type = "native_harness".into();
+        forged.idempotency_key = "forged-source-type".into();
+        let admission = db
+            .submit_evidence(&forged, "producer:checks", 1_100)
+            .unwrap();
+        assert!(!admission.accepted);
+        assert_eq!(
+            admission.submission.rejection_code.as_deref(),
+            Some("source_type_forbidden")
         );
     }
 
@@ -1742,6 +1827,7 @@ mod tests {
         let conflicting = EvidenceProducerCapability {
             producer_identity: "producer:other".into(),
             config_version: 1,
+            source_types: vec!["verification_system".into()],
             source_instances: vec!["checks-primary".into()],
             namespaces: vec!["acme".into()],
             evidence_types: vec!["verification.result".into()],
@@ -1765,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_backfills_source_identity_and_defaults_clock_skew() {
+    fn migration_backfills_source_identity_type_authority_and_clock_skew() {
         let db = configured_db();
         db.submit_evidence(&envelope(), "producer:checks", 1_100)
             .unwrap();
@@ -1784,6 +1870,7 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("max_clock_skew_ms");
+            capability.as_object_mut().unwrap().remove("source_types");
             conn.execute(
                 "UPDATE sekai_evidence_producers SET capability_json=?1
                  WHERE producer_identity='producer:checks'",
@@ -1800,6 +1887,18 @@ mod tests {
         }
 
         db.migrate_evidence().unwrap();
+        let migrated_capability: String = db
+            .conn()
+            .query_row(
+                "SELECT capability_json FROM sekai_evidence_producers
+                 WHERE producer_identity='producer:checks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated_capability: EvidenceProducerCapability =
+            serde_json::from_str(&migrated_capability).unwrap();
+        assert_eq!(migrated_capability.source_types, ["verification_system"]);
         let mut collision = envelope();
         collision.idempotency_key = "post-migration".into();
         collision.source_version = "renamed".into();

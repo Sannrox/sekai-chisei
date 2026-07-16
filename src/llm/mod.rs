@@ -385,7 +385,8 @@ pub fn resolve_with_registry(
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| format!("{key_env} not set"))?;
-            Box::new(openai::OpenAI::new(&key, Some(&base_url)))
+            let api_root = openai_compatible_api_root(&base_url);
+            Box::new(openai::OpenAI::new(&key, Some(api_root)))
         }
         provider => return Err(format!("unsupported provider {provider:?}")),
     };
@@ -397,6 +398,11 @@ pub fn resolve_with_registry(
     }))
 }
 
+fn openai_compatible_api_root(base_url: &str) -> &str {
+    let base_url = base_url.trim_end_matches('/');
+    base_url.strip_suffix("/v1").unwrap_or(base_url)
+}
+
 pub fn provider_name(model: &str) -> &str {
     crate::provider_profile::resolve_provider_id(model).unwrap_or("unknown")
 }
@@ -405,6 +411,22 @@ pub fn provider_name(model: &str) -> &str {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn hosted_openai_compatible_urls_use_an_api_root() {
+        assert_eq!(
+            openai_compatible_api_root("https://api.x.ai/v1"),
+            "https://api.x.ai"
+        );
+        assert_eq!(
+            openai_compatible_api_root("https://example.test/v1/"),
+            "https://example.test"
+        );
+        assert_eq!(
+            openai_compatible_api_root("https://example.test/openai"),
+            "https://example.test/openai"
+        );
+    }
 
     struct CapturingProvider(Arc<Mutex<String>>);
 
