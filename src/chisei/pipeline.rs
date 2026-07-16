@@ -5,6 +5,7 @@ use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAI
 use crate::sekai::capacity;
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::schema::ObjectType;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -25,8 +26,10 @@ pub struct PipelineRequest {
     pub expanded_context_items: usize,
     pub evidence_references: Vec<EvidenceContextReference>,
     pub memory_actor: String,
+    pub memory_assignment_id: String,
     pub memory_token_budget: usize,
     pub memory_references: Vec<MemoryContextReference>,
+    pub memory_holdouts: Vec<MemoryHoldoutReference>,
     pub allowed_evidence_classes: HashSet<EvidenceContextClass>,
 }
 
@@ -64,6 +67,27 @@ pub struct MemoryContextReference {
     pub content_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryHoldoutReference {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub classification: String,
+    pub content_digest: String,
+}
+
+fn memory_holdout(assignment_id: &str, memory_id: &str, version: u32) -> bool {
+    if assignment_id.is_empty() {
+        return false;
+    }
+    let mut digest = Sha256::new();
+    for value in [assignment_id.as_bytes(), memory_id.as_bytes()] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(version.to_be_bytes());
+    digest.finalize()[0] % 5 == 0
+}
+
 #[derive(Debug, Clone)]
 pub struct StepDecision {
     pub step: String,
@@ -93,6 +117,7 @@ pub struct RunResult {
     pub expanded_context_items: usize,
     pub evidence_references: Vec<EvidenceContextReference>,
     pub memory_references: Vec<MemoryContextReference>,
+    pub memory_holdouts: Vec<MemoryHoldoutReference>,
 }
 
 impl RunResult {
@@ -776,6 +801,7 @@ impl Pipeline {
         req.expanded_context_items = 0;
         req.evidence_references.clear();
         req.memory_references.clear();
+        req.memory_holdouts.clear();
         req.allowed_evidence_classes = allowed_evidence_classes;
         let decisions: Vec<StepDecision> = self
             .steps
@@ -798,6 +824,7 @@ impl Pipeline {
             expanded_context_items: req.expanded_context_items,
             evidence_references: req.evidence_references.clone(),
             memory_references: req.memory_references.clone(),
+            memory_holdouts: req.memory_holdouts.clone(),
         }
     }
 }
@@ -916,12 +943,27 @@ fn run_kioku_enrich(
         if estimated_tokens > remaining_tokens {
             continue;
         }
+        // Reserve identical context capacity in both arms. Allowing a lower-ranked memory to
+        // replace a held-out one would change more than the tested memory and confound impact.
+        remaining_tokens -= estimated_tokens;
+        if memory_holdout(
+            &req.memory_assignment_id,
+            &item.memory.id,
+            item.memory.version,
+        ) {
+            req.memory_holdouts.push(MemoryHoldoutReference {
+                memory_id: item.memory.id.clone(),
+                memory_version: item.memory.version,
+                classification: item.memory.classification.as_str().into(),
+                content_digest: crate::chisei::kioku::memory_claim_digest(&item.memory),
+            });
+            continue;
+        }
         let evidence_operation_ids = item
             .evidence
             .iter()
             .map(|link| link.operation_id.clone())
             .collect::<Vec<_>>();
-        remaining_tokens -= estimated_tokens;
         lines.push(line);
         req.memory_references.push(MemoryContextReference {
             memory_id: item.memory.id.clone(),
@@ -1519,6 +1561,19 @@ fn decode_review_policy(steps: &[StepDecision]) -> Option<ReviewPolicy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_holdouts_are_stable_and_preserve_treatment_traffic() {
+        let assignments = (0..100)
+            .map(|index| memory_holdout(&format!("request-{index}"), "memory-1", 1))
+            .collect::<Vec<_>>();
+        assert!(assignments.iter().any(|held_out| *held_out));
+        assert!(assignments.iter().any(|held_out| !*held_out));
+        assert_eq!(
+            memory_holdout("request-7", "memory-1", 1),
+            memory_holdout("request-7", "memory-1", 1)
+        );
+    }
     use crate::chisei::kioku::{
         HumanMemoryReview, HumanReviewAction, KIOKU_MEMORY_VERSION, KiokuEvidenceLink, KiokuMemory,
         MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
@@ -1594,8 +1649,10 @@ mod tests {
             expanded_context_items: 0,
             evidence_references: vec![],
             memory_actor: String::new(),
+            memory_assignment_id: String::new(),
             memory_token_budget: 0,
             memory_references: vec![],
+            memory_holdouts: vec![],
             allowed_evidence_classes: HashSet::new(),
         }
     }
@@ -2099,8 +2156,10 @@ mod tests {
             expanded_context_items: 0,
             evidence_references: vec![],
             memory_actor: String::new(),
+            memory_assignment_id: String::new(),
             memory_token_budget: 0,
             memory_references: vec![],
+            memory_holdouts: vec![],
             allowed_evidence_classes: HashSet::new(),
         };
         let result = p.run(&mut req, &db);

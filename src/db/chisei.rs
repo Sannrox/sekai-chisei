@@ -1,12 +1,41 @@
 use std::collections::{BTreeSet, HashMap};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::sekai::SekaiDb;
 use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind},
 };
+
+fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, bool)>, String> {
+    if !matches!(
+        event.kind,
+        ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+    ) {
+        return Ok(None);
+    }
+    let Some(metric) = event.attributes.get("outcome_metric") else {
+        return Ok(None);
+    };
+    let Some(value) = event.attributes.get("outcome_value") else {
+        return Ok(None);
+    };
+    let Some(passed) = event.attributes.get("passed") else {
+        return Ok(None);
+    };
+    let metric = metric.trim();
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "outcome evidence value must be finite".to_string())?;
+    if metric.is_empty() || !value.is_finite() {
+        return Err("outcome evidence metric and finite value are required".into());
+    }
+    let passed = passed
+        .parse::<bool>()
+        .map_err(|_| "outcome evidence passed flag must be boolean".to_string())?;
+    Ok(Some((metric, value, passed)))
+}
 
 impl SekaiDb {
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
@@ -382,27 +411,35 @@ impl SekaiDb {
     }
 
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
-        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
-        let request_id = receipt.events.iter().find_map(|event| {
-            (event.kind == ReceiptEventKind::IntentRecorded)
-                .then(|| event.attributes.get("request_id"))
-                .flatten()
-                .filter(|request_id| !request_id.is_empty())
-        });
-        let lookup_request_id = receipt.events.iter().find_map(|event| {
-            (event.kind == ReceiptEventKind::IntentRecorded)
-                .then(|| event.attributes.get("lookup_request_id"))
-                .flatten()
-                .filter(|request_id| !request_id.is_empty())
-        });
-        let caller_scope = receipt.events.iter().find_map(|event| {
-            (event.kind == ReceiptEventKind::IntentRecorded)
-                .then(|| event.attributes.get("caller_scope"))
-                .flatten()
-                .filter(|scope| !scope.is_empty())
-        });
         let conn = self.conn();
-        conn.execute(
+        upsert_operation_receipt(&conn, receipt)
+    }
+}
+
+pub(crate) fn upsert_operation_receipt(
+    conn: &Connection,
+    receipt: &OperationReceipt,
+) -> Result<(), String> {
+    let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+    let request_id = receipt.events.iter().find_map(|event| {
+        (event.kind == ReceiptEventKind::IntentRecorded)
+            .then(|| event.attributes.get("request_id"))
+            .flatten()
+            .filter(|request_id| !request_id.is_empty())
+    });
+    let lookup_request_id = receipt.events.iter().find_map(|event| {
+        (event.kind == ReceiptEventKind::IntentRecorded)
+            .then(|| event.attributes.get("lookup_request_id"))
+            .flatten()
+            .filter(|request_id| !request_id.is_empty())
+    });
+    let caller_scope = receipt.events.iter().find_map(|event| {
+        (event.kind == ReceiptEventKind::IntentRecorded)
+            .then(|| event.attributes.get("caller_scope"))
+            .flatten()
+            .filter(|scope| !scope.is_empty())
+    });
+    conn.execute(
             "INSERT INTO chisei_operation_receipts(operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, namespace, receipt_json, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(operation_id) DO UPDATE SET
@@ -428,9 +465,10 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        Ok(())
-    }
+    Ok(())
+}
 
+impl SekaiDb {
     pub fn get_operation_receipt(
         &self,
         operation_id: &str,
@@ -688,6 +726,22 @@ impl SekaiDb {
                 "event {} already exists with different evidence",
                 event.event_id
             ));
+        }
+        if let Some((metric, value, passed)) = outcome_evidence(&event)? {
+            for existing in &receipt.events {
+                let Some((existing_metric, existing_value, existing_passed)) =
+                    outcome_evidence(existing)?
+                else {
+                    continue;
+                };
+                if existing_metric == metric
+                    && (existing_value != value || existing_passed != passed)
+                {
+                    return Err(format!(
+                        "outcome metric {metric} already exists with different evidence"
+                    ));
+                }
+            }
         }
         let parent_id = event
             .parent_event_id
