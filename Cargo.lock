@@ -2149,6 +2149,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "httpdate",
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",

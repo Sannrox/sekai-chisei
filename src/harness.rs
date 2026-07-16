@@ -372,6 +372,9 @@ impl SseDecoder {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
         while let Some((frame_end, separator_end)) = find_frame_boundary(&self.buffer) {
+            if frame_end > 1024 * 1024 {
+                return Err("responses SSE frame exceeds 1 MiB".into());
+            }
             let frame = std::str::from_utf8(&self.buffer[..frame_end])
                 .map_err(|_| "responses stream is not valid UTF-8")?
                 .to_owned();
@@ -379,6 +382,9 @@ impl SseDecoder {
             if let Some(event) = parse_frame(&frame)? {
                 events.push(event);
             }
+        }
+        if self.buffer.len() > 1024 * 1024 {
+            return Err("responses SSE frame exceeds 1 MiB".into());
         }
         Ok(events)
     }
@@ -449,6 +455,40 @@ fn parse_frame(frame: &str) -> Result<Option<HarnessEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    const CONFORMANCE_FIXTURES: [(&str, &[u8]); 6] = [
+        (
+            "cancelled.sse",
+            include_bytes!("../tests/fixtures/responses/cancelled.sse"),
+        ),
+        (
+            "failed-partial.sse",
+            include_bytes!("../tests/fixtures/responses/failed-partial.sse"),
+        ),
+        (
+            "fragmented-and-unknown.sse",
+            include_bytes!("../tests/fixtures/responses/fragmented-and-unknown.sse"),
+        ),
+        (
+            "incomplete.sse",
+            include_bytes!("../tests/fixtures/responses/incomplete.sse"),
+        ),
+        (
+            "interrupted.sse",
+            include_bytes!("../tests/fixtures/responses/interrupted.sse"),
+        ),
+        (
+            "multiple-tools.sse",
+            include_bytes!("../tests/fixtures/responses/multiple-tools.sse"),
+        ),
+    ];
+
+    #[derive(Deserialize)]
+    struct FixtureManifest {
+        profile: String,
+        fixtures: BTreeMap<String, String>,
+    }
 
     #[test]
     fn decodes_fragmented_frames_and_preserves_unknown_events() {
@@ -458,11 +498,11 @@ mod tests {
         for chunk in fixture.chunks(7) {
             events.extend(decoder.push(chunk).unwrap());
         }
-        events.extend(decoder.push(b"\n").unwrap());
         events.extend(decoder.finish().unwrap());
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert_eq!(events[1].event, "response.future.delta");
         assert_eq!(events.last().unwrap().event, "response.completed");
+        StreamAssembly::from_events(&events).unwrap();
     }
 
     #[test]
@@ -479,16 +519,9 @@ mod tests {
 
     #[test]
     fn fixtures_have_exactly_one_terminal_event() {
-        for fixture in [
-            include_bytes!("../tests/fixtures/responses/multiple-tools.sse").as_slice(),
-            include_bytes!("../tests/fixtures/responses/failed-partial.sse").as_slice(),
-            include_bytes!("../tests/fixtures/responses/cancelled.sse").as_slice(),
-            include_bytes!("../tests/fixtures/responses/interrupted.sse").as_slice(),
-            include_bytes!("../tests/fixtures/responses/incomplete.sse").as_slice(),
-        ] {
+        for (_, fixture) in CONFORMANCE_FIXTURES {
             let mut decoder = SseDecoder::default();
             let mut events = decoder.push(fixture).unwrap();
-            events.extend(decoder.push(b"\n").unwrap());
             events.extend(decoder.finish().unwrap());
             let terminals = events
                 .iter()
@@ -509,11 +542,26 @@ mod tests {
     }
 
     #[test]
+    fn conformance_fixture_manifest_detects_corpus_drift() {
+        let manifest: FixtureManifest =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/responses/manifest.json"))
+                .unwrap();
+        assert_eq!(manifest.profile, RESPONSES_HARNESS_PROFILE_VERSION);
+        assert_eq!(manifest.fixtures.len(), CONFORMANCE_FIXTURES.len());
+        for (name, fixture) in CONFORMANCE_FIXTURES {
+            assert_eq!(
+                manifest.fixtures.get(name),
+                Some(&format!("{:x}", Sha256::digest(fixture))),
+                "fixture drift: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn assembles_interleaved_tools_for_portable_continuation() {
         let fixture = include_bytes!("../tests/fixtures/responses/multiple-tools.sse");
         let mut decoder = SseDecoder::default();
         let mut events = decoder.push(fixture).unwrap();
-        events.extend(decoder.push(b"\n").unwrap());
         events.extend(decoder.finish().unwrap());
         let assembly = StreamAssembly::from_events(&events).unwrap();
         assert_eq!(assembly.terminal.as_deref(), Some("response.completed"));
@@ -834,5 +882,17 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "response.completed");
+    }
+
+    #[test]
+    fn rejects_oversized_unterminated_frames() {
+        let mut decoder = SseDecoder::default();
+        let error = decoder.push(&vec![b'a'; 1024 * 1024 + 1]).unwrap_err();
+        assert!(error.contains("exceeds 1 MiB"));
+
+        let mut terminated = vec![b'a'; 1024 * 1024 + 1];
+        terminated.extend_from_slice(b"\n\n");
+        let error = SseDecoder::default().push(&terminated).unwrap_err();
+        assert!(error.contains("exceeds 1 MiB"));
     }
 }

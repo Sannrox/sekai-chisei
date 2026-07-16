@@ -1,0 +1,11 @@
+{
+  "profile": "chisei.responses-harness/v1",
+  "fixtures": {
+    "cancelled.sse": "8aa4c17009317782abc6218a4c486d66e7bc6704da3b8afcdb818a5e7fd26242",
+    "failed-partial.sse": "bc29cb0929cddfa1af279a0c1f99fc7f1e19630027473b0fd44d6626b56d274e",
+    "fragmented-and-unknown.sse": "4d4b51cc8f79eef73d0b8ec2f6d1f8295f6bf52814a8aae4fbdddc6e5a52e176",
+    "incomplete.sse": "1384a5e78ff81bd9b30242d8bd8320ec0a14f11a99cf883be850c02eb0cc5f0f",
+    "interrupted.sse": "67b73a85aa9f6903dc256f8fa7670f328d87d075e422490e2b3da3d1fcedbea9",
+    "multiple-tools.sse": "1f1f53e638dcbebc29b3041e4fd1a310de0576676ed549c6959beefbb82fd505"
+  }
+}

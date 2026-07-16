@@ -5,6 +5,13 @@ tool execution, approvals, workspaces, recovery, and the iterative tool loop.
 Chisei owns model routing and the policy, budget, egress, usage, audit, and receipt
 decisions around each model call.
 
+The canonical versioned conformance corpus is
+`tests/fixtures/responses/manifest.json`. A consumer vendors the complete profile
+directory, verifies each fixture against the manifest digest, and runs the fixtures
+through its own decoder and state machine. Chisei's reference assembler and Bugyo's
+Tauri-native assembler are independent implementations of this contract; neither
+imports the other's parser.
+
 ## Request contract
 
 Clients may rely on `model`, `input`, `instructions`, `tools`, `tool_choice`,
@@ -131,9 +138,9 @@ zero.
 A host continues tool work by assembling every function call independently by
 `call_id`, validating the completed arguments, executing locally under host policy,
 and sending one or more `function_call_output` items in a new request. The full
-portable input is authoritative. `previous_response_id` may be included only when
-the selected provider profile supports it and must never be the sole copy of the
-conversation or tool results.
+portable input is authoritative. The gateway currently rejects `previous_response_id`
+because shared provider credentials cannot safely prove continuation ownership;
+clients must send the portable conversation and tool results instead.
 
 ## Error taxonomy
 
@@ -153,3 +160,16 @@ are optional continuation hints and are not operation identity.
 Sanitized fixtures under `tests/fixtures/responses/` exercise fragmented frames,
 unknown events, interleaved tool calls, partial usage, failure, cancellation, and
 interruption. They contain no credentials or production prompts.
+
+## Evidence influence
+
+Host observations use the external-evidence contract with
+`source_type: native_harness`; the Responses request itself is not an outcome.
+Context admission is evaluated independently for each `(source_type,
+evidence_type)` pair. A passing comparison for the same evidence type from CI,
+deployment, or another producer cannot admit native-harness evidence. The paired
+evaluation uses matched baseline and candidate cases with the canonical
+`without` and `with` configuration references before that evidence can influence
+routing context. Evidence ingestion and admitted routing context do not create
+portfolio observations or active Kioku memories; those remain separately
+governed and evaluated paths.
