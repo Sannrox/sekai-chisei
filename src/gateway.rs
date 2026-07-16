@@ -36,10 +36,11 @@ use crate::grpc::client::{
 };
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
-    CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, GatewayAuditEvent,
-    GetEvalRunRequest, GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
-    RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
-    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
+    CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, EvalRun, GatewayAuditEvent,
+    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
+    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
+    RecordSampleObservationRequest, RecordUsageRequest, ResolvePolicyRequest, RunPipelineRequest,
+    SampleObservation,
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
@@ -84,6 +85,7 @@ const X_CHISEI_REQUEST_ID: HeaderName = HeaderName::from_static("x-chisei-reques
 const X_CHISEI_TURN_ID: HeaderName = HeaderName::from_static("x-chisei-turn-id");
 const X_CHISEI_ATTEMPT: HeaderName = HeaderName::from_static("x-chisei-attempt");
 const X_CHISEI_CYCLE_ID: HeaderName = HeaderName::from_static("x-chisei-cycle-id");
+const X_CHISEI_RETRY_SAFETY: HeaderName = HeaderName::from_static("x-chisei-retry-safety");
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
@@ -93,6 +95,8 @@ const PROVIDER_REGISTRY_REFRESH_TTL_MS: u64 = 250;
 const MAX_BUDGET_CACHE_ENTRIES: usize = 4096;
 const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
 const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
+const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
 const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
@@ -103,8 +107,49 @@ const DEFAULT_CONTROL_PLANE_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 5;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES: u32 = 1;
+const MAX_PROVIDER_RETRY_AFTER_SECS: u64 = 60 * 60;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
+pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
+    "request_id",
+    "receipt_id",
+    "operation_id",
+    "parent_operation_id",
+    "turn_id",
+    "attempt",
+    "cycle_id",
+    "traceparent",
+    "timestamp_ms",
+    "agent",
+    "project",
+    "user_id",
+    "key_id",
+    "provider",
+    "model",
+    "resolved_model",
+    "work_unit_id",
+    "route_bias",
+    "policy_scope",
+    "policy_version",
+    "pipeline_sampled",
+    "sample_reason",
+    "sample_rate",
+    "status",
+    "terminal_outcome",
+    "error_type",
+    "refusal_reason",
+    "request_bytes",
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cost_usd_micros",
+    "cost_usd",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_savings_usd_micros",
+    "cache_savings_usd",
+];
 
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -517,13 +562,13 @@ impl CircuitBreakerState {
                 self.health = signal;
                 self.last_failure = Some(format!("provider health is {signal:?}"));
                 self.open_until =
-                    Some(Instant::now() + retry_after.unwrap_or(config.circuit_cooldown));
+                    Instant::now().checked_add(retry_after.unwrap_or(config.circuit_cooldown));
             }
             ProviderHealth::Overloaded | ProviderHealth::Unavailable => {
                 self.record_failure(format!("provider health is {signal:?}"), config);
                 self.health = signal;
                 if let Some(retry_after) = retry_after {
-                    self.open_until = Some(Instant::now() + retry_after);
+                    self.open_until = Instant::now().checked_add(retry_after);
                 }
             }
         }
@@ -1333,6 +1378,8 @@ struct ProviderLifecycleRequest {
     #[serde(default)]
     baseline_run_id: String,
     #[serde(default)]
+    baseline_config_ref: String,
+    #[serde(default)]
     candidate_run_id: String,
 }
 
@@ -1391,22 +1438,26 @@ async fn update_provider_lifecycle_admin(
     ) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &reason);
     }
-    if let Err(reason) = verify_provider_lifecycle_promotion(&state, &request).await {
-        record_gateway_event(
-            &state.config,
-            "chisei-gateway-admin",
-            "gateway.provider_lifecycle",
-            &reason,
-            "denied",
-            HashMap::from([
-                ("target_kind".into(), request.target_kind.clone()),
-                ("target".into(), request.target.clone()),
-                ("state".into(), request.state.clone()),
-            ]),
-        )
-        .await;
-        return json_error(StatusCode::CONFLICT, "governance_precondition", &reason);
-    }
+    let verified_registry_version = match verify_provider_lifecycle_promotion(&state, &request).await
+    {
+        Ok(version) => version,
+        Err(reason) => {
+            record_gateway_event(
+                &state.config,
+                "chisei-gateway-admin",
+                "gateway.provider_lifecycle",
+                &reason,
+                "denied",
+                HashMap::from([
+                    ("target_kind".into(), request.target_kind.clone()),
+                    ("target".into(), request.target.clone()),
+                    ("state".into(), request.state.clone()),
+                ]),
+            )
+            .await;
+            return json_error(StatusCode::CONFLICT, "governance_precondition", &reason);
+        }
+    };
     let mut audit_evidence = HashMap::from([
         ("target_kind".to_string(), request.target_kind.clone()),
         ("target".to_string(), request.target.clone()),
@@ -1414,6 +1465,12 @@ async fn update_provider_lifecycle_admin(
     ]);
     if !request.baseline_run_id.is_empty() {
         audit_evidence.insert("baseline_run_id".into(), request.baseline_run_id.clone());
+    }
+    if !request.baseline_config_ref.is_empty() {
+        audit_evidence.insert(
+            "baseline_config_ref".into(),
+            request.baseline_config_ref.clone(),
+        );
     }
     if !request.candidate_run_id.is_empty() {
         audit_evidence.insert("candidate_run_id".into(), request.candidate_run_id.clone());
@@ -1441,7 +1498,10 @@ async fn update_provider_lifecycle_admin(
         request.state,
         "chisei-gateway-admin".into(),
         request.reason,
-        Utc::now().to_rfc3339(),
+        (
+            Utc::now().to_rfc3339(),
+            Some(verified_registry_version),
+        ),
     )
     .await
     {
@@ -1461,7 +1521,7 @@ async fn update_provider_lifecycle_admin(
 async fn verify_provider_lifecycle_promotion(
     state: &GatewayState,
     request: &ProviderLifecycleRequest,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let registry = provider_registry_snapshot();
     let provider = match request.target_kind.as_str() {
         "provider" => Some(request.target.clone()),
@@ -1480,20 +1540,30 @@ async fn verify_provider_lifecycle_promotion(
             .map(|(provider, _)| provider.to_string()),
         _ => None,
     };
-    let requires_gate = provider
-        .as_deref()
-        .and_then(|provider| registry.profile(provider))
-        .is_some_and(|profile| {
-            matches!(profile.lifecycle.as_str(), "experimental" | "canary")
-                || registry
-                    .effective_profile(&profile.provider)
-                    .is_some_and(|profile| profile.lifecycle == "canary")
-        });
+    let scoped_requires_gate = registry
+        .lifecycle_state_for_target(&request.target_kind, &request.target)
+        .is_some_and(|state| matches!(state, "experimental" | "canary"));
+    let requires_gate = scoped_requires_gate
+        || provider
+            .as_deref()
+            .and_then(|provider| registry.profile(provider))
+            .is_some_and(|profile| {
+                matches!(profile.lifecycle.as_str(), "experimental" | "canary")
+                    || registry
+                        .effective_profile(&profile.provider)
+                        .is_some_and(|profile| profile.lifecycle == "canary")
+            });
     if request.state != "enabled" || !requires_gate {
-        return Ok(());
+        return Ok(registry.state_version);
     }
     if request.baseline_run_id.trim().is_empty() || request.candidate_run_id.trim().is_empty() {
         return Err("promotion to enabled requires baseline_run_id and candidate_run_id".into());
+    }
+    if request.baseline_run_id == request.candidate_run_id {
+        return Err("promotion evaluation requires distinct baseline and candidate runs".into());
+    }
+    if request.baseline_config_ref.trim().is_empty() {
+        return Err("promotion to enabled requires baseline_config_ref".into());
     }
     let target = state
         .config
@@ -1525,29 +1595,94 @@ async fn verify_provider_lifecycle_promotion(
     if baseline.suite_id != candidate.suite_id {
         return Err("promotion evaluation runs must belong to the same suite".into());
     }
+    let suite = client
+        .get_eval_suite(gateway_request(GetEvalSuiteRequest {
+            id: baseline.suite_id.clone(),
+        }))
+        .await
+        .map_err(|error| format!("promotion evaluation suite is unavailable: {error}"))?
+        .into_inner()
+        .suite
+        .ok_or_else(|| "promotion evaluation suite is missing".to_string())?;
+    if suite.id.starts_with("sampling-") {
+        return Err("mutable sampling suites cannot authorize provider promotion".into());
+    }
+    if baseline.config_ref != request.baseline_config_ref || baseline.config_ref == request.target {
+        return Err(format!(
+            "baseline evaluation config {:?} does not match the expected eligible baseline {:?}",
+            baseline.config_ref, request.baseline_config_ref
+        ));
+    }
+    let baseline_is_currently_eligible = registry
+        .resolve_model(&baseline.config_ref)
+        .ok()
+        .and_then(|resolved| registry.effective_profile(&resolved.provider))
+        .is_some_and(|profile| profile.lifecycle == "enabled")
+        || registry.profiles.iter().any(|profile| {
+            (profile.provider == baseline.config_ref
+                || profile.profile_version == baseline.config_ref)
+                && registry
+                    .effective_profile(&profile.provider)
+                    .is_some_and(|effective| effective.lifecycle == "enabled")
+        });
+    if !baseline_is_currently_eligible {
+        return Err("baseline evaluation config is not a current enabled registry route".into());
+    }
     if candidate.config_ref != request.target {
         return Err(format!(
             "candidate evaluation config {:?} does not match lifecycle target {:?}",
             candidate.config_ref, request.target
         ));
     }
-    let decision = client
-        .compare_runs(gateway_request(CompareRunsRequest {
-            baseline_id: baseline.id,
-            candidate_id: candidate.id,
-        }))
-        .await
-        .map_err(|error| format!("promotion evaluation comparison failed: {error}"))?
-        .into_inner()
-        .decision
-        .ok_or_else(|| "promotion evaluation returned no gate decision".to_string())?;
-    if decision.verdict != "pass" {
+    let complete_case_ids = |run: &EvalRun| {
+        let case_ids = run
+            .results
+            .iter()
+            .map(|result| result.case_id.trim().to_string())
+            .collect::<std::collections::HashSet<_>>();
+        (!run.results.is_empty()
+            && case_ids.len() == run.results.len()
+            && !case_ids.contains("")
+            && run
+                .results
+                .iter()
+                .all(|result| !result.status.trim().is_empty()))
+        .then_some(case_ids)
+    };
+    let Some(baseline_cases) = complete_case_ids(&baseline) else {
+        return Err("baseline evaluation must contain complete unique case results".into());
+    };
+    let Some(candidate_cases) = complete_case_ids(&candidate) else {
+        return Err("candidate evaluation must contain complete unique case results".into());
+    };
+    if baseline_cases != candidate_cases {
+        return Err("promotion evaluation runs must cover the same cases".into());
+    }
+    let suite_cases = suite
+        .cases
+        .iter()
+        .map(|case| case.id.trim().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    if suite_cases.is_empty()
+        || suite_cases.len() != suite.cases.len()
+        || suite_cases.contains("")
+        || baseline_cases != suite_cases
+    {
+        return Err("promotion evaluation runs must exactly cover the registered suite".into());
+    }
+    let pass_rate = |run: &EvalRun| {
+        run.results.iter().filter(|result| result.passed).count() as f64 / run.results.len() as f64
+    };
+    let baseline_score = pass_rate(&baseline);
+    let candidate_score = pass_rate(&candidate);
+    if candidate_score < baseline_score {
         return Err(format!(
-            "promotion evaluation did not pass: {}",
-            decision.reason
+            "promotion evaluation did not pass: candidate {:.0}% vs baseline {:.0}%",
+            candidate_score * 100.0,
+            baseline_score * 100.0,
         ));
     }
-    Ok(())
+    Ok(registry.state_version)
 }
 
 fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
@@ -1629,6 +1764,21 @@ impl GatewayCorrelation {
     }
 }
 
+fn gateway_attempt_receipt_id(operation_id: &str, request_id: &str, attempt: u32) -> String {
+    if attempt == 1 {
+        return operation_id.to_string();
+    }
+    let mut digest = Sha256::new();
+    digest.update((operation_id.len() as u64).to_be_bytes());
+    digest.update(operation_id.as_bytes());
+    digest.update((request_id.len() as u64).to_be_bytes());
+    digest.update(request_id.as_bytes());
+    format!(
+        "{operation_id}:__attempt__:{:x}:{attempt}",
+        digest.finalize()
+    )
+}
+
 fn gateway_correlation_scope(identity: &GatewayIdentity) -> String {
     let digest = Sha256::digest(
         [
@@ -1644,6 +1794,7 @@ fn gateway_correlation_scope(identity: &GatewayIdentity) -> String {
 }
 
 fn scoped_operation_id(value: &str, caller_scope: &str) -> Result<String, String> {
+    const RESERVED_ATTEMPT_SEGMENT: &str = "__attempt__:";
     let prefix = format!("chisei:{caller_scope}:");
     if value.starts_with("chisei:") {
         let suffix = value
@@ -1652,7 +1803,13 @@ fn scoped_operation_id(value: &str, caller_scope: &str) -> Result<String, String
         if suffix.is_empty() {
             return Err("operation id requires a non-empty scoped identifier".into());
         }
+        if suffix.contains(RESERVED_ATTEMPT_SEGMENT) {
+            return Err("operation id contains a reserved attempt segment".into());
+        }
         return Ok(value.to_string());
+    }
+    if value.contains(RESERVED_ATTEMPT_SEGMENT) {
+        return Err("operation id contains a reserved attempt segment".into());
     }
     if value.len().saturating_add(prefix.len()) > 128 {
         return Err("operation id is too long after caller scoping".into());
@@ -1773,14 +1930,11 @@ async fn proxy_gateway_inner(
         }
     };
     let canary_requested = header_str(&headers, &X_CHISEI_ADMISSION) == Some("canary");
-    if canary_requested
-        && !header_str(&headers, &X_CHISEI_TASK_CLASS)
-            .is_some_and(crate::chisei::model_routing::is_cheap_eligible_task_class)
-    {
+    if canary_requested && !canary_admission_allowed(&identity_context, &headers) {
         return json_error(
             StatusCode::FORBIDDEN,
             "policy_denied",
-            "canary admission requires an explicit bounded low-risk task class",
+            "canary admission requires an operator-managed low-risk identity and an explicit bounded task class",
         );
     }
     let scoped = proxy_gateway_inner_scoped(
@@ -1800,6 +1954,13 @@ async fn proxy_gateway_inner(
         }
     })
     .await
+}
+
+fn canary_admission_allowed(identity: &IdentityContext, headers: &HeaderMap) -> bool {
+    identity.upstream_auth == UpstreamAuthMode::GatewayKey
+        && identity.identity.tier == "low-risk"
+        && header_str(headers, &X_CHISEI_TASK_CLASS)
+            .is_some_and(crate::chisei::model_routing::is_cheap_eligible_task_class)
 }
 
 async fn proxy_gateway_inner_scoped(
@@ -1986,10 +2147,9 @@ async fn proxy_gateway_inner_scoped(
         .as_ref()
         .and_then(|resolved| ProviderKind::from_model(&resolved.canonical_model).ok())
         .unwrap_or(client_provider);
-    let built_in_registry = ProviderRegistry::built_in();
     let requested_profile = requested_registry_model
         .as_ref()
-        .and_then(|resolved| built_in_registry.profile(&resolved.provider));
+        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
     // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
     // even under `no_preflight`, where the routing-only call below is skipped.
     let failure_posture =
@@ -2187,7 +2347,7 @@ async fn proxy_gateway_inner_scoped(
                 if let Some(route) = rejection.rejected_route.as_ref() {
                     preflight_context.provider = route.provider;
                     preflight_context.resolved_model = Some(route.resolved_model.clone());
-                    let profile = built_in_registry.profile(capability_provider_id(route.provider));
+                    let profile = registry_snapshot.profile(capability_provider_id(route.provider));
                     preflight_context.profile_version =
                         profile.map(|profile| profile.profile_version.clone());
                     preflight_context.governance_metadata_status =
@@ -2219,10 +2379,11 @@ async fn proxy_gateway_inner_scoped(
         let originally_resolved_model = resolved.resolved_model.clone();
         let resolved = match select_healthy_policy_fallback(
             &state.runtime,
-            &built_in_registry,
+            &registry_snapshot,
             resolved,
             capability_surface,
             state.config.allow_cross_provider,
+            budget.provisional_local_free,
         )
         .await
         {
@@ -2258,8 +2419,8 @@ async fn proxy_gateway_inner_scoped(
         let effective_profile = resolved
             .resolved_model
             .as_deref()
-            .and_then(|model| built_in_registry.resolve_model(model).ok())
-            .and_then(|model| built_in_registry.profile(&model.provider));
+            .and_then(|model| registry_snapshot.resolve_model(model).ok())
+            .and_then(|model| registry_snapshot.profile(&model.provider));
         preflight_context.profile_version =
             effective_profile.map(|profile| profile.profile_version.clone());
         preflight_context.governance_metadata_status =
@@ -2455,10 +2616,10 @@ async fn proxy_gateway_inner_scoped(
     let resolved_registry_metadata = resolved
         .resolved_model
         .as_deref()
-        .and_then(|model| ProviderRegistry::built_in().resolve_model(model).ok());
+        .and_then(|model| registry_snapshot.resolve_model(model).ok());
     let resolved_profile = resolved_registry_metadata
         .as_ref()
-        .and_then(|resolved| built_in_registry.profile(&resolved.provider));
+        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
     let pricing_snapshot_version = effective_pricing_snapshot_version(
         &state.config,
         resolved_profile,
@@ -2576,6 +2737,7 @@ async fn proxy_gateway_inner_scoped(
                     health
                 ),
                 rejected_route: None,
+                retry_safety: Some("safe"),
             };
             record_refusal_with_usage_and_append(
                 &state.config,
@@ -2586,18 +2748,29 @@ async fn proxy_gateway_inner_scoped(
                 true,
             )
             .await;
-            json_error(rejection.status, &rejection.error_type, &rejection.reason)
+            json_error_with_retry_safety(
+                rejection.status,
+                &rejection.error_type,
+                &rejection.reason,
+                "safe",
+            )
         }
         Err(UpstreamSendError::Request {
             error: err,
             snapshot_version,
         }) => {
             usage_context.capability_snapshot_version = Some(snapshot_version);
+            let retry_safety = if err.is_connect() {
+                "safe"
+            } else {
+                "ambiguous"
+            };
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
                 reason: safe_upstream_error_reason(prepared.provider, "request", &err),
                 rejected_route: None,
+                retry_safety: Some(retry_safety),
             };
             record_refusal_with_usage_and_append(
                 &state.config,
@@ -2608,7 +2781,12 @@ async fn proxy_gateway_inner_scoped(
                 true,
             )
             .await;
-            json_error(rejection.status, &rejection.error_type, &rejection.reason)
+            json_error_with_retry_safety(
+                rejection.status,
+                &rejection.error_type,
+                &rejection.reason,
+                retry_safety,
+            )
         }
     }
 }
@@ -2760,6 +2938,7 @@ struct GatewayRejection {
     error_type: String,
     reason: String,
     rejected_route: Option<RejectedRoute>,
+    retry_safety: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -2804,7 +2983,13 @@ impl GatewayRejection {
             error_type: error_type.to_string(),
             reason,
             rejected_route: None,
+            retry_safety: None,
         }
+    }
+
+    fn with_retry_safety(mut self, retry_safety: &'static str) -> Self {
+        self.retry_safety = Some(retry_safety);
+        self
     }
 
     fn with_rejected_route(mut self, provider: ProviderKind, resolved_model: String) -> Self {
@@ -2816,7 +3001,15 @@ impl GatewayRejection {
     }
 
     fn response(&self) -> Response<Body> {
-        json_error(self.status, &self.error_type, &self.reason)
+        match self.retry_safety {
+            Some(retry_safety) => json_error_with_retry_safety(
+                self.status,
+                &self.error_type,
+                &self.reason,
+                retry_safety,
+            ),
+            None => json_error(self.status, &self.error_type, &self.reason),
+        }
     }
 }
 
@@ -3150,6 +3343,7 @@ async fn select_healthy_policy_fallback(
     mut decision: PolicyPreflight,
     surface: Option<CapabilityRequestSurface>,
     allow_cross_provider: bool,
+    local_free_only: bool,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let selected_key = capability_provider_id(decision.resolved_provider);
     let circuits = runtime.upstream_circuits.read().await;
@@ -3165,6 +3359,7 @@ async fn select_healthy_policy_fallback(
             "upstream_unavailable",
             format!("selected provider {selected_key:?} has no effective profile"),
         )
+        .with_retry_safety("safe")
     })?;
     let requirements = surface
         .map(|surface| match surface {
@@ -3193,6 +3388,9 @@ async fn select_healthy_policy_fallback(
         let Some(provider) = ProviderKind::from_runtime(&resolved.provider) else {
             continue;
         };
+        if local_free_only && provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama) {
+            continue;
+        }
         if !decision.resolved_provider.same_family(provider) && !allow_cross_provider {
             continue;
         }
@@ -3231,7 +3429,8 @@ async fn select_healthy_policy_fallback(
         format!(
             "provider {selected_key:?} is unhealthy and no policy-authorized capability and governance equivalent fallback is eligible"
         ),
-    ))
+    )
+    .with_retry_safety("safe"))
 }
 
 #[derive(Debug, Clone)]
@@ -7092,7 +7291,7 @@ fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration
         .trim()
         .parse::<u64>()
         .ok()
-        .map(Duration::from_secs)
+        .map(|seconds| Duration::from_secs(seconds.min(MAX_PROVIDER_RETRY_AFTER_SECS)))
 }
 
 impl ProviderKind {
@@ -7514,10 +7713,37 @@ fn upstream_auth_mode(
     requested_mode
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum GatewayUsageOutcome {
     Success(StatusCode),
+    Incomplete(StatusCode, String),
+    TerminalFailure(StatusCode, String),
     AccountingOnly(StatusCode),
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptTerminalOutcome<'a> {
+    Incomplete(&'a str),
+    Failed,
+    Cancelled,
+}
+
+impl<'a> ReceiptTerminalOutcome<'a> {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Incomplete(_) => "incomplete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn reason(self) -> &'a str {
+        match self {
+            Self::Incomplete(reason) => reason,
+            Self::Failed => "response_failed",
+            Self::Cancelled => "response_cancelled",
+        }
+    }
 }
 
 async fn record_usage_and_append(
@@ -7533,9 +7759,10 @@ async fn record_usage_and_append(
         return;
     };
     let status = match outcome {
-        GatewayUsageOutcome::Success(status) | GatewayUsageOutcome::AccountingOnly(status) => {
-            status
-        }
+        GatewayUsageOutcome::Success(status)
+        | GatewayUsageOutcome::Incomplete(status, _)
+        | GatewayUsageOutcome::TerminalFailure(status, _)
+        | GatewayUsageOutcome::AccountingOnly(status) => status,
     };
     if matches!(outcome, GatewayUsageOutcome::Success(_)) {
         record_gateway_operation_receipt(
@@ -7546,6 +7773,36 @@ async fn record_usage_and_append(
             usage.as_ref(),
             response_observation.as_ref(),
             None,
+            None,
+        )
+        .await;
+    } else if let GatewayUsageOutcome::Incomplete(_, ref reason) = outcome {
+        record_gateway_operation_receipt(
+            config,
+            identity,
+            context,
+            status,
+            usage.as_ref(),
+            response_observation.as_ref(),
+            None,
+            Some(ReceiptTerminalOutcome::Incomplete(reason)),
+        )
+        .await;
+    } else if let GatewayUsageOutcome::TerminalFailure(_, ref reason) = outcome {
+        let terminal = if reason == "response_cancelled" {
+            ReceiptTerminalOutcome::Cancelled
+        } else {
+            ReceiptTerminalOutcome::Failed
+        };
+        record_gateway_operation_receipt(
+            config,
+            identity,
+            context,
+            status,
+            usage.as_ref(),
+            response_observation.as_ref(),
+            None,
+            Some(terminal),
         )
         .await;
     }
@@ -7626,25 +7883,42 @@ async fn record_usage_and_append(
             if matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
                 return;
             }
-            let pipeline_observation =
-                run_gateway_pipeline_observation(config, identity, context, &mut chisei).await;
+            let non_success = matches!(
+                outcome,
+                GatewayUsageOutcome::Incomplete(_, _) | GatewayUsageOutcome::TerminalFailure(_, _)
+            );
+            let pipeline_observation = if non_success {
+                None
+            } else {
+                run_gateway_pipeline_observation(config, identity, context, &mut chisei).await
+            };
             let portfolio_cost_usd_micros = usage
                 .as_ref()
                 .and_then(|usage| estimate_cost_usd_micros(config, context, usage))
                 .unwrap_or(0);
-            record_sample_observation_if_needed(
-                identity,
-                context,
-                usage,
-                portfolio_cost_usd_micros,
-                response_observation.as_ref(),
-                pipeline_observation.as_ref(),
-                &mut chisei,
-            )
-            .await;
+            if !non_success {
+                record_sample_observation_if_needed(
+                    identity,
+                    context,
+                    usage,
+                    portfolio_cost_usd_micros,
+                    response_observation.as_ref(),
+                    pipeline_observation.as_ref(),
+                    &mut chisei,
+                )
+                .await;
+            }
 
             let mut values = HashMap::new();
             values.insert("request_id".to_string(), context.request_id.clone());
+            values.insert(
+                "receipt_id".to_string(),
+                gateway_attempt_receipt_id(
+                    &context.operation_id,
+                    &context.request_id,
+                    context.attempt,
+                ),
+            );
             insert_correlation_values(&mut values, context);
             values.insert(
                 "timestamp_ms".to_string(),
@@ -7700,6 +7974,23 @@ async fn record_usage_and_append(
                 values.insert("sample_rate".to_string(), observation.rate.to_string());
             }
             values.insert("status".to_string(), status.as_u16().to_string());
+            match &outcome {
+                GatewayUsageOutcome::Incomplete(_, _) => {
+                    values.insert("terminal_outcome".into(), "incomplete".into());
+                }
+                GatewayUsageOutcome::TerminalFailure(_, reason) => {
+                    values.insert(
+                        "terminal_outcome".into(),
+                        if reason == "response_cancelled" {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
+                    );
+                }
+                _ => {}
+            }
             values.insert(
                 "request_bytes".to_string(),
                 context.request_bytes.to_string(),
@@ -7872,11 +8163,16 @@ async fn record_refusal_with_usage_and_append(
             rejection,
             model_attempted,
         }),
+        None,
     )
     .await;
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let mut values = HashMap::new();
     values.insert("request_id".to_string(), context.request_id.clone());
+    values.insert(
+        "receipt_id".to_string(),
+        gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt),
+    );
     insert_correlation_values(&mut values, context);
     values.insert(
         "timestamp_ms".to_string(),
@@ -8007,12 +8303,14 @@ fn build_gateway_operation_receipt(
     usage: Option<&ResponseUsage>,
     observation: Option<&ResponseObservation>,
     rejection: Option<ReceiptRejection<'_>>,
+    terminal_outcome: Option<ReceiptTerminalOutcome<'_>>,
 ) -> OperationReceipt {
     let model_attempted = rejection
         .map(|failure| failure.model_attempted)
         .unwrap_or(true);
     let rejection = rejection.map(|failure| failure.rejection);
-    let operation_id = context.operation_id.clone();
+    let operation_id =
+        gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt);
     let completed_at_ms = Utc::now().timestamp_millis();
     let actor = identity.agent.as_str();
     let policy_version = context
@@ -8185,6 +8483,14 @@ fn build_gateway_operation_receipt(
             )]),
         ),
     ];
+    let mut model_call_attributes = BTreeMap::from([(
+        "usage_status".into(),
+        if usage.is_some() { "known" } else { "unknown" }.into(),
+    )]);
+    if let Some(usage) = usage {
+        model_call_attributes.insert("input_tokens".into(), usage.input_tokens.to_string());
+        model_call_attributes.insert("output_tokens".into(), usage.output_tokens.to_string());
+    }
     let outcome_parent = if rejection.is_some() && !model_attempted {
         "egress"
     } else {
@@ -8215,22 +8521,7 @@ fn build_gateway_operation_receipt(
                 completed_at_ms,
                 ReceiptEventKind::ModelCalled,
                 "chisei.gateway",
-                BTreeMap::from([
-                    (
-                        "input_tokens".into(),
-                        usage
-                            .map(|usage| usage.input_tokens)
-                            .unwrap_or(0)
-                            .to_string(),
-                    ),
-                    (
-                        "output_tokens".into(),
-                        usage
-                            .map(|usage| usage.output_tokens)
-                            .unwrap_or(0)
-                            .to_string(),
-                    ),
-                ]),
+                model_call_attributes,
             ),
             gateway_receipt_event(
                 &operation_id,
@@ -8283,6 +8574,8 @@ fn build_gateway_operation_receipt(
                 "status".into(),
                 if rejection.is_some() {
                     "denied"
+                } else if let Some(terminal) = terminal_outcome {
+                    terminal.status()
                 } else {
                     "completed"
                 }
@@ -8293,6 +8586,7 @@ fn build_gateway_operation_receipt(
                 "completion_reason".into(),
                 rejection
                     .map(|rejection| rejection.error_type.clone())
+                    .or_else(|| terminal_outcome.map(|terminal| terminal.reason().to_string()))
                     .or_else(|| observation.map(|observation| observation.stop_reason.clone()))
                     .unwrap_or_else(|| "upstream_completed".into()),
             ),
@@ -8307,10 +8601,14 @@ fn build_gateway_operation_receipt(
     OperationReceipt {
         version: OPERATION_RECEIPT_VERSION.into(),
         operation_id,
-        parent_operation_id: context
-            .parent_operation_id
-            .clone()
-            .or_else(|| context.work_unit_id.clone()),
+        parent_operation_id: if context.attempt > 1 {
+            Some(context.operation_id.clone())
+        } else {
+            context
+                .parent_operation_id
+                .clone()
+                .or_else(|| context.work_unit_id.clone())
+        },
         namespace: identity.project.clone(),
         operation_class: "model_inference".into(),
         initiating_actor: actor.into(),
@@ -8324,6 +8622,7 @@ fn build_gateway_operation_receipt(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_gateway_operation_receipt(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
@@ -8332,9 +8631,17 @@ async fn record_gateway_operation_receipt(
     usage: Option<&ResponseUsage>,
     observation: Option<&ResponseObservation>,
     rejection: Option<ReceiptRejection<'_>>,
+    terminal_outcome: Option<ReceiptTerminalOutcome<'_>>,
 ) {
-    let receipt =
-        build_gateway_operation_receipt(identity, context, status, usage, observation, rejection);
+    let receipt = build_gateway_operation_receipt(
+        identity,
+        context,
+        status,
+        usage,
+        observation,
+        rejection,
+        terminal_outcome,
+    );
     let Ok(receipt_json) = serde_json::to_string(&receipt) else {
         error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
         return;
@@ -8374,48 +8681,14 @@ async fn append_llm_calls_rows(
 async fn ensure_llm_calls_dataset(
     sekai: &mut SekaiServiceClient<GatewayClient>,
 ) -> Result<(), tonic::Status> {
-    let columns = [
-        "request_id",
-        "operation_id",
-        "parent_operation_id",
-        "turn_id",
-        "attempt",
-        "cycle_id",
-        "traceparent",
-        "timestamp_ms",
-        "agent",
-        "project",
-        "data_class",
-        "user_id",
-        "key_id",
-        "provider",
-        "model",
-        "resolved_model",
-        "work_unit_id",
-        "route_bias",
-        "policy_scope",
-        "policy_version",
-        "pipeline_sampled",
-        "sample_reason",
-        "sample_rate",
-        "status",
-        "error_type",
-        "refusal_reason",
-        "request_bytes",
-        "latency_ms",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "cost_usd_micros",
-        "cost_usd",
-    ]
-    .into_iter()
-    .map(|name| ColumnDef {
-        name: name.to_string(),
-        r#type: "string".to_string(),
-        classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
-    })
-    .collect();
+    let columns = LLM_CALLS_COLUMNS
+        .iter()
+        .copied()
+        .map(|name| ColumnDef {
+            name: name.to_string(),
+            r#type: "string".to_string(),
+        })
+        .collect();
 
     sekai
         .create_dataset(gateway_request(CreateDatasetRequest {
@@ -9230,12 +9503,104 @@ struct SseUsageTap {
     terminal: Option<ResponsesTerminal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default)]
+struct ResponsesStreamValidator {
+    pending: Vec<u8>,
+    terminal_seen: bool,
+    sse: Option<bool>,
+}
+
+impl ResponsesStreamValidator {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        if self.sse == Some(false) {
+            return Ok(bytes.to_vec());
+        }
+        let mut validated = Vec::new();
+        for window in bytes.chunks(SSE_VALIDATION_WINDOW_BYTES) {
+            if self.sse == Some(false) {
+                validated.extend_from_slice(window);
+                continue;
+            }
+            self.pending.extend_from_slice(window);
+            if self.sse.is_none()
+                && let Some(sse) = body_prefix_is_sse(&self.pending)
+            {
+                self.sse = Some(sse);
+                if !sse {
+                    validated.extend_from_slice(&self.pending);
+                    self.pending.clear();
+                    continue;
+                }
+            }
+            let mut consumed = 0;
+            while let Some((frame_end, separator_end)) =
+                crate::harness::find_frame_boundary(&self.pending[consumed..])
+            {
+                if frame_end > MAX_SSE_FRAME_BYTES {
+                    return Err("upstream SSE frame exceeds the gateway limit".into());
+                }
+                let frame_start = consumed;
+                let frame_end = frame_start + frame_end;
+                consumed = frame_start + separator_end;
+                let frame = &self.pending[frame_start..frame_end];
+                let semantic_frame = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
+                let has_data = validate_responses_sse_frame(semantic_frame)?;
+                if self.terminal_seen && has_data {
+                    return Err("upstream emitted data after a terminal response event".into());
+                }
+                if has_data && sse_event_terminal(semantic_frame).is_some() {
+                    if self.terminal_seen {
+                        return Err("upstream emitted duplicate terminal response events".into());
+                    }
+                    self.terminal_seen = true;
+                }
+            }
+            validated.extend_from_slice(&self.pending[..consumed]);
+            self.pending.drain(..consumed);
+            if self.pending.len() > MAX_SSE_FRAME_BYTES {
+                return Err("upstream SSE frame exceeds the gateway limit".into());
+            }
+        }
+        Ok(validated)
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.sse == Some(false) {
+            return Ok(());
+        }
+        if self.pending.iter().all(u8::is_ascii_whitespace) {
+            Ok(())
+        } else {
+            Err("upstream stream ended within an SSE frame".into())
+        }
+    }
+}
+
+fn validate_responses_sse_frame(frame: &[u8]) -> Result<bool, String> {
+    let text = std::str::from_utf8(frame)
+        .map_err(|_| "upstream SSE frame is not valid UTF-8".to_string())?;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let data = normalized
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    let data = data.join("\n");
+    serde_json::from_str::<serde_json::Value>(&data)
+        .map_err(|error| format!("upstream SSE data is invalid JSON: {error}"))?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ResponsesTerminal {
     Completed,
+    Incomplete(String),
     Failed,
     Cancelled,
     Interrupted,
+    Invalid,
 }
 
 impl SseUsageTap {
@@ -9267,7 +9632,11 @@ impl SseUsageTap {
         while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
             let event = self.pending.drain(..boundary).collect::<Vec<_>>();
             self.pending.drain(..separator_len);
-            self.terminal = self.terminal.or_else(|| sse_event_terminal(&event));
+            if self.terminal.is_some() && extract_sse_data(&event).is_some() {
+                self.terminal = Some(ResponsesTerminal::Invalid);
+                continue;
+            }
+            self.terminal = sse_event_terminal(&event).or_else(|| self.terminal.take());
             if let Some(usage) = extract_sse_event_usage(&event) {
                 self.usage = Some(merge_usage(self.usage, usage));
             }
@@ -9291,7 +9660,7 @@ impl SseUsageTap {
         SseTapMode,
     ) {
         self.flush_pending();
-        let terminal = self.terminal;
+        let terminal = self.terminal.clone();
         let mode = self.mode;
         let observation = if self.observation.output_content.trim().is_empty() {
             None
@@ -9305,7 +9674,7 @@ impl SseUsageTap {
 
     #[cfg(test)]
     fn terminal(&self) -> Option<ResponsesTerminal> {
-        self.terminal
+        self.terminal.clone()
     }
 
     fn flush_pending(&mut self) {
@@ -9313,7 +9682,11 @@ impl SseUsageTap {
             return;
         }
         let pending = std::mem::take(&mut self.pending);
-        self.terminal = self.terminal.or_else(|| sse_event_terminal(&pending));
+        if self.terminal.is_some() && extract_sse_data(&pending).is_some() {
+            self.terminal = Some(ResponsesTerminal::Invalid);
+            return;
+        }
+        self.terminal = sse_event_terminal(&pending).or_else(|| self.terminal.take());
         // Non-SSE passthrough bodies (no Content-Type header) arrive here as
         // one pending blob; fall back to whole-JSON extraction for those.
         if let Some(usage) = extract_sse_event_usage(&pending).or_else(|| {
@@ -9350,14 +9723,31 @@ fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
         _ => None,
     };
     let text = String::from_utf8_lossy(event);
+    let data_value = extract_sse_data(event)
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+    if data_value
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(|value| value.as_str())
+        == Some("response.incomplete")
+    {
+        let reason = data_value
+            .as_ref()
+            .and_then(|value| value.get("response"))
+            .and_then(|value| value.get("incomplete_details"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("response_incomplete")
+            .to_string();
+        return Some(ResponsesTerminal::Incomplete(reason));
+    }
     if let Some(terminal) = text.lines().find_map(|line| {
         line.strip_prefix("event:")
             .and_then(|event| parse(event.trim()))
     }) {
         return Some(terminal);
     }
-    extract_sse_data(event)
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+    data_value
         .and_then(|value| {
             value
                 .get("type")
@@ -9371,7 +9761,11 @@ fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
 /// while the prefix is still too short to tell. SSE streams start with a
 /// field line (`data:`, `event:`, `id:`, `retry:`) or a `:` comment line.
 fn body_prefix_is_sse(bytes: &[u8]) -> Option<bool> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+    if bytes.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(bytes) {
+        return None;
+    }
+    let bytes = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
     let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
     let prefix = &bytes[start..];
     const SSE_FIELD_PREFIXES: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
@@ -9437,6 +9831,7 @@ fn extract_sse_event_observation(event: &[u8]) -> Option<ResponseObservation> {
 }
 
 fn extract_sse_data(event: &[u8]) -> Option<String> {
+    let event = event.strip_prefix(b"\xef\xbb\xbf").unwrap_or(event);
     let text = String::from_utf8_lossy(event);
     let mut data = String::new();
     for line in text.lines() {
@@ -9649,11 +10044,16 @@ async fn response_from_upstream(
             } else {
                 SseUsageTap::new()
             };
+            let mut responses_validator = context
+                .responses_profile
+                .then(ResponsesStreamValidator::default);
             let mut translator =
                 translate.then(|| AnthropicMessageStreamTranslator::new(client_model));
             let mut aborted = false;
             let mut stream_error = None;
             let mut client_gone = false;
+            let mut terminal_forwarded = false;
+            let mut interruption_forwarded = false;
             while let Some(chunk) = upstream_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
@@ -9661,19 +10061,58 @@ async fn response_from_upstream(
                         // after the client disconnects: OpenAI reports token
                         // counts only in the trailing chunk, so we must keep
                         // draining to meter interrupted streams accurately.
+                        let terminal_was_forwarded = responses_validator
+                            .as_ref()
+                            .is_some_and(|validator| validator.terminal_seen);
+                        let validated_responses_bytes = match responses_validator.as_mut() {
+                            Some(validator) => match validator.push(&bytes) {
+                                Ok(validated) => Some(Bytes::from(validated)),
+                                Err(reason) => {
+                                    usage_tap.push(&bytes);
+                                    stream_error = Some(reason.clone());
+                                    if !terminal_was_forwarded && !client_gone {
+                                        let interruption = interrupted_responses_event(
+                                            &reason,
+                                            usage_tap.usage.as_ref(),
+                                        );
+                                        interruption_forwarded =
+                                            tx.send(Ok(interruption)).await.is_ok();
+                                    }
+                                    aborted = true;
+                                    break;
+                                }
+                            },
+                            None => None,
+                        };
+                        let had_terminal = usage_tap.terminal.is_some();
                         usage_tap.push(&bytes);
+                        if usage_tap.terminal == Some(ResponsesTerminal::Invalid) {
+                            let reason =
+                                "upstream emitted data after a terminal response event".to_string();
+                            stream_error = Some(reason.clone());
+                            if context.responses_profile && !terminal_forwarded && !client_gone {
+                                let interruption =
+                                    interrupted_responses_event(&reason, usage_tap.usage.as_ref());
+                                interruption_forwarded = tx.send(Ok(interruption)).await.is_ok();
+                            }
+                            aborted = true;
+                            break;
+                        }
+                        let gained_terminal = !had_terminal && usage_tap.terminal.is_some();
                         if client_gone {
                             continue;
                         }
                         let outgoing = match translator.as_mut() {
                             Some(translator) => Bytes::from(translator.push(&bytes)),
-                            None => bytes,
+                            None => validated_responses_bytes.unwrap_or(bytes),
                         };
                         if outgoing.is_empty() {
                             continue;
                         }
                         if tx.send(Ok(outgoing)).await.is_err() {
                             client_gone = true;
+                        } else if gained_terminal {
+                            terminal_forwarded = true;
                         }
                     }
                     Err(err) => {
@@ -9686,6 +10125,19 @@ async fn response_from_upstream(
                         break;
                     }
                 }
+            }
+            if !aborted
+                && let Some(validator) = &responses_validator
+                && let Err(reason) = validator.finish()
+            {
+                stream_error = Some(reason.clone());
+                usage_tap.terminal = Some(ResponsesTerminal::Invalid);
+                if !validator.terminal_seen && !client_gone {
+                    let interruption =
+                        interrupted_responses_event(&reason, usage_tap.usage.as_ref());
+                    interruption_forwarded = tx.send(Ok(interruption)).await.is_ok();
+                }
+                aborted = true;
             }
             // Only emit the Anthropic closing events on a clean end of stream to
             // a still-connected client; after an upstream error or client
@@ -9702,7 +10154,7 @@ async fn response_from_upstream(
             let (usage, observation, terminal, tap_mode) = usage_tap.finish_with_terminal();
             let missing_responses_terminal =
                 context.responses_profile && tap_mode != SseTapMode::Raw && terminal.is_none();
-            if missing_responses_terminal && !client_gone {
+            if missing_responses_terminal && !client_gone && !interruption_forwarded {
                 let terminal_event = interrupted_responses_event(
                     stream_error
                         .as_deref()
@@ -9711,32 +10163,31 @@ async fn response_from_upstream(
                 );
                 let _ = tx.send(Ok(terminal_event)).await;
             }
-            let rejection = match terminal {
-                Some(ResponsesTerminal::Failed) => Some(GatewayRejection {
-                    status: StatusCode::BAD_GATEWAY,
-                    error_type: "upstream_invalid_response".into(),
-                    reason: "upstream reported response.failed".into(),
-                    rejected_route: None,
-                }),
-                Some(ResponsesTerminal::Cancelled) => Some(GatewayRejection {
-                    status: StatusCode::CONFLICT,
-                    error_type: "request_conflict".into(),
-                    reason: "upstream reported response.cancelled".into(),
-                    rejected_route: None,
-                }),
+            let rejection = match &terminal {
+                Some(ResponsesTerminal::Failed | ResponsesTerminal::Cancelled) => None,
                 Some(ResponsesTerminal::Interrupted) => Some(GatewayRejection {
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_unavailable".into(),
                     reason: "upstream reported chisei.response.interrupted".into(),
                     rejected_route: None,
+                    retry_safety: Some("ambiguous"),
                 }),
                 Some(ResponsesTerminal::Completed) => None,
+                Some(ResponsesTerminal::Incomplete(_)) => None,
+                Some(ResponsesTerminal::Invalid) => Some(GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_invalid_response".into(),
+                    reason: "upstream emitted data after a terminal event".into(),
+                    rejected_route: None,
+                    retry_safety: Some("ambiguous"),
+                }),
                 None if aborted || missing_responses_terminal => Some(GatewayRejection {
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_stream_error".into(),
                     reason: stream_error
                         .unwrap_or_else(|| "upstream stream ended without a terminal event".into()),
                     rejected_route: None,
+                    retry_safety: Some("ambiguous"),
                 }),
                 None => None,
             };
@@ -9756,6 +10207,18 @@ async fn response_from_upstream(
                 )
                 .await;
             } else {
+                let outcome = match terminal {
+                    Some(ResponsesTerminal::Incomplete(reason)) => {
+                        GatewayUsageOutcome::Incomplete(status, reason)
+                    }
+                    Some(ResponsesTerminal::Failed) => {
+                        GatewayUsageOutcome::TerminalFailure(status, "response_failed".into())
+                    }
+                    Some(ResponsesTerminal::Cancelled) => {
+                        GatewayUsageOutcome::TerminalFailure(status, "response_cancelled".into())
+                    }
+                    _ => GatewayUsageOutcome::Success(status),
+                };
                 record_usage_and_append(
                     &config,
                     &runtime,
@@ -9763,7 +10226,7 @@ async fn response_from_upstream(
                     usage,
                     observation,
                     &context,
-                    GatewayUsageOutcome::Success(status),
+                    outcome,
                 )
                 .await;
             }
@@ -9783,6 +10246,10 @@ async fn response_from_upstream(
     match upstream.bytes().await {
         Ok(bytes) => {
             let (usage, observation) = extract_buffered_body_usage(&bytes);
+            let buffered_terminal = context
+                .responses_profile
+                .then(|| buffered_responses_terminal(&bytes))
+                .flatten();
             let body = match response_adapter {
                 ResponseAdapter::Passthrough => bytes.to_vec(),
                 // Both cross-provider adapters map a buffered OpenAI chat body to
@@ -9810,6 +10277,7 @@ async fn response_from_upstream(
                                     "failed to translate OpenAI response to Anthropic: {err}"
                                 ),
                                 rejected_route: None,
+                                retry_safety: None,
                             };
                             record_usage_and_append(
                                 config,
@@ -9842,6 +10310,7 @@ async fn response_from_upstream(
                         error_type: "gateway_response_error".into(),
                         reason: format!("failed to build upstream response: {err}"),
                         rejected_route: None,
+                        retry_safety: None,
                     };
                     record_usage_and_append(
                         config,
@@ -9860,6 +10329,18 @@ async fn response_from_upstream(
                     return json_error(rejection.status, &rejection.error_type, &rejection.reason);
                 }
             };
+            let outcome = match buffered_terminal {
+                Some(ResponsesTerminal::Incomplete(reason)) => {
+                    GatewayUsageOutcome::Incomplete(status, reason)
+                }
+                Some(ResponsesTerminal::Failed) => {
+                    GatewayUsageOutcome::TerminalFailure(status, "response_failed".into())
+                }
+                Some(ResponsesTerminal::Cancelled) => {
+                    GatewayUsageOutcome::TerminalFailure(status, "response_cancelled".into())
+                }
+                _ => GatewayUsageOutcome::Success(status),
+            };
             record_usage_and_append(
                 config,
                 runtime,
@@ -9867,7 +10348,7 @@ async fn response_from_upstream(
                 usage,
                 observation,
                 &context,
-                GatewayUsageOutcome::Success(status),
+                outcome,
             )
             .await;
             response
@@ -9878,6 +10359,7 @@ async fn response_from_upstream(
                 error_type: "upstream_error".into(),
                 reason: safe_upstream_error_reason(context.provider, "response", &err),
                 rejected_route: None,
+                retry_safety: Some("ambiguous"),
             };
             record_refusal_with_usage_and_append(
                 config, identity, &context, &rejection, None, true,
@@ -9885,6 +10367,32 @@ async fn response_from_upstream(
             .await;
             json_error(rejection.status, &rejection.error_type, &rejection.reason)
         }
+    }
+}
+
+#[cfg(test)]
+fn buffered_responses_incomplete_reason(body: &[u8]) -> Option<String> {
+    match buffered_responses_terminal(body) {
+        Some(ResponsesTerminal::Incomplete(reason)) => Some(reason),
+        _ => None,
+    }
+}
+
+fn buffered_responses_terminal(body: &[u8]) -> Option<ResponsesTerminal> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match value.get("status").and_then(|value| value.as_str())? {
+        "completed" => Some(ResponsesTerminal::Completed),
+        "incomplete" => Some(ResponsesTerminal::Incomplete(
+            value
+                .get("incomplete_details")
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("response_incomplete")
+                .to_string(),
+        )),
+        "failed" => Some(ResponsesTerminal::Failed),
+        "cancelled" => Some(ResponsesTerminal::Cancelled),
+        _ => None,
     }
 }
 
@@ -9904,6 +10412,7 @@ fn interrupted_responses_event(reason: &str, usage: Option<&ResponseUsage>) -> B
             "type": "upstream_stream_error",
             "code": "upstream_unavailable",
             "message": reason,
+            "retry_safety": "ambiguous",
         }
     });
     Bytes::from(format!(
@@ -9972,6 +10481,9 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 fn json_error(status: StatusCode, error_type: &str, message: &str) -> Response<Body> {
+    if let Some(retry_safety) = retry_safety_for_error(error_type) {
+        return json_error_with_retry_safety(status, error_type, message, retry_safety);
+    }
     let code = stable_gateway_error_code(error_type);
     let body = serde_json::json!({
         "error": {
@@ -9986,6 +10498,54 @@ fn json_error(status: StatusCode, error_type: &str, message: &str) -> Response<B
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn retry_safety_for_error(error_type: &str) -> Option<&'static str> {
+    match error_type {
+        "rate_limited" | "rate_limit_exceeded" | "upstream_rate_limited" => Some("safe"),
+        "governance_unavailable"
+        | "governance_audit_unavailable"
+        | "provider_registry_unavailable"
+        | "audit_unavailable"
+        | "audit_spool_unavailable" => Some("safe"),
+        "upstream_timeout"
+        | "upstream_unavailable"
+        | "upstream_error"
+        | "upstream_stream_error" => Some("ambiguous"),
+        _ => None,
+    }
+}
+
+fn json_error_with_retry_safety(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    retry_safety: &'static str,
+) -> Response<Body> {
+    let code = stable_gateway_error_code(error_type);
+    let body = serde_json::json!({
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+            "retry_safety": retry_safety,
+        }
+    });
+    (
+        status,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                X_CHISEI_RETRY_SAFETY,
+                HeaderValue::from_static(retry_safety),
+            ),
+        ],
         body.to_string(),
     )
         .into_response()
@@ -10007,6 +10567,7 @@ fn stable_gateway_error_code(error_type: &str) -> &'static str {
         "upstream_quota_exhausted" => "quota_exhausted",
         "upstream_timeout" => "upstream_timeout",
         "upstream_unavailable"
+        | "provider_registry_unavailable"
         | "upstream_error"
         | "upstream_stream_error"
         | "governance_unavailable"
@@ -10340,6 +10901,7 @@ mod tests {
         assert_eq!(events[0].event, "chisei.response.interrupted");
         assert_eq!(events[0].data["response"]["usage"]["total_tokens"], 9);
         assert_eq!(events[0].data["error"]["code"], "upstream_unavailable");
+        assert_eq!(events[0].data["error"]["retry_safety"], "ambiguous");
 
         let bytes = interrupted_responses_event("interrupted", None);
         let events = decoder.push(&bytes).unwrap();
@@ -10348,6 +10910,21 @@ mod tests {
         let mut tap = SseUsageTap::new();
         tap.push(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n");
         assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        let mut tap = SseUsageTap::new();
+        tap.push(b"\xef\xbb\xbfdata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n");
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        assert_eq!(tap.usage.unwrap().total_tokens, 3);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n");
+        assert_eq!(
+            tap.terminal(),
+            Some(ResponsesTerminal::Incomplete("response_incomplete".into()))
+        );
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+        );
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Invalid));
         let mut tap = SseUsageTap::new();
         tap.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n");
         assert_eq!(tap.terminal(), None);
@@ -10374,6 +10951,116 @@ mod tests {
         let (_, _, terminal, mode) = tap.finish_with_terminal();
         assert_eq!(mode, SseTapMode::Undetected);
         assert_eq!(terminal, None);
+    }
+
+    #[test]
+    fn responses_stream_validation_waits_for_complete_frames() {
+        let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let split = terminal.len() - 5;
+        let mut validator = ResponsesStreamValidator::default();
+        assert!(validator.push(&terminal[..split]).unwrap().is_empty());
+        assert_eq!(validator.push(&terminal[split..]).unwrap(), terminal);
+        assert!(validator.terminal_seen);
+        assert!(
+            validator
+                .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n")
+                .is_err()
+        );
+
+        let mut validator = ResponsesStreamValidator::default();
+        assert!(validator.push(b"data: {not-json}\n\n").is_err());
+        let mut validator = ResponsesStreamValidator::default();
+        let bare_cr = b"data: {\"type\":\"response.completed\"}\r\r";
+        assert_eq!(validator.push(bare_cr).unwrap(), bare_cr);
+
+        let mut validator = ResponsesStreamValidator::default();
+        assert!(validator.push(b"\xef").unwrap().is_empty());
+        assert!(validator.push(b"\xbb").unwrap().is_empty());
+        let bom_frame = b"\xbfdata: {\"type\":\"response.completed\"}\n\n";
+        assert_eq!(
+            validator.push(bom_frame).unwrap(),
+            b"\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n"
+        );
+        assert!(validator.terminal_seen);
+
+        let mut validator = ResponsesStreamValidator::default();
+        assert_eq!(
+            validator.push(b"event: response.completed\n\n").unwrap(),
+            b"event: response.completed\n\n"
+        );
+        assert!(!validator.terminal_seen);
+        assert!(validator.finish().is_ok());
+
+        let mut validator = ResponsesStreamValidator::default();
+        let many_frames = b"data: {}\n\n".repeat(100_000);
+        assert_eq!(
+            validator.push(&many_frames).unwrap().len(),
+            many_frames.len()
+        );
+
+        let mut validator = ResponsesStreamValidator::default();
+        let mut oversized = b"data: \"".to_vec();
+        oversized.resize(MAX_SSE_FRAME_BYTES + 1, b'x');
+        oversized.extend_from_slice(b"\n\n");
+        assert!(validator.push(&oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_safety_is_observable_on_gateway_errors() {
+        let response = json_error_with_retry_safety(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "upstream failed",
+            "ambiguous",
+        );
+        assert_eq!(response.headers()[&X_CHISEI_RETRY_SAFETY], "ambiguous");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(body["error"]["retry_safety"], "ambiguous");
+
+        let response = json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_exceeded",
+            "local rate exceeded",
+        );
+        assert_eq!(response.headers()[&X_CHISEI_RETRY_SAFETY], "safe");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["retry_safety"], "safe");
+
+        let response = json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_registry_unavailable",
+            "registry refresh failed",
+        );
+        assert_eq!(response.headers()[&X_CHISEI_RETRY_SAFETY], "safe");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+    }
+
+    #[test]
+    fn buffered_responses_preserve_incomplete_reason() {
+        assert_eq!(
+            buffered_responses_incomplete_reason(
+                br#"{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+            )
+            .as_deref(),
+            Some("max_output_tokens")
+        );
+        assert!(
+            buffered_responses_incomplete_reason(br#"{"id":"resp_1","status":"completed"}"#,)
+                .is_none()
+        );
+        assert_eq!(
+            buffered_responses_terminal(br#"{"id":"resp_1","status":"failed"}"#),
+            Some(ResponsesTerminal::Failed)
+        );
+        assert_eq!(
+            buffered_responses_terminal(br#"{"id":"resp_1","status":"cancelled"}"#),
+            Some(ResponsesTerminal::Cancelled)
+        );
     }
 
     #[test]
@@ -10521,11 +11208,39 @@ mod tests {
             }),
             Some(&observation),
             None,
+            None,
         );
 
         assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
-        assert_eq!(receipt.operation_id, "gateway-op-1");
-        assert_eq!(receipt.parent_operation_id.as_deref(), Some("parent-op"));
+        assert_eq!(
+            receipt.operation_id,
+            gateway_attempt_receipt_id("gateway-op-1", "gateway-op-1", 2)
+        );
+        assert_eq!(receipt.parent_operation_id.as_deref(), Some("gateway-op-1"));
+        let incomplete_receipt = build_gateway_operation_receipt(
+            &identity,
+            &context,
+            StatusCode::OK,
+            None,
+            Some(&observation),
+            None,
+            Some(ReceiptTerminalOutcome::Incomplete("max_output_tokens")),
+        );
+        let outcome = incomplete_receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .unwrap();
+        assert_eq!(outcome.attributes["status"], "incomplete");
+        assert_eq!(outcome.attributes["completion_reason"], "max_output_tokens");
+        let model_call = incomplete_receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::ModelCalled)
+            .unwrap();
+        assert_eq!(model_call.attributes["usage_status"], "unknown");
+        assert!(!model_call.attributes.contains_key("input_tokens"));
+        assert!(!model_call.attributes.contains_key("output_tokens"));
         assert_eq!(receipt.initiating_actor, identity.agent);
         assert!(receipt.completeness().complete);
         let serialized = serde_json::to_string(&receipt).unwrap();
@@ -10588,6 +11303,7 @@ mod tests {
                 rejection: &rejection,
                 model_attempted: false,
             }),
+            None,
         );
         assert_eq!(
             receipt.parent_operation_id.as_deref(),
@@ -10619,6 +11335,7 @@ mod tests {
                 rejection: &budget_rejection,
                 model_attempted: false,
             }),
+            None,
         );
         assert!(budget_receipt.events.iter().any(|event| {
             event.kind == ReceiptEventKind::PolicyDecided
@@ -11311,6 +12028,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retry_after_is_clamped_to_a_safe_circuit_duration() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("18446744073709551615"),
+        );
+        assert_eq!(
+            retry_after_duration(&headers),
+            Some(Duration::from_secs(MAX_PROVIDER_RETRY_AFTER_SECS))
+        );
+    }
+
+    #[test]
+    fn canary_admission_requires_trusted_identity_and_bounded_class() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&X_CHISEI_TASK_CLASS, HeaderValue::from_static("background"));
+        let identity = GatewayIdentity {
+            agent: "test".into(),
+            project: "default".into(),
+            user_id: "agent:test".into(),
+            key_id: "test".into(),
+            tier: "untrusted".into(),
+        };
+        let mut context = IdentityContext {
+            identity,
+            upstream_auth: UpstreamAuthMode::GatewayKey,
+        };
+        assert!(!canary_admission_allowed(&context, &headers));
+        context.identity.tier = "low-risk".into();
+        assert!(canary_admission_allowed(&context, &headers));
+        context.upstream_auth = UpstreamAuthMode::Passthrough;
+        assert!(!canary_admission_allowed(&context, &headers));
+        context.upstream_auth = UpstreamAuthMode::GatewayKey;
+        headers.insert(
+            &X_CHISEI_TASK_CLASS,
+            HeaderValue::from_static("interactive"),
+        );
+        assert!(!canary_admission_allowed(&context, &headers));
+    }
+
     #[tokio::test]
     async fn unhealthy_routes_use_only_policy_authorized_equivalent_fallbacks() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
@@ -11337,6 +12095,7 @@ mod tests {
             &ProviderRegistry::built_in(),
             decision,
             Some(CapabilityRequestSurface::Responses),
+            false,
             false,
         )
         .await
@@ -11366,15 +12125,53 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["native/native-default".into()],
         };
-        let result = select_healthy_policy_fallback(
+        let rejection = select_healthy_policy_fallback(
             &runtime,
             &ProviderRegistry::built_in(),
             decision,
             Some(CapabilityRequestSurface::Responses),
             false,
+            false,
         )
-        .await;
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
+        let response = rejection.response();
+        assert_eq!(response.headers()[&X_CHISEI_RETRY_SAFETY], "safe");
+    }
+
+    #[tokio::test]
+    async fn local_free_health_fallback_never_selects_a_paid_provider() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.upstream_circuits.write().await.insert(
+            "ollama".into(),
+            CircuitBreakerState {
+                consecutive_failures: 1,
+                open_until: Some(Instant::now() + Duration::from_secs(60)),
+                last_failure: Some("unavailable".into()),
+                health: ProviderHealth::Unavailable,
+            },
+        );
+        let decision = PolicyPreflight {
+            body: br#"{"model":"ollama/llama3.2","input":"hello"}"#.to_vec(),
+            resolved_model: Some("ollama/llama3.2".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+            route_bias: Some("local_free".into()),
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["openai/gpt-5.5".into()],
+        };
+        assert!(
+            select_healthy_policy_fallback(
+                &runtime,
+                &ProviderRegistry::built_in(),
+                decision,
+                Some(CapabilityRequestSurface::Responses),
+                false,
+                true,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

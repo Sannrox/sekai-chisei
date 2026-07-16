@@ -40,13 +40,13 @@ pub struct ModelComparison {
     pub models: Vec<ModelVarianceResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Assertion {
     pub assert_type: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Case {
     pub id: String,
     pub name: String,
@@ -55,7 +55,7 @@ pub struct Case {
     pub assertions: Vec<Assertion>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Suite {
     pub id: String,
     pub name: String,
@@ -63,7 +63,7 @@ pub struct Suite {
     pub cases: Vec<Case>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaseResult {
     pub case_id: String,
     pub passed: bool,
@@ -74,7 +74,7 @@ pub struct CaseResult {
     pub elapsed: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Run {
     pub id: String,
     pub suite_id: String,
@@ -178,8 +178,19 @@ impl EvalStore {
         if let Some(db) = &self.db {
             return db.put_eval_suite(&suite);
         }
-        self.suites.lock().unwrap().insert(suite.id.clone(), suite);
-        Ok(())
+        let mut suites = self.suites.lock().unwrap();
+        match suites.get(&suite.id) {
+            Some(existing) if existing == &suite => Ok(()),
+            Some(_) if suite.id.starts_with("sampling-") => {
+                suites.insert(suite.id.clone(), suite);
+                Ok(())
+            }
+            Some(_) => Err(format!("eval suite {:?} is immutable", suite.id)),
+            None => {
+                suites.insert(suite.id.clone(), suite);
+                Ok(())
+            }
+        }
     }
     pub fn get_suite(&self, id: &str) -> Option<Suite> {
         if let Some(db) = &self.db {
@@ -209,8 +220,15 @@ impl EvalStore {
         if let Some(db) = &self.db {
             return db.put_eval_run(&run);
         }
-        self.runs.lock().unwrap().insert(run.id.clone(), run);
-        Ok(())
+        let mut runs = self.runs.lock().unwrap();
+        match runs.get(&run.id) {
+            Some(existing) if existing == &run => Ok(()),
+            Some(_) => Err(format!("eval run {:?} is immutable", run.id)),
+            None => {
+                runs.insert(run.id.clone(), run);
+                Ok(())
+            }
+        }
     }
     pub fn get_run(&self, id: &str) -> Option<Run> {
         if let Some(db) = &self.db {
@@ -765,6 +783,57 @@ mod tests {
         assert_eq!(store.list_runs("shared-suite").len(), 1);
 
         drop((store, writer));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn database_eval_evidence_is_append_only_across_connections() {
+        let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
+        let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let mut promotion = Suite {
+            id: "promotion-suite".into(),
+            name: "a".into(),
+            description: String::new(),
+            cases: Vec::new(),
+        };
+        first.put_eval_suite(&promotion).unwrap();
+        promotion.name = "b".into();
+        assert!(second.put_eval_suite(&promotion).is_err());
+
+        let sampling = Suite {
+            id: "sampling-live".into(),
+            name: "first".into(),
+            description: String::new(),
+            cases: Vec::new(),
+        };
+        first.put_eval_suite(&sampling).unwrap();
+        let mut updated = sampling.clone();
+        updated.name = "second".into();
+        second.put_eval_suite(&updated).unwrap();
+
+        let mut uppercase = sampling.clone();
+        uppercase.id = "Sampling-locked".into();
+        first.put_eval_suite(&uppercase).unwrap();
+        uppercase.name = "changed".into();
+        assert!(second.put_eval_suite(&uppercase).is_err());
+
+        let run = Run {
+            id: "immutable-run".into(),
+            suite_id: "promotion-suite".into(),
+            config_ref: "v1".into(),
+            results: Vec::new(),
+            timestamp: 1,
+        };
+        let mut changed = run.clone();
+        changed.config_ref = "v2".into();
+        first.put_eval_run(&run).unwrap();
+        let error = second.put_eval_run(&changed).unwrap_err();
+        assert!(error.contains("immutable-run") && error.contains("immutable"));
+
+        drop((first, second));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

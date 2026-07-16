@@ -866,46 +866,14 @@ async fn upsert_object(
 async fn ensure_llm_calls_dataset(
     sekai: &mut SekaiServiceClient<GatewayClient>,
 ) -> Result<(), tonic::Status> {
-    let columns = [
-        "request_id",
-        "timestamp_ms",
-        "agent",
-        "project",
-        "data_class",
-        "user_id",
-        "key_id",
-        "provider",
-        "model",
-        "resolved_model",
-        "work_unit_id",
-        "pipeline_sampled",
-        "sample_reason",
-        "sample_rate",
-        "route_bias",
-        "policy_scope",
-        "policy_version",
-        "status",
-        "error_type",
-        "refusal_reason",
-        "request_bytes",
-        "latency_ms",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "cost_usd_micros",
-        "cost_usd",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-        "cache_savings_usd_micros",
-        "cache_savings_usd",
-    ]
-    .into_iter()
-    .map(|name| ColumnDef {
-        name: name.to_string(),
-        r#type: "string".to_string(),
-        classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
-    })
-    .collect();
+    let columns = crate::gateway::LLM_CALLS_COLUMNS
+        .iter()
+        .copied()
+        .map(|name| ColumnDef {
+            name: name.to_string(),
+            r#type: "string".to_string(),
+        })
+        .collect();
 
     match sekai
         .create_dataset(gateway_request(CreateDatasetRequest {
