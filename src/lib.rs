@@ -14,6 +14,7 @@ pub mod grpc;
 pub mod harness;
 pub mod launch;
 pub mod llm;
+pub mod memory_cli;
 pub mod obs;
 pub mod onboarding;
 pub mod operation_report;
