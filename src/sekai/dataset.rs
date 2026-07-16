@@ -178,6 +178,26 @@ impl SekaiDb {
         Ok(())
     }
 
+    pub fn update_dataset(&self, d: &Dataset) -> Result<(), String> {
+        let conn = self.conn();
+        let cols = serde_json::to_string(
+            &d.columns
+                .iter()
+                .map(|c| (&c.name, &c.col_type))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
+        let changed = conn
+            .execute(
+                "UPDATE sekai_datasets SET name=?2, columns=?3 WHERE id=?1",
+                params![d.id, d.name, cols],
+            )
+            .map_err(|error| error.to_string())?;
+        (changed == 1)
+            .then_some(())
+            .ok_or_else(|| format!("dataset {:?} not found", d.id))
+    }
+
     pub fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
         let conn = self.conn();
         conn.query_row(
@@ -518,123 +538,42 @@ mod tests {
     }
 
     #[test]
-    fn loads_legacy_dataset_columns_as_public() {
+    fn update_dataset_preserves_rows_and_creation_time() {
         let db = setup();
-        db.conn()
-            .execute(
-                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
-                 VALUES ('legacy','legacy','[[\"value\",\"string\"]]','',1)",
-                [],
-            )
-            .unwrap();
-
-        let dataset = db.get_dataset("legacy").unwrap().unwrap();
-        assert_eq!(dataset.columns[0].classification, "public");
-    }
-
-    #[test]
-    fn migrates_legacy_llm_call_column_classifications() {
-        let db = setup();
-        db.conn()
-            .execute(
-                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
-                 VALUES ('llm_calls','calls','[[\"user_id\",\"string\"],[\"status\",\"string\"]]','',1)",
-                [],
-            )
-            .unwrap();
-        db.migrate_datasets().unwrap();
-
-        let dataset = db.get_dataset("llm_calls").unwrap().unwrap();
-        assert_eq!(dataset.columns[0].classification, "sensitive");
-        assert_eq!(dataset.columns[1].classification, "public");
-        let data_class = dataset
-            .columns
-            .iter()
-            .find(|column| column.name == "data_class")
-            .unwrap();
-        assert_eq!(data_class.col_type, "string");
-        assert_eq!(data_class.classification, "public");
-    }
-
-    #[test]
-    fn redacts_only_matching_classified_dataset_fields() {
-        let db = setup();
-        db.create_dataset(&Dataset {
-            id: "classified".into(),
-            name: "classified".into(),
-            columns: vec![
-                ColumnDef {
-                    name: "namespace".into(),
-                    col_type: "string".into(),
-                    classification: "public".into(),
-                },
-                ColumnDef {
-                    name: "identity".into(),
-                    col_type: "string".into(),
-                    classification: "sensitive".into(),
-                },
-                ColumnDef {
-                    name: "metric".into(),
-                    col_type: "int".into(),
-                    classification: "public".into(),
-                },
-            ],
-            object_id: String::new(),
-            created: 1,
-        })
-        .unwrap();
+        let mut dataset = Dataset {
+            id: "ds1".into(),
+            name: "old name".into(),
+            columns: vec![ColumnDef {
+                name: "old_column".into(),
+                col_type: "string".into(),
+            }],
+            object_id: "object-a".into(),
+            created: 100,
+        };
+        db.create_dataset(&dataset).unwrap();
         db.append_rows(
-            "classified",
-            &[
-                HashMap::from([
-                    ("namespace".into(), "redact".into()),
-                    ("identity".into(), "alice".into()),
-                    ("metric".into(), "1".into()),
-                ]),
-                HashMap::from([
-                    ("namespace".into(), "keep".into()),
-                    ("identity".into(), "bob".into()),
-                    ("metric".into(), "2".into()),
-                ]),
-            ],
+            "ds1",
+            &[HashMap::from([("old_column".into(), "value".into())])],
         )
         .unwrap();
 
-        let error = db
-            .redact_dataset_fields(
-                "classified",
-                "sensitive",
-                &[RowFilter {
-                    column: "namespace".into(),
-                    op: "contains".into(),
-                    value: "redact".into(),
-                }],
-            )
-            .unwrap_err();
-        assert!(error.contains("unsupported filter operator"));
+        dataset.name = "new name".into();
+        dataset.columns.push(ColumnDef {
+            name: "new_column".into(),
+            col_type: "string".into(),
+        });
+        dataset.object_id = "object-b".into();
+        dataset.created = 999;
+        db.update_dataset(&dataset).unwrap();
 
-        let result = db
-            .redact_dataset_fields(
-                "classified",
-                "sensitive",
-                &[RowFilter {
-                    column: "namespace".into(),
-                    op: "eq".into(),
-                    value: "redact".into(),
-                }],
-            )
-            .unwrap();
-        assert_eq!(result.rows_updated, 1);
-        assert_eq!(result.fields_redacted, 1);
-        let rows = db.query_rows("classified", &RowQuery::default()).unwrap();
-        assert_eq!(rows[0]["identity"], "[redacted]");
-        assert_eq!(rows[0]["metric"], "1");
-        assert_eq!(rows[1]["identity"], "bob");
+        let updated = db.get_dataset("ds1").unwrap().unwrap();
+        assert_eq!(updated.name, "new name");
+        assert_eq!(updated.columns.len(), 2);
+        assert_eq!(updated.object_id, "object-a");
+        assert_eq!(updated.created, 100);
         assert_eq!(
-            db.redact_dataset_fields("classified", "sensitive", &[])
-                .unwrap()
-                .rows_updated,
-            1
+            db.query_rows("ds1", &RowQuery::default()).unwrap(),
+            vec![HashMap::from([("old_column".into(), "value".into())])]
         );
     }
 

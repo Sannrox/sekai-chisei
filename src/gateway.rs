@@ -47,7 +47,7 @@ use crate::grpc::pb::sekai::{
     AppendRowsRequest, ColumnDef, ContextRoot as SekaiContextRoot, CreateDatasetRequest,
     CreateLinkRequest, CreateObjectRequest, Dataset, FindByExternalIdRequest,
     FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject,
-    RetrieveContextRequest, Row,
+    RetrieveContextRequest, Row, UpdateDatasetRequest,
 };
 use crate::llm::HttpTimeouts;
 #[cfg(test)]
@@ -82,6 +82,7 @@ const X_CHISEI_OPERATION_ID: HeaderName = HeaderName::from_static("x-chisei-oper
 const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
     HeaderName::from_static("x-chisei-parent-operation-id");
 const X_CHISEI_REQUEST_ID: HeaderName = HeaderName::from_static("x-chisei-request-id");
+const X_CHISEI_RECEIPT_ID: HeaderName = HeaderName::from_static("x-chisei-receipt-id");
 const X_CHISEI_TURN_ID: HeaderName = HeaderName::from_static("x-chisei-turn-id");
 const X_CHISEI_ATTEMPT: HeaderName = HeaderName::from_static("x-chisei-attempt");
 const X_CHISEI_CYCLE_ID: HeaderName = HeaderName::from_static("x-chisei-cycle-id");
@@ -1765,9 +1766,6 @@ impl GatewayCorrelation {
 }
 
 fn gateway_attempt_receipt_id(operation_id: &str, request_id: &str, attempt: u32) -> String {
-    if attempt == 1 {
-        return operation_id.to_string();
-    }
     let mut digest = Sha256::new();
     digest.update((operation_id.len() as u64).to_be_bytes());
     digest.update(operation_id.as_bytes());
@@ -2139,6 +2137,7 @@ async fn proxy_gateway_inner_scoped(
                 )
                 .await;
                 record_refusal_and_append(&state.config, &identity, &context, &rejection).await;
+                return refusal_response(&state.config, &context, &rejection);
             }
             return rejection.response();
         }
@@ -2208,7 +2207,7 @@ async fn proxy_gateway_inner_scoped(
             ),
         );
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
-        return rejection.response();
+        return refusal_response(&state.config, &preflight_context, &rejection);
     }
     if state.config.no_preflight && context_request.is_some() {
         return json_error(
@@ -2224,7 +2223,7 @@ async fn proxy_gateway_inner_scoped(
             "the auto model sentinel requires policy preflight",
         );
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
-        return rejection.response();
+        return refusal_response(&state.config, &preflight_context, &rejection);
     }
     if state.config.no_preflight && failure_posture.fail_closed {
         let rejection = GatewayRejection::json(
@@ -2233,7 +2232,7 @@ async fn proxy_gateway_inner_scoped(
             "preflight cannot be disabled for classified or elevated-risk traffic",
         );
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
-        return rejection.response();
+        return refusal_response(&state.config, &preflight_context, &rejection);
     }
     if state.config.no_preflight
         && !record_resilience_decision(
@@ -2265,7 +2264,7 @@ async fn proxy_gateway_inner_scoped(
         .await
     {
         record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
-        return rejection.response();
+        return refusal_response(&state.config, &preflight_context, &rejection);
     }
     let (resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
@@ -2300,7 +2299,7 @@ async fn proxy_gateway_inner_scoped(
             Err(rejection) => {
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         };
         preflight_context.budget_subject = budget.budget_subject.clone();
@@ -2341,7 +2340,7 @@ async fn proxy_gateway_inner_scoped(
                 );
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
             Err(rejection) => {
                 if let Some(route) = rejection.rejected_route.as_ref() {
@@ -2373,7 +2372,7 @@ async fn proxy_gateway_inner_scoped(
                 };
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         };
         let originally_resolved_model = resolved.resolved_model.clone();
@@ -2391,7 +2390,7 @@ async fn proxy_gateway_inner_scoped(
             Err(rejection) => {
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         };
         if resolved.resolved_model != originally_resolved_model {
@@ -2476,7 +2475,7 @@ async fn proxy_gateway_inner_scoped(
             Err(rejection) => {
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         };
         (resolved, egress, Some(budget))
@@ -2492,7 +2491,7 @@ async fn proxy_gateway_inner_scoped(
                 );
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         };
     }
@@ -2538,7 +2537,7 @@ async fn proxy_gateway_inner_scoped(
                 .await;
                 record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
                     .await;
-                return rejection.response();
+                return refusal_response(&state.config, &preflight_context, &rejection);
             }
         }
     }
@@ -3011,6 +3010,26 @@ impl GatewayRejection {
             None => json_error(self.status, &self.error_type, &self.reason),
         }
     }
+}
+
+fn refusal_response(
+    config: &GatewayConfig,
+    context: &UsageContext,
+    rejection: &GatewayRejection,
+) -> Response<Body> {
+    let mut response = rejection.response();
+    if config.chisei_grpc_target.is_some() {
+        insert_header(
+            response.headers_mut(),
+            &X_CHISEI_RECEIPT_ID,
+            &gateway_attempt_receipt_id(
+                &context.operation_id,
+                &context.request_id,
+                context.attempt,
+            ),
+        );
+    }
+    response
 }
 
 fn is_transient_governance_status(status: &tonic::Status) -> bool {
@@ -7718,6 +7737,7 @@ enum GatewayUsageOutcome {
     Success(StatusCode),
     Incomplete(StatusCode, String),
     TerminalFailure(StatusCode, String),
+    Interrupted(StatusCode, String),
     AccountingOnly(StatusCode),
 }
 
@@ -7726,6 +7746,7 @@ enum ReceiptTerminalOutcome<'a> {
     Incomplete(&'a str),
     Failed,
     Cancelled,
+    Interrupted(&'a str),
 }
 
 impl<'a> ReceiptTerminalOutcome<'a> {
@@ -7734,6 +7755,7 @@ impl<'a> ReceiptTerminalOutcome<'a> {
             Self::Incomplete(_) => "incomplete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted(_) => "interrupted",
         }
     }
 
@@ -7742,6 +7764,7 @@ impl<'a> ReceiptTerminalOutcome<'a> {
             Self::Incomplete(reason) => reason,
             Self::Failed => "response_failed",
             Self::Cancelled => "response_cancelled",
+            Self::Interrupted(reason) => reason,
         }
     }
 }
@@ -7762,6 +7785,7 @@ async fn record_usage_and_append(
         GatewayUsageOutcome::Success(status)
         | GatewayUsageOutcome::Incomplete(status, _)
         | GatewayUsageOutcome::TerminalFailure(status, _)
+        | GatewayUsageOutcome::Interrupted(status, _)
         | GatewayUsageOutcome::AccountingOnly(status) => status,
     };
     if matches!(outcome, GatewayUsageOutcome::Success(_)) {
@@ -7803,6 +7827,18 @@ async fn record_usage_and_append(
             response_observation.as_ref(),
             None,
             Some(terminal),
+        )
+        .await;
+    } else if let GatewayUsageOutcome::Interrupted(_, ref reason) = outcome {
+        record_gateway_operation_receipt(
+            config,
+            identity,
+            context,
+            status,
+            usage.as_ref(),
+            response_observation.as_ref(),
+            None,
+            Some(ReceiptTerminalOutcome::Interrupted(reason)),
         )
         .await;
     }
@@ -7885,7 +7921,9 @@ async fn record_usage_and_append(
             }
             let non_success = matches!(
                 outcome,
-                GatewayUsageOutcome::Incomplete(_, _) | GatewayUsageOutcome::TerminalFailure(_, _)
+                GatewayUsageOutcome::Incomplete(_, _)
+                    | GatewayUsageOutcome::TerminalFailure(_, _)
+                    | GatewayUsageOutcome::Interrupted(_, _)
             );
             let pipeline_observation = if non_success {
                 None
@@ -7988,6 +8026,9 @@ async fn record_usage_and_append(
                         }
                         .into(),
                     );
+                }
+                GatewayUsageOutcome::Interrupted(_, _) => {
+                    values.insert("terminal_outcome".into(), "interrupted".into());
                 }
                 _ => {}
             }
@@ -8690,18 +8731,33 @@ async fn ensure_llm_calls_dataset(
         })
         .collect();
 
-    sekai
+    let dataset = Dataset {
+        id: "llm_calls".to_string(),
+        name: "LLM calls".to_string(),
+        columns,
+        object_id: String::new(),
+        created: Utc::now().timestamp_millis(),
+    };
+    match sekai
         .create_dataset(gateway_request(CreateDatasetRequest {
-            dataset: Some(Dataset {
-                id: "llm_calls".to_string(),
-                name: "LLM calls".to_string(),
-                columns,
-                object_id: String::new(),
-                created: Utc::now().timestamp_millis(),
-            }),
+            dataset: Some(dataset.clone()),
         }))
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error.code() == tonic::Code::InvalidArgument
+                && error.message().contains("UNIQUE constraint failed") =>
+        {
+            sekai
+                .update_dataset(gateway_request(UpdateDatasetRequest {
+                    dataset: Some(dataset),
+                }))
+                .await
+                .map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9510,8 +9566,14 @@ struct ResponsesStreamValidator {
     sse: Option<bool>,
 }
 
+#[derive(Debug)]
+struct ResponsesStreamError {
+    reason: String,
+    validated: Vec<u8>,
+}
+
 impl ResponsesStreamValidator {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ResponsesStreamError> {
         if self.sse == Some(false) {
             return Ok(bytes.to_vec());
         }
@@ -9537,28 +9599,49 @@ impl ResponsesStreamValidator {
                 crate::harness::find_frame_boundary(&self.pending[consumed..])
             {
                 if frame_end > MAX_SSE_FRAME_BYTES {
-                    return Err("upstream SSE frame exceeds the gateway limit".into());
+                    validated.extend_from_slice(&self.pending[..consumed]);
+                    return Err(ResponsesStreamError {
+                        reason: "upstream SSE frame exceeds the gateway limit".into(),
+                        validated,
+                    });
                 }
                 let frame_start = consumed;
                 let frame_end = frame_start + frame_end;
-                consumed = frame_start + separator_end;
                 let frame = &self.pending[frame_start..frame_end];
                 let semantic_frame = frame.strip_prefix(b"\xef\xbb\xbf").unwrap_or(frame);
-                let has_data = validate_responses_sse_frame(semantic_frame)?;
+                let has_data = match validate_responses_sse_frame(semantic_frame) {
+                    Ok(has_data) => has_data,
+                    Err(reason) => {
+                        validated.extend_from_slice(&self.pending[..frame_start]);
+                        return Err(ResponsesStreamError { reason, validated });
+                    }
+                };
                 if self.terminal_seen && has_data {
-                    return Err("upstream emitted data after a terminal response event".into());
+                    validated.extend_from_slice(&self.pending[..frame_start]);
+                    return Err(ResponsesStreamError {
+                        reason: "upstream emitted data after a terminal response event".into(),
+                        validated,
+                    });
                 }
                 if has_data && sse_event_terminal(semantic_frame).is_some() {
                     if self.terminal_seen {
-                        return Err("upstream emitted duplicate terminal response events".into());
+                        validated.extend_from_slice(&self.pending[..frame_start]);
+                        return Err(ResponsesStreamError {
+                            reason: "upstream emitted duplicate terminal response events".into(),
+                            validated,
+                        });
                     }
                     self.terminal_seen = true;
                 }
+                consumed = frame_start + separator_end;
             }
             validated.extend_from_slice(&self.pending[..consumed]);
             self.pending.drain(..consumed);
             if self.pending.len() > MAX_SSE_FRAME_BYTES {
-                return Err("upstream SSE frame exceeds the gateway limit".into());
+                return Err(ResponsesStreamError {
+                    reason: "upstream SSE frame exceeds the gateway limit".into(),
+                    validated,
+                });
             }
         }
         Ok(validated)
@@ -9659,7 +9742,13 @@ impl SseUsageTap {
         Option<ResponsesTerminal>,
         SseTapMode,
     ) {
+        let raw_terminal = (self.mode == SseTapMode::Raw)
+            .then(|| buffered_responses_terminal(&self.pending))
+            .flatten();
         self.flush_pending();
+        if self.terminal.is_none() {
+            self.terminal = raw_terminal;
+        }
         let terminal = self.terminal.clone();
         let mode = self.mode;
         let observation = if self.observation.output_content.trim().is_empty() {
@@ -9722,15 +9811,27 @@ fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
         "chisei.response.interrupted" => Some(ResponsesTerminal::Interrupted),
         _ => None,
     };
+    let data = extract_sse_data(event)?;
     let text = String::from_utf8_lossy(event);
-    let data_value = extract_sse_data(event)
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
-    if data_value
+    let semantic_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let normalized = semantic_text.replace("\r\n", "\n").replace('\r', "\n");
+    let data_value = serde_json::from_str::<serde_json::Value>(&data).ok();
+    let event_name = normalized
+        .lines()
+        .filter_map(|line| {
+            if line == "event" {
+                Some("")
+            } else {
+                line.strip_prefix("event:").map(str::trim)
+            }
+        })
+        .next_back();
+    let data_event = data_value
         .as_ref()
         .and_then(|value| value.get("type"))
-        .and_then(|value| value.as_str())
-        == Some("response.incomplete")
-    {
+        .and_then(|value| value.as_str());
+    let authoritative_event = event_name.or(data_event);
+    if authoritative_event == Some("response.incomplete") {
         let reason = data_value
             .as_ref()
             .and_then(|value| value.get("response"))
@@ -9741,20 +9842,10 @@ fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
             .to_string();
         return Some(ResponsesTerminal::Incomplete(reason));
     }
-    if let Some(terminal) = text.lines().find_map(|line| {
-        line.strip_prefix("event:")
-            .and_then(|event| parse(event.trim()))
-    }) {
-        return Some(terminal);
+    if let Some(event) = event_name {
+        return parse(event);
     }
-    data_value
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
-        .and_then(|event| parse(&event))
+    data_event.and_then(parse)
 }
 
 /// Decide from the first body bytes whether the stream is SSE. Returns None
@@ -9768,6 +9859,11 @@ fn body_prefix_is_sse(bytes: &[u8]) -> Option<bool> {
     let bytes = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
     let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
     let prefix = &bytes[start..];
+    if let Some(line_end) = prefix.iter().position(|byte| matches!(byte, b'\n' | b'\r'))
+        && matches!(&prefix[..line_end], b"data" | b"event" | b"id" | b"retry")
+    {
+        return Some(true);
+    }
     const SSE_FIELD_PREFIXES: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
     let mut undecided = false;
     for field in SSE_FIELD_PREFIXES {
@@ -9782,15 +9878,8 @@ fn body_prefix_is_sse(bytes: &[u8]) -> Option<bool> {
 }
 
 fn find_sse_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes.windows(2).position(|window| window == b"\n\n");
-    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
+    crate::harness::find_frame_boundary(bytes)
+        .map(|(frame_end, separator_end)| (frame_end, separator_end - frame_end))
 }
 
 fn extract_sse_event_usage(event: &[u8]) -> Option<ResponseUsage> {
@@ -9833,9 +9922,9 @@ fn extract_sse_event_observation(event: &[u8]) -> Option<ResponseObservation> {
 fn extract_sse_data(event: &[u8]) -> Option<String> {
     let event = event.strip_prefix(b"\xef\xbb\xbf").unwrap_or(event);
     let text = String::from_utf8_lossy(event);
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut data = String::new();
-    for line in text.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for line in normalized.lines() {
         if let Some(value) = line.strip_prefix("data:") {
             if !data.is_empty() {
                 data.push('\n');
@@ -9996,6 +10085,12 @@ async fn response_from_upstream(
 ) -> Response<Body> {
     let status = upstream.status();
     let mut builder = Response::builder().status(status);
+    if config.chisei_grpc_target.is_some() {
+        builder = builder.header(
+            &X_CHISEI_RECEIPT_ID,
+            gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt),
+        );
+    }
     let response_headers = upstream.headers().clone();
     for (name, value) in upstream.headers().iter() {
         if should_forward_response_header(name) {
@@ -10067,12 +10162,21 @@ async fn response_from_upstream(
                         let validated_responses_bytes = match responses_validator.as_mut() {
                             Some(validator) => match validator.push(&bytes) {
                                 Ok(validated) => Some(Bytes::from(validated)),
-                                Err(reason) => {
+                                Err(error) => {
                                     usage_tap.push(&bytes);
-                                    stream_error = Some(reason.clone());
-                                    if !terminal_was_forwarded && !client_gone {
+                                    stream_error = Some(error.reason.clone());
+                                    if !client_gone
+                                        && !error.validated.is_empty()
+                                        && tx.send(Ok(Bytes::from(error.validated))).await.is_err()
+                                    {
+                                        client_gone = true;
+                                    }
+                                    if !terminal_was_forwarded
+                                        && !validator.terminal_seen
+                                        && !client_gone
+                                    {
                                         let interruption = interrupted_responses_event(
-                                            &reason,
+                                            &error.reason,
                                             usage_tap.usage.as_ref(),
                                         );
                                         interruption_forwarded =
@@ -10152,9 +10256,12 @@ async fn response_from_upstream(
                 }
             }
             let (usage, observation, terminal, tap_mode) = usage_tap.finish_with_terminal();
-            let missing_responses_terminal =
-                context.responses_profile && tap_mode != SseTapMode::Raw && terminal.is_none();
-            if missing_responses_terminal && !client_gone && !interruption_forwarded {
+            let missing_responses_terminal = context.responses_profile && terminal.is_none();
+            if missing_responses_terminal
+                && tap_mode != SseTapMode::Raw
+                && !client_gone
+                && !interruption_forwarded
+            {
                 let terminal_event = interrupted_responses_event(
                     stream_error
                         .as_deref()
@@ -10163,73 +10270,41 @@ async fn response_from_upstream(
                 );
                 let _ = tx.send(Ok(terminal_event)).await;
             }
-            let rejection = match &terminal {
-                Some(ResponsesTerminal::Failed | ResponsesTerminal::Cancelled) => None,
-                Some(ResponsesTerminal::Interrupted) => Some(GatewayRejection {
-                    status: StatusCode::BAD_GATEWAY,
-                    error_type: "upstream_unavailable".into(),
-                    reason: "upstream reported chisei.response.interrupted".into(),
-                    rejected_route: None,
-                    retry_safety: Some("ambiguous"),
-                }),
-                Some(ResponsesTerminal::Completed) => None,
-                Some(ResponsesTerminal::Incomplete(_)) => None,
-                Some(ResponsesTerminal::Invalid) => Some(GatewayRejection {
-                    status: StatusCode::BAD_GATEWAY,
-                    error_type: "upstream_invalid_response".into(),
-                    reason: "upstream emitted data after a terminal event".into(),
-                    rejected_route: None,
-                    retry_safety: Some("ambiguous"),
-                }),
-                None if aborted || missing_responses_terminal => Some(GatewayRejection {
-                    status: StatusCode::BAD_GATEWAY,
-                    error_type: "upstream_stream_error".into(),
-                    reason: stream_error
+            let outcome = match terminal {
+                Some(ResponsesTerminal::Incomplete(reason)) => {
+                    GatewayUsageOutcome::Incomplete(status, reason)
+                }
+                Some(ResponsesTerminal::Failed) => {
+                    GatewayUsageOutcome::TerminalFailure(status, "response_failed".into())
+                }
+                Some(ResponsesTerminal::Cancelled) => {
+                    GatewayUsageOutcome::TerminalFailure(status, "response_cancelled".into())
+                }
+                Some(ResponsesTerminal::Interrupted) => GatewayUsageOutcome::Interrupted(
+                    status,
+                    "upstream reported chisei.response.interrupted".into(),
+                ),
+                Some(ResponsesTerminal::Invalid) => GatewayUsageOutcome::Interrupted(
+                    status,
+                    "upstream emitted invalid terminal events".into(),
+                ),
+                None if aborted || missing_responses_terminal => GatewayUsageOutcome::Interrupted(
+                    status,
+                    stream_error
                         .unwrap_or_else(|| "upstream stream ended without a terminal event".into()),
-                    rejected_route: None,
-                    retry_safety: Some("ambiguous"),
-                }),
-                None => None,
+                ),
+                _ => GatewayUsageOutcome::Success(status),
             };
-            if let Some(rejection) = rejection {
-                record_usage_and_append(
-                    &config,
-                    &runtime,
-                    &identity,
-                    usage,
-                    observation,
-                    &context,
-                    GatewayUsageOutcome::AccountingOnly(rejection.status),
-                )
-                .await;
-                record_refusal_with_usage_and_append(
-                    &config, &identity, &context, &rejection, usage, true,
-                )
-                .await;
-            } else {
-                let outcome = match terminal {
-                    Some(ResponsesTerminal::Incomplete(reason)) => {
-                        GatewayUsageOutcome::Incomplete(status, reason)
-                    }
-                    Some(ResponsesTerminal::Failed) => {
-                        GatewayUsageOutcome::TerminalFailure(status, "response_failed".into())
-                    }
-                    Some(ResponsesTerminal::Cancelled) => {
-                        GatewayUsageOutcome::TerminalFailure(status, "response_cancelled".into())
-                    }
-                    _ => GatewayUsageOutcome::Success(status),
-                };
-                record_usage_and_append(
-                    &config,
-                    &runtime,
-                    &identity,
-                    usage,
-                    observation,
-                    &context,
-                    outcome,
-                )
-                .await;
-            }
+            record_usage_and_append(
+                &config,
+                &runtime,
+                &identity,
+                usage,
+                observation,
+                &context,
+                outcome,
+            )
+            .await;
         });
         let stream = ReceiverStream::new(rx);
         return builder
@@ -10671,6 +10746,10 @@ mod tests {
             scoped_operation_id(&correlation.operation_id, "caller-a").unwrap(),
             correlation.operation_id
         );
+        assert_ne!(
+            gateway_attempt_receipt_id("operation-1", "request-1", 1),
+            gateway_attempt_receipt_id("operation-1", "request-2", 1)
+        );
     }
 
     #[tokio::test]
@@ -10921,6 +11000,54 @@ mod tests {
             Some(ResponsesTerminal::Incomplete("response_incomplete".into()))
         );
         let mut tap = SseUsageTap::new();
+        tap.push(b"\xef\xbb\xbfevent: response.completed\n\n");
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.incomplete\ndata: {\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n");
+        assert_eq!(
+            tap.terminal(),
+            Some(ResponsesTerminal::Incomplete("max_output_tokens".into()))
+        );
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.output_text.delta\nevent: response.completed\ndata: {\"response\":{}}\n\n");
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.completed\nevent: response.output_text.delta\ndata: {\"type\":\"response.completed\"}\n\n");
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.completed\nevent:\ndata: {\"type\":\"response.completed\"}\n\n");
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"\xef\xbb\xbfevent: response.output_text.delta\ndata: {\"type\":\"response.completed\"}\n\n");
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event\ndata: {\"type\":\"response.incomplete\"}\n\n");
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.incomplete\"}\n\n",
+        );
+        assert_eq!(tap.terminal(), None);
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.incomplete\ndata: {\"type\":\"response.output_text.delta\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n");
+        assert_eq!(
+            tap.terminal(),
+            Some(ResponsesTerminal::Incomplete("max_output_tokens".into()))
+        );
+        let mut tap = SseUsageTap::new();
+        tap.push(b"id\rdata: {\"type\":\"response.completed\"}\r\r");
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        for separator in [b"\n\r".as_slice(), b"\n\r\n", b"\r\n\r"] {
+            let mut stream =
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}".to_vec();
+            stream.extend_from_slice(separator);
+            stream.extend_from_slice(b"data: {\"type\":\"response.completed\"}");
+            stream.extend_from_slice(separator);
+            let mut tap = SseUsageTap::new();
+            tap.push(&stream);
+            assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        }
+        let mut tap = SseUsageTap::new();
         tap.push(
             b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
         );
@@ -10946,6 +11073,21 @@ mod tests {
         assert_eq!(terminal, None);
         assert_eq!(usage.unwrap().total_tokens, 3);
 
+        for (status, expected) in [
+            (
+                "incomplete",
+                ResponsesTerminal::Incomplete("response_incomplete".into()),
+            ),
+            ("failed", ResponsesTerminal::Failed),
+            ("cancelled", ResponsesTerminal::Cancelled),
+        ] {
+            let mut tap = SseUsageTap::new();
+            tap.push(format!(r#"{{"status":"{status}"}}"#).as_bytes());
+            let (_, _, terminal, mode) = tap.finish_with_terminal();
+            assert_eq!(mode, SseTapMode::Raw);
+            assert_eq!(terminal, Some(expected));
+        }
+
         let mut tap = SseUsageTap::new();
         tap.push(b"   ");
         let (_, _, terminal, mode) = tap.finish_with_terminal();
@@ -10969,6 +11111,13 @@ mod tests {
 
         let mut validator = ResponsesStreamValidator::default();
         assert!(validator.push(b"data: {not-json}\n\n").is_err());
+        let mut validator = ResponsesStreamValidator::default();
+        let valid = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"kept\"}\n\n";
+        let mut mixed = valid.to_vec();
+        mixed.extend_from_slice(b"data: {not-json}\n\n");
+        let error = validator.push(&mixed).unwrap_err();
+        assert_eq!(error.validated, valid);
+        assert!(error.reason.contains("invalid JSON"));
         let mut validator = ResponsesStreamValidator::default();
         let bare_cr = b"data: {\"type\":\"response.completed\"}\r\r";
         assert_eq!(validator.push(bare_cr).unwrap(), bare_cr);
@@ -17035,6 +17184,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(&X_CHISEI_RECEIPT_ID));
         assert_eq!(resp.text().await.unwrap(), upstream_body);
 
         let rows = wait_for_llm_calls(&db, 1).await;
@@ -17042,6 +17192,10 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("8"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("6"));
         assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("14"));
+        assert_eq!(
+            rows[0].get("terminal_outcome").map(String::as_str),
+            Some("interrupted")
+        );
     }
 
     #[test]
