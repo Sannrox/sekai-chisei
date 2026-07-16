@@ -2,5 +2,4 @@ event: response.created
 data: {"type":"response.created","response":{"id":"resp_interrupted"}}
 
 event: chisei.response.interrupted
-data: {"type":"chisei.response.interrupted","response":{"id":"resp_interrupted","status":"incomplete"},"error":{"code":"upstream_timeout"}}
-
+data: {"type":"chisei.response.interrupted","response":{"id":"resp_interrupted","status":"interrupted"},"error":{"code":"upstream_timeout"}}

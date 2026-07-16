@@ -1303,6 +1303,40 @@ impl ProviderRegistry {
             && self.model_or_provider_is_disabled(&format!("{wire_provider}/{requested}"))
     }
 
+    pub fn model_or_provider_is_unavailable_for_provider(
+        &self,
+        requested: &str,
+        wire_provider: &str,
+    ) -> bool {
+        if validate_model_identifier(requested).is_err() {
+            return false;
+        }
+        let canary_admitted = REQUEST_CANARY_ADMISSION
+            .try_with(|allowed| *allowed)
+            .unwrap_or(false);
+        let unavailable = |state: &str| {
+            matches!(state, "disabled" | "experimental") || (state == "canary" && !canary_admitted)
+        };
+        let check = |model: &str| {
+            let Ok((provider, upstream_model)) = resolve_provider_model(model) else {
+                return false;
+            };
+            if self
+                .effective_profile(provider)
+                .is_some_and(|profile| unavailable(&profile.lifecycle))
+            {
+                return true;
+            }
+            let canonical_model = format!("{provider}/{upstream_model}");
+            self.latest_lifecycle_override("model", &canonical_model)
+                .is_some_and(|lifecycle| unavailable(&lifecycle.state))
+        };
+        check(requested)
+            || (!requested.contains('/')
+                && self.profile(wire_provider).is_some()
+                && check(&format!("{wire_provider}/{requested}")))
+    }
+
     fn validate_lifecycle_target(&self, target_kind: &str, target: &str) -> Result<(), String> {
         let valid = match target_kind {
             "provider" => self.profile(target).is_some(),
@@ -2405,6 +2439,31 @@ mod tests {
                 .resolve_model_for_provider("claude-sonnet-4", "openai")
                 .unwrap_err()
                 .contains("disabled")
+        );
+    }
+
+    #[test]
+    fn unavailable_lifecycle_classification_includes_gated_states() {
+        for state in ["disabled", "experimental", "canary"] {
+            let mut registry = ProviderRegistry::built_in();
+            registry.state_version = 1;
+            registry
+                .lifecycle_overrides
+                .push(RegistryLifecycleOverride {
+                    target_kind: "provider".into(),
+                    target: "openai".into(),
+                    state: state.into(),
+                    version: 1,
+                    actor: "operator".into(),
+                    reason: "test".into(),
+                    changed_at: "2026-07-14T00:00:00Z".into(),
+                });
+            assert!(registry.model_or_provider_is_unavailable_for_provider("gpt-5.5", "openai"));
+        }
+
+        let registry = ProviderRegistry::built_in();
+        assert!(
+            !registry.model_or_provider_is_unavailable_for_provider("meta/bad model", "openai")
         );
     }
 

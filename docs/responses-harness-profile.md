@@ -44,6 +44,22 @@ gateway identity. The gateway returns their canonical `chisei:<scope>:<id>` form
 clients reuse that returned value on later calls. An identifier from another caller
 scope is rejected rather than attached to receipt lineage.
 
+Before dispatch, the host supplies an opaque `x-chisei-request-id` unique within
+its authenticated gateway identity for each attempt. The gateway echoes that
+identifier unchanged and indexes the attempt receipt by the full caller scope plus
+the opaque alias. Because the host knows the request identifier before any
+response headers arrive, it can use `GetOperationReceipt(request_id=...)` to
+reconcile a disconnect without collapsing separate attempts into one receipt. The
+capability-discovery response exposes the stable `x-chisei-caller-scope`; the host
+passes that value as `caller_scope` when aliases may be reused across identities.
+Opaque aliases cannot begin with the reserved canonical `chisei:` namespace.
+Opaque-alias reconciliation is available through the local/root administrative
+inspection boundary; ordinary principals use canonical receipt or operation IDs.
+Logical operation lookup accepts `attempt` when retries produced multiple receipts.
+If the request-ID header is omitted, Chisei generates an identifier, but that form
+cannot reconcile a connection lost before headers and is intended only for callers
+that accept that limitation.
+
 Authenticated clients discover the versioned provider matrix with
 `GET /v1/chisei/capabilities`. Chisei derives required streaming, tool,
 parallel-tool, structured-output, reasoning, modality, continuation, and built-in

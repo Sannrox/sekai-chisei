@@ -7,7 +7,7 @@ use std::collections::HashMap;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl receipt <operation-id> [--json]"
+    "sekaictl receipt <id> [--request-id] [--scope <caller-scope>] [--attempt <number>] [--json]"
 }
 
 fn target() -> String {
@@ -17,14 +17,37 @@ fn target() -> String {
 }
 
 pub async fn run_receipt_command(args: Vec<String>) -> Result<(), BoxErr> {
-    let operation_id = args
+    let id = args
         .first()
         .filter(|value| !value.starts_with('-'))
         .ok_or_else(|| std::io::Error::other(usage()))?;
     let mut client = ChiseiServiceClient::new(connect_sekai(&target()).await?);
+    let by_request_id = args.iter().any(|arg| arg == "--request-id");
+    let caller_scope = args
+        .windows(2)
+        .find(|pair| pair[0] == "--scope")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_default();
+    let attempt = args
+        .windows(2)
+        .find(|pair| pair[0] == "--attempt")
+        .map(|pair| pair[1].parse::<u32>())
+        .transpose()?
+        .unwrap_or_default();
     let response = client
         .get_operation_receipt(GetOperationReceiptRequest {
-            operation_id: operation_id.clone(),
+            operation_id: if by_request_id {
+                String::new()
+            } else {
+                id.clone()
+            },
+            request_id: if by_request_id {
+                id.clone()
+            } else {
+                String::new()
+            },
+            caller_scope,
+            attempt,
         })
         .await?
         .into_inner();
