@@ -15,6 +15,7 @@ pub mod harness;
 pub mod launch;
 pub mod llm;
 pub mod obs;
+pub mod onboarding;
 pub mod provenance;
 pub mod provider_profile;
 pub mod receipt_cli;
