@@ -37,6 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "report" => {
             sekai_chisei::report_cli::run_report_command(args.into_iter().skip(1).collect()).await
         }
+        "memory" => {
+            sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
+        }
         "estimate" => {
             sekai_chisei::launch::load_local_env();
             let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
@@ -227,7 +230,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -255,6 +258,10 @@ fn print_root_usage() {
     println!(
         "\nOperation report:\n  {}",
         sekai_chisei::report_cli::usage()
+    );
+    println!(
+        "\nMemory commands:\n  {}",
+        sekai_chisei::memory_cli::usage()
     );
 }
 

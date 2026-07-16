@@ -712,6 +712,16 @@ message KiokuCandidateRecord {
   uint32 contradicting_evidence = 6;
 }
 message ListKiokuCandidatesResponse { repeated KiokuCandidateRecord candidates = 1; }
+message ReviewKiokuMemoryRequest {
+  string memory_id = 1;
+  uint32 memory_version = 2;
+  string action = 3;
+  string rationale = 4;
+}
+message ReviewKiokuMemoryResponse {
+  string memory_json = 1;
+  repeated string lifecycle_events_json = 2;
+}
 
 // --- Service ---
 
@@ -750,6 +760,7 @@ service ChiseiService {
   rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
+  rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
   rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 
