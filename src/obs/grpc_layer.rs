@@ -271,6 +271,10 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "PlanExecution"
                 | "ExecutePlan"
                 | "ExecutePlanStream"
+                | "ReportOperationEvent"
+                | "AuthorizeOperationReporter"
+                | "GetOperationReceipt"
+                | "ReserveGatewayRequestAlias"
                 | "GetAffinity"
                 | "CreateEvalSuite"
                 | "ListEvalSuites"
@@ -355,5 +359,25 @@ fn record_rpc(grpc_service: &str, grpc_method: &str, grpc_code: &str, elapsed: D
             grpc_service,
             grpc_method, grpc_code, elapsed_ms, "gRPC request completed"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_grpc_path;
+
+    #[test]
+    fn recognizes_operation_receipt_rpc_paths() {
+        for method in [
+            "ReportOperationEvent",
+            "AuthorizeOperationReporter",
+            "GetOperationReceipt",
+            "ReserveGatewayRequestAlias",
+        ] {
+            assert_eq!(
+                parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
+                ("chisei.ChiseiService".into(), method.into())
+            );
+        }
     }
 }

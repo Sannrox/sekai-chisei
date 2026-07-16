@@ -590,7 +590,23 @@ message AuthorizeOperationReporterResponse {
   bool changed = 2;
 }
 
-message GetOperationReceiptRequest { string operation_id = 1; }
+message GetOperationReceiptRequest {
+  string operation_id = 1;
+  string request_id = 2;
+  string caller_scope = 3;
+  uint32 attempt = 4;
+}
+
+message ReserveGatewayRequestAliasRequest {
+  string caller_scope = 1;
+  string request_alias = 2;
+  string request_id = 3;
+  string operation_id = 4;
+}
+
+message ReserveGatewayRequestAliasResponse {
+  bool reserved = 1;
+}
 message GetOperationReceiptResponse {
   string receipt_json = 1;
   bool complete = 2;
@@ -700,6 +716,7 @@ service ChiseiService {
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc AuthorizeOperationReporter(AuthorizeOperationReporterRequest) returns (AuthorizeOperationReporterResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
+  rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
 
   // Affinity
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);

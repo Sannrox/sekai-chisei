@@ -69,14 +69,178 @@ impl SekaiDb {
             CREATE INDEX IF NOT EXISTS idx_chisei_sample_observations_scored ON chisei_sample_observations(scored, timestamp);
             CREATE TABLE IF NOT EXISTS chisei_operation_receipts (
                 operation_id TEXT PRIMARY KEY,
+                request_id TEXT,
+                lookup_request_id TEXT,
+                initiating_actor TEXT,
+                caller_scope TEXT,
+                alias_retired INTEGER NOT NULL DEFAULT 0,
                 namespace TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chisei_operation_receipts_namespace
-                ON chisei_operation_receipts(namespace, updated_at);",
+                ON chisei_operation_receipts(namespace, updated_at);
+            CREATE TABLE IF NOT EXISTS chisei_gateway_request_aliases (
+                caller_scope TEXT NOT NULL,
+                request_alias TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                reserved_at INTEGER NOT NULL,
+                PRIMARY KEY(caller_scope, request_alias)
+            );",
         )
         .map_err(|e| e.to_string())?;
+        match conn.execute(
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN request_id TEXT",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") => {}
+            Err(err) => return Err(err.to_string()),
+        }
+        for statement in [
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN lookup_request_id TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN initiating_actor TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN caller_scope TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN alias_retired INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match conn.execute(statement, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        conn.execute_batch(
+            r#"WITH candidates AS (
+               SELECT receipts.operation_id,
+                      json_extract(
+                        CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                        '$.attributes.request_id'
+                      ) AS request_id
+               FROM chisei_operation_receipts AS receipts,
+                    json_each(
+                      CASE WHEN json_valid(receipts.receipt_json)
+                           THEN receipts.receipt_json
+                           ELSE '{"events":[]}' END,
+                      '$.events'
+                    ) AS events
+               WHERE json_extract(
+                       CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                       '$.kind'
+                     )='intent_recorded'
+                 AND json_type(
+                       CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                       '$.attributes.request_id'
+                     )='text'
+             ), unique_candidates AS (
+               SELECT operation_id, request_id
+               FROM candidates
+               WHERE request_id IS NOT NULL AND request_id != ''
+                 AND request_id IN (
+                   SELECT request_id FROM candidates GROUP BY request_id HAVING COUNT(*)=1
+                 )
+             )
+             UPDATE chisei_operation_receipts
+             SET request_id=(
+               SELECT request_id FROM unique_candidates
+               WHERE unique_candidates.operation_id=chisei_operation_receipts.operation_id
+             )
+             WHERE request_id IS NULL
+               AND operation_id IN (SELECT operation_id FROM unique_candidates);
+             DROP INDEX IF EXISTS idx_chisei_operation_receipts_lookup;
+             WITH ranked_aliases AS (
+               SELECT operation_id,
+                      row_number() OVER (
+                        PARTITION BY
+                          COALESCE(
+                            caller_scope,
+                            substr(request_id, 8, instr(substr(request_id, 8), ':') - 1)
+                          ),
+                          lookup_request_id
+                        ORDER BY (caller_scope IS NOT NULL) DESC,
+                                 updated_at DESC,
+                                 operation_id DESC
+                      ) AS alias_rank
+               FROM chisei_operation_receipts
+               WHERE lookup_request_id IS NOT NULL
+                 AND (
+                   caller_scope IS NOT NULL
+                   OR (request_id LIKE 'chisei:%:%' AND instr(substr(request_id, 8), ':') > 1)
+                 )
+             )
+             UPDATE chisei_operation_receipts
+             SET lookup_request_id=NULL, alias_retired=1
+             WHERE operation_id IN (
+               SELECT operation_id FROM ranked_aliases WHERE alias_rank > 1
+             );
+             UPDATE chisei_operation_receipts
+             SET alias_retired=1
+             WHERE lookup_request_id IS NULL
+               AND alias_retired=0
+               AND EXISTS (
+                 SELECT 1
+                 FROM json_each(
+                   CASE WHEN json_valid(chisei_operation_receipts.receipt_json)
+                        THEN chisei_operation_receipts.receipt_json
+                        ELSE '{"events":[]}' END,
+                   '$.events'
+                 ) AS events
+                 WHERE json_extract(
+                         CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                         '$.kind'
+                       )='intent_recorded'
+                   AND json_type(
+                         CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                         '$.attributes.lookup_request_id'
+                       )='text'
+                   AND COALESCE(
+                         json_extract(
+                           CASE WHEN events.type='object' THEN events.value ELSE '{}' END,
+                           '$.attributes.lookup_request_id'
+                         ),
+                         ''
+                       ) != ''
+               );
+             UPDATE chisei_operation_receipts
+             SET caller_scope=substr(request_id, 8, instr(substr(request_id, 8), ':') - 1)
+             WHERE caller_scope IS NULL
+               AND lookup_request_id IS NOT NULL
+               AND request_id LIKE 'chisei:%:%'
+               AND instr(substr(request_id, 8), ':') > 1;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_request
+               ON chisei_operation_receipts(request_id) WHERE request_id IS NOT NULL;
+             CREATE UNIQUE INDEX idx_chisei_operation_receipts_lookup
+               ON chisei_operation_receipts(caller_scope, lookup_request_id)
+               WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;
+             INSERT OR IGNORE INTO chisei_gateway_request_aliases(
+               caller_scope, request_alias, request_id, operation_id, reserved_at
+             )
+             SELECT caller_scope,
+                    COALESCE(
+                      lookup_request_id,
+                      (SELECT json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id')
+                       FROM json_each(CASE WHEN json_valid(receipt_json) THEN receipt_json ELSE '{"events":[]}' END, '$.events') AS events
+                       WHERE json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.kind')='intent_recorded'
+                         AND json_type(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id')='text'
+                         AND json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id') != ''
+                       LIMIT 1)
+                    ),
+                    COALESCE(request_id, operation_id), operation_id, updated_at
+             FROM chisei_operation_receipts
+             WHERE caller_scope IS NOT NULL
+               AND COALESCE(
+                     lookup_request_id,
+                     (SELECT json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id')
+                      FROM json_each(CASE WHEN json_valid(receipt_json) THEN receipt_json ELSE '{"events":[]}' END, '$.events') AS events
+                      WHERE json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.kind')='intent_recorded'
+                        AND json_type(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id')='text'
+                        AND json_extract(CASE WHEN events.type='object' THEN events.value ELSE '{}' END, '$.attributes.lookup_request_id') != ''
+                      LIMIT 1)
+                   ) IS NOT NULL;"#,
+        )
+        .map_err(|error| error.to_string())?;
         match conn.execute(
             "ALTER TABLE chisei_eval_iterations ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
             [],
@@ -215,16 +379,45 @@ impl SekaiDb {
 
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let request_id = receipt.events.iter().find_map(|event| {
+            (event.kind == ReceiptEventKind::IntentRecorded)
+                .then(|| event.attributes.get("request_id"))
+                .flatten()
+                .filter(|request_id| !request_id.is_empty())
+        });
+        let lookup_request_id = receipt.events.iter().find_map(|event| {
+            (event.kind == ReceiptEventKind::IntentRecorded)
+                .then(|| event.attributes.get("lookup_request_id"))
+                .flatten()
+                .filter(|request_id| !request_id.is_empty())
+        });
+        let caller_scope = receipt.events.iter().find_map(|event| {
+            (event.kind == ReceiptEventKind::IntentRecorded)
+                .then(|| event.attributes.get("caller_scope"))
+                .flatten()
+                .filter(|scope| !scope.is_empty())
+        });
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO chisei_operation_receipts(operation_id, namespace, receipt_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO chisei_operation_receipts(operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, namespace, receipt_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(operation_id) DO UPDATE SET
+                request_id=excluded.request_id,
+                lookup_request_id=CASE
+                  WHEN chisei_operation_receipts.alias_retired=1 THEN NULL
+                  ELSE excluded.lookup_request_id
+                END,
+                initiating_actor=excluded.initiating_actor,
+                caller_scope=COALESCE(excluded.caller_scope, chisei_operation_receipts.caller_scope),
                 namespace=excluded.namespace,
                 receipt_json=excluded.receipt_json,
                 updated_at=excluded.updated_at",
             params![
                 receipt.operation_id,
+                request_id,
+                lookup_request_id,
+                receipt.initiating_actor,
+                caller_scope,
                 receipt.namespace,
                 receipt_json,
                 chrono::Utc::now().timestamp_millis()
@@ -248,6 +441,128 @@ impl SekaiDb {
             .optional()
             .map_err(|error| error.to_string())?;
         receipt_json
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn reserve_gateway_request_alias(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let receipt_exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM chisei_operation_receipts
+                   WHERE caller_scope=?1 AND lookup_request_id=?2
+                 )",
+                params![caller_scope, request_alias],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if receipt_exists {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        let reserved = transaction.execute(
+            "INSERT OR IGNORE INTO chisei_gateway_request_aliases(caller_scope, request_alias, request_id, operation_id, reserved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                caller_scope,
+                request_alias,
+                request_id,
+                operation_id,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .map_err(|error| error.to_string())? == 1;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(reserved)
+    }
+
+    pub fn find_gateway_receipt_by_logical_operation_id(
+        &self,
+        operation_id: &str,
+        attempt: Option<u32>,
+    ) -> Result<Option<OperationReceipt>, String> {
+        let conn = self.conn();
+        let attempt = attempt.map(|attempt| attempt.to_string());
+        let mut statement = conn
+            .prepare(
+                "SELECT receipt_json FROM chisei_operation_receipts
+                 WHERE instr(operation_id, ?1 || ':__attempt__:')=1
+                   AND (?2 IS NULL OR operation_id LIKE '%:' || ?2)
+                 ORDER BY updated_at DESC, operation_id DESC LIMIT 2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![operation_id, attempt], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if rows.len() > 1 {
+            return Err("logical operation id matches multiple receipt attempts".into());
+        }
+        rows.into_iter()
+            .next()
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn find_operation_receipt_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<OperationReceipt>, String> {
+        let conn = self.conn();
+        let receipt_json = conn
+            .query_row(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE request_id=?1",
+                params![request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        receipt_json
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub fn find_operation_receipt_by_lookup_request_id(
+        &self,
+        request_id: &str,
+        caller_scope: Option<&str>,
+        initiating_actor: Option<&str>,
+    ) -> Result<Option<OperationReceipt>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT receipt_json FROM chisei_operation_receipts
+                 WHERE lookup_request_id=?1
+                   AND (?2 IS NULL OR caller_scope=?2)
+                   AND (?3 IS NULL OR initiating_actor=?3)
+                 ORDER BY operation_id LIMIT 2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![request_id, caller_scope, initiating_actor], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if rows.len() > 1 {
+            return Err("request id matches multiple operation receipts".into());
+        }
+        rows.into_iter()
+            .next()
             .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
             .transpose()
     }
@@ -1027,8 +1342,151 @@ fn is_legacy_case_namespace_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_request_aliases_are_reserved_once_per_scope() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        assert!(
+            db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-1", "operation-1")
+                .unwrap()
+        );
+        assert!(
+            !db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-2", "operation-2")
+                .unwrap()
+        );
+        assert!(
+            db.reserve_gateway_request_alias("scope-b", "opaque-1", "request-3", "operation-3")
+                .unwrap()
+        );
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts(operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, namespace, receipt_json, updated_at)
+                 VALUES ('legacy-op', 'legacy-request', 'legacy-alias', 'gateway', 'scope-a', 'default', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.reserve_gateway_request_alias(
+                "scope-a",
+                "legacy-alias",
+                "new-request",
+                "new-operation"
+            )
+            .unwrap()
+        );
+    }
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn receipt_request_backfill_ignores_malformed_legacy_rows() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts
+                 (operation_id, request_id, namespace, receipt_json, updated_at)
+                 VALUES ('damaged', NULL, 'test', '{invalid', 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts
+                 (operation_id, request_id, namespace, receipt_json, updated_at)
+                 VALUES ('damaged-events', NULL, 'test', '{\"events\":[\"broken\"]}', 2)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_chisei().unwrap();
+        assert!(
+            db.find_operation_receipt_by_request_id("missing")
+                .unwrap()
+                .is_none()
+        );
+
+        db.conn()
+            .execute_batch(
+                "DROP INDEX idx_chisei_operation_receipts_lookup;
+                 INSERT INTO chisei_operation_receipts
+                   (operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, namespace, receipt_json, updated_at)
+                 VALUES
+                   ('legacy-alias', 'chisei:scope-a:legacy', 'shared-alias', 'agent:test', NULL, 'test', '{}', 3),
+                   ('current-alias', 'chisei:scope-a:current', 'shared-alias', 'agent:test', 'scope-a', 'test', '{}', 2);
+                 CREATE UNIQUE INDEX idx_chisei_operation_receipts_lookup
+                   ON chisei_operation_receipts(caller_scope, lookup_request_id)
+                   WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;",
+            )
+            .unwrap();
+        db.migrate_chisei().unwrap();
+        let aliases: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM chisei_operation_receipts WHERE lookup_request_id='shared-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aliases, 1);
+        let owner: String = db
+            .conn()
+            .query_row(
+                "SELECT operation_id FROM chisei_operation_receipts WHERE lookup_request_id='shared-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "current-alias");
+        let retired: i64 = db
+            .conn()
+            .query_row(
+                "SELECT alias_retired FROM chisei_operation_receipts WHERE operation_id='legacy-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 1);
+
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts
+                 (operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, alias_retired, namespace, receipt_json, updated_at)
+                 VALUES ('damaged-alias', 'chisei:scope-a:damaged', NULL, 'agent:test', 'scope-a', 0, 'test',
+                         '{\"events\":[{\"kind\":\"intent_recorded\",\"attributes\":{\"lookup_request_id\":{}}}]}', 4)",
+                [],
+            )
+            .unwrap();
+        db.migrate_chisei().unwrap();
+        let retired: i64 = db
+            .conn()
+            .query_row(
+                "SELECT alias_retired FROM chisei_operation_receipts WHERE operation_id='damaged-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 0);
+
+        db.conn()
+            .execute(
+                "UPDATE chisei_operation_receipts
+                 SET alias_retired=0,
+                     receipt_json='{\"events\":[{\"kind\":\"intent_recorded\",\"attributes\":{\"lookup_request_id\":\"shared-alias\"}}]}'
+                 WHERE operation_id='legacy-alias'",
+                [],
+            )
+            .unwrap();
+        db.migrate_chisei().unwrap();
+        let retired: i64 = db
+            .conn()
+            .query_row(
+                "SELECT alias_retired FROM chisei_operation_receipts WHERE operation_id='legacy-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 1);
+    }
 
     #[test]
     fn eval_writers_wait_for_active_transactions_and_preserve_outcomes() {

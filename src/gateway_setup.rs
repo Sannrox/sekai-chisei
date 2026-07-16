@@ -894,12 +894,16 @@ async fn ensure_llm_calls_dataset(
             if err.code() == tonic::Code::InvalidArgument
                 && err.message().contains("UNIQUE constraint failed") =>
         {
-            sekai
+            match sekai
                 .update_dataset(gateway_request(UpdateDatasetRequest {
                     dataset: Some(dataset),
                 }))
                 .await
-                .map(|_| ())
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.code() == tonic::Code::Unimplemented => Ok(()),
+                Err(error) => Err(error),
+            }
         }
         Err(err) => Err(err),
     }

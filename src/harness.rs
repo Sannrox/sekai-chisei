@@ -46,6 +46,12 @@ pub struct ToolCallAssembly {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedOutputItem {
+    pub output_index: u64,
+    pub item: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingToolArguments {
     output_index: u64,
     arguments: String,
@@ -62,12 +68,13 @@ pub struct NormalizedUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamAssembly {
     pub text: String,
+    pub output_items: Vec<CompletedOutputItem>,
     pub tool_calls: Vec<ToolCallAssembly>,
     pub terminal: Option<String>,
     pub usage: Option<NormalizedUsage>,
     pending_tool_arguments: BTreeMap<String, PendingToolArguments>,
     completed_item_ids: BTreeSet<String>,
-    output_items: BTreeMap<String, u64>,
+    output_identities: BTreeMap<String, u64>,
     output_indexes: BTreeMap<u64, String>,
     output_kinds: BTreeMap<String, String>,
 }
@@ -76,12 +83,13 @@ impl StreamAssembly {
     pub fn from_events(events: &[HarnessEvent]) -> Result<Self, String> {
         let mut assembly = Self {
             text: String::new(),
+            output_items: Vec::new(),
             tool_calls: Vec::new(),
             terminal: None,
             usage: None,
             pending_tool_arguments: BTreeMap::new(),
             completed_item_ids: BTreeSet::new(),
-            output_items: BTreeMap::new(),
+            output_identities: BTreeMap::new(),
             output_indexes: BTreeMap::new(),
             output_kinds: BTreeMap::new(),
         };
@@ -169,6 +177,11 @@ impl StreamAssembly {
                 if self.completed_item_ids.contains(item_id) {
                     return Err(format!("duplicate completion for output item {item_id}"));
                 }
+                self.output_items.push(CompletedOutputItem {
+                    output_index,
+                    item: item.clone(),
+                });
+                self.output_items.sort_by_key(|item| item.output_index);
                 if item.get("type").and_then(|value| value.as_str()) == Some("function_call") {
                     let call_id = required_str(item, "call_id")?;
                     let name = required_str(item, "name")?;
@@ -228,13 +241,14 @@ impl StreamAssembly {
             | "response.failed"
             | "response.cancelled"
             | "chisei.response.interrupted" => {
+                validate_terminal_metadata(event)?;
                 if event.event == "response.completed" {
-                    let unfinished_function_call =
-                        self.output_kinds.iter().any(|(item_id, kind)| {
-                            kind == "function_call" && !self.completed_item_ids.contains(item_id)
-                        });
-                    if !self.pending_tool_arguments.is_empty() || unfinished_function_call {
-                        return Err("terminal event arrived with an incomplete tool call".into());
+                    let unfinished_output = self
+                        .output_kinds
+                        .keys()
+                        .any(|item_id| !self.completed_item_ids.contains(item_id));
+                    if !self.pending_tool_arguments.is_empty() || unfinished_output {
+                        return Err("terminal event arrived with an incomplete output item".into());
                     }
                 }
                 self.terminal = Some(event.event.clone());
@@ -252,7 +266,7 @@ impl StreamAssembly {
         item_kind: &str,
     ) -> Result<(), String> {
         if self
-            .output_items
+            .output_identities
             .get(item_id)
             .is_some_and(|existing| *existing != output_index)
         {
@@ -274,12 +288,38 @@ impl StreamAssembly {
         {
             return Err(format!("output item {item_id} changed kind"));
         }
-        self.output_items.insert(item_id.to_owned(), output_index);
+        self.output_identities
+            .insert(item_id.to_owned(), output_index);
         self.output_indexes.insert(output_index, item_id.to_owned());
         self.output_kinds
             .insert(item_id.to_owned(), item_kind.to_owned());
         Ok(())
     }
+}
+
+fn validate_terminal_metadata(event: &HarnessEvent) -> Result<(), String> {
+    let expected_status = match event.event.as_str() {
+        "response.completed" => "completed",
+        "response.incomplete" => "incomplete",
+        "response.failed" => "failed",
+        "response.cancelled" => "cancelled",
+        "chisei.response.interrupted" => "interrupted",
+        _ => return Ok(()),
+    };
+    let data_event = event.data.get("type").and_then(|value| value.as_str());
+    let response_status = event
+        .data
+        .get("response")
+        .and_then(|response| response.get("status"))
+        .or_else(|| event.data.get("status"))
+        .and_then(|value| value.as_str());
+    if data_event.is_some_and(|data_event| data_event != event.event)
+        || response_status.is_some_and(|status| status != expected_status)
+        || (data_event.is_none() && response_status.is_none())
+    {
+        return Err("terminal event has inconsistent response metadata".into());
+    }
+    Ok(())
 }
 
 fn required_str<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
@@ -464,6 +504,7 @@ mod tests {
                 })
                 .count();
             assert_eq!(terminals, 1);
+            StreamAssembly::from_events(&events).unwrap();
         }
     }
 
@@ -477,10 +518,47 @@ mod tests {
         let assembly = StreamAssembly::from_events(&events).unwrap();
         assert_eq!(assembly.terminal.as_deref(), Some("response.completed"));
         assert_eq!(assembly.tool_calls.len(), 2);
+        assert_eq!(assembly.output_items.len(), 2);
+        assert!(
+            assembly
+                .output_items
+                .windows(2)
+                .all(|items| items[0].output_index < items[1].output_index)
+        );
+        assert!(
+            assembly
+                .output_items
+                .iter()
+                .all(|item| item.item["type"] == "function_call")
+        );
         assert!(assembly.tool_calls.iter().all(|call| call.complete));
         assert_eq!(assembly.tool_calls[0].name, "lookup_weather");
         assert_eq!(assembly.tool_calls[1].name, "search_docs");
         assert!(!assembly.usage.unwrap().partial);
+    }
+
+    #[test]
+    fn preserves_non_function_output_items_for_portable_continuation() {
+        let events = [
+            HarnessEvent {
+                event: "response.output_item.done".into(),
+                data: serde_json::json!({
+                    "output_index": 0,
+                    "item": {"id":"reasoning-1","type":"reasoning","summary":[]}
+                }),
+            },
+            HarnessEvent {
+                event: "response.completed".into(),
+                data: serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"status":"completed"}
+                }),
+            },
+        ];
+        let assembly = StreamAssembly::from_events(&events).unwrap();
+        assert_eq!(assembly.output_items.len(), 1);
+        assert_eq!(assembly.output_items[0].output_index, 0);
+        assert_eq!(assembly.output_items[0].item["type"], "reasoning");
     }
 
     #[test]
@@ -513,7 +591,10 @@ mod tests {
             },
             HarnessEvent {
                 event: "response.completed".into(),
-                data: serde_json::json!({"response":{"usage":{"input_tokens":1,"output_tokens":1}}}),
+                data: serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}
+                }),
             },
         ];
         assert!(StreamAssembly::from_events(&incomplete).is_err());
@@ -532,6 +613,29 @@ mod tests {
             },
         ];
         assert!(StreamAssembly::from_events(&added_without_done).is_err());
+
+        let unfinished_message = [
+            HarnessEvent {
+                event: "response.output_item.added".into(),
+                data: serde_json::json!({
+                    "output_index": 0,
+                    "item": {"type":"message", "id":"message_1", "content":[]}
+                }),
+            },
+            HarnessEvent {
+                event: "response.output_text.delta".into(),
+                data: serde_json::json!({
+                    "item_id":"message_1", "output_index":0, "delta":"partial"
+                }),
+            },
+            HarnessEvent {
+                event: "response.completed".into(),
+                data: serde_json::json!({
+                    "type":"response.completed", "response":{"status":"completed"}
+                }),
+            },
+        ];
+        assert!(StreamAssembly::from_events(&unfinished_message).is_err());
 
         let truncated = HarnessEvent {
             event: "response.output_item.done".into(),
@@ -592,7 +696,10 @@ mod tests {
             },
             HarnessEvent {
                 event: "response.completed".into(),
-                data: serde_json::json!({"response":{"usage":{"input_tokens":1,"output_tokens":1}}}),
+                data: serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}
+                }),
             },
         ];
         let assembly = StreamAssembly::from_events(&events).unwrap();
@@ -600,6 +707,15 @@ mod tests {
         assert_eq!(assembly.tool_calls[0].item_id, "item_1");
         assert_eq!(assembly.tool_calls[0].name, "read");
         assert_eq!(assembly.tool_calls[0].output_index, 3);
+
+        let contradictory_terminal = HarnessEvent {
+            event: "response.completed".into(),
+            data: serde_json::json!({
+                "type":"response.failed",
+                "response":{"status":"failed"}
+            }),
+        };
+        assert!(StreamAssembly::from_events(&[contradictory_terminal]).is_err());
 
         let mut late = events.to_vec();
         late.insert(
