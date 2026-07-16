@@ -36,7 +36,8 @@ Built-in search, code, or MCP tools remain unavailable unless the selected profi
 declares the exact external capability.
 
 The discovery document also carries `registry_version` and versioned `profiles`.
-Each profile publishes its provider and model namespace, lifecycle, protocol
+Each profile publishes its provider and currently accepted model selectors,
+lifecycle, protocol
 surfaces, endpoint configuration source, request and response adaptations, usage
 and error normalization versions, capability limits, pricing-metadata version, and
 governance-metadata status. API-key environment names may be advertised, but
