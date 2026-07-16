@@ -45,6 +45,23 @@ credential values are never part of capability discovery, policy, receipts, or
 correlation metadata. Existing `paths` entries remain the compatibility view of
 the same profile capabilities.
 
+Registry v3 is the model-resolution authority for both the gateway and direct LLM
+execution. Canonical model identifiers are `openai/<model>`,
+`anthropic/<model>`, `ollama/<model>`, and `native/<model>`. Existing unprefixed
+provider aliases remain accepted at the client boundary and are recorded as the
+requested alias, while the canonical identifier and upstream model name are
+resolved before policy or provider contact. Unknown namespaces fail closed.
+
+An operator with the separately configured gateway admin credential may change a
+provider, profile version, model, or capability lifecycle through
+`PUT /_chisei/admin/provider-lifecycle`. Changes require a non-empty reason, are
+versioned, and become effective only after the gateway persists an audit event.
+Disabled provider, profile, and model targets fail during registry resolution;
+disabled capabilities disappear from the effective capability matrix. Discovery
+exposes the current registry state version and lifecycle override history with
+operator-supplied reasons redacted so credentials or incident details cannot
+leak through discovery.
+
 ## Stream contract
 
 SSE frames are ordered as received. Clients assemble text from

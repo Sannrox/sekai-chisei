@@ -425,6 +425,6 @@ mod tests {
         .unwrap()
         .unwrap_err();
 
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 }

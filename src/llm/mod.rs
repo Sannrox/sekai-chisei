@@ -156,6 +156,52 @@ impl ChatStreamChunk {
 
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, String>> + Send>>;
 
+#[derive(Debug)]
+pub enum ProviderError {
+    Precondition(String),
+    Unavailable(String),
+    Upstream(String),
+}
+
+const PRECONDITION_ERROR_PREFIX: &str = "chisei-provider-error:precondition:";
+const UNAVAILABLE_ERROR_PREFIX: &str = "chisei-provider-error:unavailable:";
+
+pub(crate) fn encode_provider_error(error: ProviderError) -> String {
+    match error {
+        ProviderError::Precondition(message) => format!("{PRECONDITION_ERROR_PREFIX}{message}"),
+        ProviderError::Unavailable(message) => format!("{UNAVAILABLE_ERROR_PREFIX}{message}"),
+        ProviderError::Upstream(message) => message,
+    }
+}
+
+pub(crate) fn decode_provider_error(error: String) -> ProviderError {
+    if let Some(message) = error.strip_prefix(PRECONDITION_ERROR_PREFIX) {
+        ProviderError::Precondition(message.to_string())
+    } else if let Some(message) = error.strip_prefix(UNAVAILABLE_ERROR_PREFIX) {
+        ProviderError::Unavailable(message.to_string())
+    } else {
+        ProviderError::Upstream(error)
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Precondition(message) | Self::Unavailable(message) | Self::Upstream(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+impl From<String> for ProviderError {
+    fn from(message: String) -> Self {
+        Self::Upstream(message)
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String>;
@@ -168,6 +214,96 @@ pub trait Provider: Send + Sync {
     }
 }
 
+struct ResolvedModelProvider {
+    inner: Box<dyn Provider>,
+    upstream_model: String,
+    canonical_model: String,
+    registry_state_path: Option<std::path::PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl Provider for ResolvedModelProvider {
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
+        self.enforce_current_capabilities(req, false)
+            .await
+            .map_err(encode_provider_error)?;
+        let mut request = req.clone();
+        request.model.clone_from(&self.upstream_model);
+        self.inner.chat(&request).await
+    }
+
+    async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
+        self.enforce_current_capabilities(req, true)
+            .await
+            .map_err(encode_provider_error)?;
+        let mut request = req.clone();
+        request.model.clone_from(&self.upstream_model);
+        self.inner.chat_stream(&request).await
+    }
+}
+
+impl ResolvedModelProvider {
+    async fn enforce_current_capabilities(
+        &self,
+        request: &ChatRequest,
+        streaming: bool,
+    ) -> Result<(), ProviderError> {
+        let registry = if let Some(path) = self.registry_state_path.as_deref() {
+            crate::provider_profile::refresh_provider_registry_async(path)
+                .await
+                .map_err(ProviderError::Unavailable)?
+        } else {
+            crate::provider_profile::provider_registry_snapshot()
+        };
+        let resolved = registry
+            .resolve_model(&self.canonical_model)
+            .map_err(ProviderError::Precondition)?;
+        let capabilities = registry
+            .effective_profile(&resolved.provider)
+            .ok_or_else(|| {
+                ProviderError::Precondition(format!(
+                    "provider profile {:?} is not registered",
+                    resolved.provider
+                ))
+            })?
+            .capabilities;
+        enforce_chat_capabilities(request, streaming, &capabilities)
+            .map_err(ProviderError::Precondition)
+    }
+}
+
+fn enforce_chat_capabilities(
+    request: &ChatRequest,
+    streaming: bool,
+    capabilities: &crate::provider_profile::ProviderCapabilities,
+) -> Result<(), String> {
+    let requirements = crate::provider_profile::CapabilityRequirements {
+        streaming,
+        tools: !request.tools.is_empty()
+            || request
+                .messages
+                .iter()
+                .any(|message| !message.tool_calls.is_empty() || !message.tool_call_id.is_empty()),
+        modalities: vec!["text".into()],
+        max_output_tokens: (request.max_tokens > 0).then_some(request.max_tokens as u64),
+        ..Default::default()
+    };
+    if streaming && !request.tools.is_empty() {
+        return Err(
+            "provider adapter cannot preserve tool calls in streaming responses".to_string(),
+        );
+    }
+    let missing = requirements.unsupported_by(capabilities);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider cannot preserve required capabilities: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// Resolve a model name to the appropriate provider.
 pub fn resolve(
     model: &str,
@@ -176,40 +312,225 @@ pub fn resolve(
     ollama_url: &str,
     native_url: Option<&str>,
 ) -> Result<Box<dyn Provider>, String> {
-    if !is_valid_model_name(model) {
-        return Err(format!("invalid model name: {:?}", model));
-    }
-    if model.starts_with("claude") {
-        let key = anthropic_key.ok_or("ANTHROPIC_API_KEY not set")?;
-        Ok(Box::new(anthropic::Anthropic::new(key)))
-    } else if model.starts_with("gpt-") || model.starts_with("o1") {
-        let key = openai_key.ok_or("OPENAI_API_KEY not set")?;
-        Ok(Box::new(openai::OpenAI::new(key, None)))
-    } else if model.starts_with("ollama/") {
-        Ok(Box::new(openai::OpenAI::new("", Some(ollama_url))))
-    } else {
-        let url =
-            native_url.ok_or_else(|| format!("NATIVE_LLM_URL not set for model {:?}", model))?;
-        Ok(Box::new(openai::OpenAI::new("", Some(url))))
-    }
+    let registry = crate::provider_profile::provider_registry_snapshot();
+    resolve_with_registry(
+        model,
+        &registry,
+        None,
+        anthropic_key,
+        openai_key,
+        ollama_url,
+        native_url,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_with_registry(
+    model: &str,
+    registry: &crate::provider_profile::ProviderRegistry,
+    registry_state_path: Option<&std::path::Path>,
+    anthropic_key: Option<&str>,
+    openai_key: Option<&str>,
+    ollama_url: &str,
+    native_url: Option<&str>,
+) -> Result<Box<dyn Provider>, String> {
+    let resolved = registry.resolve_model(model)?;
+    let inner: Box<dyn Provider> = match resolved.provider.as_str() {
+        "anthropic" => {
+            let key = anthropic_key.ok_or("ANTHROPIC_API_KEY not set")?;
+            Box::new(anthropic::Anthropic::new(key))
+        }
+        "openai" => {
+            let key = openai_key.ok_or("OPENAI_API_KEY not set")?;
+            Box::new(openai::OpenAI::new(key, None))
+        }
+        "ollama" => Box::new(openai::OpenAI::new("", Some(ollama_url))),
+        "native" => {
+            let url = native_url
+                .ok_or_else(|| format!("NATIVE_LLM_URL not set for model {:?}", model))?;
+            Box::new(openai::OpenAI::new("", Some(url)))
+        }
+        provider => return Err(format!("unsupported provider {provider:?}")),
+    };
+    Ok(Box::new(ResolvedModelProvider {
+        inner,
+        upstream_model: resolved.upstream_model,
+        canonical_model: resolved.canonical_model,
+        registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
+    }))
 }
 
 pub fn provider_name(model: &str) -> &str {
-    if model.starts_with("claude") {
-        "anthropic"
-    } else if model.starts_with("gpt-") || model.starts_with("o1") {
-        "openai"
-    } else if model.starts_with("ollama/") {
-        "ollama"
-    } else {
-        "native"
-    }
+    crate::provider_profile::resolve_provider_id(model).unwrap_or("unknown")
 }
 
-fn is_valid_model_name(model: &str) -> bool {
-    !model.is_empty()
-        && model.len() <= 128
-        && model
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingProvider(Arc<Mutex<String>>);
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, String> {
+            *self.0.lock().unwrap() = request.model.clone();
+            Ok(ChatResponse {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                stop_reason: "stop".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_strips_canonical_namespace_before_upstream() {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = ResolvedModelProvider {
+            inner: Box::new(CapturingProvider(captured.clone())),
+            upstream_model: "gpt-5.5".into(),
+            canonical_model: "openai/gpt-5.5".into(),
+            registry_state_path: None,
+        };
+        provider
+            .chat(&ChatRequest {
+                model: "openai/gpt-5.5".into(),
+                system: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                max_tokens: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(*captured.lock().unwrap(), "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_blocks_disabled_tools_before_contact() {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = ResolvedModelProvider {
+            inner: Box::new(CapturingProvider(captured.clone())),
+            upstream_model: "mistral".into(),
+            canonical_model: "native/mistral".into(),
+            registry_state_path: None,
+        };
+        let error = provider
+            .chat(&ChatRequest {
+                model: "native/mistral".into(),
+                system: String::new(),
+                messages: Vec::new(),
+                tools: vec![ToolDef {
+                    name: "read".into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                }],
+                max_tokens: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("tools"));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_blocks_streaming_tools_before_contact() {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = ResolvedModelProvider {
+            inner: Box::new(CapturingProvider(captured.clone())),
+            upstream_model: "gpt-5.5".into(),
+            canonical_model: "openai/gpt-5.5".into(),
+            registry_state_path: None,
+        };
+        let result = provider
+            .chat_stream(&ChatRequest {
+                model: "openai/gpt-5.5".into(),
+                system: String::new(),
+                messages: Vec::new(),
+                tools: vec![ToolDef {
+                    name: "read".into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                }],
+                max_tokens: 1,
+            })
+            .await;
+        let error = match result {
+            Ok(_) => panic!("streaming tool call reached the provider"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("tool calls"));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn streaming_tool_history_does_not_request_new_tool_emission() {
+        let request = ChatRequest {
+            model: "openai/gpt-5.5".into(),
+            system: String::new(),
+            messages: vec![Message {
+                role: "tool".into(),
+                content: "done".into(),
+                tool_call_id: "call_1".into(),
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: 1,
+        };
+        let capabilities = crate::provider_profile::ProviderRegistry::built_in()
+            .profile("openai")
+            .unwrap()
+            .capabilities
+            .clone();
+
+        assert!(enforce_chat_capabilities(&request, true, &capabilities).is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_refreshes_registry_before_contact() {
+        let directory = std::env::temp_dir().join(format!(
+            "sekai-direct-provider-registry-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        crate::provider_profile::refresh_provider_registry(&registry_path).unwrap();
+        std::fs::remove_file(&registry_path).unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = ResolvedModelProvider {
+            inner: Box::new(CapturingProvider(captured.clone())),
+            upstream_model: "gpt-5.5".into(),
+            canonical_model: "openai/gpt-5.5".into(),
+            registry_state_path: Some(registry_path),
+        };
+
+        let error = provider
+            .chat(&ChatRequest {
+                model: "openai/gpt-5.5".into(),
+                system: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                max_tokens: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            decode_provider_error(error),
+            ProviderError::Unavailable(_)
+        ));
+        assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn provider_name_uses_registry_namespace_rules() {
+        assert_eq!(provider_name("openai/gpt-5.5"), "openai");
+        assert_eq!(provider_name("anthropic/claude-sonnet-4"), "anthropic");
+        assert_eq!(provider_name("native/mistral"), "native");
+        assert_eq!(provider_name("Kiro"), "unknown");
+        assert_eq!(provider_name("unknown/model"), "unknown");
+    }
 }
