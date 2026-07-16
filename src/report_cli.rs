@@ -8,10 +8,14 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]"
+    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
 }
 
 pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
+    if matches!(args.first().map(String::as_str), Some("bundle" | "verify")) {
+        return crate::attest_cli::run_attest_command(attest_args(args).expect("matched command"))
+            .await;
+    }
     let operation_id = args
         .first()
         .filter(|arg| !arg.starts_with('-'))
@@ -119,6 +123,19 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn attest_args(args: Vec<String>) -> Option<Vec<String>> {
+    let command = match args.first()?.as_str() {
+        "bundle" => "export",
+        "verify" => "verify",
+        _ => return None,
+    };
+    Some(
+        std::iter::once(command.to_string())
+            .chain(args.into_iter().skip(1))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +170,17 @@ mod tests {
         assert!(rendered.contains("evidence_complete: false"));
         assert!(rendered.contains("integrity: not_verified"));
         assert!(rendered.contains("policy_compliance: failed"));
+    }
+
+    #[test]
+    fn report_bundle_and_verify_reuse_attestation_commands() {
+        assert_eq!(
+            attest_args(vec!["bundle".into(), "op-1".into()]).unwrap(),
+            vec!["export", "op-1"]
+        );
+        assert_eq!(
+            attest_args(vec!["verify".into(), "bundle.json".into()]).unwrap(),
+            vec!["verify", "bundle.json"]
+        );
     }
 }
