@@ -16,6 +16,7 @@ pub mod launch;
 pub mod llm;
 pub mod obs;
 pub mod onboarding;
+pub mod operation_report;
 pub mod provenance;
 pub mod provider_profile;
 pub mod receipt_cli;
