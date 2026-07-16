@@ -44,12 +44,23 @@ impl HttpTimeouts {
     }
 
     pub(crate) fn client(self) -> reqwest::Client {
+        self.client_builder()
+            .build()
+            .expect("valid reqwest timeout configuration")
+    }
+
+    pub(crate) fn gateway_client(self) -> reqwest::Client {
+        self.client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("valid reqwest timeout configuration")
+    }
+
+    fn client_builder(self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .pool_idle_timeout(self.pool_idle_timeout)
-            .build()
-            .expect("valid reqwest timeout configuration")
     }
 }
 

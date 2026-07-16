@@ -127,6 +127,7 @@ pub struct GatewayReportRow {
     pub cache_read_input_tokens: i64,
     pub cache_savings_usd_micros: i64,
     pub refusals: i64,
+    pub terminal_failures: i64,
     pub models: BTreeMap<String, i64>,
     pub budget_used: i64,
     pub budget_limit: i64,
@@ -156,6 +157,7 @@ pub async fn run_report(
                     "sample_reason".to_string(),
                     "sample_rate".to_string(),
                     "status".to_string(),
+                    "terminal_outcome".to_string(),
                     "refusal_reason".to_string(),
                     "input_tokens".to_string(),
                     "output_tokens".to_string(),
@@ -285,6 +287,13 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
                 .is_some_and(|reason| !reason.is_empty())
         {
             summary.refusals += 1;
+        }
+        if row
+            .values
+            .get("terminal_outcome")
+            .is_some_and(|outcome| !outcome.is_empty() && outcome != "completed")
+        {
+            summary.terminal_failures += 1;
         }
         if group_by == ReportGroupBy::WorkUnit {
             let model = row
@@ -416,9 +425,10 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
         return;
     }
     println!(
-        "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+        "{:<24} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
         group_by.label(),
         "calls",
+        "failures",
         "input_tokens",
         "output_tokens",
         "total_tokens",
@@ -429,9 +439,10 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
     println!("{}", "-".repeat(126));
     for row in rows {
         println!(
-            "{:<24} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+            "{:<24} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
             truncate(&row.group, 24),
             row.calls,
+            row.terminal_failures,
             row.input_tokens,
             row.output_tokens,
             row.total_tokens,
@@ -444,8 +455,8 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
 
 fn print_work_unit_report(rows: &[GatewayReportRow]) {
     println!(
-        "{:<24} {:>7} {:>9} {:>12} {:>11} {:>9}  models",
-        "work_unit", "calls", "refusals", "cost_usd", "cache_read", "budget"
+        "{:<24} {:>7} {:>9} {:>9} {:>12} {:>11} {:>9}  models",
+        "work_unit", "calls", "refusals", "failures", "cost_usd", "cache_read", "budget"
     );
     println!("{}", "-".repeat(112));
     for row in rows {
@@ -470,10 +481,11 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "{:<24} {:>7} {:>9} {:>12} {:>10}% {:>9}  {}",
+            "{:<24} {:>7} {:>9} {:>9} {:>12} {:>10}% {:>9}  {}",
             truncate(&row.group, 24),
             row.calls,
             row.refusals,
+            row.terminal_failures,
             format_usd_micros(row.cost_usd_micros),
             cache_pct,
             budget,
@@ -498,6 +510,13 @@ pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
             total.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
             total.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
             total.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
+            if row
+                .values
+                .get("terminal_outcome")
+                .is_some_and(|outcome| !outcome.is_empty() && outcome != "completed")
+            {
+                total.terminal_failures += 1;
+            }
             total
         });
     format!(
@@ -560,6 +579,7 @@ tr:last-child td {{ border-bottom:0; }}
 fn render_metric_cards(total: &GatewayReportRow) -> String {
     [
         ("Calls", total.calls.to_string()),
+        ("Terminal failures", total.terminal_failures.to_string()),
         ("Input tokens", total.input_tokens.to_string()),
         ("Output tokens", total.output_tokens.to_string()),
         ("Total tokens", total.total_tokens.to_string()),
@@ -596,10 +616,11 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
                 0
             };
             format!(
-                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
+                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{failures}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
                 group = html_escape(&row.group),
                 width = width,
                 calls = row.calls,
+                failures = row.terminal_failures,
                 input = row.input_tokens,
                 output = row.output_tokens,
                 total = row.total_tokens,
@@ -614,7 +635,7 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
         r#"<section>
 <h2>{title}</h2>
 <table>
-<thead><tr><th>{first_column}</th><th>calls</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
+<thead><tr><th>{first_column}</th><th>calls</th><th>terminal failures</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
 <tbody>
 {body}
 </tbody>
@@ -915,13 +936,21 @@ mod tests {
                 ("status", "refused"),
                 ("refusal_reason", "budget"),
             ]),
+            row([
+                ("work_unit_id", "feature-x"),
+                ("model", "gpt-5.5"),
+                ("status", "200"),
+                ("terminal_outcome", "interrupted"),
+            ]),
         ];
 
         let report = summarize_rows(rows, ReportGroupBy::WorkUnit);
-        assert_eq!(report[0].calls, 2);
+        assert_eq!(report[0].calls, 3);
         assert_eq!(report[0].refusals, 1);
+        assert_eq!(report[0].terminal_failures, 1);
         assert_eq!(report[0].models["claude-sonnet"], 1);
         assert_eq!(report[0].models["claude-haiku"], 1);
+        assert_eq!(report[0].models["gpt-5.5"], 1);
     }
 
     #[test]

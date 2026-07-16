@@ -4853,11 +4853,13 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("dataset not found"))?;
         if existing.object_id.is_empty() {
-            let trusted_gateway = principals.iter().any(|principal| {
-                matches!(principal.as_str(), "chisei-gateway" | "root")
-                    || self.gateway_schema_principals.contains(principal)
-            });
-            if !trusted_gateway {
+            let root = principals.iter().any(|principal| principal == "root");
+            let trusted_gateway = parsed.id == "llm_calls"
+                && principals.iter().any(|principal| {
+                    principal == "chisei-gateway"
+                        || self.gateway_schema_principals.contains(principal)
+                });
+            if !root && !trusted_gateway {
                 return Err(Status::permission_denied(
                     "unbound dataset updates require the gateway service principal",
                 ));
@@ -8184,7 +8186,7 @@ mod tests {
         svc.gateway_schema_principals = vec!["gateway-prod".into()];
         svc.create_dataset(with_principal(CreateDatasetRequest {
             dataset: Some(Dataset {
-                id: "system-dataset".into(),
+                id: "llm_calls".into(),
                 name: "original".into(),
                 columns: vec![],
                 object_id: String::new(),
@@ -8195,7 +8197,7 @@ mod tests {
         .unwrap();
         let update = UpdateDatasetRequest {
             dataset: Some(Dataset {
-                id: "system-dataset".into(),
+                id: "llm_calls".into(),
                 name: "updated".into(),
                 columns: vec![ColumnDef {
                     name: "receipt_id".into(),
@@ -8222,6 +8224,34 @@ mod tests {
         assert_eq!(updated.name, "updated");
         assert_eq!(updated.columns[0].name, "receipt_id");
         assert_eq!(updated.created, 1);
+
+        svc.create_dataset(with_principal(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "other-system-dataset".into(),
+                name: "original".into(),
+                columns: vec![],
+                object_id: String::new(),
+                created: 2,
+            }),
+        }))
+        .await
+        .unwrap();
+        let error = svc
+            .update_dataset(with_named_principal(
+                UpdateDatasetRequest {
+                    dataset: Some(Dataset {
+                        id: "other-system-dataset".into(),
+                        name: "hijacked".into(),
+                        columns: vec![],
+                        object_id: String::new(),
+                        created: 2,
+                    }),
+                },
+                "gateway-prod",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
