@@ -350,6 +350,32 @@ pub fn resolve_with_registry(
                 .ok_or_else(|| format!("NATIVE_LLM_URL not set for model {:?}", model))?;
             Box::new(openai::OpenAI::new("", Some(url)))
         }
+        "xai" | "meta" => {
+            let profile = registry
+                .effective_profile(&resolved.provider)
+                .ok_or_else(|| {
+                    format!("provider profile {:?} is unavailable", resolved.provider)
+                })?;
+            let base_url = std::env::var(&profile.endpoint.base_url_env)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or(profile.endpoint.default_base_url)
+                .ok_or_else(|| {
+                    format!(
+                        "{} not set for provider {:?}",
+                        profile.endpoint.base_url_env, resolved.provider
+                    )
+                })?;
+            let key_env = profile
+                .endpoint
+                .api_key_env
+                .ok_or_else(|| format!("provider {:?} has no API key source", resolved.provider))?;
+            let key = std::env::var(&key_env)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("{key_env} not set"))?;
+            Box::new(openai::OpenAI::new(&key, Some(&base_url)))
+        }
         provider => return Err(format!("unsupported provider {provider:?}")),
     };
     Ok(Box::new(ResolvedModelProvider {
