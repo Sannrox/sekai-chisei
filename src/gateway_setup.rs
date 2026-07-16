@@ -14,7 +14,8 @@ use crate::grpc::pb::chisei::{SetBudgetLimitRequest, SetNamespacePolicyRequest};
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest, Dataset,
-    FindByExternalIdRequest, Link, ListFilter, ListObjectsRequest, Object, UpdateObjectRequest,
+    FindByExternalIdRequest, Link, ListFilter, ListObjectsRequest, Object, UpdateDatasetRequest,
+    UpdateObjectRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,15 +876,16 @@ async fn ensure_llm_calls_dataset(
         })
         .collect();
 
+    let dataset = Dataset {
+        id: "llm_calls".to_string(),
+        name: "LLM calls".to_string(),
+        columns,
+        object_id: String::new(),
+        created: Utc::now().timestamp_millis(),
+    };
     match sekai
         .create_dataset(gateway_request(CreateDatasetRequest {
-            dataset: Some(Dataset {
-                id: "llm_calls".to_string(),
-                name: "LLM calls".to_string(),
-                columns,
-                object_id: String::new(),
-                created: Utc::now().timestamp_millis(),
-            }),
+            dataset: Some(dataset.clone()),
         }))
         .await
     {
@@ -892,7 +894,12 @@ async fn ensure_llm_calls_dataset(
             if err.code() == tonic::Code::InvalidArgument
                 && err.message().contains("UNIQUE constraint failed") =>
         {
-            Ok(())
+            sekai
+                .update_dataset(gateway_request(UpdateDatasetRequest {
+                    dataset: Some(dataset),
+                }))
+                .await
+                .map(|_| ())
         }
         Err(err) => Err(err),
     }
