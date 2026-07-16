@@ -198,7 +198,10 @@ impl PolicyResolver {
 }
 
 fn is_registry_runtime(runtime: &str) -> bool {
-    matches!(runtime, "openai" | "anthropic" | "ollama" | "native")
+    matches!(
+        runtime,
+        "openai" | "anthropic" | "ollama" | "native" | "xai" | "meta"
+    )
 }
 
 pub(crate) fn validate_resolved_route(runtime: &str, model: &str) -> Result<(), String> {
@@ -452,6 +455,13 @@ mod tests {
         );
         assert!(validate_resolved_route("kiro", "kiro/native-default").is_err());
         assert!(validate_resolved_route("kiro", "openai/gpt-5.5").is_err());
+    }
+
+    #[test]
+    fn hosted_registry_runtimes_validate_against_their_models() {
+        assert!(validate_resolved_route("xai", "xai/grok-4.5").is_ok());
+        assert!(is_registry_runtime("meta"));
+        assert!(validate_resolved_route("xai", "openai/gpt-5.5").is_err());
     }
 
     #[test]

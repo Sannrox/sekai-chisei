@@ -605,6 +605,7 @@ fn from_proto_evidence_producer(
     Ok(DomainEvidenceProducerCapability {
         producer_identity: capability.producer_identity,
         config_version: capability.config_version,
+        source_types: capability.source_types,
         source_instances: capability.source_instances,
         namespaces: capability.namespaces,
         evidence_types: capability.evidence_types,
@@ -12657,6 +12658,7 @@ mod tests {
                 capability: Some(EvidenceProducerCapability {
                     producer_identity: "producer:checks".into(),
                     config_version: 1,
+                    source_types: vec!["verification_system".into()],
                     source_instances: vec!["checks-primary".into()],
                     namespaces: vec!["acme".into()],
                     evidence_types: vec!["verification.result".into()],

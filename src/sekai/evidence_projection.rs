@@ -656,6 +656,10 @@ mod tests {
             &EvidenceProducerCapability {
                 producer_identity: "producer:checks".into(),
                 config_version: 1,
+                source_types: vec![
+                    "verification_system".into(),
+                    "other_verification_system".into(),
+                ],
                 source_instances: vec!["checks-primary".into()],
                 namespaces: vec!["acme".into()],
                 evidence_types: vec!["verification.result".into()],
@@ -794,7 +798,7 @@ mod tests {
         let usable = db
             .list_usable_evidence_for_targets(
                 &[projection.target_object_id.unwrap()],
-                &["verification.result".into()],
+                &[("verification_system".into(), "verification.result".into())],
                 450,
                 8,
             )

@@ -2,7 +2,7 @@ use std::error::Error as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -46,8 +46,8 @@ use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     AppendRowsRequest, ColumnDef, ContextRoot as SekaiContextRoot, CreateDatasetRequest,
     CreateLinkRequest, CreateObjectRequest, Dataset, FindByExternalIdRequest,
-    FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject,
-    RetrieveContextRequest, Row, UpdateDatasetRequest,
+    FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest,
+    RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
 };
 use crate::llm::HttpTimeouts;
 #[cfg(test)]
@@ -109,6 +109,8 @@ const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 5;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES: u32 = 1;
 const MAX_PROVIDER_RETRY_AFTER_SECS: u64 = 60 * 60;
+const RECOVERY_REPLAY_YIELD_INTERVAL: usize = 32;
+const SCHEMA_RECONCILIATION_RETRY_MS: u64 = 60_000;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
 pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
@@ -128,6 +130,8 @@ pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
     "provider",
     "model",
     "resolved_model",
+    "profile_version",
+    "capability_snapshot_version",
     "work_unit_id",
     "route_bias",
     "policy_scope",
@@ -222,9 +226,12 @@ impl GatewayConfig {
                 .as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
-        let hosted_key_configured = ["XAI_API_KEY", "META_MODEL_API_KEY"]
-            .iter()
-            .any(|variable| std::env::var(variable).is_ok_and(|value| !value.trim().is_empty()));
+        let xai_configured =
+            std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+        let meta_configured = std::env::var("META_MODEL_API_KEY")
+            .is_ok_and(|value| !value.trim().is_empty())
+            && std::env::var("CHISEI_META_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
+        let hosted_key_configured = xai_configured || meta_configured;
         if openai_api_key.is_none()
             && anthropic_api_key.is_none()
             && !hosted_key_configured
@@ -470,6 +477,10 @@ struct GatewayRuntime {
     audit_spool_path: Option<PathBuf>,
     audit_spool_max_bytes: u64,
     audit_spool_lock: Arc<Mutex<()>>,
+    recovery_replay_running: Arc<AtomicBool>,
+    llm_calls_schema_reconciled: Arc<AtomicBool>,
+    llm_calls_schema_retry_after_ms: Arc<AtomicU64>,
+    llm_calls_schema_lock: Arc<Mutex<()>>,
     control_plane_circuit: Arc<RwLock<CircuitBreakerState>>,
     readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
     upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
@@ -794,6 +805,10 @@ impl GatewayRuntime {
             audit_spool_path: None,
             audit_spool_max_bytes: DEFAULT_AUDIT_SPOOL_MAX_BYTES,
             audit_spool_lock: Arc::new(Mutex::new(())),
+            recovery_replay_running: Arc::new(AtomicBool::new(false)),
+            llm_calls_schema_reconciled: Arc::new(AtomicBool::new(false)),
+            llm_calls_schema_retry_after_ms: Arc::new(AtomicU64::new(0)),
+            llm_calls_schema_lock: Arc::new(Mutex::new(())),
             control_plane_circuit: Arc::new(RwLock::new(CircuitBreakerState::default())),
             readiness_probe: Arc::new(Mutex::new(None)),
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
@@ -1577,6 +1592,10 @@ fn canonical_eval_config_ref(registry: &ProviderRegistry, config_ref: &str) -> S
     canonical_lifecycle_target("model", config_ref).unwrap_or_else(|_| config_ref.to_string())
 }
 
+fn lifecycle_state_is_routable(state: &str) -> bool {
+    matches!(state, "enabled" | "degraded" | "retiring")
+}
+
 async fn verify_provider_lifecycle_promotion(
     state: &GatewayState,
     request: &ProviderLifecycleRequest,
@@ -1614,23 +1633,24 @@ async fn verify_provider_lifecycle_promotion(
                         .effective_profile(&profile.provider)
                         .is_some_and(|profile| profile.lifecycle == "canary")
             });
-    if request.state != "enabled" || !requires_gate {
+    let becomes_routable = lifecycle_state_is_routable(&request.state);
+    if !becomes_routable || !requires_gate {
         return Ok(registry.state_version);
     }
     if request.baseline_run_id.trim().is_empty() || request.candidate_run_id.trim().is_empty() {
-        return Err("promotion to enabled requires baseline_run_id and candidate_run_id".into());
+        return Err(
+            "promotion to a routable state requires baseline_run_id and candidate_run_id".into(),
+        );
     }
     if request.baseline_run_id == request.candidate_run_id {
         return Err("promotion evaluation requires distinct baseline and candidate runs".into());
     }
     if request.baseline_config_ref.trim().is_empty() {
-        return Err("promotion to enabled requires baseline_config_ref".into());
+        return Err("promotion to a routable state requires baseline_config_ref".into());
     }
-    let target = state
-        .config
-        .chisei_grpc_target
-        .as_deref()
-        .ok_or_else(|| "promotion to enabled requires the policy control plane".to_string())?;
+    let target = state.config.chisei_grpc_target.as_deref().ok_or_else(|| {
+        "promotion to a routable state requires the policy control plane".to_string()
+    })?;
     let channel = connect_governance(&state.runtime, target)
         .await
         .map_err(|error| format!("promotion evaluation is unavailable: {error}"))?;
@@ -2187,9 +2207,6 @@ async fn proxy_gateway_inner_scoped(
         request_hash.clone(),
         registry_snapshot_version.clone(),
     );
-    if let Err(error) = reserve_gateway_request_alias(&state.config, &alias_context).await {
-        return alias_reservation_error_response(error);
-    }
     let requested_registry_model = match requested_model
         .as_deref()
         .filter(|_| !policy_model_sentinel)
@@ -2216,39 +2233,6 @@ async fn proxy_gateway_inner_scoped(
                 format!("model resolution failed: {reason}"),
             );
             if lifecycle_denial {
-                let mut context = early_refusal_context(
-                    &correlation,
-                    responses_profile,
-                    requested_provider_without_lifecycle,
-                    requested_model.clone(),
-                    work_unit_id.clone(),
-                    pipeline_spec.clone(),
-                    request_bytes,
-                    started_ms,
-                    task_class.clone(),
-                    request_hash.clone(),
-                    registry_snapshot_version.clone(),
-                );
-                if let Some(requested_model) = requested_model.as_deref()
-                    && let Ok(route) = ProviderRegistry::built_in().resolve_model(requested_model)
-                {
-                    context.provider = ProviderKind::from_runtime(&route.provider)
-                        .unwrap_or(requested_provider_without_lifecycle);
-                    context.resolved_model = Some(route.canonical_model.clone());
-                    context.requested_alias = route.requested_alias;
-                    let registry = ProviderRegistry::built_in();
-                    let profile = registry.profile(&route.provider);
-                    context.profile_version =
-                        profile.map(|profile| profile.profile_version.clone());
-                    context.pricing_snapshot_version = effective_pricing_snapshot_version(
-                        &state.config,
-                        profile,
-                        Some(&route.canonical_model),
-                        Some(requested_model),
-                    );
-                    context.governance_metadata_status =
-                        profile.map(|profile| profile.governance.metadata_status.clone());
-                }
                 record_gateway_decision(
                     &state.config,
                     &identity,
@@ -2258,8 +2242,6 @@ async fn proxy_gateway_inner_scoped(
                     HashMap::from([("request_id".into(), request_id.clone())]),
                 )
                 .await;
-                record_refusal_and_append(&state.config, &identity, &context, &rejection).await;
-                return rejection.response();
             }
             return rejection.response();
         }
@@ -2279,7 +2261,10 @@ async fn proxy_gateway_inner_scoped(
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mut preflight_context = UsageContext {
         request_id: request_id.clone(),
-        lookup_request_id: correlation.lookup_request_id.clone(),
+        // The client alias is not owned until durable reservation succeeds.
+        // Pre-dispatch refusal receipts remain addressable by canonical request
+        // and operation ids without consuming a retryable alias.
+        lookup_request_id: None,
         caller_scope: correlation.caller_scope.clone(),
         operation_id: correlation.operation_id.clone(),
         parent_operation_id: correlation.parent_operation_id.clone(),
@@ -2331,7 +2316,14 @@ async fn proxy_gateway_inner_scoped(
                 requested_provider.runtime_name()
             ),
         );
-        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
         return rejection.response();
     }
     if state.config.no_preflight && context_request.is_some() {
@@ -2347,7 +2339,14 @@ async fn proxy_gateway_inner_scoped(
             "governance_unavailable",
             "the auto model sentinel requires policy preflight",
         );
-        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
         return rejection.response();
     }
     if state.config.no_preflight && failure_posture.fail_closed {
@@ -2356,7 +2355,14 @@ async fn proxy_gateway_inner_scoped(
             "governance_unavailable",
             "preflight cannot be disabled for classified or elevated-risk traffic",
         );
-        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
         return rejection.response();
     }
     if state.config.no_preflight
@@ -2388,7 +2394,14 @@ async fn proxy_gateway_inner_scoped(
         )
         .await
     {
-        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
         return rejection.response();
     }
     let (resolved, mut egress, budget) = if state.config.no_preflight {
@@ -2422,8 +2435,14 @@ async fn proxy_gateway_inner_scoped(
         {
             Ok(budget) => budget,
             Err(rejection) => {
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         };
@@ -2463,8 +2482,14 @@ async fn proxy_gateway_inner_scoped(
                     "budget_exceeded",
                     "budget exceeded and local-free routing could not be verified",
                 );
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
             Err(rejection) => {
@@ -2495,8 +2520,14 @@ async fn proxy_gateway_inner_scoped(
                 } else {
                     rejection
                 };
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         };
@@ -2513,8 +2544,14 @@ async fn proxy_gateway_inner_scoped(
         {
             Ok(resolved) => resolved,
             Err(rejection) => {
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         };
@@ -2598,8 +2635,14 @@ async fn proxy_gateway_inner_scoped(
         {
             Ok(egress) => egress,
             Err(rejection) => {
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         };
@@ -2614,8 +2657,14 @@ async fn proxy_gateway_inner_scoped(
                     "invalid_request_error",
                     reason,
                 );
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         };
@@ -2660,8 +2709,14 @@ async fn proxy_gateway_inner_scoped(
                     ]),
                 )
                 .await;
-                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                    .await;
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
                 return rejection.response();
             }
         }
@@ -2671,6 +2726,10 @@ async fn proxy_gateway_inner_scoped(
         resolved_model: resolved_registry_model.map(str::to_string),
         requirements: contact_requirements,
     };
+    let resolved_registry_metadata = resolved
+        .resolved_model
+        .as_deref()
+        .and_then(|model| registry_snapshot.resolve_model(model).ok());
     let prepared = match prepare_upstream_request(
         &state.config,
         &identity,
@@ -2678,7 +2737,7 @@ async fn proxy_gateway_inner_scoped(
         client_provider,
         resolved.resolved_provider,
         egress.body,
-        resolved.resolved_model.as_deref(),
+        resolved_registry_metadata.as_ref(),
     )
     .await
     {
@@ -2737,10 +2796,13 @@ async fn proxy_gateway_inner_scoped(
         }
     }
 
-    let resolved_registry_metadata = resolved
-        .resolved_model
-        .as_deref()
-        .and_then(|model| registry_snapshot.resolve_model(model).ok());
+    // Reserve the opaque alias only after every fallible pre-dispatch step has
+    // completed. Earlier refusals persist their own terminal receipt; reserving
+    // before that point could strand an alias without a reconcilable outcome.
+    if let Err(error) = reserve_gateway_request_alias(&state.config, &alias_context).await {
+        return alias_reservation_error_response(error);
+    }
+
     let resolved_profile = resolved_registry_metadata
         .as_ref()
         .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
@@ -2840,6 +2902,7 @@ async fn proxy_gateway_inner_scoped(
             .await;
             record_refusal_with_usage_and_append(
                 &state.config,
+                &state.runtime,
                 &identity,
                 &usage_context,
                 &rejection,
@@ -2868,11 +2931,12 @@ async fn proxy_gateway_inner_scoped(
             };
             record_refusal_with_usage_and_append(
                 &state.config,
+                &state.runtime,
                 &identity,
                 &usage_context,
                 &rejection,
                 None,
-                true,
+                false,
             )
             .await;
             json_error_with_retry_safety(
@@ -2901,6 +2965,7 @@ async fn proxy_gateway_inner_scoped(
             };
             record_refusal_with_usage_and_append(
                 &state.config,
+                &state.runtime,
                 &identity,
                 &usage_context,
                 &rejection,
@@ -4641,6 +4706,13 @@ fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json
     serde_json::to_vec(&value)
 }
 
+fn rewrite_resolved_request_model(
+    body: &[u8],
+    resolved_model: &crate::provider_profile::ResolvedProviderModel,
+) -> Result<Vec<u8>, serde_json::Error> {
+    rewrite_request_model(body, &resolved_model.upstream_model)
+}
+
 /// Chisei names Ollama models `ollama/<name>`, but the Ollama API expects the
 /// bare `<name>`. Strip the prefix from the request body's model before
 /// forwarding to the Ollama backend. Returns the body unchanged if it can't be
@@ -4689,23 +4761,14 @@ async fn prepare_upstream_request(
     client_provider: ProviderKind,
     resolved_provider: ProviderKind,
     body: Vec<u8>,
-    resolved_model: Option<&str>,
+    resolved_model: Option<&crate::provider_profile::ResolvedProviderModel>,
 ) -> Result<PreparedUpstreamRequest, Response<Body>> {
     if client_provider == resolved_provider || client_provider.same_family(resolved_provider) {
         // Same wire family: pass through unchanged, but route to the *resolved*
         // provider's backend so within-family routing (OpenAI vs Ollama vs native)
         // reaches the right upstream. All of these speak the same wire natively.
         let body = if let Some(resolved_model) = resolved_model {
-            let registry_model = ProviderRegistry::built_in()
-                .resolve_model(resolved_model)
-                .map_err(|reason| {
-                    json_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        &format!("resolved model is invalid: {reason}"),
-                    )
-                })?;
-            rewrite_request_model(&body, &registry_model.upstream_model).map_err(|error| {
+            rewrite_resolved_request_model(&body, resolved_model).map_err(|error| {
                 json_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
@@ -4722,7 +4785,16 @@ async fn prepare_upstream_request(
         };
         return Ok(PreparedUpstreamRequest {
             provider: resolved_provider,
-            url: upstream_url_for_provider(config, uri, resolved_provider),
+            url: upstream_url_for_provider(config, uri, resolved_provider).ok_or_else(|| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "gateway_config_error",
+                    &format!(
+                        "{} endpoint is not configured",
+                        resolved_provider.runtime_name()
+                    ),
+                )
+            })?,
             body,
             response_adapter: ResponseAdapter::Passthrough,
             client_response_model: None,
@@ -4769,17 +4841,8 @@ async fn prepare_upstream_request(
                 "cross-provider translation requires a resolved model",
             )
         })?;
-        let registry_model = ProviderRegistry::built_in()
-            .resolve_model(resolved_model)
-            .map_err(|reason| {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &format!("resolved model is invalid: {reason}"),
-                )
-            })?;
         let mut translated =
-            anthropic_messages_to_openai_chat(&body, &registry_model.upstream_model).map_err(
+            anthropic_messages_to_openai_chat(&body, &resolved_model.upstream_model).map_err(
                 |err| {
                     json_error(
                         StatusCode::BAD_REQUEST,
@@ -4822,7 +4885,10 @@ async fn prepare_upstream_request(
                     "resolved_provider".to_string(),
                     capability_provider_id(resolved_provider).to_string(),
                 ),
-                ("resolved_model".to_string(), resolved_model.to_string()),
+                (
+                    "resolved_model".to_string(),
+                    resolved_model.canonical_model.clone(),
+                ),
                 ("streaming".to_string(), streaming.to_string()),
                 ("project".to_string(), identity.project.clone()),
             ]),
@@ -4830,10 +4896,21 @@ async fn prepare_upstream_request(
         .await;
         return Ok(PreparedUpstreamRequest {
             provider: resolved_provider,
-            url: chat_completions_url_for_provider(config, uri, resolved_provider),
+            url: chat_completions_url_for_provider(config, uri, resolved_provider).ok_or_else(
+                || {
+                    json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "gateway_config_error",
+                        &format!(
+                            "{} endpoint is not configured",
+                            resolved_provider.runtime_name()
+                        ),
+                    )
+                },
+            )?,
             body: translated,
             response_adapter,
-            client_response_model: Some(registry_model.upstream_model),
+            client_response_model: Some(resolved_model.upstream_model.clone()),
             cross_provider: true,
         });
     }
@@ -4867,16 +4944,24 @@ async fn prepare_upstream_request(
     ))
 }
 
-fn upstream_url_for_provider(config: &GatewayConfig, uri: &Uri, provider: ProviderKind) -> String {
+fn upstream_url_for_provider(
+    config: &GatewayConfig,
+    uri: &Uri,
+    provider: ProviderKind,
+) -> Option<String> {
     // Keep the client's wire path but send it to the resolved provider's backend,
     // so e.g. a Responses request resolved to an Ollama model hits the Ollama base.
     match upstream_path(uri) {
-        Some((_, path)) => build_upstream_url(&base_url_for_provider(config, provider), &path, uri),
+        Some((_, path)) => Some(build_upstream_url(
+            &base_url_for_provider(config, provider)?,
+            &path,
+            uri,
+        )),
         None => openai_chat_completions_url(config, uri),
     }
 }
 
-fn openai_chat_completions_url(config: &GatewayConfig, uri: &Uri) -> String {
+fn openai_chat_completions_url(config: &GatewayConfig, uri: &Uri) -> Option<String> {
     chat_completions_url_for_provider(config, uri, ProviderKind::OpenAi(OpenAiRuntime::OpenAi))
 }
 
@@ -4887,16 +4972,16 @@ fn chat_completions_url_for_provider(
     config: &GatewayConfig,
     uri: &Uri,
     provider: ProviderKind,
-) -> String {
+) -> Option<String> {
     let mut url = format!(
         "{}/chat/completions",
-        base_url_for_provider(config, provider).trim_end_matches('/')
+        base_url_for_provider(config, provider)?.trim_end_matches('/')
     );
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
     }
-    url
+    Some(url)
 }
 
 /// Whether an Anthropic Messages request carries a non-empty `tools` array.
@@ -7417,14 +7502,25 @@ fn provider_health_from_status(status: reqwest::StatusCode) -> ProviderHealth {
 }
 
 fn retry_after_duration(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
+    let value = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|seconds| Duration::from_secs(seconds.min(MAX_PROVIDER_RETRY_AFTER_SECS)))
+        .trim();
+    retry_after_value_duration(value)
+}
+
+fn retry_after_value_duration(value: &str) -> Option<Duration> {
+    let seconds = value.parse::<u64>().ok().or_else(|| {
+        httpdate::parse_http_date(value).ok().map(|date| {
+            date.duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+                .as_secs()
+        })
+    })?;
+    Some(Duration::from_secs(
+        seconds.min(MAX_PROVIDER_RETRY_AFTER_SECS),
+    ))
 }
 
 impl ProviderKind {
@@ -7536,6 +7632,13 @@ fn enforce_provider_capabilities(
             format!("cannot derive request capabilities: {reason}"),
         )
     })?;
+    if requirements.provider_continuation {
+        return Err(GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "capability_unsupported",
+            "previous_response_id is unavailable until provider continuation ownership can be verified",
+        ));
+    }
     let provider_id = capability_provider_id(provider);
     let registry = provider_registry_snapshot();
     registry
@@ -7708,23 +7811,24 @@ fn normalize_anthropic_base_url(base: &str) -> String {
 /// Base URL for a provider's backend. This is what makes per-model routing work:
 /// a request resolved to an Ollama or native model is sent to that backend
 /// instead of the OpenAI upstream.
-fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> String {
+fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> Option<String> {
     match provider {
-        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => config.openai_base_url.clone(),
-        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => config.ollama_base_url.clone(),
+        ProviderKind::OpenAi(OpenAiRuntime::OpenAi) => Some(config.openai_base_url.clone()),
+        ProviderKind::OpenAi(OpenAiRuntime::Ollama) => Some(config.ollama_base_url.clone()),
         ProviderKind::OpenAi(OpenAiRuntime::Native) => config
             .native_base_url
             .clone()
-            .unwrap_or_else(|| config.openai_base_url.clone()),
-        ProviderKind::OpenAi(OpenAiRuntime::Xai) => std::env::var("CHISEI_XAI_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "https://api.x.ai/v1".into()),
+            .filter(|value| !value.trim().is_empty()),
+        ProviderKind::OpenAi(OpenAiRuntime::Xai) => Some(
+            std::env::var("CHISEI_XAI_BASE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "https://api.x.ai/v1".into()),
+        ),
         ProviderKind::OpenAi(OpenAiRuntime::Meta) => std::env::var("CHISEI_META_BASE_URL")
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default(),
-        ProviderKind::Anthropic => config.anthropic_base_url.clone(),
+            .filter(|value| !value.trim().is_empty()),
+        ProviderKind::Anthropic => Some(config.anthropic_base_url.clone()),
     }
 }
 
@@ -7991,6 +8095,7 @@ async fn record_usage_and_append(
     if matches!(outcome, GatewayUsageOutcome::Success(_)) {
         record_gateway_operation_receipt(
             config,
+            Some(runtime),
             identity,
             context,
             status,
@@ -8003,6 +8108,7 @@ async fn record_usage_and_append(
     } else if let GatewayUsageOutcome::Incomplete(_, ref reason) = outcome {
         record_gateway_operation_receipt(
             config,
+            Some(runtime),
             identity,
             context,
             status,
@@ -8020,6 +8126,7 @@ async fn record_usage_and_append(
         };
         record_gateway_operation_receipt(
             config,
+            Some(runtime),
             identity,
             context,
             status,
@@ -8032,6 +8139,7 @@ async fn record_usage_and_append(
     } else if let GatewayUsageOutcome::Interrupted(_, ref reason) = outcome {
         record_gateway_operation_receipt(
             config,
+            Some(runtime),
             identity,
             context,
             status,
@@ -8068,6 +8176,7 @@ async fn record_usage_and_append(
     });
     match connect_sekai_with_timeout(target, Some(runtime.resilience.control_plane_timeout)).await {
         Ok(channel) => {
+            spawn_gateway_recovery_replay(config.clone(), runtime.clone());
             let mut chisei = ChiseiServiceClient::new(channel.clone());
             if let Err(err) = chisei
                 .record_usage(GrpcRequest::new(request_usage.clone()))
@@ -8179,6 +8288,15 @@ async fn record_usage_and_append(
             if let Some(model) = &context.resolved_model {
                 values.insert("resolved_model".to_string(), model.clone());
             }
+            if let Some(profile_version) = &context.profile_version {
+                values.insert("profile_version".to_string(), profile_version.clone());
+            }
+            if let Some(snapshot_version) = &context.capability_snapshot_version {
+                values.insert(
+                    "capability_snapshot_version".to_string(),
+                    snapshot_version.clone(),
+                );
+            }
             if let Some(work_unit_id) = &context.work_unit_id {
                 values.insert("work_unit_id".to_string(), work_unit_id.clone());
             }
@@ -8275,9 +8393,19 @@ async fn record_usage_and_append(
                     values: values.clone(),
                 }],
             };
-            let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
+            let append_result = append_llm_calls_rows(runtime, &mut sekai, append.clone()).await;
             if let Err(append_err) = append_result {
                 warn!(error = %append_err, "chisei-gateway llm_calls append failed");
+                if !append_gateway_recovery(
+                    runtime,
+                    GatewayRecoveryRecord::LlmRow {
+                        values: values.clone(),
+                    },
+                )
+                .await
+                {
+                    error!("chisei-gateway llm_calls recovery spool write failed");
+                }
                 return;
             }
             link_work_unit_usage(&mut sekai, identity, context, &values).await;
@@ -8294,9 +8422,116 @@ async fn record_usage_and_append(
                     "chisei-gateway budget reconciliation queue saturated; cached budget admission disabled"
                 );
             }
+            if !matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
+                let mut values = gateway_recovery_llm_values(
+                    config,
+                    identity,
+                    context,
+                    status,
+                    &outcome,
+                    usage.as_ref(),
+                    elapsed_ms,
+                );
+                values.insert("control_plane_error".into(), "unavailable".into());
+                if !append_gateway_recovery(runtime, GatewayRecoveryRecord::LlmRow { values }).await
+                {
+                    error!("chisei-gateway llm_calls recovery spool write failed");
+                }
+            }
             warn!(error = %err, "chisei-gateway usage append skipped; Chisei unavailable");
         }
     }
+}
+
+fn gateway_recovery_llm_values(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    context: &UsageContext,
+    status: StatusCode,
+    outcome: &GatewayUsageOutcome,
+    usage: Option<&ResponseUsage>,
+    elapsed_ms: i64,
+) -> HashMap<String, String> {
+    let mut values = HashMap::from([
+        ("request_id".into(), context.request_id.clone()),
+        (
+            "receipt_id".into(),
+            gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt),
+        ),
+        (
+            "timestamp_ms".into(),
+            Utc::now().timestamp_millis().to_string(),
+        ),
+        ("agent".into(), identity.agent.clone()),
+        ("project".into(), identity.project.clone()),
+        ("user_id".into(), identity.user_id.clone()),
+        (
+            "provider".into(),
+            capability_provider_id(context.provider).to_string(),
+        ),
+        ("status".into(), status.as_u16().to_string()),
+        ("request_bytes".into(), context.request_bytes.to_string()),
+        ("latency_ms".into(), elapsed_ms.max(0).to_string()),
+    ]);
+    insert_correlation_values(&mut values, context);
+    for (key, value) in [
+        ("key_id", Some(identity.key_id.as_str())),
+        ("model", context.requested_model.as_deref()),
+        ("resolved_model", context.resolved_model.as_deref()),
+        ("profile_version", context.profile_version.as_deref()),
+        (
+            "capability_snapshot_version",
+            context.capability_snapshot_version.as_deref(),
+        ),
+        ("work_unit_id", context.work_unit_id.as_deref()),
+        ("route_bias", context.route_bias.as_deref()),
+        ("policy_scope", context.policy_scope.as_deref()),
+        ("policy_version", context.policy_version.as_deref()),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            values.insert(key.into(), value.into());
+        }
+    }
+    let terminal = match outcome {
+        GatewayUsageOutcome::Incomplete(_, _) => Some("incomplete"),
+        GatewayUsageOutcome::TerminalFailure(_, reason) if reason == "response_cancelled" => {
+            Some("cancelled")
+        }
+        GatewayUsageOutcome::TerminalFailure(_, _) => Some("failed"),
+        GatewayUsageOutcome::Interrupted(_, _) => Some("interrupted"),
+        _ => None,
+    };
+    if let Some(terminal) = terminal {
+        values.insert("terminal_outcome".into(), terminal.into());
+    }
+    if let Some(usage) = usage {
+        values.insert("input_tokens".into(), usage.input_tokens.to_string());
+        values.insert("output_tokens".into(), usage.output_tokens.to_string());
+        values.insert("total_tokens".into(), usage.total_tokens.to_string());
+        if usage.cache_read_input_tokens > 0 {
+            values.insert(
+                "cache_read_input_tokens".into(),
+                usage.cache_read_input_tokens.to_string(),
+            );
+        }
+        if usage.cache_creation_input_tokens > 0 {
+            values.insert(
+                "cache_creation_input_tokens".into(),
+                usage.cache_creation_input_tokens.to_string(),
+            );
+        }
+        if let Some(cost) = estimate_cost_usd_micros(config, context, usage) {
+            values.insert("cost_usd_micros".into(), cost.to_string());
+            values.insert("cost_usd".into(), format_usd_micros(cost));
+        }
+        if usage.cache_read_input_tokens > 0
+            && let Some(savings) = estimate_cache_savings_usd_micros(config, context, usage)
+        {
+            values.insert("cache_savings_usd_micros".into(), savings.to_string());
+            values.insert("cache_savings_usd".into(), format_usd_micros(savings));
+        }
+    }
+    values
 }
 
 async fn emit_budget_threshold_warnings(
@@ -8375,15 +8610,20 @@ async fn emit_budget_threshold_warnings(
 
 async fn record_refusal_and_append(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     context: &UsageContext,
     rejection: &GatewayRejection,
 ) {
-    record_refusal_with_usage_and_append(config, identity, context, rejection, None, false).await;
+    record_refusal_with_usage_and_append(
+        config, runtime, identity, context, rejection, None, false,
+    )
+    .await;
 }
 
 async fn record_refusal_with_usage_and_append(
     config: &GatewayConfig,
+    runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     context: &UsageContext,
     rejection: &GatewayRejection,
@@ -8395,6 +8635,7 @@ async fn record_refusal_with_usage_and_append(
     };
     record_gateway_operation_receipt(
         config,
+        Some(runtime),
         identity,
         context,
         rejection.status,
@@ -8435,6 +8676,15 @@ async fn record_refusal_with_usage_and_append(
     }
     if let Some(model) = &context.resolved_model {
         values.insert("resolved_model".to_string(), model.clone());
+    }
+    if let Some(profile_version) = &context.profile_version {
+        values.insert("profile_version".to_string(), profile_version.clone());
+    }
+    if let Some(snapshot_version) = &context.capability_snapshot_version {
+        values.insert(
+            "capability_snapshot_version".to_string(),
+            snapshot_version.clone(),
+        );
     }
     if let Some(work_unit_id) = &context.work_unit_id {
         values.insert("work_unit_id".to_string(), work_unit_id.clone());
@@ -8477,6 +8727,7 @@ async fn record_refusal_with_usage_and_append(
 
     match connect_sekai_with_timeout(target, Some(configured_control_plane_timeout())).await {
         Ok(channel) => {
+            spawn_gateway_recovery_replay(config.clone(), runtime.clone());
             let mut sekai = SekaiServiceClient::new(channel);
             let append = AppendRowsRequest {
                 dataset_id: "llm_calls".to_string(),
@@ -8484,17 +8735,29 @@ async fn record_refusal_with_usage_and_append(
                     values: values.clone(),
                 }],
             };
-            let append_result = append_llm_calls_rows(&mut sekai, append.clone()).await;
+            let append_result = append_llm_calls_rows(runtime, &mut sekai, append.clone()).await;
             if let Err(append_err) = append_result {
                 warn!(error = %append_err, "chisei-gateway refusal append failed");
+                if !append_gateway_recovery(
+                    runtime,
+                    GatewayRecoveryRecord::LlmRow {
+                        values: values.clone(),
+                    },
+                )
+                .await
+                {
+                    error!("chisei-gateway refusal recovery spool write failed");
+                }
                 return;
             }
             link_work_unit_usage(&mut sekai, identity, context, &values).await;
         }
-        Err(err) => warn!(
-            error = %err,
-            "chisei-gateway refusal append skipped; Chisei unavailable"
-        ),
+        Err(err) => {
+            if !append_gateway_recovery(runtime, GatewayRecoveryRecord::LlmRow { values }).await {
+                error!("chisei-gateway refusal recovery spool write failed");
+            }
+            warn!(error = %err, "chisei-gateway refusal append skipped; Chisei unavailable");
+        }
     }
 }
 
@@ -8871,6 +9134,7 @@ fn build_gateway_operation_receipt(
 #[allow(clippy::too_many_arguments)]
 async fn record_gateway_operation_receipt(
     config: &GatewayConfig,
+    runtime: Option<&GatewayRuntime>,
     identity: &GatewayIdentity,
     context: &UsageContext,
     status: StatusCode,
@@ -8892,41 +9156,105 @@ async fn record_gateway_operation_receipt(
         error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
         return;
     };
-    record_gateway_event(
+    let operation_id = receipt.operation_id.clone();
+    let outcome = if rejection.is_some() {
+        "denied"
+    } else {
+        "recorded"
+    };
+    let persisted = record_gateway_event(
         config,
         &identity.agent,
         "operation.receipt.upsert",
         "gateway operation completed",
-        if rejection.is_some() {
-            "denied"
-        } else {
-            "recorded"
-        },
+        outcome,
         HashMap::from([
-            ("operation_id".into(), receipt.operation_id),
-            ("receipt_json".into(), receipt_json),
+            ("operation_id".into(), operation_id.clone()),
+            ("receipt_json".into(), receipt_json.clone()),
         ]),
     )
     .await;
+    if !persisted
+        && let Some(runtime) = runtime
+        && !append_gateway_recovery(
+            runtime,
+            GatewayRecoveryRecord::Receipt {
+                actor: identity.agent.clone(),
+                operation_id,
+                receipt_json,
+                outcome: outcome.into(),
+            },
+        )
+        .await
+    {
+        error!("gateway operation receipt recovery spool write failed");
+    }
 }
 
 async fn append_llm_calls_rows(
+    runtime: &GatewayRuntime,
     sekai: &mut SekaiServiceClient<GatewayClient>,
     append: AppendRowsRequest,
 ) -> Result<(), tonic::Status> {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    if !runtime.llm_calls_schema_reconciled.load(Ordering::Acquire)
+        && now_ms
+            >= runtime
+                .llm_calls_schema_retry_after_ms
+                .load(Ordering::Acquire)
+    {
+        let _guard = runtime.llm_calls_schema_lock.lock().await;
+        let claimed_at_ms = Utc::now().timestamp_millis().max(0) as u64;
+        if !runtime.llm_calls_schema_reconciled.load(Ordering::Acquire)
+            && claimed_at_ms
+                >= runtime
+                    .llm_calls_schema_retry_after_ms
+                    .load(Ordering::Acquire)
+        {
+            runtime.llm_calls_schema_retry_after_ms.store(
+                claimed_at_ms.saturating_add(SCHEMA_RECONCILIATION_RETRY_MS),
+                Ordering::Release,
+            );
+            match ensure_llm_calls_dataset(sekai).await {
+                Ok(true) => runtime
+                    .llm_calls_schema_reconciled
+                    .store(true, Ordering::Release),
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(%error, "llm_calls schema reconciliation deferred");
+                }
+            }
+        }
+    }
     match sekai.append_rows(gateway_request(append.clone())).await {
         Ok(_) => Ok(()),
-        Err(err) if err.code() == tonic::Code::NotFound => {
-            ensure_llm_calls_dataset(sekai).await?;
+        Err(error) if error.code() == tonic::Code::NotFound => {
+            let _guard = runtime.llm_calls_schema_lock.lock().await;
+            match sekai.append_rows(gateway_request(append.clone())).await {
+                Ok(_) => return Ok(()),
+                Err(error) if error.code() == tonic::Code::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            runtime
+                .llm_calls_schema_reconciled
+                .store(false, Ordering::Release);
+            runtime.llm_calls_schema_retry_after_ms.store(
+                now_ms.saturating_add(SCHEMA_RECONCILIATION_RETRY_MS),
+                Ordering::Release,
+            );
+            let reconciled = ensure_llm_calls_dataset(sekai).await?;
+            runtime
+                .llm_calls_schema_reconciled
+                .store(reconciled, Ordering::Release);
             sekai.append_rows(gateway_request(append)).await.map(|_| ())
         }
-        Err(err) => Err(err),
+        Err(error) => Err(error),
     }
 }
 
 async fn ensure_llm_calls_dataset(
     sekai: &mut SekaiServiceClient<GatewayClient>,
-) -> Result<(), tonic::Status> {
+) -> Result<bool, tonic::Status> {
     let columns = LLM_CALLS_COLUMNS
         .iter()
         .copied()
@@ -8949,7 +9277,7 @@ async fn ensure_llm_calls_dataset(
         }))
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(error)
             if error.code() == tonic::Code::InvalidArgument
                 && error.message().contains("UNIQUE constraint failed") =>
@@ -8960,8 +9288,8 @@ async fn ensure_llm_calls_dataset(
                 }))
                 .await
             {
-                Ok(_) => Ok(()),
-                Err(error) if error.code() == tonic::Code::Unimplemented => Ok(()),
+                Ok(_) => Ok(true),
+                Err(error) if error.code() == tonic::Code::Unimplemented => Ok(false),
                 Err(error) => Err(error),
             }
         }
@@ -9442,6 +9770,285 @@ struct LocalGatewayAuditEvent {
     reason: String,
     outcome: String,
     evidence: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum GatewayRecoveryRecord {
+    Receipt {
+        actor: String,
+        operation_id: String,
+        receipt_json: String,
+        outcome: String,
+    },
+    LlmRow {
+        values: HashMap<String, String>,
+    },
+}
+
+fn recovery_spool_path(runtime: &GatewayRuntime) -> Option<PathBuf> {
+    runtime
+        .audit_spool_path
+        .as_ref()
+        .map(|path| PathBuf::from(format!("{}.recovery", path.display())))
+}
+
+async fn append_gateway_recovery(runtime: &GatewayRuntime, record: GatewayRecoveryRecord) -> bool {
+    let Some(path) = recovery_spool_path(runtime) else {
+        return false;
+    };
+    let Ok(mut line) = serde_json::to_vec(&record) else {
+        return false;
+    };
+    line.push(b'\n');
+    let max_bytes = runtime.audit_spool_max_bytes;
+    let _guard = runtime.audit_spool_lock.lock().await;
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let current_bytes = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let needs_separator = if current_bytes == 0 {
+            false
+        } else {
+            let mut existing = std::fs::OpenOptions::new().read(true).open(&path)?;
+            existing.seek(SeekFrom::End(-1))?;
+            let mut tail = [0u8; 1];
+            existing.read_exact(&mut tail)?;
+            tail[0] != b'\n'
+        };
+        if current_bytes
+            .saturating_add(line.len() as u64)
+            .saturating_add(u64::from(needs_separator))
+            > max_bytes
+        {
+            return Err(std::io::Error::other("gateway recovery spool is full"));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        if needs_separator {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(&line)?;
+        file.sync_all()
+    })
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+fn spawn_gateway_recovery_replay(config: GatewayConfig, runtime: GatewayRuntime) {
+    if runtime.recovery_replay_running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        let initial_records = match recovery_spool_path(&runtime) {
+            Some(path) => tokio::fs::read(path)
+                .await
+                .map(|bytes| {
+                    bytes
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .count()
+                })
+                .unwrap_or(0),
+            None => 0,
+        };
+        let max_batches = initial_records.div_ceil(RECOVERY_REPLAY_YIELD_INTERVAL);
+        for _ in 0..max_batches {
+            let (pending, progressed, deferred) = replay_gateway_recovery(&config, &runtime).await;
+            if !pending || (!progressed && !deferred) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        runtime
+            .recovery_replay_running
+            .store(false, Ordering::Release);
+    });
+}
+
+async fn llm_recovery_row_exists(
+    sekai: &mut SekaiServiceClient<GatewayClient>,
+    values: &HashMap<String, String>,
+) -> Result<bool, tonic::Status> {
+    let Some((column, value)) = ["receipt_id", "request_id"].into_iter().find_map(|column| {
+        values
+            .get(column)
+            .filter(|value| !value.is_empty())
+            .map(|value| (column, value))
+    }) else {
+        return Ok(false);
+    };
+    match sekai
+        .query_rows(gateway_request(QueryRowsRequest {
+            dataset_id: "llm_calls".into(),
+            query: Some(RowQuery {
+                filters: vec![RowFilter {
+                    column: column.into(),
+                    op: "eq".into(),
+                    value: value.clone(),
+                }],
+                columns: vec![column.into()],
+                limit: 1,
+                offset: 0,
+            }),
+        }))
+        .await
+    {
+        Ok(response) => Ok(!response.into_inner().rows.is_empty()),
+        Err(error) if error.code() == tonic::Code::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn replay_gateway_recovery(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+) -> (bool, bool, bool) {
+    let Some(path) = recovery_spool_path(runtime) else {
+        return (false, false, false);
+    };
+    if !tokio::fs::metadata(&path)
+        .await
+        .is_ok_and(|metadata| metadata.len() > 0)
+    {
+        return (false, false, false);
+    }
+    let Some(target) = config.chisei_grpc_target.as_deref() else {
+        return (false, false, false);
+    };
+    let Ok(channel) = connect_sekai_as_gateway_with_timeout(
+        target,
+        Some(runtime.resilience.control_plane_timeout),
+    )
+    .await
+    else {
+        return (true, false, false);
+    };
+    let _guard = runtime.audit_spool_lock.lock().await;
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return (false, false, false);
+    };
+    let mut failed = Vec::new();
+    let mut deferred = Vec::new();
+    let mut attempted = 0usize;
+    let mut progressed = false;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if attempted >= RECOVERY_REPLAY_YIELD_INTERVAL {
+            deferred.push(line.to_vec());
+            continue;
+        }
+        attempted += 1;
+        let Ok(record) = serde_json::from_slice::<GatewayRecoveryRecord>(line) else {
+            warn!("discarding malformed gateway recovery record");
+            continue;
+        };
+        let replayed = match record {
+            GatewayRecoveryRecord::Receipt {
+                actor,
+                operation_id,
+                receipt_json,
+                outcome,
+            } => ChiseiServiceClient::new(channel.clone())
+                .record_gateway_audit(gateway_request(RecordGatewayAuditRequest {
+                    event: Some(GatewayAuditEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: Utc::now().timestamp_millis(),
+                        actor,
+                        action: "operation.receipt.upsert".into(),
+                        reason: "replayed gateway operation receipt".into(),
+                        evidence: HashMap::from([
+                            ("operation_id".into(), operation_id.clone()),
+                            ("receipt_json".into(), receipt_json),
+                        ]),
+                        target_id: operation_id,
+                        outcome,
+                    }),
+                }))
+                .await
+                .is_ok(),
+            GatewayRecoveryRecord::LlmRow { values } => {
+                let mut sekai = SekaiServiceClient::new(channel.clone());
+                match llm_recovery_row_exists(&mut sekai, &values).await {
+                    Ok(true) => true,
+                    Ok(false) => append_llm_calls_rows(
+                        runtime,
+                        &mut sekai,
+                        AppendRowsRequest {
+                            dataset_id: "llm_calls".into(),
+                            rows: vec![Row { values }],
+                        },
+                    )
+                    .await
+                    .is_ok(),
+                    Err(_) => false,
+                }
+            }
+        };
+        if !replayed {
+            failed.push(line.to_vec());
+        } else {
+            progressed = true;
+        }
+    }
+    let had_deferred = !deferred.is_empty();
+    deferred.extend(failed);
+    let pending = !deferred.is_empty();
+    let rewritten = deferred
+        .into_iter()
+        .flat_map(|mut line| {
+            line.push(b'\n');
+            line
+        })
+        .collect::<Vec<_>>();
+    let path_for_log = path.clone();
+    let rewrite_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        if rewritten.is_empty() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => sync_parent_directory(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            let temporary =
+                PathBuf::from(format!("{}.{}.tmp", path.display(), uuid::Uuid::new_v4()));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let result = (|| {
+                let mut file = options.open(&temporary)?;
+                file.write_all(&rewritten)?;
+                file.sync_all()?;
+                std::fs::rename(&temporary, &path)?;
+                sync_parent_directory(&path)
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(temporary);
+            }
+            result
+        }
+    })
+    .await;
+    if !rewrite_result.is_ok_and(|result| result.is_ok()) {
+        error!(path = %path_for_log.display(), "gateway recovery spool rewrite failed");
+        return (true, false, false);
+    }
+    (pending, progressed, had_deferred)
 }
 
 fn bounded_audit_text(value: &str, max_chars: usize) -> String {
@@ -10423,6 +11030,113 @@ async fn response_from_upstream(
     client_response_model: Option<String>,
 ) -> Response<Body> {
     let status = upstream.status();
+    if context.responses_profile && !status.is_success() {
+        let retry_after = upstream
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .cloned();
+        let mut upstream_stream = upstream.bytes_stream();
+        let mut buffered = Vec::new();
+        let mut body_error = None;
+        while let Some(chunk) = upstream_stream.next().await {
+            match chunk {
+                Ok(chunk)
+                    if buffered.len().saturating_add(chunk.len()) <= DEFAULT_MAX_REQUEST_BYTES =>
+                {
+                    buffered.extend_from_slice(&chunk);
+                }
+                Ok(_) => {
+                    body_error = Some("upstream error response exceeds the gateway limit".into());
+                    break;
+                }
+                Err(error) => {
+                    body_error = Some(safe_upstream_error_reason(
+                        context.provider,
+                        "error response",
+                        &error,
+                    ));
+                    break;
+                }
+            }
+        }
+        let bytes = match body_error {
+            None => Bytes::from(buffered),
+            Some(reason) => {
+                let rejection = GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_invalid_response".into(),
+                    reason,
+                    rejected_route: None,
+                    retry_safety: Some("ambiguous"),
+                };
+                record_usage_and_append(
+                    config,
+                    runtime,
+                    identity,
+                    None,
+                    None,
+                    &context,
+                    GatewayUsageOutcome::AccountingOnly(rejection.status),
+                )
+                .await;
+                record_refusal_with_usage_and_append(
+                    config, runtime, identity, &context, &rejection, None, true,
+                )
+                .await;
+                return json_error_with_retry_safety(
+                    rejection.status,
+                    &rejection.error_type,
+                    &rejection.reason,
+                    "ambiguous",
+                );
+            }
+        };
+        let (usage, observation) = extract_buffered_body_usage(&bytes);
+        let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
+                    .or_else(|| value.get("message"))
+                    .and_then(|message| message.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("upstream provider returned HTTP {status}"));
+        record_usage_and_append(
+            config,
+            runtime,
+            identity,
+            usage,
+            observation,
+            &context,
+            GatewayUsageOutcome::TerminalFailure(status, "upstream_http_error".into()),
+        )
+        .await;
+        let (code, safety) = match status.as_u16() {
+            400 | 404 | 405 | 409 | 413 | 422 => ("invalid_request", "safe"),
+            401 | 403 => ("authentication_error", "safe"),
+            402 => ("upstream_unavailable", "safe"),
+            429 => ("rate_limited", "safe"),
+            408 => ("upstream_timeout", "ambiguous"),
+            400..=499 => ("invalid_request", "safe"),
+            300..=399 => ("upstream_invalid_response", "ambiguous"),
+            500..=599 => ("upstream_unavailable", "ambiguous"),
+            _ => ("upstream_unavailable", "safe"),
+        };
+        let mut response = json_error_with_retry_safety(status, code, &message, safety);
+        if let Some(value) = retry_after
+            && value
+                .to_str()
+                .ok()
+                .and_then(retry_after_value_duration)
+                .is_some()
+        {
+            response
+                .headers_mut()
+                .insert(reqwest::header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     if status.is_redirection() {
         record_usage_and_append(
             config,
@@ -10501,7 +11215,18 @@ async fn response_from_upstream(
             let mut client_gone = false;
             let mut terminal_forwarded = false;
             let mut interruption_forwarded = false;
-            while let Some(chunk) = upstream_stream.next().await {
+            let mut terminal_validation_deadline = None;
+            loop {
+                let next = if let Some(deadline) = terminal_validation_deadline {
+                    tokio::time::timeout_at(deadline, upstream_stream.next())
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    upstream_stream.next().await
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
                 match chunk {
                     Ok(bytes) => {
                         // Always tap the upstream (OpenAI) bytes for usage, even
@@ -10535,6 +11260,14 @@ async fn response_from_upstream(
                             None => None,
                         };
                         usage_tap.push(&bytes);
+                        if terminal_validation_deadline.is_none()
+                            && responses_validator
+                                .as_ref()
+                                .is_some_and(|validator| validator.terminal_seen)
+                        {
+                            terminal_validation_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                        }
                         if enforce_responses_terminal
                             && usage_tap.terminal == Some(ResponsesTerminal::Invalid)
                         {
@@ -10712,7 +11445,7 @@ async fn response_from_upstream(
                             )
                             .await;
                             record_refusal_with_usage_and_append(
-                                config, identity, &context, &rejection, usage, true,
+                                config, runtime, identity, &context, &rejection, usage, true,
                             )
                             .await;
                             return json_error(
@@ -10745,7 +11478,7 @@ async fn response_from_upstream(
                     )
                     .await;
                     record_refusal_with_usage_and_append(
-                        config, identity, &context, &rejection, usage, true,
+                        config, runtime, identity, &context, &rejection, usage, true,
                     )
                     .await;
                     return json_error(rejection.status, &rejection.error_type, &rejection.reason);
@@ -10787,8 +11520,18 @@ async fn response_from_upstream(
                 rejected_route: None,
                 retry_safety: Some("ambiguous"),
             };
+            record_usage_and_append(
+                config,
+                runtime,
+                identity,
+                None,
+                None,
+                &context,
+                GatewayUsageOutcome::AccountingOnly(rejection.status),
+            )
+            .await;
             record_refusal_with_usage_and_append(
-                config, identity, &context, &rejection, None, true,
+                config, runtime, identity, &context, &rejection, None, true,
             )
             .await;
             json_error(rejection.status, &rejection.error_type, &rejection.reason)
@@ -10991,7 +11734,7 @@ fn stable_gateway_error_code(error_type: &str) -> &'static str {
         | "governance_precondition" => "request_conflict",
         "rate_limited" | "rate_limit_exceeded" => "rate_limited",
         "upstream_rate_limited" => "rate_limited",
-        "upstream_quota_exhausted" => "quota_exhausted",
+        "upstream_quota_exhausted" => "upstream_unavailable",
         "upstream_timeout" => "upstream_timeout",
         "upstream_unavailable"
         | "provider_registry_unavailable"
@@ -11220,6 +11963,21 @@ mod tests {
         .unwrap_err();
         assert!(rejection.reason.contains("built_in_tool:web_search"));
 
+        let continuation = br#"{
+            "model":"gpt-5.5",
+            "previous_response_id":"resp_other_caller",
+            "input":[{"type":"message","role":"user","content":"continue"}]
+        }"#;
+        let rejection = enforce_provider_capabilities(
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            None,
+            CapabilityRequestSurface::Responses,
+            continuation,
+        )
+        .unwrap_err();
+        assert_eq!(rejection.error_type, "capability_unsupported");
+        assert!(rejection.reason.contains("ownership"));
+
         let chat_tools = br#"{
             "model":"native/mistral",
             "tools":[{"type":"function","function":{"name":"read"}}]
@@ -11321,6 +12079,7 @@ mod tests {
             crate::provider_profile::CAPABILITY_MATRIX_VERSION
         );
         assert!(matrix.capabilities("openai").unwrap().parallel_tools);
+        assert!(!matrix.capabilities("openai").unwrap().provider_continuation);
         assert!(!matrix.capabilities("ollama").unwrap().parallel_tools);
         assert!(!matrix.capabilities("anthropic").unwrap().responses);
     }
@@ -11876,6 +12635,32 @@ mod tests {
         assert_eq!(model_call.attributes["usage_status"], "unknown");
         assert!(!model_call.attributes.contains_key("input_tokens"));
         assert!(!model_call.attributes.contains_key("output_tokens"));
+        let circuit_rejection = GatewayRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "upstream_unavailable".into(),
+            reason: "provider circuit is open".into(),
+            rejected_route: None,
+            retry_safety: Some("safe"),
+        };
+        let circuit_receipt = build_gateway_operation_receipt(
+            &identity,
+            &context,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            None,
+            Some(ReceiptRejection {
+                rejection: &circuit_rejection,
+                model_attempted: false,
+            }),
+            None,
+        );
+        assert!(circuit_receipt.events.iter().all(|event| !matches!(
+            event.kind,
+            ReceiptEventKind::AttemptStarted
+                | ReceiptEventKind::ModelCalled
+                | ReceiptEventKind::ArtifactProduced
+                | ReceiptEventKind::VerificationRecorded
+        )));
         assert_eq!(receipt.initiating_actor, identity.agent);
         assert!(receipt.completeness().complete);
         let receipt_db = SekaiDb::new(":memory:").unwrap();
@@ -12659,6 +13444,16 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn every_routable_lifecycle_state_requires_admission() {
+        for state in ["enabled", "degraded", "retiring"] {
+            assert!(lifecycle_state_is_routable(state), "{state}");
+        }
+        for state in ["experimental", "canary", "disabled"] {
+            assert!(!lifecycle_state_is_routable(state), "{state}");
+        }
+    }
+
     #[tokio::test]
     async fn oversized_egress_bodies_are_not_cached() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
@@ -12697,6 +13492,56 @@ mod tests {
                 None,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_recovery_spool_replays_llm_rows() {
+        let directory =
+            std::env::temp_dir().join(format!("chisei-recovery-{}", uuid::Uuid::new_v4()));
+        let audit_path = directory.join("audit.jsonl");
+        let recovery_path = PathBuf::from(format!("{}.recovery", audit_path.display()));
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_audit_spool_path(Some(audit_path.clone()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(&recovery_path, br#"{"kind":"llm_row""#)
+            .await
+            .unwrap();
+        let values = HashMap::from([
+            ("request_id".into(), "recovered-request".into()),
+            ("timestamp_ms".into(), "1".into()),
+            ("status".into(), "200".into()),
+        ]);
+        assert!(
+            append_gateway_recovery(
+                &runtime,
+                GatewayRecoveryRecord::LlmRow {
+                    values: values.clone(),
+                },
+            )
+            .await
+        );
+        assert!(
+            append_gateway_recovery(
+                &runtime,
+                GatewayRecoveryRecord::LlmRow {
+                    values: values.clone(),
+                },
+            )
+            .await
+        );
+        let (target, db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(target);
+        replay_gateway_recovery(&config, &runtime).await;
+        let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.get("request_id") == Some(&"recovered-request".into()))
+                .count(),
+            1
+        );
+        assert!(!recovery_path.exists());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
@@ -12882,6 +13727,14 @@ mod tests {
             retry_after_duration(&headers),
             Some(Duration::from_secs(MAX_PROVIDER_RETRY_AFTER_SECS))
         );
+
+        let future = std::time::SystemTime::now() + Duration::from_secs(120);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap(),
+        );
+        let parsed = retry_after_duration(&headers).unwrap();
+        assert!((119..=120).contains(&parsed.as_secs()));
     }
 
     #[test]
@@ -13260,6 +14113,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_rewrite_uses_promoted_registry_models() {
+        let mut registry = ProviderRegistry::built_in();
+        registry
+            .lifecycle_overrides
+            .push(crate::provider_profile::RegistryLifecycleOverride {
+                target_kind: "provider".into(),
+                target: "meta".into(),
+                state: "enabled".into(),
+                version: 1,
+                actor: "operator".into(),
+                reason: "verified promotion".into(),
+                changed_at: "2026-07-16T00:00:00Z".into(),
+            });
+        registry.state_version = 1;
+        let resolved = registry.resolve_model("meta/muse-spark-1.1").unwrap();
+        let prepared = rewrite_resolved_request_model(
+            br#"{"model":"meta/muse-spark-1.1","input":"hello"}"#,
+            &resolved,
+        )
+        .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
+        assert_eq!(body["model"], "muse-spark-1.1");
+    }
+
+    #[tokio::test]
+    async fn request_preparation_rejects_unconfigured_native_endpoint() {
+        let registry = ProviderRegistry::built_in();
+        let resolved = registry.resolve_model("native/mistral").unwrap();
+        let identity = GatewayIdentity {
+            agent: "agent:test".into(),
+            project: "test".into(),
+            user_id: "user:test".into(),
+            key_id: "key:test".into(),
+            tier: "low-risk".into(),
+        };
+        let mut config = routing_config();
+        config.native_base_url = None;
+        let response = match prepare_upstream_request(
+            &config,
+            &identity,
+            &"/v1/responses".parse().unwrap(),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::OpenAi(OpenAiRuntime::Native),
+            br#"{"model":"native/mistral","input":"hello"}"#.to_vec(),
+            Some(&resolved),
+        )
+        .await
+        {
+            Ok(_) => panic!("native route unexpectedly used another provider endpoint"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
     #[tokio::test]
     async fn provider_contact_guard_refreshes_durable_registry_state() {
         let directory = std::env::temp_dir().join(format!(
@@ -13540,8 +14450,8 @@ mod tests {
         config.anthropic_base_url = normalize_anthropic_base_url("https://api.anthropic.com");
         let uri: Uri = "/v1/messages".parse().unwrap();
         assert_eq!(
-            upstream_url_for_provider(&config, &uri, ProviderKind::Anthropic),
-            "https://api.anthropic.com/v1/messages"
+            upstream_url_for_provider(&config, &uri, ProviderKind::Anthropic).as_deref(),
+            Some("https://api.anthropic.com/v1/messages")
         );
     }
 
@@ -13551,16 +14461,29 @@ mod tests {
         let uri: Uri = "/v1/responses".parse().unwrap();
         // The same Responses wire path routes to different backends by provider.
         assert_eq!(
-            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::OpenAi)),
-            "https://openai.example/v1/responses"
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::OpenAi))
+                .as_deref(),
+            Some("https://openai.example/v1/responses")
         );
         assert_eq!(
-            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Ollama)),
-            "http://localhost:11434/v1/responses"
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Ollama))
+                .as_deref(),
+            Some("http://localhost:11434/v1/responses")
         );
         assert_eq!(
-            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Native)),
-            "http://localhost:9999/v1/responses"
+            upstream_url_for_provider(&config, &uri, ProviderKind::OpenAi(OpenAiRuntime::Native))
+                .as_deref(),
+            Some("http://localhost:9999/v1/responses")
+        );
+        let mut unconfigured = config.clone();
+        unconfigured.native_base_url = None;
+        assert_eq!(
+            upstream_url_for_provider(
+                &unconfigured,
+                &uri,
+                ProviderKind::OpenAi(OpenAiRuntime::Native)
+            ),
+            None
         );
         assert_eq!(
             ProviderKind::from_model("xai/grok-4.5"),
@@ -14384,8 +15307,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_aliases_are_reserved_before_model_refusals() {
-        let (chisei_target, _db) = spawn_control_plane().await;
+    async fn invalid_models_do_not_consume_request_aliases() {
+        let (chisei_target, db) = spawn_control_plane().await;
         let mut config = routing_config();
         config.chisei_grpc_target = Some(chisei_target);
         config.no_preflight = true;
@@ -14406,9 +15329,78 @@ mod tests {
 
         let first = send().send().await.unwrap();
         assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            db.find_operation_receipt_by_lookup_request_id("early-refusal-attempt", None, None)
+                .unwrap()
+                .is_none()
+        );
         let second = send().send().await.unwrap();
-        assert_eq!(second.status(), StatusCode::CONFLICT);
-        assert!(second.text().await.unwrap().contains("request_id_conflict"));
+        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_refusals_do_not_strand_request_aliases() {
+        let (chisei_target, db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        config.no_preflight = true;
+        let gateway_base = spawn_gateway_with_config(config).await;
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{gateway_base}/v1/responses"))
+                .bearer_auth("sk-chisei-codex-app")
+                .header("x-chisei-request-id", "pre-dispatch-refusal")
+                .json(&serde_json::json!({
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "chisei_context": {
+                        "objects": [{"ref": "ticker:AAPL", "fields": ["score"]}]
+                    }
+                }))
+        };
+
+        for _ in 0..2 {
+            let response = send().send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_ne!(response.status(), StatusCode::CONFLICT);
+        }
+        assert!(
+            db.find_operation_receipt_by_lookup_request_id("pre-dispatch-refusal", None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_provider_credentials_do_not_strand_request_aliases() {
+        let (chisei_target, _db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        config.openai_api_key = None;
+        config.rewrite_openai_passthrough_auth = true;
+        let gateway_base = spawn_gateway_with_config(config).await;
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{gateway_base}/v1/responses"))
+                .bearer_auth("sk-chisei-codex-app")
+                .header("x-chisei-request-id", "missing-provider-credential")
+                .header("x-chisei-data-class", "unclassified")
+                .header("x-chisei-action-risk", "low")
+                .json(&serde_json::json!({
+                    "model": "openai/gpt-5.5",
+                    "input": "hello"
+                }))
+        };
+
+        for _ in 0..2 {
+            let response = send().send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert_ne!(status, StatusCode::CONFLICT, "{body}");
+        }
     }
 
     #[tokio::test]
@@ -18034,7 +19026,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
     }
 
     #[tokio::test]
-    async fn errors_without_content_type_are_preserved() {
+    async fn responses_errors_without_content_type_are_normalized() {
         for upstream_body in [
             r#"{"error":{"message":"provider rejected request"}}"#,
             "",
@@ -18058,8 +19050,72 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             let status = resp.status();
             let body = resp.text().await.unwrap();
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-            assert_eq!(body, upstream_body);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"]["code"], "invalid_request");
         }
+    }
+
+    #[tokio::test]
+    async fn responses_client_errors_use_stable_error_codes() {
+        for (status, expected_code) in [
+            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::PAYMENT_REQUIRED, "upstream_unavailable"),
+            (StatusCode::FORBIDDEN, "authentication_error"),
+            (StatusCode::CONFLICT, "invalid_request"),
+        ] {
+            let (upstream_base, _requests) = spawn_fake_upstream_with_status(
+                r#"{"error":{"code":"vendor_specific","message":"rejected"}}"#,
+                "application/json",
+                status,
+                None,
+            )
+            .await;
+            let gateway_base = spawn_gateway_with_preflight(upstream_base, true).await;
+
+            let resp = reqwest::Client::new()
+                .post(format!("{gateway_base}/v1/responses"))
+                .bearer_auth("sk-chisei-codex-app")
+                .header("x-chisei-data-class", "unclassified")
+                .header("x-chisei-action-risk", "low")
+                .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), status);
+            assert_eq!(resp.headers()[&X_CHISEI_RETRY_SAFETY], "safe");
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], expected_code);
+            assert_eq!(body["error"]["message"], "rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_responses_errors_are_normalized() {
+        let upstream_body = r#"{"error":{"code":"vendor_busy","message":"try later"}}"#;
+        let (upstream_base, _requests) = spawn_fake_upstream_with_status(
+            upstream_body,
+            "application/json",
+            StatusCode::TOO_MANY_REQUESTS,
+            None,
+        )
+        .await;
+        let gateway_base = spawn_gateway_with_preflight(upstream_base, true).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/responses"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
+            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()[&X_CHISEI_RETRY_SAFETY], "safe");
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited");
+        assert_eq!(body["error"]["message"], "try later");
     }
 
     #[test]

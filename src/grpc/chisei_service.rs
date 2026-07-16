@@ -70,6 +70,16 @@ fn authenticated_actor<T>(request: &Request<T>) -> String {
         .to_string()
 }
 
+fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
+    if matches!(authenticated_actor(request).as_str(), "root" | "local") {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "evaluation mutation requires control-plane administration",
+        ))
+    }
+}
+
 fn auth_source<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()
@@ -320,26 +330,43 @@ fn pipeline_context_expansion_profile_key(namespace: &str) -> String {
     )
 }
 
-fn evidence_context_profile_key(namespace: &str, evidence_type: &str) -> String {
+fn evidence_context_profile_key(namespace: &str, source_type: &str, evidence_type: &str) -> String {
+    let namespace = namespace.trim();
+    let source_type = source_type.trim();
+    let evidence_type = evidence_type.trim();
     format!(
-        "context-expansion:{}:{}:evidence:{}",
+        "context-expansion:{}:{}:{}:evidence:{}:{}:{}:{}",
         PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION,
-        namespace.trim(),
-        evidence_type.trim()
+        namespace.len(),
+        namespace,
+        source_type.len(),
+        source_type,
+        evidence_type.len(),
+        evidence_type
     )
 }
 
-fn evidence_context_config_ref(evidence_type: &str, with_evidence: bool) -> String {
+fn evidence_context_config_ref(
+    source_type: &str,
+    evidence_type: &str,
+    with_evidence: bool,
+) -> String {
+    let source_type = source_type.trim();
+    let evidence_type = evidence_type.trim();
     format!(
-        "evidence-context:{}:{}:{}",
+        "evidence-context:{}:{}:{}:{}:{}:{}",
         PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION,
         if with_evidence { "with" } else { "without" },
-        evidence_type.trim()
+        source_type.len(),
+        source_type,
+        evidence_type.len(),
+        evidence_type
     )
 }
 
 #[derive(Debug, Clone)]
 struct EvidenceClassGate {
+    source_type: String,
     evidence_type: String,
     gate: crate::chisei::eval::ContextExpansionGate,
     effective_allowed: bool,
@@ -536,17 +563,22 @@ impl ChiseiServiceImpl {
     fn evidence_context_gate(
         &self,
         namespace: &str,
+        source_type: &str,
         evidence_type: &str,
         namespace_gate_allowed: bool,
     ) -> EvidenceClassGate {
         let mut gate = self
             .eval
-            .context_expansion_gate(&evidence_context_profile_key(namespace, evidence_type));
+            .context_expansion_gate(&evidence_context_profile_key(
+                namespace,
+                source_type,
+                evidence_type,
+            ));
         if !gate.baseline_run_id.is_empty() && !gate.candidate_run_id.is_empty() {
             let baseline = self.eval.get_run(&gate.baseline_run_id);
             let candidate = self.eval.get_run(&gate.candidate_run_id);
-            let expected_baseline = evidence_context_config_ref(evidence_type, false);
-            let expected_candidate = evidence_context_config_ref(evidence_type, true);
+            let expected_baseline = evidence_context_config_ref(source_type, evidence_type, false);
+            let expected_candidate = evidence_context_config_ref(source_type, evidence_type, true);
             let invalid_reason = match (baseline.as_ref(), candidate.as_ref()) {
                 (Some(baseline), Some(candidate)) => {
                     let baseline_cases = baseline
@@ -586,6 +618,7 @@ impl ChiseiServiceImpl {
             }
         }
         EvidenceClassGate {
+            source_type: source_type.to_string(),
             evidence_type: evidence_type.to_string(),
             effective_allowed: namespace_gate_allowed && gate.allowed,
             gate,
@@ -597,15 +630,16 @@ impl ChiseiServiceImpl {
         request: &pipe::PipelineRequest,
         namespace_gate_allowed: bool,
     ) -> Result<Vec<EvidenceClassGate>, Status> {
-        pipe::applicable_evidence_types(request, &self.db)
+        pipe::applicable_evidence_classes(request, &self.db)
             .map_err(Status::internal)
             .map(|evidence_types| {
                 evidence_types
                     .into_iter()
-                    .map(|evidence_type| {
+                    .map(|class| {
                         self.evidence_context_gate(
                             &request.namespace,
-                            &evidence_type,
+                            &class.source_type,
+                            &class.evidence_type,
                             namespace_gate_allowed,
                         )
                     })
@@ -624,6 +658,7 @@ impl ChiseiServiceImpl {
             let used_count = references
                 .iter()
                 .filter(|reference| reference.evidence_type == class_gate.evidence_type)
+                .filter(|reference| reference.source_type == class_gate.source_type)
                 .count();
             self.db
                 .record_decision(&crate::sekai::audit::Decision {
@@ -640,6 +675,7 @@ impl ChiseiServiceImpl {
                     },
                     evidence: HashMap::from([
                         ("request_id".into(), request_id.to_string()),
+                        ("source_type".into(), class_gate.source_type.clone()),
                         ("evidence_type".into(), class_gate.evidence_type.clone()),
                         ("profile_key".into(), class_gate.gate.profile_key.clone()),
                         ("iteration_id".into(), class_gate.gate.iteration_id.clone()),
@@ -660,11 +696,19 @@ impl ChiseiServiceImpl {
                         ("used_evidence_count".into(), used_count.to_string()),
                         (
                             "expected_baseline_config_ref".into(),
-                            evidence_context_config_ref(&class_gate.evidence_type, false),
+                            evidence_context_config_ref(
+                                &class_gate.source_type,
+                                &class_gate.evidence_type,
+                                false,
+                            ),
                         ),
                         (
                             "expected_candidate_config_ref".into(),
-                            evidence_context_config_ref(&class_gate.evidence_type, true),
+                            evidence_context_config_ref(
+                                &class_gate.source_type,
+                                &class_gate.evidence_type,
+                                true,
+                            ),
                         ),
                     ]),
                     target_id: namespace.to_string(),
@@ -842,25 +886,28 @@ impl ChiseiServiceImpl {
             template_only,
             expanded_context_items: 0,
             evidence_references: vec![],
+            memory_references: vec![],
             memory_actor: authenticated_actor.into(),
             memory_token_budget: 512,
-            memory_references: vec![],
-            allowed_evidence_types: std::collections::HashSet::new(),
+            allowed_evidence_classes: std::collections::HashSet::new(),
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
         let evidence_context_gates =
             self.applicable_evidence_context_gates(&pipeline_req, context_expansion_gate.allowed)?;
-        let allowed_evidence_types = evidence_context_gates
+        let allowed_evidence_classes = evidence_context_gates
             .iter()
             .filter(|class_gate| class_gate.effective_allowed)
-            .map(|class_gate| class_gate.evidence_type.clone())
+            .map(|class_gate| pipe::EvidenceContextClass {
+                source_type: class_gate.source_type.clone(),
+                evidence_type: class_gate.evidence_type.clone(),
+            })
             .collect::<HashSet<_>>();
         let initial_run = self.pipeline.run_with_context_admission(
             &mut pipeline_req,
             &self.db,
             context_expansion_gate.allowed,
-            allowed_evidence_types.clone(),
+            allowed_evidence_classes.clone(),
         );
         let fallback_runtime = pipeline_req.runtime.clone();
         let (initial_runtime, initial_model) = self
@@ -902,16 +949,16 @@ impl ChiseiServiceImpl {
                     template_only,
                     expanded_context_items: 0,
                     evidence_references: vec![],
+                    memory_references: vec![],
                     memory_actor: authenticated_actor.into(),
                     memory_token_budget: 512,
-                    memory_references: vec![],
-                    allowed_evidence_types: std::collections::HashSet::new(),
+                    allowed_evidence_classes: std::collections::HashSet::new(),
                 };
                 let local_run = self.pipeline.run_with_context_admission(
                     &mut local_pipeline_req,
                     &self.db,
                     context_expansion_gate.allowed,
-                    allowed_evidence_types,
+                    allowed_evidence_classes,
                 );
                 let (local_runtime, local_model) = self
                     .resolve_model_for_run(
@@ -1208,6 +1255,11 @@ impl ChiseiServiceImpl {
                 .iter()
                 .map(context_evidence_reference)
                 .collect(),
+            memory_references: run
+                .memory_references
+                .iter()
+                .map(memory_context_reference)
+                .collect(),
         })
     }
 
@@ -1220,6 +1272,29 @@ impl ChiseiServiceImpl {
         let inserted_plan_id = plan.plan_id.clone();
         plans.insert(inserted_plan_id.clone(), plan);
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
+    }
+
+    fn record_execution_memory_injections(
+        &self,
+        request_id: &str,
+        actor: &str,
+        references: &[MemoryContextReference],
+    ) -> Result<(), Status> {
+        for reference in references {
+            self.db
+                .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
+                    memory_id: reference.memory_id.clone(),
+                    memory_version: reference.memory_version,
+                    action: "injected".into(),
+                    from_state: Some("active".into()),
+                    to_state: "active".into(),
+                    actor: actor.into(),
+                    reason: format!("pipeline request {request_id}"),
+                    recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .map_err(Status::internal)?;
+        }
+        Ok(())
     }
 
     fn record_planned_operation(&self, plan: &ExecutionPlan, actor: &str) -> Result<(), String> {
@@ -1339,6 +1414,23 @@ impl ChiseiServiceImpl {
                         ),
                         content_hash: Some(reference.content_digest.clone()),
                         disclosed_fields: reference.disclosed_fields.clone(),
+                        omitted: false,
+                        omission_reason: None,
+                    }),
+            );
+        events[1]
+            .references
+            .extend(
+                plan.memory_references
+                    .iter()
+                    .map(|reference| GovernedReference {
+                        kind: "kioku_memory".into(),
+                        reference: format!(
+                            "memory:{}@{}",
+                            reference.memory_id, reference.memory_version
+                        ),
+                        content_hash: None,
+                        disclosed_fields: vec!["claim".into()],
                         omitted: false,
                         omission_reason: None,
                     }),
@@ -2373,7 +2465,7 @@ fn validate_policy_provider_pairs(policy: &Policy) -> Result<(), String> {
     {
         if !matches!(
             runtime.as_str(),
-            "openai" | "anthropic" | "ollama" | "native"
+            "openai" | "anthropic" | "ollama" | "native" | "xai" | "meta"
         ) {
             return Err(format!("unsupported policy runtime {runtime:?}"));
         }
@@ -3286,6 +3378,9 @@ impl ChiseiService for ChiseiServiceImpl {
             })
             .filter(|candidate| candidate != &model)
             .filter(|candidate| {
+                final_runtime_for_model(effective_policy.as_ref(), &runtime, candidate).is_ok()
+            })
+            .filter(|candidate| {
                 let provider = crate::llm::provider_name(candidate);
                 !safe_only
                     || crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers)
@@ -3388,24 +3483,27 @@ impl ChiseiService for ChiseiServiceImpl {
             template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
             expanded_context_items: 0,
             evidence_references: vec![],
-            memory_actor: actor,
-            memory_token_budget: 512,
             memory_references: vec![],
-            allowed_evidence_types: std::collections::HashSet::new(),
+            memory_actor: actor.clone(),
+            memory_token_budget: 512,
+            allowed_evidence_classes: std::collections::HashSet::new(),
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
         let evidence_context_gates =
             self.applicable_evidence_context_gates(&pr, context_expansion_gate.allowed)?;
-        let allowed_evidence_types = evidence_context_gates
+        let allowed_evidence_classes = evidence_context_gates
             .iter()
             .filter(|class_gate| class_gate.effective_allowed)
-            .map(|class_gate| class_gate.evidence_type.clone())
+            .map(|class_gate| pipe::EvidenceContextClass {
+                source_type: class_gate.source_type.clone(),
+                evidence_type: class_gate.evidence_type.clone(),
+            })
             .collect::<HashSet<_>>();
         let result = self.pipeline.run_with_context_admission(
             &mut pr,
             &self.db,
             context_expansion_gate.allowed,
-            allowed_evidence_types,
+            allowed_evidence_classes,
         );
         self.record_context_expansion_gate(
             &pr.request_id,
@@ -3797,6 +3895,11 @@ impl ChiseiService for ChiseiServiceImpl {
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
+        self.record_execution_memory_injections(
+            &input.request_id,
+            &actor,
+            &plan.memory_references,
+        )?;
         let chat = match execute_chat_request(&self.config, self.budget.clone(), llm_req).await {
             Ok(chat) => chat,
             Err(status) => {
@@ -3991,6 +4094,11 @@ impl ChiseiService for ChiseiServiceImpl {
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
+        self.record_execution_memory_injections(
+            &input.request_id,
+            &actor,
+            &plan.memory_references,
+        )?;
         let chat_stream =
             match execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await {
                 Ok(stream) => stream,
@@ -4582,6 +4690,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<CreateEvalSuiteRequest>,
     ) -> Result<Response<CreateEvalSuiteResponse>, Status> {
+        require_eval_admin(&req)?;
         let s = req
             .into_inner()
             .suite
@@ -4669,6 +4778,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<CreateEvalRunRequest>,
     ) -> Result<Response<CreateEvalRunResponse>, Status> {
+        require_eval_admin(&req)?;
         let req = req.into_inner();
         let r = req.run.ok_or(Status::invalid_argument("run required"))?;
         let run = crate::chisei::eval::Run {
@@ -4752,6 +4862,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<TrackEvalIterationRequest>,
     ) -> Result<Response<TrackEvalIterationResponse>, Status> {
+        require_eval_admin(&req)?;
         let r = req.into_inner();
         if r.suite_id.is_empty() || r.run_id.is_empty() || r.changed_file.is_empty() {
             return Err(Status::invalid_argument(
@@ -4823,15 +4934,20 @@ impl ChiseiService for ChiseiServiceImpl {
     ) -> Result<Response<GetEvidenceContextGateResponse>, Status> {
         let request = req.into_inner();
         let namespace = request.namespace.trim();
+        let source_type = request.source_type.trim();
         let evidence_type = request.evidence_type.trim();
-        if namespace.is_empty() || evidence_type.is_empty() {
+        if namespace.is_empty() || source_type.is_empty() || evidence_type.is_empty() {
             return Err(Status::invalid_argument(
-                "namespace and evidence_type are required",
+                "namespace, source_type, and evidence_type are required",
             ));
         }
         let namespace_gate = self.pipeline_context_expansion_gate(namespace);
-        let class_gate =
-            self.evidence_context_gate(namespace, evidence_type, namespace_gate.allowed);
+        let class_gate = self.evidence_context_gate(
+            namespace,
+            source_type,
+            evidence_type,
+            namespace_gate.allowed,
+        );
         let reason = if class_gate.effective_allowed {
             class_gate.gate.reason.clone()
         } else if class_gate.gate.allowed {
@@ -4841,6 +4957,7 @@ impl ChiseiService for ChiseiServiceImpl {
         };
         Ok(Response::new(GetEvidenceContextGateResponse {
             gate: Some(EvidenceContextGate {
+                source_type: class_gate.source_type,
                 evidence_type: class_gate.evidence_type,
                 profile_key: class_gate.gate.profile_key,
                 allowed: class_gate.effective_allowed,
@@ -4849,8 +4966,16 @@ impl ChiseiService for ChiseiServiceImpl {
                 iteration_id: class_gate.gate.iteration_id,
                 baseline_run_id: class_gate.gate.baseline_run_id,
                 candidate_run_id: class_gate.gate.candidate_run_id,
-                expected_baseline_config_ref: evidence_context_config_ref(evidence_type, false),
-                expected_candidate_config_ref: evidence_context_config_ref(evidence_type, true),
+                expected_baseline_config_ref: evidence_context_config_ref(
+                    source_type,
+                    evidence_type,
+                    false,
+                ),
+                expected_candidate_config_ref: evidence_context_config_ref(
+                    source_type,
+                    evidence_type,
+                    true,
+                ),
             }),
         }))
     }
@@ -5199,10 +5324,15 @@ mod tests {
             portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
             None
         );
+        assert!(final_runtime_for_model(Some(&policy), "anthropic", "openai/gpt-5.5").is_err());
         policy.allowed_runtimes.push("openai".into());
         assert_eq!(
             portfolio_runtime_for_model(Some(&policy), "anthropic", "gpt-5.5"),
             Some("openai".into())
+        );
+        assert_eq!(
+            final_runtime_for_model(Some(&policy), "anthropic", "openai/gpt-5.5").unwrap(),
+            "openai"
         );
         policy.allowed_runtimes.clear();
         assert_eq!(
@@ -5310,6 +5440,15 @@ mod tests {
             data_class: String::new(),
         };
         assert_eq!(validate_policy_provider_pairs(&canonical_alias), Ok(()));
+
+        let hosted = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["xai".into()],
+            allowed_models: vec!["xai/grok-4.5".into()],
+            default_runtime: "xai".into(),
+            default_model: "xai/grok-4.5".into(),
+            data_class: String::new(),
+        };
+        assert_eq!(validate_policy_provider_pairs(&hosted), Ok(()));
     }
 
     #[test]
@@ -6098,6 +6237,7 @@ mod tests {
     fn evidence_eval_run(
         id: &str,
         suite_id: &str,
+        source_type: &str,
         evidence_type: &str,
         with_evidence: bool,
         score: i32,
@@ -6106,7 +6246,7 @@ mod tests {
         EvalRun {
             id: id.into(),
             suite_id: suite_id.into(),
-            config_ref: evidence_context_config_ref(evidence_type, with_evidence),
+            config_ref: evidence_context_config_ref(source_type, evidence_type, with_evidence),
             results: (1..=MIN_EVIDENCE_CONTEXT_EVAL_CASES)
                 .map(|case| CaseResult {
                     case_id: format!("evidence-case-{case}"),
@@ -6122,7 +6262,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn evaluation_mutations_require_control_plane_administration() {
+        let svc = memory_service();
+        let mut suite_request = Request::new(CreateEvalSuiteRequest {
+            suite: Some(EvalSuite {
+                id: "forged-suite".into(),
+                name: "forged".into(),
+                description: String::new(),
+                cases: vec![],
+            }),
+        });
+        suite_request
+            .metadata_mut()
+            .insert("x-principal", "agent:untrusted".parse().unwrap());
+        assert_eq!(
+            svc.create_eval_suite(suite_request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut run_request = Request::new(CreateEvalRunRequest {
+            run: Some(eval_run("forged-run", "forged-suite", 100, 1)),
+            changed_file: "context-expansion:pipeline-v1:acme".into(),
+            diff_hash: "forged".into(),
+        });
+        run_request
+            .metadata_mut()
+            .insert("x-principal", "agent:untrusted".parse().unwrap());
+        assert_eq!(
+            svc.create_eval_run(run_request).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut iteration_request = Request::new(TrackEvalIterationRequest {
+            suite_id: "forged-suite".into(),
+            run_id: "forged-run".into(),
+            changed_file: "context-expansion:pipeline-v1:acme".into(),
+            diff_hash: "forged".into(),
+        });
+        iteration_request
+            .metadata_mut()
+            .insert("x-principal", "agent:untrusted".parse().unwrap());
+        assert_eq!(
+            svc.track_eval_iteration(iteration_request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     fn project_test_evidence(svc: &ChiseiServiceImpl) -> String {
+        project_test_evidence_from_source(
+            svc,
+            "verification_system",
+            "eval-primary",
+            "producer:eval",
+            "check-1",
+            "eval-delivery-1",
+        )
+    }
+
+    fn project_test_evidence_from_source(
+        svc: &ChiseiServiceImpl,
+        source_type: &str,
+        source_instance: &str,
+        producer_identity: &str,
+        source_record_id: &str,
+        idempotency_key: &str,
+    ) -> String {
         use crate::sekai::evidence::{
             EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
             EvidenceSignal, EvidenceTarget, SchemaCompatibility,
@@ -6134,9 +6345,10 @@ mod tests {
         svc.db
             .upsert_evidence_producer(
                 &EvidenceProducerCapability {
-                    producer_identity: "producer:eval".into(),
+                    producer_identity: producer_identity.into(),
                     config_version: 1,
-                    source_instances: vec!["eval-primary".into()],
+                    source_types: vec![source_type.into()],
+                    source_instances: vec![source_instance.into()],
                     namespaces: vec!["acme".into()],
                     evidence_types: vec!["verification.result".into()],
                     target_kinds: vec!["ticker".into()],
@@ -6169,9 +6381,9 @@ mod tests {
         let content = serde_json::json!({"result": "passed"});
         let envelope = EvidenceEnvelope {
             contract_version: EVIDENCE_ENVELOPE_VERSION.into(),
-            source_type: "verification_system".into(),
-            source_instance: "eval-primary".into(),
-            source_record_id: "check-1".into(),
+            source_type: source_type.into(),
+            source_instance: source_instance.into(),
+            source_record_id: source_record_id.into(),
             source_version: "attempt-1".into(),
             source_sequence: 1,
             target: EvidenceTarget {
@@ -6190,17 +6402,17 @@ mod tests {
             content_digest: canonical_content_digest(&content).unwrap(),
             content,
             relationships: vec![],
-            producer_identity: "producer:eval".into(),
+            producer_identity: producer_identity.into(),
             confidence_bps: 9_500,
             classification: EvidenceClassification::Public,
             provenance: BTreeMap::new(),
-            idempotency_key: "eval-delivery-1".into(),
+            idempotency_key: idempotency_key.into(),
             intent: EvidenceIntent::Upsert,
             causality: None,
         };
         let admission = svc
             .db
-            .submit_evidence(&envelope, "producer:eval", now)
+            .submit_evidence(&envelope, producer_identity, now)
             .unwrap();
         svc.db
             .project_evidence_submission(&admission.submission.id, now)
@@ -6303,7 +6515,8 @@ mod tests {
         assert!(allowed.evidence_references.is_empty());
         assert!(!allowed.prepared_spec.contains("result=passed"));
 
-        let class_profile = evidence_context_profile_key("acme", "verification.result");
+        let class_profile =
+            evidence_context_profile_key("acme", "verification_system", "verification.result");
         for (id, with_evidence, score, timestamp) in [
             ("evidence-base", false, 90, 3),
             ("evidence-pass", true, 95, 4),
@@ -6312,6 +6525,7 @@ mod tests {
                 run: Some(evidence_eval_run(
                     id,
                     "suite-1",
+                    "verification_system",
                     "verification.result",
                     with_evidence,
                     score,
@@ -6326,6 +6540,7 @@ mod tests {
         let class_gate = svc
             .get_evidence_context_gate(Request::new(GetEvidenceContextGateRequest {
                 namespace: "acme".into(),
+                source_type: "verification_system".into(),
                 evidence_type: "verification.result".into(),
             }))
             .await
@@ -6338,10 +6553,14 @@ mod tests {
         assert_eq!(class_gate.profile_key, class_profile);
         assert_eq!(
             class_gate.expected_baseline_config_ref,
-            evidence_context_config_ref("verification.result", false)
+            evidence_context_config_ref("verification_system", "verification.result", false)
         );
 
-        let invalid_profile = evidence_context_profile_key("acme", "operations.health_snapshot");
+        let invalid_profile = evidence_context_profile_key(
+            "acme",
+            "verification_system",
+            "operations.health_snapshot",
+        );
         for (id, score, timestamp) in [("invalid-base", 90, 5), ("invalid-pass", 95, 6)] {
             svc.create_eval_run(Request::new(CreateEvalRunRequest {
                 run: Some(eval_run(id, "suite-1", score, timestamp)),
@@ -6354,6 +6573,7 @@ mod tests {
         let invalid_gate = svc
             .get_evidence_context_gate(Request::new(GetEvidenceContextGateRequest {
                 namespace: "acme".into(),
+                source_type: "verification_system".into(),
                 evidence_type: "operations.health_snapshot".into(),
             }))
             .await
@@ -6424,10 +6644,25 @@ mod tests {
         let svc = memory_service();
         create_suite(&svc, "acme").await;
         let evidence_type = "verification.result";
-        let profile = evidence_context_profile_key("acme", evidence_type);
-        let baseline = evidence_eval_run("duplicate-base", "suite-1", evidence_type, false, 90, 1);
-        let mut candidate =
-            evidence_eval_run("duplicate-pass", "suite-1", evidence_type, true, 95, 2);
+        let profile = evidence_context_profile_key("acme", "verification_system", evidence_type);
+        let baseline = evidence_eval_run(
+            "duplicate-base",
+            "suite-1",
+            "verification_system",
+            evidence_type,
+            false,
+            90,
+            1,
+        );
+        let mut candidate = evidence_eval_run(
+            "duplicate-pass",
+            "suite-1",
+            "verification_system",
+            evidence_type,
+            true,
+            95,
+            2,
+        );
         candidate.results.push(candidate.results[0].clone());
         for run in [baseline, candidate] {
             let id = run.id.clone();
@@ -6440,10 +6675,158 @@ mod tests {
             .unwrap();
         }
 
-        let gate = svc.evidence_context_gate("acme", evidence_type, true);
+        let gate = svc.evidence_context_gate("acme", "verification_system", evidence_type, true);
         assert!(!gate.effective_allowed);
         assert_eq!(gate.gate.verdict, "invalid_comparison");
         assert!(gate.gate.reason.contains("duplicate"));
+    }
+
+    #[test]
+    fn evidence_context_keys_do_not_alias_delimited_source_classes() {
+        assert_ne!(
+            evidence_context_profile_key("acme", "native:harness", "verification.result"),
+            evidence_context_profile_key("acme", "native", "harness:verification.result")
+        );
+        assert_ne!(
+            evidence_context_config_ref("native:harness", "verification.result", true),
+            evidence_context_config_ref("native", "harness:verification.result", true)
+        );
+        assert_ne!(
+            evidence_context_profile_key("x", "a:evidence:1:b", "c"),
+            evidence_context_profile_key("x:evidence:14:a", "b", "c")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_harness_evidence_requires_its_own_baseline_comparison() {
+        let svc = memory_service();
+        svc.db
+            .create_object(&Object {
+                id: "ticker-aapl".into(),
+                kind: "ticker".into(),
+                name: "AAPL".into(),
+                namespace: "acme".into(),
+                external_id: "ticker:AAPL".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let verification_id = project_test_evidence(&svc);
+        let native_id = project_test_evidence_from_source(
+            &svc,
+            "native_harness",
+            "bugyo-tauri",
+            "producer:bugyo",
+            "bugyo-check-1",
+            "bugyo-delivery-1",
+        );
+        create_suite(&svc, "acme").await;
+
+        let context_profile = pipeline_context_expansion_profile_key("acme");
+        for (id, score, timestamp) in [("context-base", 90, 1), ("context-pass", 95, 2)] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(eval_run(id, "suite-1", score, timestamp)),
+                changed_file: context_profile.clone(),
+                diff_hash: format!("hash-{id}"),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let verification_profile =
+            evidence_context_profile_key("acme", "verification_system", "verification.result");
+        for (id, with_evidence, score, timestamp) in [
+            ("verification-base", false, 90, 3),
+            ("verification-pass", true, 95, 4),
+        ] {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(evidence_eval_run(
+                    id,
+                    "suite-1",
+                    "verification_system",
+                    "verification.result",
+                    with_evidence,
+                    score,
+                    timestamp,
+                )),
+                changed_file: verification_profile.clone(),
+                diff_hash: format!("hash-{id}"),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let request = |request_id: &str| RunPipelineRequest {
+            request: Some(PipelineRequest {
+                request_id: request_id.into(),
+                namespace: "acme".into(),
+                spec: "inspect ticker:AAPL".into(),
+                model: String::new(),
+                runtime: String::new(),
+                task_type: "analysis".into(),
+                priority: 0,
+                task_class: "analysis".into(),
+            }),
+        };
+        let before_native_comparison = svc
+            .run_pipeline(Request::new(request("before-native-comparison")))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(
+            before_native_comparison
+                .evidence_references
+                .iter()
+                .any(|reference| reference.submission_id == verification_id)
+        );
+        assert!(
+            !before_native_comparison
+                .evidence_references
+                .iter()
+                .any(|reference| reference.submission_id == native_id)
+        );
+        assert!(before_native_comparison.memory_references.is_empty());
+        assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
+
+        let native_profile =
+            evidence_context_profile_key("acme", "native_harness", "verification.result");
+        for (id, with_evidence, score, timestamp) in
+            [("native-base", false, 90, 5), ("native-pass", true, 95, 6)]
+        {
+            svc.create_eval_run(Request::new(CreateEvalRunRequest {
+                run: Some(evidence_eval_run(
+                    id,
+                    "suite-1",
+                    "native_harness",
+                    "verification.result",
+                    with_evidence,
+                    score,
+                    timestamp,
+                )),
+                changed_file: native_profile.clone(),
+                diff_hash: format!("hash-{id}"),
+            }))
+            .await
+            .unwrap();
+        }
+        let after_native_comparison = svc
+            .run_pipeline(Request::new(request("after-native-comparison")))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(
+            after_native_comparison
+                .evidence_references
+                .iter()
+                .any(|reference| reference.submission_id == native_id)
+        );
+        assert!(after_native_comparison.memory_references.is_empty());
+        assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7852,7 +8235,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_receipt_pins_exact_external_evidence_snapshot() {
+    fn planned_receipt_pins_external_evidence_and_memory_provenance() {
         let svc = memory_service();
         let digest = "a".repeat(64);
         let plan = ExecutionPlan {
@@ -7871,6 +8254,14 @@ mod tests {
                 content_digest: digest.clone(),
                 disclosed_fields: vec!["content.result".into(), "signal".into()],
                 ..Default::default()
+            }],
+            memory_references: vec![MemoryContextReference {
+                memory_id: "memory-7".into(),
+                memory_version: 3,
+                classification: "internal".into(),
+                confidence_bps: 9_000,
+                applicability: "verification".into(),
+                evidence_operation_ids: vec!["operation-7".into()],
             }],
             ..Default::default()
         };
@@ -7897,6 +8288,26 @@ mod tests {
         assert_eq!(
             evidence.disclosed_fields,
             vec!["content.result".to_string(), "signal".to_string()]
+        );
+        let memory = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::ContextGoverned)
+            .and_then(|event| {
+                event
+                    .references
+                    .iter()
+                    .find(|reference| reference.kind == "kioku_memory")
+            })
+            .expect("pinned memory reference");
+        assert_eq!(memory.reference, "memory:memory-7@3");
+        assert_eq!(memory.disclosed_fields, ["claim"]);
+        assert!(
+            svc.db
+                .list_kioku_lifecycle_events("memory-7", 3)
+                .unwrap()
+                .is_empty(),
+            "planning must not record a treatment assignment"
         );
     }
 
@@ -8576,6 +8987,7 @@ mod tests {
             egress_decisions: vec![],
             task_class: String::new(),
             evidence_references: vec![],
+            memory_references: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -8641,6 +9053,7 @@ mod tests {
             egress_decisions: vec![],
             task_class: String::new(),
             evidence_references: vec![],
+            memory_references: vec![],
         };
         svc.cache_plan(plan.clone());
 
@@ -8748,6 +9161,7 @@ mod tests {
                 egress_decisions: vec![],
                 task_class: String::new(),
                 evidence_references: vec![],
+                memory_references: vec![],
             });
         }
         let newest = ExecutionPlan {
@@ -8777,6 +9191,7 @@ mod tests {
             egress_decisions: vec![],
             task_class: String::new(),
             evidence_references: vec![],
+            memory_references: vec![],
         };
         svc.cache_plan(newest.clone());
 
@@ -8820,6 +9235,7 @@ mod tests {
             egress_decisions: vec![],
             task_class: String::new(),
             evidence_references: vec![],
+            memory_references: vec![],
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -8869,6 +9285,7 @@ mod tests {
                 egress_decisions: vec![],
                 task_class: String::new(),
                 evidence_references: vec![],
+                memory_references: vec![],
             });
         }
         let inserted = ExecutionPlan {
@@ -8898,6 +9315,7 @@ mod tests {
             egress_decisions: vec![],
             task_class: String::new(),
             evidence_references: vec![],
+            memory_references: vec![],
         };
         svc.cache_plan(inserted.clone());
 

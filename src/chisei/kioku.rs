@@ -277,6 +277,32 @@ pub fn derive_verified_outcome_candidate(
                 )
             })?;
 
+        let recorded_metric = verification
+            .3
+            .attributes
+            .get("outcome_metric")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let recorded_value = verification
+            .3
+            .attributes
+            .get("outcome_value")
+            .and_then(|value| value.parse::<f64>().ok());
+        let recorded_passed = verification
+            .3
+            .attributes
+            .get("passed")
+            .and_then(|value| value.parse::<bool>().ok());
+        if recorded_metric != outcome.outcome_metric.trim()
+            || recorded_value != Some(outcome.outcome_value)
+            || recorded_passed != Some(outcome.passed)
+        {
+            return Err(format!(
+                "operation {} outcome labels do not match its receipt evidence",
+                outcome.receipt.operation_id
+            ));
+        }
+
         let stance = if outcome.passed {
             supporting = supporting.saturating_add(1);
             last_confirmed_at_ms = Some(
@@ -1043,6 +1069,30 @@ impl SekaiDb {
         {
             return Err("outcome metric does not match memory evidence".into());
         }
+        let recorded_outcome = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .ok_or_else(|| "operation receipt lacks an outcome event".to_string())?;
+        let recorded_metric = recorded_outcome
+            .attributes
+            .get("outcome_metric")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let recorded_value = recorded_outcome
+            .attributes
+            .get("outcome_value")
+            .and_then(|value| value.parse::<f64>().ok());
+        let recorded_passed = recorded_outcome
+            .attributes
+            .get("passed")
+            .and_then(|value| value.parse::<bool>().ok());
+        if recorded_metric != observation.outcome_metric.trim()
+            || recorded_value != Some(observation.outcome_value)
+            || recorded_passed != Some(observation.passed)
+        {
+            return Err("memory outcome does not match receipt evidence".into());
+        }
         let conn = self.conn();
         let assignment_reason = format!("pipeline request {}", observation.request_id.trim());
         let (injected, held_out): (bool, bool) = conn
@@ -1421,7 +1471,7 @@ mod tests {
                 references,
                 attributes: BTreeMap::new(),
             };
-        let receipt = OperationReceipt {
+        let mut receipt = OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id: operation_id.into(),
             parent_operation_id: None,
@@ -1475,6 +1525,21 @@ mod tests {
             uncovered_surfaces: vec![],
             reporter_grants: vec![],
         };
+        let outcome = receipt
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .unwrap();
+        outcome
+            .attributes
+            .insert("outcome_metric".into(), "verification_pass_rate".into());
+        outcome.attributes.insert(
+            "outcome_value".into(),
+            if passed { "1" } else { "0" }.into(),
+        );
+        outcome
+            .attributes
+            .insert("passed".into(), passed.to_string());
         VerifiedOutcome {
             receipt,
             passed,
@@ -1483,8 +1548,8 @@ mod tests {
         }
     }
 
-    fn persist_outcome_receipt(db: &SekaiDb, operation_id: &str, request_id: &str) {
-        let mut receipt = verified_outcome(operation_id, true).receipt;
+    fn persist_outcome_receipt(db: &SekaiDb, operation_id: &str, request_id: &str, passed: bool) {
+        let mut receipt = verified_outcome(operation_id, passed).receipt;
         receipt
             .events
             .iter_mut()
@@ -1913,7 +1978,7 @@ mod tests {
         );
         for operation_id in ["treatment-1", "treatment-2"] {
             let request_id = format!("request-{operation_id}");
-            persist_outcome_receipt(&db, operation_id, &request_id);
+            persist_outcome_receipt(&db, operation_id, &request_id, false);
             db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
                 memory_id: "regressing".into(),
                 memory_version: 1,
@@ -1925,7 +1990,7 @@ mod tests {
                 recorded_at_ms: 140,
             })
             .unwrap();
-            db.record_kioku_outcome(&MemoryOutcomeObservation {
+            let observation = MemoryOutcomeObservation {
                 memory_id: "regressing".into(),
                 memory_version: 1,
                 operation_id: operation_id.into(),
@@ -1935,12 +2000,16 @@ mod tests {
                 outcome_value: 0.0,
                 passed: false,
                 recorded_at_ms: 150,
-            })
-            .unwrap();
+            };
+            let mut forged = observation.clone();
+            forged.outcome_value = 1.0;
+            forged.passed = true;
+            assert!(db.record_kioku_outcome(&forged).is_err());
+            db.record_kioku_outcome(&observation).unwrap();
         }
         for operation_id in ["control-1", "control-2"] {
             let request_id = format!("request-{operation_id}");
-            persist_outcome_receipt(&db, operation_id, &request_id);
+            persist_outcome_receipt(&db, operation_id, &request_id, true);
             db.record_kioku_holdout("regressing", 1, &request_id, "kioku:evaluator", 140)
                 .unwrap();
             db.record_kioku_outcome(&MemoryOutcomeObservation {
