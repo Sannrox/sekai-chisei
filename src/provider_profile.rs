@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_MATRIX_VERSION: &str = "chisei.provider-capabilities/v1";
+pub const PROVIDER_REGISTRY_VERSION: &str = "chisei.provider-registry/v1";
 pub const RESPONSES_REQUEST_FIELDS: &[&str] = &[
     "model",
     "input",
@@ -79,26 +80,84 @@ pub struct ProviderCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityPath {
-    pub provider: String,
-    pub profile_version: String,
-    pub lifecycle: String,
-    pub capabilities: ProviderCapabilities,
+pub struct ProviderEndpointProfile {
+    pub base_url_env: String,
+    pub default_base_url: Option<String>,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityMatrix {
+pub struct UsageNormalizationProfile {
     pub version: String,
-    pub paths: Vec<CapabilityPath>,
+    pub input_tokens: bool,
+    pub output_tokens: bool,
+    pub reasoning_tokens: bool,
+    pub cache_read_tokens: bool,
+    pub cache_write_tokens: bool,
+    pub partial_responses: bool,
 }
 
-impl CapabilityMatrix {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PricingProfile {
+    pub version: String,
+    pub source: String,
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub dimensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderGovernanceProfile {
+    pub metadata_status: String,
+    pub data_retention: Option<String>,
+    pub training_use: Option<String>,
+    #[serde(default)]
+    pub regions: Vec<String>,
+    pub zero_data_retention_eligible: Option<bool>,
+    pub contractual_status: Option<String>,
+    pub terms_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub provider: String,
+    pub profile_version: String,
+    pub lifecycle: String,
+    pub transport: String,
+    pub model_namespace: String,
+    pub endpoint: ProviderEndpointProfile,
+    pub protocol_surfaces: Vec<String>,
+    #[serde(default)]
+    pub request_adaptations: Vec<String>,
+    #[serde(default)]
+    pub response_adaptations: Vec<String>,
+    pub capabilities: ProviderCapabilities,
+    pub usage_normalization: UsageNormalizationProfile,
+    pub error_normalization_version: String,
+    pub pricing: PricingProfile,
+    pub governance: ProviderGovernanceProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRegistry {
+    pub version: String,
+    pub profiles: Vec<ProviderProfile>,
+}
+
+impl ProviderRegistry {
     pub fn built_in() -> Self {
         Self {
-            version: CAPABILITY_MATRIX_VERSION.into(),
-            paths: vec![
-                path(
+            version: PROVIDER_REGISTRY_VERSION.into(),
+            profiles: vec![
+                profile(
                     "openai",
+                    "openai-compatible",
+                    "openai/",
+                    "CHISEI_OPENAI_BASE_URL",
+                    Some("https://api.openai.com/v1"),
+                    Some("OPENAI_API_KEY"),
+                    &["responses", "chat_completions", "models"],
+                    &[],
                     ProviderCapabilities {
                         responses: true,
                         streaming: true,
@@ -115,8 +174,15 @@ impl CapabilityMatrix {
                         built_in_tools: vec![],
                     },
                 ),
-                path(
+                profile(
                     "ollama",
+                    "openai-compatible",
+                    "ollama/",
+                    "CHISEI_OLLAMA_BASE_URL",
+                    Some("http://127.0.0.1:11434/v1"),
+                    None,
+                    &["responses", "chat_completions", "models"],
+                    &["strip_model_namespace"],
                     ProviderCapabilities {
                         responses: true,
                         streaming: true,
@@ -133,8 +199,15 @@ impl CapabilityMatrix {
                         built_in_tools: vec![],
                     },
                 ),
-                path(
+                profile(
                     "native",
+                    "openai-compatible",
+                    "native/",
+                    "NATIVE_LLM_URL",
+                    None,
+                    None,
+                    &["responses", "chat_completions"],
+                    &[],
                     ProviderCapabilities {
                         responses: true,
                         streaming: true,
@@ -151,8 +224,15 @@ impl CapabilityMatrix {
                         built_in_tools: vec![],
                     },
                 ),
-                path(
+                profile(
                     "anthropic",
+                    "anthropic-messages",
+                    "anthropic/",
+                    "CHISEI_ANTHROPIC_BASE_URL",
+                    Some("https://api.anthropic.com/v1"),
+                    Some("ANTHROPIC_API_KEY"),
+                    &["messages", "count_tokens"],
+                    &[],
                     ProviderCapabilities {
                         responses: false,
                         streaming: true,
@@ -173,6 +253,50 @@ impl CapabilityMatrix {
         }
     }
 
+    pub fn profile(&self, provider: &str) -> Option<&ProviderProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.provider == provider)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityPath {
+    pub provider: String,
+    pub profile_version: String,
+    pub lifecycle: String,
+    pub capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityMatrix {
+    pub version: String,
+    pub paths: Vec<CapabilityPath>,
+    pub registry_version: String,
+    pub profiles: Vec<ProviderProfile>,
+}
+
+impl CapabilityMatrix {
+    pub fn built_in() -> Self {
+        let registry = ProviderRegistry::built_in();
+        let paths = registry
+            .profiles
+            .iter()
+            .map(|profile| CapabilityPath {
+                provider: profile.provider.clone(),
+                profile_version: profile.profile_version.clone(),
+                lifecycle: profile.lifecycle.clone(),
+                capabilities: profile.capabilities.clone(),
+            })
+            .collect();
+        Self {
+            version: CAPABILITY_MATRIX_VERSION.into(),
+            paths,
+            registry_version: registry.version,
+            profiles: registry.profiles,
+        }
+    }
+
     pub fn capabilities(&self, provider: &str) -> Option<&ProviderCapabilities> {
         self.paths
             .iter()
@@ -181,12 +305,66 @@ impl CapabilityMatrix {
     }
 }
 
-fn path(provider: &str, capabilities: ProviderCapabilities) -> CapabilityPath {
-    CapabilityPath {
+fn profile(
+    provider: &str,
+    transport: &str,
+    model_namespace: &str,
+    base_url_env: &str,
+    default_base_url: Option<&str>,
+    api_key_env: Option<&str>,
+    protocol_surfaces: &[&str],
+    request_adaptations: &[&str],
+    capabilities: ProviderCapabilities,
+) -> ProviderProfile {
+    let reports_reasoning = capabilities.reasoning_controls;
+    let reports_partial = capabilities.partial_usage;
+    let reports_cache = provider == "anthropic";
+    ProviderProfile {
         provider: provider.into(),
         profile_version: format!("{provider}.builtin/v1"),
         lifecycle: "enabled".into(),
+        transport: transport.into(),
+        model_namespace: model_namespace.into(),
+        endpoint: ProviderEndpointProfile {
+            base_url_env: base_url_env.into(),
+            default_base_url: default_base_url.map(str::to_string),
+            api_key_env: api_key_env.map(str::to_string),
+        },
+        protocol_surfaces: protocol_surfaces
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+        request_adaptations: request_adaptations
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+        response_adaptations: Vec::new(),
         capabilities,
+        usage_normalization: UsageNormalizationProfile {
+            version: "chisei.usage-normalization/v1".into(),
+            input_tokens: true,
+            output_tokens: true,
+            reasoning_tokens: reports_reasoning,
+            cache_read_tokens: reports_cache,
+            cache_write_tokens: reports_cache,
+            partial_responses: reports_partial,
+        },
+        error_normalization_version: "chisei.gateway-errors/v1".into(),
+        pricing: PricingProfile {
+            version: format!("{provider}.unpriced/v1"),
+            source: "unconfigured".into(),
+            observed_at: None,
+            dimensions: Vec::new(),
+        },
+        governance: ProviderGovernanceProfile {
+            metadata_status: "unknown".into(),
+            data_retention: None,
+            training_use: None,
+            regions: Vec::new(),
+            zero_data_retention_eligible: None,
+            contractual_status: None,
+            terms_version: None,
+        },
     }
 }
 
@@ -379,6 +557,45 @@ mod tests {
         assert!(required.structured_output);
         assert_eq!(required.modalities, vec!["image", "text"]);
         assert_eq!(required.built_in_tools, vec!["web_search"]);
+    }
+
+    #[test]
+    fn built_in_profiles_publish_versioned_isolated_endpoints() {
+        let registry = ProviderRegistry::built_in();
+        assert_eq!(registry.version, PROVIDER_REGISTRY_VERSION);
+        let openai = registry.profile("openai").unwrap();
+        let ollama = registry.profile("ollama").unwrap();
+        let anthropic = registry.profile("anthropic").unwrap();
+        assert_eq!(
+            openai.endpoint.api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            anthropic.endpoint.api_key_env.as_deref(),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(ollama.endpoint.api_key_env, None);
+        assert_ne!(openai.endpoint.base_url_env, ollama.endpoint.base_url_env);
+        assert_ne!(openai.profile_version, anthropic.profile_version);
+        assert!(openai.protocol_surfaces.contains(&"responses".to_string()));
+        assert!(
+            anthropic
+                .protocol_surfaces
+                .contains(&"messages".to_string())
+        );
+    }
+
+    #[test]
+    fn capability_matrix_is_derived_from_the_profile_registry() {
+        let matrix = CapabilityMatrix::built_in();
+        assert_eq!(matrix.registry_version, PROVIDER_REGISTRY_VERSION);
+        assert_eq!(matrix.paths.len(), matrix.profiles.len());
+        for profile in &matrix.profiles {
+            assert_eq!(
+                matrix.capabilities(&profile.provider),
+                Some(&profile.capabilities)
+            );
+        }
     }
 
     #[test]
