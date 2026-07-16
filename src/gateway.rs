@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
-use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use axum::http::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, post, put};
@@ -36,11 +38,11 @@ use crate::grpc::client::{
 };
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
-    CheckBudgetRequest, CheckBudgetResponse, CompareRunsRequest, EvalRun, GatewayAuditEvent,
-    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
-    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
-    RecordSampleObservationRequest, RecordUsageRequest, ReserveGatewayRequestAliasRequest,
-    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
+    CheckBudgetRequest, CheckBudgetResponse, ClaimGatewayRequestAliasDispatchRequest,
+    CompareRunsRequest, EvalRun, GatewayAuditEvent, GetEvalRunRequest, GetEvalSuiteRequest,
+    GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
+    RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
+    ReserveGatewayRequestAliasRequest, ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
@@ -657,6 +659,7 @@ struct CachedPolicyDecision {
     policy_scope: Option<String>,
     policy_version: Option<String>,
     fallback_models: Vec<String>,
+    data_class: Option<String>,
     cached_at: Instant,
 }
 
@@ -1821,8 +1824,9 @@ impl GatewayCorrelation {
 
     fn from_headers(headers: &HeaderMap, caller_scope: &str) -> Result<Self, String> {
         let mut correlation = Self::generated(caller_scope);
-        if let Some(value) = correlation_header(headers, &X_CHISEI_OPERATION_ID)? {
-            correlation.operation_id = scoped_operation_id(&value, caller_scope)?;
+        let supplied_operation_id = correlation_header(headers, &X_CHISEI_OPERATION_ID)?;
+        if let Some(value) = supplied_operation_id.as_deref() {
+            correlation.operation_id = scoped_operation_id(value, caller_scope)?;
         }
         if let Some(value) = correlation_header(headers, &X_CHISEI_REQUEST_ID)? {
             if value.starts_with("chisei:") {
@@ -1830,6 +1834,9 @@ impl GatewayCorrelation {
             }
             correlation.lookup_request_id = Some(value.clone());
             correlation.request_id = scoped_request_id(&value, caller_scope);
+            if supplied_operation_id.is_none() {
+                correlation.operation_id = correlation.request_id.clone();
+            }
         }
         correlation.parent_operation_id =
             correlation_header(headers, &X_CHISEI_PARENT_OPERATION_ID)?
@@ -2119,6 +2126,13 @@ async fn proxy_gateway_inner_scoped(
     };
     let responses_profile = normalized_path.starts_with("/responses");
     let responses_create = is_responses_create(&method, &normalized_path);
+    if responses_profile && !responses_create {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Responses retrieval, cancellation, and deletion require caller-bound provider ownership and are not exposed by this gateway",
+        );
+    }
     let capability_surface = capability_request_surface(&method, &normalized_path);
     if let Err(reason) = validate_harness_request_headers(responses_profile, &headers) {
         return json_error(StatusCode::BAD_REQUEST, "capability_unsupported", &reason);
@@ -2415,6 +2429,7 @@ async fn proxy_gateway_inner_scoped(
             policy_scope: None,
             policy_version: None,
             fallback_models: Vec::new(),
+            data_class: None,
         };
         let egress = ContextEgressPreflight {
             body: resolved.body.clone(),
@@ -2613,8 +2628,14 @@ async fn proxy_gateway_inner_scoped(
                 "data_class_conflict",
                 "request data classification is stricter than the resolved namespace policy",
             );
-            record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
-                .await;
+            record_refusal_and_append(
+                &state.config,
+                &state.runtime,
+                &identity,
+                &preflight_context,
+                &rejection,
+            )
+            .await;
             return rejection.response();
         }
         let egress = match apply_context_egress(
@@ -2789,8 +2810,10 @@ async fn proxy_gateway_inner_scoped(
         };
     }
     for (name, value) in headers.iter() {
-        let strip_client_auth = (prepared.cross_provider || resolved_to_isolated_openai_backend)
-            && (name == AUTHORIZATION || name == X_API_KEY);
+        let strip_client_auth = should_strip_isolated_client_credential(
+            name,
+            prepared.cross_provider || resolved_to_isolated_openai_backend,
+        );
         if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
             upstream = upstream.header(name, value);
         }
@@ -2800,6 +2823,12 @@ async fn proxy_gateway_inner_scoped(
     // completed. Earlier refusals persist their own terminal receipt; reserving
     // before that point could strand an alias without a reconcilable outcome.
     if let Err(error) = reserve_gateway_request_alias(&state.config, &alias_context).await {
+        return alias_reservation_error_response(error);
+    }
+    let dispatch_token = uuid::Uuid::new_v4().to_string();
+    if let Err(error) =
+        claim_gateway_request_alias_dispatch(&state.config, &alias_context, &dispatch_token).await
+    {
         return alias_reservation_error_response(error);
     }
 
@@ -3123,6 +3152,7 @@ fn early_refusal_context(
         policy_scope: None,
         policy_version: None,
         task_class,
+        data_class: "unclassified".into(),
         request_hash,
         budget_subject: None,
         budget_status: "not_evaluated".into(),
@@ -3533,6 +3563,7 @@ struct PolicyPreflight {
     policy_scope: Option<String>,
     policy_version: Option<String>,
     fallback_models: Vec<String>,
+    data_class: Option<String>,
 }
 
 async fn select_healthy_policy_fallback(
@@ -3944,6 +3975,7 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
             policy_scope: decision.policy_scope.clone(),
             policy_version: decision.policy_version.clone(),
             fallback_models: decision.fallback_models.clone(),
+            data_class: decision.data_class.clone(),
             cached_at: Instant::now(),
         },
     );
@@ -3989,6 +4021,7 @@ async fn cached_policy_decision(
         policy_scope: cached.policy_scope.clone(),
         policy_version: cached.policy_version.clone(),
         fallback_models: cached.fallback_models.clone(),
+        data_class: cached.data_class.clone(),
     })
 }
 
@@ -4239,6 +4272,7 @@ async fn resolve_policy_preflight(
             policy_scope: None,
             policy_version: None,
             fallback_models: Vec::new(),
+            data_class: None,
         });
     };
     let requested_registry_model = if requested_model == "auto" {
@@ -4291,6 +4325,7 @@ async fn resolve_policy_preflight(
             policy_scope: None,
             policy_version: None,
             fallback_models: Vec::new(),
+            data_class: None,
         });
     };
     match connect_governance(runtime, target).await {
@@ -4463,6 +4498,8 @@ async fn resolve_policy_preflight(
                         policy_version: Some(resolution.policy_version)
                             .filter(|version| !version.is_empty()),
                         fallback_models: resolution.fallback_models,
+                        data_class: Some(resolution.data_class)
+                            .filter(|data_class| !data_class.is_empty()),
                     };
                     cache_policy_decision(runtime, cache_key, &decision).await;
                     Ok(decision)
@@ -4569,6 +4606,7 @@ async fn resolve_policy_preflight(
                         policy_scope: None,
                         policy_version: None,
                         fallback_models: Vec::new(),
+                        data_class: None,
                     })
                 }
             }
@@ -4619,6 +4657,7 @@ async fn resolve_policy_preflight(
                 policy_scope: None,
                 policy_version: None,
                 fallback_models: Vec::new(),
+                data_class: None,
             })
         }
     }
@@ -7836,10 +7875,10 @@ fn base_url_for_provider(config: &GatewayConfig, provider: ProviderKind) -> Opti
 fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
     let path = uri.path();
     let openai = ProviderKind::OpenAi(OpenAiRuntime::OpenAi);
-    let mapped = if let Some(rest) = path.strip_prefix("/v1/responses") {
-        (openai, format!("/responses{rest}"))
-    } else if let Some(rest) = path.strip_prefix("/responses") {
-        (openai, format!("/responses{rest}"))
+    let mapped = if matches!(path, "/v1/responses" | "/v1/responses/") {
+        (openai, path.trim_start_matches("/v1").to_string())
+    } else if matches!(path, "/responses" | "/responses/") {
+        (openai, path.to_string())
     } else if let Some(rest) = path.strip_prefix("/v1/chat/completions") {
         (openai, format!("/chat/completions{rest}"))
     } else if let Some(rest) = path.strip_prefix("/chat/completions") {
@@ -9261,6 +9300,7 @@ async fn ensure_llm_calls_dataset(
         .map(|name| ColumnDef {
             name: name.to_string(),
             r#type: "string".to_string(),
+            classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
         })
         .collect();
 
@@ -9635,7 +9675,7 @@ fn alias_reservation_error_response(error: AliasReservationError) -> Response<Bo
             StatusCode::SERVICE_UNAVAILABLE,
             "governance_unavailable",
             &reason,
-            "safe",
+            "ambiguous",
         ),
     }
 }
@@ -9660,22 +9700,93 @@ async fn reserve_gateway_request_alias(
                     "request alias reservation is unavailable: {error}"
                 ))
             })?;
-    let reserved = ChiseiServiceClient::new(channel)
-        .reserve_gateway_request_alias(gateway_request(ReserveGatewayRequestAliasRequest {
-            caller_scope: context.caller_scope.clone(),
-            request_alias: request_alias.to_string(),
-            request_id: context.request_id.clone(),
-            operation_id: context.operation_id.clone(),
-        }))
-        .await
-        .map_err(|error| {
-            AliasReservationError::Unavailable(format!("request alias reservation failed: {error}"))
-        })?
-        .into_inner()
-        .reserved;
+    let mut client = ChiseiServiceClient::new(channel);
+    let request = ReserveGatewayRequestAliasRequest {
+        caller_scope: context.caller_scope.clone(),
+        request_alias: request_alias.to_string(),
+        request_id: context.request_id.clone(),
+        operation_id: context.operation_id.clone(),
+    };
+    let mut last_error = None;
+    let mut reserved = None;
+    for _ in 0..2 {
+        match client
+            .reserve_gateway_request_alias(gateway_request(request.clone()))
+            .await
+        {
+            Ok(response) => {
+                reserved = Some(response.into_inner().reserved);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let reserved = reserved.ok_or_else(|| {
+        AliasReservationError::Unavailable(format!(
+            "request alias reservation failed: {}",
+            last_error.expect("reservation retry records an error")
+        ))
+    })?;
     if !reserved {
         return Err(AliasReservationError::Conflict(
             "x-chisei-request-id was already used in this caller scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn claim_gateway_request_alias_dispatch(
+    config: &GatewayConfig,
+    context: &UsageContext,
+    dispatch_token: &str,
+) -> Result<(), AliasReservationError> {
+    let Some(request_alias) = context.lookup_request_id.as_deref() else {
+        return Ok(());
+    };
+    let target = config.chisei_grpc_target.as_deref().ok_or_else(|| {
+        AliasReservationError::Unavailable(
+            "opaque request aliases require the policy control plane".into(),
+        )
+    })?;
+    let channel =
+        connect_sekai_as_gateway_with_timeout(target, Some(configured_control_plane_timeout()))
+            .await
+            .map_err(|error| {
+                AliasReservationError::Unavailable(format!(
+                    "request alias dispatch claim is unavailable: {error}"
+                ))
+            })?;
+    let mut client = ChiseiServiceClient::new(channel);
+    let request = ClaimGatewayRequestAliasDispatchRequest {
+        caller_scope: context.caller_scope.clone(),
+        request_alias: request_alias.to_string(),
+        request_id: context.request_id.clone(),
+        operation_id: context.operation_id.clone(),
+        dispatch_token: dispatch_token.to_string(),
+    };
+    let mut last_error = None;
+    let mut claimed = None;
+    for _ in 0..2 {
+        match client
+            .claim_gateway_request_alias_dispatch(gateway_request(request.clone()))
+            .await
+        {
+            Ok(response) => {
+                claimed = Some(response.into_inner().claimed);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let claimed = claimed.ok_or_else(|| {
+        AliasReservationError::Unavailable(format!(
+            "request alias dispatch claim failed: {}",
+            last_error.expect("dispatch claim retry records an error")
+        ))
+    })?;
+    if !claimed {
+        return Err(AliasReservationError::Conflict(
+            "x-chisei-request-id already authorized another provider dispatch".into(),
         ));
     }
     Ok(())
@@ -11627,6 +11738,10 @@ fn should_forward_request_header(name: &HeaderName, auth_mode: UpstreamAuthMode)
     true
 }
 
+fn should_strip_isolated_client_credential(name: &HeaderName, isolated_route: bool) -> bool {
+    isolated_route && (name == AUTHORIZATION || name == X_API_KEY || name == COOKIE)
+}
+
 fn is_chisei_header(name: &HeaderName) -> bool {
     name.as_str().starts_with("x-chisei-")
 }
@@ -11821,6 +11936,18 @@ mod tests {
     }
 
     #[test]
+    fn request_alias_derives_stable_operation_identity_when_unspecified() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&X_CHISEI_REQUEST_ID, "retryable-alias".parse().unwrap());
+
+        let first = GatewayCorrelation::from_headers(&headers, "caller-a").unwrap();
+        let second = GatewayCorrelation::from_headers(&headers, "caller-a").unwrap();
+        assert_eq!(first.request_id, second.request_id);
+        assert_eq!(first.operation_id, first.request_id);
+        assert_eq!(second.operation_id, second.request_id);
+    }
+
+    #[test]
     fn correlation_rejects_ambiguous_or_forged_metadata() {
         let mut headers = HeaderMap::new();
         headers.insert(&X_CHISEI_OPERATION_ID, "operation/escape".parse().unwrap());
@@ -11919,7 +12046,7 @@ mod tests {
         headers.insert(&IDEMPOTENCY_KEY, "retry-1".parse().unwrap());
         assert!(validate_harness_request_headers(true, &headers).is_err());
         assert!(validate_harness_request_headers(false, &headers).is_ok());
-        for path in ["/v1/responses", "/responses", "/v1/responses/cancel"] {
+        for path in ["/v1/responses", "/responses"] {
             let uri: Uri = path.parse().unwrap();
             let (_, normalized) = upstream_path(&uri).unwrap();
             assert!(
@@ -11927,6 +12054,8 @@ mod tests {
                     .is_err()
             );
         }
+        let uri: Uri = "/v1/responses/resp_1/cancel".parse().unwrap();
+        assert!(upstream_path(&uri).is_none());
     }
 
     #[test]
@@ -13321,6 +13450,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: Vec::new(),
+            data_class: None,
         };
         cache_policy_decision(&runtime, "policy".into(), &policy).await;
         cache_egress_decision(
@@ -13351,6 +13481,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: Vec::new(),
+            data_class: None,
         };
         cache_policy_decision(&runtime, "policy".into(), &policy).await;
         runtime
@@ -13392,6 +13523,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: Vec::new(),
+            data_class: None,
         };
 
         assert_eq!(policy_registry_state(&policy, &registry), None);
@@ -13785,6 +13917,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: vec!["ollama/llama3.2".into()],
+            data_class: None,
         };
         let selected = select_healthy_policy_fallback(
             &runtime,
@@ -13820,6 +13953,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: vec!["native/native-default".into()],
+            data_class: None,
         };
         let rejection = select_healthy_policy_fallback(
             &runtime,
@@ -13855,6 +13989,7 @@ mod tests {
             policy_scope: Some("project:default".into()),
             policy_version: Some("v1".into()),
             fallback_models: vec!["openai/gpt-5.5".into()],
+            data_class: None,
         };
         assert!(
             select_healthy_policy_fallback(
@@ -14414,6 +14549,18 @@ mod tests {
                 "Content-Type should forward in {mode:?} mode"
             );
         }
+    }
+
+    #[test]
+    fn isolated_provider_routes_strip_client_credentials() {
+        for header in [&AUTHORIZATION, &X_API_KEY, &COOKIE] {
+            assert!(should_strip_isolated_client_credential(header, true));
+            assert!(!should_strip_isolated_client_credential(header, false));
+        }
+        assert!(!should_strip_isolated_client_credential(
+            &CONTENT_TYPE,
+            true
+        ));
     }
 
     #[test]

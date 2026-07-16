@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
+    "sekaictl attest export <operation-id> --output <bundle> [--attempt <number>] [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportConfig {
     operation_id: String,
+    attempt: u32,
     output: PathBuf,
     signing_key: PathBuf,
     identity: String,
@@ -61,6 +62,9 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     let receipt_json = ChiseiServiceClient::new(connect_sekai(&target).await?)
         .get_operation_receipt(GetOperationReceiptRequest {
             operation_id: config.operation_id,
+            request_id: String::new(),
+            caller_scope: String::new(),
+            attempt: config.attempt,
         })
         .await?
         .into_inner()
@@ -201,6 +205,14 @@ fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
     let output = flag(args, "--output")
         .map(PathBuf::from)
         .ok_or_else(|| "--output is required".to_string())?;
+    let attempt = flag(args, "--attempt")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| "--attempt must be an unsigned integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or_default();
     let signing_key = flag(args, "--signing-key")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("SHOMEI_SIGNING_KEY_FILE").map(PathBuf::from))
@@ -229,6 +241,7 @@ fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
         .collect();
     Ok(ExportConfig {
         operation_id,
+        attempt,
         output,
         signing_key,
         identity,
@@ -447,6 +460,8 @@ mod tests {
             "op-1".into(),
             "--output".into(),
             "bundle.json".into(),
+            "--attempt".into(),
+            "2".into(),
             "--signing-key".into(),
             "key.hex".into(),
             "--identity".into(),
@@ -460,6 +475,20 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.artifacts.len(), 2);
+        assert_eq!(config.attempt, 2);
+    }
+
+    #[test]
+    fn export_parser_rejects_invalid_attempts() {
+        let error = parse_export(&[
+            "op-1".into(),
+            "--output".into(),
+            "bundle.json".into(),
+            "--attempt".into(),
+            "retry".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(error, "--attempt must be an unsigned integer");
     }
 
     #[test]
