@@ -67,6 +67,15 @@ const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-c
 const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
 const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
+const X_CHISEI_OPERATION_ID: HeaderName = HeaderName::from_static("x-chisei-operation-id");
+const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
+    HeaderName::from_static("x-chisei-parent-operation-id");
+const X_CHISEI_REQUEST_ID: HeaderName = HeaderName::from_static("x-chisei-request-id");
+const X_CHISEI_TURN_ID: HeaderName = HeaderName::from_static("x-chisei-turn-id");
+const X_CHISEI_ATTEMPT: HeaderName = HeaderName::from_static("x-chisei-attempt");
+const X_CHISEI_CYCLE_ID: HeaderName = HeaderName::from_static("x-chisei-cycle-id");
+const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
 const READINESS_PROBE_CACHE_SECS: u64 = 5;
@@ -1163,6 +1172,147 @@ fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
     expected.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayCorrelation {
+    operation_id: String,
+    parent_operation_id: Option<String>,
+    request_id: String,
+    turn_id: Option<String>,
+    attempt: u32,
+    cycle_id: Option<String>,
+    traceparent: Option<String>,
+}
+
+impl GatewayCorrelation {
+    fn generated(caller_scope: &str) -> Self {
+        let request_id = format!("chisei:{caller_scope}:{}", uuid::Uuid::new_v4());
+        Self {
+            operation_id: request_id.clone(),
+            parent_operation_id: None,
+            request_id,
+            turn_id: None,
+            attempt: 1,
+            cycle_id: None,
+            traceparent: None,
+        }
+    }
+
+    fn from_headers(headers: &HeaderMap, caller_scope: &str) -> Result<Self, String> {
+        let mut correlation = Self::generated(caller_scope);
+        if let Some(value) = correlation_header(headers, &X_CHISEI_OPERATION_ID)? {
+            correlation.operation_id = scoped_operation_id(&value, caller_scope)?;
+        }
+        correlation.parent_operation_id =
+            correlation_header(headers, &X_CHISEI_PARENT_OPERATION_ID)?
+                .map(|value| scoped_operation_id(&value, caller_scope))
+                .transpose()?;
+        correlation.turn_id = correlation_header(headers, &X_CHISEI_TURN_ID)?;
+        correlation.cycle_id = correlation_header(headers, &X_CHISEI_CYCLE_ID)?;
+        if let Some(value) = correlation_header(headers, &X_CHISEI_ATTEMPT)? {
+            correlation.attempt = value
+                .parse::<u32>()
+                .ok()
+                .filter(|attempt| *attempt > 0)
+                .ok_or_else(|| "x-chisei-attempt must be a positive integer".to_string())?;
+        }
+        correlation.traceparent = header_str(headers, &TRACEPARENT)
+            .map(validate_traceparent)
+            .transpose()?;
+        Ok(correlation)
+    }
+
+    fn apply_response_headers(&self, response: &mut Response<Body>) {
+        let headers = response.headers_mut();
+        insert_header(headers, &X_CHISEI_OPERATION_ID, &self.operation_id);
+        insert_header(headers, &X_CHISEI_REQUEST_ID, &self.request_id);
+        insert_header(headers, &X_CHISEI_ATTEMPT, &self.attempt.to_string());
+        if let Some(value) = &self.parent_operation_id {
+            insert_header(headers, &X_CHISEI_PARENT_OPERATION_ID, value);
+        }
+        if let Some(value) = &self.turn_id {
+            insert_header(headers, &X_CHISEI_TURN_ID, value);
+        }
+        if let Some(value) = &self.cycle_id {
+            insert_header(headers, &X_CHISEI_CYCLE_ID, value);
+        }
+        if let Some(value) = &self.traceparent {
+            insert_header(headers, &TRACEPARENT, value);
+        }
+    }
+}
+
+fn gateway_correlation_scope(identity: &GatewayIdentity) -> String {
+    let digest = Sha256::digest(
+        [
+            identity.agent.as_str(),
+            identity.project.as_str(),
+            identity.user_id.as_str(),
+            identity.key_id.as_str(),
+        ]
+        .join("\0")
+        .as_bytes(),
+    );
+    format!("{digest:x}")[..16].to_string()
+}
+
+fn scoped_operation_id(value: &str, caller_scope: &str) -> Result<String, String> {
+    let prefix = format!("chisei:{caller_scope}:");
+    if value.starts_with("chisei:") {
+        return value
+            .starts_with(&prefix)
+            .then(|| value.to_string())
+            .ok_or_else(|| "operation id belongs to a different caller scope".to_string());
+    }
+    if value.len().saturating_add(prefix.len()) > 128 {
+        return Err("operation id is too long after caller scoping".into());
+    }
+    Ok(format!("{prefix}{value}"))
+}
+
+fn correlation_header(headers: &HeaderMap, name: &HeaderName) -> Result<Option<String>, String> {
+    let Some(value) = header_str(headers, name) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err(format!("{name} must contain 1 to 128 characters"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(format!("{name} contains unsupported characters"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validate_traceparent(value: &str) -> Result<String, String> {
+    let parts = value.split('-').collect::<Vec<_>>();
+    let valid_hex = |part: &str, len: usize| {
+        part.len() == len
+            && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && part.bytes().any(|byte| byte != b'0')
+    };
+    if parts.len() != 4
+        || parts[0].len() != 2
+        || !parts[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+        || parts[0].eq_ignore_ascii_case("ff")
+        || !valid_hex(parts[1], 32)
+        || !valid_hex(parts[2], 16)
+        || parts[3].len() != 2
+        || !parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("traceparent must use the W3C version-trace-parent-flags format".into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &HeaderName, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
 async fn proxy_gateway(
     State(state): State<GatewayState>,
     uri: Uri,
@@ -1170,13 +1320,6 @@ async fn proxy_gateway(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Response<Body> {
-    let Some((client_provider, _)) = upstream_path(&uri) else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "chisei-gateway currently supports /v1/responses, /v1/chat/completions, /v1/models, /v1/messages, and /v1/messages/count_tokens",
-        );
-    };
     let identity_context = match resolve_identity(&headers, &state).await {
         Ok(identity) => identity,
         Err(err) => {
@@ -1189,9 +1332,56 @@ async fn proxy_gateway(
                 err.evidence(&state.config),
             )
             .await;
-            return err.response();
+            let correlation = GatewayCorrelation::generated("unauthenticated");
+            let mut response = err.response();
+            correlation.apply_response_headers(&mut response);
+            return response;
         }
     };
+    let correlation_scope = gateway_correlation_scope(&identity_context.identity);
+    let correlation = match GatewayCorrelation::from_headers(&headers, &correlation_scope) {
+        Ok(correlation) => correlation,
+        Err(reason) => {
+            let correlation = GatewayCorrelation::generated(&correlation_scope);
+            let mut response = json_error(StatusCode::BAD_REQUEST, "invalid_correlation", &reason);
+            correlation.apply_response_headers(&mut response);
+            return response;
+        }
+    };
+    let mut response = proxy_gateway_inner(
+        state,
+        uri,
+        method,
+        headers,
+        request,
+        correlation.clone(),
+        identity_context,
+    )
+    .await;
+    correlation.apply_response_headers(&mut response);
+    response
+}
+
+async fn proxy_gateway_inner(
+    state: GatewayState,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    request: Request<Body>,
+    correlation: GatewayCorrelation,
+    identity_context: IdentityContext,
+) -> Response<Body> {
+    let Some((client_provider, normalized_path)) = upstream_path(&uri) else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "chisei-gateway currently supports /v1/responses, /v1/chat/completions, /v1/models, /v1/messages, and /v1/messages/count_tokens",
+        );
+    };
+    let responses_profile = normalized_path.starts_with("/responses");
+    if let Err(reason) = validate_harness_request_headers(responses_profile, &headers) {
+        return json_error(StatusCode::BAD_REQUEST, "capability_unsupported", &reason);
+    }
     let identity = identity_context.identity;
 
     if let Some(subject) = rate_limit_rejection(&state.runtime, &identity).await {
@@ -1249,7 +1439,7 @@ async fn proxy_gateway(
     let request_bytes = body.len();
     let request_hash = format!("{:x}", Sha256::digest(&body));
     let requested_model = extract_request_model(&body);
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = correlation.request_id.clone();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
     let started_ms = Utc::now().timestamp_millis();
@@ -1262,6 +1452,13 @@ async fn proxy_gateway(
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mut preflight_context = UsageContext {
         request_id: request_id.clone(),
+        operation_id: correlation.operation_id.clone(),
+        parent_operation_id: correlation.parent_operation_id.clone(),
+        turn_id: correlation.turn_id.clone(),
+        attempt: correlation.attempt,
+        cycle_id: correlation.cycle_id.clone(),
+        traceparent: correlation.traceparent.clone(),
+        responses_profile,
         provider: client_provider,
         requested_model: requested_model.clone(),
         resolved_model: None,
@@ -1533,6 +1730,13 @@ async fn proxy_gateway(
 
     let usage_context = UsageContext {
         request_id,
+        operation_id: correlation.operation_id,
+        parent_operation_id: correlation.parent_operation_id,
+        turn_id: correlation.turn_id,
+        attempt: correlation.attempt,
+        cycle_id: correlation.cycle_id,
+        traceparent: correlation.traceparent,
+        responses_profile,
         provider: prepared.provider,
         requested_model,
         resolved_model: resolved.resolved_model,
@@ -1617,6 +1821,16 @@ async fn proxy_gateway(
     }
 }
 
+fn validate_harness_request_headers(
+    responses_route: bool,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    if responses_route && headers.contains_key(&IDEMPOTENCY_KEY) {
+        return Err("Idempotency-Key is not supported by this gateway profile version".into());
+    }
+    Ok(())
+}
+
 async fn rate_limit_rejection(
     runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
@@ -1668,6 +1882,13 @@ async fn rate_limit_rejection(
 #[derive(Debug, Clone)]
 struct UsageContext {
     request_id: String,
+    operation_id: String,
+    parent_operation_id: Option<String>,
+    turn_id: Option<String>,
+    attempt: u32,
+    cycle_id: Option<String>,
+    traceparent: Option<String>,
+    responses_profile: bool,
     provider: ProviderKind,
     requested_model: Option<String>,
     resolved_model: Option<String>,
@@ -5882,6 +6103,7 @@ async fn record_usage_and_append(
 
             let mut values = HashMap::new();
             values.insert("request_id".to_string(), context.request_id.clone());
+            insert_correlation_values(&mut values, context);
             values.insert(
                 "timestamp_ms".to_string(),
                 Utc::now().timestamp_millis().to_string(),
@@ -6113,6 +6335,7 @@ async fn record_refusal_with_usage_and_append(
     let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let mut values = HashMap::new();
     values.insert("request_id".to_string(), context.request_id.clone());
+    insert_correlation_values(&mut values, context);
     values.insert(
         "timestamp_ms".to_string(),
         Utc::now().timestamp_millis().to_string(),
@@ -6196,6 +6419,23 @@ async fn record_refusal_with_usage_and_append(
     }
 }
 
+fn insert_correlation_values(values: &mut HashMap<String, String>, context: &UsageContext) {
+    values.insert("operation_id".into(), context.operation_id.clone());
+    values.insert("attempt".into(), context.attempt.to_string());
+    if let Some(value) = &context.parent_operation_id {
+        values.insert("parent_operation_id".into(), value.clone());
+    }
+    if let Some(value) = &context.turn_id {
+        values.insert("turn_id".into(), value.clone());
+    }
+    if let Some(value) = &context.cycle_id {
+        values.insert("cycle_id".into(), value.clone());
+    }
+    if let Some(value) = &context.traceparent {
+        values.insert("traceparent".into(), value.clone());
+    }
+}
+
 fn gateway_receipt_event(
     operation_id: &str,
     suffix: &str,
@@ -6230,7 +6470,7 @@ fn build_gateway_operation_receipt(
         .map(|failure| failure.model_attempted)
         .unwrap_or(true);
     let rejection = rejection.map(|failure| failure.rejection);
-    let operation_id = context.request_id.clone();
+    let operation_id = context.operation_id.clone();
     let completed_at_ms = Utc::now().timestamp_millis();
     let actor = identity.agent.as_str();
     let policy_version = context
@@ -6277,6 +6517,19 @@ fn build_gateway_operation_receipt(
                 ("request_id".into(), context.request_id.clone()),
                 ("request_hash".into(), context.request_hash.clone()),
                 ("request_bytes".into(), context.request_bytes.to_string()),
+                ("attempt".into(), context.attempt.to_string()),
+                (
+                    "turn_id".into(),
+                    context.turn_id.clone().unwrap_or_default(),
+                ),
+                (
+                    "cycle_id".into(),
+                    context.cycle_id.clone().unwrap_or_default(),
+                ),
+                (
+                    "traceparent".into(),
+                    context.traceparent.clone().unwrap_or_default(),
+                ),
             ]),
         ),
         context_event,
@@ -6375,7 +6628,17 @@ fn build_gateway_operation_receipt(
                 context.started_ms,
                 ReceiptEventKind::AttemptStarted,
                 actor,
-                BTreeMap::from([("attempt".into(), "1".into())]),
+                BTreeMap::from([
+                    ("attempt".into(), context.attempt.to_string()),
+                    (
+                        "turn_id".into(),
+                        context.turn_id.clone().unwrap_or_default(),
+                    ),
+                    (
+                        "cycle_id".into(),
+                        context.cycle_id.clone().unwrap_or_default(),
+                    ),
+                ]),
             ),
             gateway_receipt_event(
                 &operation_id,
@@ -6476,7 +6739,10 @@ fn build_gateway_operation_receipt(
     OperationReceipt {
         version: OPERATION_RECEIPT_VERSION.into(),
         operation_id,
-        parent_operation_id: context.work_unit_id.clone(),
+        parent_operation_id: context
+            .parent_operation_id
+            .clone()
+            .or_else(|| context.work_unit_id.clone()),
         namespace: identity.project.clone(),
         operation_class: "model_inference".into(),
         initiating_actor: actor.into(),
@@ -6542,6 +6808,12 @@ async fn ensure_llm_calls_dataset(
 ) -> Result<(), tonic::Status> {
     let columns = [
         "request_id",
+        "operation_id",
+        "parent_operation_id",
+        "turn_id",
+        "attempt",
+        "cycle_id",
+        "traceparent",
         "timestamp_ms",
         "agent",
         "project",
@@ -7385,11 +7657,27 @@ struct SseUsageTap {
     mode: SseTapMode,
     usage: Option<ResponseUsage>,
     observation: ResponseObservation,
+    terminal: Option<ResponsesTerminal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesTerminal {
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
 }
 
 impl SseUsageTap {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn sse() -> Self {
+        Self {
+            mode: SseTapMode::Sse,
+            ..Self::default()
+        }
     }
 
     fn push(&mut self, bytes: &[u8]) {
@@ -7409,6 +7697,7 @@ impl SseUsageTap {
         while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
             let event = self.pending.drain(..boundary).collect::<Vec<_>>();
             self.pending.drain(..separator_len);
+            self.terminal = self.terminal.or_else(|| sse_event_terminal(&event));
             if let Some(usage) = extract_sse_event_usage(&event) {
                 self.usage = Some(merge_usage(self.usage, usage));
             }
@@ -7418,8 +7707,22 @@ impl SseUsageTap {
         }
     }
 
-    fn finish(mut self) -> (Option<ResponseUsage>, Option<ResponseObservation>) {
+    fn finish(self) -> (Option<ResponseUsage>, Option<ResponseObservation>) {
+        let (usage, observation, _, _) = self.finish_with_terminal();
+        (usage, observation)
+    }
+
+    fn finish_with_terminal(
+        mut self,
+    ) -> (
+        Option<ResponseUsage>,
+        Option<ResponseObservation>,
+        Option<ResponsesTerminal>,
+        SseTapMode,
+    ) {
         self.flush_pending();
+        let terminal = self.terminal;
+        let mode = self.mode;
         let observation = if self.observation.output_content.trim().is_empty() {
             None
         } else {
@@ -7427,7 +7730,12 @@ impl SseUsageTap {
                 truncate_gateway_spec(&self.observation.output_content);
             Some(self.observation)
         };
-        (self.usage, observation)
+        (self.usage, observation, terminal, mode)
+    }
+
+    #[cfg(test)]
+    fn terminal(&self) -> Option<ResponsesTerminal> {
+        self.terminal
     }
 
     fn flush_pending(&mut self) {
@@ -7435,6 +7743,7 @@ impl SseUsageTap {
             return;
         }
         let pending = std::mem::take(&mut self.pending);
+        self.terminal = self.terminal.or_else(|| sse_event_terminal(&pending));
         // Non-SSE passthrough bodies (no Content-Type header) arrive here as
         // one pending blob; fall back to whole-JSON extraction for those.
         if let Some(usage) = extract_sse_event_usage(&pending).or_else(|| {
@@ -7460,6 +7769,32 @@ impl SseUsageTap {
             self.observation.stop_reason = observation.stop_reason;
         }
     }
+}
+
+fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
+    let parse = |event: &str| match event {
+        "response.completed" => Some(ResponsesTerminal::Completed),
+        "response.failed" => Some(ResponsesTerminal::Failed),
+        "response.cancelled" => Some(ResponsesTerminal::Cancelled),
+        "chisei.response.interrupted" => Some(ResponsesTerminal::Interrupted),
+        _ => None,
+    };
+    let text = String::from_utf8_lossy(event);
+    if let Some(terminal) = text.lines().find_map(|line| {
+        line.strip_prefix("event:")
+            .and_then(|event| parse(event.trim()))
+    }) {
+        return Some(terminal);
+    }
+    extract_sse_data(event)
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .and_then(|event| parse(&event))
 }
 
 /// Decide from the first body bytes whether the stream is SSE. Returns None
@@ -7736,7 +8071,11 @@ async fn response_from_upstream(
         let mut upstream_stream = upstream.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(32);
         tokio::spawn(async move {
-            let mut usage_tap = SseUsageTap::new();
+            let mut usage_tap = if declares_sse {
+                SseUsageTap::sse()
+            } else {
+                SseUsageTap::new()
+            };
             let mut translator = translate.then(|| AnthropicMessageStreamTranslator::new(model));
             let mut aborted = false;
             let mut stream_error = None;
@@ -7766,7 +8105,7 @@ async fn response_from_upstream(
                     Err(err) => {
                         stream_error =
                             Some(safe_upstream_error_reason(context.provider, "stream", &err));
-                        if !client_gone {
+                        if !context.responses_profile && !client_gone {
                             let _ = tx.send(Err(err)).await;
                         }
                         aborted = true;
@@ -7786,13 +8125,44 @@ async fn response_from_upstream(
                     let _ = tx.send(Ok(Bytes::from(tail))).await;
                 }
             }
-            let (usage, observation) = usage_tap.finish();
-            if aborted {
-                let rejection = GatewayRejection {
+            let (usage, observation, terminal, tap_mode) = usage_tap.finish_with_terminal();
+            let missing_responses_terminal =
+                context.responses_profile && tap_mode != SseTapMode::Raw && terminal.is_none();
+            if missing_responses_terminal && !client_gone {
+                let terminal_event = interrupted_responses_event(
+                    stream_error
+                        .as_deref()
+                        .unwrap_or("upstream stream ended without a terminal event"),
+                    usage.as_ref(),
+                );
+                let _ = tx.send(Ok(terminal_event)).await;
+            }
+            let rejection = match terminal {
+                Some(ResponsesTerminal::Failed) => Some(GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_invalid_response".into(),
+                    reason: "upstream reported response.failed".into(),
+                }),
+                Some(ResponsesTerminal::Cancelled) => Some(GatewayRejection {
+                    status: StatusCode::CONFLICT,
+                    error_type: "request_conflict".into(),
+                    reason: "upstream reported response.cancelled".into(),
+                }),
+                Some(ResponsesTerminal::Interrupted) => Some(GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_unavailable".into(),
+                    reason: "upstream reported chisei.response.interrupted".into(),
+                }),
+                Some(ResponsesTerminal::Completed) => None,
+                None if aborted || missing_responses_terminal => Some(GatewayRejection {
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_stream_error".into(),
-                    reason: stream_error.unwrap_or_else(|| "upstream stream aborted".into()),
-                };
+                    reason: stream_error
+                        .unwrap_or_else(|| "upstream stream ended without a terminal event".into()),
+                }),
+                None => None,
+            };
+            if let Some(rejection) = rejection {
                 record_usage_and_append(
                     &config,
                     &runtime,
@@ -7931,6 +8301,29 @@ async fn response_from_upstream(
     }
 }
 
+fn interrupted_responses_event(reason: &str, usage: Option<&ResponseUsage>) -> Bytes {
+    let mut response = serde_json::json!({"status": "interrupted"});
+    if let Some(usage) = usage {
+        response["usage"] = serde_json::json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+        });
+    }
+    let payload = serde_json::json!({
+        "type": "chisei.response.interrupted",
+        "response": response,
+        "error": {
+            "type": "upstream_stream_error",
+            "code": "upstream_unavailable",
+            "message": reason,
+        }
+    });
+    Bytes::from(format!(
+        "event: chisei.response.interrupted\ndata: {payload}\n\n"
+    ))
+}
+
 fn safe_upstream_error_reason(
     provider: ProviderKind,
     stage: &str,
@@ -7992,9 +8385,11 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 fn json_error(status: StatusCode, error_type: &str, message: &str) -> Response<Body> {
+    let code = stable_gateway_error_code(error_type);
     let body = serde_json::json!({
         "error": {
             "type": error_type,
+            "code": code,
             "message": message
         }
     });
@@ -8007,6 +8402,38 @@ fn json_error(status: StatusCode, error_type: &str, message: &str) -> Response<B
         body.to_string(),
     )
         .into_response()
+}
+
+fn stable_gateway_error_code(error_type: &str) -> &'static str {
+    match error_type {
+        "authentication_error" | "invalid_api_key" | "unauthorized" => "authentication_error",
+        "policy_denied" | "governance_denied" | "context_denied" => "policy_denied",
+        "budget_exceeded" => "budget_exceeded",
+        "capability_unsupported"
+        | "unsupported_cross_provider_stream"
+        | "unsupported_cross_provider_route" => "capability_unsupported",
+        "request_conflict" | "budget_reconciliation_required" | "governance_precondition" => {
+            "request_conflict"
+        }
+        "rate_limited" | "rate_limit_exceeded" => "rate_limited",
+        "upstream_timeout" => "upstream_timeout",
+        "upstream_unavailable"
+        | "upstream_error"
+        | "upstream_stream_error"
+        | "governance_unavailable"
+        | "governance_audit_unavailable"
+        | "audit_unavailable"
+        | "audit_spool_unavailable" => "upstream_unavailable",
+        "upstream_invalid_response" | "gateway_response_error" => "upstream_invalid_response",
+        "invalid_request"
+        | "invalid_request_error"
+        | "invalid_correlation"
+        | "not_found"
+        | "context_not_found"
+        | "governance_not_found" => "invalid_request",
+        "internal_error" | "gateway_config_error" => "internal_error",
+        _ => "internal_error",
+    }
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> {
@@ -8024,6 +8451,215 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlation_round_trips_harness_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&X_CHISEI_OPERATION_ID, "operation-1".parse().unwrap());
+        headers.insert(
+            &X_CHISEI_PARENT_OPERATION_ID,
+            "operation-parent".parse().unwrap(),
+        );
+        headers.insert(&X_CHISEI_TURN_ID, "turn-2".parse().unwrap());
+        headers.insert(&X_CHISEI_ATTEMPT, "3".parse().unwrap());
+        headers.insert(&X_CHISEI_CYCLE_ID, "cycle-4".parse().unwrap());
+        headers.insert(
+            &TRACEPARENT,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+
+        let correlation = GatewayCorrelation::from_headers(&headers, "caller-a").unwrap();
+        assert_eq!(correlation.operation_id, "chisei:caller-a:operation-1");
+        assert_eq!(
+            correlation.parent_operation_id.as_deref(),
+            Some("chisei:caller-a:operation-parent")
+        );
+        assert_eq!(correlation.turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(correlation.attempt, 3);
+        assert_eq!(correlation.cycle_id.as_deref(), Some("cycle-4"));
+
+        let mut response = Response::new(Body::empty());
+        correlation.apply_response_headers(&mut response);
+        assert_eq!(
+            response.headers()[&X_CHISEI_OPERATION_ID],
+            "chisei:caller-a:operation-1"
+        );
+        assert!(!response.headers()[&X_CHISEI_REQUEST_ID].is_empty());
+        assert_eq!(response.headers()[&X_CHISEI_ATTEMPT], "3");
+    }
+
+    #[test]
+    fn correlation_rejects_ambiguous_or_forged_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&X_CHISEI_OPERATION_ID, "operation/escape".parse().unwrap());
+        assert!(GatewayCorrelation::from_headers(&headers, "caller-a").is_err());
+
+        headers.clear();
+        headers.insert(
+            &TRACEPARENT,
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        assert!(GatewayCorrelation::from_headers(&headers, "caller-a").is_err());
+
+        headers.clear();
+        headers.insert(
+            &X_CHISEI_OPERATION_ID,
+            "chisei:caller-b:operation-1".parse().unwrap(),
+        );
+        assert!(GatewayCorrelation::from_headers(&headers, "caller-a").is_err());
+    }
+
+    #[test]
+    fn generated_correlation_preserves_request_receipt_identity() {
+        let correlation = GatewayCorrelation::generated("caller-a");
+        assert_eq!(correlation.operation_id, correlation.request_id);
+        assert_eq!(
+            scoped_operation_id(&correlation.operation_id, "caller-a").unwrap(),
+            correlation.operation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_include_stable_codes() {
+        let response = json_error(
+            StatusCode::BAD_REQUEST,
+            "capability_unsupported",
+            "unsupported",
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "capability_unsupported");
+        assert_eq!(body["error"]["code"], "capability_unsupported");
+        assert_eq!(
+            stable_gateway_error_code("rate_limit_exceeded"),
+            "rate_limited"
+        );
+        assert_eq!(
+            stable_gateway_error_code("invalid_request_error"),
+            "invalid_request"
+        );
+        for (legacy, stable) in [
+            ("context_denied", "policy_denied"),
+            ("context_not_found", "invalid_request"),
+            ("governance_unavailable", "upstream_unavailable"),
+            ("governance_audit_unavailable", "upstream_unavailable"),
+            ("budget_reconciliation_required", "request_conflict"),
+            ("governance_precondition", "request_conflict"),
+            ("unsupported_cross_provider_route", "capability_unsupported"),
+        ] {
+            assert_eq!(stable_gateway_error_code(legacy), stable);
+        }
+    }
+
+    #[test]
+    fn canonical_operation_ids_always_round_trip() {
+        let raw = "a".repeat(104);
+        let canonical = scoped_operation_id(&raw, "0123456789abcdef").unwrap();
+        assert_eq!(canonical.len(), 128);
+        assert_eq!(
+            scoped_operation_id(&canonical, "0123456789abcdef").unwrap(),
+            canonical
+        );
+        assert!(scoped_operation_id(&"a".repeat(105), "0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn profile_rejects_unenforced_idempotency_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&IDEMPOTENCY_KEY, "retry-1".parse().unwrap());
+        assert!(validate_harness_request_headers(true, &headers).is_err());
+        assert!(validate_harness_request_headers(false, &headers).is_ok());
+        for path in ["/v1/responses", "/responses", "/v1/responses/cancel"] {
+            let uri: Uri = path.parse().unwrap();
+            let (_, normalized) = upstream_path(&uri).unwrap();
+            assert!(
+                validate_harness_request_headers(normalized.starts_with("/responses"), &headers)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_responses_event_is_terminal_and_preserves_partial_usage() {
+        let bytes = interrupted_responses_event(
+            "openai upstream stream failed",
+            Some(&ResponseUsage {
+                input_tokens: 7,
+                output_tokens: 2,
+                total_tokens: 9,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }),
+        );
+        let mut decoder = crate::harness::SseDecoder::default();
+        let events = decoder.push(&bytes).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "chisei.response.interrupted");
+        assert_eq!(events[0].data["response"]["usage"]["total_tokens"], 9);
+        assert_eq!(events[0].data["error"]["code"], "upstream_unavailable");
+
+        let bytes = interrupted_responses_event("interrupted", None);
+        let events = decoder.push(&bytes).unwrap();
+        assert!(events[0].data["response"].get("usage").is_none());
+
+        let mut tap = SseUsageTap::new();
+        tap.push(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n");
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Completed));
+        let mut tap = SseUsageTap::new();
+        tap.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n");
+        assert_eq!(tap.terminal(), None);
+
+        let mut tap = SseUsageTap::new();
+        tap.push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}");
+        assert_eq!(tap.terminal(), None);
+        let (usage, _, terminal, mode) = tap.finish_with_terminal();
+        assert_eq!(terminal, Some(ResponsesTerminal::Completed));
+        assert_eq!(mode, SseTapMode::Sse);
+        assert_eq!(usage.unwrap().total_tokens, 3);
+
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            br#"{"type":"response","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}"#,
+        );
+        let (usage, _, terminal, mode) = tap.finish_with_terminal();
+        assert_eq!(mode, SseTapMode::Raw);
+        assert_eq!(terminal, None);
+        assert_eq!(usage.unwrap().total_tokens, 3);
+
+        let mut tap = SseUsageTap::new();
+        tap.push(b"   ");
+        let (_, _, terminal, mode) = tap.finish_with_terminal();
+        assert_eq!(mode, SseTapMode::Undetected);
+        assert_eq!(terminal, None);
+    }
+
+    #[test]
+    fn correlation_scope_uses_resolved_identity_only() {
+        let identity = GatewayIdentity {
+            agent: "codex-app".into(),
+            project: "project-a".into(),
+            user_id: "user-a".into(),
+            key_id: "key-a".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        assert_eq!(
+            gateway_correlation_scope(&identity),
+            gateway_correlation_scope(&identity.clone())
+        );
+        let mut other = identity;
+        other.key_id = "key-b".into();
+        assert_ne!(
+            gateway_correlation_scope(&other),
+            gateway_correlation_scope(&GatewayIdentity {
+                key_id: "key-a".into(),
+                ..other.clone()
+            })
+        );
+    }
 
     #[test]
     fn rejects_weak_admin_tokens() {
@@ -8100,6 +8736,13 @@ mod tests {
         };
         let context = UsageContext {
             request_id: "gateway-op-1".into(),
+            operation_id: "gateway-op-1".into(),
+            parent_operation_id: Some("parent-op".into()),
+            turn_id: Some("turn-1".into()),
+            attempt: 2,
+            cycle_id: Some("cycle-1".into()),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            responses_profile: true,
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
             resolved_model: Some("gpt-5.5".into()),
@@ -8137,6 +8780,8 @@ mod tests {
         );
 
         assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
+        assert_eq!(receipt.operation_id, "gateway-op-1");
+        assert_eq!(receipt.parent_operation_id.as_deref(), Some("parent-op"));
         assert_eq!(receipt.initiating_actor, identity.agent);
         assert!(receipt.completeness().complete);
         let serialized = serde_json::to_string(&receipt).unwrap();
@@ -8155,10 +8800,17 @@ mod tests {
         };
         let context = UsageContext {
             request_id: "gateway-op-denied".into(),
+            operation_id: "gateway-op-denied".into(),
+            parent_operation_id: None,
+            turn_id: None,
+            attempt: 1,
+            cycle_id: None,
+            traceparent: None,
+            responses_profile: true,
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
             resolved_model: None,
-            work_unit_id: None,
+            work_unit_id: Some("legacy-work-unit".into()),
             pipeline_spec: String::new(),
             request_bytes: 42,
             started_ms: 100,
@@ -8184,6 +8836,10 @@ mod tests {
                 rejection: &rejection,
                 model_attempted: false,
             }),
+        );
+        assert_eq!(
+            receipt.parent_operation_id.as_deref(),
+            Some("legacy-work-unit")
         );
 
         assert!(receipt.completeness().complete);
