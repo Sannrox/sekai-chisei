@@ -179,11 +179,25 @@ impl SekaiDb {
     }
 
     pub fn update_dataset(&self, d: &Dataset) -> Result<(), String> {
+        for column in &d.columns {
+            if !crate::sekai::schema::is_valid_property_classification(&column.classification) {
+                return Err(format!(
+                    "column {} has invalid classification: {}",
+                    column.name, column.classification
+                ));
+            }
+        }
         let conn = self.conn();
         let cols = serde_json::to_string(
             &d.columns
                 .iter()
-                .map(|c| (&c.name, &c.col_type))
+                .map(|c| {
+                    (
+                        &c.name,
+                        &c.col_type,
+                        crate::sekai::schema::normalize_property_classification(&c.classification),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| error.to_string())?;
@@ -546,6 +560,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "old_column".into(),
                 col_type: "string".into(),
+                classification: "public".into(),
             }],
             object_id: "object-a".into(),
             created: 100,
@@ -561,6 +576,7 @@ mod tests {
         dataset.columns.push(ColumnDef {
             name: "new_column".into(),
             col_type: "string".into(),
+            classification: "public".into(),
         });
         dataset.object_id = "object-b".into();
         dataset.created = 999;
@@ -574,6 +590,127 @@ mod tests {
         assert_eq!(
             db.query_rows("ds1", &RowQuery::default()).unwrap(),
             vec![HashMap::from([("old_column".into(), "value".into())])]
+        );
+    }
+
+    #[test]
+    fn loads_legacy_dataset_columns_as_public() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
+                 VALUES ('legacy','legacy','[[\"value\",\"string\"]]','',1)",
+                [],
+            )
+            .unwrap();
+
+        let dataset = db.get_dataset("legacy").unwrap().unwrap();
+        assert_eq!(dataset.columns[0].classification, "public");
+    }
+
+    #[test]
+    fn migrates_legacy_llm_call_column_classifications() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
+                 VALUES ('llm_calls','calls','[[\"user_id\",\"string\"],[\"status\",\"string\"]]','',1)",
+                [],
+            )
+            .unwrap();
+        db.migrate_datasets().unwrap();
+
+        let dataset = db.get_dataset("llm_calls").unwrap().unwrap();
+        assert_eq!(dataset.columns[0].classification, "sensitive");
+        assert_eq!(dataset.columns[1].classification, "public");
+        let data_class = dataset
+            .columns
+            .iter()
+            .find(|column| column.name == "data_class")
+            .unwrap();
+        assert_eq!(data_class.col_type, "string");
+        assert_eq!(data_class.classification, "public");
+    }
+
+    #[test]
+    fn redacts_only_matching_classified_dataset_fields() {
+        let db = setup();
+        db.create_dataset(&Dataset {
+            id: "classified".into(),
+            name: "classified".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "namespace".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                ColumnDef {
+                    name: "identity".into(),
+                    col_type: "string".into(),
+                    classification: "sensitive".into(),
+                },
+                ColumnDef {
+                    name: "metric".into(),
+                    col_type: "int".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows(
+            "classified",
+            &[
+                HashMap::from([
+                    ("namespace".into(), "redact".into()),
+                    ("identity".into(), "alice".into()),
+                    ("metric".into(), "1".into()),
+                ]),
+                HashMap::from([
+                    ("namespace".into(), "keep".into()),
+                    ("identity".into(), "bob".into()),
+                    ("metric".into(), "2".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+
+        let error = db
+            .redact_dataset_fields(
+                "classified",
+                "sensitive",
+                &[RowFilter {
+                    column: "namespace".into(),
+                    op: "contains".into(),
+                    value: "redact".into(),
+                }],
+            )
+            .unwrap_err();
+        assert!(error.contains("unsupported filter operator"));
+
+        let result = db
+            .redact_dataset_fields(
+                "classified",
+                "sensitive",
+                &[RowFilter {
+                    column: "namespace".into(),
+                    op: "eq".into(),
+                    value: "redact".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+        assert_eq!(result.fields_redacted, 1);
+        let rows = db.query_rows("classified", &RowQuery::default()).unwrap();
+        assert_eq!(rows[0]["identity"], "[redacted]");
+        assert_eq!(rows[0]["metric"], "1");
+        assert_eq!(rows[1]["identity"], "bob");
+        assert_eq!(
+            db.redact_dataset_fields("classified", "sensitive", &[])
+                .unwrap()
+                .rows_updated,
+            1
         );
     }
 

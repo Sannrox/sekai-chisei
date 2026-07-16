@@ -86,6 +86,8 @@ impl SekaiDb {
                 request_id TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
                 reserved_at INTEGER NOT NULL,
+                dispatch_started INTEGER NOT NULL DEFAULT 0,
+                dispatch_token TEXT,
                 PRIMARY KEY(caller_scope, request_alias)
             );",
         )
@@ -104,6 +106,8 @@ impl SekaiDb {
             "ALTER TABLE chisei_operation_receipts ADD COLUMN initiating_actor TEXT",
             "ALTER TABLE chisei_operation_receipts ADD COLUMN caller_scope TEXT",
             "ALTER TABLE chisei_operation_receipts ADD COLUMN alias_retired INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_token TEXT",
         ] {
             match conn.execute(statement, []) {
                 Ok(_) => {}
@@ -470,6 +474,31 @@ impl SekaiDb {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
+        let existing_reservation = transaction
+            .query_row(
+                "SELECT request_id, operation_id, dispatch_started
+                 FROM chisei_gateway_request_aliases
+                 WHERE caller_scope=?1 AND request_alias=?2",
+                params![caller_scope, request_alias],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((existing_request_id, existing_operation_id, dispatch_started)) =
+            existing_reservation
+        {
+            let resumable = existing_request_id == request_id
+                && existing_operation_id == operation_id
+                && !dispatch_started;
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(resumable);
+        }
         let reserved = transaction.execute(
             "INSERT OR IGNORE INTO chisei_gateway_request_aliases(caller_scope, request_alias, request_id, operation_id, reserved_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -484,6 +513,60 @@ impl SekaiDb {
         .map_err(|error| error.to_string())? == 1;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(reserved)
+    }
+
+    pub fn claim_gateway_request_alias_dispatch(
+        &self,
+        caller_scope: &str,
+        request_alias: &str,
+        request_id: &str,
+        operation_id: &str,
+        dispatch_token: &str,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let claimed = transaction
+            .execute(
+                "UPDATE chisei_gateway_request_aliases
+                 SET dispatch_started=1, dispatch_token=?1
+                 WHERE caller_scope=?2 AND request_alias=?3 AND request_id=?4
+                   AND operation_id=?5 AND dispatch_started=0",
+                params![
+                    dispatch_token,
+                    caller_scope,
+                    request_alias,
+                    request_id,
+                    operation_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?
+            == 1;
+        let same_claim = if claimed {
+            true
+        } else {
+            transaction
+                .query_row(
+                    "SELECT dispatch_token=?1
+                     FROM chisei_gateway_request_aliases
+                     WHERE caller_scope=?2 AND request_alias=?3 AND request_id=?4
+                       AND operation_id=?5 AND dispatch_started=1",
+                    params![
+                        dispatch_token,
+                        caller_scope,
+                        request_alias,
+                        request_id,
+                        operation_id,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(false)
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(same_claim)
     }
 
     pub fn find_gateway_receipt_by_logical_operation_id(
@@ -1349,6 +1432,48 @@ mod tests {
         assert!(
             db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-1", "operation-1")
                 .unwrap()
+        );
+        assert!(
+            db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-1", "operation-1")
+                .unwrap(),
+            "a lost reservation response must resume while still pending"
+        );
+        assert!(
+            db.claim_gateway_request_alias_dispatch(
+                "scope-a",
+                "opaque-1",
+                "request-1",
+                "operation-1",
+                "dispatch-a"
+            )
+            .unwrap()
+        );
+        assert!(
+            db.claim_gateway_request_alias_dispatch(
+                "scope-a",
+                "opaque-1",
+                "request-1",
+                "operation-1",
+                "dispatch-a"
+            )
+            .unwrap(),
+            "a lost claim response must be retryable by the same gateway invocation"
+        );
+        assert!(
+            !db.claim_gateway_request_alias_dispatch(
+                "scope-a",
+                "opaque-1",
+                "request-1",
+                "operation-1",
+                "dispatch-b"
+            )
+            .unwrap(),
+            "a concurrent request must not claim an authorized dispatch"
+        );
+        assert!(
+            !db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-1", "operation-1")
+                .unwrap(),
+            "a dispatched alias must not be replayed"
         );
         assert!(
             !db.reserve_gateway_request_alias("scope-a", "opaque-1", "request-2", "operation-2")
