@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{any, post};
+use axum::routing::{any, post, put};
 use chrono::Utc;
 use futures_util::StreamExt;
 use http_body_util::LengthLimitError;
@@ -49,8 +49,13 @@ use crate::grpc::pb::sekai::{
     RetrieveContextRequest, Row,
 };
 use crate::llm::HttpTimeouts;
+#[cfg(test)]
+use crate::provider_profile::resolve_registered_model;
 use crate::provider_profile::{
-    CapabilityMatrix, CapabilityRequirements, normalize_responses_request,
+    CAPABILITY_MATRIX_VERSION, CapabilityMatrix, CapabilityRequirements, ProviderProfile,
+    ProviderRegistry, normalize_responses_request, provider_registry_snapshot,
+    provider_registry_state_path, refresh_provider_registry, update_registry_lifecycle_async,
+    validate_provider_registry_storage, validate_registry_lifecycle_update,
     validate_responses_request_fields,
 };
 
@@ -83,6 +88,7 @@ const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
 const READINESS_PROBE_CACHE_SECS: u64 = 5;
+const PROVIDER_REGISTRY_REFRESH_TTL_MS: u64 = 250;
 const MAX_BUDGET_CACHE_ENTRIES: usize = 4096;
 const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
 const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
@@ -406,6 +412,9 @@ struct GatewayRuntime {
     governance_cache_ttl: Duration,
     budget_reconciliation_path: Option<PathBuf>,
     budget_reconciliation_lock: Arc<Mutex<()>>,
+    provider_registry_state_path: Option<PathBuf>,
+    provider_registry_refresh: Arc<Mutex<ProviderRegistryRefreshState>>,
+    provider_registry_refresh_generation: Arc<AtomicU64>,
     audit_spool_path: Option<PathBuf>,
     audit_spool_max_bytes: u64,
     audit_spool_lock: Arc<Mutex<()>>,
@@ -425,6 +434,12 @@ struct ResilienceConfig {
     circuit_failure_threshold: u32,
     circuit_cooldown: Duration,
     upstream_connect_retries: u32,
+}
+
+#[derive(Default)]
+struct ProviderRegistryRefreshState {
+    refreshed_at: Option<Instant>,
+    result: Option<Result<ProviderRegistry, String>>,
 }
 
 impl Default for ResilienceConfig {
@@ -534,6 +549,7 @@ struct CachedBudgetDecision {
 struct CachedPolicyDecision {
     resolved_model: Option<String>,
     resolved_provider: ProviderKind,
+    registry_state_version: u64,
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
@@ -635,6 +651,9 @@ impl GatewayRuntime {
             std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
                 .unwrap_or_else(|_| "data/chisei-gateway-budget-reconciliation.json".to_string()),
         )))
+        .with_provider_registry_state_path(Some(provider_registry_state_path(
+            &std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".to_string()),
+        )))
         .with_audit_spool_path(Some(PathBuf::from(
             std::env::var("CHISEI_GATEWAY_AUDIT_SPOOL_PATH")
                 .unwrap_or_else(|_| "data/chisei-gateway-audit.jsonl".to_string()),
@@ -675,6 +694,11 @@ impl GatewayRuntime {
             governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
             budget_reconciliation_path: None,
             budget_reconciliation_lock: Arc::new(Mutex::new(())),
+            provider_registry_state_path: None,
+            provider_registry_refresh: Arc::new(
+                Mutex::new(ProviderRegistryRefreshState::default()),
+            ),
+            provider_registry_refresh_generation: Arc::new(AtomicU64::new(0)),
             audit_spool_path: None,
             audit_spool_max_bytes: DEFAULT_AUDIT_SPOOL_MAX_BYTES,
             audit_spool_lock: Arc::new(Mutex::new(())),
@@ -746,6 +770,56 @@ impl GatewayRuntime {
             }
         }
         self
+    }
+
+    fn with_provider_registry_state_path(mut self, path: Option<PathBuf>) -> Self {
+        self.provider_registry_state_path = path;
+        self
+    }
+
+    async fn refresh_registry_snapshot(&self, force: bool) -> Result<ProviderRegistry, String> {
+        let observed_generation = self
+            .provider_registry_refresh_generation
+            .load(Ordering::Acquire);
+        self.refresh_registry_snapshot_after_generation(force, observed_generation)
+            .await
+    }
+
+    async fn refresh_registry_snapshot_after_generation(
+        &self,
+        force: bool,
+        observed_generation: u64,
+    ) -> Result<ProviderRegistry, String> {
+        let Some(path) = self.provider_registry_state_path.clone() else {
+            return Ok(provider_registry_snapshot());
+        };
+        let mut refresh = self.provider_registry_refresh.lock().await;
+        let refresh_completed_while_waiting = self
+            .provider_registry_refresh_generation
+            .load(Ordering::Acquire)
+            != observed_generation;
+        let reusable = refresh_completed_while_waiting
+            || !force
+                && refresh.refreshed_at.is_some_and(|refreshed_at| {
+                    refreshed_at.elapsed() < Duration::from_millis(PROVIDER_REGISTRY_REFRESH_TTL_MS)
+                });
+        if reusable && let Some(result) = refresh.result.as_ref() {
+            return result.clone();
+        }
+        let result = crate::provider_profile::refresh_provider_registry_async(&path).await;
+        refresh.refreshed_at = Some(Instant::now());
+        refresh.result = Some(result.clone());
+        self.provider_registry_refresh_generation
+            .fetch_add(1, Ordering::Release);
+        result
+    }
+
+    async fn invalidate_registry_snapshot(&self) {
+        let mut refresh = self.provider_registry_refresh.lock().await;
+        refresh.refreshed_at = None;
+        refresh.result = None;
+        self.provider_registry_refresh_generation
+            .fetch_add(1, Ordering::Release);
     }
     fn with_audit_spool_path(mut self, path: Option<PathBuf>) -> Self {
         self.audit_spool_path = path;
@@ -901,6 +975,10 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
         .route("/readyz", axum::routing::get(gateway_readiness))
         .route("/statusz", axum::routing::get(gateway_status))
         .route("/_chisei/admin/refresh", post(refresh_gateway_admin))
+        .route(
+            "/_chisei/admin/provider-lifecycle",
+            put(update_provider_lifecycle_admin),
+        )
         .route("/{*path}", any(proxy_gateway))
         .with_state(state)
 }
@@ -946,6 +1024,16 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
 }
 
 async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> {
+    if let Err(reason) = state.runtime.refresh_registry_snapshot(true).await {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "not_ready",
+                "reason": "provider_registry_unavailable",
+                "detail": reason
+            }),
+        );
+    }
     if state.config.no_preflight {
         let mut cached_probe = state.runtime.readiness_probe.lock().await;
         let ready = if let Some((checked_at, ready)) = *cached_probe
@@ -1082,6 +1170,10 @@ async fn audit_spool_writable(runtime: &GatewayRuntime) -> bool {
 
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = GatewayRuntime::from_env();
+    if let Some(state_path) = runtime.provider_registry_state_path.as_deref() {
+        validate_provider_registry_storage(state_path).map_err(std::io::Error::other)?;
+        refresh_provider_registry(state_path).map_err(std::io::Error::other)?;
+    }
     validate_gateway_security(
         config.bind_addr,
         &config.gateway_keys,
@@ -1164,6 +1256,114 @@ async fn refresh_gateway_admin(
             "pending_budget_reconciliations": pending_budget_reconciliations
         }),
     )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProviderLifecycleRequest {
+    target_kind: String,
+    target: String,
+    state: String,
+    reason: String,
+}
+
+async fn update_provider_lifecycle_admin(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ProviderLifecycleRequest>,
+) -> Response<Body> {
+    if state.runtime.admin_token.is_none() {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "chisei gateway admin endpoint is disabled",
+        );
+    }
+    if !admin_authorized(&headers, &state.runtime) {
+        record_gateway_event(
+            &state.config,
+            "chisei-gateway-admin",
+            "gateway.provider_lifecycle",
+            "invalid admin credential",
+            "denied",
+            HashMap::new(),
+        )
+        .await;
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid chisei gateway admin token",
+        );
+    }
+    let Some(state_path) = state.runtime.provider_registry_state_path.as_deref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_registry_unavailable",
+            "provider registry persistence is not configured",
+        );
+    };
+    let registry = match state.runtime.refresh_registry_snapshot(true).await {
+        Ok(registry) => registry,
+        Err(reason) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider_registry_unavailable",
+                &reason,
+            );
+        }
+    };
+    crate::provider_profile::with_provider_registry_snapshot(registry, async {
+    if let Err(reason) = validate_registry_lifecycle_update(
+        &request.target_kind,
+        &request.target,
+        &request.state,
+        "chisei-gateway-admin",
+        &request.reason,
+    ) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &reason);
+    }
+    let audit_evidence = HashMap::from([
+        ("target_kind".to_string(), request.target_kind.clone()),
+        ("target".to_string(), request.target.clone()),
+        ("state".to_string(), request.state.clone()),
+    ]);
+    if !record_gateway_event(
+        &state.config,
+        "chisei-gateway-admin",
+        "gateway.provider_lifecycle",
+        &request.reason,
+        "allowed",
+        audit_evidence,
+    )
+    .await
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_audit_unavailable",
+            "provider lifecycle state was not changed because its audit record could not be persisted",
+        );
+    }
+    match update_registry_lifecycle_async(
+        state_path.to_path_buf(),
+        request.target_kind,
+        request.target,
+        request.state,
+        "chisei-gateway-admin".into(),
+        request.reason,
+        Utc::now().to_rfc3339(),
+    )
+    .await
+    {
+        Ok(mutation) => {
+            state.runtime.invalidate_registry_snapshot().await;
+            json_response(
+                StatusCode::OK,
+                serde_json::to_value(mutation).expect("registry lifecycle mutation is serializable"),
+            )
+        }
+        Err(reason) => json_error(StatusCode::CONFLICT, "request_conflict", &reason),
+    }
+    })
+    .await
 }
 
 fn admin_authorized(headers: &HeaderMap, runtime: &GatewayRuntime) -> bool {
@@ -1378,6 +1578,40 @@ async fn proxy_gateway_inner(
     correlation: GatewayCorrelation,
     identity_context: IdentityContext,
 ) -> Response<Body> {
+    let registry = match state.runtime.refresh_registry_snapshot(false).await {
+        Ok(registry) => registry,
+        Err(reason) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider_registry_unavailable",
+                &reason,
+            );
+        }
+    };
+    crate::provider_profile::with_provider_registry_snapshot(
+        registry,
+        proxy_gateway_inner_scoped(
+            state,
+            uri,
+            method,
+            headers,
+            request,
+            correlation,
+            identity_context,
+        ),
+    )
+    .await
+}
+
+async fn proxy_gateway_inner_scoped(
+    state: GatewayState,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    request: Request<Body>,
+    correlation: GatewayCorrelation,
+    identity_context: IdentityContext,
+) -> Response<Body> {
     if uri.path() == "/v1/chisei/capabilities" {
         if method != Method::GET {
             return json_error(
@@ -1401,6 +1635,7 @@ async fn proxy_gateway_inner(
     };
     let responses_profile = normalized_path.starts_with("/responses");
     let responses_create = is_responses_create(&method, &normalized_path);
+    let capability_surface = capability_request_surface(&method, &normalized_path);
     if let Err(reason) = validate_harness_request_headers(responses_profile, &headers) {
         return json_error(StatusCode::BAD_REQUEST, "capability_unsupported", &reason);
     }
@@ -1465,9 +1700,99 @@ async fn proxy_gateway_inner(
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
     let started_ms = Utc::now().timestamp_millis();
+    let task_class = resolve_task_class(&headers, requested_model.as_deref());
+    let registry_snapshot = provider_registry_snapshot();
+    let registry_snapshot_version = capability_snapshot_identifier(&registry_snapshot);
+    let policy_model_sentinel = requested_model.as_deref() == Some("auto");
+    let wire_provider_id = capability_provider_id(client_provider);
+    let requested_provider_without_lifecycle = requested_model
+        .as_deref()
+        .filter(|_| !policy_model_sentinel)
+        .and_then(|model| ProviderKind::from_model(model).ok())
+        .unwrap_or(client_provider);
+    let requested_registry_model = match requested_model
+        .as_deref()
+        .filter(|_| !policy_model_sentinel)
+        .map(|model| registry_snapshot.resolve_model_for_provider(model, wire_provider_id))
+        .transpose()
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            let lifecycle_denial = requested_model.as_deref().is_some_and(|model| {
+                registry_snapshot
+                    .model_or_provider_is_disabled_for_provider(model, wire_provider_id)
+            });
+            let rejection = GatewayRejection::json(
+                if lifecycle_denial {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                if lifecycle_denial {
+                    "policy_denied"
+                } else {
+                    "invalid_request_error"
+                },
+                format!("model resolution failed: {reason}"),
+            );
+            if lifecycle_denial {
+                let mut context = early_refusal_context(
+                    &correlation,
+                    responses_profile,
+                    requested_provider_without_lifecycle,
+                    requested_model.clone(),
+                    work_unit_id.clone(),
+                    pipeline_spec.clone(),
+                    request_bytes,
+                    started_ms,
+                    task_class.clone(),
+                    request_hash.clone(),
+                    registry_snapshot_version.clone(),
+                );
+                if let Some(requested_model) = requested_model.as_deref()
+                    && let Ok(route) = ProviderRegistry::built_in().resolve_model(requested_model)
+                {
+                    context.provider = ProviderKind::from_runtime(&route.provider)
+                        .unwrap_or(requested_provider_without_lifecycle);
+                    context.resolved_model = Some(route.canonical_model.clone());
+                    context.requested_alias = route.requested_alias;
+                    let registry = ProviderRegistry::built_in();
+                    let profile = registry.profile(&route.provider);
+                    context.profile_version =
+                        profile.map(|profile| profile.profile_version.clone());
+                    context.pricing_snapshot_version = effective_pricing_snapshot_version(
+                        &state.config,
+                        profile,
+                        Some(&route.canonical_model),
+                        Some(requested_model),
+                    );
+                    context.governance_metadata_status =
+                        profile.map(|profile| profile.governance.metadata_status.clone());
+                }
+                record_gateway_decision(
+                    &state.config,
+                    &identity,
+                    "gateway.lifecycle_denied",
+                    &rejection.reason,
+                    "denied",
+                    HashMap::from([("request_id".into(), request_id.clone())]),
+                )
+                .await;
+                record_refusal_and_append(&state.config, &identity, &context, &rejection).await;
+            }
+            return rejection.response();
+        }
+    };
+    let requested_provider = requested_registry_model
+        .as_ref()
+        .and_then(|resolved| ProviderKind::from_model(&resolved.canonical_model).ok())
+        .unwrap_or(client_provider);
+    let built_in_registry = ProviderRegistry::built_in();
+    let requested_profile = requested_registry_model
+        .as_ref()
+        .and_then(|resolved| built_in_registry.profile(&resolved.provider));
     // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
     // even under `no_preflight`, where the routing-only call below is skipped.
-    let task_class = resolve_task_class(&headers, requested_model.as_deref());
     let failure_posture =
         GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
     let mid_task = header_str(&headers, &X_CHISEI_MID_TASK)
@@ -1481,9 +1806,24 @@ async fn proxy_gateway_inner(
         cycle_id: correlation.cycle_id.clone(),
         traceparent: correlation.traceparent.clone(),
         responses_profile,
-        provider: client_provider,
+        provider: requested_provider,
         requested_model: requested_model.clone(),
         resolved_model: None,
+        requested_alias: requested_registry_model
+            .as_ref()
+            .and_then(|resolved| resolved.requested_alias.clone()),
+        profile_version: requested_profile.map(|profile| profile.profile_version.clone()),
+        capability_snapshot_version: Some(registry_snapshot_version.clone()),
+        pricing_snapshot_version: effective_pricing_snapshot_version(
+            &state.config,
+            requested_profile,
+            requested_registry_model
+                .as_ref()
+                .map(|model| model.canonical_model.as_str()),
+            requested_model.as_deref(),
+        ),
+        governance_metadata_status: requested_profile
+            .map(|profile| profile.governance.metadata_status.clone()),
         work_unit_id: work_unit_id.clone(),
         pipeline_spec: pipeline_spec.clone(),
         request_bytes,
@@ -1498,12 +1838,34 @@ async fn proxy_gateway_inner(
         budget_status: "not_evaluated".into(),
         egress_applied: false,
     };
+    if !client_provider.same_family(requested_provider) && !state.config.allow_cross_provider {
+        let rejection = GatewayRejection::json(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            format!(
+                "cross-provider routing from {} to {} is disabled",
+                client_provider.runtime_name(),
+                requested_provider.runtime_name()
+            ),
+        );
+        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        return rejection.response();
+    }
     if state.config.no_preflight && context_request.is_some() {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "governance_unavailable",
             "explicit governed context is unavailable while preflight is disabled",
         );
+    }
+    if state.config.no_preflight && policy_model_sentinel {
+        let rejection = GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "the auto model sentinel requires policy preflight",
+        );
+        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
+        return rejection.response();
     }
     if state.config.no_preflight && failure_posture.fail_closed {
         let rejection = GatewayRejection::json(
@@ -1549,8 +1911,10 @@ async fn proxy_gateway_inner(
     let (resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
-            resolved_model: requested_model.clone(),
-            resolved_provider: client_provider,
+            resolved_model: requested_registry_model
+                .as_ref()
+                .map(|resolved| resolved.canonical_model.clone()),
+            resolved_provider: requested_provider,
             route_bias: None,
             policy_scope: None,
             policy_version: None,
@@ -1621,6 +1985,21 @@ async fn proxy_gateway_inner(
                 return rejection.response();
             }
             Err(rejection) => {
+                if let Some(route) = rejection.rejected_route.as_ref() {
+                    preflight_context.provider = route.provider;
+                    preflight_context.resolved_model = Some(route.resolved_model.clone());
+                    let profile = built_in_registry.profile(capability_provider_id(route.provider));
+                    preflight_context.profile_version =
+                        profile.map(|profile| profile.profile_version.clone());
+                    preflight_context.governance_metadata_status =
+                        profile.map(|profile| profile.governance.metadata_status.clone());
+                    preflight_context.pricing_snapshot_version = effective_pricing_snapshot_version(
+                        &state.config,
+                        profile,
+                        Some(&route.resolved_model),
+                        requested_model.as_deref(),
+                    );
+                }
                 let rejection = if budget.provisional_local_free {
                     GatewayRejection::json(
                         StatusCode::TOO_MANY_REQUESTS,
@@ -1640,6 +2019,21 @@ async fn proxy_gateway_inner(
         };
         preflight_context.provider = resolved.resolved_provider;
         preflight_context.resolved_model = resolved.resolved_model.clone();
+        let effective_profile = resolved
+            .resolved_model
+            .as_deref()
+            .and_then(|model| built_in_registry.resolve_model(model).ok())
+            .and_then(|model| built_in_registry.profile(&model.provider));
+        preflight_context.profile_version =
+            effective_profile.map(|profile| profile.profile_version.clone());
+        preflight_context.governance_metadata_status =
+            effective_profile.map(|profile| profile.governance.metadata_status.clone());
+        preflight_context.pricing_snapshot_version = effective_pricing_snapshot_version(
+            &state.config,
+            effective_profile,
+            resolved.resolved_model.as_deref(),
+            requested_model.as_deref(),
+        );
         preflight_context.route_bias = resolved.route_bias.clone();
         preflight_context.policy_scope = resolved.policy_scope.clone();
         preflight_context.policy_version = resolved.policy_version.clone();
@@ -1670,6 +2064,7 @@ async fn proxy_gateway_inner(
             &state.runtime,
             &identity,
             client_provider,
+            resolved.resolved_provider,
             &resolved.body,
             context_request.as_ref(),
             requested_model.as_deref(),
@@ -1704,28 +2099,57 @@ async fn proxy_gateway_inner(
             }
         };
     }
-    if responses_create
-        && let Err(rejection) =
-            enforce_provider_capabilities(resolved.resolved_provider, &egress.body)
-    {
-        record_gateway_decision(
-            &state.config,
-            &identity,
-            "gateway.capability_denied",
-            &rejection.reason,
-            "denied",
-            HashMap::from([
-                (
-                    "provider".into(),
-                    capability_provider_id(resolved.resolved_provider).into(),
-                ),
-                ("request_id".into(), request_id.clone()),
-            ]),
+    let resolved_registry_model = resolved.resolved_model.as_deref().or_else(|| {
+        requested_registry_model
+            .as_ref()
+            .map(|model| model.canonical_model.as_str())
+    });
+    let mut contact_requirements = None;
+    if let Some(surface) = capability_surface {
+        let enforcement = enforce_provider_capabilities(
+            resolved.resolved_provider,
+            resolved_registry_model,
+            surface,
+            &egress.body,
         )
-        .await;
-        record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection).await;
-        return rejection.response();
+        .and_then(|requirements| {
+            enforce_adapter_capabilities(
+                client_provider,
+                resolved.resolved_provider,
+                surface,
+                &egress.body,
+            )?;
+            Ok(requirements)
+        });
+        match enforcement {
+            Ok(requirements) => contact_requirements = Some(requirements),
+            Err(rejection) => {
+                record_gateway_decision(
+                    &state.config,
+                    &identity,
+                    "gateway.capability_denied",
+                    &rejection.reason,
+                    "denied",
+                    HashMap::from([
+                        (
+                            "provider".into(),
+                            capability_provider_id(resolved.resolved_provider).into(),
+                        ),
+                        ("request_id".into(), request_id.clone()),
+                    ]),
+                )
+                .await;
+                record_refusal_and_append(&state.config, &identity, &preflight_context, &rejection)
+                    .await;
+                return rejection.response();
+            }
+        }
     }
+    let contact_guard = ProviderContactGuard {
+        provider: resolved.resolved_provider,
+        resolved_model: resolved_registry_model.map(str::to_string),
+        requirements: contact_requirements,
+    };
     let prepared = match prepare_upstream_request(
         &state.config,
         &identity,
@@ -1787,7 +2211,20 @@ async fn proxy_gateway_inner(
         }
     }
 
-    let usage_context = UsageContext {
+    let resolved_registry_metadata = resolved
+        .resolved_model
+        .as_deref()
+        .and_then(|model| ProviderRegistry::built_in().resolve_model(model).ok());
+    let resolved_profile = resolved_registry_metadata
+        .as_ref()
+        .and_then(|resolved| built_in_registry.profile(&resolved.provider));
+    let pricing_snapshot_version = effective_pricing_snapshot_version(
+        &state.config,
+        resolved_profile,
+        resolved.resolved_model.as_deref(),
+        requested_model.as_deref(),
+    );
+    let mut usage_context = UsageContext {
         request_id,
         operation_id: correlation.operation_id,
         parent_operation_id: correlation.parent_operation_id,
@@ -1799,6 +2236,14 @@ async fn proxy_gateway_inner(
         provider: prepared.provider,
         requested_model,
         resolved_model: resolved.resolved_model,
+        requested_alias: requested_registry_model
+            .as_ref()
+            .and_then(|resolved| resolved.requested_alias.clone()),
+        profile_version: resolved_profile.map(|profile| profile.profile_version.clone()),
+        capability_snapshot_version: Some(registry_snapshot_version),
+        pricing_snapshot_version,
+        governance_metadata_status: resolved_profile
+            .map(|profile| profile.governance.metadata_status.clone()),
         work_unit_id,
         pipeline_spec,
         request_bytes,
@@ -1828,8 +2273,11 @@ async fn proxy_gateway_inner(
             .into(),
         egress_applied: !state.config.no_preflight,
     };
-    match send_upstream_with_resilience(&state.runtime, prepared.provider, upstream).await {
-        Ok(resp) => {
+    match send_upstream_with_resilience(&state.runtime, prepared.provider, upstream, &contact_guard)
+        .await
+    {
+        Ok((resp, contact_snapshot_version)) => {
+            usage_context.capability_snapshot_version = Some(contact_snapshot_version);
             response_from_upstream(
                 resp,
                 &state.config,
@@ -1837,8 +2285,40 @@ async fn proxy_gateway_inner(
                 &identity,
                 usage_context,
                 prepared.response_adapter,
+                prepared.client_response_model,
             )
             .await
+        }
+        Err(UpstreamSendError::Governance {
+            rejection,
+            snapshot_version,
+            model_attempted,
+        }) => {
+            usage_context.capability_snapshot_version = Some(snapshot_version);
+            let action = match rejection.error_type.as_str() {
+                "capability_unsupported" => "gateway.capability_denied",
+                "provider_registry_unavailable" => "gateway.provider_registry_unavailable",
+                _ => "gateway.lifecycle_denied",
+            };
+            record_gateway_decision(
+                &state.config,
+                &identity,
+                action,
+                &rejection.reason,
+                "denied",
+                HashMap::from([("request_id".into(), usage_context.request_id.clone())]),
+            )
+            .await;
+            record_refusal_with_usage_and_append(
+                &state.config,
+                &identity,
+                &usage_context,
+                &rejection,
+                None,
+                model_attempted,
+            )
+            .await;
+            rejection.response()
         }
         Err(UpstreamSendError::CircuitOpen) => {
             let rejection = GatewayRejection {
@@ -1848,6 +2328,7 @@ async fn proxy_gateway_inner(
                     "{} upstream circuit is open",
                     prepared.provider.runtime_name()
                 ),
+                rejected_route: None,
             };
             record_refusal_with_usage_and_append(
                 &state.config,
@@ -1860,11 +2341,16 @@ async fn proxy_gateway_inner(
             .await;
             json_error(rejection.status, &rejection.error_type, &rejection.reason)
         }
-        Err(UpstreamSendError::Request(err)) => {
+        Err(UpstreamSendError::Request {
+            error: err,
+            snapshot_version,
+        }) => {
+            usage_context.capability_snapshot_version = Some(snapshot_version);
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
                 reason: safe_upstream_error_reason(prepared.provider, "request", &err),
+                rejected_route: None,
             };
             record_refusal_with_usage_and_append(
                 &state.config,
@@ -1891,7 +2377,7 @@ fn validate_harness_request_headers(
 }
 
 fn is_responses_create(method: &Method, normalized_path: &str) -> bool {
-    method == Method::POST && normalized_path == "/responses"
+    method == Method::POST && matches!(normalized_path, "/responses" | "/responses/")
 }
 
 async fn rate_limit_rejection(
@@ -1955,6 +2441,11 @@ struct UsageContext {
     provider: ProviderKind,
     requested_model: Option<String>,
     resolved_model: Option<String>,
+    requested_alias: Option<String>,
+    profile_version: Option<String>,
+    capability_snapshot_version: Option<String>,
+    pricing_snapshot_version: Option<String>,
+    governance_metadata_status: Option<String>,
     work_unit_id: Option<String>,
     pipeline_spec: String,
     request_bytes: usize,
@@ -1970,11 +2461,64 @@ struct UsageContext {
     egress_applied: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn early_refusal_context(
+    correlation: &GatewayCorrelation,
+    responses_profile: bool,
+    provider: ProviderKind,
+    requested_model: Option<String>,
+    work_unit_id: Option<String>,
+    pipeline_spec: String,
+    request_bytes: usize,
+    started_ms: i64,
+    task_class: String,
+    request_hash: String,
+    capability_snapshot_version: String,
+) -> UsageContext {
+    UsageContext {
+        request_id: correlation.request_id.clone(),
+        operation_id: correlation.operation_id.clone(),
+        parent_operation_id: correlation.parent_operation_id.clone(),
+        turn_id: correlation.turn_id.clone(),
+        attempt: correlation.attempt,
+        cycle_id: correlation.cycle_id.clone(),
+        traceparent: correlation.traceparent.clone(),
+        responses_profile,
+        provider,
+        requested_model,
+        resolved_model: None,
+        requested_alias: None,
+        profile_version: None,
+        capability_snapshot_version: Some(capability_snapshot_version),
+        pricing_snapshot_version: None,
+        governance_metadata_status: None,
+        work_unit_id,
+        pipeline_spec,
+        request_bytes,
+        started_ms,
+        route_bias: None,
+        policy_scope: None,
+        policy_version: None,
+        task_class,
+        request_hash,
+        budget_subject: None,
+        budget_status: "not_evaluated".into(),
+        egress_applied: false,
+    }
+}
+
 #[derive(Debug)]
 struct GatewayRejection {
     status: StatusCode,
     error_type: String,
     reason: String,
+    rejected_route: Option<RejectedRoute>,
+}
+
+#[derive(Debug, Clone)]
+struct RejectedRoute {
+    provider: ProviderKind,
+    resolved_model: String,
 }
 
 #[derive(Clone, Copy)]
@@ -2012,7 +2556,16 @@ impl GatewayRejection {
             status,
             error_type: error_type.to_string(),
             reason,
+            rejected_route: None,
         }
+    }
+
+    fn with_rejected_route(mut self, provider: ProviderKind, resolved_model: String) -> Self {
+        self.rejected_route = Some(RejectedRoute {
+            provider,
+            resolved_model,
+        });
+        self
     }
 
     fn response(&self) -> Response<Body> {
@@ -2637,6 +3190,10 @@ fn policy_cache_key(
 }
 
 async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: &PolicyPreflight) {
+    let registry = provider_registry_snapshot();
+    let Some(registry_state_version) = policy_registry_state(decision, &registry) else {
+        return;
+    };
     let mut cache = runtime.governance_cache.write().await;
     prune_timed_cache(
         &mut cache.policies,
@@ -2648,6 +3205,7 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
         CachedPolicyDecision {
             resolved_model: decision.resolved_model.clone(),
             resolved_provider: decision.resolved_provider,
+            registry_state_version,
             route_bias: decision.route_bias.clone(),
             policy_scope: decision.policy_scope.clone(),
             policy_version: decision.policy_version.clone(),
@@ -2655,6 +3213,14 @@ async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: 
             cached_at: Instant::now(),
         },
     );
+}
+
+fn policy_registry_state(decision: &PolicyPreflight, registry: &ProviderRegistry) -> Option<u64> {
+    let resolved_model = registry
+        .resolve_model(decision.resolved_model.as_deref()?)
+        .ok()?;
+    (resolved_model.provider == capability_provider_id(decision.resolved_provider))
+        .then_some(registry.state_version)
 }
 
 async fn invalidate_cached_policy(runtime: &GatewayRuntime, key: &str) {
@@ -2670,6 +3236,9 @@ async fn cached_policy_decision(
     let cache = runtime.governance_cache.read().await;
     let cached = cache.policies.get(key)?;
     if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
+        return None;
+    }
+    if cached.registry_state_version != crate::provider_profile::provider_registry_state_version() {
         return None;
     }
     let body = match cached.resolved_model.as_deref() {
@@ -2938,12 +3507,52 @@ async fn resolve_policy_preflight(
             data_class: None,
         });
     };
+    let requested_registry_model = if requested_model == "auto" {
+        None
+    } else {
+        Some(
+            crate::provider_profile::resolve_registered_model_for_provider(
+                requested_model,
+                capability_provider_id(provider),
+            )
+            .map_err(|reason| {
+                GatewayRejection::json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("model resolution failed: {reason}"),
+                )
+            })?,
+        )
+    };
+    let requested_provider = requested_registry_model
+        .as_ref()
+        .map(|model| {
+            ProviderKind::from_runtime(&model.provider).ok_or_else(|| {
+                GatewayRejection::json(
+                    StatusCode::BAD_REQUEST,
+                    "capability_unsupported",
+                    format!(
+                        "provider {:?} is not supported by the gateway",
+                        model.provider
+                    ),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(provider);
     let cache_key = policy_cache_key(identity, provider, requested_model, task_class, budget);
     let Some(target) = &config.chisei_grpc_target else {
+        if requested_model == "auto" {
+            return Err(GatewayRejection::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_unavailable",
+                "the auto model sentinel requires a configured policy control plane",
+            ));
+        }
         return Ok(PolicyPreflight {
             body: body.to_vec(),
-            resolved_model: Some(requested_model.to_string()),
-            resolved_provider: provider,
+            resolved_model: requested_registry_model.map(|model| model.canonical_model),
+            resolved_provider: requested_provider,
             route_bias: None,
             policy_scope: None,
             policy_version: None,
@@ -2953,10 +3562,18 @@ async fn resolve_policy_preflight(
     match connect_governance(runtime, target).await {
         Ok(channel) => {
             let mut client = ChiseiServiceClient::new(channel);
+            let preferred_runtime = requested_registry_model
+                .as_ref()
+                .map(|model| model.provider.clone())
+                .unwrap_or_else(|| capability_provider_id(provider).to_string());
+            let preferred_model = requested_registry_model
+                .as_ref()
+                .map(|model| model.canonical_model.clone())
+                .unwrap_or_else(|| requested_model.to_string());
             let req = GrpcRequest::new(ResolvePolicyRequest {
                 namespace: identity.project.clone(),
-                preferred_runtime: provider.runtime_name().to_string(),
-                preferred_model: requested_model.to_string(),
+                preferred_runtime,
+                preferred_model,
                 subject: identity.user_id.clone(),
                 project: identity.project.clone(),
                 agent: identity.agent.clone(),
@@ -2992,14 +3609,56 @@ async fn resolve_policy_preflight(
                         )
                         .await;
                     };
-                    // Refine the backend from the resolved model within the OpenAI
-                    // family (openai vs ollama vs native), since policy carries a
-                    // coarse runtime. Anthropic stays as resolved by runtime.
-                    let resolved_provider = if runtime_provider.is_openai() {
-                        ProviderKind::from_model(&resolution.model)
-                    } else {
-                        runtime_provider
+                    let registry_snapshot = provider_registry_snapshot();
+                    let registry_resolution = match registry_snapshot
+                        .resolve_model(&resolution.model)
+                    {
+                        Ok(resolution) => resolution,
+                        Err(reason) => {
+                            if registry_snapshot.model_or_provider_is_disabled(&resolution.model) {
+                                return policy_lifecycle_denied(
+                                    config,
+                                    identity,
+                                    RejectedRoute {
+                                        provider: runtime_provider,
+                                        resolved_model: resolution.model.clone(),
+                                    },
+                                    requested_model,
+                                    &format!("policy resolved disabled model: {reason}"),
+                                    request_id,
+                                    work_unit_id,
+                                )
+                                .await;
+                            }
+                            return policy_denied(
+                                config,
+                                identity,
+                                requested_model,
+                                &resolution.model,
+                                &format!("policy resolved invalid model: {reason}"),
+                                request_id,
+                                work_unit_id,
+                            )
+                            .await;
+                        }
                     };
+                    let resolved_provider =
+                        ProviderKind::from_runtime(&registry_resolution.provider)
+                            .expect("built-in provider profiles have gateway runtimes");
+                    if capability_provider_id(runtime_provider)
+                        != registry_resolution.provider.as_str()
+                    {
+                        return policy_denied(
+                            config,
+                            identity,
+                            requested_model,
+                            &resolution.model,
+                            "policy runtime does not match the registry model provider",
+                            request_id,
+                            work_unit_id,
+                        )
+                        .await;
+                    }
                     if !provider.same_family(resolved_provider) && !config.allow_cross_provider {
                         return policy_denied(
                             config,
@@ -3009,22 +3668,6 @@ async fn resolve_policy_preflight(
                             &format!(
                                 "policy resolved unsupported runtime {:?}",
                                 resolution.runtime
-                            ),
-                            request_id,
-                            work_unit_id,
-                        )
-                        .await;
-                    }
-                    if !resolved_provider.is_compatible_model(&resolution.model) {
-                        return policy_denied(
-                            config,
-                            identity,
-                            requested_model,
-                            &resolution.model,
-                            &format!(
-                                "policy resolved unsupported {} proxy model {:?}",
-                                resolved_provider.runtime_name(),
-                                resolution.model
                             ),
                             request_id,
                             work_unit_id,
@@ -3078,7 +3721,7 @@ async fn resolve_policy_preflight(
                     };
                     let decision = PolicyPreflight {
                         body: next_body,
-                        resolved_model: Some(resolution.model),
+                        resolved_model: Some(registry_resolution.canonical_model),
                         resolved_provider,
                         route_bias: Some(resolution.route_bias).filter(|bias| !bias.is_empty()),
                         policy_scope: Some(resolution.policy_scope)
@@ -3178,10 +3821,17 @@ async fn resolve_policy_preflight(
                         &format!("ResolvePolicy failed: {err}"),
                     )
                     .await?;
+                    let Some(requested_registry_model) = requested_registry_model.as_ref() else {
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "governance_unavailable",
+                            "the auto model sentinel cannot fail open without a policy resolution",
+                        ));
+                    };
                     Ok(PolicyPreflight {
                         body: body.to_vec(),
-                        resolved_model: Some(requested_model.to_string()),
-                        resolved_provider: provider,
+                        resolved_model: Some(requested_registry_model.canonical_model.clone()),
+                        resolved_provider: requested_provider,
                         route_bias: None,
                         policy_scope: None,
                         policy_version: None,
@@ -3221,10 +3871,17 @@ async fn resolve_policy_preflight(
                 &format!("failed to connect to Chisei control plane: {err}"),
             )
             .await?;
+            let Some(requested_registry_model) = requested_registry_model else {
+                return Err(GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    "the auto model sentinel cannot fail open without a policy resolution",
+                ));
+            };
             Ok(PolicyPreflight {
                 body: body.to_vec(),
-                resolved_model: Some(requested_model.to_string()),
-                resolved_provider: provider,
+                resolved_model: Some(requested_registry_model.canonical_model),
+                resolved_provider: requested_provider,
                 route_bias: None,
                 policy_scope: None,
                 policy_version: None,
@@ -3268,28 +3925,41 @@ async fn policy_denied(
     ))
 }
 
-fn is_openai_compatible_model(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    if model.is_empty() || model.starts_with("claude") {
-        return false;
+async fn policy_lifecycle_denied(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    route: RejectedRoute,
+    requested_model: &str,
+    reason: &str,
+    request_id: &str,
+    work_unit_id: Option<&str>,
+) -> Result<PolicyPreflight, GatewayRejection> {
+    let mut evidence = HashMap::from([
+        ("requested_model".to_string(), requested_model.to_string()),
+        ("resolved_model".to_string(), route.resolved_model.clone()),
+        ("project".to_string(), identity.project.clone()),
+        ("request_id".to_string(), request_id.to_string()),
+    ]);
+    if let Some(work_unit_id) = work_unit_id.filter(|value| !value.is_empty()) {
+        evidence.insert("work_unit".to_string(), work_unit_id.to_string());
     }
-    if model.starts_with("native-") || model.starts_with("ollama/") {
-        return true;
-    }
-    const NON_OPENAI_PREFIXES: &[&str] = &[
-        "gemini",
-        "vertex",
-        "palm",
-        "bedrock",
-        "anthropic",
-        "azure",
-        "cohere",
-        "claude",
-    ];
-
-    !NON_OPENAI_PREFIXES
-        .iter()
-        .any(|prefix| model.starts_with(prefix))
+    record_gateway_decision(
+        config,
+        identity,
+        "gateway.lifecycle_denied",
+        reason,
+        "denied",
+        evidence,
+    )
+    .await;
+    let resolved_model = ProviderRegistry::built_in()
+        .resolve_model(&route.resolved_model)
+        .map(|model| model.canonical_model)
+        .unwrap_or(route.resolved_model);
+    Err(
+        GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason)
+            .with_rejected_route(route.provider, resolved_model),
+    )
 }
 
 fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
@@ -3337,6 +4007,7 @@ struct PreparedUpstreamRequest {
     url: String,
     body: Vec<u8>,
     response_adapter: ResponseAdapter,
+    client_response_model: Option<String>,
     /// True when the request was translated across provider families (client
     /// provider differs from the resolved upstream provider). The client's
     /// credential must not be forwarded to a different provider's upstream.
@@ -3356,7 +4027,24 @@ async fn prepare_upstream_request(
         // Same wire family: pass through unchanged, but route to the *resolved*
         // provider's backend so within-family routing (OpenAI vs Ollama vs native)
         // reaches the right upstream. All of these speak the same wire natively.
-        let body = if matches!(
+        let body = if let Some(resolved_model) = resolved_model {
+            let registry_model = ProviderRegistry::built_in()
+                .resolve_model(resolved_model)
+                .map_err(|reason| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &format!("resolved model is invalid: {reason}"),
+                    )
+                })?;
+            rewrite_request_model(&body, &registry_model.upstream_model).map_err(|error| {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("could not rewrite resolved model: {error}"),
+                )
+            })?
+        } else if matches!(
             resolved_provider,
             ProviderKind::OpenAi(OpenAiRuntime::Ollama)
         ) {
@@ -3369,6 +4057,7 @@ async fn prepare_upstream_request(
             url: upstream_url_for_provider(config, uri, resolved_provider),
             body,
             response_adapter: ResponseAdapter::Passthrough,
+            client_response_model: None,
             cross_provider: false,
         });
     }
@@ -3390,11 +4079,11 @@ async fn prepare_upstream_request(
                 HashMap::from([
                     (
                         "client_provider".to_string(),
-                        client_provider.runtime_name().to_string(),
+                        capability_provider_id(client_provider).to_string(),
                     ),
                     (
                         "resolved_provider".to_string(),
-                        resolved_provider.runtime_name().to_string(),
+                        capability_provider_id(resolved_provider).to_string(),
                     ),
                 ]),
             )
@@ -3412,14 +4101,25 @@ async fn prepare_upstream_request(
                 "cross-provider translation requires a resolved model",
             )
         })?;
-        let mut translated =
-            anthropic_messages_to_openai_chat(&body, resolved_model).map_err(|err| {
+        let registry_model = ProviderRegistry::built_in()
+            .resolve_model(resolved_model)
+            .map_err(|reason| {
                 json_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    &format!("failed to translate Anthropic request to OpenAI: {err}"),
+                    &format!("resolved model is invalid: {reason}"),
                 )
             })?;
+        let mut translated =
+            anthropic_messages_to_openai_chat(&body, &registry_model.upstream_model).map_err(
+                |err| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &format!("failed to translate Anthropic request to OpenAI: {err}"),
+                    )
+                },
+            )?;
         // Ask the OpenAI-compatible upstream to stream (with usage) so we can
         // re-emit Anthropic streaming events and still meter tokens.
         if streaming {
@@ -3448,11 +4148,11 @@ async fn prepare_upstream_request(
             HashMap::from([
                 (
                     "client_provider".to_string(),
-                    client_provider.runtime_name().to_string(),
+                    capability_provider_id(client_provider).to_string(),
                 ),
                 (
                     "resolved_provider".to_string(),
-                    resolved_provider.runtime_name().to_string(),
+                    capability_provider_id(resolved_provider).to_string(),
                 ),
                 ("resolved_model".to_string(), resolved_model.to_string()),
                 ("streaming".to_string(), streaming.to_string()),
@@ -3465,13 +4165,14 @@ async fn prepare_upstream_request(
             url: chat_completions_url_for_provider(config, uri, resolved_provider),
             body: translated,
             response_adapter,
+            client_response_model: Some(registry_model.upstream_model),
             cross_provider: true,
         });
     }
     let reason = format!(
         "cross-provider translation from {} to {} is not supported",
-        client_provider.runtime_name(),
-        resolved_provider.runtime_name()
+        capability_provider_id(client_provider),
+        capability_provider_id(resolved_provider)
     );
     record_gateway_decision(
         config,
@@ -3482,11 +4183,11 @@ async fn prepare_upstream_request(
         HashMap::from([
             (
                 "client_provider".to_string(),
-                client_provider.runtime_name().to_string(),
+                capability_provider_id(client_provider).to_string(),
             ),
             (
                 "resolved_provider".to_string(),
-                resolved_provider.runtime_name().to_string(),
+                capability_provider_id(resolved_provider).to_string(),
             ),
         ]),
     )
@@ -4184,6 +4885,7 @@ async fn apply_context_egress(
     runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     provider: ProviderKind,
+    resolved_provider: ProviderKind,
     body: &[u8],
     context_request: Option<&GatewayContextRequest>,
     requested_model: Option<&str>,
@@ -4611,7 +5313,10 @@ async fn apply_context_egress(
                 "work_unit".to_string(),
                 work_unit_id.unwrap_or_default().to_string(),
             ),
-            ("provider".to_string(), provider.runtime_name().to_string()),
+            (
+                "provider".to_string(),
+                capability_provider_id(resolved_provider).to_string(),
+            ),
             (
                 "requested_model".to_string(),
                 requested_model.unwrap_or_default().to_string(),
@@ -5722,20 +6427,64 @@ fn lookup_model_pricing<'c>(
     context
         .resolved_model
         .as_ref()
-        .and_then(|model| {
-            config
-                .pricing
-                .get(model)
-                .map(|pricing| (model.as_str(), pricing))
-        })
+        .and_then(|model| lookup_pricing_entry(&config.pricing, model))
         .or_else(|| {
-            context.requested_model.as_ref().and_then(|model| {
-                config
-                    .pricing
-                    .get(model)
-                    .map(|pricing| (model.as_str(), pricing))
+            context
+                .requested_model
+                .as_ref()
+                .and_then(|model| lookup_pricing_entry(&config.pricing, model))
+        })
+}
+
+fn lookup_pricing_entry<'a>(
+    pricing: &'a HashMap<String, ModelPricing>,
+    model: &str,
+) -> Option<(&'a str, &'a ModelPricing)> {
+    pricing
+        .get_key_value(model)
+        .or_else(|| {
+            let registry = ProviderRegistry::built_in();
+            registry.resolve_model(model).ok().and_then(|resolved| {
+                let alias_matches = registry
+                    .resolve_model(&resolved.upstream_model)
+                    .map(|alias| alias.canonical_model == resolved.canonical_model)
+                    .unwrap_or_else(|_| {
+                        resolved.provider == "ollama" && resolved.upstream_model.contains('/')
+                    });
+                alias_matches
+                    .then(|| pricing.get_key_value(&resolved.upstream_model))
+                    .flatten()
             })
         })
+        .map(|(model, pricing)| (model.as_str(), pricing))
+}
+
+fn effective_pricing_snapshot_version(
+    config: &GatewayConfig,
+    profile: Option<&ProviderProfile>,
+    resolved_model: Option<&str>,
+    requested_model: Option<&str>,
+) -> Option<String> {
+    let configured_rate_applies = resolved_model
+        .and_then(|model| lookup_pricing_entry(&config.pricing, model))
+        .or_else(|| requested_model.and_then(|model| lookup_pricing_entry(&config.pricing, model)))
+        .is_some();
+    if !configured_rate_applies {
+        return profile.map(|profile| profile.pricing.version.clone());
+    }
+
+    let mut entries = config.pricing.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(model, _)| *model);
+    let mut hasher = Sha256::new();
+    hasher.update(b"chisei.gateway-pricing/v1\0");
+    for (model, pricing) in entries {
+        hasher.update(model.as_bytes());
+        hasher.update([0]);
+        hasher.update(pricing.input_usd_micros_per_million.to_be_bytes());
+        hasher.update(pricing.output_usd_micros_per_million.to_be_bytes());
+        hasher.update(pricing.cached_input_usd_micros_per_million.to_be_bytes());
+    }
+    Some(format!("chisei.gateway-pricing/v1:{:x}", hasher.finalize()))
 }
 
 fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
@@ -5803,14 +6552,108 @@ enum ProviderKind {
 #[derive(Debug)]
 enum UpstreamSendError {
     CircuitOpen,
-    Request(reqwest::Error),
+    Request {
+        error: reqwest::Error,
+        snapshot_version: String,
+    },
+    Governance {
+        rejection: GatewayRejection,
+        snapshot_version: String,
+        model_attempted: bool,
+    },
+}
+
+struct ProviderContactGuard {
+    provider: ProviderKind,
+    resolved_model: Option<String>,
+    requirements: Option<CapabilityRequirements>,
+}
+
+impl ProviderContactGuard {
+    async fn enforce(
+        &self,
+        runtime: &GatewayRuntime,
+    ) -> Result<String, (GatewayRejection, String)> {
+        let registry = runtime
+            .refresh_registry_snapshot(true)
+            .await
+            .map_err(|reason| {
+                (
+                    GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "provider_registry_unavailable",
+                        reason,
+                    ),
+                    capability_snapshot_identifier(&provider_registry_snapshot()),
+                )
+            })?;
+        let snapshot_version = capability_snapshot_identifier(&registry);
+        let provider_id = capability_provider_id(self.provider);
+        registry
+            .ensure_provider_available(provider_id)
+            .map_err(|reason| {
+                (
+                    GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason),
+                    snapshot_version.clone(),
+                )
+            })?;
+        if let Some(model) = self.resolved_model.as_deref() {
+            let resolved = registry.resolve_model(model).map_err(|reason| {
+                (
+                    GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason),
+                    snapshot_version.clone(),
+                )
+            })?;
+            if resolved.provider != provider_id {
+                return Err((
+                    GatewayRejection::json(
+                        StatusCode::FORBIDDEN,
+                        "policy_denied",
+                        format!(
+                            "resolved model provider {:?} does not match routed provider {provider_id:?}",
+                            resolved.provider
+                        ),
+                    ),
+                    snapshot_version,
+                ));
+            }
+        }
+        if let Some(requirements) = &self.requirements {
+            let profile = registry.effective_profile(provider_id).ok_or_else(|| {
+                (
+                    GatewayRejection::json(
+                        StatusCode::BAD_REQUEST,
+                        "capability_unsupported",
+                        format!("provider {provider_id} has no capability profile"),
+                    ),
+                    snapshot_version.clone(),
+                )
+            })?;
+            let missing = requirements.unsupported_by(&profile.capabilities);
+            if !missing.is_empty() {
+                return Err((
+                    GatewayRejection::json(
+                        StatusCode::BAD_REQUEST,
+                        "capability_unsupported",
+                        format!(
+                            "provider {provider_id} cannot preserve required capabilities: {}",
+                            missing.join(", ")
+                        ),
+                    ),
+                    snapshot_version,
+                ));
+            }
+        }
+        Ok(snapshot_version)
+    }
 }
 
 async fn send_upstream_with_resilience(
     runtime: &GatewayRuntime,
     provider: ProviderKind,
     request: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, UpstreamSendError> {
+    contact_guard: &ProviderContactGuard,
+) -> Result<(reqwest::Response, String), UpstreamSendError> {
     let circuit_key = format!("{provider:?}");
     if runtime
         .upstream_circuits
@@ -5823,8 +6666,21 @@ async fn send_upstream_with_resilience(
     }
 
     let mut request = request;
+    let mut model_attempted = false;
     for attempt in 0..=runtime.resilience.upstream_connect_retries {
+        let contact_snapshot_version =
+            contact_guard
+                .enforce(runtime)
+                .await
+                .map_err(
+                    |(rejection, snapshot_version)| UpstreamSendError::Governance {
+                        rejection,
+                        snapshot_version,
+                        model_attempted,
+                    },
+                )?;
         let retry = request.try_clone();
+        model_attempted = true;
         match request.send().await {
             Ok(response) => {
                 runtime
@@ -5834,7 +6690,7 @@ async fn send_upstream_with_resilience(
                     .entry(circuit_key)
                     .or_default()
                     .record_success();
-                return Ok(response);
+                return Ok((response, contact_snapshot_version));
             }
             Err(error)
                 if error.is_connect()
@@ -5854,7 +6710,10 @@ async fn send_upstream_with_resilience(
                     .entry(circuit_key)
                     .or_default()
                     .record_failure(error.to_string(), &runtime.resilience);
-                return Err(UpstreamSendError::Request(error));
+                return Err(UpstreamSendError::Request {
+                    error,
+                    snapshot_version: contact_snapshot_version,
+                });
             }
         }
     }
@@ -5875,12 +6734,13 @@ impl ProviderKind {
     /// Derives the concrete backend from a model name. Used to pick the upstream
     /// per resolved model (e.g. `ollama/llama3.2` routes to the Ollama backend),
     /// which is more reliable than the runtime string carried by policy.
-    fn from_model(model: &str) -> Self {
-        match crate::llm::provider_name(model) {
-            "anthropic" => Self::Anthropic,
-            "ollama" => Self::OpenAi(OpenAiRuntime::Ollama),
-            "native" => Self::OpenAi(OpenAiRuntime::Native),
-            _ => Self::OpenAi(OpenAiRuntime::OpenAi),
+    fn from_model(model: &str) -> Result<Self, String> {
+        match crate::provider_profile::resolve_provider_id(model)? {
+            "anthropic" => Ok(Self::Anthropic),
+            "ollama" => Ok(Self::OpenAi(OpenAiRuntime::Ollama)),
+            "native" => Ok(Self::OpenAi(OpenAiRuntime::Native)),
+            "openai" => Ok(Self::OpenAi(OpenAiRuntime::OpenAi)),
+            provider => Err(format!("unsupported provider {provider:?}")),
         }
     }
 
@@ -5898,16 +6758,6 @@ impl ProviderKind {
     fn same_family(self, other: Self) -> bool {
         self.is_openai() == other.is_openai()
     }
-
-    fn is_compatible_model(self, model: &str) -> bool {
-        match self {
-            Self::OpenAi(openai_runtime) => match openai_runtime {
-                OpenAiRuntime::OpenAi => is_openai_compatible_model(model),
-                OpenAiRuntime::Ollama | OpenAiRuntime::Native => !model.starts_with("claude"),
-            },
-            Self::Anthropic => model.starts_with("claude"),
-        }
-    }
 }
 
 fn capability_provider_id(provider: ProviderKind) -> &'static str {
@@ -5919,32 +6769,80 @@ fn capability_provider_id(provider: ProviderKind) -> &'static str {
     }
 }
 
+fn capability_snapshot_identifier(registry: &ProviderRegistry) -> String {
+    format!(
+        "{CAPABILITY_MATRIX_VERSION}:registry-state-{}",
+        registry.state_version
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CapabilityRequestSurface {
+    Responses,
+    OpenAiChat,
+    AnthropicMessages,
+}
+
+fn capability_request_surface(
+    method: &Method,
+    normalized_path: &str,
+) -> Option<CapabilityRequestSurface> {
+    if method != Method::POST {
+        return None;
+    }
+    match normalized_path {
+        "/responses" | "/responses/" => Some(CapabilityRequestSurface::Responses),
+        "/chat/completions" | "/chat/completions/" => Some(CapabilityRequestSurface::OpenAiChat),
+        "/messages" | "/messages/" => Some(CapabilityRequestSurface::AnthropicMessages),
+        _ => None,
+    }
+}
+
 fn enforce_provider_capabilities(
     provider: ProviderKind,
+    resolved_model: Option<&str>,
+    surface: CapabilityRequestSurface,
     body: &[u8],
-) -> Result<(), GatewayRejection> {
-    validate_responses_request_fields(body).map_err(|reason| {
-        GatewayRejection::json(StatusCode::BAD_REQUEST, "invalid_request_error", reason)
-    })?;
-    let requirements = CapabilityRequirements::from_responses_body(body).map_err(|reason| {
+) -> Result<CapabilityRequirements, GatewayRejection> {
+    if matches!(surface, CapabilityRequestSurface::Responses) {
+        validate_responses_request_fields(body).map_err(|reason| {
+            GatewayRejection::json(StatusCode::BAD_REQUEST, "invalid_request_error", reason)
+        })?;
+    }
+    let requirements = match surface {
+        CapabilityRequestSurface::Responses => CapabilityRequirements::from_responses_body(body),
+        CapabilityRequestSurface::OpenAiChat => CapabilityRequirements::from_openai_chat_body(body),
+        CapabilityRequestSurface::AnthropicMessages => {
+            CapabilityRequirements::from_anthropic_messages_body(body)
+        }
+    }
+    .map_err(|reason| {
         GatewayRejection::json(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!("cannot derive Responses capabilities: {reason}"),
+            format!("cannot derive request capabilities: {reason}"),
         )
     })?;
     let provider_id = capability_provider_id(provider);
-    let matrix = CapabilityMatrix::built_in();
-    let capabilities = matrix.capabilities(provider_id).ok_or_else(|| {
+    let registry = provider_registry_snapshot();
+    registry
+        .ensure_provider_available(provider_id)
+        .map_err(|reason| GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason))?;
+    if let Some(model) = resolved_model {
+        registry.resolve_model(model).map_err(|reason| {
+            GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason)
+        })?;
+    }
+    let profile = registry.effective_profile(provider_id).ok_or_else(|| {
         GatewayRejection::json(
             StatusCode::BAD_REQUEST,
             "capability_unsupported",
             format!("provider {provider_id} has no capability profile"),
         )
     })?;
-    let missing = requirements.unsupported_by(capabilities);
+    let missing = requirements.unsupported_by(&profile.capabilities);
     if missing.is_empty() {
-        return Ok(());
+        return Ok(requirements);
     }
     Err(GatewayRejection::json(
         StatusCode::BAD_REQUEST,
@@ -5954,6 +6852,126 @@ fn enforce_provider_capabilities(
             missing.join(", ")
         ),
     ))
+}
+
+fn enforce_adapter_capabilities(
+    client_provider: ProviderKind,
+    resolved_provider: ProviderKind,
+    surface: CapabilityRequestSurface,
+    body: &[u8],
+) -> Result<(), GatewayRejection> {
+    if client_provider != ProviderKind::Anthropic
+        || !resolved_provider.is_openai()
+        || !matches!(surface, CapabilityRequestSurface::AnthropicMessages)
+    {
+        return Ok(());
+    }
+    let required =
+        CapabilityRequirements::from_anthropic_messages_body(body).map_err(|reason| {
+            GatewayRejection::json(StatusCode::BAD_REQUEST, "invalid_request_error", reason)
+        })?;
+    let mut unsupported = Vec::new();
+    if required.tools {
+        unsupported.push("tools");
+    }
+    if required.structured_output {
+        unsupported.push("structured_output");
+    }
+    if required.reasoning_controls {
+        unsupported.push("reasoning_controls");
+    }
+    if required
+        .modalities
+        .iter()
+        .any(|modality| modality != "text")
+    {
+        unsupported.push("non_text_modalities");
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|reason| {
+        GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("invalid Anthropic request: {reason}"),
+        )
+    })?;
+    let allowed_fields = [
+        "model",
+        "messages",
+        "system",
+        "max_tokens",
+        "temperature",
+        "stream",
+    ];
+    if value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|field| !allowed_fields.contains(&field.as_str()))
+    }) {
+        unsupported.push("request_fields");
+    }
+    if !anthropic_adapter_preserves_text_content(&value) {
+        unsupported.push("content_blocks");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "capability_unsupported",
+            format!(
+                "cross-provider Anthropic to OpenAI adapter cannot preserve: {}",
+                unsupported.join(", ")
+            ),
+        ))
+    }
+}
+
+fn anthropic_adapter_preserves_text_content(value: &serde_json::Value) -> bool {
+    fn text_content_is_lossless(content: &serde_json::Value) -> bool {
+        match content {
+            serde_json::Value::String(_) => true,
+            serde_json::Value::Array(blocks) => {
+                let [block] = blocks.as_slice() else {
+                    return false;
+                };
+                let Some(object) = block.as_object() else {
+                    return false;
+                };
+                object.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && object.get("text").is_some_and(serde_json::Value::is_string)
+                    && object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "type" | "text"))
+            }
+            _ => false,
+        }
+    }
+
+    if value
+        .get("system")
+        .is_some_and(|system| !text_content_is_lossless(system))
+    {
+        return false;
+    }
+    value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            !messages.is_empty()
+                && messages.iter().all(|message| {
+                    let Some(object) = message.as_object() else {
+                        return false;
+                    };
+                    object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "role" | "content"))
+                        && object
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|role| matches!(role, "user" | "assistant"))
+                        && object.get("content").is_some_and(text_content_is_lossless)
+                })
+        })
 }
 
 /// Normalizes a gateway Anthropic upstream base URL so it ends in `/v1`.
@@ -6226,7 +7244,7 @@ async fn record_usage_and_append(
             }
             values.insert(
                 "provider".to_string(),
-                context.provider.runtime_name().to_string(),
+                capability_provider_id(context.provider).to_string(),
             );
             if let Some(model) = &context.requested_model {
                 values.insert("model".to_string(), model.clone());
@@ -6458,7 +7476,7 @@ async fn record_refusal_with_usage_and_append(
     }
     values.insert(
         "provider".to_string(),
-        context.provider.runtime_name().to_string(),
+        capability_provider_id(context.provider).to_string(),
     );
     if let Some(model) = &context.requested_model {
         values.insert("model".to_string(), model.clone());
@@ -6668,7 +7686,7 @@ fn build_gateway_operation_receipt(
             BTreeMap::from([
                 (
                     "provider".into(),
-                    context.provider.runtime_name().to_string(),
+                    capability_provider_id(context.provider).to_string(),
                 ),
                 (
                     "requested_model".into(),
@@ -6677,6 +7695,32 @@ fn build_gateway_operation_receipt(
                 (
                     "resolved_model".into(),
                     context.resolved_model.clone().unwrap_or_default(),
+                ),
+                (
+                    "requested_alias".into(),
+                    context.requested_alias.clone().unwrap_or_default(),
+                ),
+                (
+                    "profile_version".into(),
+                    context.profile_version.clone().unwrap_or_default(),
+                ),
+                (
+                    "capability_snapshot_version".into(),
+                    context
+                        .capability_snapshot_version
+                        .clone()
+                        .unwrap_or_default(),
+                ),
+                (
+                    "pricing_snapshot_version".into(),
+                    context.pricing_snapshot_version.clone().unwrap_or_default(),
+                ),
+                (
+                    "governance_metadata_status".into(),
+                    context
+                        .governance_metadata_status
+                        .clone()
+                        .unwrap_or_default(),
                 ),
             ]),
         ),
@@ -7002,7 +8046,7 @@ async fn run_gateway_pipeline_observation(
                 namespace: identity.project.clone(),
                 spec: context.pipeline_spec.clone(),
                 model,
-                runtime: context.provider.runtime_name().to_string(),
+                runtime: capability_provider_id(context.provider).to_string(),
                 task_type: "gateway_llm_call".to_string(),
                 task_class: String::new(),
                 priority: 0,
@@ -7100,7 +8144,7 @@ async fn record_gateway_pipeline_decision(
             ("sample_rate".to_string(), observation.rate.to_string()),
             (
                 "provider".to_string(),
-                context.provider.runtime_name().to_string(),
+                capability_provider_id(context.provider).to_string(),
             ),
         ]),
     )
@@ -7238,7 +8282,7 @@ fn llm_call_object_properties(
         ("project".to_string(), identity.project.clone()),
         (
             "provider".to_string(),
-            context.provider.runtime_name().to_string(),
+            capability_provider_id(context.provider).to_string(),
         ),
     ]);
     for key in [
@@ -7303,13 +8347,13 @@ async fn record_gateway_event(
     reason: &str,
     outcome: &str,
     evidence: HashMap<String, String>,
-) {
+) -> bool {
     let Some(target) = &config.chisei_grpc_target else {
-        return;
+        return false;
     };
     let timeout = configured_control_plane_timeout();
     let Ok(channel) = connect_sekai_as_gateway_with_timeout(target, Some(timeout)).await else {
-        return;
+        return false;
     };
     let mut sekai = SekaiServiceClient::new(channel.clone());
     if let Err(err) = ensure_llm_calls_dataset(&mut sekai).await
@@ -7317,7 +8361,7 @@ async fn record_gateway_event(
             || !err.message().contains("UNIQUE constraint failed"))
     {
         error!(error = %err, "chisei-gateway audit target create failed");
-        return;
+        return false;
     }
     let mut chisei = ChiseiServiceClient::new(channel);
     let target_id = if action == "operation.receipt.upsert" {
@@ -7344,7 +8388,9 @@ async fn record_gateway_event(
         .await
     {
         error!(error = %err, "chisei-gateway audit decision record failed");
+        return false;
     }
+    true
 }
 
 /// Audit evidence is a metadata-only boundary. Credentials are intentionally
@@ -8136,6 +9182,7 @@ async fn response_from_upstream(
     identity: &GatewayIdentity,
     context: UsageContext,
     response_adapter: ResponseAdapter,
+    client_response_model: Option<String>,
 ) -> Response<Body> {
     let status = upstream.status();
     let mut builder = Response::builder().status(status);
@@ -8176,7 +9223,9 @@ async fn response_from_upstream(
         let runtime = runtime.clone();
         let identity = identity.clone();
         let context = context.clone();
-        let model = context.resolved_model.clone().unwrap_or_default();
+        let client_model = client_response_model
+            .or_else(|| context.resolved_model.clone())
+            .unwrap_or_default();
         let mut upstream_stream = upstream.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(32);
         tokio::spawn(async move {
@@ -8185,7 +9234,8 @@ async fn response_from_upstream(
             } else {
                 SseUsageTap::new()
             };
-            let mut translator = translate.then(|| AnthropicMessageStreamTranslator::new(model));
+            let mut translator =
+                translate.then(|| AnthropicMessageStreamTranslator::new(client_model));
             let mut aborted = false;
             let mut stream_error = None;
             let mut client_gone = false;
@@ -8251,16 +9301,19 @@ async fn response_from_upstream(
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_invalid_response".into(),
                     reason: "upstream reported response.failed".into(),
+                    rejected_route: None,
                 }),
                 Some(ResponsesTerminal::Cancelled) => Some(GatewayRejection {
                     status: StatusCode::CONFLICT,
                     error_type: "request_conflict".into(),
                     reason: "upstream reported response.cancelled".into(),
+                    rejected_route: None,
                 }),
                 Some(ResponsesTerminal::Interrupted) => Some(GatewayRejection {
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_unavailable".into(),
                     reason: "upstream reported chisei.response.interrupted".into(),
+                    rejected_route: None,
                 }),
                 Some(ResponsesTerminal::Completed) => None,
                 None if aborted || missing_responses_terminal => Some(GatewayRejection {
@@ -8268,6 +9321,7 @@ async fn response_from_upstream(
                     error_type: "upstream_stream_error".into(),
                     reason: stream_error
                         .unwrap_or_else(|| "upstream stream ended without a terminal event".into()),
+                    rejected_route: None,
                 }),
                 None => None,
             };
@@ -8322,9 +9376,15 @@ async fn response_from_upstream(
                 // a whole JSON body.
                 ResponseAdapter::OpenAiChatToAnthropicMessage
                 | ResponseAdapter::OpenAiChatStreamToAnthropicMessage => {
+                    let response_model = context
+                        .resolved_model
+                        .as_deref()
+                        .and_then(|model| ProviderRegistry::built_in().resolve_model(model).ok());
                     match openai_chat_to_anthropic_message(
                         &bytes,
-                        context.resolved_model.as_deref(),
+                        response_model
+                            .as_ref()
+                            .map(|resolved| resolved.upstream_model.as_str()),
                     ) {
                         Ok(body) => body,
                         Err(err) => {
@@ -8334,6 +9394,7 @@ async fn response_from_upstream(
                                 reason: format!(
                                     "failed to translate OpenAI response to Anthropic: {err}"
                                 ),
+                                rejected_route: None,
                             };
                             record_usage_and_append(
                                 config,
@@ -8365,6 +9426,7 @@ async fn response_from_upstream(
                         status: StatusCode::BAD_GATEWAY,
                         error_type: "gateway_response_error".into(),
                         reason: format!("failed to build upstream response: {err}"),
+                        rejected_route: None,
                     };
                     record_usage_and_append(
                         config,
@@ -8400,6 +9462,7 @@ async fn response_from_upstream(
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
                 reason: safe_upstream_error_reason(context.provider, "response", &err),
+                rejected_route: None,
             };
             record_refusal_with_usage_and_append(
                 config, identity, &context, &rejection, None, true,
@@ -8696,6 +9759,7 @@ mod tests {
     #[test]
     fn capability_preflight_rejects_unsupported_paths() {
         assert!(is_responses_create(&Method::POST, "/responses"));
+        assert!(is_responses_create(&Method::POST, "/responses/"));
         assert!(!is_responses_create(&Method::GET, "/responses/resp_1"));
         assert!(!is_responses_create(
             &Method::POST,
@@ -8708,6 +9772,8 @@ mod tests {
         }"#;
         let rejection = enforce_provider_capabilities(
             ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+            None,
+            CapabilityRequestSurface::Responses,
             parallel_tools,
         )
         .unwrap_err();
@@ -8715,10 +9781,106 @@ mod tests {
         assert!(rejection.reason.contains("parallel_tools"));
 
         let built_in = br#"{"model":"gpt-5.5","tools":[{"type":"web_search"}]}"#;
-        let rejection =
-            enforce_provider_capabilities(ProviderKind::OpenAi(OpenAiRuntime::OpenAi), built_in)
-                .unwrap_err();
+        let rejection = enforce_provider_capabilities(
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            None,
+            CapabilityRequestSurface::Responses,
+            built_in,
+        )
+        .unwrap_err();
         assert!(rejection.reason.contains("built_in_tool:web_search"));
+
+        let chat_tools = br#"{
+            "model":"native/mistral",
+            "tools":[{"type":"function","function":{"name":"read"}}]
+        }"#;
+        let rejection = enforce_provider_capabilities(
+            ProviderKind::OpenAi(OpenAiRuntime::Native),
+            None,
+            CapabilityRequestSurface::OpenAiChat,
+            chat_tools,
+        )
+        .unwrap_err();
+        assert!(rejection.reason.contains("tools"));
+
+        let anthropic_built_in = br#"{
+            "model":"claude-sonnet-4",
+            "max_tokens":1024,
+            "tools":[{"type":"web_search_20250305","name":"web_search"}]
+        }"#;
+        let rejection = enforce_provider_capabilities(
+            ProviderKind::Anthropic,
+            None,
+            CapabilityRequestSurface::AnthropicMessages,
+            anthropic_built_in,
+        )
+        .unwrap_err();
+        assert!(
+            rejection
+                .reason
+                .contains("built_in_tool:web_search_20250305")
+        );
+    }
+
+    #[test]
+    fn capability_preflight_only_targets_provider_create_requests() {
+        assert!(matches!(
+            capability_request_surface(&Method::POST, "/responses"),
+            Some(CapabilityRequestSurface::Responses)
+        ));
+        assert!(matches!(
+            capability_request_surface(&Method::POST, "/chat/completions"),
+            Some(CapabilityRequestSurface::OpenAiChat)
+        ));
+        assert!(matches!(
+            capability_request_surface(&Method::POST, "/messages"),
+            Some(CapabilityRequestSurface::AnthropicMessages)
+        ));
+        assert!(matches!(
+            capability_request_surface(&Method::POST, "/messages/"),
+            Some(CapabilityRequestSurface::AnthropicMessages)
+        ));
+        assert!(matches!(
+            capability_request_surface(&Method::POST, "/chat/completions/"),
+            Some(CapabilityRequestSurface::OpenAiChat)
+        ));
+        assert!(capability_request_surface(&Method::POST, "/messages/count_tokens").is_none());
+        assert!(capability_request_surface(&Method::GET, "/responses/resp_1").is_none());
+    }
+
+    #[test]
+    fn cross_provider_adapter_rejects_lossy_anthropic_requests() {
+        for body in [
+            br#"{"tools":[{"name":"read","input_schema":{"type":"object"}}]}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"x"}}]}]}"#.as_slice(),
+            br#"{"output_config":{"format":{"type":"json_schema"}}}"#.as_slice(),
+            br#"{"output_config":{"effort":"high"}}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":"hello"}],"stop_sequences":["END"]}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","data":"x"}}]}]}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#.as_slice(),
+            br#"{"system":"prompt"}"#.as_slice(),
+            br#"{"messages":"hello"}"#.as_slice(),
+        ] {
+            let rejection = enforce_adapter_capabilities(
+                ProviderKind::Anthropic,
+                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+                CapabilityRequestSurface::AnthropicMessages,
+                body,
+            )
+            .unwrap_err();
+            assert_eq!(rejection.error_type, "capability_unsupported");
+        }
+
+        assert!(
+            enforce_adapter_capabilities(
+                ProviderKind::Anthropic,
+                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+                CapabilityRequestSurface::AnthropicMessages,
+                br#"{"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -8905,7 +10067,12 @@ mod tests {
             responses_profile: true,
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
-            resolved_model: Some("gpt-5.5".into()),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            requested_alias: Some("gpt-5.5".into()),
+            profile_version: Some("openai.builtin/v3".into()),
+            capability_snapshot_version: Some(CAPABILITY_MATRIX_VERSION.into()),
+            pricing_snapshot_version: Some("openai.unpriced/v1".into()),
+            governance_metadata_status: Some("unknown".into()),
             work_unit_id: Some("work-1".into()),
             pipeline_spec: "private task body".into(),
             request_bytes: 42,
@@ -8945,6 +10112,9 @@ mod tests {
         assert_eq!(receipt.initiating_actor, identity.agent);
         assert!(receipt.completeness().complete);
         let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(serialized.contains("openai.builtin/v3"));
+        assert!(serialized.contains(CAPABILITY_MATRIX_VERSION));
+        assert!(serialized.contains("openai.unpriced/v1"));
         assert!(!serialized.contains("private task body"));
         assert!(!serialized.contains("private model output"));
     }
@@ -8970,6 +10140,11 @@ mod tests {
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
             resolved_model: None,
+            requested_alias: Some("gpt-5.5".into()),
+            profile_version: Some("openai.builtin/v3".into()),
+            capability_snapshot_version: Some(CAPABILITY_MATRIX_VERSION.into()),
+            pricing_snapshot_version: Some("openai.unpriced/v1".into()),
+            governance_metadata_status: Some("unknown".into()),
             work_unit_id: Some("legacy-work-unit".into()),
             pipeline_spec: String::new(),
             request_bytes: 42,
@@ -9451,6 +10626,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_cache_is_invalidated_by_registry_state_changes() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        let policy = PolicyPreflight {
+            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+        };
+        cache_policy_decision(&runtime, "policy".into(), &policy).await;
+        runtime
+            .governance_cache
+            .write()
+            .await
+            .policies
+            .get_mut("policy")
+            .unwrap()
+            .registry_state_version += 1;
+
+        assert!(
+            cached_policy_decision(&runtime, "policy", &policy.body, "gpt-4")
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabled_routes_are_not_admitted_to_policy_cache() {
+        let mut registry = ProviderRegistry::built_in();
+        registry.state_version = 1;
+        registry
+            .lifecycle_overrides
+            .push(crate::provider_profile::RegistryLifecycleOverride {
+                target_kind: "model".into(),
+                target: "openai/gpt-5.5".into(),
+                state: "disabled".into(),
+                version: 1,
+                actor: "operator".into(),
+                reason: "rollback".into(),
+                changed_at: "2026-07-13T00:00:00Z".into(),
+            });
+        let policy = PolicyPreflight {
+            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+        };
+
+        assert_eq!(policy_registry_state(&policy, &registry), None);
+    }
+
+    #[tokio::test]
     async fn oversized_egress_bodies_are_not_cached() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
         cache_egress_decision(
@@ -9827,6 +11057,188 @@ mod tests {
         std::fs::remove_file(parent).unwrap();
     }
 
+    #[tokio::test]
+    async fn readiness_fails_when_provider_registry_disappears() {
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-readiness-provider-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        let audit_path = directory.join("audit.jsonl");
+        crate::provider_profile::refresh_provider_registry_async(&registry_path)
+            .await
+            .unwrap();
+        std::fs::remove_file(&registry_path).unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_provider_registry_state_path(Some(registry_path))
+            .with_audit_spool_path(Some(audit_path));
+        let mut config = routing_config();
+        config.no_preflight = true;
+        let state = GatewayState {
+            client: runtime.http_timeouts.client(),
+            config: Arc::new(config),
+            runtime,
+        };
+
+        let response = gateway_readiness(State(state)).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capability_snapshot_identifies_registry_state() {
+        let mut registry = ProviderRegistry::built_in();
+        registry.state_version = 7;
+
+        assert_eq!(
+            capability_snapshot_identifier(&registry),
+            format!("{CAPABILITY_MATRIX_VERSION}:registry-state-7")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_contact_guard_refreshes_durable_registry_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-contact-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        crate::provider_profile::refresh_provider_registry_async(&registry_path)
+            .await
+            .unwrap();
+        std::fs::remove_file(&registry_path).unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_provider_registry_state_path(Some(registry_path));
+        let guard = ProviderContactGuard {
+            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            requirements: None,
+        };
+
+        let (rejection, snapshot_version) = guard.enforce(&runtime).await.unwrap_err();
+
+        assert_eq!(rejection.error_type, "provider_registry_unavailable");
+        assert!(snapshot_version.contains("registry-state-"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_contact_guard_refreshes_each_attempt() {
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-contact-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        crate::provider_profile::refresh_provider_registry_async(&registry_path)
+            .await
+            .unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_provider_registry_state_path(Some(registry_path.clone()));
+        let guard = ProviderContactGuard {
+            provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            requirements: None,
+        };
+
+        guard.enforce(&runtime).await.unwrap();
+        assert_eq!(
+            runtime
+                .provider_registry_refresh_generation
+                .load(Ordering::Acquire),
+            1
+        );
+        guard.enforce(&runtime).await.unwrap();
+        assert_eq!(
+            runtime
+                .provider_registry_refresh_generation
+                .load(Ordering::Acquire),
+            2
+        );
+        std::fs::remove_file(&registry_path).unwrap();
+        assert!(guard.enforce(&runtime).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_registry_refreshes_share_one_generation() {
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-refresh-single-flight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        crate::provider_profile::refresh_provider_registry_async(&registry_path)
+            .await
+            .unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_provider_registry_state_path(Some(registry_path));
+        let observed_generation = runtime
+            .provider_registry_refresh_generation
+            .load(Ordering::Acquire);
+        let tasks = (0..8)
+            .map(|_| {
+                let runtime = runtime.clone();
+                tokio::spawn(async move {
+                    runtime
+                        .refresh_registry_snapshot_after_generation(true, observed_generation)
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            runtime
+                .provider_registry_refresh_generation
+                .load(Ordering::Acquire),
+            1
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_mutation_invalidation_reloads_the_runtime_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "chisei-provider-refresh-invalidation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_path = directory.join("registry.json");
+        crate::provider_profile::refresh_provider_registry_async(&registry_path)
+            .await
+            .unwrap();
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
+            .with_provider_registry_state_path(Some(registry_path.clone()));
+        let before = runtime.refresh_registry_snapshot(false).await.unwrap();
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "registry_version": before.version.clone(),
+                "state_version": 1,
+                "lifecycle_overrides": [{
+                    "target_kind": "provider",
+                    "target": "openai",
+                    "state": "disabled",
+                    "version": 1,
+                    "actor": "operator",
+                    "reason": "test invalidation",
+                    "changed_at": "2026-07-14T00:00:00Z"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        runtime.invalidate_registry_snapshot().await;
+        let after = runtime.refresh_registry_snapshot(false).await.unwrap();
+
+        assert_eq!(before.state_version, 0);
+        assert_eq!(after.state_version, 1);
+        assert!(after.resolve_model("openai/gpt-5.5").is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn no_preflight_readiness_rejects_read_only_audit_spool() {
@@ -9901,16 +11313,17 @@ mod tests {
     fn provider_kind_from_model_maps_backends() {
         assert_eq!(
             ProviderKind::from_model("gpt-5.5"),
-            ProviderKind::OpenAi(OpenAiRuntime::OpenAi)
+            Ok(ProviderKind::OpenAi(OpenAiRuntime::OpenAi))
         );
         assert_eq!(
             ProviderKind::from_model("ollama/llama3.2:latest"),
-            ProviderKind::OpenAi(OpenAiRuntime::Ollama)
+            Ok(ProviderKind::OpenAi(OpenAiRuntime::Ollama))
         );
         assert_eq!(
             ProviderKind::from_model("claude-sonnet-4"),
-            ProviderKind::Anthropic
+            Ok(ProviderKind::Anthropic)
         );
+        assert!(ProviderKind::from_model("unknown/model").is_err());
     }
 
     #[test]
@@ -10088,6 +11501,49 @@ mod tests {
         );
         // Too many rate fields is rejected.
         assert!(parse_pricing_table("gpt-5.5=1:2:3:4").is_err());
+    }
+
+    #[test]
+    fn configured_pricing_uses_a_deterministic_effective_snapshot() {
+        let mut config = routing_config();
+        config.pricing = parse_pricing_table("gpt-5.5=1.25:10,claude-sonnet-4-6=3:15").unwrap();
+        let registry = ProviderRegistry::built_in();
+        let profile = registry.profile("openai").unwrap();
+
+        let version = effective_pricing_snapshot_version(
+            &config,
+            Some(profile),
+            Some("openai/gpt-5.5"),
+            Some("gpt-5.5"),
+        )
+        .unwrap();
+
+        assert!(version.starts_with("chisei.gateway-pricing/v1:"));
+        assert_ne!(version, profile.pricing.version);
+        assert_eq!(
+            effective_pricing_snapshot_version(
+                &config,
+                Some(profile),
+                Some("openai/unpriced"),
+                None,
+            ),
+            Some(profile.pricing.version.clone())
+        );
+    }
+
+    #[test]
+    fn canonical_models_use_legacy_pricing_entries() {
+        let pricing = parse_pricing_table("gpt-5.5=1.25:10,hf.co/org/model=2:4").unwrap();
+        let (model, rates) = lookup_pricing_entry(&pricing, "openai/gpt-5.5").unwrap();
+
+        assert_eq!(model, "gpt-5.5");
+        assert_eq!(rates.input_usd_micros_per_million, 1_250_000);
+        assert!(lookup_pricing_entry(&pricing, "native/gpt-5.5").is_none());
+        assert_eq!(
+            lookup_pricing_entry(&pricing, "ollama/hf.co/org/model").map(|(model, _)| model),
+            Some("hf.co/org/model")
+        );
+        assert!(lookup_pricing_entry(&pricing, "openai/hf.co/org/model").is_none());
     }
 
     #[test]
@@ -11452,7 +12908,7 @@ mod tests {
         assert_eq!(rows[0].get("key_id").map(String::as_str), Some("codex-app"));
         assert_eq!(
             rows[0].get("resolved_model").map(String::as_str),
-            Some("gpt-5.5")
+            Some("openai/gpt-5.5")
         );
 
         let decisions = db
@@ -11679,6 +13135,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_model_namespace_cannot_bypass_cross_provider_gate() {
+        let (upstream_base, requests) =
+            spawn_fake_upstream(r#"{"id":"unexpected"}"#, "application/json").await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: None,
+            fail_closed: false,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: true,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .json(&serde_json::json!({
+                "model": "openai/gpt-5.5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn anthropic_messages_can_translate_to_openai_chat_when_policy_routes_cross_provider() {
         let upstream_body = r#"{
             "id":"chatcmpl_1",
@@ -11727,7 +13224,7 @@ mod tests {
             .post(format!("{gateway_base}/v1/messages"))
             .header(X_API_KEY, "sk-chisei-claude-code")
             .json(&serde_json::json!({
-                "model": "claude-sonnet-4-20250514",
+                "model": "auto",
                 "max_tokens": 64,
                 "system": "stay terse",
                 "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
@@ -11763,13 +13260,10 @@ mod tests {
         let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("provider").map(String::as_str), Some("openai"));
-        assert_eq!(
-            rows[0].get("model").map(String::as_str),
-            Some("claude-sonnet-4-20250514")
-        );
+        assert_eq!(rows[0].get("model").map(String::as_str), Some("auto"));
         assert_eq!(
             rows[0].get("resolved_model").map(String::as_str),
-            Some("gpt-5.5")
+            Some("openai/gpt-5.5")
         );
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("4"));
@@ -11858,6 +13352,8 @@ mod tests {
         let body = resp.text().await.unwrap();
         // Client receives well-formed Anthropic Messages SSE events.
         assert!(body.contains("event: message_start"), "{body}");
+        assert!(body.contains("\"model\":\"gpt-5.5\""), "{body}");
+        assert!(!body.contains("openai/gpt-5.5"), "{body}");
         assert!(body.contains("event: content_block_start"), "{body}");
         assert!(body.contains("event: content_block_delta"), "{body}");
         assert!(body.contains("\"text\":\"translated\""), "{body}");
@@ -11927,7 +13423,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["type"], "unsupported_cross_provider_stream");
+        assert_eq!(body["error"]["type"], "capability_unsupported");
         // Nothing was forwarded upstream.
         assert!(requests.lock().unwrap().is_empty());
     }
@@ -11952,7 +13448,7 @@ mod tests {
         let ollama_tags = spawn_fake_ollama_tags("ci-fake-ollama:latest").await;
         let mut cp_config = test_config();
         cp_config.ollama_url = ollama_tags;
-        let (chisei_target, _db) = spawn_control_plane_with_config(cp_config).await;
+        let (chisei_target, db) = spawn_control_plane_with_config(cp_config).await;
         seed_cross_provider_policy(&chisei_target, "ollama/ci-fake-ollama:latest", "ollama").await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -12002,6 +13498,25 @@ mod tests {
         // The ollama/ prefix is stripped from the resolved model.
         let translated: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
         assert_eq!(translated["model"], "ci-fake-ollama:latest");
+        drop(requests);
+
+        let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("provider").map(String::as_str), Some("ollama"));
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.cross_provider_translate".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0]
+                .evidence
+                .get("resolved_provider")
+                .map(String::as_str),
+            Some("ollama")
+        );
     }
 
     #[tokio::test]
@@ -12403,6 +13918,64 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
         assert_eq!(accepted.text().await.unwrap(), upstream_body);
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_lifecycle_changes_are_audited_before_becoming_effective() {
+        let (chisei_target, _db) = spawn_control_plane().await;
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        let registry_directory = std::env::temp_dir().join(format!(
+            "sekai-gateway-provider-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let registry_state_path = registry_directory.join("state.json");
+        let gateway_base = spawn_gateway_with_runtime(
+            config,
+            GatewayRuntime::new(Duration::from_secs(60), Some("admin-secret".into()))
+                .with_provider_registry_state_path(Some(registry_state_path.clone())),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let target = "openai/gpt-lifecycle-test";
+
+        let disabled = client
+            .put(format!("{gateway_base}/_chisei/admin/provider-lifecycle"))
+            .bearer_auth("admin-secret")
+            .json(&serde_json::json!({
+                "target_kind": "model",
+                "target": target,
+                "state": "disabled",
+                "reason": "test kill switch"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        assert!(resolve_registered_model(target).is_err());
+
+        let enabled = client
+            .put(format!("{gateway_base}/_chisei/admin/provider-lifecycle"))
+            .bearer_auth("admin-secret")
+            .json(&serde_json::json!({
+                "target_kind": "model",
+                "target": target,
+                "state": "enabled",
+                "reason": "test recovery"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert!(resolve_registered_model(target).is_ok());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(registry_state_path).unwrap()).unwrap();
+        assert_eq!(persisted["state_version"], 2);
+        assert_eq!(
+            persisted["lifecycle_overrides"].as_array().unwrap().len(),
+            2
+        );
+        std::fs::remove_dir_all(registry_directory).unwrap();
     }
 
     #[tokio::test]
@@ -13509,6 +15082,7 @@ mod tests {
             &runtime,
             &identity,
             ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             br#"{"model":"gpt-5.5","input":"analyze"}"#,
             Some(&request),
             Some("gpt-5.5"),
@@ -13542,6 +15116,7 @@ mod tests {
             &runtime,
             &identity,
             ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             br#"{"model":"gpt-5.5","input":"analyze"}"#,
             Some(&retrieval_request),
             Some("gpt-5.5"),
@@ -13553,6 +15128,68 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn egress_uses_client_shape_and_resolved_provider_attribution() {
+        let (chisei_target, db) = spawn_control_plane().await;
+        db.create_object(&crate::domain::Object {
+            id: "ticker-aapl".into(),
+            kind: "ticker".into(),
+            name: "AAPL".into(),
+            namespace: "default".into(),
+            external_id: "ticker:AAPL".into(),
+            properties: HashMap::from([
+                ("score".into(), "0.82".into()),
+                (
+                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    "score".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let mut config = routing_config();
+        config.chisei_grpc_target = Some(chisei_target);
+        let runtime = GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None);
+        let identity = GatewayIdentity {
+            agent: "codex-app".into(),
+            project: "default".into(),
+            user_id: "agent:codex-app".into(),
+            key_id: "codex-app".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        let failure_posture =
+            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new());
+
+        let egress = apply_context_egress(
+            &config,
+            &runtime,
+            &identity,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+            br#"{"model":"gpt-5.5","input":"analyze ticker:{AAPL}"}"#,
+            None,
+            Some("gpt-5.5"),
+            Some("ollama/qwen:14b"),
+            "request-split-provider-egress",
+            None,
+            &failure_posture,
+        )
+        .await
+        .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&egress.body).unwrap();
+        assert!(body["input"].as_str().unwrap().contains("[Object context]"));
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("gateway.egress".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].evidence["provider"], "ollama");
     }
 
     #[tokio::test]
@@ -13688,7 +15325,7 @@ mod tests {
         assert_eq!(rows[0].get("model").map(String::as_str), Some("gpt-5.5"));
         assert_eq!(
             rows[0].get("resolved_model").map(String::as_str),
-            Some("gpt-5.5")
+            Some("openai/gpt-5.5")
         );
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("7"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("5"));
@@ -14645,27 +16282,5 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         // No real breakpoint, so the normal system-injection path is used.
         assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
         assert_eq!(value["messages"][0]["content"], "analyze ticker:{MSFT}");
-    }
-
-    #[test]
-    fn openai_compatibility_accepts_codex_models() {
-        assert!(is_openai_compatible_model("gpt-5.5"));
-        assert!(is_openai_compatible_model("o3-mini"));
-        assert!(is_openai_compatible_model("o5-pro"));
-        assert!(is_openai_compatible_model("text-embedding-3-small"));
-        assert!(is_openai_compatible_model("tts-1"));
-        assert!(is_openai_compatible_model("ft:gpt-4o-mini:personal:abc"));
-        assert!(is_openai_compatible_model("mistral-large"));
-        assert!(is_openai_compatible_model("deepseek-chat"));
-        assert!(is_openai_compatible_model("llama-3.3-70b"));
-        assert!(is_openai_compatible_model("codex-mini-latest"));
-        assert!(is_openai_compatible_model("qwen2"));
-        assert!(is_openai_compatible_model("phi3"));
-        assert!(is_openai_compatible_model("mixtral"));
-        assert!(!is_openai_compatible_model("claude-sonnet-4"));
-        assert!(!is_openai_compatible_model("gemini-pro"));
-        assert!(!is_openai_compatible_model("anthropic-3"));
-        assert!(is_openai_compatible_model("native-default"));
-        assert!(is_openai_compatible_model("ollama/gpt-oss"));
     }
 }
