@@ -34,6 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
+        "report" => {
+            sekai_chisei::report_cli::run_report_command(args.into_iter().skip(1).collect()).await
+        }
         "estimate" => {
             sekai_chisei::launch::load_local_env();
             let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
@@ -224,7 +227,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -248,6 +251,10 @@ fn print_root_usage() {
     println!(
         "\nOperation receipt:\n  {}",
         sekai_chisei::receipt_cli::usage()
+    );
+    println!(
+        "\nOperation report:\n  {}",
+        sekai_chisei::report_cli::usage()
     );
 }
 
