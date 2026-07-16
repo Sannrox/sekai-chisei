@@ -2946,6 +2946,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     route_bias: String::new(),
                     policy_scope: r.namespace,
                     policy_version,
+                    fallback_models: Vec::new(),
                 }),
             }))
         })
@@ -3274,6 +3275,23 @@ impl ChiseiService for ChiseiServiceImpl {
                 crate::chisei::privacy::gate_reason(data_class, task_class, provider),
             ));
         }
+        let fallback_models = effective_policy
+            .as_ref()
+            .into_iter()
+            .flat_map(|policy| policy.allowed_models.iter())
+            .filter_map(|candidate| {
+                crate::provider_profile::resolve_registered_model(candidate)
+                    .ok()
+                    .map(|resolved| resolved.canonical_model)
+            })
+            .filter(|candidate| candidate != &model)
+            .filter(|candidate| {
+                let provider = crate::llm::provider_name(candidate);
+                !safe_only
+                    || crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers)
+            })
+            .take(8)
+            .collect();
 
         Ok(Response::new(ResolvePolicyResponse {
             resolution: Some(PolicyResolution {
@@ -3291,6 +3309,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     .as_ref()
                     .map(|policy| policy.version())
                     .unwrap_or_default(),
+                fallback_models,
             }),
         }))
         })

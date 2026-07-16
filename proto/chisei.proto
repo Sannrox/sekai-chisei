@@ -25,6 +25,9 @@ message PolicyResolution {
   // should carry these into audit evidence so the decision is reproducible.
   string policy_scope = 7;
   string policy_version = 8;
+  // Policy-authorized alternatives. The gateway still rechecks health,
+  // capabilities, governance, egress, and budget before selecting one.
+  repeated string fallback_models = 9;
 }
 
 message PortfolioPoint {
