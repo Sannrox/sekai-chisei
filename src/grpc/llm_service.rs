@@ -38,13 +38,18 @@ pub async fn execute_chat_request(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatResponse, Status> {
+    let registry = refresh_provider_registry(config).await?;
+    let registry_state_path =
+        crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.as_deref().unwrap_or("default");
     let estimated = estimate_chat_request(&r);
     budget
         .check_and_reserve(user_id, estimated)
         .map_err(Status::resource_exhausted)?;
-    let provider = match llm::resolve(
+    let provider = match llm::resolve_with_registry(
         &r.model,
+        &registry,
+        Some(&registry_state_path),
         config.anthropic_api_key.as_deref(),
         config.openai_api_key.as_deref(),
         &config.ollama_url,
@@ -93,7 +98,7 @@ pub async fn execute_chat_request(
         Ok(r) => r,
         Err(e) => {
             budget.adjust(user_id, estimated, 0);
-            return Err(Status::internal(e));
+            return Err(provider_error_status(e));
         }
     };
     let actual_tokens = resp.input_tokens + resp.output_tokens;
@@ -124,13 +129,18 @@ pub async fn execute_chat_request_stream(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatStreamResponse, Status> {
+    let registry = refresh_provider_registry(config).await?;
+    let registry_state_path =
+        crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
     let estimated = estimate_chat_request(&r);
     budget
         .check_and_reserve(&user_id, estimated)
         .map_err(Status::resource_exhausted)?;
-    let provider = match llm::resolve(
+    let provider = match llm::resolve_with_registry(
         &r.model,
+        &registry,
+        Some(&registry_state_path),
         config.anthropic_api_key.as_deref(),
         config.openai_api_key.as_deref(),
         &config.ollama_url,
@@ -147,7 +157,7 @@ pub async fn execute_chat_request_stream(
         Ok(stream) => stream,
         Err(e) => {
             budget.adjust(&user_id, estimated, 0);
-            return Err(Status::internal(e));
+            return Err(provider_error_status(e));
         }
     };
     let budget_for_stream = budget.clone();
@@ -185,6 +195,14 @@ pub async fn execute_chat_request_stream(
     });
 
     Ok(Box::pin(ReceiverStream::new(rx)))
+}
+
+fn provider_error_status(error: String) -> Status {
+    match llm::decode_provider_error(error) {
+        llm::ProviderError::Precondition(message) => Status::failed_precondition(message),
+        llm::ProviderError::Unavailable(message) => Status::unavailable(message),
+        llm::ProviderError::Upstream(message) => Status::internal(message),
+    }
 }
 
 fn pb_chat_to_domain(r: ChatRequest) -> llm::ChatRequest {
@@ -288,9 +306,65 @@ impl LlmService for LlmServiceImpl {
         &self,
         req: Request<ResolveProviderRequest>,
     ) -> Result<Response<ResolveProviderResponse>, Status> {
+        let registry = refresh_provider_registry(&self.config).await?;
         let model = req.into_inner().model;
-        Ok(Response::new(ResolveProviderResponse {
-            provider: llm::provider_name(&model).into(),
-        }))
+        let provider = registry
+            .resolve_model(&model)
+            .map_err(Status::failed_precondition)?
+            .provider;
+        Ok(Response::new(ResolveProviderResponse { provider }))
+    }
+}
+
+async fn refresh_provider_registry(
+    config: &Config,
+) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+    let path = crate::provider_profile::provider_registry_state_path(&config.db_path);
+    refresh_provider_registry_at(&path).await
+}
+
+async fn refresh_provider_registry_at(
+    path: &std::path::Path,
+) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+    crate::provider_profile::refresh_provider_registry_async(path)
+        .await
+        .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registry_state_loss_is_reported_as_unavailable() {
+        let directory = std::env::temp_dir().join(format!(
+            "sekai-llm-provider-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = directory.join("state.json");
+        crate::provider_profile::refresh_provider_registry(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let status = refresh_provider_registry_at(&path).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn provider_preconditions_are_not_reported_as_server_faults() {
+        let precondition = provider_error_status(llm::encode_provider_error(
+            llm::ProviderError::Precondition("provider disabled".into()),
+        ));
+        let upstream = provider_error_status(llm::encode_provider_error(
+            llm::ProviderError::Upstream("provider timed out".into()),
+        ));
+        let unavailable = provider_error_status(llm::encode_provider_error(
+            llm::ProviderError::Unavailable("registry unavailable".into()),
+        ));
+
+        assert_eq!(precondition.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+        assert_eq!(upstream.code(), tonic::Code::Internal);
     }
 }

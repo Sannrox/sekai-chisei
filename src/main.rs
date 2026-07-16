@@ -14,6 +14,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "sekai-chisei starting");
 
+    let provider_registry_state_path =
+        sekai_chisei::provider_profile::provider_registry_state_path(&config.db_path);
+    sekai_chisei::provider_profile::validate_provider_registry_storage(
+        &provider_registry_state_path,
+    )
+    .map_err(std::io::Error::other)?;
+    sekai_chisei::provider_profile::refresh_provider_registry(&provider_registry_state_path)
+        .map_err(std::io::Error::other)?;
+
     if config.auth_token.is_some() {
         tracing::warn!(
             "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
