@@ -31,9 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = Arc::new(SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?);
     let active_credentials = db.list_active_credentials()?;
-    let external_credentials_active = active_credentials
-        .iter()
-        .any(|credential| credential.principal != "chisei-gateway");
+    let external_credentials_active = active_credentials.iter().any(|credential| {
+        !matches!(
+            credential.principal.as_str(),
+            "chisei-gateway" | "local-onboarding"
+        )
+    });
     let grpc_tcp_mode = config.grpc_tcp_mode(external_credentials_active);
 
     if config.insecure && grpc_tcp_mode.auth_configured {

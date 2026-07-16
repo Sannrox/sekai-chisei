@@ -266,6 +266,12 @@ pub async fn run_launch(
     config: LaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".into());
+    let credential = crate::onboarding::ensure_local_credential(
+        &db_path,
+        &config.socket,
+        &crate::onboarding::default_credential_path(),
+    )?;
     if let Some(context_tokens) = config.estimate_context_tokens {
         let estimate_config = crate::cost_estimate::CostEstimateConfig {
             model: config.model.clone(),
@@ -286,9 +292,9 @@ pub async fn run_launch(
     std::fs::create_dir_all(LOG_DIR)?;
     recover_stale_codex_config();
 
-    ensure_server(&config).await?;
+    ensure_server(&config, &db_path).await?;
     seed_agent(&config).await?;
-    ensure_gateway(&config).await?;
+    ensure_gateway(&config, &credential.token).await?;
 
     if config.no_app {
         let addr = connect_addr(&config.gateway_bind);
@@ -308,6 +314,7 @@ pub async fn run_launch(
 
 async fn ensure_server(
     config: &LaunchConfig,
+    db_path: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if socket_ready(&config.socket).await {
         println!("sekai server already running at {}", config.socket);
@@ -327,11 +334,13 @@ async fn ensure_server(
             provider_list(&ALL_KINDS),
         ),
     ];
-    let auth_token = std::env::var("SEKAI_AUTH_TOKEN").unwrap_or_default();
-    if auth_token.trim().is_empty() {
-        envs.push(("SEKAI_INSECURE".to_string(), "1".to_string()));
-        println!("starting sekai server in SEKAI_INSECURE=1 local mode");
-    }
+    envs.push(("SEKAI_BIND".to_string(), "127.0.0.1".to_string()));
+    envs.push(("DB_PATH".to_string(), db_path.to_string()));
+    envs.push(("SEKAI_INSECURE".to_string(), String::new()));
+    // The generated credential lives in the database. Do not also expose it as
+    // the deprecated root-token compatibility credential in the server child.
+    envs.push(("SEKAI_AUTH_TOKEN".to_string(), String::new()));
+    println!("starting authenticated sekai server on local-only endpoints");
     let mut child = spawn_service(SERVER_BIN, &envs)?;
 
     let socket = config.socket.clone();
@@ -441,6 +450,7 @@ fn namespace_default(launched: AgentKind, launched_model: &str) -> (String, Stri
 
 async fn ensure_gateway(
     config: &LaunchConfig,
+    auth_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = connect_addr(&config.gateway_bind);
     if tcp_ready(&addr).await {
@@ -454,6 +464,7 @@ async fn ensure_gateway(
     let mut envs = vec![
         ("SEKAI_SOCKET".to_string(), config.socket.clone()),
         ("GATEWAY_BIND".to_string(), config.gateway_bind.clone()),
+        ("SEKAI_AUTH_TOKEN".to_string(), auth_token.to_string()),
     ];
 
     // The gateway routes upstream by resolved model, so one process fronts every
