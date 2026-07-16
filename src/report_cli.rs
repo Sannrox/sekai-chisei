@@ -41,8 +41,9 @@ pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
         .await?
         .into_inner()
         .receipt_json;
-    let report =
-        OperationReport::from_receipt(&serde_json::from_str::<OperationReceipt>(&receipt_json)?);
+    let report = OperationReport::from_authorized_receipt(
+        &serde_json::from_str::<OperationReceipt>(&receipt_json)?,
+    );
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(output) = flag(&args, "--output").map(PathBuf::from) {
         std::fs::write(&output, format!("{json}\n"))?;
@@ -206,6 +207,12 @@ mod tests {
             started_at_ms: 1,
             completed_at_ms: Some(3),
             duration_ms: Some(2),
+            governance: crate::operation_report::GovernanceProjection {
+                authorization_enforced_at_source: true,
+                receipt_disclosures_only: true,
+                retention_redactions: 0,
+                tombstone_redactions: 0,
+            },
             claims: AssuranceClaims {
                 evidence_complete: false,
                 integrity: ClaimState::NotVerified,
