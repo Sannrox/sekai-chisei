@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_MATRIX_VERSION: &str = "chisei.provider-capabilities/v1";
-pub const PROVIDER_REGISTRY_VERSION: &str = "chisei.provider-registry/v1";
+pub const PROVIDER_REGISTRY_VERSION: &str = "chisei.provider-registry/v2";
 pub const RESPONSES_REQUEST_FIELDS: &[&str] = &[
     "model",
     "input",
@@ -124,7 +124,10 @@ pub struct ProviderProfile {
     pub profile_version: String,
     pub lifecycle: String,
     pub transport: String,
-    pub model_namespace: String,
+    pub model_namespace: Option<String>,
+    pub accepted_model_patterns: Vec<String>,
+    #[serde(default)]
+    pub excluded_model_prefixes: Vec<String>,
     pub endpoint: ProviderEndpointProfile,
     pub protocol_surfaces: Vec<String>,
     #[serde(default)]
@@ -152,7 +155,7 @@ impl ProviderRegistry {
                 profile(
                     "openai",
                     "openai-compatible",
-                    "openai/",
+                    None,
                     "CHISEI_OPENAI_BASE_URL",
                     Some("https://api.openai.com/v1"),
                     Some("OPENAI_API_KEY"),
@@ -177,7 +180,7 @@ impl ProviderRegistry {
                 profile(
                     "ollama",
                     "openai-compatible",
-                    "ollama/",
+                    Some("ollama/"),
                     "CHISEI_OLLAMA_BASE_URL",
                     Some("http://127.0.0.1:11434/v1"),
                     None,
@@ -202,7 +205,7 @@ impl ProviderRegistry {
                 profile(
                     "native",
                     "openai-compatible",
-                    "native/",
+                    None,
                     "NATIVE_LLM_URL",
                     None,
                     None,
@@ -227,7 +230,7 @@ impl ProviderRegistry {
                 profile(
                     "anthropic",
                     "anthropic-messages",
-                    "anthropic/",
+                    None,
                     "CHISEI_ANTHROPIC_BASE_URL",
                     Some("https://api.anthropic.com/v1"),
                     Some("ANTHROPIC_API_KEY"),
@@ -308,7 +311,7 @@ impl CapabilityMatrix {
 fn profile(
     provider: &str,
     transport: &str,
-    model_namespace: &str,
+    model_namespace: Option<&str>,
     base_url_env: &str,
     default_base_url: Option<&str>,
     api_key_env: Option<&str>,
@@ -318,13 +321,39 @@ fn profile(
 ) -> ProviderProfile {
     let reports_reasoning = capabilities.reasoning_controls;
     let reports_partial = capabilities.partial_usage;
-    let reports_cache = provider == "anthropic";
+    let reports_cache_reads = matches!(provider, "openai" | "anthropic");
+    let reports_cache_writes = provider == "anthropic";
+    let accepted_model_patterns = match provider {
+        "openai" => vec!["*".into()],
+        "ollama" => vec!["ollama/*".into()],
+        "anthropic" => vec!["claude*".into()],
+        _ => vec!["fallback:*".into()],
+    };
+    let excluded_model_prefixes = if provider == "openai" {
+        [
+            "claude",
+            "gemini",
+            "vertex",
+            "palm",
+            "bedrock",
+            "anthropic",
+            "azure",
+            "cohere",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    } else {
+        Vec::new()
+    };
     ProviderProfile {
         provider: provider.into(),
-        profile_version: format!("{provider}.builtin/v1"),
+        profile_version: format!("{provider}.builtin/v2"),
         lifecycle: "enabled".into(),
         transport: transport.into(),
-        model_namespace: model_namespace.into(),
+        model_namespace: model_namespace.map(str::to_string),
+        accepted_model_patterns,
+        excluded_model_prefixes,
         endpoint: ProviderEndpointProfile {
             base_url_env: base_url_env.into(),
             default_base_url: default_base_url.map(str::to_string),
@@ -345,8 +374,8 @@ fn profile(
             input_tokens: true,
             output_tokens: true,
             reasoning_tokens: reports_reasoning,
-            cache_read_tokens: reports_cache,
-            cache_write_tokens: reports_cache,
+            cache_read_tokens: reports_cache_reads,
+            cache_write_tokens: reports_cache_writes,
             partial_responses: reports_partial,
         },
         error_normalization_version: "chisei.gateway-errors/v1".into(),
@@ -577,6 +606,15 @@ mod tests {
         assert_eq!(ollama.endpoint.api_key_env, None);
         assert_ne!(openai.endpoint.base_url_env, ollama.endpoint.base_url_env);
         assert_ne!(openai.profile_version, anthropic.profile_version);
+        assert_eq!(openai.model_namespace, None);
+        assert_eq!(ollama.model_namespace.as_deref(), Some("ollama/"));
+        assert_eq!(openai.accepted_model_patterns, vec!["*"]);
+        assert!(
+            openai
+                .excluded_model_prefixes
+                .contains(&"anthropic".to_string())
+        );
+        assert!(openai.usage_normalization.cache_read_tokens);
         assert!(openai.protocol_surfaces.contains(&"responses".to_string()));
         assert!(
             anthropic
