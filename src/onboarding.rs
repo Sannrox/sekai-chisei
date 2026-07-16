@@ -185,12 +185,13 @@ impl DoctorCheck {
 }
 
 pub fn run_doctor(agent: Option<&str>) -> Vec<DoctorCheck> {
-    let mut checks = Vec::new();
-    checks.push(check_client(agent));
-    checks.push(check_socket());
-    checks.push(check_gateway_port());
-    checks.push(check_database());
-    checks.push(check_transport_security());
+    let mut checks = vec![
+        check_client(agent),
+        check_socket(),
+        check_gateway_port(),
+        check_database(),
+        check_transport_security(),
+    ];
     checks.extend(check_providers());
     checks.push(check_harness_contract(agent));
     checks
@@ -296,9 +297,7 @@ fn check_socket() -> DoctorCheck {
             return DoctorCheck::failed(
                 "control-plane socket",
                 format!("{socket} exists but is not a Unix socket"),
-                format!(
-                    "move the file away, then rerun `sekaictl launch`; do not delete it until its contents are understood"
-                ),
+                "move the file away, then rerun `sekaictl launch`; do not delete it until its contents are understood",
             );
         }
     }
