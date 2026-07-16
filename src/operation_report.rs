@@ -82,23 +82,12 @@ pub struct OperationReport {
     pub structural_errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernanceProjection {
     pub authorization_enforced_at_source: bool,
     pub receipt_disclosures_only: bool,
     pub retention_redactions: usize,
     pub tombstone_redactions: usize,
-}
-
-impl Default for GovernanceProjection {
-    fn default() -> Self {
-        Self {
-            authorization_enforced_at_source: false,
-            receipt_disclosures_only: false,
-            retention_redactions: 0,
-            tombstone_redactions: 0,
-        }
-    }
 }
 
 impl OperationReport {
@@ -222,10 +211,10 @@ impl OperationSummary {
                     Some("failed" | "error")
                 ) as usize;
                 degraded += attribute_true(event, "degraded_mode") as usize;
-                if event.kind == "outcome_recorded" {
-                    if let Some(value) = attribute_f64(event, "quality_score") {
-                        quality.push(value);
-                    }
+                if event.kind == "outcome_recorded"
+                    && let Some(value) = attribute_f64(event, "quality_score")
+                {
+                    quality.push(value);
                 }
             }
             spend = spend.saturating_add(operation_cost);
