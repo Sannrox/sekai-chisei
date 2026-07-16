@@ -14,9 +14,16 @@ provider profile declares them safe. Tool results use `function_call_output` inp
 items and identify the matching `call_id`. A request may contain multiple tool
 results.
 
-The optional `Idempotency-Key` header identifies one model-call attempt. Reusing a
-key with a different request is an error. A retry after an ambiguous disconnect may
-return the original result; clients must not assume a second provider execution.
+This profile version rejects `Idempotency-Key` with `capability_unsupported` rather
+than forwarding a key it cannot enforce. Clients must use a new attempt number for
+an ambiguous retry and must assume that a disconnected provider call may have run.
+Replay and conflicting-key detection will be advertised only by a later capability
+revision that persists request hashes and terminal results.
+
+Caller-supplied operation and parent identifiers are scoped to the authenticated
+gateway identity. The gateway returns their canonical `chisei:<scope>:<id>` form;
+clients reuse that returned value on later calls. An identifier from another caller
+scope is rejected rather than attached to receipt lineage.
 
 ## Stream contract
 
