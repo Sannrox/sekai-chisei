@@ -436,3 +436,401 @@ fn is_answered_escalation(event: &OperationReceiptEvent) -> bool {
         "answered" | "approved" | "rejected" | "denied" | "resolved"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chisei::receipt::{
+        GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    };
+
+    fn event(
+        operation_id: &str,
+        sequence: usize,
+        timestamp_ms: i64,
+        kind: ReceiptEventKind,
+        attributes: &[(&str, &str)],
+    ) -> OperationReceiptEvent {
+        OperationReceiptEvent {
+            event_id: format!("{operation_id}-{sequence}"),
+            operation_id: operation_id.into(),
+            parent_event_id: None,
+            timestamp_ms,
+            kind,
+            surface: kind.surface(),
+            actor: "test".into(),
+            references: Vec::new(),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        }
+    }
+
+    fn receipt(
+        operation_id: &str,
+        namespace: &str,
+        started_at_ms: i64,
+        completed_at_ms: Option<i64>,
+        events: Vec<OperationReceiptEvent>,
+    ) -> OperationReceipt {
+        OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.into(),
+            parent_operation_id: None,
+            namespace: namespace.into(),
+            operation_class: "test".into(),
+            initiating_actor: "test".into(),
+            schema_version: "test/v1".into(),
+            policy_version: "test/v1".into(),
+            started_at_ms,
+            completed_at_ms,
+            events,
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconciles_attempts_cost_outcomes_and_learning_without_content() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let first_id = "attempt-1";
+        let mut first_context = event(first_id, 3, 130, ReceiptEventKind::ContextGoverned, &[]);
+        first_context.references = vec![GovernedReference {
+            kind: "kioku_memory".into(),
+            reference: "secret-memory-body-must-not-leak".into(),
+            content_hash: None,
+            disclosed_fields: Vec::new(),
+            omitted: false,
+            omission_reason: None,
+        }];
+        db.put_operation_receipt(&receipt(
+            first_id,
+            "alpha",
+            100,
+            Some(150),
+            vec![
+                event(
+                    first_id,
+                    0,
+                    100,
+                    ReceiptEventKind::IntentRecorded,
+                    &[("logical_operation_id", "logical-1")],
+                ),
+                event(
+                    first_id,
+                    1,
+                    110,
+                    ReceiptEventKind::RouteSelected,
+                    &[("resolved_model", "model-a")],
+                ),
+                event(
+                    first_id,
+                    2,
+                    120,
+                    ReceiptEventKind::ModelCalled,
+                    &[("cost_usd_micros", "100")],
+                ),
+                first_context,
+                event(
+                    first_id,
+                    4,
+                    150,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("status", "failed")],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let second_id = "attempt-2";
+        db.put_operation_receipt(&receipt(
+            second_id,
+            "alpha",
+            200,
+            Some(260),
+            vec![
+                event(
+                    second_id,
+                    0,
+                    200,
+                    ReceiptEventKind::IntentRecorded,
+                    &[("logical_operation_id", "logical-1")],
+                ),
+                event(
+                    second_id,
+                    1,
+                    220,
+                    ReceiptEventKind::ModelCalled,
+                    &[("model", "model-a"), ("cost_usd_micros", "250")],
+                ),
+                event(
+                    second_id,
+                    2,
+                    240,
+                    ReceiptEventKind::HumanIntervened,
+                    &[("status", "answered")],
+                ),
+                event(
+                    second_id,
+                    3,
+                    250,
+                    ReceiptEventKind::VerificationRecorded,
+                    &[("verdict", "passed")],
+                ),
+                event(
+                    second_id,
+                    4,
+                    260,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("status", "completed")],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let unpriced_id = "unpriced";
+        db.put_operation_receipt(&receipt(
+            unpriced_id,
+            "beta",
+            300,
+            Some(340),
+            vec![
+                event(unpriced_id, 0, 300, ReceiptEventKind::IntentRecorded, &[]),
+                event(unpriced_id, 1, 320, ReceiptEventKind::ModelCalled, &[]),
+                event(
+                    unpriced_id,
+                    2,
+                    330,
+                    ReceiptEventKind::PolicyDecided,
+                    &[("status", "denied")],
+                ),
+                event(
+                    unpriced_id,
+                    3,
+                    340,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("status", "failed")],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let statistics =
+            query_operation_statistics(&db, &["alpha".into(), "beta".into()], 0, 1_000).unwrap();
+        assert_eq!(statistics.totals.logical_operations, 2);
+        assert_eq!(statistics.totals.receipts, 3);
+        assert_eq!(statistics.totals.model_calls, 3);
+        assert_eq!(statistics.totals.priced_model_calls, 2);
+        assert_eq!(statistics.totals.unpriced_model_calls, 1);
+        assert_eq!(statistics.totals.model_calls_without_model, 1);
+        assert_eq!(statistics.totals.total_cost_usd_micros, 350);
+        assert_eq!(
+            statistics
+                .namespace_model_spend
+                .get(&("alpha".into(), "model-a".into())),
+            Some(&350)
+        );
+        assert_eq!(statistics.outcomes.verified, 1);
+        assert_eq!(statistics.outcomes.rejected, 1);
+        assert_eq!(statistics.outcomes.failed, 0);
+        assert_eq!(statistics.learning.enrichments_served, 1);
+        assert_eq!(statistics.learning.escalations_answered, 1);
+        assert!(!format!("{statistics:?}").contains("secret-memory-body"));
+    }
+
+    #[test]
+    fn paginates_receipts_and_applies_inclusive_exclusive_event_bounds() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for index in 0..129 {
+            let operation_id = format!("op-{index:03}");
+            let timestamp = 1_000 + index;
+            db.put_operation_receipt(&receipt(
+                &operation_id,
+                "alpha",
+                timestamp,
+                Some(timestamp),
+                vec![event(
+                    &operation_id,
+                    0,
+                    timestamp,
+                    ReceiptEventKind::ModelCalled,
+                    &[("model", "model-a"), ("cost_usd_micros", "1")],
+                )],
+            ))
+            .unwrap();
+        }
+        db.put_operation_receipt(&receipt(
+            "end-boundary",
+            "alpha",
+            1_999,
+            Some(2_000),
+            vec![event(
+                "end-boundary",
+                0,
+                2_000,
+                ReceiptEventKind::ModelCalled,
+                &[("model", "model-a"), ("cost_usd_micros", "99")],
+            )],
+        ))
+        .unwrap();
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 1_000, 2_000).unwrap();
+        assert_eq!(statistics.totals.receipts, 130);
+        assert_eq!(statistics.totals.model_calls, 129);
+        assert_eq!(statistics.totals.total_cost_usd_micros, 129);
+    }
+
+    #[test]
+    fn waiting_time_sums_repeated_cycles_and_excludes_resolved_pre_window_waits() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let operation_id = "waiting";
+        db.put_operation_receipt(&receipt(
+            operation_id,
+            "alpha",
+            50,
+            Some(350),
+            vec![
+                event(
+                    operation_id,
+                    0,
+                    60,
+                    ReceiptEventKind::ApprovalDecided,
+                    &[("status", "pending")],
+                ),
+                event(
+                    operation_id,
+                    1,
+                    90,
+                    ReceiptEventKind::ApprovalDecided,
+                    &[("status", "approved")],
+                ),
+                event(
+                    operation_id,
+                    2,
+                    150,
+                    ReceiptEventKind::HumanIntervened,
+                    &[("status", "pending")],
+                ),
+                event(
+                    operation_id,
+                    3,
+                    200,
+                    ReceiptEventKind::HumanIntervened,
+                    &[("status", "answered")],
+                ),
+                event(
+                    operation_id,
+                    4,
+                    250,
+                    ReceiptEventKind::ApprovalDecided,
+                    &[("status", "pending")],
+                ),
+                event(
+                    operation_id,
+                    5,
+                    300,
+                    ReceiptEventKind::ApprovalDecided,
+                    &[("status", "rejected")],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 100, 400).unwrap();
+        assert_eq!(statistics.totals.waiting_operations, 1);
+        assert_eq!(statistics.totals.waiting_time_ms, 100);
+    }
+
+    #[test]
+    fn classifies_terminal_parked_unverified_and_unknown_operations() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for (operation_id, kind, status) in [
+            (
+                "dispatch-failure",
+                ReceiptEventKind::OutcomeRecorded,
+                "failed",
+            ),
+            ("cancelled", ReceiptEventKind::OutcomeRecorded, "cancelled"),
+            ("parked", ReceiptEventKind::ApprovalDecided, "pending"),
+            (
+                "admitted-no-verdict",
+                ReceiptEventKind::OutcomeRecorded,
+                "completed",
+            ),
+        ] {
+            db.put_operation_receipt(&receipt(
+                operation_id,
+                "alpha",
+                100,
+                Some(150),
+                vec![event(operation_id, 0, 150, kind, &[("status", status)])],
+            ))
+            .unwrap();
+        }
+        db.put_operation_receipt(&receipt(
+            "external-evidence-only",
+            "alpha",
+            100,
+            None,
+            vec![{
+                let mut event = event(
+                    "external-evidence-only",
+                    0,
+                    120,
+                    ReceiptEventKind::ContextGoverned,
+                    &[],
+                );
+                event.references.push(GovernedReference {
+                    kind: "external_evidence".into(),
+                    reference: "evidence:admitted".into(),
+                    content_hash: None,
+                    disclosed_fields: Vec::new(),
+                    omitted: false,
+                    omission_reason: None,
+                });
+                event
+            }],
+        ))
+        .unwrap();
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 0, 1_000).unwrap();
+        assert_eq!(statistics.outcomes.failed, 2);
+        assert_eq!(statistics.outcomes.parked, 1);
+        assert_eq!(statistics.outcomes.unverified, 1);
+        assert_eq!(statistics.outcomes.unknown, 1);
+        assert_eq!(statistics.outcomes.verified, 0);
+    }
+
+    #[test]
+    fn learning_admissions_include_only_current_active_memories_in_window() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for (id, state, promoted_at) in [
+            ("active", "active", 100),
+            ("rejected", "rejected", 110),
+            ("superseded", "superseded", 120),
+            ("before", "active", 99),
+            ("end", "active", 200),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO chisei_kioku_memories
+                     (id, version, namespace, state, classification, expires_at_ms, memory_json)
+                     VALUES (?1, 1, 'alpha', ?2, 'internal', NULL, '{}')",
+                    rusqlite::params![id, state],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO chisei_kioku_lifecycle_events
+                     (memory_id, memory_version, action, from_state, to_state, actor, reason, recorded_at_ms)
+                     VALUES (?1, 1, 'promoted', 'candidate', ?2, 'test', 'test', ?3)",
+                    rusqlite::params![id, state, promoted_at],
+                )
+                .unwrap();
+        }
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 100, 200).unwrap();
+        assert_eq!(statistics.learning.learnings_admitted, 1);
+    }
+}
