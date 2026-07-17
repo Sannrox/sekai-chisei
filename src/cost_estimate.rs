@@ -120,16 +120,40 @@ pub fn usage() -> String {
 }
 
 fn projected_cost(input: i64, output: i64, pricing: &ModelPricing) -> Result<i64, String> {
-    let cost = i128::from(input)
-        .checked_mul(i128::from(pricing.input_usd_micros_per_million))
-        .and_then(|input_cost| {
-            i128::from(output)
-                .checked_mul(i128::from(pricing.output_usd_micros_per_million))
-                .and_then(|output_cost| input_cost.checked_add(output_cost))
-        })
-        .and_then(|cost| cost.checked_div(1_000_000))
-        .ok_or_else(|| "cost estimate is too large".to_string())?;
-    i64::try_from(cost).map_err(|_| "cost estimate is too large".to_string())
+    cost_usd_micros("", pricing, input, output, 0, 0)
+        .ok_or_else(|| "cost estimate is too large".to_string())
+}
+
+/// Shared provider-usage pricing for gateway and native executions.
+///
+/// Anthropic reports cache reads separately from uncached input, while OpenAI
+/// compatible providers report cached input as a subset of prompt tokens.
+pub(crate) fn cost_usd_micros(
+    model: &str,
+    pricing: &ModelPricing,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+) -> Option<i64> {
+    let cache_read = cache_read_input_tokens.max(0) as i128;
+    let cache_creation = cache_creation_input_tokens.max(0) as i128;
+    let input_tokens = input_tokens.max(0) as i128;
+    let uncached_input = if crate::llm::provider_name(model) == "anthropic" {
+        input_tokens
+    } else {
+        (input_tokens - cache_read).max(0)
+    };
+    let input_rate = pricing.input_usd_micros_per_million as i128;
+    let output_rate = pricing.output_usd_micros_per_million as i128;
+    let cached_rate = pricing.cached_input_usd_micros_per_million as i128;
+    let total = uncached_input
+        .checked_mul(input_rate)?
+        .checked_add(cache_read.checked_mul(cached_rate)?)?
+        .checked_add(cache_creation.checked_mul(input_rate)?)?
+        .checked_add((output_tokens.max(0) as i128).checked_mul(output_rate)?)?
+        .checked_div(1_000_000)?;
+    i64::try_from(total).ok()
 }
 
 fn format_usd(micros: i64) -> String {
@@ -182,5 +206,22 @@ mod tests {
         .unwrap();
         assert_eq!(config.context_tokens, 12_000);
         assert_eq!(config.turns, 3);
+    }
+
+    #[test]
+    fn shared_actual_cost_preserves_provider_cache_semantics() {
+        let pricing = ModelPricing {
+            input_usd_micros_per_million: 3_000_000,
+            output_usd_micros_per_million: 15_000_000,
+            cached_input_usd_micros_per_million: 300_000,
+        };
+        assert_eq!(
+            cost_usd_micros("gpt-5.5", &pricing, 100, 10, 80, 20),
+            Some(294)
+        );
+        assert_eq!(
+            cost_usd_micros("claude-sonnet-4-6", &pricing, 100, 10, 80, 20),
+            Some(534)
+        );
     }
 }
