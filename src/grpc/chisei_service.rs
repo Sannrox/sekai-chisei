@@ -6374,6 +6374,7 @@ impl ChiseiService for ChiseiServiceImpl {
 mod tests {
     use super::*;
     use crate::domain::Object;
+    use crate::sekai::security::{Grant, Role};
     use std::fs;
     use std::sync::Arc;
 
@@ -7252,6 +7253,73 @@ mod tests {
     fn file_service(path: &str) -> ChiseiServiceImpl {
         let db = Arc::new(SekaiDb::new(path).unwrap());
         ChiseiServiceImpl::new(db, config(path))
+    }
+
+    fn statistics_target(svc: &ChiseiServiceImpl, prefix: &str, namespace: &str, id: &str) {
+        svc.db
+            .create_object(&Object {
+                id: id.into(),
+                kind: prefix.into(),
+                name: namespace.into(),
+                namespace: namespace.into(),
+                external_id: format!("{prefix}:{namespace}"),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+    }
+
+    fn statistics_grant(svc: &ChiseiServiceImpl, object_id: &str, principal: &str) {
+        svc.db
+            .create_grant(&Grant {
+                id: format!("grant-{object_id}-{principal}"),
+                object_id: object_id.into(),
+                principal: principal.into(),
+                role: Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn statistics_authorization_accepts_project_grants() {
+        let svc = memory_service();
+        statistics_target(&svc, "project", "alpha", "project-alpha");
+        statistics_grant(&svc, "project-alpha", "agent:analyst");
+        let mut request = Request::new(QueryOperationStatisticsRequest {
+            namespaces: vec!["alpha".into()],
+            start_timestamp_ms: 1,
+            end_timestamp_ms: 2,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "agent:analyst".parse().unwrap());
+
+        let response = svc.query_operation_statistics(request).await.unwrap();
+        assert_eq!(response.into_inner().totals.unwrap().receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn statistics_authorization_fails_closed_across_namespaces_and_conflicting_acls() {
+        let svc = memory_service();
+        statistics_target(&svc, "namespace", "alpha", "namespace-alpha");
+        statistics_target(&svc, "project", "alpha", "project-alpha");
+        statistics_target(&svc, "namespace", "beta", "namespace-beta");
+        statistics_grant(&svc, "namespace-alpha", "agent:analyst");
+        statistics_grant(&svc, "project-alpha", "agent:other");
+        statistics_grant(&svc, "namespace-beta", "agent:analyst");
+        let mut request = Request::new(QueryOperationStatisticsRequest {
+            namespaces: vec!["alpha".into(), "beta".into()],
+            start_timestamp_ms: 1,
+            end_timestamp_ms: 2,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "agent:analyst".parse().unwrap());
+
+        let error = svc.query_operation_statistics(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
