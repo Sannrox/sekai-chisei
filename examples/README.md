@@ -62,8 +62,8 @@ finishes.
 
 ## governed_tool_use
 
-[governed_tool_use.rs](governed_tool_use.rs) demonstrates Plan 9's governed
-tool-use bridge: it maps a model tool-call to an `ExecuteAction` request — the
+[governed_tool_use.rs](governed_tool_use.rs) demonstrates the governed tool-use
+bridge: it maps a model tool-call to an `ExecuteAction` request — the
 single enforcement point — so the call is policy-checked, dry-run-able,
 held-for-approval, budget-limited, and audited before any graph mutation.
 

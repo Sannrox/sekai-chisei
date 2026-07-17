@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 readme = "README.md"
-description = "Local-first Rust control plane for policy-governed AI-assisted software delivery."
+description = "Local-first Rust control plane for governed agent operations."
+repository = "https://github.com/Sannrox/sekai-chisei"
+homepage = "https://github.com/Sannrox/sekai-chisei"
+documentation = "https://github.com/Sannrox/sekai-chisei/tree/main/docs"
+keywords = ["agents", "governance", "llm", "grpc", "local-first"]
+categories = ["development-tools", "web-programming"]
 
 [features]
 default = []
