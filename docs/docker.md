@@ -3,7 +3,7 @@
 ## Quickstart
 
 ```bash
-export CHISEI_GATEWAY_ADMIN_TOKEN='sekai-docker-admin'
+export CHISEI_GATEWAY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='<your-openai-key>'
 export GATEWAY_KEYS='sekai-docker-demo=demo:default'
 export GATEWAY_KEY='sekai-docker-demo'
@@ -44,10 +44,10 @@ Use `docker compose down` to stop and keep the persisted data volume.
 | `GATEWAY_BIND` | `127.0.0.1:8788` | Gateway bind address. Override to `0.0.0.0:8080` for container exposure |
 | `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume. File databases use SQLite WAL mode, so volume backups must include `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
 | `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
-| `CHISEI_GRPC_URL` | unset | Optional TCP override for gateway; defaults to `SEKAI_SOCKET` when unset |
+| `CHISEI_GRPC_URL` | unset | Optional TCP override; when unset, the gateway uses the image's explicit `SEKAI_SOCKET=/data/sekai.sock` setting |
 | `OPENAI_API_KEY` | unset | API key for OpenAI upstream |
 | `ANTHROPIC_API_KEY` | unset | API key for Anthropic upstream |
-| `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | If set, gates `/_chisei/admin/refresh`; unset means endpoint is open |
+| `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | Enables and protects `/_chisei/admin/refresh`; must be at least 32 bytes, and unset disables the endpoint |
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | Ollama-compatible endpoint for gateway/llm tests |
 
 ## UDS (default) vs TCP transport
