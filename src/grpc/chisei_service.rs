@@ -439,6 +439,49 @@ fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
     }
 }
 
+fn authorize_statistics_namespaces(
+    db: &SekaiDb,
+    actor: &str,
+    namespaces: &[String],
+) -> Result<(), Status> {
+    if matches!(actor, "root" | "local") {
+        return Ok(());
+    }
+    for namespace in namespaces {
+        let mut targets = Vec::new();
+        for prefix in ["namespace", "project", "policy"] {
+            if let Some(target) = db
+                .find_by_external_id(&format!("{prefix}:{namespace}"))
+                .map_err(Status::internal)?
+            {
+                targets.push(target);
+            }
+        }
+        if targets.is_empty() {
+            return Err(Status::permission_denied(
+                "namespace statistics access is not authorized",
+            ));
+        }
+        let mut explicitly_authorized = false;
+        for target in targets {
+            let grants = db.list_grants(&target.id).map_err(Status::internal)?;
+            let actor_has_grant = grants.iter().any(|grant| grant.principal == actor);
+            if !grants.is_empty() && !actor_has_grant {
+                return Err(Status::permission_denied(
+                    "namespace statistics access is not authorized",
+                ));
+            }
+            explicitly_authorized |= actor_has_grant;
+        }
+        if !explicitly_authorized {
+            return Err(Status::permission_denied(
+                "namespace statistics access is not authorized",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn auth_source<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()
@@ -5630,6 +5673,117 @@ impl ChiseiService for ChiseiServiceImpl {
                 .into_iter()
                 .map(|surface| surface.as_str().to_string())
                 .collect(),
+        }))
+    }
+
+    async fn query_operation_statistics(
+        &self,
+        req: Request<QueryOperationStatisticsRequest>,
+    ) -> Result<Response<QueryOperationStatisticsResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        if request.namespaces.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one namespace is required",
+            ));
+        }
+        if request.start_timestamp_ms < 0 || request.end_timestamp_ms <= request.start_timestamp_ms
+        {
+            return Err(Status::invalid_argument(
+                "statistics require an inclusive start before the exclusive end",
+            ));
+        }
+        if request
+            .end_timestamp_ms
+            .saturating_sub(request.start_timestamp_ms)
+            > crate::operation_statistics::MAX_STATISTICS_WINDOW_MS
+        {
+            return Err(Status::invalid_argument(
+                "statistics window must not exceed one year",
+            ));
+        }
+        let mut namespaces = request
+            .namespaces
+            .into_iter()
+            .map(|namespace| namespace.trim().to_string())
+            .collect::<Vec<_>>();
+        if namespaces.iter().any(String::is_empty) {
+            return Err(Status::invalid_argument(
+                "namespace values must not be empty",
+            ));
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        if namespaces.len() > 100 {
+            return Err(Status::invalid_argument(
+                "statistics queries support at most 100 namespaces",
+            ));
+        }
+        authorize_statistics_namespaces(&self.db, &actor, &namespaces)?;
+        let statistics = crate::operation_statistics::query_operation_statistics(
+            &self.db,
+            &namespaces,
+            request.start_timestamp_ms,
+            request.end_timestamp_ms,
+        )
+        .map_err(|error| {
+            if error.starts_with("statistics receipt limit exceeded") {
+                Status::resource_exhausted(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+        let totals = statistics.totals;
+        let outcomes = statistics.outcomes;
+        let learning = statistics.learning;
+        Ok(Response::new(QueryOperationStatisticsResponse {
+            totals: Some(OperationStatisticsTotals {
+                logical_operations: totals.logical_operations,
+                receipts: totals.receipts,
+                model_calls: totals.model_calls,
+                priced_model_calls: totals.priced_model_calls,
+                unpriced_model_calls: totals.unpriced_model_calls,
+                model_calls_without_model: totals.model_calls_without_model,
+                total_cost_usd_micros: totals.total_cost_usd_micros,
+                waiting_operations: totals.waiting_operations,
+                waiting_time_ms: totals.waiting_time_ms,
+            }),
+            daily_spend: statistics
+                .daily_spend
+                .into_iter()
+                .map(|(day, value)| OperationStatisticValue {
+                    labels: HashMap::from([("date".into(), day)]),
+                    value,
+                })
+                .collect(),
+            namespace_model_spend: statistics
+                .namespace_model_spend
+                .into_iter()
+                .map(|((namespace, model), value)| OperationStatisticValue {
+                    labels: HashMap::from([
+                        ("namespace".into(), namespace),
+                        ("model".into(), model),
+                    ]),
+                    value,
+                })
+                .collect(),
+            // No namespace policy currently defines a monetary cap and period.
+            // Portfolio objectives and token budgets are intentionally not
+            // relabeled as spend caps.
+            spend_caps: Vec::new(),
+            outcomes: Some(OperationOutcomeCounts {
+                verified: outcomes.verified,
+                failed: outcomes.failed,
+                parked: outcomes.parked,
+                rejected: outcomes.rejected,
+                unverified: outcomes.unverified,
+                unknown: outcomes.unknown,
+            }),
+            learning: Some(OperationLearningCounts {
+                learnings_admitted: learning.learnings_admitted,
+                enrichments_served: learning.enrichments_served,
+                escalations_answered: learning.escalations_answered,
+            }),
         }))
     }
 

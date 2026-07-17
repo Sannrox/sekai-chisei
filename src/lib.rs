@@ -18,6 +18,7 @@ pub mod memory_cli;
 pub mod obs;
 pub mod onboarding;
 pub mod operation_report;
+pub mod operation_statistics;
 pub mod provenance;
 pub mod provider_profile;
 pub mod receipt_cli;
