@@ -245,6 +245,37 @@ impl SekaiDb {
         })
     }
 
+    pub fn create_managed_team_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_team_principals (principal, created) VALUES (?1, ?2)",
+            params![principal, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,'active',?4,?4,0)",
+            params![id, principal, token_hash, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".into(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+        })
+    }
+
     pub fn rotate_principal_credential(
         &self,
         principal: &str,
@@ -291,6 +322,46 @@ impl SekaiDb {
             principal: principal.to_string(),
             token_hash: token_hash.to_string(),
             status: "active".to_string(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+        })
+    }
+
+    pub fn rotate_managed_team_credential(
+        &self,
+        principal: &str,
+        token_hash: &str,
+    ) -> Result<PrincipalCredential, String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_team_principals (principal, created) VALUES (?1, ?2)",
+            params![principal, now],
+        )
+        .map_err(|e| e.to_string())?;
+        let revoked = tx
+            .execute(
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND status='active'",
+                params![now, principal],
+            )
+            .map_err(|e| e.to_string())?;
+        if revoked == 0 {
+            return Err(format!("no active credential for {principal:?}"));
+        }
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id, principal, token_hash, status, created, rotated_at, revoked_at) VALUES (?1,?2,?3,'active',?4,?4,0)",
+            params![id, principal, token_hash, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.to_string(),
+            token_hash: token_hash.to_string(),
+            status: "active".into(),
             created: now,
             rotated_at: now,
             revoked_at: 0,
@@ -359,7 +430,20 @@ impl SekaiDb {
     }
 
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
+        if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
+            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+        }
         let conn = self.conn();
+        let historical_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
+                params![o.id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if historical_changes > 0 {
+            return Err("object IDs with audit history cannot be reused".into());
+        }
         let props = serde_json::to_string(&o.properties).unwrap_or_default();
         conn.execute(
             "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -385,6 +469,9 @@ impl SekaiDb {
     }
 
     pub fn update_object_with_existing(&self, o: &Object) -> Result<Option<Object>, String> {
+        if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
+            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+        }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
@@ -398,6 +485,12 @@ impl SekaiDb {
         if before.is_none() {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(None);
+        }
+        if before
+            .as_ref()
+            .is_some_and(|existing| existing.namespace != o.namespace)
+        {
+            return Err("object namespace is immutable".into());
         }
         let props = serde_json::to_string(&o.properties).unwrap_or_default();
         tx.execute(
@@ -1041,6 +1134,9 @@ fn build_visibility_filter_internal(
     principals: &[&str],
     start_param: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let privileged = principals
+        .iter()
+        .any(|principal| matches!(*principal, "root" | "local"));
     let effective_principals: Vec<&str> = principals
         .iter()
         .copied()
@@ -1048,8 +1144,14 @@ fn build_visibility_filter_internal(
         .collect();
     if effective_principals.is_empty() {
         return (
-            " AND NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id)"
-                .to_string(),
+            " AND NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id)
+             AND NOT EXISTS (
+                 SELECT 1 FROM sekai_objects team_namespace
+                 WHERE team_namespace.kind = 'namespace'
+                   AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                   AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+             )"
+            .to_string(),
             Vec::new(),
         );
     }
@@ -1066,10 +1168,32 @@ fn build_visibility_filter_internal(
         .collect::<Vec<_>>()
         .join(",");
 
+    let team_namespace_filter = if privileged {
+        String::new()
+    } else {
+        format!(
+            " AND (
+                NOT EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    WHERE team_namespace.kind = 'namespace'
+                      AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                      AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    JOIN sekai_grants team_grant ON team_grant.object_id = team_namespace.id
+                    WHERE team_namespace.kind = 'namespace'
+                      AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
+                      AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      AND team_grant.principal IN ({principal_placeholders})
+                )
+            )"
+        )
+    };
+
     (
         format!(
-            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({})))",
-            principal_placeholders
+            " AND (NOT EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id) OR EXISTS (SELECT 1 FROM sekai_grants WHERE object_id = sekai_objects.id AND principal IN ({principal_placeholders}))){team_namespace_filter}"
         ),
         params,
     )

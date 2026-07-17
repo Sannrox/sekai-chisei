@@ -63,6 +63,7 @@ use crate::provider_profile::{
 };
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
+const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
@@ -374,6 +375,14 @@ impl GatewayIdentity {
         } else {
             &self.user_id
         }
+    }
+
+    fn can_delegate_principal(&self) -> bool {
+        !self.key_id.is_empty() && self.tier != "untrusted"
+    }
+
+    fn delegated_principal(&self) -> &str {
+        &self.agent
     }
 }
 
@@ -9345,22 +9354,25 @@ async fn run_gateway_pipeline_observation(
         .or(context.requested_model.as_ref())
         .cloned()
         .unwrap_or_default();
-    let response = chisei
-        .run_pipeline(GrpcRequest::new(RunPipelineRequest {
-            request: Some(ChiseiPipelineRequest {
-                request_id: context.request_id.clone(),
-                namespace: identity.project.clone(),
-                spec: context.pipeline_spec.clone(),
-                model,
-                runtime: capability_provider_id(context.provider).to_string(),
-                task_type: "gateway_llm_call".to_string(),
-                task_class: String::new(),
-                priority: 0,
-            }),
-        }))
-        .await
-        .ok()?
-        .into_inner();
+    let mut request = gateway_request(RunPipelineRequest {
+        request: Some(ChiseiPipelineRequest {
+            request_id: context.request_id.clone(),
+            namespace: identity.project.clone(),
+            spec: context.pipeline_spec.clone(),
+            model,
+            runtime: capability_provider_id(context.provider).to_string(),
+            task_type: "gateway_llm_call".to_string(),
+            task_class: String::new(),
+            priority: 0,
+        }),
+    });
+    if identity.can_delegate_principal() {
+        request.metadata_mut().insert(
+            DELEGATED_PRINCIPAL_HEADER,
+            tonic::metadata::MetadataValue::try_from(identity.delegated_principal()).ok()?,
+        );
+    }
+    let response = chisei.run_pipeline(request).await.ok()?.into_inner();
     let result = response.result?;
     let sampling_step = result.steps.iter().find(|step| step.step == "sampling")?;
     let value: serde_json::Value = serde_json::from_str(&sampling_step.value).ok()?;
@@ -11871,6 +11883,31 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_registered_gateway_identities_can_delegate_principals() {
+        let registered = GatewayIdentity {
+            agent: "alice".into(),
+            project: "acme".into(),
+            user_id: "alice".into(),
+            key_id: "alice-key".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        };
+        assert!(registered.can_delegate_principal());
+        assert_eq!(registered.delegated_principal(), "alice");
+
+        let passthrough = GatewayIdentity {
+            key_id: String::new(),
+            ..registered.clone()
+        };
+        assert!(!passthrough.can_delegate_principal());
+
+        let derived = GatewayIdentity {
+            tier: "untrusted".into(),
+            ..registered
+        };
+        assert!(!derived.can_delegate_principal());
+    }
 
     #[test]
     fn correlation_round_trips_harness_metadata() {
@@ -16234,7 +16271,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "codex-app");
+        assert_eq!(decisions[0].actor, "chisei-gateway");
         assert_eq!(decisions[0].outcome, "routed");
         assert_eq!(
             decisions[0]
@@ -17709,7 +17746,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "codex-app");
+        assert_eq!(decisions[0].actor, "chisei-gateway");
         assert_eq!(decisions[0].outcome, "denied");
         assert_eq!(decisions[0].target_id, "llm_calls");
         assert_eq!(
@@ -18023,7 +18060,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "codex-app");
+        assert_eq!(decisions[0].actor, "chisei-gateway");
         assert_eq!(decisions[0].outcome, "redacted");
         assert!(!decisions[0].evidence["request_id"].is_empty());
         assert_eq!(decisions[0].evidence["work_unit"], "gateway-egress-work");
