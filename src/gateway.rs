@@ -7228,7 +7228,7 @@ fn lookup_model_pricing<'c>(
         })
 }
 
-fn lookup_pricing_entry<'a>(
+pub(crate) fn lookup_pricing_entry<'a>(
     pricing: &'a HashMap<String, ModelPricing>,
     model: &str,
 ) -> Option<(&'a str, &'a ModelPricing)> {
@@ -7291,37 +7291,14 @@ fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> O
 /// Pure cost math for a resolved model/pricing pair, split out so it can be
 /// tested without constructing a full gateway config/context.
 fn cost_for_model(model: &str, pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
-    let cache_read = usage.cache_read_input_tokens.max(0) as i128;
-    let cache_creation = usage.cache_creation_input_tokens.max(0) as i128;
-    // Anthropic reports `input_tokens` as the uncached count, with cache tokens
-    // tracked separately, so the uncached portion is `input_tokens` as-is.
-    // OpenAI reports cached tokens as a subset of `prompt_tokens`, so the
-    // uncached portion must subtract the cache-read count to avoid billing it
-    // twice.
-    let input_tokens = usage.input_tokens.max(0) as i128;
-    let uncached_input = if crate::llm::provider_name(model) == "anthropic" {
-        input_tokens
-    } else {
-        (input_tokens - cache_read).max(0)
-    };
-
-    let input_rate = pricing.input_usd_micros_per_million as i128;
-    let output_rate = pricing.output_usd_micros_per_million as i128;
-    let cached_rate = pricing.cached_input_usd_micros_per_million as i128;
-
-    // Cache reads bill at the discounted cached rate; cache-creation (write)
-    // tokens bill at the normal input rate.
-    let input_cost = uncached_input.checked_mul(input_rate)?;
-    let cache_read_cost = cache_read.checked_mul(cached_rate)?;
-    let cache_creation_cost = cache_creation.checked_mul(input_rate)?;
-    let output_cost = (usage.output_tokens.max(0) as i128).checked_mul(output_rate)?;
-
-    let total = input_cost
-        .checked_add(cache_read_cost)?
-        .checked_add(cache_creation_cost)?
-        .checked_add(output_cost)?
-        .checked_div(1_000_000)?;
-    i64::try_from(total).ok()
+    crate::cost_estimate::cost_usd_micros(
+        model,
+        pricing,
+        i64::from(usage.input_tokens),
+        i64::from(usage.output_tokens),
+        i64::from(usage.cache_read_input_tokens),
+        i64::from(usage.cache_creation_input_tokens),
+    )
 }
 
 fn format_usd_micros(value: i64) -> String {
@@ -8839,6 +8816,7 @@ fn gateway_receipt_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_gateway_operation_receipt(
     identity: &GatewayIdentity,
     context: &UsageContext,
@@ -8847,6 +8825,7 @@ fn build_gateway_operation_receipt(
     observation: Option<&ResponseObservation>,
     rejection: Option<ReceiptRejection<'_>>,
     terminal_outcome: Option<ReceiptTerminalOutcome<'_>>,
+    cost_usd_micros: Option<i64>,
 ) -> OperationReceipt {
     let model_attempted = rejection
         .map(|failure| failure.model_attempted)
@@ -8898,6 +8877,8 @@ fn build_gateway_operation_receipt(
             actor,
             BTreeMap::from([
                 ("request_id".into(), context.request_id.clone()),
+                ("logical_operation_id".into(), context.operation_id.clone()),
+                ("attempt_id".into(), context.attempt.to_string()),
                 (
                     "lookup_request_id".into(),
                     context.lookup_request_id.clone().unwrap_or_default(),
@@ -9038,6 +9019,9 @@ fn build_gateway_operation_receipt(
     if let Some(usage) = usage {
         model_call_attributes.insert("input_tokens".into(), usage.input_tokens.to_string());
         model_call_attributes.insert("output_tokens".into(), usage.output_tokens.to_string());
+    }
+    if let Some(cost_usd_micros) = cost_usd_micros {
+        model_call_attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
     }
     let outcome_parent = if rejection.is_some() && !model_attempted {
         "egress"
@@ -9190,6 +9174,7 @@ async fn record_gateway_operation_receipt(
         observation,
         rejection,
         terminal_outcome,
+        usage.and_then(|usage| estimate_cost_usd_micros(config, context, usage)),
     );
     let Ok(receipt_json) = serde_json::to_string(&receipt) else {
         error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
@@ -12732,6 +12717,7 @@ mod tests {
             Some(&observation),
             None,
             None,
+            Some(45),
         );
 
         assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
@@ -12740,6 +12726,19 @@ mod tests {
             gateway_attempt_receipt_id("gateway-op-1", "gateway-op-1", 2)
         );
         assert_eq!(receipt.parent_operation_id.as_deref(), Some("gateway-op-1"));
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap();
+        assert_eq!(intent.attributes["logical_operation_id"], "gateway-op-1");
+        assert_eq!(intent.attributes["attempt_id"], "2");
+        let priced_call = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::ModelCalled)
+            .unwrap();
+        assert_eq!(priced_call.attributes["cost_usd_micros"], "45");
         let incomplete_receipt = build_gateway_operation_receipt(
             &identity,
             &context,
@@ -12748,6 +12747,7 @@ mod tests {
             Some(&observation),
             None,
             Some(ReceiptTerminalOutcome::Incomplete("max_output_tokens")),
+            None,
         );
         let outcome = incomplete_receipt
             .events
@@ -12781,6 +12781,7 @@ mod tests {
                 rejection: &circuit_rejection,
                 model_attempted: false,
             }),
+            None,
             None,
         );
         assert!(circuit_receipt.events.iter().all(|event| !matches!(
@@ -13014,6 +13015,7 @@ mod tests {
                 model_attempted: false,
             }),
             None,
+            None,
         );
         assert_eq!(
             receipt.parent_operation_id.as_deref(),
@@ -13045,6 +13047,7 @@ mod tests {
                 rejection: &budget_rejection,
                 model_attempted: false,
             }),
+            None,
             None,
         );
         assert!(budget_receipt.events.iter().any(|event| {

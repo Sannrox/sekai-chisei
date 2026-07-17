@@ -438,6 +438,7 @@ async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
             .to_string(),
         max_tokens: 256,
         task_class: String::new(),
+        ..Default::default()
     };
 
     // Step 1: plan the execution (budget + policy + enrichment, no model call yet).

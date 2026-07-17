@@ -46,6 +46,7 @@ fn local_private_plan() -> PlanExecutionRequest {
                 .into(),
             max_tokens: 512,
             task_class: String::new(),
+            ..Default::default()
         }),
     }
 }
@@ -67,6 +68,7 @@ fn frontier_template_request() -> PlanExecutionRequest {
             system: "Return an abstract checklist only.".into(),
             max_tokens: 512,
             task_class: "template_only".into(),
+            ..Default::default()
         }),
     }
 }
@@ -93,6 +95,7 @@ fn local_private_compose_request(template: &str) -> PlanExecutionRequest {
             system: "Use private context locally and keep the result on this machine.".into(),
             max_tokens: 1024,
             task_class: String::new(),
+            ..Default::default()
         }),
     }
 }
@@ -119,6 +122,7 @@ fn frontier_polish_request(scrubbed_draft: &str) -> PlanExecutionRequest {
             system: "Edit only. Do not add specifics.".into(),
             max_tokens: 512,
             task_class: "template_only".into(),
+            ..Default::default()
         }),
     }
 }

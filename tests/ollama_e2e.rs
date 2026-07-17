@@ -128,6 +128,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
                 system: "Reply with a short plain-text answer.".into(),
                 max_tokens: 32,
                 task_class: String::new(),
+                ..Default::default()
             }),
         })
         .await
@@ -237,6 +238,7 @@ async fn delegation_chain_keeps_private_context_local() {
                 system: "Keep private context local.".into(),
                 max_tokens: 128,
                 task_class: String::new(),
+                ..Default::default()
             }),
         })
         .await
@@ -278,6 +280,7 @@ async fn delegation_chain_keeps_private_context_local() {
                 system: "Return an abstract checklist only.".into(),
                 max_tokens: 256,
                 task_class: "template_only".into(),
+                ..Default::default()
             }),
         })
         .await
