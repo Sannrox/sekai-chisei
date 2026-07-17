@@ -563,6 +563,9 @@ fn record_completed_operation_on(
     attempt_started_at_ms: i64,
     completed_at_ms: i64,
 ) -> Result<(), String> {
+    let cost_usd_micros = crate::cost_estimate::pricing_from_env()
+        .ok()
+        .and_then(|pricing| native_execution_cost(plan, response, &pricing));
     db.update_operation_receipt(&plan.plan_id, |receipt| {
         if receipt.completed_at_ms.is_some() {
             return Err("operation receipt already has a terminal outcome".into());
@@ -592,12 +595,18 @@ fn record_completed_operation_on(
                 completed_at_ms,
                 ReceiptEventKind::ModelCalled,
                 "chisei.llm",
-                BTreeMap::from([
-                    ("provider".into(), response.provider.clone()),
-                    ("model".into(), plan.resolved_model.clone()),
-                    ("input_tokens".into(), response.input_tokens.to_string()),
-                    ("output_tokens".into(), response.output_tokens.to_string()),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("provider".into(), response.provider.clone()),
+                        ("model".into(), plan.resolved_model.clone()),
+                        ("input_tokens".into(), response.input_tokens.to_string()),
+                        ("output_tokens".into(), response.output_tokens.to_string()),
+                    ]);
+                    if let Some(cost_usd_micros) = cost_usd_micros {
+                        attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
+                    }
+                    attributes
+                },
             ),
             receipt_event(
                 &receipt.operation_id,
@@ -645,6 +654,23 @@ fn record_completed_operation_on(
         Ok(())
     })?;
     Ok(())
+}
+
+fn native_execution_cost(
+    plan: &ExecutionPlan,
+    response: &PlannedChatResponse,
+    pricing: &HashMap<String, crate::gateway::ModelPricing>,
+) -> Option<i64> {
+    let (priced_model, rates) =
+        crate::gateway::lookup_pricing_entry(pricing, &plan.resolved_model)?;
+    crate::cost_estimate::cost_usd_micros(
+        priced_model,
+        rates,
+        i64::from(response.input_tokens),
+        i64::from(response.output_tokens),
+        0,
+        0,
+    )
 }
 
 fn record_failed_operation_on(
@@ -1786,11 +1812,23 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::IntentRecorded,
                 actor,
-                BTreeMap::from([
-                    ("request_id".into(), input.request_id.clone()),
-                    ("task_type".into(), input.task_type.clone()),
-                    ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("request_id".into(), input.request_id.clone()),
+                        ("task_type".into(), input.task_type.clone()),
+                        ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
+                    ]);
+                    if !input.logical_operation_id.trim().is_empty() {
+                        attributes.insert(
+                            "logical_operation_id".into(),
+                            input.logical_operation_id.trim().into(),
+                        );
+                    }
+                    if !input.attempt_id.trim().is_empty() {
+                        attributes.insert("attempt_id".into(), input.attempt_id.trim().into());
+                    }
+                    attributes
+                },
             ),
             receipt_event(
                 &operation_id,
@@ -6194,6 +6232,21 @@ mod tests {
     }
 
     #[test]
+    fn native_cost_uses_gateway_pricing_alias_resolution() {
+        let plan = ExecutionPlan {
+            resolved_model: "openai/gpt-5.5".into(),
+            ..Default::default()
+        };
+        let response = PlannedChatResponse {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let pricing = crate::gateway::parse_pricing_table("gpt-5.5=3:15").unwrap();
+        assert_eq!(native_execution_cost(&plan, &response, &pricing), Some(450));
+    }
+
+    #[test]
     fn response_artifact_hash_covers_tool_calls() {
         let response = |name: &str| PlannedChatResponse {
             content: String::new(),
@@ -8626,6 +8679,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -8717,6 +8771,8 @@ mod tests {
                 system: "do not disclose raw context".into(),
                 max_tokens: 128,
                 task_class: String::new(),
+                logical_operation_id: "external-operation-7".into(),
+                attempt_id: "retry-b".into(),
             }),
         });
         request
@@ -8738,6 +8794,16 @@ mod tests {
         assert_eq!(receipt.initiating_actor, "agent:authenticated");
         assert_eq!(receipt.operation_id, plan.plan_id);
         assert_eq!(receipt.namespace, "receipt-ns");
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap();
+        assert_eq!(
+            intent.attributes["logical_operation_id"],
+            "external-operation-7"
+        );
+        assert_eq!(intent.attributes["attempt_id"], "retry-b");
         assert!(receipt.completed_at_ms.is_none());
         assert!(!receipt.completeness().complete);
         assert!(receipt.events.iter().all(|event| {
@@ -9353,6 +9419,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9413,6 +9480,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9483,6 +9551,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9628,6 +9697,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9715,6 +9785,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: "template_only".into(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9793,6 +9864,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: "template_only".into(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9892,6 +9964,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
@@ -9958,6 +10031,7 @@ mod tests {
                 system: String::new(),
                 max_tokens: 512,
                 task_class: String::new(),
+                ..Default::default()
             }),
             resolved_runtime: "kiro".into(),
             resolved_model: "native-default".into(),
@@ -10053,6 +10127,7 @@ mod tests {
                 tools: vec![],
                 system: String::new(),
                 max_tokens: 512,
+                ..Default::default()
             }),
             resolved_runtime: "openai".into(),
             resolved_model: "gpt-5.5".into(),
@@ -10152,6 +10227,7 @@ mod tests {
                     system: String::new(),
                     max_tokens: 512,
                     task_class: String::new(),
+                    ..Default::default()
                 }),
             }))
             .await
