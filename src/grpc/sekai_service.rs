@@ -163,8 +163,24 @@ impl SekaiServiceImpl {
                     Status::invalid_argument(err)
                 }
             })?;
+        if actions.creates_namespace(action_name, params) {
+            return Err(Status::permission_denied(
+                "namespace objects must be managed through EnsureTeamNamespace",
+            ));
+        }
         for target_id in &target_ids {
+            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                check_team_namespace(&self.db, principals, &target.namespace, true)?;
+            }
             check_write(&self.security, target_id, principals)?;
+        }
+        if let Some(namespace) = params.get("namespace") {
+            check_team_namespace(&self.db, principals, namespace, true)?;
+        } else if action_name == "create_object" && is_managed_team_principal(&self.db, principals)?
+        {
+            return Err(Status::permission_denied(
+                "team object creation requires a canonical namespace",
+            ));
         }
         let schema_kinds = actions
             .schema_kinds(&self.db, action_name, params)
@@ -269,6 +285,7 @@ impl SekaiServiceImpl {
             .clone();
         compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
             !is_reserved_governance_kind(&candidate.kind)
+                && check_team_namespace(&self.db, principals, &candidate.namespace, false).is_ok()
                 && self.security.can_access(&candidate.id, &refs)
         })
         .map_err(Status::internal)?;
@@ -800,6 +817,175 @@ fn check_write(
     Ok(())
 }
 
+fn check_object_admin(
+    db: &SekaiDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+) -> Result<(), Status> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(());
+    }
+    let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    if security.can_admin(&object.id, &refs) {
+        return Ok(());
+    }
+    let memberships = team_namespace_memberships(db, principals)?;
+    if memberships
+        .iter()
+        .any(|(namespace, role)| namespace == &object.namespace && *role == security::Role::Admin)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("admin access denied"))
+}
+
+fn check_object_namespace_access(
+    db: &SekaiDb,
+    principals: &[String],
+    object_id: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let namespace = match db.get_object(object_id).map_err(Status::internal)? {
+        Some(object) => Some(object.namespace),
+        None => db
+            .object_change_namespace(object_id)
+            .map_err(Status::internal)?,
+    };
+    match namespace {
+        Some(namespace) => check_team_namespace(db, principals, &namespace, write),
+        None if is_managed_team_principal(db, principals)? => {
+            Err(Status::permission_denied("namespace access denied"))
+        }
+        None => Ok(()),
+    }
+}
+
+fn team_namespace_memberships(
+    db: &SekaiDb,
+    principals: &[String],
+) -> Result<Vec<(String, security::Role)>, Status> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(Vec::new());
+    }
+    let mut memberships = Vec::new();
+    for principal in principals {
+        memberships.extend(
+            db.list_namespace_roles_for_principal(principal)
+                .map_err(Status::internal)?,
+        );
+    }
+    Ok(memberships)
+}
+
+fn is_managed_team_principal(db: &SekaiDb, principals: &[String]) -> Result<bool, Status> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(false);
+    }
+    for principal in principals {
+        if db.is_team_principal(principal).map_err(Status::internal)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn check_team_namespace(
+    db: &SekaiDb,
+    principals: &[String],
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(());
+    }
+    let canonical = namespace.trim();
+    if canonical.is_empty() || canonical != namespace {
+        return if is_managed_team_principal(db, principals)? {
+            Err(Status::permission_denied(
+                "team principals require a canonical namespace",
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let boundary = db
+        .find_namespace_boundary(canonical)
+        .map_err(Status::internal)?;
+    let team_managed_namespace = boundary.as_ref().is_some_and(|object| {
+        object
+            .properties
+            .get("team_managed")
+            .is_some_and(|value| value == "true")
+    });
+    if !team_managed_namespace && !is_managed_team_principal(db, principals)? {
+        return Ok(());
+    }
+    let memberships = team_namespace_memberships(db, principals)?;
+    let authorized = memberships.iter().any(|(member_namespace, role)| {
+        member_namespace == canonical
+            && (!write || matches!(role, security::Role::Editor | security::Role::Admin))
+    });
+    if authorized {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("namespace access denied"))
+    }
+}
+
+fn check_dataset_access(
+    db: &SekaiDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    dataset: &dataset::Dataset,
+    write: bool,
+) -> Result<(), Status> {
+    if dataset.object_id.is_empty() {
+        if is_managed_team_principal(db, principals)? {
+            return Err(Status::permission_denied(
+                "team principals cannot access unbound global datasets",
+            ));
+        }
+        return Ok(());
+    }
+    let object = match db
+        .get_object(&dataset.object_id)
+        .map_err(Status::internal)?
+    {
+        Some(object) => object,
+        None if is_managed_team_principal(db, principals)? => {
+            return Err(Status::permission_denied(
+                "team dataset binding object is unavailable",
+            ));
+        }
+        None => {
+            return if write {
+                check_write(security, &dataset.object_id, principals)
+            } else {
+                check_read(security, &dataset.object_id, principals)
+            };
+        }
+    };
+    check_team_namespace(db, principals, &object.namespace, write)?;
+    if write {
+        check_write(security, &object.id, principals)
+    } else {
+        check_read(security, &object.id, principals)
+    }
+}
+
 fn check_schema_admin(
     security: &SecurityChecker,
     kind: &str,
@@ -877,11 +1063,13 @@ fn check_scope_write(
 }
 
 fn check_work_unit_read(
+    db: &SekaiDb,
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
 ) -> Result<(), Status> {
     if !work_unit.target_object_id.is_empty() {
+        check_object_namespace_access(db, principals, &work_unit.target_object_id, false)?;
         check_read(security, &work_unit.target_object_id, principals)
     } else if principal_matches(&work_unit.owner_principal, principals) {
         Ok(())
@@ -891,11 +1079,13 @@ fn check_work_unit_read(
 }
 
 fn check_work_unit_write(
+    db: &SekaiDb,
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
 ) -> Result<(), Status> {
     if !work_unit.target_object_id.is_empty() {
+        check_object_namespace_access(db, principals, &work_unit.target_object_id, true)?;
         check_write(security, &work_unit.target_object_id, principals)
     } else if principal_matches(&work_unit.owner_principal, principals) {
         Ok(())
@@ -2298,6 +2488,23 @@ impl SekaiService for SekaiServiceImpl {
         if obj.id.is_empty() {
             return Err(Status::invalid_argument("id required"));
         }
+        if obj.id.starts_with("namespace:") && obj.kind != "namespace" {
+            return Err(Status::invalid_argument(
+                "namespace:* object IDs are reserved for namespace boundaries",
+            ));
+        }
+        if obj.external_id.starts_with("namespace:") && obj.kind != "namespace" {
+            return Err(Status::invalid_argument(
+                "namespace:* external IDs are reserved for namespace boundaries",
+            ));
+        }
+        if obj.kind == "namespace" {
+            require_credential_admin(&principals)?;
+            return Err(Status::failed_precondition(
+                "namespace objects must be managed through EnsureTeamNamespace",
+            ));
+        }
+        check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
         if is_reserved_governance_kind(&domain_obj.kind) {
@@ -2335,12 +2542,13 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let id = req.into_inner().id;
-        check_read(&self.security, &id, &principals)?;
         let obj = self
             .db
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
+        check_read(&self.security, &id, &principals)?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
@@ -2361,6 +2569,27 @@ impl SekaiService for SekaiServiceImpl {
         if obj.id.is_empty() {
             return Err(Status::invalid_argument("id required"));
         }
+        if obj.external_id.starts_with("namespace:") && obj.kind != "namespace" {
+            return Err(Status::invalid_argument(
+                "namespace:* external IDs are reserved for namespace boundaries",
+            ));
+        }
+        if obj.kind == "namespace"
+            || self
+                .db
+                .get_object(&obj.id)
+                .map_err(Status::internal)?
+                .is_some_and(|existing| existing.kind == "namespace")
+        {
+            require_credential_admin(&principals)?;
+        }
+        let existing = self
+            .db
+            .get_object(&obj.id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
+        check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+        check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
         let mut domain_obj = from_proto_obj(&obj);
         if is_reserved_governance_kind(&domain_obj.kind)
@@ -2406,6 +2635,22 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<DeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let id = req.into_inner().id;
+        let Some(existing) = self.db.get_object(&id).map_err(Status::internal)? else {
+            return Ok(Response::new(DeleteObjectResponse {}));
+        };
+        if existing.kind == "namespace" {
+            require_credential_admin(&principals)?;
+            if existing
+                .properties
+                .get("team_managed")
+                .is_some_and(|value| value == "true")
+            {
+                return Err(Status::failed_precondition(
+                    "team-managed namespaces cannot be deleted through the generic object API",
+                ));
+            }
+        }
+        check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         check_write(&self.security, &id, &principals)?;
         if self
             .db
@@ -2429,6 +2674,12 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            let namespace = filter.namespace.as_deref().ok_or_else(|| {
+                Status::permission_denied("team principals must filter by namespace")
+            })?;
+            check_team_namespace(&self.db, &principals, namespace, false)?;
+        }
         // Never expose internal governance objects through generic listing.
         if filter
             .kind
@@ -2493,6 +2744,7 @@ impl SekaiService for SekaiServiceImpl {
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
+        check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &obj.id, &principals)?;
         let obj = self.resolve_computed_for_response(obj, &principals)?;
         Ok(Response::new(GetObjectResponse {
@@ -2524,6 +2776,12 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
         let filtered = self.security.filter_objects(&objs, &refs);
+        let filtered = filtered
+            .into_iter()
+            .filter(|object| {
+                check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+            })
+            .collect::<Vec<_>>();
         let filtered = self
             .resolve_computed_for_responses(filtered.into_iter().cloned().collect(), &principals)?;
         Ok(Response::new(ListObjectsResponse {
@@ -2544,6 +2802,12 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::invalid_argument("object_set required"))?,
             owner.as_str(),
         )?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            let namespace = domain_set.filter.namespace.as_deref().ok_or_else(|| {
+                Status::permission_denied("team object sets must filter by namespace")
+            })?;
+            check_team_namespace(&self.db, &principals, namespace, false)?;
+        }
         if domain_set
             .filter
             .kind
@@ -2640,6 +2904,12 @@ impl SekaiService for SekaiServiceImpl {
             }
             filter.offset = offset;
         }
+        if is_managed_team_principal(&self.db, &principals)? {
+            let namespace = filter.namespace.as_deref().ok_or_else(|| {
+                Status::permission_denied("team object sets must filter by namespace")
+            })?;
+            check_team_namespace(&self.db, &principals, namespace, false)?;
+        }
         {
             let schema = self
                 .schema
@@ -2666,10 +2936,21 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
         let l = req
             .into_inner()
             .link
             .ok_or(Status::invalid_argument("link required"))?;
+        for object_id in [&l.from_id, &l.to_id] {
+            let object = self
+                .db
+                .get_object(object_id)
+                .map_err(Status::internal)?
+                .ok_or(Status::not_found("link endpoint not found"))?;
+            check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+            check_write(&self.security, object_id, &principals)?;
+        }
         let dl = domain::Link {
             id: l.id.clone(),
             from_id: l.from_id.clone(),
@@ -2684,16 +2965,38 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
-        self.db
-            .delete_link(&req.into_inner().id)
-            .map_err(Status::internal)?;
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let id = req.into_inner().id;
+        let Some(link) = self.db.get_link(&id).map_err(Status::internal)? else {
+            return Ok(Response::new(DeleteLinkResponse {}));
+        };
+        for object_id in [&link.from_id, &link.to_id] {
+            let object = self
+                .db
+                .get_object(object_id)
+                .map_err(Status::internal)?
+                .ok_or(Status::not_found("link endpoint not found"))?;
+            check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+            check_write(&self.security, object_id, &principals)?;
+        }
+        self.db.delete_link(&id).map_err(Status::internal)?;
         Ok(Response::new(DeleteLinkResponse {}))
     }
     async fn get_links(
         &self,
         req: Request<GetLinksRequest>,
     ) -> Result<Response<GetLinksResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
         let r = req.into_inner();
+        let root = self
+            .db
+            .get_object(&r.object_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
+        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
+        check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -2703,6 +3006,22 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_links(&r.object_id, &r.relation, &dir)
             .map_err(Status::internal)?;
+        let links = links
+            .into_iter()
+            .filter(|link| {
+                [&link.from_id, &link.to_id].into_iter().all(|object_id| {
+                    self.db
+                        .get_object(object_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|object| {
+                            check_team_namespace(&self.db, &principals, &object.namespace, false)
+                                .is_ok()
+                                && check_read(&self.security, object_id, &principals).is_ok()
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(Response::new(GetLinksResponse {
             links: links.iter().map(to_proto_link).collect(),
         }))
@@ -2713,6 +3032,13 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
+        let root = self
+            .db
+            .get_object(&r.object_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
+        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
+        check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -2722,6 +3048,13 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_linked_objects(&r.object_id, &r.relation, &dir)
             .map_err(Status::internal)?;
+        let objs = objs
+            .into_iter()
+            .filter(|object| {
+                check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                    && check_read(&self.security, &object.id, &principals).is_ok()
+            })
+            .collect();
         let objs = self.resolve_computed_for_responses(objs, &principals)?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
@@ -2770,6 +3103,18 @@ impl SekaiService for SekaiServiceImpl {
         let mut res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
             .map_err(Status::internal)?;
         drop(schema);
+        res.objects.retain(|object| {
+            check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                && check_read(&self.security, &object.id, &principals).is_ok()
+        });
+        let visible_ids = res
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        res.links.retain(|link| {
+            visible_ids.contains(link.from_id.as_str()) && visible_ids.contains(link.to_id.as_str())
+        });
         res.objects = self.resolve_computed_for_responses(res.objects, &principals)?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
@@ -2805,7 +3150,10 @@ impl SekaiService for SekaiServiceImpl {
         let mut result = retrieval::retrieve(
             &self.db,
             &query,
-            |object| self.security.can_access(&object.id, &principal_refs),
+            |object| {
+                self.security.can_access(&object.id, &principal_refs)
+                    && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+            },
             |object| is_reserved_governance_kind(&object.kind),
         )
         .map_err(map_retrieval_error)?;
@@ -3167,8 +3515,23 @@ impl SekaiService for SekaiServiceImpl {
                     Status::invalid_argument(err)
                 }
             })?;
+        if actions.creates_namespace(&r.action, &r.params) {
+            return Err(Status::permission_denied(
+                "namespace objects must be managed through EnsureTeamNamespace",
+            ));
+        }
         for target_id in &target_ids {
+            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                check_team_namespace(&self.db, &principals, &target.namespace, true)?;
+            }
             check_write(&self.security, target_id, &principals)?;
+        }
+        if let Some(namespace) = r.params.get("namespace") {
+            check_team_namespace(&self.db, &principals, namespace, true)?;
+        } else if r.action == "create_object" && is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "team object creation requires a canonical namespace",
+            ));
         }
         let actor = principals.first().cloned().unwrap_or_default();
         // Governed-action policy gate (Plan 9, Phase A). Resolved by
@@ -3926,14 +4289,31 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetLineageResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
+        let root = self
+            .db
+            .get_object(&r.object_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("not found"))?;
+        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
+        check_read(&self.security, &root.id, &principals)?;
         let res = crate::sekai::lineage::get_lineage(&self.db, &r.object_id, r.max_nodes as usize)
             .map_err(Status::internal)?;
+        let visible_nodes = res
+            .nodes
+            .iter()
+            .filter(|node| {
+                check_team_namespace(&self.db, &principals, &node.object.namespace, false).is_ok()
+                    && check_read(&self.security, &node.object.id, &principals).is_ok()
+            })
+            .collect::<Vec<_>>();
         let objects = self.resolve_computed_for_responses(
-            res.nodes.iter().map(|node| node.object.clone()).collect(),
+            visible_nodes
+                .iter()
+                .map(|node| node.object.clone())
+                .collect(),
             &principals,
         )?;
-        let nodes = res
-            .nodes
+        let nodes = visible_nodes
             .iter()
             .zip(objects.iter())
             .map(|(n, object)| LineageNode {
@@ -3941,10 +4321,17 @@ impl SekaiService for SekaiServiceImpl {
                 role: n.role.clone(),
                 ephemeral: n.ephemeral,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let visible_ids = nodes
+            .iter()
+            .filter_map(|node| node.object.as_ref().map(|object| object.id.as_str()))
+            .collect::<std::collections::HashSet<_>>();
         let edges = res
             .edges
             .iter()
+            .filter(|edge| {
+                visible_ids.contains(edge.from.as_str()) && visible_ids.contains(edge.to.as_str())
+            })
             .map(|e| LineageEdge {
                 from: e.from.clone(),
                 to: e.to.clone(),
@@ -3965,6 +4352,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CreateContentionScopeResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "managed team principals cannot create global contention scopes",
+            ));
+        }
         let inner = req.into_inner();
         let mut scope = inner
             .scope
@@ -4127,14 +4519,24 @@ impl SekaiService for SekaiServiceImpl {
                 .get_work_unit_by_idempotency_key(&work_unit.idempotency_key)
                 .map_err(Status::internal)?
             {
-                check_work_unit_read(&self.security, &existing, &principals)?;
+                check_work_unit_read(&self.db, &self.security, &existing, &principals)?;
                 return Ok(Response::new(CreateWorkUnitResponse {
                     work_unit: Some(to_proto_work_unit(&existing)),
                 }));
             }
         }
         if !work_unit.target_object_id.is_empty() {
+            check_object_namespace_access(
+                &self.db,
+                &principals,
+                &work_unit.target_object_id,
+                true,
+            )?;
             check_write(&self.security, &work_unit.target_object_id, &principals)?;
+        } else if is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "team work units require a namespace-bound target object",
+            ));
         }
         let scope = self
             .db
@@ -4183,7 +4585,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&req.into_inner().id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_read(&self.security, &work_unit, &principals)?;
+        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
         Ok(Response::new(GetWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -4202,7 +4604,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .into_iter()
             .filter(|work_unit| {
-                check_work_unit_read(&self.security, work_unit, &principals).is_ok()
+                check_work_unit_read(&self.db, &self.security, work_unit, &principals).is_ok()
             })
             .collect::<Vec<_>>();
         let next_page_token = if limit > 0 && work_units.len() > limit as usize {
@@ -4233,7 +4635,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &work_unit, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &work_unit, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "try_admit_work_unit")
@@ -4307,7 +4709,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &existing, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "heartbeat_work_unit")
@@ -4355,7 +4757,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &existing, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "complete_work_unit")
@@ -4402,7 +4804,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &existing, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "fail_work_unit")
@@ -4453,7 +4855,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &existing, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "cancel_work_unit")
@@ -4505,7 +4907,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.security, &existing, &principals)?;
+        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
         if let Some(record) = self
             .db
             .get_dedup_request(&inner.request_id, "release_reservation")
@@ -4568,7 +4970,7 @@ impl SekaiService for SekaiServiceImpl {
                 .get_work_unit(&reservation.work_unit_id)
                 .map_err(Status::internal)?
             {
-                if check_work_unit_read(&self.security, &work_unit, &principals).is_ok() {
+                if check_work_unit_read(&self.db, &self.security, &work_unit, &principals).is_ok() {
                     visible.push(to_proto_reservation(&reservation));
                 }
             }
@@ -4589,7 +4991,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_read(&self.security, &work_unit, &principals)?;
+        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
         let limit = inner.limit;
         let mut events = self
             .db
@@ -4731,6 +5133,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetCoordinationSnapshotResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "the global coordination snapshot requires control-plane administration",
+            ));
+        }
         let visible_scopes = self
             .db
             .list_contention_scopes()
@@ -4757,6 +5164,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CreateFunctionResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "team principals cannot create global stored functions",
+            ));
+        }
         let function = req
             .into_inner()
             .function
@@ -4775,6 +5187,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListFunctionsResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        if is_managed_team_principal(&self.db, &principals)? {
+            return Err(Status::permission_denied(
+                "team principals cannot list global stored functions",
+            ));
+        }
         let functions = self
             .db
             .list_functions()
@@ -4806,6 +5223,7 @@ impl SekaiService for SekaiServiceImpl {
         }
         let result = function::execute_with_filter(&self.db, &function, &inner.params, |object| {
             self.security.can_access(&object.id, &refs)
+                && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
         })
         .map_err(Status::invalid_argument)?;
         let objects = self.resolve_computed_for_responses(result.objects, &principals)?;
@@ -4827,9 +5245,7 @@ impl SekaiService for SekaiServiceImpl {
             .dataset
             .ok_or(Status::invalid_argument("dataset required"))?;
         let parsed = from_proto_dataset(&dataset);
-        if !parsed.object_id.is_empty() {
-            check_write(&self.security, &parsed.object_id, &principals)?;
-        }
+        check_dataset_access(&self.db, &self.security, &principals, &parsed, true)?;
         self.db
             .create_dataset(&parsed)
             .map_err(Status::invalid_argument)?;
@@ -4853,6 +5269,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_dataset(&parsed.id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("dataset not found"))?;
+        check_dataset_access(&self.db, &self.security, &principals, &existing, true)?;
         if existing.object_id.is_empty() {
             let root = principals.iter().any(|principal| principal == "root");
             let trusted_gateway = parsed.id == "llm_calls"
@@ -4865,9 +5282,8 @@ impl SekaiService for SekaiServiceImpl {
                     "unbound dataset updates require the gateway service principal",
                 ));
             }
-        } else {
-            check_write(&self.security, &existing.object_id, &principals)?;
         }
+        check_dataset_access(&self.db, &self.security, &principals, &parsed, true)?;
         self.db.update_dataset(&parsed).map_err(Status::internal)?;
         let updated = self
             .db
@@ -4890,8 +5306,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .into_iter()
             .filter(|dataset| {
-                dataset.object_id.is_empty()
-                    || check_read(&self.security, &dataset.object_id, &principals).is_ok()
+                check_dataset_access(&self.db, &self.security, &principals, dataset, false).is_ok()
             })
             .collect::<Vec<_>>()
             .iter()
@@ -4911,9 +5326,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_dataset(&inner.dataset_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("dataset not found"))?;
-        if !dataset.object_id.is_empty() {
-            check_write(&self.security, &dataset.object_id, &principals)?;
-        }
+        check_dataset_access(&self.db, &self.security, &principals, &dataset, true)?;
         let rows: Vec<_> = inner.rows.into_iter().map(|r| r.values).collect();
         let count = self
             .db
@@ -4933,9 +5346,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_dataset(&inner.dataset_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("dataset not found"))?;
-        if !dataset.object_id.is_empty() {
-            check_read(&self.security, &dataset.object_id, &principals)?;
-        }
+        check_dataset_access(&self.db, &self.security, &principals, &dataset, false)?;
         let query = inner.query.unwrap_or_default();
         let rows = self
             .db
@@ -4969,9 +5380,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_dataset(&parsed.dataset_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("dataset not found"))?;
-        if !dataset.object_id.is_empty() {
-            check_write(&self.security, &dataset.object_id, &principals)?;
-        }
+        check_dataset_access(&self.db, &self.security, &principals, &dataset, true)?;
         self.db
             .create_virtual_table(&parsed)
             .map_err(Status::invalid_argument)?;
@@ -4996,8 +5405,8 @@ impl SekaiService for SekaiServiceImpl {
                     .ok()
                     .flatten()
                     .map(|dataset| {
-                        dataset.object_id.is_empty()
-                            || check_read(&self.security, &dataset.object_id, &principals).is_ok()
+                        check_dataset_access(&self.db, &self.security, &principals, &dataset, false)
+                            .is_ok()
                     })
                     .unwrap_or(false)
             })
@@ -5018,7 +5427,17 @@ impl SekaiService for SekaiServiceImpl {
             .grant
             .ok_or(Status::invalid_argument("grant required"))?;
         let parsed = from_proto_grant(&grant)?;
-        check_write(&self.security, &parsed.object_id, &principals)?;
+        let target = self
+            .db
+            .get_object(&parsed.object_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::invalid_argument("grant target object does not exist"))?;
+        if target.kind == "namespace" {
+            require_credential_admin(&principals)?;
+        } else {
+            check_team_namespace(&self.db, &principals, &target.namespace, true)?;
+        }
+        check_object_admin(&self.db, &self.security, &target, &principals)?;
         self.db
             .create_grant(&parsed)
             .map_err(Status::invalid_argument)?;
@@ -5039,7 +5458,20 @@ impl SekaiService for SekaiServiceImpl {
             .get_grant(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("grant not found"))?;
-        check_write(&self.security, &existing.object_id, &principals)?;
+        let target = self
+            .db
+            .get_object(&existing.object_id)
+            .map_err(Status::internal)?;
+        if target
+            .as_ref()
+            .is_some_and(|object| object.kind == "namespace")
+        {
+            require_credential_admin(&principals)?;
+        } else if let Some(target) = &target {
+            check_team_namespace(&self.db, &principals, &target.namespace, true)?;
+        }
+        let target = target.ok_or(Status::not_found("grant target not found"))?;
+        check_object_admin(&self.db, &self.security, &target, &principals)?;
         let deleted = self.db.delete_grant(&id).map_err(Status::internal)?;
         if let Some(grant) = deleted {
             self.security
@@ -5054,7 +5486,17 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let object_id = req.into_inner().object_id;
-        check_write(&self.security, &object_id, &principals)?;
+        let target = self
+            .db
+            .get_object(&object_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("grant target not found"))?;
+        if target.kind == "namespace" {
+            require_credential_admin(&principals)?;
+        } else {
+            check_team_namespace(&self.db, &principals, &target.namespace, true)?;
+        }
+        check_object_admin(&self.db, &self.security, &target, &principals)?;
         let grants = self
             .db
             .list_grants(&object_id)
@@ -5071,10 +5513,35 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
+        check_object_namespace_access(&self.db, &principals, &inner.object_id, false)?;
         check_read(&self.security, &inner.object_id, &principals)?;
         let refs: Vec<&str> = inner.principals.iter().map(String::as_str).collect();
         Ok(Response::new(CheckAccessResponse {
             allowed: self.security.can_access(&inner.object_id, &refs),
+        }))
+    }
+    async fn ensure_team_namespace(
+        &self,
+        req: Request<EnsureTeamNamespaceRequest>,
+    ) -> Result<Response<EnsureTeamNamespaceResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let inner = req.into_inner();
+        let namespace = validate_credential_principal(&inner.namespace)?;
+        let principal = validate_team_principal(&inner.principal)?;
+        let role = security::Role::parse(&inner.role)
+            .ok_or_else(|| Status::invalid_argument("role must be viewer, editor, or admin"))?;
+        let actor = principals.first().map(String::as_str).unwrap_or("root");
+        let (namespace, grants) = self
+            .db
+            .ensure_team_namespace(&namespace, &principal, role, actor)
+            .map_err(Status::internal)?;
+        for grant in &grants {
+            self.security.add_grant(grant);
+        }
+        Ok(Response::new(EnsureTeamNamespaceResponse {
+            namespace: Some(to_proto_obj(&namespace)),
+            grants: grants.iter().map(to_proto_grant).collect(),
         }))
     }
     async fn record_decision(
@@ -5087,6 +5554,20 @@ impl SekaiService for SekaiServiceImpl {
             .into_inner()
             .decision
             .ok_or_else(|| Status::invalid_argument("decision required"))?;
+        decision.actor = principals
+            .first()
+            .cloned()
+            .ok_or(Status::unauthenticated("principal required"))?;
+        if decision.target_id.is_empty() {
+            if is_managed_team_principal(&self.db, &principals)? {
+                return Err(Status::permission_denied(
+                    "team decisions require a namespace-bound target object",
+                ));
+            }
+        } else {
+            check_object_namespace_access(&self.db, &principals, &decision.target_id, true)?;
+            check_write(&self.security, &decision.target_id, &principals)?;
+        }
         if decision.id.is_empty() {
             decision.id = uuid::Uuid::new_v4().to_string();
         }
@@ -5149,6 +5630,7 @@ impl SekaiService for SekaiServiceImpl {
         let mut decisions = Vec::new();
         let mut offset = 0;
         let mut scanned = 0usize;
+        let managed_team_principal = is_managed_team_principal(&self.db, &principals)?;
         while decisions.len() < visible_limit && scanned < max_scan {
             let batch = self
                 .db
@@ -5167,7 +5649,17 @@ impl SekaiService for SekaiServiceImpl {
             scanned += batch.len();
             offset += batch.len() as i32;
             for decision in batch {
-                if decision.target_id.is_empty()
+                if decision.target_id.is_empty() {
+                    if managed_team_principal {
+                        continue;
+                    }
+                } else if check_object_namespace_access(
+                    &self.db,
+                    &principals,
+                    &decision.target_id,
+                    false,
+                )
+                .is_err()
                     || check_read(&self.security, &decision.target_id, &principals).is_err()
                 {
                     continue;
@@ -5201,6 +5693,7 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
+        check_object_namespace_access(&self.db, &principals, &inner.object_id, false)?;
         check_read(&self.security, &inner.object_id, &principals)?;
         let object = self
             .db
@@ -5220,7 +5713,7 @@ impl SekaiService for SekaiServiceImpl {
             .clone();
         let changes = self
             .db
-            .list_object_changes(&inner.object_id, inner.limit, inner.offset)
+            .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
             .map_err(Status::internal)?
             .into_iter()
             .map(|change| {
@@ -5506,7 +5999,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateCredentialRequest>,
     ) -> Result<Response<CreateCredentialResponse>, Status> {
         require_credential_admin(&caller_principals(&req))?;
-        let principal = validate_new_credential_principal(&req.into_inner().principal)?;
+        let request = req.into_inner();
+        let principal = if request.managed_team_principal {
+            validate_team_principal(&request.principal)?
+        } else {
+            validate_new_credential_principal(&request.principal)?
+        };
         if !self
             .db
             .list_credentials(Some(&principal), Some("active"))
@@ -5518,14 +6016,16 @@ impl SekaiService for SekaiServiceImpl {
             )));
         }
         let token = new_credential_token();
-        let credential = self
-            .db
-            .create_principal_credential(
-                &principal,
-                &hash_gateway_key(&token),
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .map_err(Status::internal)?;
+        let token_hash = hash_gateway_key(&token);
+        let now = chrono::Utc::now().timestamp_millis();
+        let credential = if request.managed_team_principal {
+            self.db
+                .create_managed_team_credential(&principal, &token_hash, now)
+        } else {
+            self.db
+                .create_principal_credential(&principal, &token_hash, now)
+        }
+        .map_err(Status::internal)?;
         Ok(Response::new(CreateCredentialResponse {
             token,
             credential: Some(to_proto_credential(credential)),
@@ -5537,7 +6037,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RotateCredentialRequest>,
     ) -> Result<Response<RotateCredentialResponse>, Status> {
         require_credential_admin(&caller_principals(&req))?;
-        let principal = validate_new_credential_principal(&req.into_inner().principal)?;
+        let request = req.into_inner();
+        let principal = if request.managed_team_principal {
+            validate_team_principal(&request.principal)?
+        } else {
+            validate_new_credential_principal(&request.principal)?
+        };
         if self
             .db
             .list_credentials(Some(&principal), Some("active"))
@@ -5549,10 +6054,14 @@ impl SekaiService for SekaiServiceImpl {
             )));
         }
         let token = new_credential_token();
-        let credential = self
-            .db
-            .rotate_principal_credential(&principal, &hash_gateway_key(&token))
-            .map_err(Status::internal)?;
+        let token_hash = hash_gateway_key(&token);
+        let credential = if request.managed_team_principal {
+            self.db
+                .rotate_managed_team_credential(&principal, &token_hash)
+        } else {
+            self.db.rotate_principal_credential(&principal, &token_hash)
+        }
+        .map_err(Status::internal)?;
         Ok(Response::new(RotateCredentialResponse {
             token,
             credential: Some(to_proto_credential(credential)),
@@ -5864,7 +6373,12 @@ impl SekaiService for SekaiServiceImpl {
         if work_unit_id.is_empty() {
             return Err(Status::invalid_argument("work_unit_id required"));
         }
-        check_read(&self.security, &work_unit_id, &principals)?;
+        let work_unit = self
+            .db
+            .get_work_unit(&work_unit_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("work unit not found"))?;
+        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
         let report = crate::provenance::assemble_report(&self.db, &work_unit_id)
             .map_err(Status::internal)?;
         Ok(Response::new(GetProvenanceReportResponse {
@@ -5899,10 +6413,20 @@ fn validate_credential_principal(principal: &str) -> Result<String, Status> {
 
 fn validate_new_credential_principal(principal: &str) -> Result<String, Status> {
     let principal = validate_credential_principal(principal)?;
-    if matches!(principal.as_str(), "root" | "local") {
+    if matches!(principal.as_str(), "root" | "local" | "anonymous") {
         return Err(Status::invalid_argument(format!(
             "principal {principal:?} is reserved for control-plane authentication"
         )));
+    }
+    Ok(principal)
+}
+
+fn validate_team_principal(principal: &str) -> Result<String, Status> {
+    let principal = validate_new_credential_principal(principal)?;
+    if principal == "chisei-gateway" {
+        return Err(Status::invalid_argument(
+            "principal \"chisei-gateway\" is reserved for gateway authentication",
+        ));
     }
     Ok(principal)
 }
@@ -8466,6 +8990,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computed_properties_respect_team_namespace_boundaries() {
+        let svc = service();
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "acme".into(),
+                principal: "alice".into(),
+                role: "viewer".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_function(with_named_principal(
+            CreateFunctionRequest {
+                function: Some(Function {
+                    name: "count_team_children".into(),
+                    pipeline: vec![
+                        PipelineStep {
+                            op: "self".into(),
+                            ..Default::default()
+                        },
+                        PipelineStep {
+                            op: "traverse".into(),
+                            relation: "contains".into(),
+                            ..Default::default()
+                        },
+                        PipelineStep {
+                            op: "aggregate".into(),
+                            func: "count".into(),
+                            r#as: "child_count".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(ObjectType {
+                    kind: "team-cluster".into(),
+                    properties: vec![PropertyDef {
+                        name: "child_count".into(),
+                        r#type: "computed".into(),
+                        compute_expr: "count_team_children".into(),
+                        classification: "public".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        for (id, kind, namespace) in [
+            ("team-cluster", "team-cluster", "acme"),
+            ("acme-child", "component", "acme"),
+            ("beta-child", "component", "beta"),
+        ] {
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: id.into(),
+                        kind: kind.into(),
+                        name: id.into(),
+                        namespace: namespace.into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        for child in ["acme-child", "beta-child"] {
+            svc.create_link(with_named_principal(
+                CreateLinkRequest {
+                    link: Some(Link {
+                        id: format!("team-cluster->{child}"),
+                        from_id: "team-cluster".into(),
+                        to_id: child.into(),
+                        relation: "contains".into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+
+        let cluster = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "team-cluster".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(cluster.properties["child_count"], "1");
+    }
+
+    #[tokio::test]
     async fn schema_type_rejects_unknown_computed_function() {
         let svc = service();
         grant_schema_admin(&svc);
@@ -9445,6 +10080,18 @@ mod tests {
     #[tokio::test]
     async fn grant_and_audit_rpcs_round_trip() {
         let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "o1".into(),
+                kind: "note".into(),
+                name: "target".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let admin_grant = security::Grant {
             id: "admin".into(),
             object_id: "o1".into(),
@@ -9546,6 +10193,917 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(changes.changes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_plane_admin_can_recover_managed_acl() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "namespace:acme".into(),
+                kind: "namespace".into(),
+                name: "acme".into(),
+                namespace: "acme".into(),
+                external_id: "namespace:acme".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        let member_grant = security::Grant {
+            id: "member".into(),
+            object_id: "namespace:acme".into(),
+            principal: "alice".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&member_grant).unwrap();
+        svc.security.add_grant(&member_grant);
+
+        svc.create_grant(with_named_principal(
+            CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "recovery".into(),
+                    object_id: "namespace:acme".into(),
+                    principal: "root".into(),
+                    role: "admin".into(),
+                    created: 1,
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+
+        assert!(svc.security.can_admin("namespace:acme", &["root"]));
+    }
+
+    #[tokio::test]
+    async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
+        let svc = service();
+        let denied = svc
+            .ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: "acme".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.find_namespace_boundary("acme").unwrap().is_none());
+
+        let created = svc
+            .ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: "acme".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let namespace = created.namespace.unwrap();
+        assert_eq!(namespace.external_id, "namespace:acme");
+        assert_eq!(created.grants.len(), 3);
+        assert!(svc.security.can_access(&namespace.id, &["alice"]));
+
+        let forged_namespace = svc
+            .create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: "namespace-forged".into(),
+                        kind: "namespace".into(),
+                        name: "forged".into(),
+                        namespace: "forged".into(),
+                        external_id: "namespace:forged".into(),
+                        properties: HashMap::new(),
+                        created: 1,
+                        updated: 1,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(forged_namespace.code(), tonic::Code::PermissionDenied);
+
+        let forged_external_id = svc
+            .create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: "ordinary-object".into(),
+                        kind: "note".into(),
+                        name: "forged identity".into(),
+                        namespace: "acme".into(),
+                        external_id: "namespace:future".into(),
+                        properties: HashMap::new(),
+                        created: 1,
+                        updated: 1,
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(forged_external_id.code(), tonic::Code::InvalidArgument);
+
+        let root_grant = created
+            .grants
+            .into_iter()
+            .find(|grant| grant.principal == "root")
+            .unwrap();
+        let delete_root = svc
+            .delete_grant(with_named_principal(
+                DeleteGrantRequest { id: root_grant.id },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(delete_root.code(), tonic::Code::PermissionDenied);
+
+        let delete_namespace = svc
+            .delete_object(with_named_principal(
+                DeleteObjectRequest {
+                    id: namespace.id.clone(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(delete_namespace.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.db.find_namespace_boundary("acme").unwrap().is_some());
+
+        svc.db
+            .create_object(&domain::Object {
+                id: "legacy-boundary".into(),
+                kind: "namespace".into(),
+                name: "legacy".into(),
+                namespace: String::new(),
+                external_id: "namespace:legacy".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let adopted = svc
+            .ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: "legacy".into(),
+                    principal: "bob".into(),
+                    role: "viewer".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .namespace
+            .unwrap();
+        assert_eq!(adopted.namespace, "legacy");
+        assert_eq!(
+            adopted.properties.get("team_managed").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            svc.delete_object(with_named_principal(
+                DeleteObjectRequest { id: adopted.id },
+                "local",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn team_namespace_roles_scope_generic_object_access() {
+        let svc = service();
+        for (principal, role) in [("alice", "viewer"), ("bob", "editor")] {
+            svc.ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: "acme".into(),
+                    principal: principal.into(),
+                    role: role.into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "beta".into(),
+                principal: "carol".into(),
+                role: "editor".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        for (id, namespace) in [("acme-object", "acme"), ("beta-object", "beta")] {
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: id.into(),
+                        kind: "note".into(),
+                        name: id.into(),
+                        namespace: namespace.into(),
+                        external_id: String::new(),
+                        properties: HashMap::new(),
+                        created: 1,
+                        updated: 1,
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+
+        svc.get_object(with_named_principal(
+            GetObjectRequest {
+                id: "acme-object".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "acme-object".into(),
+                },
+                "unmanaged-principal",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let unmanaged_list = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: "acme".into(),
+                        ..Default::default()
+                    }),
+                },
+                "unmanaged-principal",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(unmanaged_list.objects.is_empty());
+        assert_eq!(unmanaged_list.total, 0);
+        assert_eq!(
+            svc.get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "beta-object".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: "viewer-write".into(),
+                        kind: "note".into(),
+                        name: "denied".into(),
+                        namespace: "acme".into(),
+                        external_id: String::new(),
+                        properties: HashMap::new(),
+                        created: 1,
+                        updated: 1,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(Object {
+                    id: "editor-write".into(),
+                    kind: "note".into(),
+                    name: "allowed".into(),
+                    namespace: "acme".into(),
+                    external_id: String::new(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                }),
+            },
+            "bob",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.list_objects(with_named_principal(
+                ListObjectsRequest { filter: None },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let listed = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: "acme".into(),
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            listed
+                .objects
+                .iter()
+                .all(|object| object.namespace == "acme")
+        );
+
+        let unscoped_set = svc
+            .create_object_set(with_named_principal(
+                CreateObjectSetRequest {
+                    object_set: Some(ObjectSet {
+                        name: "unscoped".into(),
+                        filter: Some(ListFilter::default()),
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(unscoped_set.code(), tonic::Code::PermissionDenied);
+
+        svc.create_link(with_named_principal(
+            CreateLinkRequest {
+                link: Some(Link {
+                    id: "cross-namespace-link".into(),
+                    from_id: "acme-object".into(),
+                    to_id: "beta-object".into(),
+                    relation: "depends_on".into(),
+                    created: 1,
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let linked = svc
+            .get_linked_objects(with_named_principal(
+                GetLinkedObjectsRequest {
+                    object_id: "acme-object".into(),
+                    relation: "depends_on".into(),
+                    direction: "outgoing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(linked.objects.is_empty());
+        let viewer_link = svc
+            .create_link(with_named_principal(
+                CreateLinkRequest {
+                    link: Some(Link {
+                        id: "viewer-link".into(),
+                        from_id: "acme-object".into(),
+                        to_id: "editor-write".into(),
+                        relation: "depends_on".into(),
+                        created: 1,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(viewer_link.code(), tonic::Code::PermissionDenied);
+
+        let lineage = svc
+            .get_lineage(with_named_principal(
+                GetLineageRequest {
+                    object_id: "acme-object".into(),
+                    max_nodes: 10,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(lineage.nodes.len(), 1);
+        assert!(lineage.edges.is_empty());
+
+        svc.create_function(with_named_principal(
+            CreateFunctionRequest {
+                function: Some(Function {
+                    name: "all-notes".into(),
+                    pipeline: vec![PipelineStep {
+                        op: "filter".into(),
+                        kind: "note".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.create_function(with_named_principal(
+                CreateFunctionRequest {
+                    function: Some(Function::default()),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let function_result = svc
+            .execute_function(with_named_principal(
+                ExecuteFunctionRequest {
+                    name: "all-notes".into(),
+                    params: HashMap::new(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(
+            function_result
+                .objects
+                .iter()
+                .all(|object| object.namespace == "acme")
+        );
+
+        for (id, object_id) in [("beta-dataset", "beta-object"), ("global-dataset", "")] {
+            svc.create_dataset(with_named_principal(
+                CreateDatasetRequest {
+                    dataset: Some(Dataset {
+                        id: id.into(),
+                        name: id.into(),
+                        object_id: object_id.into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                svc.query_rows(with_named_principal(
+                    QueryRowsRequest {
+                        dataset_id: id.into(),
+                        query: None,
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+
+        for (principal, target) in [("alice", "acme-object"), ("bob", "beta-object")] {
+            let denied = svc
+                .execute_action(with_named_principal(
+                    ExecuteActionRequest {
+                        request: Some(ActionRequest {
+                            action: "set_property".into(),
+                            params: HashMap::from([
+                                ("id".into(), target.into()),
+                                ("key".into(), "compromised".into()),
+                                ("value".into(), "true".into()),
+                            ]),
+                            actor: principal.into(),
+                        }),
+                        dry_run: false,
+                    },
+                    principal,
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        for params in [
+            HashMap::from([
+                ("id".into(), "namespace:acme-duplicate".into()),
+                ("kind".into(), "namespace".into()),
+                ("name".into(), "duplicate".into()),
+                ("namespace".into(), "acme".into()),
+                ("external_id".into(), "namespace:acme".into()),
+            ]),
+            HashMap::from([
+                ("id".into(), "unscoped-action-object".into()),
+                ("kind".into(), "note".into()),
+                ("name".into(), "unscoped".into()),
+            ]),
+        ] {
+            assert_eq!(
+                svc.execute_action(with_named_principal(
+                    ExecuteActionRequest {
+                        request: Some(ActionRequest {
+                            action: "create_object".into(),
+                            params,
+                            actor: "bob".into(),
+                        }),
+                        dry_run: false,
+                    },
+                    "bob",
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+
+        let acl_escalation = svc
+            .create_grant(with_named_principal(
+                CreateGrantRequest {
+                    grant: Some(Grant {
+                        id: "viewer-escalation".into(),
+                        object_id: "acme-object".into(),
+                        principal: "alice".into(),
+                        role: "admin".into(),
+                        created: 1,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(acl_escalation.code(), tonic::Code::PermissionDenied);
+        let editor_acl_escalation = svc
+            .create_grant(with_named_principal(
+                CreateGrantRequest {
+                    grant: Some(Grant {
+                        id: "editor-escalation".into(),
+                        object_id: "acme-object".into(),
+                        principal: "bob".into(),
+                        role: "admin".into(),
+                        created: 1,
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(editor_acl_escalation.code(), tonic::Code::PermissionDenied);
+
+        assert_eq!(
+            svc.check_access(with_named_principal(
+                CheckAccessRequest {
+                    object_id: "beta-object".into(),
+                    principals: vec!["carol".into()],
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        for (id, target_id) in [
+            ("acme-decision", "acme-object"),
+            ("beta-decision", "beta-object"),
+        ] {
+            svc.db
+                .record_decision(&audit::Decision {
+                    id: id.into(),
+                    timestamp: 1,
+                    actor: "local".into(),
+                    action: "test".into(),
+                    reason: "namespace isolation".into(),
+                    evidence: HashMap::new(),
+                    target_id: target_id.into(),
+                    outcome: "recorded".into(),
+                })
+                .unwrap();
+        }
+        let decisions = svc
+            .list_decisions(with_named_principal(
+                ListDecisionsRequest {
+                    limit: 10,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            decisions
+                .decisions
+                .iter()
+                .map(|decision| decision.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acme-decision"]
+        );
+
+        let forged_decision = svc
+            .record_decision(with_named_principal(
+                RecordDecisionRequest {
+                    decision: Some(Decision {
+                        actor: "root".into(),
+                        target_id: "beta-object".into(),
+                        action: "forged".into(),
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(forged_decision.code(), tonic::Code::PermissionDenied);
+        let recorded = svc
+            .record_decision(with_named_principal(
+                RecordDecisionRequest {
+                    decision: Some(Decision {
+                        actor: "root".into(),
+                        target_id: "acme-object".into(),
+                        action: "editor-note".into(),
+                        ..Default::default()
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(recorded.actor, "bob");
+
+        svc.create_contention_scope(with_named_principal(
+            CreateContentionScopeRequest {
+                request_id: "alice-scope".into(),
+                scope: Some(ContentionScope {
+                    id: "alice-scope".into(),
+                    name: "alice".into(),
+                    max_concurrency: 1,
+                    admission_policy: coordination::ADMISSION_POLICY_FIFO.into(),
+                    heartbeat_ttl_seconds: 30,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.create_work_unit(with_named_principal(
+                CreateWorkUnitRequest {
+                    request_id: "cross-team-work".into(),
+                    work_unit: Some(WorkUnit {
+                        id: "cross-team-work".into(),
+                        kind: "analysis".into(),
+                        actor: "alice".into(),
+                        target_object_id: "beta-object".into(),
+                        requested_spec: "read beta".into(),
+                        scope_id: "alice-scope".into(),
+                        timeout_seconds: 60,
+                        heartbeat_ttl_seconds: 30,
+                        idempotency_key: "cross-team-work".into(),
+                        created_at: 1,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        svc.create_contention_scope(with_named_principal(
+            CreateContentionScopeRequest {
+                request_id: "team-scope".into(),
+                scope: Some(ContentionScope {
+                    id: "team-scope".into(),
+                    name: "team".into(),
+                    max_concurrency: 1,
+                    admission_policy: coordination::ADMISSION_POLICY_FIFO.into(),
+                    heartbeat_ttl_seconds: 30,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_work_unit(with_named_principal(
+            CreateWorkUnitRequest {
+                request_id: "beta-work".into(),
+                work_unit: Some(WorkUnit {
+                    id: "beta-work".into(),
+                    kind: "analysis".into(),
+                    actor: "local".into(),
+                    target_object_id: "beta-object".into(),
+                    requested_spec: "private beta work".into(),
+                    scope_id: "team-scope".into(),
+                    timeout_seconds: 60,
+                    heartbeat_ttl_seconds: 30,
+                    idempotency_key: "beta-work".into(),
+                    created_at: 1,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.get_work_unit(with_named_principal(
+                GetWorkUnitRequest {
+                    id: "beta-work".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.get_provenance_report(with_named_principal(
+                GetProvenanceReportRequest {
+                    work_unit_id: "beta-work".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        svc.delete_object(with_named_principal(
+            DeleteObjectRequest {
+                id: "beta-object".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: "beta-object".into(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let beta_changes = svc
+            .list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: "beta-object".into(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "carol",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            beta_changes
+                .changes
+                .iter()
+                .any(|change| change.field == "_deleted")
+        );
+
+        svc.delete_grant(with_named_principal(
+            DeleteGrantRequest {
+                id: "team:acme:alice".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "acme-object".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_cannot_preclaim_future_namespace_boundaries() {
+        let svc = service();
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "acme".into(),
+                principal: "bob".into(),
+                role: "editor".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(Object {
+                        id: "namespace:future".into(),
+                        kind: "note".into(),
+                        name: "preclaim".into(),
+                        namespace: "acme".into(),
+                        ..Default::default()
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        let denied = svc
+            .create_grant(with_named_principal(
+                CreateGrantRequest {
+                    grant: Some(Grant {
+                        id: "orphan".into(),
+                        object_id: "namespace:future".into(),
+                        principal: "mallory".into(),
+                        role: "admin".into(),
+                        created: 1,
+                    }),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+
+        svc.db
+            .create_grant(&security::Grant {
+                id: "legacy-orphan".into(),
+                object_id: "namespace:future".into(),
+                principal: "mallory".into(),
+                role: security::Role::Admin,
+                created: 1,
+            })
+            .unwrap();
+        let bootstrap = svc
+            .ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: "future".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(bootstrap.code(), tonic::Code::Internal);
+        assert!(svc.db.find_namespace_boundary("future").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -9795,6 +11353,41 @@ mod tests {
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.running_count, 1);
         assert!(!snapshot.blocked_scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_team_principals_cannot_read_global_coordination_snapshots() {
+        let svc = service();
+        svc.db
+            .ensure_team_namespace("acme", "alice", security::Role::Viewer, "local")
+            .unwrap();
+        let error = svc
+            .get_coordination_snapshot(with_named_principal(
+                GetCoordinationSnapshotRequest {},
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let error = svc
+            .create_contention_scope(with_named_principal(
+                CreateContentionScopeRequest {
+                    request_id: "team-global-scope".into(),
+                    scope: Some(ContentionScope {
+                        id: "team-global-scope".into(),
+                        name: "forbidden".into(),
+                        max_concurrency: 1,
+                        admission_policy: coordination::ADMISSION_POLICY_FIFO.into(),
+                        heartbeat_ttl_seconds: 30,
+                        timeout_seconds: 60,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -12562,6 +14155,7 @@ mod tests {
             .create_credential(with_named_principal(
                 CreateCredentialRequest {
                     principal: "agent-a".into(),
+                    managed_team_principal: false,
                 },
                 "local",
             ))
@@ -12575,6 +14169,7 @@ mod tests {
             .rotate_credential(with_named_principal(
                 RotateCredentialRequest {
                     principal: "agent-a".into(),
+                    managed_team_principal: false,
                 },
                 "local",
             ))
@@ -12623,12 +14218,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_team_classification_is_atomic_with_credential_rotation() {
+        let svc = service();
+        svc.create_credential(with_named_principal(
+            CreateCredentialRequest {
+                principal: "team-agent".into(),
+                managed_team_principal: false,
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert!(!svc.db.is_team_principal("team-agent").unwrap());
+
+        svc.rotate_credential(with_named_principal(
+            RotateCredentialRequest {
+                principal: "team-agent".into(),
+                managed_team_principal: true,
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert!(svc.db.is_team_principal("team-agent").unwrap());
+        assert_eq!(
+            svc.db
+                .list_credentials(Some("team-agent"), Some("active"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn credential_rpcs_reject_privileged_principal_names() {
-        for principal in ["root", "local"] {
+        for principal in ["root", "local", "anonymous"] {
             let error = service()
                 .create_credential(with_named_principal(
                     CreateCredentialRequest {
                         principal: principal.into(),
+                        managed_team_principal: false,
                     },
                     "local",
                 ))
@@ -12639,8 +14268,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_credentials_reject_reserved_gateway_principal() {
+        let error = service()
+            .create_credential(with_named_principal(
+                CreateCredentialRequest {
+                    principal: "chisei-gateway".into(),
+                    managed_team_principal: true,
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn provenance_report_is_served_without_direct_database_access() {
-        let response = service()
+        let svc = service();
+        svc.create_contention_scope(with_named_principal(
+            CreateContentionScopeRequest {
+                request_id: "provenance-scope".into(),
+                scope: Some(ContentionScope {
+                    id: "provenance-scope".into(),
+                    name: "provenance".into(),
+                    max_concurrency: 1,
+                    admission_policy: coordination::ADMISSION_POLICY_FIFO.into(),
+                    heartbeat_ttl_seconds: 30,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_work_unit(with_named_principal(
+            CreateWorkUnitRequest {
+                request_id: "work-unit-1".into(),
+                work_unit: Some(WorkUnit {
+                    id: "work-unit-1".into(),
+                    kind: "analysis".into(),
+                    actor: "local".into(),
+                    requested_spec: "assemble provenance".into(),
+                    scope_id: "provenance-scope".into(),
+                    timeout_seconds: 60,
+                    heartbeat_ttl_seconds: 30,
+                    created_at: 1,
+                    idempotency_key: "work-unit-1".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let response = svc
             .get_provenance_report(with_named_principal(
                 GetProvenanceReportRequest {
                     work_unit_id: "work-unit-1".into(),

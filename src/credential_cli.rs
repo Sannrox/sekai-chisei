@@ -141,6 +141,7 @@ pub async fn create_credential(principal: &str) -> Result<String, String> {
     let response = SekaiServiceClient::new(channel)
         .create_credential(CreateCredentialRequest {
             principal: principal.to_string(),
+            managed_team_principal: false,
         })
         .await
         .map_err(|error| format!("create credential: {error}"))?;
@@ -155,6 +156,7 @@ pub async fn rotate_credential(principal: &str) -> Result<String, String> {
     let response = SekaiServiceClient::new(channel)
         .rotate_credential(RotateCredentialRequest {
             principal: principal.to_string(),
+            managed_team_principal: false,
         })
         .await
         .map_err(|error| format!("rotate credential: {error}"))?;

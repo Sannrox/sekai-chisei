@@ -142,7 +142,11 @@ impl SekaiDb {
                 SELECT MAX(rowid) FROM sekai_grants GROUP BY object_id, principal
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_grants_object_principal
-                ON sekai_grants(object_id, principal);",
+                ON sekai_grants(object_id, principal);
+            CREATE TABLE IF NOT EXISTS sekai_team_principals (
+                principal TEXT PRIMARY KEY,
+                created INTEGER NOT NULL
+            );",
         )
         .map_err(|e| e.to_string())
     }
@@ -238,6 +242,47 @@ impl SekaiDb {
             })
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn list_namespace_roles_for_principal(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<(String, Role)>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.external_id, g.role
+                 FROM sekai_grants g
+                 JOIN sekai_objects o ON o.id = g.object_id
+                 WHERE g.principal = ?1 AND o.kind = 'namespace'
+                 ORDER BY o.external_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![principal], |row| {
+                let external_id: String = row.get(0)?;
+                let role: String = row.get(1)?;
+                Ok((
+                    external_id
+                        .strip_prefix("namespace:")
+                        .unwrap_or(&external_id)
+                        .to_string(),
+                    Role::parse(&role).unwrap_or(Role::Viewer),
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn is_team_principal(&self, principal: &str) -> Result<bool, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sekai_team_principals WHERE principal = ?1)",
+            params![principal],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
