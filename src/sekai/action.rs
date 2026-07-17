@@ -143,6 +143,18 @@ impl ActionExecutor {
         RiskClass::Destructive
     }
 
+    pub fn creates_namespace(&self, action: &str, params: &HashMap<String, String>) -> bool {
+        if action == "create_object" {
+            return params.get("kind").is_some_and(|kind| kind == "namespace");
+        }
+        self.action_types.get(action).is_some_and(|action_type| {
+            action_type
+                .ops
+                .iter()
+                .any(|op| op.op == "create_object" && op.property == "namespace")
+        })
+    }
+
     /// Human-readable description of the ops an action would perform, in order.
     /// Used by dry-run; describes op shape without leaking property values.
     pub fn planned_ops(

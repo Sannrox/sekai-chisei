@@ -40,6 +40,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "memory" => {
             sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
         }
+        "team" => {
+            if args.get(1).map(String::as_str) != Some("join") {
+                return Err(std::io::Error::other(sekai_chisei::team_cli::usage()).into());
+            }
+            let config =
+                sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(args.into_iter().skip(2))
+                    .map_err(std::io::Error::other)?;
+            let bundle = sekai_chisei::team_cli::run_team_join(config)
+                .await
+                .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&bundle)?);
+            Ok(())
+        }
         "estimate" => {
             sekai_chisei::launch::load_local_env();
             let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
@@ -230,7 +243,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory|team> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -263,6 +276,7 @@ fn print_root_usage() {
         "\nMemory commands:\n  {}",
         sekai_chisei::memory_cli::usage()
     );
+    println!("\nTeam commands:\n  {}", sekai_chisei::team_cli::usage());
 }
 
 fn print_gateway_usage() {

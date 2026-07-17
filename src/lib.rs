@@ -26,3 +26,4 @@ pub mod report_cli;
 pub mod secrets;
 pub mod sekai;
 pub mod shomei;
+pub mod team_cli;

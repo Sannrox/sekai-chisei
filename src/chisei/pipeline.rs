@@ -206,11 +206,49 @@ fn resolve_context_objects(req: &PipelineRequest, db: &SekaiDb) -> Vec<crate::do
             continue;
         }
         let obj = db.find_by_external_id(&external_id).ok().flatten();
-        if let Some(obj) = obj {
+        if let Some(obj) = obj
+            && context_object_authorized(req, db, &obj)
+        {
             objects.push(obj);
         }
     }
     objects
+}
+
+fn context_object_authorized(req: &PipelineRequest, db: &SekaiDb, object: &Object) -> bool {
+    // Direct in-process pipeline users are trusted and historically omit an
+    // actor. Network entry points always populate this from authenticated metadata.
+    if req.memory_actor.is_empty() || matches!(req.memory_actor.as_str(), "root" | "local") {
+        return true;
+    }
+    if object.namespace != req.namespace.trim() {
+        return false;
+    }
+    let namespace_authorized = match db.find_namespace_boundary(&req.namespace) {
+        Ok(Some(boundary))
+            if boundary
+                .properties
+                .get("team_managed")
+                .is_some_and(|value| value == "true") =>
+        {
+            db.list_grants(&boundary.id).is_ok_and(|grants| {
+                grants
+                    .iter()
+                    .any(|grant| grant.principal == req.memory_actor)
+            })
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    if !namespace_authorized {
+        return false;
+    }
+    db.list_grants(&object.id).is_ok_and(|grants| {
+        grants.is_empty()
+            || grants
+                .iter()
+                .any(|grant| grant.principal == req.memory_actor)
+    })
 }
 
 fn evidence_classification_allowed(classification: EvidenceClassification, external: bool) -> bool {
@@ -391,6 +429,7 @@ fn filter_context_property(
 }
 
 fn collect_related_verdict_context(
+    req: &PipelineRequest,
     obj: &Object,
     db: &SekaiDb,
     external_egress: bool,
@@ -407,6 +446,9 @@ fn collect_related_verdict_context(
     );
 
     for candidate in candidates {
+        if !context_object_authorized(req, db, &candidate) {
+            continue;
+        }
         if candidate.kind == KIND_LEARNING {
             continue;
         }
@@ -605,6 +647,9 @@ fn run_object_context_enrich(
                 .unwrap_or_default();
             let mut pitfalls = Vec::new();
             for candidate in learnings {
+                if !context_object_authorized(req, db, &candidate) {
+                    continue;
+                }
                 if candidate.kind == KIND_LEARNING {
                     let mut learning_record = egress::new_record(&candidate);
                     let title = filter_context_property(
@@ -639,7 +684,7 @@ fn run_object_context_enrich(
                 has_content = true;
             }
             let (related_verdicts, mut related_records) =
-                collect_related_verdict_context(&obj, db, req.external_egress);
+                collect_related_verdict_context(req, &obj, db, req.external_egress);
             if !related_verdicts.is_empty() {
                 req.expanded_context_items = req
                     .expanded_context_items
@@ -1082,6 +1127,7 @@ fn run_learnings_enrich(
             .find_by_external_id(&format!("namespace:{}", context.kind))
             .ok()
             .flatten()
+            .filter(|object| context_object_authorized(req, db, object))
         {
             sources.push(ns_obj.id);
         }
@@ -1090,6 +1136,9 @@ fn run_learnings_enrich(
                 .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             for obj in learnings {
+                if !context_object_authorized(req, db, &obj) {
+                    continue;
+                }
                 if obj.kind != KIND_LEARNING {
                     continue;
                 }
@@ -1184,6 +1233,9 @@ impl Step for SpecEnrichStep {
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default();
             for comp in components {
+                if !context_object_authorized(req, db, &comp) {
+                    continue;
+                }
                 if !is_evaluable_context(db, &comp) {
                     continue;
                 }
@@ -1298,7 +1350,10 @@ impl Step for RiskStep {
         for context in resolve_context_objects(req, db) {
             let components = db
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|object| context_object_authorized(req, db, object))
+                .collect::<Vec<_>>();
             let degraded = components
                 .iter()
                 .filter(|c| is_degraded_evaluable(db, c, 30))
@@ -2757,6 +2812,72 @@ mod tests {
         assert!(result.prepared_spec.contains("watch margin risk"));
         assert!(result.expanded_context_items > 0);
         assert!(result.prepared_spec.contains("Local analysis"));
+    }
+
+    #[test]
+    fn authenticated_context_never_crosses_namespace_or_object_acl() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut object = Object {
+            id: "asset-secret".into(),
+            kind: "asset".into(),
+            name: "Secret".into(),
+            namespace: "other".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::from([("verdict".into(), "private context".into())]),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object(&object).unwrap();
+        let pipeline = default_pipeline();
+        let mut request = make_req();
+        request.namespace = "acme".into();
+        request.spec = "inspect asset:SECRET".into();
+        request.memory_actor = "alice".into();
+        request.external_egress = false;
+
+        let cross_namespace = pipeline.run(&mut request, &db);
+        assert!(!cross_namespace.prepared_spec.contains("private context"));
+
+        db.delete_object(&object.id).unwrap();
+        db.ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .unwrap();
+        object.id = "asset-protected".into();
+        object.namespace = "acme".into();
+        db.create_object(&object).unwrap();
+        db.create_grant(&Grant {
+            id: "secret-bob".into(),
+            object_id: object.id.clone(),
+            principal: "bob".into(),
+            role: Role::Viewer,
+            created: 1,
+        })
+        .unwrap();
+        let protected = pipeline.run(&mut request, &db);
+        assert!(!protected.prepared_spec.contains("private context"));
+
+        db.create_grant(&Grant {
+            id: "secret-alice".into(),
+            object_id: object.id.clone(),
+            principal: "alice".into(),
+            role: Role::Viewer,
+            created: 2,
+        })
+        .unwrap();
+        let authorized = pipeline.run(&mut request, &db);
+        assert!(authorized.prepared_spec.contains("private context"));
+
+        db.create_grant(&Grant {
+            id: "secret-gateway".into(),
+            object_id: object.id.clone(),
+            principal: "chisei-gateway".into(),
+            role: Role::Viewer,
+            created: 3,
+        })
+        .unwrap();
+        request.spec = "inspect asset:SECRET".into();
+        request.memory_actor = "chisei-gateway".into();
+        let namespace_denied = pipeline.run(&mut request, &db);
+        assert!(!namespace_denied.prepared_spec.contains("private context"));
     }
 
     #[test]

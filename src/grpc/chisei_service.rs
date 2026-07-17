@@ -58,6 +58,7 @@ const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
 const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
+const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
 const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
 const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
@@ -480,6 +481,168 @@ fn authorize_statistics_namespaces(
         }
     }
     Ok(())
+}
+
+fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> Result<(), Status> {
+    let actor = authenticated_actor(request);
+    if matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+        || config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor)
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "evaluation reads require an authorized service principal",
+        ))
+    }
+}
+
+fn require_control_plane_admin<T>(request: &Request<T>, mutation: &str) -> Result<(), Status> {
+    if matches!(authenticated_actor(request).as_str(), "root" | "local") {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "{mutation} requires control-plane administration"
+        )))
+    }
+}
+
+fn require_telemetry_writer<T>(request: &Request<T>, config: &Config) -> Result<String, Status> {
+    let actor = authenticated_actor(request);
+    let allowed = matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+        || config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor);
+    if allowed {
+        Ok(actor)
+    } else {
+        Err(Status::permission_denied(
+            "telemetry ingestion requires an authorized service principal",
+        ))
+    }
+}
+
+fn canonical_namespace(namespace: &str) -> Result<&str, Status> {
+    let canonical = namespace.trim();
+    if canonical.is_empty() {
+        return Err(Status::invalid_argument("namespace required"));
+    }
+    if canonical != namespace {
+        return Err(Status::invalid_argument(
+            "namespace must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn require_namespace_access(db: &SekaiDb, actor: &str, namespace: &str) -> Result<(), Status> {
+    let namespace = canonical_namespace(namespace)?;
+    if matches!(actor, "root" | "local") {
+        return Ok(());
+    }
+    let boundary = db
+        .find_namespace_boundary(namespace)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied("namespace access denied"))?;
+    let granted = db
+        .list_grants(&boundary.id)
+        .map_err(Status::internal)?
+        .into_iter()
+        .any(|grant| grant.principal == actor);
+    if granted {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("namespace access denied"))
+    }
+}
+
+fn require_team_namespace_access<T>(
+    db: &SekaiDb,
+    _config: &Config,
+    request: &Request<T>,
+    namespace: &str,
+) -> Result<(), Status> {
+    let actor = authenticated_actor(request);
+    let trusted_service = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
+    if trusted_service {
+        return Ok(());
+    }
+    let boundary = db
+        .find_namespace_boundary(namespace)
+        .map_err(Status::internal)?;
+    let team_managed_namespace = boundary.as_ref().is_some_and(|object| {
+        object
+            .properties
+            .get("team_managed")
+            .is_some_and(|value| value == "true")
+    });
+    if team_managed_namespace || db.is_team_principal(&actor).map_err(Status::internal)? {
+        require_namespace_access(db, &actor, namespace)?;
+    }
+    Ok(())
+}
+
+fn require_execution_namespace_access(
+    db: &SekaiDb,
+    _config: &Config,
+    actor: &str,
+    namespace: &str,
+) -> Result<(), Status> {
+    if actor == "chisei-gateway" {
+        canonical_namespace(namespace).map(|_| ())
+    } else {
+        require_namespace_access(db, actor, namespace)
+    }
+}
+
+fn execution_budget_scope(namespace: &str, actor: &str, requested_user_id: &str) -> String {
+    if matches!(actor, "root" | "local") {
+        return if requested_user_id.trim().is_empty() {
+            "default"
+        } else {
+            requested_user_id.trim()
+        }
+        .to_string();
+    }
+    format!("project:{}/agent:{}", namespace.trim(), actor.trim())
+}
+
+fn strongest_pressure(
+    left: crate::chisei::budget::PressureLevel,
+    right: crate::chisei::budget::PressureLevel,
+) -> crate::chisei::budget::PressureLevel {
+    use crate::chisei::budget::PressureLevel;
+    match (left, right) {
+        (PressureLevel::Critical, _) | (_, PressureLevel::Critical) => PressureLevel::Critical,
+        (PressureLevel::Moderate, _) | (_, PressureLevel::Moderate) => PressureLevel::Moderate,
+        _ => PressureLevel::None,
+    }
+}
+
+fn execution_context_actor(
+    db: &SekaiDb,
+    _config: &Config,
+    actor: &str,
+    delegated: Option<&str>,
+    namespace: &str,
+) -> Result<String, Status> {
+    let Some(delegated) = delegated.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(actor.to_string());
+    };
+    if actor != "chisei-gateway" {
+        return Err(Status::permission_denied(
+            "delegated execution identity requires a gateway service principal",
+        ));
+    }
+    if db.is_team_principal(delegated).map_err(Status::internal)? {
+        require_namespace_access(db, delegated, namespace)?;
+        Ok(delegated.to_string())
+    } else {
+        Ok(actor.to_string())
+    }
 }
 
 fn auth_source<T>(request: &Request<T>) -> Option<String> {
@@ -1298,12 +1461,13 @@ impl ChiseiServiceImpl {
         authenticated_actor: &str,
     ) -> Result<ExecutionPlan, Status> {
         let plan_id = uuid::Uuid::new_v4().to_string();
-        let normalized_user_id = if input.user_id.is_empty() {
-            "default".to_string()
-        } else {
-            input.user_id.clone()
-        };
-        let budget_pressure = self.budget.namespace_pressure(&input.namespace);
+        let normalized_user_id =
+            execution_budget_scope(&input.namespace, authenticated_actor, &input.user_id);
+        let scoped_pressure = self.budget.scope_pressure(&normalized_user_id);
+        let namespace_pressure = self
+            .budget
+            .scope_pressure(&format!("project:{}", input.namespace.trim()));
+        let budget_pressure = strongest_pressure(scoped_pressure, namespace_pressure);
         let namespace_hint = input.namespace.trim().to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
         let data_class = self.data_class(effective_policy.as_ref());
@@ -3306,16 +3470,55 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<CheckBudgetRequest>,
     ) -> Result<Response<CheckBudgetResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let r = req.into_inner();
         let metric = budget_metric(&r.metric)?;
-        let budget_subject = budget_subject(
-            &r.subject,
-            &r.project,
-            &r.agent,
-            &r.key_id,
-            &r.work_unit,
-            &r.user_id,
-        )?;
+        let managed_team_principal = self
+            .db
+            .is_team_principal(&actor)
+            .map_err(Status::internal)?;
+        let budget_subject = if managed_team_principal {
+            require_namespace_access(&self.db, &actor, &r.project)?;
+            if !r.subject.trim().is_empty()
+                || !r.key_id.trim().is_empty()
+                || !r.user_id.trim().is_empty()
+                || (!r.agent.trim().is_empty() && r.agent.trim() != actor)
+            {
+                return Err(Status::permission_denied(
+                    "team budget scope is derived from the authenticated principal",
+                ));
+            }
+            let mut subject = format!("project:{}/agent:{}", r.project, actor);
+            if !r.work_unit.trim().is_empty() {
+                let work_unit = self
+                    .db
+                    .get_work_unit(r.work_unit.trim())
+                    .map_err(Status::internal)?
+                    .ok_or(Status::not_found("work unit not found"))?;
+                if work_unit.owner_principal != actor && work_unit.creator_principal != actor {
+                    return Err(Status::permission_denied("work unit access denied"));
+                }
+                let target = self
+                    .db
+                    .get_object(&work_unit.target_object_id)
+                    .map_err(Status::internal)?
+                    .ok_or(Status::permission_denied("work unit target unavailable"))?;
+                if target.namespace != r.project {
+                    return Err(Status::permission_denied("work unit namespace denied"));
+                }
+                subject.push_str(&format!("/work_unit:{}", r.work_unit.trim()));
+            }
+            subject
+        } else {
+            budget_subject(
+                &r.subject,
+                &r.project,
+                &r.agent,
+                &r.key_id,
+                &r.work_unit,
+                &r.user_id,
+            )?
+        };
         let within_cap = self
             .budget
             .check_with_metric(&budget_subject, r.estimated_tokens, metric)
@@ -3336,7 +3539,12 @@ impl ChiseiService for ChiseiServiceImpl {
             && active_continuation_allocation(
                 &self.db,
                 &r.work_unit,
-                &[r.agent.as_str(), r.key_id.as_str(), r.user_id.as_str()],
+                &[
+                    actor.as_str(),
+                    r.agent.as_str(),
+                    r.key_id.as_str(),
+                    r.user_id.as_str(),
+                ],
                 chrono::Utc::now().timestamp_millis(),
             )
             && self
@@ -3397,7 +3605,25 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RecordUsageRequest>,
     ) -> Result<Response<RecordUsageResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let trusted_accounting_principal =
+            matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+                || self
+                    .config
+                    .gateway_receipt_principals
+                    .iter()
+                    .any(|principal| principal == &actor);
+        if !trusted_accounting_principal {
+            return Err(Status::permission_denied(
+                "usage recording requires an authorized accounting principal",
+            ));
+        }
         let r = req.into_inner();
+        if r.tokens_used < 0 && !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "negative usage adjustments require control-plane administration",
+            ));
+        }
         let metric = budget_metric(&r.metric)?;
         let budget_subject = budget_subject(
             &r.subject,
@@ -3431,6 +3657,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<SetBudgetLimitRequest>,
     ) -> Result<Response<SetBudgetLimitResponse>, Status> {
+        require_control_plane_admin(&req, "budget mutation")?;
         let r = req.into_inner();
         let metric = budget_metric(&r.metric)?;
         let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
@@ -3453,6 +3680,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RecordPortfolioObservationRequest>,
     ) -> Result<Response<RecordPortfolioObservationResponse>, Status> {
+        require_telemetry_writer(&req, &self.config)?;
         let r = req.into_inner();
         let updated_at = if r.updated_at > 0 {
             r.updated_at
@@ -3486,6 +3714,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetPortfolioFrontierRequest>,
     ) -> Result<Response<GetPortfolioFrontierResponse>, Status> {
+        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
         let r = req.into_inner();
         if r.namespace.trim().is_empty() {
             return Err(Status::invalid_argument("portfolio namespace required"));
@@ -3504,6 +3733,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<SetPortfolioObjectiveRequest>,
     ) -> Result<Response<SetPortfolioObjectiveResponse>, Status> {
+        require_control_plane_admin(&req, "portfolio objective mutation")?;
         let r = req
             .into_inner()
             .objective
@@ -3532,6 +3762,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<AllocatePortfolioRequest>,
     ) -> Result<Response<AllocatePortfolioResponse>, Status> {
+        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
         let r = req.into_inner();
         let objective = self
             .portfolio
@@ -3573,6 +3804,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<SetNamespacePolicyRequest>,
     ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
+        require_control_plane_admin(&req, "namespace policy mutation")?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
         let validated_registry_version = registry.state_version;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
@@ -3619,6 +3851,12 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ResolvePolicyRequest>,
     ) -> Result<Response<ResolvePolicyResponse>, Status> {
+        let requested_namespace = if req.get_ref().namespace.trim().is_empty() {
+            req.get_ref().project.trim()
+        } else {
+            req.get_ref().namespace.trim()
+        };
+        require_team_namespace_access(&self.db, &self.config, &req, requested_namespace)?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let r = req.into_inner();
@@ -4033,10 +4271,23 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<RunPipelineRequest>,
     ) -> Result<Response<RunPipelineResponse>, Status> {
         let actor = authenticated_actor(&req);
+        let delegated_principal = req
+            .metadata()
+            .get(DELEGATED_PRINCIPAL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let r = req
             .into_inner()
             .request
             .ok_or(Status::invalid_argument("request required"))?;
+        require_execution_namespace_access(&self.db, &self.config, &actor, &r.namespace)?;
+        let context_actor = execution_context_actor(
+            &self.db,
+            &self.config,
+            &actor,
+            delegated_principal.as_deref(),
+            &r.namespace,
+        )?;
         let mut pr = pipe::PipelineRequest {
             request_id: r.request_id,
             namespace: r.namespace,
@@ -4055,7 +4306,7 @@ impl ChiseiService for ChiseiServiceImpl {
             evidence_references: vec![],
             memory_references: vec![],
             memory_holdouts: vec![],
-            memory_actor: actor.clone(),
+            memory_actor: context_actor,
             memory_assignment_id: String::new(),
             memory_token_budget: 512,
             allowed_evidence_classes: std::collections::HashSet::new(),
@@ -4132,6 +4383,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RecordSampleObservationRequest>,
     ) -> Result<Response<RecordSampleObservationResponse>, Status> {
+        require_telemetry_writer(&req, &self.config)?;
         let observation = req
             .into_inner()
             .observation
@@ -4179,7 +4431,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<RecordGatewayAuditRequest>,
     ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
-        let authenticated_principal = authenticated_actor(&req);
+        let authenticated_principal = require_telemetry_writer(&req, &self.config)?;
         let auth_source = auth_source(&req);
         let mut event = req
             .into_inner()
@@ -4321,6 +4573,8 @@ impl ChiseiService for ChiseiServiceImpl {
                     outcome: "failed".into(),
                 });
             }
+        } else {
+            event.actor = authenticated_principal;
         }
         self.db
             .record_decision(&crate::sekai::audit::Decision {
@@ -4350,6 +4604,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .into_inner()
                 .input
                 .ok_or(Status::invalid_argument("input required"))?;
+            require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
             let plan = self.plan_from_input(input, &actor).await?;
             if let Some(plan_input) = &plan.input {
                 let namespace_hint = plan_input.namespace.trim().to_string();
@@ -4410,6 +4665,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .input
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
+        require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
@@ -4668,6 +4924,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .input
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
+        require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         if crate::chisei::egress::is_external_provider(&provider)
@@ -4991,7 +5248,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ListKiokuCandidatesRequest>,
     ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
-        require_eval_admin(&req)?;
+        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
         let request = req.into_inner();
         if request.namespace.trim().is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
@@ -5840,8 +6097,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn list_eval_suites(
         &self,
-        _r: Request<ListEvalSuitesRequest>,
+        req: Request<ListEvalSuitesRequest>,
     ) -> Result<Response<ListEvalSuitesResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let suites = self.eval.list_suites();
         let pb: Vec<EvalSuite> = suites
             .iter()
@@ -5859,6 +6117,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetEvalSuiteRequest>,
     ) -> Result<Response<GetEvalSuiteResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let s = self
             .eval
             .get_suite(&req.into_inner().id)
@@ -5929,6 +6188,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetEvalRunRequest>,
     ) -> Result<Response<GetEvalRunResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let run = self
             .eval
             .get_run(&req.into_inner().id)
@@ -5960,6 +6220,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ListEvalRunsRequest>,
     ) -> Result<Response<ListEvalRunsResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let runs = self.eval.list_runs(&req.into_inner().suite_id);
         let pb: Vec<EvalRun> = runs
             .iter()
@@ -5998,6 +6259,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetLatestEvalIterationRequest>,
     ) -> Result<Response<GetLatestEvalIterationResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let iteration = self
             .eval
             .latest_iteration_for_file(&req.into_inner().changed_file)
@@ -6011,6 +6273,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<ListEvalIterationsRequest>,
     ) -> Result<Response<ListEvalIterationsResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let r = req.into_inner();
         let mut iterations = if r.changed_file.is_empty() {
             self.eval.list_iterations(&r.suite_id)
@@ -6029,6 +6292,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<CompareRunsRequest>,
     ) -> Result<Response<CompareRunsResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let r = req.into_inner();
         let d = self
             .eval
@@ -6048,6 +6312,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetEvidenceContextGateRequest>,
     ) -> Result<Response<GetEvidenceContextGateResponse>, Status> {
+        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
         let request = req.into_inner();
         let namespace = request.namespace.trim();
         let source_type = request.source_type.trim();
@@ -6100,6 +6365,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<EvalVarianceRequest>,
     ) -> Result<Response<EvalVarianceResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let r = req.into_inner();
         let variance = self.eval.variance(&r.suite_id, &r.config_ref);
         Ok(Response::new(EvalVarianceResponse {
@@ -6132,6 +6398,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<EvalModelCompareRequest>,
     ) -> Result<Response<EvalModelCompareResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
         let r = req.into_inner();
         let comparison = self.eval.model_compare(&r.suite_id);
         Ok(Response::new(EvalModelCompareResponse {
@@ -7514,6 +7781,365 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configuration_mutations_require_control_plane_administration() {
+        let svc = memory_service();
+        let mut budget = Request::new(SetBudgetLimitRequest {
+            subject: "project:acme".into(),
+            max_tokens: 1_000,
+            period_type: "week".into(),
+            ..Default::default()
+        });
+        budget
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.set_budget_limit(budget).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut objective = Request::new(SetPortfolioObjectiveRequest {
+            objective: Some(PortfolioObjective {
+                namespace: "acme".into(),
+                mode: "maximize_value".into(),
+                budget_usd_micros: 1_000,
+                quality_bar: 0.8,
+                min_samples: 5,
+                updated_at: 1,
+            }),
+        });
+        objective
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.set_portfolio_objective(objective)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut policy = Request::new(SetNamespacePolicyRequest {
+            namespace: "acme".into(),
+            ..Default::default()
+        });
+        policy
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.set_namespace_policy(policy).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn team_execution_uses_authenticated_namespace_and_budget_scope() {
+        let svc = memory_service();
+        svc.db
+            .create_object(&Object {
+                id: "existing-namespace-acme".into(),
+                kind: "namespace".into(),
+                name: "Acme".into(),
+                namespace: String::new(),
+                external_id: "namespace:acme".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&crate::sekai::security::Grant {
+                id: "alice-acme".into(),
+                object_id: "existing-namespace-acme".into(),
+                principal: "alice".into(),
+                role: crate::sekai::security::Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+
+        require_namespace_access(&svc.db, "alice", "acme").unwrap();
+        assert_eq!(
+            require_namespace_access(&svc.db, "alice", " acme ")
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            require_namespace_access(&svc.db, "mallory", "acme")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        require_execution_namespace_access(&svc.db, &svc.config, "chisei-gateway", "unmanaged")
+            .unwrap();
+        assert_eq!(
+            require_execution_namespace_access(&svc.db, &svc.config, "alice", "unmanaged")
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            execution_budget_scope("acme", "alice", "forged"),
+            "project:acme/agent:alice"
+        );
+        assert_eq!(execution_budget_scope("acme", "local", "forged"), "forged");
+        assert_eq!(execution_budget_scope("acme", "root", ""), "default");
+        assert_eq!(
+            strongest_pressure(
+                crate::chisei::budget::PressureLevel::None,
+                crate::chisei::budget::PressureLevel::Critical,
+            ),
+            crate::chisei::budget::PressureLevel::Critical
+        );
+        svc.budget
+            .set_limit(
+                "project:acme",
+                100,
+                crate::chisei::budget::PeriodType::Weekly,
+            )
+            .unwrap();
+        svc.budget.record("project:acme/agent:alice", 95);
+        assert_eq!(
+            svc.budget.scope_pressure("project:acme/agent:alice"),
+            crate::chisei::budget::PressureLevel::Critical
+        );
+    }
+
+    #[tokio::test]
+    async fn team_policy_resolution_requires_namespace_membership() {
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Viewer,
+                "local",
+            )
+            .unwrap();
+        let mut request = Request::new(ResolvePolicyRequest {
+            namespace: "beta".into(),
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.resolve_policy(request).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut unmanaged = Request::new(ResolvePolicyRequest {
+            namespace: "acme".into(),
+            ..Default::default()
+        });
+        unmanaged
+            .metadata_mut()
+            .insert("x-principal", "unmanaged-principal".parse().unwrap());
+        assert_eq!(
+            svc.resolve_policy(unmanaged).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut frontier = Request::new(GetPortfolioFrontierRequest {
+            namespace: "beta".into(),
+            task_class: "analysis".into(),
+        });
+        frontier
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.get_portfolio_frontier(frontier)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut suites = Request::new(ListEvalSuitesRequest {});
+        suites
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.list_eval_suites(suites).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn team_budget_checks_use_authenticated_namespace_and_actor() {
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Viewer,
+                "local",
+            )
+            .unwrap();
+        svc.budget
+            .set_limit(
+                "project:acme/agent:alice",
+                100,
+                crate::chisei::budget::PeriodType::Weekly,
+            )
+            .unwrap();
+        svc.budget.record("project:acme/agent:alice", 25);
+
+        let mut allowed = Request::new(CheckBudgetRequest {
+            project: "acme".into(),
+            estimated_tokens: 10,
+            ..Default::default()
+        });
+        allowed
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        let response = svc.check_budget(allowed).await.unwrap().into_inner();
+        assert!(response.allowed);
+        assert_eq!(response.usage.unwrap().user_id, "project:acme/agent:alice");
+
+        for forged in [
+            CheckBudgetRequest {
+                subject: "project:beta/agent:mallory".into(),
+                project: "acme".into(),
+                ..Default::default()
+            },
+            CheckBudgetRequest {
+                project: "acme".into(),
+                agent: "mallory".into(),
+                ..Default::default()
+            },
+            CheckBudgetRequest {
+                project: "beta".into(),
+                ..Default::default()
+            },
+        ] {
+            let mut request = Request::new(forged);
+            request
+                .metadata_mut()
+                .insert("x-principal", "alice".parse().unwrap());
+            assert_eq!(
+                svc.check_budget(request).await.unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn team_principals_cannot_mutate_usage_accounting() {
+        let svc = memory_service();
+        let mut request = Request::new(RecordUsageRequest {
+            subject: "project:acme".into(),
+            tokens_used: -10,
+            idempotency_key: "forged-reset".into(),
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.record_usage(request).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut portfolio = Request::new(RecordPortfolioObservationRequest {
+            namespace: "other-team".into(),
+            task_class: "primary".into(),
+            model: "forged".into(),
+            quality_score: 1.0,
+            cost_usd_micros: 1,
+            sample_count: 100,
+            updated_at: 1,
+        });
+        portfolio
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.record_portfolio_observation(portfolio)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut sample = Request::new(RecordSampleObservationRequest {
+            observation: Some(SampleObservation {
+                request_id: "forged".into(),
+                namespace: "other-team".into(),
+                spec: "forged".into(),
+                output_content: "forged".into(),
+                ..Default::default()
+            }),
+        });
+        sample
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.record_sample_observation(sample)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_plan_execution_rechecks_namespace_membership() {
+        let svc = memory_service();
+        svc.db
+            .create_object(&Object {
+                id: "namespace-revocation".into(),
+                kind: "namespace".into(),
+                name: "Revocation".into(),
+                namespace: String::new(),
+                external_id: "namespace:revocation".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&crate::sekai::security::Grant {
+                id: "revocation-alice".into(),
+                object_id: "namespace-revocation".into(),
+                principal: "alice".into(),
+                role: crate::sekai::security::Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+        let mut planning = Request::new(PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: "revoked-plan".into(),
+                namespace: "revocation".into(),
+                spec: "summarize".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                user_id: "forged".into(),
+                max_tokens: 16,
+                ..Default::default()
+            }),
+        });
+        planning
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        let plan = svc
+            .plan_execution(planning)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        svc.db.delete_grant("revocation-alice").unwrap();
+
+        let mut execution = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        execution
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.execute_plan(execution).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     fn project_test_evidence(svc: &ChiseiServiceImpl) -> String {
         project_test_evidence_from_source(
             svc,
@@ -8384,10 +9010,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "codex-app");
+        assert_eq!(decisions[0].actor, "local");
         assert_eq!(
             decisions[0].evidence.get("request_id").map(String::as_str),
             Some("req-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_gateway_audit_rejects_untrusted_principals() {
+        let svc = memory_service();
+        let mut request = Request::new(RecordGatewayAuditRequest {
+            event: Some(GatewayAuditEvent {
+                actor: "root".into(),
+                action: "gateway.model_rewrite".into(),
+                outcome: "routed".into(),
+                ..Default::default()
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.record_gateway_audit(request).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
         );
     }
 
@@ -8974,9 +9620,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_gateway_principal_can_run_pipeline_with_delegated_membership() {
+        let mut svc = memory_service();
+        svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
+        svc.db
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Viewer,
+                "local",
+            )
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "delegated-context".into(),
+                kind: "asset".into(),
+                name: "Delegated context".into(),
+                namespace: "acme".into(),
+                external_id: "asset:DELEGATED".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "delegated context value".into()),
+                    (
+                        crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "verdict".into(),
+                    ),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&crate::sekai::security::Grant {
+                id: "delegated-context-alice".into(),
+                object_id: "delegated-context".into(),
+                principal: "alice".into(),
+                role: crate::sekai::security::Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            execution_context_actor(&svc.db, &svc.config, "Gateway-Prod", Some("alice"), "acme",)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut request = Request::new(RunPipelineRequest {
+            request: Some(PipelineRequest {
+                request_id: "gateway-observation".into(),
+                namespace: "acme".into(),
+                spec: "inspect asset:DELEGATED".into(),
+                ..Default::default()
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(DELEGATED_PRINCIPAL_HEADER, "alice".parse().unwrap());
+        let response = svc.run_pipeline(request).await.unwrap().into_inner();
+        assert!(
+            response
+                .result
+                .unwrap()
+                .prepared_spec
+                .contains("delegated context value")
+        );
+    }
+
+    #[tokio::test]
     async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
         let mut svc = memory_service();
         svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
+        svc.db
+            .create_object(&Object {
+                id: "receipt-namespace".into(),
+                kind: "namespace".into(),
+                name: "Receipt namespace".into(),
+                namespace: String::new(),
+                external_id: "namespace:receipt-ns".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&crate::sekai::security::Grant {
+                id: "receipt-namespace-authenticated".into(),
+                object_id: "receipt-namespace".into(),
+                principal: "agent:authenticated".into(),
+                role: crate::sekai::security::Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
         let mut request = Request::new(PlanExecutionRequest {
             input: Some(ExecutionInput {
                 request_id: "receipt-task-1".into(),
