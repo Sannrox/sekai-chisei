@@ -279,6 +279,14 @@ impl BudgetTracker {
             _ => PressureLevel::None,
         }
     }
+
+    pub fn scope_pressure(&self, scope_id: &str) -> PressureLevel {
+        match self.projected_pressure_percent(scope_id, 0, METRIC_TOKENS) {
+            Some(percent) if percent >= 90 => PressureLevel::Critical,
+            Some(percent) if percent >= 70 => PressureLevel::Moderate,
+            _ => PressureLevel::None,
+        }
+    }
 }
 
 #[cfg(test)]

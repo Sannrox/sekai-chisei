@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
+use crate::sekai::security::{Grant, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeSet, HashMap};
 
@@ -67,15 +68,26 @@ pub(crate) fn object_diff_changes(
             changed_by: actor.into(),
             timestamp,
         }),
-        (Some(before), None) => changes.push(ObjectChange {
-            id: uuid::Uuid::new_v4().to_string(),
-            object_id: before.id.clone(),
-            field: "_deleted".into(),
-            old_value: format!("{}/{}", before.kind, before.name),
-            new_value: String::new(),
-            changed_by: actor.into(),
-            timestamp,
-        }),
+        (Some(before), None) => {
+            changes.push(ObjectChange {
+                id: uuid::Uuid::new_v4().to_string(),
+                object_id: before.id.clone(),
+                field: "_deleted".into(),
+                old_value: format!("{}/{}", before.kind, before.name),
+                new_value: String::new(),
+                changed_by: actor.into(),
+                timestamp,
+            });
+            changes.push(ObjectChange {
+                id: uuid::Uuid::new_v4().to_string(),
+                object_id: before.id.clone(),
+                field: "_namespace".into(),
+                old_value: before.namespace.clone(),
+                new_value: String::new(),
+                changed_by: actor.into(),
+                timestamp,
+            });
+        }
         (Some(before), Some(after)) => {
             push_if_changed(
                 &mut changes,
@@ -163,6 +175,166 @@ fn push_if_changed(
 }
 
 impl SekaiDb {
+    pub fn find_namespace_boundary(&self, namespace: &str) -> Result<Option<Object>, String> {
+        let conn = self.conn();
+        let external_id = format!("namespace:{}", namespace.trim());
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE external_id = ?1 ORDER BY id LIMIT 2",
+            )
+            .map_err(|error| error.to_string())?;
+        let objects = statement
+            .query_map(params![external_id], crate::db::sekai::row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        if objects.len() > 1 || objects.iter().any(|object| object.kind != "namespace") {
+            return Err(format!(
+                "canonical namespace identity {external_id:?} is not uniquely held by a namespace boundary"
+            ));
+        }
+        Ok(objects.into_iter().next())
+    }
+
+    pub fn ensure_team_namespace(
+        &self,
+        namespace: &str,
+        principal: &str,
+        member_role: Role,
+        actor: &str,
+    ) -> Result<(Object, Vec<Grant>), String> {
+        let namespace = namespace.trim();
+        let external_id = format!("namespace:{namespace}");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let objects = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE external_id = ?1 ORDER BY id LIMIT 2",
+                )
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map(params![external_id], crate::db::sekai::row_to_object)
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if objects.len() > 1 || objects.iter().any(|object| object.kind != "namespace") {
+            return Err(format!(
+                "canonical namespace identity {external_id:?} is not uniquely held by a namespace boundary"
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_team_principals (principal, created) VALUES (?1, ?2)",
+            params![principal, now],
+        )
+        .map_err(|error| error.to_string())?;
+        let object = if let Some(mut object) = objects.into_iter().next() {
+            let original = object.clone();
+            object.namespace = namespace.into();
+            object
+                .properties
+                .insert("team_managed".into(), "true".into());
+            object
+                .properties
+                .insert("runtime_boundary".into(), namespace.into());
+            if object.namespace != original.namespace || object.properties != original.properties {
+                object.updated = now;
+                let properties = serde_json::to_string(&object.properties).unwrap_or_default();
+                tx.execute(
+                    "UPDATE sekai_objects SET namespace = ?1, properties = ?2, updated = ?3 WHERE id = ?4",
+                    params![object.namespace, properties, object.updated, object.id],
+                )
+                .map_err(|error| error.to_string())?;
+                insert_object_changes(
+                    &tx,
+                    &object_diff_changes(actor, Some(&original), Some(&object), now),
+                )?;
+            }
+            object
+        } else {
+            let orphan_grants: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_grants WHERE object_id = ?1",
+                    params![external_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if orphan_grants > 0 {
+                return Err(format!(
+                    "namespace {namespace:?} has grants without a namespace boundary"
+                ));
+            }
+            let object = Object {
+                id: external_id.clone(),
+                kind: "namespace".into(),
+                name: namespace.into(),
+                namespace: namespace.into(),
+                external_id: external_id.clone(),
+                properties: HashMap::from([
+                    ("team_managed".into(), "true".into()),
+                    ("runtime_boundary".into(), namespace.into()),
+                ]),
+                created: now,
+                updated: now,
+            };
+            let properties = serde_json::to_string(&object.properties).unwrap_or_default();
+            tx.execute(
+                "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    object.id,
+                    object.kind,
+                    object.name,
+                    object.namespace,
+                    object.external_id,
+                    properties,
+                    object.created,
+                    object.updated
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            insert_object_changes(&tx, &object_diff_changes(actor, None, Some(&object), now))?;
+            object
+        };
+
+        let grants = [
+            ("root", Role::Admin),
+            ("local", Role::Admin),
+            (principal, member_role),
+        ]
+        .into_iter()
+        .map(|(grant_principal, role)| Grant {
+            id: format!("team:{namespace}:{grant_principal}"),
+            object_id: object.id.clone(),
+            principal: grant_principal.into(),
+            role,
+            created: now,
+        })
+        .collect::<Vec<_>>();
+        for grant in &grants {
+            tx.execute(
+                "INSERT INTO sekai_grants (id, object_id, principal, role, created)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(object_id, principal) DO UPDATE SET
+                    id=excluded.id, role=excluded.role, created=excluded.created",
+                params![
+                    grant.id,
+                    grant.object_id,
+                    grant.principal,
+                    grant.role.as_str(),
+                    grant.created
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((object, grants))
+    }
+
     pub(crate) fn migrate_audit(&self) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch(
@@ -198,6 +370,38 @@ impl SekaiDb {
                 Err(error) => return Err(error.to_string()),
             }
         }
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO sekai_object_changes
+                 (id, object_id, field, old_value, new_value, changed_by, timestamp)
+             SELECT 'audit-namespace-backfill-current:' || hex(object.id), object.id,
+                    '_namespace', object.namespace, '', 'migration', object.updated
+             FROM sekai_objects object
+             WHERE object.namespace <> ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM sekai_object_changes marker
+                   WHERE marker.object_id = object.id AND marker.field = '_namespace'
+               );
+             INSERT OR IGNORE INTO sekai_object_changes
+                 (id, object_id, field, old_value, new_value, changed_by, timestamp)
+             SELECT 'audit-namespace-backfill-history:' || hex(change.object_id), change.object_id,
+                    '_namespace', COALESCE(NULLIF(change.new_value, ''), change.old_value), '',
+                    'migration', change.timestamp
+             FROM sekai_object_changes change
+             WHERE change.field = 'namespace'
+               AND COALESCE(NULLIF(change.new_value, ''), change.old_value) <> ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM sekai_object_changes newer
+                   WHERE newer.object_id = change.object_id
+                     AND newer.field = 'namespace'
+                     AND (newer.timestamp > change.timestamp
+                          OR (newer.timestamp = change.timestamp AND newer.rowid > change.rowid))
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM sekai_object_changes marker
+                   WHERE marker.object_id = change.object_id AND marker.field = '_namespace'
+               );",
+        )
+        .map_err(|error| error.to_string())?;
         let tombstone_backfill_pending: bool = conn
             .query_row(
                 "SELECT NOT EXISTS(
@@ -409,8 +613,24 @@ impl SekaiDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        if object.id.starts_with("namespace:") && object.kind != "namespace" {
+            return Err("namespace:* object IDs are reserved for namespace boundaries".into());
+        }
+        if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
+            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+        }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let historical_changes: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
+                params![object.id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if historical_changes > 0 {
+            return Err("object IDs with audit history cannot be reused".into());
+        }
         let props = serde_json::to_string(&object.properties).unwrap_or_default();
         tx.execute(
             "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -442,6 +662,9 @@ impl SekaiDb {
         object: &Object,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
+            return Err("namespace:* external IDs are reserved for namespace boundaries".into());
+        }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
@@ -456,6 +679,9 @@ impl SekaiDb {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(None);
         };
+        if before_object.namespace != object.namespace {
+            return Err("object namespace is immutable".into());
+        }
         let props = serde_json::to_string(&object.properties).unwrap_or_default();
         tx.execute(
             "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
@@ -506,15 +732,12 @@ impl SekaiDb {
         if let Some(before) = &before {
             insert_object_changes(
                 &tx,
-                &[ObjectChange {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    object_id: before.id.clone(),
-                    field: "_deleted".into(),
-                    old_value: format!("{}/{}", before.kind, before.name),
-                    new_value: String::new(),
-                    changed_by: actor.into(),
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                }],
+                &object_diff_changes(
+                    actor,
+                    Some(before),
+                    None,
+                    chrono::Utc::now().timestamp_millis(),
+                ),
             )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -549,6 +772,33 @@ impl SekaiDb {
         Ok(results)
     }
 
+    pub fn list_visible_object_changes(
+        &self,
+        object_id: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<ObjectChange>, String> {
+        let conn = self.conn();
+        let effective_limit = if limit > 0 { limit } else { 100 };
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![object_id, effective_limit, offset], |row| {
+                Ok(ObjectChange {
+                    id: row.get(0)?,
+                    object_id: row.get(1)?,
+                    field: row.get(2)?,
+                    old_value: row.get(3)?,
+                    new_value: row.get(4)?,
+                    changed_by: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
         let conn = self.conn();
         let marker = conn
@@ -575,6 +825,20 @@ impl SekaiDb {
             };
             value.split_once('/').map(|(kind, _)| kind.to_string())
         }))
+    }
+
+    pub fn object_change_namespace(&self, object_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT old_value FROM sekai_object_changes
+             WHERE object_id = ?1 AND field = '_namespace'
+             ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+            params![object_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|value| value.filter(|namespace| !namespace.is_empty()))
+        .map_err(|e| e.to_string())
     }
 
     pub fn purge_old_records(&self, before: i64) -> Result<i32, String> {
@@ -908,15 +1172,48 @@ mod tests {
         );
         assert_eq!(
             record_object_diff(&db, "tester", Some(&obj), None).unwrap(),
-            1
+            2
         );
 
         let changes = db.list_object_changes("o1", 10, 0).unwrap();
-        assert_eq!(changes[0].field, "_deleted");
-        assert_eq!(changes[0].old_value, "component/api");
-        assert_eq!(changes[1].field, "_created");
-        assert_eq!(changes[1].new_value, "component/api");
+        assert_eq!(changes[0].field, "_namespace");
+        assert_eq!(changes[0].old_value, "default");
+        assert_eq!(changes[1].field, "_deleted");
+        assert_eq!(changes[1].old_value, "component/api");
+        assert_eq!(changes[2].field, "_created");
+        assert_eq!(changes[2].new_value, "component/api");
+        let visible = db.list_visible_object_changes("o1", 1, 0).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].field, "_deleted");
+        let next_visible = db.list_visible_object_changes("o1", 1, 1).unwrap();
+        assert_eq!(next_visible.len(), 1);
+        assert_eq!(next_visible[0].field, "_created");
+        assert_eq!(
+            db.object_change_namespace("o1").unwrap().as_deref(),
+            Some("default")
+        );
         assert!(changes.iter().all(|change| change.changed_by == "tester"));
+    }
+
+    #[test]
+    fn audited_object_ids_and_namespaces_are_immutable() {
+        let db = setup();
+        let original = object("stable-id", "api", "alpha", "api:stable", HashMap::new());
+        db.create_object_with_audit(&original, "tester").unwrap();
+
+        let mut moved = original.clone();
+        moved.namespace = "beta".into();
+        assert_eq!(
+            db.update_object_with_audit(&moved, "tester").unwrap_err(),
+            "object namespace is immutable"
+        );
+
+        db.delete_object_with_audit(&original.id, "tester").unwrap();
+        assert_eq!(
+            db.create_object_with_audit(&original, "tester")
+                .unwrap_err(),
+            "object IDs with audit history cannot be reused"
+        );
     }
 
     #[test]
@@ -1001,6 +1298,38 @@ mod tests {
         let obj = object("o1", "api", "default", "ext-1", HashMap::new());
 
         assert!(record_object_diff(&db, "tester", None, Some(&obj)).is_err());
+    }
+
+    #[test]
+    fn migration_recovers_deleted_object_namespaces_from_legacy_changes() {
+        let db = setup();
+        db.record_object_change(&ObjectChange {
+            id: "legacy-namespace".into(),
+            object_id: "deleted-object".into(),
+            field: "namespace".into(),
+            old_value: String::new(),
+            new_value: "acme".into(),
+            changed_by: "alice".into(),
+            timestamp: 1,
+        })
+        .unwrap();
+        db.record_object_change(&ObjectChange {
+            id: "legacy-deleted".into(),
+            object_id: "deleted-object".into(),
+            field: "_deleted".into(),
+            old_value: "component/api".into(),
+            new_value: String::new(),
+            changed_by: "alice".into(),
+            timestamp: 2,
+        })
+        .unwrap();
+
+        db.migrate_audit().unwrap();
+
+        assert_eq!(
+            db.object_change_namespace("deleted-object").unwrap(),
+            Some("acme".into())
+        );
     }
 
     #[test]

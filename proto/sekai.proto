@@ -371,6 +371,15 @@ message ListGrantsRequest { string object_id = 1; }
 message ListGrantsResponse { repeated Grant grants = 1; }
 message CheckAccessRequest { string object_id = 1; repeated string principals = 2; }
 message CheckAccessResponse { bool allowed = 1; }
+message EnsureTeamNamespaceRequest {
+  string namespace = 1;
+  string principal = 2;
+  string role = 3;
+}
+message EnsureTeamNamespaceResponse {
+  Object namespace = 1;
+  repeated Grant grants = 2;
+}
 
 message RecordDecisionRequest { Decision decision = 1; }
 message RecordDecisionResponse { Decision decision = 1; }
@@ -672,9 +681,9 @@ message CredentialRecord {
   int64 rotated_at = 5;
   int64 revoked_at = 6;
 }
-message CreateCredentialRequest { string principal = 1; }
+message CreateCredentialRequest { string principal = 1; bool managed_team_principal = 2; }
 message CreateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
-message RotateCredentialRequest { string principal = 1; }
+message RotateCredentialRequest { string principal = 1; bool managed_team_principal = 2; }
 message RotateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
 message RevokeCredentialRequest { string principal = 1; }
 message RevokeCredentialResponse { CredentialRecord credential = 1; }
@@ -882,6 +891,7 @@ service SekaiService {
   rpc DeleteGrant(DeleteGrantRequest) returns (DeleteGrantResponse);
   rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
   rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+  rpc EnsureTeamNamespace(EnsureTeamNamespaceRequest) returns (EnsureTeamNamespaceResponse);
 
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
