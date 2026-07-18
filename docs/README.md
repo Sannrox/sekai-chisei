@@ -40,6 +40,8 @@ in order.
   and pull requests.
 - [Project operating system](project-operating-system.md) — artifact decisions,
   Issue lifecycles, Skills, review roles, conventions, automation, and scaling.
+- [Performance benchmarks](performance-benchmarks.md) — reproduce the sanitized
+  workload baseline and interpret regression budgets.
 - [Architecture decisions](decisions/README.md) — accepted, durable design
   choices and the ADR template.
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
