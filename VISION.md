@@ -66,6 +66,30 @@ This layer stays simple, queryable, and durable. Domain concepts such as a
 repository, support ticket, campaign, contract, deployment, or clinical case
 belong in schemas and adapters rather than the core contract.
 
+### Semantic Ontology Layer
+
+Above the durable graph sits a semantic ontology that lets objects be understood
+by their meaning and relationships, not only their kind. It elevates the current
+typed property graph into a reasoned knowledge layer:
+
+- ontology classes, properties, and relations with inheritance, equivalence,
+  disjointness, and domain/range constraints
+- inference and entailment (subclass, transitivity, rules) over asserted facts
+- temporal semantics for state over time and change causality
+- semantic and reasoning-aware query surfaces, including an LLM-facing command
+  set that composes resolve, expand, apply, retrieve, and summarize
+
+The intended layering is:
+
+```
+Natural Language -> Semantic Ontology -> Knowledge Graph -> Governance Engine -> Agent Runtime
+```
+
+The ontology stays governed and namespace-scoped like the rest of `sekai`, and
+remains interoperable with external standards (RDF/OWL, GraphQL). It adds meaning
+above the durable facts; it does not pull domain-specific concepts into the core
+contract, which continue to live in schemas and adapters.
+
 ### Chisei: Governed Decisions
 
 `chisei` decides how operations may proceed:
@@ -174,6 +198,8 @@ domain-neutral operating model.
 - Enable organizations to treat agent policy as infrastructure
 - Make operational memory cumulative so every verified outcome improves future
   execution quality
+- Grow the semantic ontology layer into first-class reasoning, temporal, and
+  simulation capabilities over the governed graph
 
 ## Success Criteria
 
