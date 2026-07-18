@@ -52,8 +52,6 @@ use crate::grpc::pb::sekai::{
     RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
 };
 use crate::llm::HttpTimeouts;
-#[cfg(test)]
-use crate::provider_profile::resolve_registered_model;
 use crate::provider_profile::{
     CAPABILITY_MATRIX_VERSION, CapabilityMatrix, CapabilityRequirements, ProviderProfile,
     ProviderRegistry, normalize_responses_request, provider_registry_snapshot,
@@ -925,7 +923,7 @@ impl GatewayRuntime {
         if reusable && let Some(result) = refresh.result.as_ref() {
             return result.clone();
         }
-        let result = crate::provider_profile::refresh_provider_registry_async(&path).await;
+        let result = crate::provider_resolution::snapshot_for_execution(Some(&path)).await;
         refresh.refreshed_at = Some(Instant::now());
         refresh.result = Some(result.clone());
         self.provider_registry_refresh_generation
@@ -4288,7 +4286,7 @@ async fn resolve_policy_preflight(
         None
     } else {
         Some(
-            crate::provider_profile::resolve_registered_model_for_provider(
+            crate::provider_resolution::resolve_model_for_provider(
                 requested_model,
                 capability_provider_id(provider),
             )
@@ -4733,8 +4731,7 @@ async fn policy_lifecycle_denied(
         evidence,
     )
     .await;
-    let resolved_model = ProviderRegistry::built_in()
-        .resolve_model(&route.resolved_model)
+    let resolved_model = crate::provider_resolution::resolve_model(&route.resolved_model)
         .map(|model| model.canonical_model)
         .unwrap_or(route.resolved_model);
     Err(
@@ -7244,7 +7241,7 @@ pub(crate) fn lookup_pricing_entry<'a>(
     pricing
         .get_key_value(model)
         .or_else(|| {
-            let registry = ProviderRegistry::built_in();
+            let registry = provider_registry_snapshot();
             registry.resolve_model(model).ok().and_then(|resolved| {
                 let alias_matches = registry
                     .resolve_model(&resolved.upstream_model)
@@ -11524,7 +11521,7 @@ async fn response_from_upstream(
                     let response_model = context
                         .resolved_model
                         .as_deref()
-                        .and_then(|model| ProviderRegistry::built_in().resolve_model(model).ok());
+                        .and_then(|model| crate::provider_resolution::resolve_model(model).ok());
                     match openai_chat_to_anthropic_message(
                         &bytes,
                         response_model
@@ -17411,7 +17408,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(disabled.status(), StatusCode::OK);
-        assert!(resolve_registered_model(target).is_err());
+        assert!(crate::provider_resolution::resolve_model(target).is_err());
 
         let enabled = client
             .put(format!("{gateway_base}/_chisei/admin/provider-lifecycle"))
@@ -17426,7 +17423,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(enabled.status(), StatusCode::OK);
-        assert!(resolve_registered_model(target).is_ok());
+        assert!(crate::provider_resolution::resolve_model(target).is_ok());
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(registry_state_path).unwrap()).unwrap();
         assert_eq!(persisted["state_version"], 2);
