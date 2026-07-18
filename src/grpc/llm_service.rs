@@ -326,7 +326,7 @@ async fn refresh_provider_registry(
 async fn refresh_provider_registry_at(
     path: &std::path::Path,
 ) -> Result<crate::provider_profile::ProviderRegistry, Status> {
-    crate::provider_profile::refresh_provider_registry_async(path)
+    crate::provider_resolution::snapshot_for_execution(Some(path))
         .await
         .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
 }

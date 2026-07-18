@@ -2550,7 +2550,7 @@ impl ChiseiServiceImpl {
         let registry_state_path =
             crate::provider_profile::provider_registry_state_path(&self.config.db_path);
         let registry =
-            match crate::provider_profile::refresh_provider_registry_async(&registry_state_path)
+            match crate::provider_resolution::snapshot_for_execution(Some(&registry_state_path))
                 .await
             {
                 Ok(registry) => registry,
@@ -2696,7 +2696,7 @@ impl ChiseiServiceImpl {
         let Some(path) = self.provider_registry_state_path.as_deref() else {
             return Ok(crate::provider_profile::provider_registry_snapshot());
         };
-        crate::provider_profile::refresh_provider_registry_async(path)
+        crate::provider_resolution::snapshot_for_execution(Some(path))
             .await
             .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
     }
@@ -2984,10 +2984,9 @@ fn final_runtime_for_model(
             crate::chisei::policy::validate_resolved_route(current_runtime, model)?;
             return Ok(current_runtime.to_string());
         }
-        let identity =
-            crate::provider_profile::ProviderRegistry::built_in().resolve_model(model)?;
+        let identity = crate::provider_resolution::resolve_model(model)?;
         if identity.provider == "native" {
-            crate::provider_profile::resolve_registered_model(model)?;
+            crate::provider_resolution::resolve_model(model)?;
             return Ok("native".to_string());
         }
     }
@@ -3262,8 +3261,7 @@ fn validate_policy_provider_pairs(policy: &Policy) -> Result<(), String> {
             &policy.default_model,
         )?;
     } else if !policy.default_model.is_empty() {
-        let provider =
-            crate::provider_profile::resolve_registered_model(&policy.default_model)?.provider;
+        let provider = crate::provider_resolution::resolve_model(&policy.default_model)?.provider;
         if !policy.allowed_runtimes.is_empty() && !policy.allowed_runtimes.contains(&provider) {
             return Err(format!(
                 "default model provider {provider:?} is not in allowed runtimes"
@@ -3275,7 +3273,7 @@ fn validate_policy_provider_pairs(policy: &Policy) -> Result<(), String> {
             if let Some((runtime, _)) = model.split_once('/') {
                 crate::chisei::policy::validate_resolved_route(runtime, model)?;
             } else {
-                crate::provider_profile::resolve_registered_model(model)?;
+                crate::provider_resolution::resolve_model(model)?;
             }
             continue;
         }
@@ -3293,7 +3291,7 @@ fn validate_policy_provider_pairs(policy: &Policy) -> Result<(), String> {
 }
 
 fn validate_policy_model_alias(model: &str) -> Result<(), String> {
-    let provider = crate::provider_profile::resolve_provider_id(model)?;
+    let provider = crate::provider_resolution::provider_id(model)?;
     if provider == "native"
         && !model.starts_with("native/")
         && !model.starts_with("native-")
@@ -3310,11 +3308,7 @@ fn models_have_same_identity(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
-    let registry = crate::provider_profile::ProviderRegistry::built_in();
-    match (registry.resolve_model(left), registry.resolve_model(right)) {
-        (Ok(left), Ok(right)) => left.canonical_model == right.canonical_model,
-        _ => false,
-    }
+    crate::provider_resolution::models_have_same_identity(left, right)
 }
 
 fn validate_explicit_requested_model(model: &str) -> Result<(), String> {
@@ -3322,12 +3316,12 @@ fn validate_explicit_requested_model(model: &str) -> Result<(), String> {
         return Ok(());
     }
     let Some((namespace, _)) = model.split_once('/') else {
-        return crate::provider_profile::resolve_registered_model(model).map(|_| ());
+        return crate::provider_resolution::resolve_model(model).map(|_| ());
     };
-    match crate::provider_profile::resolve_registered_model(model) {
+    match crate::provider_resolution::resolve_model(model) {
         Ok(_) => Ok(()),
         Err(error)
-            if crate::provider_profile::ProviderRegistry::built_in()
+            if crate::provider_profile::provider_registry_snapshot()
                 .profile(namespace)
                 .is_some() =>
         {
@@ -3965,7 +3959,7 @@ impl ChiseiService for ChiseiServiceImpl {
         // Resolve the capable-tier model first; this is the baseline the request
         // would get with no cost tiering.
         let capable_model = if r.preferred_model == "auto" && effective_policy.is_none() {
-            let resolved = crate::provider_profile::resolve_registered_model(&model)
+            let resolved = crate::provider_resolution::resolve_model(&model)
                 .map_err(Status::failed_precondition)?;
             if resolved.provider != runtime {
                 return Err(Status::failed_precondition(
@@ -4211,7 +4205,7 @@ impl ChiseiService for ChiseiServiceImpl {
             .into_iter()
             .flat_map(|policy| policy.allowed_models.iter())
             .filter_map(|candidate| {
-                crate::provider_profile::resolve_registered_model(candidate)
+                crate::provider_resolution::resolve_model(candidate)
                     .ok()
                     .map(|resolved| resolved.canonical_model)
             })
