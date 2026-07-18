@@ -38,6 +38,10 @@ in order.
 - [Vision](../VISION.md) — product boundary, design principles, and non-goals.
 - [Contributing](../CONTRIBUTING.md) — local setup, tests, change expectations,
   and pull requests.
+- [Project operating system](project-operating-system.md) — artifact decisions,
+  Issue lifecycles, Skills, review roles, conventions, automation, and scaling.
+- [Architecture decisions](decisions/README.md) — accepted, durable design
+  choices and the ADR template.
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
   enforcement.
 

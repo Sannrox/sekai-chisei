@@ -9,10 +9,18 @@ All participation is governed by the [code of conduct](CODE_OF_CONDUCT.md).
 ## Before you start
 
 - Search existing issues and pull requests before proposing overlapping work.
-- Open an issue for a large API, persistence, security, or architecture change
-  before investing in implementation.
+- Open an Issue for features, public APIs, persistence, security policy, and
+  architecture changes before investing in implementation.
+- Start a GitHub Design Discussion when a choice crosses the Sekai/Chisei
+  boundary, changes the namespace or trust model, alters a difficult-to-reverse
+  public contract, or has multiple credible approaches.
 - Report exploitable vulnerabilities privately through [SECURITY.md](SECURITY.md),
   not in a public issue or pull request.
+
+Use the Bug, Feature, Refactoring, or Research form. Issues are the planning
+artifact; do not add plan documents to the repository. The
+[project operating system](docs/project-operating-system.md) defines the full
+lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 
 ## Development setup
 
@@ -107,6 +115,11 @@ A pull request should include:
 - tests and checks run;
 - configuration, migration, compatibility, and security implications; and
 - a linked issue or context when one exists.
+
+Close the primary Issue with a GitHub closing keyword when applicable. Disclose
+AI assistance, confirm that the submitting author understands the change, and
+state the actual testing level. AI-assisted changes are reviewed by the same
+behavioral, security, and maintainability standards as human-only changes.
 
 Before requesting review, run:
 
