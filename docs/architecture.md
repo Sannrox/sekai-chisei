@@ -47,6 +47,12 @@ routing, evaluation gates, outcome attribution, and learning rules.
 The LLM provider adapters execute calls but do not own these decisions.
 Provider-specific behavior stays behind `src/llm/` abstractions.
 
+Provider registry persistence and lifecycle records are owned by
+`provider_profile`; `provider_resolution` is the single orchestration boundary
+that loads an execution snapshot and resolves canonical provider/model records.
+Gateway and native gRPC transports consume that boundary, while provider
+adapters receive an already resolved record and do not infer policy or routing.
+
 ### Gateway and native execution
 
 The HTTP gateway accepts compatible OpenAI Responses, OpenAI Chat Completions,
