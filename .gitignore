@@ -1,5 +1,12 @@
 /target
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/assess-change-impact/
+!.agents/skills/capture-project-decision/
+!.agents/skills/prepare-release/
+!.agents/skills/shape-work-item/
+!.agents/skills/verify-change/
 .claude/
 data/*.db
 data/*.db-*
