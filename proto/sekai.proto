@@ -227,6 +227,52 @@ message ActionTypeDef {
   int64 created = 6;
 }
 
+// A versioned description of an existing native query, retrieval, or action
+// surface. Object and action schemas reuse the canonical definitions above;
+// the catalog does not introduce a second schema language.
+message CapabilityEntry {
+  string name = 1;
+  string description = 2;
+  string kind = 3; // query | retrieval | action
+  string lifecycle_state = 4; // preview | active | deprecated | disabled | revoked
+  string contract_version = 5;
+  string minimum_compatible_version = 6;
+  string maximum_compatible_version = 7;
+  string replacement_capability = 8;
+  string input_type = 9;  // canonical protobuf message name
+  string output_type = 10; // canonical protobuf message name
+  repeated string required_scopes = 11;
+  repeated string policy_decision_points = 12;
+  string risk_class = 13;
+  string approval_behavior = 14; // none | may_require | required
+  repeated CapabilityLimit limits = 15;
+  ObjectType object_type = 16;
+  ActionTypeDef action_type = 17;
+  repeated string evidence_requirements = 18;
+}
+
+message CapabilityLimit {
+  string name = 1;
+  uint64 value = 2;
+}
+
+message DiscoverCapabilitiesRequest {
+  string namespace = 1;
+  string contract_version = 2; // empty negotiates the latest supported version
+  string catalog_version = 3; // pins pagination to an observed snapshot
+  uint32 page_size = 4; // defaults to 50 and is capped at 200
+  string page_token = 5;
+}
+
+message DiscoverCapabilitiesResponse {
+  repeated CapabilityEntry capabilities = 1;
+  string contract_version = 2;
+  string catalog_version = 3;
+  string next_page_token = 4;
+  uint32 total_size = 5;
+  string cache_scope = 6; // always authorization_context
+}
+
 message LineageNode {
   Object object = 1;
   string role = 2;
@@ -867,6 +913,7 @@ service SekaiService {
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
+  rpc DiscoverCapabilities(DiscoverCapabilitiesRequest) returns (DiscoverCapabilitiesResponse);
 
   rpc ListSchemaTypes(ListSchemaTypesRequest) returns (ListSchemaTypesResponse);
   rpc CreateSchemaType(CreateSchemaTypeRequest) returns (CreateSchemaTypeResponse);
