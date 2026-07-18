@@ -54,3 +54,14 @@ cargo run --example evidence_http_health_poll
 
 Conformance fixtures live in `adapters/fixtures/` and run without network access
 through `cargo test --test evidence_adapters`.
+
+`batch_responses_harness.rs` is a headless batch-evaluation integration. It uses
+an independent Responses SSE decoder against the complete canonical harness
+fixture corpus, then maps terminal runs into the same operation-receipt and
+external-evidence contracts as interactive harnesses. Its conformance suite runs
+with `cargo test --test batch_harness_conformance`. The runnable target reads a
+Responses SSE stream from standard input and emits the assembled terminal result:
+
+```sh
+cargo run --example batch_responses_harness < response.sse
+```
