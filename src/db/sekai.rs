@@ -536,23 +536,25 @@ impl SekaiDb {
         if effective_filter.offset < 0 {
             effective_filter.offset = 0;
         }
-        self.list_objects_with_total(&effective_filter)
-            .map(|(objects, _)| objects)
+        self.list_objects_page(&effective_filter)
     }
 
     pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         let mut effective_filter = filter.clone();
         effective_filter.limit = i32::MAX;
-        self.list_objects_with_total(&effective_filter)
-            .map(|(objects, _)| objects)
+        self.list_objects_page(&effective_filter)
     }
 
-    pub fn list_objects_with_total(
-        &self,
+    fn list_objects_page(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        Self::list_objects_page_on_conn(&conn, filter)
+    }
+
+    fn list_objects_page_on_conn(
+        conn: &Connection,
         filter: &ListFilter,
-    ) -> Result<(Vec<Object>, i32), String> {
+    ) -> Result<Vec<Object>, String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
-        let base_param_count = query.where_param_count;
         let order_sql = build_order_by_sql(
             filter.order_by.as_str(),
             filter.descending,
@@ -565,49 +567,57 @@ impl SekaiDb {
         } else {
             filter.limit.min(MAX_LIST_LIMIT)
         };
-        let conn = self.conn();
-        let mut list_sql = format!(
+        let mut sql = format!(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}",
             query.where_sql
         );
         if let Some(order_sql) = order_sql.as_deref() {
-            list_sql.push_str(order_sql);
+            sql.push_str(order_sql);
         }
-        list_sql.push_str(&format!(
+        sql.push_str(&format!(
             " LIMIT ?{} OFFSET ?{}",
             query.params.len() + 1,
             query.params.len() + 2
         ));
         query.params.push(Box::new(effective_limit));
         query.params.push(Box::new(filter.offset.max(0)));
-        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
                 query
                     .params
                     .iter()
-                    .map(|v| v.as_ref())
+                    .map(|value| value.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
                 row_to_object,
             )
             .map_err(|e| e.to_string())?;
-        let objects: Vec<Object> = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let total = conn
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_objects_with_total(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let objects = Self::list_objects_page_on_conn(&tx, filter)?;
+        let query = build_list_query(filter).map_err(|e| e.to_string())?;
+        let total = tx
             .query_row(
                 &query.count_sql,
                 query
                     .params
                     .iter()
-                    .take(base_param_count)
                     .map(|v| v.as_ref())
                     .collect::<Vec<&dyn rusqlite::types::ToSql>>()
                     .as_slice(),
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok((objects, total.min(i32::MAX as i64) as i32))
     }
 
@@ -1391,6 +1401,33 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
+    }
+
+    #[test]
+    fn namespace_listing_query_plan_is_pinned() {
+        let db = test_db();
+        let conn = db.conn();
+        let mut statement = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE namespace = ?1
+                 ORDER BY id ASC
+                 LIMIT 16",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map(["benchmark"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("sqlite_autoindex_sekai_objects_1")),
+            "unexpected namespace listing plan: {plan:?}"
+        );
     }
 
     #[test]
