@@ -99,6 +99,8 @@ const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
 const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
+const STREAM_FORWARD_CHANNEL_CAPACITY: usize = 32;
+const STREAM_FORWARD_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
@@ -5228,15 +5230,26 @@ impl AnthropicMessageStreamTranslator {
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.pending.extend_from_slice(bytes);
+    fn push_window(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        if bytes.len() > SSE_VALIDATION_WINDOW_BYTES {
+            return Err("internal SSE translation window exceeds the gateway limit".into());
+        }
         let mut out = Vec::new();
+        self.pending.extend_from_slice(bytes);
         while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
+            if boundary > MAX_SSE_FRAME_BYTES {
+                self.pending.clear();
+                return Err("upstream SSE frame exceeds the gateway limit".into());
+            }
             let event = self.pending.drain(..boundary).collect::<Vec<_>>();
             self.pending.drain(..separator_len);
             self.translate_event(&event, &mut out);
         }
-        out
+        if self.pending.len() > MAX_SSE_FRAME_BYTES {
+            self.pending.clear();
+            return Err("upstream SSE frame exceeds the gateway limit".into());
+        }
+        Ok(out)
     }
 
     fn finish(mut self) -> Vec<u8> {
@@ -10538,6 +10551,7 @@ struct SseUsageTap {
     usage: Option<ResponseUsage>,
     observation: ResponseObservation,
     terminal: Option<ResponsesTerminal>,
+    overflow_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -10726,34 +10740,63 @@ impl SseUsageTap {
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-        if self.mode == SseTapMode::Undetected
-            && let Some(is_sse) = body_prefix_is_sse(&self.pending)
-        {
-            self.mode = if is_sse {
-                SseTapMode::Sse
-            } else {
-                SseTapMode::Raw
-            };
-        }
-        if self.mode != SseTapMode::Sse {
+        if self.overflow_reason.is_some() {
             return;
         }
-        while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
-            let event = self.pending.drain(..boundary).collect::<Vec<_>>();
-            self.pending.drain(..separator_len);
-            if self.terminal.is_some() && extract_sse_data(&event).is_some() {
-                self.terminal = Some(ResponsesTerminal::Invalid);
-                continue;
+        if bytes.len() > DEFAULT_MAX_REQUEST_BYTES {
+            self.mark_overflow("upstream streaming chunk exceeds the gateway limit");
+            return;
+        }
+        for window in bytes.chunks(SSE_VALIDATION_WINDOW_BYTES) {
+            self.pending.extend_from_slice(window);
+            if self.mode == SseTapMode::Undetected
+                && let Some(is_sse) = body_prefix_is_sse(&self.pending)
+            {
+                self.mode = if is_sse {
+                    SseTapMode::Sse
+                } else {
+                    SseTapMode::Raw
+                };
             }
-            self.terminal = sse_event_terminal(&event).or_else(|| self.terminal.take());
-            if let Some(usage) = extract_sse_event_usage(&event) {
-                self.usage = Some(merge_usage(self.usage, usage));
-            }
-            if let Some(observation) = extract_sse_event_observation(&event) {
-                self.merge_observation(observation);
+            if self.mode == SseTapMode::Sse {
+                while let Some((boundary, separator_len)) = find_sse_event_boundary(&self.pending) {
+                    if boundary > MAX_SSE_FRAME_BYTES {
+                        self.mark_overflow("upstream SSE frame exceeds the gateway limit");
+                        return;
+                    }
+                    let event = self.pending.drain(..boundary).collect::<Vec<_>>();
+                    self.pending.drain(..separator_len);
+                    if self.terminal.is_some() && extract_sse_data(&event).is_some() {
+                        self.terminal = Some(ResponsesTerminal::Invalid);
+                        continue;
+                    }
+                    self.terminal = sse_event_terminal(&event).or_else(|| self.terminal.take());
+                    if let Some(usage) = extract_sse_event_usage(&event) {
+                        self.usage = Some(merge_usage(self.usage, usage));
+                    }
+                    if let Some(observation) = extract_sse_event_observation(&event) {
+                        self.merge_observation(observation);
+                    }
+                }
+                if self.pending.len() > MAX_SSE_FRAME_BYTES {
+                    self.mark_overflow("upstream SSE frame exceeds the gateway limit");
+                    return;
+                }
+            } else if self.pending.len() > DEFAULT_MAX_REQUEST_BYTES {
+                self.mark_overflow("upstream JSON response exceeds the gateway limit");
+                return;
             }
         }
+    }
+
+    fn overflow_reason(&self) -> Option<&'static str> {
+        self.overflow_reason
+    }
+
+    fn mark_overflow(&mut self, reason: &'static str) {
+        self.pending.clear();
+        self.overflow_reason = Some(reason);
+        self.terminal = Some(ResponsesTerminal::Invalid);
     }
 
     fn finish(self) -> (Option<ResponseUsage>, Option<ResponseObservation>) {
@@ -10828,6 +10871,21 @@ impl SseUsageTap {
             self.observation.stop_reason = observation.stop_reason;
         }
     }
+}
+
+async fn send_bounded_stream_bytes(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, reqwest::Error>>,
+    outgoing: Bytes,
+) -> bool {
+    for offset in (0..outgoing.len()).step_by(STREAM_FORWARD_CHUNK_BYTES) {
+        let end = offset
+            .saturating_add(STREAM_FORWARD_CHUNK_BYTES)
+            .min(outgoing.len());
+        if tx.send(Ok(outgoing.slice(offset..end))).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn sse_event_terminal(event: &[u8]) -> Option<ResponsesTerminal> {
@@ -11302,7 +11360,9 @@ async fn response_from_upstream(
             .or_else(|| context.resolved_model.clone())
             .unwrap_or_default();
         let mut upstream_stream = upstream.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(32);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(
+            STREAM_FORWARD_CHANNEL_CAPACITY,
+        );
         tokio::spawn(async move {
             let mut usage_tap = if declares_sse {
                 SseUsageTap::sse()
@@ -11365,6 +11425,23 @@ async fn response_from_upstream(
                             None => None,
                         };
                         usage_tap.push(&bytes);
+                        if let Some(reason) = usage_tap.overflow_reason() {
+                            stream_error = Some(reason.to_string());
+                            if usage_tap.mode != SseTapMode::Raw
+                                && !terminal_forwarded
+                                && !client_gone
+                            {
+                                let interruption = interrupted_stream_event(
+                                    enforce_responses_terminal,
+                                    translate || context.provider == ProviderKind::Anthropic,
+                                    reason,
+                                    usage_tap.usage.as_ref(),
+                                );
+                                interruption_forwarded = tx.send(Ok(interruption)).await.is_ok();
+                            }
+                            aborted = true;
+                            break;
+                        }
                         if terminal_validation_deadline.is_none()
                             && responses_validator
                                 .as_ref()
@@ -11390,14 +11467,43 @@ async fn response_from_upstream(
                         if client_gone {
                             continue;
                         }
-                        let outgoing = match translator.as_mut() {
-                            Some(translator) => Bytes::from(translator.push(&bytes)),
-                            None => validated_responses_bytes.unwrap_or(bytes),
-                        };
+                        if let Some(translator) = translator.as_mut() {
+                            for window in bytes.chunks(SSE_VALIDATION_WINDOW_BYTES) {
+                                let outgoing = match translator.push_window(window) {
+                                    Ok(translated) => Bytes::from(translated),
+                                    Err(reason) => {
+                                        stream_error = Some(reason.clone());
+                                        if !terminal_forwarded && !client_gone {
+                                            let interruption = interrupted_stream_event(
+                                                false,
+                                                true,
+                                                &reason,
+                                                usage_tap.usage.as_ref(),
+                                            );
+                                            interruption_forwarded =
+                                                tx.send(Ok(interruption)).await.is_ok();
+                                        }
+                                        aborted = true;
+                                        break;
+                                    }
+                                };
+                                if !outgoing.is_empty()
+                                    && !send_bounded_stream_bytes(&tx, outgoing).await
+                                {
+                                    client_gone = true;
+                                    break;
+                                }
+                            }
+                            if aborted {
+                                break;
+                            }
+                            continue;
+                        }
+                        let outgoing = validated_responses_bytes.unwrap_or(bytes);
                         if outgoing.is_empty() {
                             continue;
                         }
-                        if tx.send(Ok(outgoing)).await.is_err() {
+                        if !send_bounded_stream_bytes(&tx, outgoing).await {
                             client_gone = true;
                         }
                     }
@@ -11692,6 +11798,29 @@ fn interrupted_responses_event(reason: &str, usage: Option<&ResponseUsage>) -> B
     Bytes::from(format!(
         "event: chisei.response.interrupted\ndata: {payload}\n\n"
     ))
+}
+
+fn interrupted_stream_event(
+    responses_profile: bool,
+    anthropic_wire: bool,
+    reason: &str,
+    usage: Option<&ResponseUsage>,
+) -> Bytes {
+    if responses_profile {
+        return interrupted_responses_event(reason, usage);
+    }
+    let error = serde_json::json!({
+        "type": if anthropic_wire { "api_error" } else { "upstream_stream_error" },
+        "code": "upstream_unavailable",
+        "message": reason,
+        "retry_safety": "ambiguous",
+    });
+    if anthropic_wire {
+        let payload = serde_json::json!({"type": "error", "error": error});
+        Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    } else {
+        Bytes::from(format!("data: {}\n\n", serde_json::json!({"error": error})))
+    }
 }
 
 fn safe_upstream_error_reason(
@@ -12379,6 +12508,20 @@ mod tests {
     }
 
     #[test]
+    fn stream_overload_errors_preserve_client_wire_format() {
+        let anthropic = interrupted_stream_event(false, true, "frame too large", None);
+        let anthropic = String::from_utf8(anthropic.to_vec()).unwrap();
+        assert!(anthropic.starts_with("event: error\ndata: "));
+        assert!(anthropic.contains("\"type\":\"api_error\""));
+        assert!(anthropic.contains("\"retry_safety\":\"ambiguous\""));
+
+        let openai = interrupted_stream_event(false, false, "frame too large", None);
+        let openai = String::from_utf8(openai.to_vec()).unwrap();
+        assert!(openai.starts_with("data: "));
+        assert!(openai.contains("\"code\":\"upstream_unavailable\""));
+    }
+
+    #[test]
     fn responses_stream_validation_waits_for_complete_frames() {
         let terminal = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
         let split = terminal.len() - 5;
@@ -12472,6 +12615,49 @@ mod tests {
         oversized.resize(MAX_SSE_FRAME_BYTES + 1, b'x');
         oversized.extend_from_slice(b"\n\n");
         assert!(validator.push(&oversized).is_err());
+    }
+
+    #[test]
+    fn streaming_parsers_bound_incomplete_frames() {
+        let complete_frames = b"data: {\"delta\":\"x\"}\n\n".repeat(100_000);
+        let mut tap = SseUsageTap::sse();
+        tap.push(&complete_frames);
+        assert_eq!(tap.overflow_reason(), None);
+        assert!(tap.pending.is_empty());
+
+        let mut oversized = b"data: \"".to_vec();
+        oversized.resize(MAX_SSE_FRAME_BYTES + 1, b'x');
+
+        let mut tap = SseUsageTap::sse();
+        tap.push(&oversized);
+        assert_eq!(
+            tap.overflow_reason(),
+            Some("upstream SSE frame exceeds the gateway limit")
+        );
+        assert!(tap.pending.is_empty());
+        assert_eq!(tap.terminal(), Some(ResponsesTerminal::Invalid));
+
+        let mut translator = AnthropicMessageStreamTranslator::new("model".into());
+        let mut rejected = false;
+        for window in oversized.chunks(SSE_VALIDATION_WINDOW_BYTES) {
+            if translator.push_window(window).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        assert!(translator.pending.len() <= MAX_SSE_FRAME_BYTES);
+
+        let mut translator = AnthropicMessageStreamTranslator::new("model".into());
+        for window in complete_frames.chunks(SSE_VALIDATION_WINDOW_BYTES) {
+            let translated = translator.push_window(window).unwrap();
+            assert!(translated.len() <= MAX_SSE_FRAME_BYTES);
+        }
+        assert!(
+            translator
+                .push_window(&vec![b'x'; SSE_VALIDATION_WINDOW_BYTES + 1])
+                .is_err()
+        );
     }
 
     #[tokio::test]
