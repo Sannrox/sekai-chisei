@@ -12,6 +12,7 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{KIND_LEARNING, ListFilter};
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
+pub const RECOMMENDATION_INPUT_VERSION: &str = "gunshi.recommendation-input/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +64,16 @@ pub struct AllocationRequest {
     pub capacity: CapacityEnvelope,
     pub operations: Vec<PendingOperation>,
     pub strategy: Strategy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecommendationInput {
+    pub contract_version: String,
+    pub request: AllocationRequest,
+    pub advisory_policy: AdvisoryPolicy,
+    #[serde(default)]
+    pub kioku_evidence: Vec<KiokuEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
