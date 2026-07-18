@@ -23,6 +23,7 @@ pub enum OperationRisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCapacity {
     pub agent_id: String,
     pub runtime: String,
@@ -34,6 +35,7 @@ pub struct AgentCapacity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
     pub model: String,
     pub quality: f64,
@@ -43,6 +45,7 @@ pub struct ModelProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapacityEnvelope {
     pub captured_at_ms: i64,
     pub policy_version: String,
@@ -55,6 +58,7 @@ pub struct CapacityEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllocationRequest {
     pub capacity: CapacityEnvelope,
     pub operations: Vec<PendingOperation>,
@@ -74,6 +78,7 @@ pub struct BaselineAllocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KiokuEvidence {
     pub memory_id: String,
     pub namespace: String,
@@ -87,6 +92,7 @@ pub struct KiokuEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdvisoryPolicy {
     pub max_memory_age_ms: i64,
     pub min_score: f64,
@@ -170,6 +176,7 @@ impl AdvisoryPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingOperation {
     pub operation_id: String,
     pub namespace: String,
@@ -196,6 +203,7 @@ pub enum BaselineStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Strategy {
     pub strategy_id: String,
     pub version: String,
