@@ -259,13 +259,10 @@ impl ResolvedModelProvider {
         request: &ChatRequest,
         streaming: bool,
     ) -> Result<(), ProviderError> {
-        let registry = if let Some(path) = self.registry_state_path.as_deref() {
-            crate::provider_profile::refresh_provider_registry_async(path)
+        let registry =
+            crate::provider_resolution::snapshot_for_execution(self.registry_state_path.as_deref())
                 .await
-                .map_err(ProviderError::Unavailable)?
-        } else {
-            crate::provider_profile::provider_registry_snapshot()
-        };
+                .map_err(ProviderError::Unavailable)?;
         let resolved = registry
             .resolve_model(&self.canonical_model)
             .map_err(ProviderError::Precondition)?;
@@ -403,8 +400,16 @@ fn openai_compatible_api_root(base_url: &str) -> &str {
     base_url.strip_suffix("/v1").unwrap_or(base_url)
 }
 
-pub fn provider_name(model: &str) -> &str {
-    crate::provider_profile::resolve_provider_id(model).unwrap_or("unknown")
+pub fn provider_name(model: &str) -> &'static str {
+    match crate::provider_resolution::provider_id(model).as_deref() {
+        Ok("anthropic") => "anthropic",
+        Ok("openai") => "openai",
+        Ok("ollama") => "ollama",
+        Ok("native") => "native",
+        Ok("xai") => "xai",
+        Ok("meta") => "meta",
+        _ => "unknown",
+    }
 }
 
 #[cfg(test)]
