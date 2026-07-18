@@ -142,7 +142,9 @@ Start with the [documentation index](docs/README.md), or go directly to:
 - [Examples](examples/README.md) — runnable, domain-neutral examples;
 - [Vision](VISION.md) — product direction and non-goals; and
 - [Contributing](CONTRIBUTING.md) — development workflow and review
-  expectations; and
+  expectations;
+- [Project operating system](docs/project-operating-system.md) — how Issues,
+  Discussions, pull requests, documentation, and Skills fit together; and
 - [Code of conduct](CODE_OF_CONDUCT.md) — community standards and enforcement.
 
 The gRPC contract is defined in [`proto/`](proto/). The
