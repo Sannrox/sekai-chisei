@@ -84,7 +84,7 @@ pub struct OperationReport {
     pub structural_errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExternalEvidenceVersion {
     pub submission_id: String,
     pub source_version: String,

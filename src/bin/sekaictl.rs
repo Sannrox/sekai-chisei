@@ -40,19 +40,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "memory" => {
             sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
         }
-        "team" => {
-            if args.get(1).map(String::as_str) != Some("join") {
-                return Err(std::io::Error::other(sekai_chisei::team_cli::usage()).into());
-            }
-            let config =
-                sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(args.into_iter().skip(2))
-                    .map_err(std::io::Error::other)?;
-            let bundle = sekai_chisei::team_cli::run_team_join(config)
-                .await
+        "team" => match args.get(1).map(String::as_str) {
+            Some("join") => {
+                let config = sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(
+                    args.into_iter().skip(2),
+                )
                 .map_err(std::io::Error::other)?;
-            println!("{}", serde_json::to_string_pretty(&bundle)?);
-            Ok(())
-        }
+                let bundle = sekai_chisei::team_cli::run_team_join(config)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+                Ok(())
+            }
+            Some("weekly-report") => {
+                let config = sekai_chisei::weekly_report_cli::WeeklyReportConfig::from_args(
+                    args.into_iter().skip(2),
+                )
+                .map_err(std::io::Error::other)?;
+                let output = config.output.clone();
+                sekai_chisei::weekly_report_cli::run_weekly_report(config).await?;
+                println!("created {}", output.display());
+                Ok(())
+            }
+            _ => Err(std::io::Error::other(format!(
+                "{}\n  {}",
+                sekai_chisei::team_cli::usage(),
+                sekai_chisei::weekly_report_cli::usage()
+            ))
+            .into()),
+        },
         "estimate" => {
             sekai_chisei::launch::load_local_env();
             let config = CostEstimateConfig::from_args(args.into_iter().skip(1))
@@ -257,6 +273,9 @@ fn print_root_usage() {
     println!("\nFirst governed operation:\n  sekaictl smoke [model]");
     println!("\nCost estimate:");
     println!("  {}", estimate_usage());
+    println!("\nTeam operations:");
+    println!("  {}", sekai_chisei::team_cli::usage());
+    println!("  {}", sekai_chisei::weekly_report_cli::usage());
     println!("\nGoverned action commands:");
     println!("{}", sekai_chisei::action_cli::usage());
     println!(
