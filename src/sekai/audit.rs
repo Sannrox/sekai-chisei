@@ -4,7 +4,7 @@ use crate::sekai::security::{Grant, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeSet, HashMap};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     pub id: String,
     pub timestamp: i64,
@@ -464,6 +464,74 @@ impl SekaiDb {
         crate::sekai::ledger::insert_chained_decision(&conn, d)
     }
 
+    pub fn record_decisions(&self, decisions: &[Decision]) -> Result<(), String> {
+        if decisions.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        for decision in decisions {
+            crate::sekai::ledger::insert_chained_decision(&transaction, decision)?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String> {
+        self.record_decisions_idempotently_by(decisions, |existing, requested| {
+            existing == requested
+        })
+    }
+
+    pub fn record_decisions_idempotently_by(
+        &self,
+        decisions: &[Decision],
+        equivalent: impl Fn(&Decision, &Decision) -> bool,
+    ) -> Result<(), String> {
+        if decisions.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        for decision in decisions {
+            let existing = transaction
+                .query_row(
+                    "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
+                     FROM sekai_decisions WHERE id=?1",
+                    params![decision.id],
+                    |row| {
+                        let evidence: String = row.get(5)?;
+                        Ok(Decision {
+                            id: row.get(0)?,
+                            timestamp: row.get(1)?,
+                            actor: row.get(2)?,
+                            action: row.get(3)?,
+                            reason: row.get(4)?,
+                            evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+                            target_id: row.get(6)?,
+                            outcome: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            match existing {
+                Some(existing) if equivalent(&existing, decision) => continue,
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting audit decision already exists for {}",
+                        decision.id
+                    ));
+                }
+                None => crate::sekai::ledger::insert_chained_decision(&transaction, decision)?,
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
         let conn = self.conn();
         conn.query_row(
@@ -541,6 +609,39 @@ impl SekaiDb {
             });
         }
         Ok(results)
+    }
+
+    pub fn list_decisions_for_action_namespace(
+        &self,
+        action: &str,
+        namespace: &str,
+    ) -> Result<Vec<Decision>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
+                 FROM sekai_decisions
+                 WHERE action=?1 AND namespace=?2
+                 ORDER BY timestamp DESC, rowid DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![action, namespace], |row| {
+                let evidence: String = row.get(5)?;
+                Ok(Decision {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    reason: row.get(4)?,
+                    evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+                    target_id: row.get(6)?,
+                    outcome: row.get(7)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// Load only decisions attributable to one work unit or one of its model

@@ -50,6 +50,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("created {}", output.display());
                 Ok(())
             }
+            Some("issue") => {
+                let config =
+                    sekai_chisei::gunshi_cli::RecommendConfig::from_args(args.into_iter().skip(2))
+                        .map_err(std::io::Error::other)?;
+                let output = config.output.clone();
+                sekai_chisei::gunshi_cli::issue_recommendations(config).await?;
+                println!("created {}", output.display());
+                Ok(())
+            }
+            Some("respond") => {
+                let config =
+                    sekai_chisei::gunshi_cli::FeedbackConfig::from_args(args.into_iter().skip(2))
+                        .map_err(std::io::Error::other)?;
+                let feedback = sekai_chisei::gunshi_cli::record_response(config).await?;
+                println!("{}", serde_json::to_string_pretty(&feedback)?);
+                Ok(())
+            }
+            Some("scorecard") => {
+                let namespace = sekai_chisei::gunshi_cli::scorecard_namespace(&args[2..])
+                    .map_err(std::io::Error::other)?;
+                let scorecard = sekai_chisei::gunshi_cli::get_scorecard(namespace).await?;
+                println!("{}", serde_json::to_string_pretty(&scorecard)?);
+                Ok(())
+            }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
         },
         "team" => match args.get(1).map(String::as_str) {
