@@ -2,8 +2,10 @@
 .agents/*
 !.agents/skills/
 .agents/skills/*
+!.agents/skills/advance-issue-frontier/
 !.agents/skills/assess-change-impact/
 !.agents/skills/capture-project-decision/
+!.agents/skills/deliver-ready-issue/
 !.agents/skills/prepare-release/
 !.agents/skills/shape-work-item/
 !.agents/skills/verify-change/
