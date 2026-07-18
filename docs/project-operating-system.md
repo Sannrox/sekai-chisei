@@ -223,6 +223,8 @@ only when a branch needs substantial project-specific material.
 | Skill | Purpose and use | Required inputs | Expected output | Responsibilities and boundaries |
 | --- | --- | --- | --- | --- |
 | `shape-work-item` | Convert an idea, bug, refactor, or research question into a decision-ready Issue. | Raw request, repository evidence, known constraints. | Issue type, concise draft, acceptance evidence, labels, and routing recommendation. | Search for duplicates and expose uncertainty. It does not invent priority, assign people, or publish without authorization. |
+| `advance-issue-frontier` | Recompute which dependency-linked Issues are blocked, ready, or active after a merge or backlog review. | Live Issues and PRs, dependency sections, trigger, active-lane limit, and mutation authority. | Newly unblocked and blocked Issues, active capacity, anomalies, ordered candidates, and authorized status updates. | Parse explicit dependencies and default to report-only. It does not prioritize, assign, implement, close, or merge work. |
+| `deliver-ready-issue` | Take one approved, dependency-ready Issue through its authorized delivery stage. | Selected Issue, live repository state, and an implement, publish, or land authority ceiling. | Bounded implementation, verification and review evidence, plus a linked PR or merge when authorized. | Preserve unrelated work and stop on blocked or competing implementation. It does not select priority or exceed the authority ceiling. |
 | `assess-change-impact` | Scope a proposed or implemented change across domain and trust boundaries. | Issue/PR/diff and affected paths. | Impact matrix, required tests, migration/docs/security obligations, open risks. | Trace SQLite/PostgreSQL, gateway/native, and policy/audit effects. It does not approve architecture or replace a security audit. |
 | `verify-change` | Select and run proportionate deterministic checks for a Rust change. | Diff or paths plus stated outcome. | Commands, results, skipped checks with reasons, and remaining uncertainty. | Start focused, expand by risk, and never claim unrun checks. Live-provider tests stay opt-in and secret-safe. |
 | `capture-project-decision` | Promote a resolved choice into the right durable artifact. | Accepted Discussion/Issue/PR outcome and alternatives. | ADR, doc/Skill update, or explicit `no durable artifact` decision with links. | Preserve one source of truth and mark superseded ADRs. It does not turn unresolved debate into policy. |
@@ -231,10 +233,19 @@ only when a branch needs substantial project-specific material.
 The Skills are intentionally composable:
 
 ```text
-shape-work-item -> assess-change-impact -> implementation
-    -> verify-change -> capture-project-decision (only when durable)
+shape-work-item -> advance-issue-frontier -> deliver-ready-issue
+    -> assess-change-impact -> implementation -> verify-change
+    -> capture-project-decision (only when durable)
     -> prepare-release (at a release boundary)
 ```
+
+Frontier execution keeps two or three independent Issues active at once. An
+Issue enters a lane only when its explicit dependencies are delivered, no
+implementation already owns it, and a maintainer has selected it. Keep one
+Issue aligned with one reviewable Pull Request and one outcome. Parallelize
+only work without dependency or contract collisions. After each merge,
+recompute the frontier before selecting another Issue; readiness is evidence,
+not automatic priority or assignment.
 
 Add a Skill only after the same project-specific procedure appears at least
 three times, or when missing a step has high security/data-integrity cost.
