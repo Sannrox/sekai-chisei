@@ -1,5 +1,11 @@
 use crate::chisei::gunshi::{
-    AdvisoryPolicy, AllocationRequest, BaselineAllocation, KiokuEvidence, recommend_advisory,
+    AdvisoryScorecard, BaselineAllocation, ObservedOutcome, OperatorChoice, recommend_advisory,
+};
+pub use crate::chisei::gunshi::{RECOMMENDATION_INPUT_VERSION, RecommendationInput};
+use crate::grpc::client::connect_sekai;
+use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
+use crate::grpc::pb::chisei::{
+    GetGunshiScorecardRequest, IssueGunshiRecommendationsRequest, RecordGunshiFeedbackRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,21 +16,11 @@ use std::path::{Path, PathBuf};
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
-pub const RECOMMENDATION_INPUT_VERSION: &str = "gunshi.recommendation-input/v1";
 pub const RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v1";
+pub const ISSUED_RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v2";
 
 pub fn usage() -> &'static str {
-    "sekaictl gunshi recommend <input.json> --output <recommendations.json>"
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecommendationInput {
-    pub contract_version: String,
-    pub request: AllocationRequest,
-    pub advisory_policy: AdvisoryPolicy,
-    #[serde(default)]
-    pub kioku_evidence: Vec<KiokuEvidence>,
+    "sekaictl gunshi recommend <input.json> --output <recommendations.json>\n  sekaictl gunshi issue <input.json> --output <recommendations.json>\n  sekaictl gunshi respond <recommendations.json> <choice.json> --operation <id> [--outcome <outcome.json>]\n  sekaictl gunshi scorecard --namespace <name>"
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +29,8 @@ pub struct RecommendationBundle {
     pub contract_version: String,
     pub advisory: bool,
     pub input_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuance_id: Option<String>,
     pub allocation: BaselineAllocation,
 }
 
@@ -40,6 +38,48 @@ pub struct RecommendationBundle {
 pub struct RecommendConfig {
     pub input: PathBuf,
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackConfig {
+    pub recommendations: PathBuf,
+    pub choice: PathBuf,
+    pub operation_id: String,
+    pub outcome: Option<PathBuf>,
+}
+
+impl FeedbackConfig {
+    pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let args = args.into_iter().collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        let mut operation_id = None;
+        let mut outcome = None;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--operation" => {
+                    index += 1;
+                    operation_id = Some(required_arg(&args, index, "--operation")?);
+                }
+                "--outcome" => {
+                    index += 1;
+                    outcome = Some(PathBuf::from(required_arg(&args, index, "--outcome")?));
+                }
+                flag if flag.starts_with('-') => return Err(format!("unknown option {flag:?}")),
+                path => paths.push(PathBuf::from(path)),
+            }
+            index += 1;
+        }
+        if paths.len() != 2 {
+            return Err("respond requires recommendation and choice paths".into());
+        }
+        Ok(Self {
+            recommendations: paths.remove(0),
+            choice: paths.remove(0),
+            operation_id: operation_id.ok_or_else(|| "--operation is required".to_string())?,
+            outcome,
+        })
+    }
 }
 
 impl RecommendConfig {
@@ -96,11 +136,123 @@ pub fn run_recommend(config: RecommendConfig) -> Result<RecommendationBundle, Bo
         contract_version: RECOMMENDATION_BUNDLE_VERSION.into(),
         advisory: true,
         input_digest: format!("{:x}", Sha256::digest(&bytes)),
+        issuance_id: None,
         allocation,
     };
     let json = serde_json::to_string_pretty(&bundle)?;
     write_atomically(&config.output, format!("{json}\n").as_bytes())?;
     Ok(bundle)
+}
+
+pub async fn issue_recommendations(
+    config: RecommendConfig,
+) -> Result<RecommendationBundle, BoxErr> {
+    let bytes = std::fs::read(&config.input)?;
+    let input: RecommendationInput = serde_json::from_slice(&bytes)?;
+    if input.contract_version != RECOMMENDATION_INPUT_VERSION {
+        return Err(std::io::Error::other(format!(
+            "unsupported recommendation input contract {}",
+            input.contract_version
+        ))
+        .into());
+    }
+    let issuance_id = format!("issuance-{}", uuid::Uuid::new_v4().simple());
+    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
+        .issue_gunshi_recommendations(IssueGunshiRecommendationsRequest {
+            input_json: serde_json::to_string(&input)?,
+            issuance_id,
+        })
+        .await?
+        .into_inner();
+    let bundle = RecommendationBundle {
+        contract_version: ISSUED_RECOMMENDATION_BUNDLE_VERSION.into(),
+        advisory: true,
+        input_digest: format!("{:x}", Sha256::digest(&bytes)),
+        issuance_id: Some(response.issuance_id),
+        allocation: serde_json::from_str(&response.allocation_json)?,
+    };
+    let json = serde_json::to_string_pretty(&bundle)?;
+    write_atomically(&config.output, format!("{json}\n").as_bytes())?;
+    Ok(bundle)
+}
+
+pub async fn record_response(config: FeedbackConfig) -> Result<serde_json::Value, BoxErr> {
+    let bundle: RecommendationBundle =
+        serde_json::from_slice(&std::fs::read(&config.recommendations)?)?;
+    if bundle.contract_version != ISSUED_RECOMMENDATION_BUNDLE_VERSION || !bundle.advisory {
+        return Err(
+            std::io::Error::other("unsupported or non-advisory recommendation bundle").into(),
+        );
+    }
+    let plans = bundle
+        .allocation
+        .plans
+        .iter()
+        .filter(|plan| plan.operation_id == config.operation_id)
+        .collect::<Vec<_>>();
+    let [plan] = plans.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "recommendation bundle must contain exactly one plan for operation {}",
+            config.operation_id
+        ))
+        .into());
+    };
+    let choice: OperatorChoice = serde_json::from_slice(&std::fs::read(&config.choice)?)?;
+    let outcome: Option<ObservedOutcome> = config
+        .outcome
+        .as_ref()
+        .map(|path| -> Result<_, BoxErr> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
+        .transpose()?;
+    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
+        .record_gunshi_feedback(RecordGunshiFeedbackRequest {
+            plan_json: serde_json::to_string(plan)?,
+            choice_json: serde_json::to_string(&choice)?,
+            outcome_json: outcome
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_default(),
+            issuance_id: bundle.issuance_id.ok_or_else(|| {
+                std::io::Error::other("recommendation bundle has no governed issuance identity")
+            })?,
+        })
+        .await?
+        .into_inner();
+    Ok(serde_json::from_str(&response.feedback_json)?)
+}
+
+pub async fn get_scorecard(namespace: String) -> Result<AdvisoryScorecard, BoxErr> {
+    if namespace.trim().is_empty() || namespace.trim() != namespace {
+        return Err(std::io::Error::other("namespace must be non-empty and canonical").into());
+    }
+    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
+        .get_gunshi_scorecard(GetGunshiScorecardRequest { namespace })
+        .await?
+        .into_inner();
+    Ok(serde_json::from_str(&response.scorecard_json)?)
+}
+
+pub fn scorecard_namespace(args: &[String]) -> Result<String, String> {
+    if args.len() == 2 && args[0] == "--namespace" {
+        let namespace = args[1].clone();
+        if !namespace.trim().is_empty() && namespace.trim() == namespace {
+            return Ok(namespace);
+        }
+    }
+    Err("scorecard requires --namespace <name>".into())
+}
+
+fn gunshi_target() -> String {
+    std::env::var("CHISEI_GRPC_URL")
+        .or_else(|_| std::env::var("SEKAI_SOCKET"))
+        .unwrap_or_else(|_| "./data/sekai.sock".into())
+}
+
+fn required_arg(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    args.get(index)
+        .filter(|value| !value.starts_with('-') && !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn paths_refer_to_same_file(input: &Path, output: &Path) -> Result<bool, String> {
@@ -148,8 +300,8 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::chisei::gunshi::{
-        AgentCapacity, BaselineStrategy, CapacityEnvelope, ModelProfile, OperationRisk,
-        PendingOperation, Strategy,
+        AdvisoryPolicy, AgentCapacity, AllocationRequest, BaselineStrategy, CapacityEnvelope,
+        KiokuEvidence, ModelProfile, OperationRisk, PendingOperation, Strategy,
     };
     use std::collections::BTreeSet;
 
@@ -240,6 +392,34 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn feedback_parser_requires_two_inputs_and_an_operation() {
+        let config = FeedbackConfig::from_args([
+            "recommendations.json".into(),
+            "choice.json".into(),
+            "--operation".into(),
+            "op-1".into(),
+            "--outcome".into(),
+            "outcome.json".into(),
+        ])
+        .unwrap();
+        assert_eq!(config.operation_id, "op-1");
+        assert_eq!(config.outcome, Some(PathBuf::from("outcome.json")));
+        assert!(
+            FeedbackConfig::from_args(["recommendations.json".into(), "choice.json".into(),])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scorecard_parser_requires_a_canonical_namespace() {
+        assert_eq!(
+            scorecard_namespace(&["--namespace".into(), "support".into()]).unwrap(),
+            "support"
+        );
+        assert!(scorecard_namespace(&["--namespace".into(), " support ".into()]).is_err());
     }
 
     #[test]
