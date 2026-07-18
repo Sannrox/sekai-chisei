@@ -559,6 +559,37 @@ fn require_namespace_access(db: &SekaiDb, actor: &str, namespace: &str) -> Resul
     }
 }
 
+fn require_namespace_write_access(
+    db: &SekaiDb,
+    actor: &str,
+    namespace: &str,
+) -> Result<(), Status> {
+    let namespace = canonical_namespace(namespace)?;
+    if matches!(actor, "root" | "local") {
+        return Ok(());
+    }
+    let boundary = db
+        .find_namespace_boundary(namespace)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied("namespace write access denied"))?;
+    let granted = db
+        .list_grants(&boundary.id)
+        .map_err(Status::internal)?
+        .into_iter()
+        .any(|grant| {
+            grant.principal == actor
+                && matches!(
+                    grant.role,
+                    crate::sekai::security::Role::Editor | crate::sekai::security::Role::Admin
+                )
+        });
+    if granted {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("namespace write access denied"))
+    }
+}
+
 fn require_team_namespace_access<T>(
     db: &SekaiDb,
     _config: &Config,
@@ -5296,6 +5327,152 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(ListKiokuCandidatesResponse { candidates }))
     }
 
+    async fn issue_gunshi_recommendations(
+        &self,
+        req: Request<IssueGunshiRecommendationsRequest>,
+    ) -> Result<Response<IssueGunshiRecommendationsResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let issuance_id = req.get_ref().issuance_id.trim();
+        if issuance_id.is_empty()
+            || issuance_id.len() > 128
+            || issuance_id != req.get_ref().issuance_id
+            || !issuance_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+        {
+            return Err(Status::invalid_argument(
+                "issuance_id must be a canonical identifier of at most 128 characters",
+            ));
+        }
+        let issuance_id = issuance_id.to_string();
+        let mut input: crate::chisei::gunshi::RecommendationInput =
+            serde_json::from_str(&req.get_ref().input_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid recommendation input: {error}"))
+            })?;
+        if input.contract_version != crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION {
+            return Err(Status::invalid_argument(format!(
+                "unsupported recommendation input contract {}",
+                input.contract_version
+            )));
+        }
+        if !input.kioku_evidence.is_empty() {
+            return Err(Status::invalid_argument(
+                "server-issued recommendations load governed Kioku evidence; inline evidence is not accepted",
+            ));
+        }
+        if input.request.operations.is_empty() {
+            return Err(Status::invalid_argument(
+                "server-issued recommendations require at least one operation",
+            ));
+        }
+        let mut scopes = input
+            .request
+            .operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation.namespace.clone(),
+                    operation.operation_class.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for (namespace, _) in &scopes {
+            require_namespace_write_access(&self.db, &actor, namespace)?;
+        }
+        for (namespace, operation_class) in std::mem::take(&mut scopes) {
+            input.kioku_evidence.extend(
+                crate::chisei::gunshi::load_kioku_evidence(&self.db, &namespace, &operation_class)
+                    .map_err(Status::internal)?,
+            );
+        }
+        input
+            .kioku_evidence
+            .sort_by(|left, right| left.memory_id.cmp(&right.memory_id));
+        input
+            .kioku_evidence
+            .dedup_by(|left, right| left.memory_id == right.memory_id);
+        let request_digest = {
+            use sha2::Digest;
+            let input_json =
+                serde_json::to_vec(&input).map_err(|error| Status::internal(error.to_string()))?;
+            format!("{:x}", sha2::Sha256::digest(input_json))
+        };
+        let allocation = crate::chisei::gunshi::recommend_advisory(
+            &input.request,
+            &input.kioku_evidence,
+            &input.advisory_policy,
+        )
+        .map_err(Status::failed_precondition)?;
+        crate::chisei::gunshi_feedback::record_issued_recommendations(
+            &self.db,
+            &actor,
+            &issuance_id,
+            &request_digest,
+            &allocation.plans,
+            chrono::Utc::now().timestamp_millis(),
+            input.request.capacity.captured_at_ms,
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(IssueGunshiRecommendationsResponse {
+            allocation_json: serde_json::to_string(&allocation)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            issuance_id,
+        }))
+    }
+
+    async fn record_gunshi_feedback(
+        &self,
+        req: Request<RecordGunshiFeedbackRequest>,
+    ) -> Result<Response<RecordGunshiFeedbackResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        let plan: crate::chisei::gunshi::AllocationPlan = serde_json::from_str(&input.plan_json)
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid allocation plan: {error}"))
+            })?;
+        require_namespace_write_access(&self.db, &actor, &plan.namespace)?;
+        let choice: crate::chisei::gunshi::OperatorChoice =
+            serde_json::from_str(&input.choice_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid operator choice: {error}"))
+            })?;
+        let outcome = (!input.outcome_json.trim().is_empty())
+            .then(|| {
+                serde_json::from_str::<crate::chisei::gunshi::ObservedOutcome>(&input.outcome_json)
+            })
+            .transpose()
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid observed outcome: {error}"))
+            })?;
+        let feedback = crate::chisei::gunshi_feedback::record_feedback(
+            &self.db,
+            &actor,
+            &input.issuance_id,
+            &plan,
+            &choice,
+            outcome.as_ref(),
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(RecordGunshiFeedbackResponse {
+            feedback_json: serde_json::to_string(&feedback)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn get_gunshi_scorecard(
+        &self,
+        req: Request<GetGunshiScorecardRequest>,
+    ) -> Result<Response<GetGunshiScorecardResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let namespace = req.get_ref().namespace.clone();
+        require_namespace_access(&self.db, &actor, &namespace)?;
+        let scorecard = crate::chisei::gunshi_feedback::advisory_scorecard(&self.db, &namespace)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetGunshiScorecardResponse {
+            scorecard_json: serde_json::to_string(&scorecard)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
     async fn review_kioku_memory(
         &self,
         req: Request<ReviewKiokuMemoryRequest>,
@@ -6645,6 +6822,54 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
+        let svc = memory_service();
+        let input = serde_json::json!({
+            "contract_version": crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION,
+            "request": {
+                "capacity": {
+                    "captured_at_ms": 1,
+                    "policy_version": "policy",
+                    "agents": [],
+                    "model_profiles": [],
+                    "budget_remaining_usd_micros": 0,
+                    "max_parallel_attempts": 0,
+                    "human_attention_minutes": 0
+                },
+                "operations": [],
+                "strategy": {
+                    "strategy_id": "baseline",
+                    "version": "1",
+                    "baseline": "conservative"
+                }
+            },
+            "advisory_policy": {
+                "max_memory_age_ms": 0,
+                "min_score": 0.0,
+                "max_evidence_references": 1
+            },
+            "kioku_evidence": []
+        });
+        let mut request = Request::new(IssueGunshiRecommendationsRequest {
+            input_json: input.to_string(),
+            issuance_id: "empty-scope".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+
+        let error = svc.issue_gunshi_recommendations(request).await.unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            svc.db
+                .list_decisions(&Default::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn receipt_hash_preserves_part_boundaries() {
         assert_ne!(
@@ -7779,6 +8004,55 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn gunshi_scorecards_require_namespace_membership() {
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Viewer,
+                "local",
+            )
+            .unwrap();
+        let mut denied = Request::new(GetGunshiScorecardRequest {
+            namespace: "acme".into(),
+        });
+        denied
+            .metadata_mut()
+            .insert("x-principal", "bob".parse().unwrap());
+        assert_eq!(
+            svc.get_gunshi_scorecard(denied).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut allowed = Request::new(GetGunshiScorecardRequest {
+            namespace: "acme".into(),
+        });
+        allowed
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        let scorecard: crate::chisei::gunshi::AdvisoryScorecard = serde_json::from_str(
+            &svc.get_gunshi_scorecard(allowed)
+                .await
+                .unwrap()
+                .into_inner()
+                .scorecard_json,
+        )
+        .unwrap();
+        assert_eq!(scorecard.comparisons, 0);
+        assert!(require_namespace_write_access(&svc.db, "alice", "acme").is_err());
+        svc.db
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Editor,
+                "local",
+            )
+            .unwrap();
+        require_namespace_write_access(&svc.db, "alice", "acme").unwrap();
     }
 
     #[tokio::test]
