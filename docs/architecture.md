@@ -57,6 +57,12 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
 
+Native runtimes can use the namespace-scoped
+[capability catalog](capability-catalog.md) to discover visible object queries,
+bounded retrieval surfaces, and governed actions before invocation. Catalog
+visibility is filtered for the authenticated authorization context and never
+acts as an authorization token; invocation always rechecks live controls.
+
 ## Core vocabulary
 
 The public contract is namespace-first and domain-neutral:

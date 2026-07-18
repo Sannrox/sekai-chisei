@@ -125,6 +125,16 @@ impl ActionExecutor {
         action_types
     }
 
+    /// Canonical descriptors for every action accepted by `ExecuteAction`.
+    /// Builtins use the same `ActionTypeDef` vocabulary as persisted action
+    /// types so discovery does not create a parallel input-schema system.
+    pub fn capability_action_types(&self) -> Vec<ActionTypeDef> {
+        let mut action_types = builtin_action_types();
+        action_types.extend(self.action_types.values().cloned());
+        action_types.sort_by(|a, b| a.name.cmp(&b.name));
+        action_types
+    }
+
     /// Risk class of an action by name. Builtin action names are op names, so
     /// they map directly; user-defined action types take the maximum class over
     /// their ops. Unknown actions are treated as `Destructive` (fail safe).
@@ -506,6 +516,117 @@ impl ActionExecutor {
             },
         );
     }
+}
+
+fn builtin_param(name: &str, required: bool) -> ActionParamDef {
+    builtin_typed_param(name, PropertyType::String, required, Vec::new())
+}
+
+fn builtin_typed_param(
+    name: &str,
+    param_type: PropertyType,
+    required: bool,
+    enum_values: Vec<String>,
+) -> ActionParamDef {
+    ActionParamDef {
+        name: name.to_string(),
+        param_type,
+        required,
+        enum_values,
+    }
+}
+
+fn builtin_action_types() -> Vec<ActionTypeDef> {
+    let definition = |name: &str,
+                      description: &str,
+                      params: Vec<ActionParamDef>,
+                      op: &str,
+                      target_kind: &str| ActionTypeDef {
+        name: name.to_string(),
+        description: description.to_string(),
+        params,
+        ops: vec![ActionOp {
+            op: op.to_string(),
+            property: String::new(),
+            value_from: String::new(),
+            relation: String::new(),
+        }],
+        target_kind: target_kind.to_string(),
+        created: 0,
+    };
+
+    vec![
+        definition(
+            "create_object",
+            "Create a schema-governed object in an authorized namespace.",
+            vec![
+                builtin_param("id", true),
+                builtin_param("kind", true),
+                builtin_param("name", true),
+                builtin_param("namespace", false),
+                builtin_param("external_id", false),
+            ],
+            "create_object",
+            "*",
+        ),
+        definition(
+            "set_property",
+            "Set one declared property on an authorized object.",
+            vec![
+                builtin_param("id", true),
+                builtin_param("key", true),
+                builtin_param("value", true),
+            ],
+            "set_property",
+            "*",
+        ),
+        definition(
+            "create_link",
+            "Create a bounded relation between authorized objects.",
+            vec![
+                builtin_param("from_id", true),
+                builtin_param("to_id", true),
+                builtin_param("relation", true),
+            ],
+            "create_link",
+            "*",
+        ),
+        definition(
+            "delete_link",
+            "Delete an existing relation between authorized objects.",
+            vec![builtin_param("id", true)],
+            "delete_link",
+            "*",
+        ),
+        definition(
+            crate::sekai::learning::RECORD_LEARNING_ACTION,
+            "Record a governed learning with source and verification evidence.",
+            vec![
+                builtin_param("id", true),
+                builtin_param("target_id", true),
+                builtin_param("title", true),
+                builtin_param("prevention", true),
+                builtin_param("reasoning", true),
+                builtin_param("source_request_id", true),
+                builtin_typed_param("score", PropertyType::Int, true, Vec::new()),
+                builtin_typed_param("passed", PropertyType::Bool, true, Vec::new()),
+                builtin_param("task_class", true),
+                builtin_param("model", true),
+                builtin_param("producer", true),
+                builtin_typed_param(
+                    "status",
+                    PropertyType::Enum,
+                    true,
+                    ["candidate", "active", "superseded", "rejected"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            ],
+            "record_learning",
+            crate::domain::KIND_LEARNING,
+        ),
+    ]
 }
 
 pub fn validate_action_type_definition(
