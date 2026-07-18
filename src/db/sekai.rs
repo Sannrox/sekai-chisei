@@ -109,6 +109,7 @@ impl SekaiDb {
         self.migrate_attestations()?;
         self.migrate_task_observations()?;
         self.migrate_evidence()?;
+        self.migrate_deduplication()?;
         self.migrate_schema_types()?;
         self.migrate_coordination()?;
         self.migrate_datasets()?;

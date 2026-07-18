@@ -115,6 +115,36 @@ links, and evidence observations are rebuildable projections. Conflicting
 submissions remain separately attributable instead of being collapsed into a
 single asserted truth.
 
+### Identity, content, and reconciliation
+
+Retry identity is scoped to an operation and idempotency key and is bound to a
+canonical request digest. Replaying that request returns its recorded result;
+reusing the key for different canonical input fails explicitly. Source-record
+identity remains producer, source instance, immutable source record ID, and
+source version. Neither contract treats equal payloads as proof of one causal
+occurrence.
+
+Immutable content can share SQLite storage only within an identical namespace,
+classification, encryption-key, and residency scope. The stored digest is
+domain-separated and includes that scope, and content is readable only through
+an independently authorized live reference. References retain their own actor,
+operation, and causal identity even when their blob is shared. Retention and
+legal holds, archive state, receipt dependencies, and attestation dependencies
+block collection. Once those obligations and all live references are gone,
+collection removes the payload while retaining required erasure tombstones and
+audit events.
+
+Object reconciliation is an explicit, append-only overlay over original graph
+objects. Namespace, kind, external identity, source precedence, and
+authoritative mappings define a case. Merge, alias, split, suppress, conflict,
+and reversal decisions are idempotent and audited; they never delete the source
+objects or their lineage. Semantic similarity is not a reconciliation action
+and cannot silently merge evidence.
+
+These storage and reconciliation contracts belong to the complete SQLite
+runtime. They do not expand the selected PostgreSQL persistence interfaces or
+change the public protobuf contract.
+
 ## Design constraints
 
 - Local-first and inspectable by default.

@@ -9,6 +9,7 @@ pub mod compute;
 pub mod coordination;
 pub mod credentials;
 pub mod dataset;
+pub mod deduplication;
 pub mod escalation;
 pub mod evidence;
 pub mod evidence_projection;
