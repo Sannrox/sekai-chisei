@@ -300,10 +300,24 @@ pub fn validate_provider_registry_storage(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Compatibility shim for callers predating the provider-resolution owner.
+/// Compiler deprecation warnings are the usage signal; remove in 0.2.0 once
+/// downstream callers have migrated to `provider_resolution::resolve_model`.
+#[deprecated(
+    since = "0.1.0",
+    note = "use provider_resolution::resolve_model; scheduled for removal in 0.2.0"
+)]
 pub fn resolve_registered_model(requested: &str) -> Result<ResolvedProviderModel, String> {
     provider_registry_snapshot().resolve_model(requested)
 }
 
+/// Compatibility shim for gateway callers predating the provider-resolution
+/// owner. Compiler deprecation warnings are the usage signal; remove in 0.2.0
+/// once callers use `provider_resolution::resolve_model_for_provider`.
+#[deprecated(
+    since = "0.1.0",
+    note = "use provider_resolution::resolve_model_for_provider; scheduled for removal in 0.2.0"
+)]
 pub fn resolve_registered_model_for_provider(
     requested: &str,
     wire_provider: &str,
@@ -2488,7 +2502,11 @@ mod tests {
                 .await
                 .unwrap();
             assert!(foreign.resolve_model("openai/gpt-5.5").is_err());
-            assert!(resolve_registered_model("openai/gpt-5.5").is_ok());
+            assert!(
+                provider_registry_snapshot()
+                    .resolve_model("openai/gpt-5.5")
+                    .is_ok()
+            );
         })
         .await;
         std::fs::remove_dir_all(directory).unwrap();

@@ -150,7 +150,7 @@ impl PolicyResolver {
         let runtime = if !uses_preferred_model && !p.default_runtime.is_empty() {
             p.default_runtime.clone()
         } else if !uses_preferred_model {
-            let provider = crate::provider_profile::resolve_registered_model(&model)
+            let provider = crate::provider_resolution::resolve_model(&model)
                 .map_err(|reason| format!("default model cannot be routed: {reason}"))?
                 .provider;
             if p.allowed_runtimes.is_empty() || p.allowed_runtimes.contains(&provider) {
@@ -177,7 +177,7 @@ impl PolicyResolver {
             if matching_opaque_runtimes.len() == 1 {
                 matching_opaque_runtimes[0].clone()
             } else {
-                let resolved = crate::provider_profile::resolve_registered_model(&model)
+                let resolved = crate::provider_resolution::resolve_model(&model)
                     .map_err(|reason| format!("preferred model cannot be routed: {reason}"))?;
                 if p.allowed_runtimes.is_empty() || p.allowed_runtimes.contains(&resolved.provider)
                 {
@@ -206,7 +206,7 @@ fn is_registry_runtime(runtime: &str) -> bool {
 
 pub(crate) fn validate_resolved_route(runtime: &str, model: &str) -> Result<(), String> {
     if is_registry_runtime(runtime) {
-        let resolved = crate::provider_profile::resolve_registered_model(model)?;
+        let resolved = crate::provider_resolution::resolve_model(model)?;
         return (resolved.provider == runtime).then_some(()).ok_or_else(|| {
             format!(
                 "runtime {runtime:?} does not match model provider {:?}",
@@ -215,7 +215,7 @@ pub(crate) fn validate_resolved_route(runtime: &str, model: &str) -> Result<(), 
         });
     }
     if runtime == "kiro" {
-        let resolved = crate::provider_profile::resolve_registered_model(model)?;
+        let resolved = crate::provider_resolution::resolve_model(model)?;
         if resolved.provider == "native" {
             return Ok(());
         }
@@ -229,14 +229,7 @@ fn policy_models_equivalent(left: &str, right: &str) -> bool {
     if left == right {
         return true;
     }
-    let registry = crate::provider_profile::ProviderRegistry::built_in();
-    let Ok(left) = registry.resolve_model(left) else {
-        return false;
-    };
-    let Ok(right) = registry.resolve_model(right) else {
-        return false;
-    };
-    left.canonical_model == right.canonical_model
+    crate::provider_resolution::models_have_same_identity(left, right)
 }
 
 #[cfg(test)]
