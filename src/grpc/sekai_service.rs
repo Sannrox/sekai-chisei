@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
+use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -16,6 +17,7 @@ use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::attestation;
+use crate::sekai::capability;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::{
@@ -137,6 +139,130 @@ impl SekaiServiceImpl {
         Ok(())
     }
 
+    fn discoverable_capabilities(
+        &self,
+        namespace: &str,
+        principals: &[String],
+    ) -> Result<Vec<CapabilityEntry>, Status> {
+        check_team_namespace(&self.db, principals, namespace, false)
+            .map_err(|_| Status::permission_denied("capability discovery denied"))?;
+        let can_write_namespace =
+            check_team_namespace(&self.db, principals, namespace, true).is_ok();
+
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("capability catalog unavailable"))?;
+        let visible_types = schema
+            .all()
+            .into_iter()
+            .filter(|object_type| {
+                !is_reserved_governance_kind(&object_type.kind)
+                    && check_read(
+                        &self.security,
+                        &schema_object_id(&object_type.kind),
+                        principals,
+                    )
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
+        let visible_kinds = visible_types
+            .iter()
+            .map(|object_type| object_type.kind.as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut entries = visible_types
+            .iter()
+            .map(object_query_capability)
+            .collect::<Vec<_>>();
+        entries.push(traverse_capability());
+        entries.push(retrieve_context_capability());
+        entries.push(kioku_candidates_capability());
+
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let resolved_policy = self
+            .db
+            .resolve_action_policy(actor, namespace, namespace)
+            .map_err(|_| Status::internal("capability catalog unavailable"))?;
+        let policy_mutation_limit = resolved_policy
+            .as_ref()
+            .and_then(|policy| policy.max_mutations_per_work_unit);
+        let policy_delete_limit = resolved_policy
+            .as_ref()
+            .and_then(|policy| policy.max_deletes_per_work_unit);
+        let actions = self
+            .actions
+            .read()
+            .map_err(|_| Status::internal("capability catalog unavailable"))?;
+        for action_type in actions.capability_action_types() {
+            if !can_write_namespace {
+                continue;
+            }
+            if !action_type.target_kind.is_empty()
+                && action_type.target_kind != "*"
+                && !visible_kinds.contains(action_type.target_kind.as_str())
+            {
+                continue;
+            }
+            if action_type.ops.iter().any(|op| {
+                op.op == "create_object"
+                    && !op.property.is_empty()
+                    && !visible_kinds.contains(op.property.as_str())
+            }) {
+                continue;
+            }
+            if check_read(
+                &self.security,
+                &action_object_id(&action_type.name),
+                principals,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let risk = actions.action_risk_class(&action_type.name);
+            let (mutation_count, delete_count) =
+                actions.action_op_counts(&action_type.name, &HashMap::new());
+            let limits = ActionCapabilityLimits {
+                mutation_count,
+                delete_count,
+                policy_mutation_limit,
+                policy_delete_limit,
+            };
+            let decision = resolved_policy
+                .as_ref()
+                .map(|policy| policy.decide(&action_type.name, risk))
+                .unwrap_or(ActionDecision::Allow);
+            if decision == ActionDecision::Deny {
+                continue;
+            }
+            if action_type.name == "create_object" {
+                for object_type in visible_types
+                    .iter()
+                    .filter(|object_type| object_type.kind != "namespace")
+                {
+                    entries.push(create_object_capability(
+                        &action_type,
+                        object_type,
+                        risk,
+                        decision == ActionDecision::RequireApproval,
+                        limits,
+                    ));
+                }
+                continue;
+            }
+            entries.push(action_capability(
+                format!("sekai.actions.{}", action_type.name),
+                action_type,
+                risk,
+                decision == ActionDecision::RequireApproval,
+                limits,
+            ));
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
     /// Execute an action's effect (target auth + schema validation + mutation +
     /// audit) without policy gating. Used to resume an approved held action.
     /// `principals` are the identities re-checked for write access at execution
@@ -185,6 +311,7 @@ impl SekaiServiceImpl {
         let schema_kinds = actions
             .schema_kinds(&self.db, action_name, params)
             .map_err(Status::invalid_argument)?;
+        ensure_action_schema_kinds_allowed(&schema_kinds)?;
         for kind in schema_kinds {
             self.require_schema_kind_loaded(&kind)?;
         }
@@ -453,11 +580,305 @@ impl SekaiServiceImpl {
     }
 }
 
+fn base_capability(
+    name: String,
+    description: String,
+    kind: &str,
+    input_type: &str,
+    output_type: &str,
+) -> CapabilityEntry {
+    CapabilityEntry {
+        name,
+        description,
+        kind: kind.to_string(),
+        lifecycle_state: "active".to_string(),
+        contract_version: capability::CONTRACT_VERSION.to_string(),
+        minimum_compatible_version: capability::CONTRACT_VERSION.to_string(),
+        maximum_compatible_version: capability::CONTRACT_VERSION.to_string(),
+        replacement_capability: String::new(),
+        input_type: input_type.to_string(),
+        output_type: output_type.to_string(),
+        required_scopes: Vec::new(),
+        policy_decision_points: Vec::new(),
+        risk_class: String::new(),
+        approval_behavior: "none".to_string(),
+        limits: Vec::new(),
+        object_type: None,
+        action_type: None,
+        evidence_requirements: Vec::new(),
+    }
+}
+
+fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry {
+    let mut entry = base_capability(
+        format!("sekai.objects.query.{}", object_type.kind),
+        format!("List authorized {} objects.", object_type.kind),
+        "query",
+        "sekai.ListObjectsRequest",
+        "sekai.ListObjectsResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "schema_visibility".into(),
+        "object_acl".into(),
+    ];
+    entry.object_type = Some(to_proto_schema_type(object_type));
+    entry
+}
+
+fn traverse_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.relations.traverse".into(),
+        "Traverse authorized object relations with bounded depth.".into(),
+        "query",
+        "sekai.TraverseRequest",
+        "sekai.TraverseResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "object_acl".into()];
+    entry.limits = vec![CapabilityLimit {
+        name: "max_depth".into(),
+        value: 10,
+    }];
+    entry
+}
+
+fn retrieve_context_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.context.retrieve".into(),
+        "Retrieve bounded, authorized context candidates.".into(),
+        "retrieval",
+        "sekai.RetrieveContextRequest",
+        "sekai.RetrieveContextResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+    ];
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_depth".into(),
+            value: 3,
+        },
+        CapabilityLimit {
+            name: "max_links".into(),
+            value: 200,
+        },
+        CapabilityLimit {
+            name: "max_objects".into(),
+            value: 100,
+        },
+    ];
+    entry
+}
+
+fn kioku_candidates_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        "chisei.kioku.candidates.list".into(),
+        "List namespace-scoped Kioku candidates with their validation evidence.".into(),
+        "retrieval",
+        "chisei.ListKiokuCandidatesRequest",
+        "chisei.ListKiokuCandidatesResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "memory:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "memory_lifecycle".into(),
+        "classification".into(),
+    ];
+    entry.evidence_requirements = vec![
+        "attributable_evidence_link".into(),
+        "resolvable_source_operation".into(),
+        "candidate_validation".into(),
+    ];
+    entry.limits = vec![CapabilityLimit {
+        name: "max_results".into(),
+        value: 100,
+    }];
+    entry
+}
+
+#[derive(Clone, Copy)]
+struct ActionCapabilityLimits {
+    mutation_count: u32,
+    delete_count: u32,
+    policy_mutation_limit: Option<u32>,
+    policy_delete_limit: Option<u32>,
+}
+
+fn action_capability(
+    capability_name: String,
+    action_type: action::ActionTypeDef,
+    risk: RiskClass,
+    approval_required: bool,
+    limits: ActionCapabilityLimits,
+) -> CapabilityEntry {
+    let mut entry = base_capability(
+        capability_name,
+        action_type.description.clone(),
+        "action",
+        "sekai.ExecuteActionRequest",
+        "sekai.ExecuteActionResponse",
+    );
+    entry.required_scopes = vec!["namespace:write".into(), "object:write".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "action_policy".into(),
+        "budget".into(),
+        "approval".into(),
+    ];
+    entry.risk_class = risk.as_str().to_string();
+    entry.approval_behavior = if approval_required {
+        "required".into()
+    } else {
+        "may_require".into()
+    };
+    entry.limits.push(CapabilityLimit {
+        name: "max_mutations_per_invocation".into(),
+        value: u64::from(limits.mutation_count),
+    });
+    if limits.delete_count > 0 {
+        entry.limits.push(CapabilityLimit {
+            name: "max_deletes_per_invocation".into(),
+            value: u64::from(limits.delete_count),
+        });
+    }
+    if let Some(limit) = limits.policy_mutation_limit {
+        entry.limits.push(CapabilityLimit {
+            name: "max_mutations_per_work_unit".into(),
+            value: u64::from(limit),
+        });
+    }
+    if let Some(limit) = limits.policy_delete_limit {
+        entry.limits.push(CapabilityLimit {
+            name: "max_deletes_per_work_unit".into(),
+            value: u64::from(limit),
+        });
+    }
+    if action_type.name == crate::sekai::learning::RECORD_LEARNING_ACTION {
+        entry.limits.extend([
+            CapabilityLimit {
+                name: "score_min".into(),
+                value: 0,
+            },
+            CapabilityLimit {
+                name: "score_max".into(),
+                value: 100,
+            },
+        ]);
+    }
+    entry.action_type = Some(to_proto_action_type(&action_type));
+    entry
+}
+
+fn create_object_capability(
+    base_action_type: &action::ActionTypeDef,
+    object_type: &schema::ObjectType,
+    risk: RiskClass,
+    approval_required: bool,
+    limits: ActionCapabilityLimits,
+) -> CapabilityEntry {
+    let mut action_type = base_action_type.clone();
+    action_type.target_kind = object_type.kind.clone();
+    action_type.description = format!(
+        "Create a schema-governed {} object in an authorized namespace.",
+        object_type.kind
+    );
+    action_type.params = vec![
+        action::ActionParamDef {
+            name: "id".into(),
+            param_type: schema::PropertyType::String,
+            required: true,
+            enum_values: Vec::new(),
+        },
+        action::ActionParamDef {
+            name: "kind".into(),
+            param_type: schema::PropertyType::Enum,
+            required: true,
+            enum_values: vec![object_type.kind.clone()],
+        },
+        action::ActionParamDef {
+            name: "name".into(),
+            param_type: schema::PropertyType::String,
+            required: true,
+            enum_values: Vec::new(),
+        },
+        action::ActionParamDef {
+            name: "namespace".into(),
+            param_type: schema::PropertyType::String,
+            required: true,
+            enum_values: Vec::new(),
+        },
+        action::ActionParamDef {
+            name: "external_id".into(),
+            param_type: schema::PropertyType::String,
+            required: false,
+            enum_values: Vec::new(),
+        },
+    ];
+    action_type.params.extend(
+        object_type
+            .properties
+            .iter()
+            .filter(|property| {
+                !matches!(
+                    property.name.as_str(),
+                    "id" | "kind" | "name" | "namespace" | "external_id"
+                )
+            })
+            .map(|property| action::ActionParamDef {
+                name: property.name.clone(),
+                param_type: property.prop_type.clone(),
+                required: property.required,
+                enum_values: property.enum_values.clone(),
+            }),
+    );
+    let mut entry = action_capability(
+        format!("sekai.actions.create_object.{}", object_type.kind),
+        action_type,
+        risk,
+        approval_required,
+        limits,
+    );
+    entry.object_type = Some(to_proto_schema_type(object_type));
+    entry
+}
+
+fn map_capability_error(error: capability::CatalogError) -> Status {
+    match error {
+        capability::CatalogError::UnsupportedContractVersion => {
+            Status::failed_precondition("unsupported capability catalog contract version")
+        }
+        capability::CatalogError::CatalogVersionUnavailable => {
+            Status::aborted("capability catalog version unavailable")
+        }
+        capability::CatalogError::InvalidPageToken => {
+            Status::invalid_argument("invalid capability catalog page token")
+        }
+    }
+}
+
 fn caller_principals(req: &Request<impl std::any::Any>) -> Vec<String> {
     req.metadata()
         .get("x-principal")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .map(|v| {
+            let principals = v
+                .split(',')
+                .map(str::trim)
+                .filter(|principal| !principal.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if principals.is_empty() {
+                vec!["anonymous".to_string()]
+            } else {
+                principals
+            }
+        })
         .unwrap_or_else(|| vec!["anonymous".to_string()])
 }
 
@@ -1765,6 +2186,15 @@ const ERASED_NAMESPACE: &str = "[erased]";
 
 fn is_reserved_governance_kind(kind: &str) -> bool {
     RESERVED_GOVERNANCE_KINDS.contains(&kind)
+}
+
+fn ensure_action_schema_kinds_allowed(kinds: &[String]) -> Result<(), Status> {
+    if kinds.iter().any(|kind| is_reserved_governance_kind(kind)) {
+        return Err(Status::permission_denied(
+            "reserved governance kinds require dedicated APIs",
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the namespace used for action-policy scope resolution: prefer the
@@ -3181,6 +3611,47 @@ impl SekaiService for SekaiServiceImpl {
             truncated_links: result.truncated_links,
         }))
     }
+    async fn discover_capabilities(
+        &self,
+        req: Request<DiscoverCapabilitiesRequest>,
+    ) -> Result<Response<DiscoverCapabilitiesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let namespace = inner.namespace.trim();
+        if namespace.is_empty() || namespace != inner.namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        let contract_version = capability::negotiate_contract_version(&inner.contract_version)
+            .map_err(map_capability_error)?;
+        let entries = self.discoverable_capabilities(namespace, &principals)?;
+        let mut context = principals.clone();
+        context.sort();
+        context.dedup();
+        context.insert(0, namespace.to_string());
+        let canonical_entries = entries
+            .iter()
+            .map(Message::encode_to_vec)
+            .collect::<Vec<_>>();
+        let catalog_version = capability::snapshot_version(&context, &canonical_entries);
+        let offset =
+            capability::resolve_offset(&inner.catalog_version, &inner.page_token, &catalog_version)
+                .map_err(map_capability_error)?;
+        let page_size = capability::page_size(inner.page_size);
+        let end = offset.saturating_add(page_size).min(entries.len());
+        let capabilities = entries.get(offset..end).unwrap_or_default().to_vec();
+        let next_page_token = capability::next_page_token(&catalog_version, end, entries.len());
+
+        Ok(Response::new(DiscoverCapabilitiesResponse {
+            capabilities,
+            contract_version: contract_version.to_string(),
+            catalog_version,
+            next_page_token,
+            total_size: entries.len().min(u32::MAX as usize) as u32,
+            cache_scope: "authorization_context".into(),
+        }))
+    }
+
     async fn list_schema_types(
         &self,
         req: Request<ListSchemaTypesRequest>,
@@ -3533,6 +4004,10 @@ impl SekaiService for SekaiServiceImpl {
                 "team object creation requires a canonical namespace",
             ));
         }
+        let schema_kinds = actions
+            .schema_kinds(&self.db, &r.action, &r.params)
+            .map_err(Status::invalid_argument)?;
+        ensure_action_schema_kinds_allowed(&schema_kinds)?;
         let actor = principals.first().cloned().unwrap_or_default();
         // Governed-action policy gate (Plan 9, Phase A). Resolved by
         // agent-then-namespace scope; no policy == allow (backward compatible).
@@ -3799,9 +4274,6 @@ impl SekaiService for SekaiServiceImpl {
                 budget_subject
             )));
         }
-        let schema_kinds = actions
-            .schema_kinds(&self.db, &r.action, &r.params)
-            .map_err(Status::invalid_argument)?;
         for kind in schema_kinds {
             self.require_schema_kind_loaded(&kind)?;
         }
@@ -14594,5 +15066,511 @@ mod tests {
                 "reserved governance kind {kind:?} is not exclusion-safe"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_requires_authentication_and_stable_version() {
+        let svc = service();
+        let unauthenticated = svc
+            .discover_capabilities(Request::new(DiscoverCapabilitiesRequest {
+                namespace: "acme".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
+
+        let blank_principal = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    ..Default::default()
+                },
+                ",",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(blank_principal.code(), tonic::Code::Unauthenticated);
+
+        let unsupported = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    contract_version: "2.0".into(),
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(unsupported.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            unsupported.message(),
+            "unsupported capability catalog contract version"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_is_deterministic_pageable_and_reuses_schemas() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_action_type(with_named_principal(
+            CreateActionTypeRequest {
+                action_type: Some(assign_color_action()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "acme".into(),
+                default_decision: ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: Some(7),
+                max_deletes_per_work_unit: Some(2),
+            })
+            .unwrap();
+
+        let full = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(full.contract_version, capability::CONTRACT_VERSION);
+        assert_eq!(full.cache_scope, "authorization_context");
+        assert_eq!(full.total_size as usize, full.capabilities.len());
+        let widget_query = full
+            .capabilities
+            .iter()
+            .find(|entry| entry.name == "sekai.objects.query.widget")
+            .unwrap();
+        assert_eq!(widget_query.object_type.as_ref().unwrap().kind, "widget");
+        assert_eq!(widget_query.input_type, "sekai.ListObjectsRequest");
+        let custom_action = full
+            .capabilities
+            .iter()
+            .find(|entry| entry.name == "sekai.actions.assign_color")
+            .unwrap();
+        let custom_action_type = custom_action.action_type.as_ref().unwrap();
+        assert_eq!(custom_action_type.name, "assign_color");
+        assert_eq!(custom_action_type.params, assign_color_action().params);
+        assert_eq!(custom_action_type.ops, assign_color_action().ops);
+        assert_eq!(custom_action.approval_behavior, "required");
+        assert!(
+            custom_action
+                .limits
+                .iter()
+                .any(|limit| { limit.name == "max_mutations_per_work_unit" && limit.value == 7 })
+        );
+        assert!(
+            custom_action
+                .limits
+                .iter()
+                .any(|limit| { limit.name == "max_deletes_per_work_unit" && limit.value == 2 })
+        );
+        assert!(
+            full.capabilities
+                .iter()
+                .all(|entry| entry.name != "sekai.actions.create_object")
+        );
+        let create_widget = full
+            .capabilities
+            .iter()
+            .find(|entry| entry.name == "sekai.actions.create_object.widget")
+            .unwrap();
+        let create_params = &create_widget.action_type.as_ref().unwrap().params;
+        assert!(create_params.iter().any(|param| {
+            param.name == "kind" && param.r#type == "enum" && param.enum_values == ["widget"]
+        }));
+        assert!(create_params.iter().any(|param| {
+            param.name == "color" && param.r#type == "enum" && param.enum_values == ["red", "blue"]
+        }));
+        assert_eq!(create_widget.object_type.as_ref().unwrap().kind, "widget");
+        let record_learning = full
+            .capabilities
+            .iter()
+            .find(|entry| entry.name == "sekai.actions.record_learning")
+            .unwrap();
+        let learning_params = &record_learning.action_type.as_ref().unwrap().params;
+        assert!(
+            learning_params
+                .iter()
+                .any(|param| param.name == "score" && param.r#type == "int")
+        );
+        assert!(
+            learning_params
+                .iter()
+                .any(|param| param.name == "passed" && param.r#type == "bool")
+        );
+        assert!(learning_params.iter().any(|param| {
+            param.name == "status"
+                && param.r#type == "enum"
+                && param.enum_values == ["candidate", "active", "superseded", "rejected"]
+        }));
+        assert!(
+            record_learning
+                .limits
+                .iter()
+                .any(|limit| { limit.name == "max_mutations_per_invocation" && limit.value == 2 })
+        );
+        assert!(
+            record_learning
+                .limits
+                .iter()
+                .any(|limit| limit.name == "score_max" && limit.value == 100)
+        );
+
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "acme".into(),
+                default_decision: ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: Some(8),
+                max_deletes_per_work_unit: Some(2),
+            })
+            .unwrap();
+        let policy_changed = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(policy_changed.catalog_version, full.catalog_version);
+
+        let first = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 2,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let repeat = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 2,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.catalog_version, repeat.catalog_version);
+        assert_eq!(first.capabilities, repeat.capabilities);
+        assert!(!first.next_page_token.is_empty());
+
+        let second = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    catalog_version: first.catalog_version.clone(),
+                    page_size: 2,
+                    page_token: first.next_page_token,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second.catalog_version, first.catalog_version);
+        assert!(first.capabilities.iter().all(|left| {
+            second
+                .capabilities
+                .iter()
+                .all(|right| left.name != right.name)
+        }));
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_filters_namespace_schema_action_and_policy_metadata() {
+        let svc = service();
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "acme".into(),
+                principal: "alice".into(),
+                role: "editor".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "beta".into(),
+                principal: "bob".into(),
+                role: "viewer".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_action_type(with_named_principal(
+            CreateActionTypeRequest {
+                action_type: Some(assign_color_action()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut secret_schema = widget_schema_type();
+        secret_schema.kind = "secret_widget".into();
+        secret_schema.description = "hidden schema description".into();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(secret_schema),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut secret_action = assign_color_action();
+        secret_action.name = "secret_action".into();
+        secret_action.description = "hidden action description".into();
+        secret_action.target_kind = "secret_widget".into();
+        svc.create_action_type(with_named_principal(
+            CreateActionTypeRequest {
+                action_type: Some(secret_action),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        grant_object_role(
+            &svc,
+            &schema_object_id("secret_widget"),
+            "bob",
+            security::Role::Viewer,
+        );
+        grant_object_role(
+            &svc,
+            &action_object_id("secret_action"),
+            "bob",
+            security::Role::Viewer,
+        );
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "acme".into(),
+                default_decision: ActionDecision::Allow,
+                action_overrides: HashMap::from([("assign_color".into(), ActionDecision::Deny)]),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+
+        let before = svc
+            .db
+            .list_decisions(&audit::DecisionFilter::default())
+            .unwrap()
+            .len();
+        let catalog = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(catalog.capabilities.iter().all(|entry| {
+            !entry.name.contains("secret_widget")
+                && !entry.name.contains("secret_action")
+                && !entry.name.contains("assign_color")
+                && entry
+                    .object_type
+                    .as_ref()
+                    .is_none_or(|object_type| object_type.kind != "secret_widget")
+                && entry
+                    .action_type
+                    .as_ref()
+                    .is_none_or(|action_type| action_type.name != "secret_action")
+        }));
+        assert!(
+            catalog
+                .capabilities
+                .iter()
+                .any(|entry| entry.name == "sekai.objects.query.widget")
+        );
+        let after = svc
+            .db
+            .list_decisions(&audit::DecisionFilter::default())
+            .unwrap()
+            .len();
+        assert_eq!(
+            before, after,
+            "discovery must not emit hidden audit metadata"
+        );
+
+        let denied = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "beta".into(),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "capability discovery denied");
+        assert!(!denied.message().contains("secret_widget"));
+        assert!(!denied.message().contains("secret_action"));
+
+        let viewer_catalog = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "beta".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "bob",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            viewer_catalog
+                .capabilities
+                .iter()
+                .all(|entry| entry.kind != "action")
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_rejects_a_stale_pinned_snapshot_without_metadata() {
+        let svc = service();
+        let first = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 1,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+
+        let stale = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    catalog_version: first.catalog_version,
+                    page_size: 1,
+                    page_token: first.next_page_token,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::Aborted);
+        assert_eq!(stale.message(), "capability catalog version unavailable");
+        assert!(!stale.message().contains("widget"));
+    }
+
+    #[tokio::test]
+    async fn capability_catalog_never_advertises_or_executes_reserved_creation() {
+        let svc = service();
+        let catalog = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        for kind in RESERVED_GOVERNANCE_KINDS {
+            assert!(catalog.capabilities.iter().all(|entry| {
+                entry
+                    .object_type
+                    .as_ref()
+                    .is_none_or(|object_type| object_type.kind != *kind)
+                    && entry.name != format!("sekai.actions.create_object.{kind}")
+            }));
+        }
+
+        let params = HashMap::from([
+            ("id".into(), "forged-policy".into()),
+            ("kind".into(), action_policy::ACTION_POLICY_KIND.into()),
+            ("name".into(), "forged".into()),
+            ("namespace".into(), "acme".into()),
+        ]);
+        let denied = svc
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "create_object".into(),
+                        params: params.clone(),
+                        actor: String::new(),
+                    }),
+                    dry_run: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.get_object("forged-policy").unwrap().is_none());
+
+        let resumed = svc
+            .run_action_effect("create_object", &params, "local", &["local".into()])
+            .unwrap_err();
+        assert_eq!(resumed.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.get_object("forged-policy").unwrap().is_none());
     }
 }
