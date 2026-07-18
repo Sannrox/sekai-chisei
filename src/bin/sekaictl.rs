@@ -40,6 +40,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "memory" => {
             sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
         }
+        "gunshi" => match args.get(1).map(String::as_str) {
+            Some("recommend") => {
+                let config =
+                    sekai_chisei::gunshi_cli::RecommendConfig::from_args(args.into_iter().skip(2))
+                        .map_err(std::io::Error::other)?;
+                let output = config.output.clone();
+                sekai_chisei::gunshi_cli::run_recommend(config)?;
+                println!("created {}", output.display());
+                Ok(())
+            }
+            _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
+        },
         "team" => match args.get(1).map(String::as_str) {
             Some("join") => {
                 let config = sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(
@@ -259,7 +271,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory|team> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory|team|gunshi> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -294,6 +306,10 @@ fn print_root_usage() {
     println!(
         "\nMemory commands:\n  {}",
         sekai_chisei::memory_cli::usage()
+    );
+    println!(
+        "\nGunshi recommendations:\n  {}",
+        sekai_chisei::gunshi_cli::usage()
     );
     println!("\nTeam commands:\n  {}", sekai_chisei::team_cli::usage());
 }
