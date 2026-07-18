@@ -14,6 +14,8 @@
 
 Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_AUTH_TOKEN`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 
+GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
+
 ## Coding Style & Naming Conventions
 
 Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `src/llm/` abstractions. Prefer explicit policy, audit, and authorization behavior over hidden side effects.

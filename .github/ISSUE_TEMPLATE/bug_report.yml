@@ -56,6 +56,11 @@ body:
       label: Redacted logs or diagnostics
       description: Remove secrets and sensitive data before submitting.
       render: shell
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression evidence
+      description: If known, identify the last working version or a focused test that should catch this behavior.
   - type: checkboxes
     id: checks
     attributes:

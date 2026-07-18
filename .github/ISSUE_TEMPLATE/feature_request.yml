@@ -17,6 +17,18 @@ body:
     validations:
       required: true
   - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: What observable examples, tests, or measurements will demonstrate that the outcome is complete?
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What related behavior is intentionally outside this request?
+  - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
@@ -40,6 +52,11 @@ body:
     attributes:
       label: Compatibility and risk
       description: Note API, migration, security, privacy, or operator implications.
+  - type: textarea
+    id: design
+    attributes:
+      label: Design discussion
+      description: Link the GitHub Discussion when this changes a core boundary, public contract, or difficult-to-reverse decision.
   - type: checkboxes
     id: checks
     attributes:
