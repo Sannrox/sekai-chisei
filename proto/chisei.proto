@@ -781,6 +781,23 @@ message ReviewKiokuMemoryResponse {
   string memory_json = 1;
   repeated string lifecycle_events_json = 2;
 }
+message RecordGunshiFeedbackRequest {
+  string plan_json = 1;
+  string choice_json = 2;
+  string outcome_json = 3;
+  string issuance_id = 4;
+}
+message RecordGunshiFeedbackResponse { string feedback_json = 1; }
+message IssueGunshiRecommendationsRequest {
+  string input_json = 1;
+  string issuance_id = 2;
+}
+message IssueGunshiRecommendationsResponse {
+  string allocation_json = 1;
+  string issuance_id = 2;
+}
+message GetGunshiScorecardRequest { string namespace = 1; }
+message GetGunshiScorecardResponse { string scorecard_json = 1; }
 
 // --- Service ---
 
@@ -821,6 +838,9 @@ service ChiseiService {
   rpc QueryOperationStatistics(QueryOperationStatisticsRequest) returns (QueryOperationStatisticsResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
   rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);
+  rpc IssueGunshiRecommendations(IssueGunshiRecommendationsRequest) returns (IssueGunshiRecommendationsResponse);
+  rpc RecordGunshiFeedback(RecordGunshiFeedbackRequest) returns (RecordGunshiFeedbackResponse);
+  rpc GetGunshiScorecard(GetGunshiScorecardRequest) returns (GetGunshiScorecardResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
   rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 
