@@ -334,7 +334,35 @@ fn grpc_status_name(code: &str) -> String {
     .to_string()
 }
 
+/// Map a gRPC status code onto the bounded outcome vocabulary.
+///
+/// The per-method `grpc_*` series below keep method granularity. This
+/// collapses to `subsystem` and `outcome` so control-plane overhead stays a
+/// flat-cardinality series that can be aggregated across every method.
+fn outcome_for_code(grpc_code: &str) -> crate::obs::labels::Outcome {
+    use crate::obs::labels::Outcome;
+    match grpc_code {
+        "ok" => Outcome::Ok,
+        "deadline_exceeded" => Outcome::Timeout,
+        // Refusals the server chose, as opposed to failures it suffered.
+        "unauthenticated"
+        | "permission_denied"
+        | "invalid_argument"
+        | "failed_precondition"
+        | "resource_exhausted"
+        | "out_of_range"
+        | "already_exists"
+        | "not_found" => Outcome::Rejected,
+        _ => Outcome::Failed,
+    }
+}
+
 fn record_rpc(grpc_service: &str, grpc_method: &str, grpc_code: &str, elapsed: Duration) {
+    crate::obs::signals::record_control_plane_overhead(
+        crate::obs::labels::Subsystem::Grpc,
+        outcome_for_code(grpc_code),
+        elapsed,
+    );
     counter!(
         "grpc_server_handled_total",
         "grpc_service" => grpc_service.to_string(),
@@ -380,6 +408,45 @@ mod tests {
                 parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
                 ("chisei.ChiseiService".into(), method.into())
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_mapping_tests {
+    use super::outcome_for_code;
+    use crate::obs::labels::Outcome;
+
+    #[test]
+    fn success_maps_to_ok() {
+        assert_eq!(outcome_for_code("ok"), Outcome::Ok);
+    }
+
+    #[test]
+    fn deadline_is_a_timeout_not_a_failure() {
+        assert_eq!(outcome_for_code("deadline_exceeded"), Outcome::Timeout);
+    }
+
+    #[test]
+    fn server_refusals_are_rejections_not_failures() {
+        // A refused request is a policy outcome, not a broken server. Folding
+        // these into Failed would make an authentication storm look like an
+        // outage.
+        for code in [
+            "unauthenticated",
+            "permission_denied",
+            "invalid_argument",
+            "failed_precondition",
+            "resource_exhausted",
+        ] {
+            assert_eq!(outcome_for_code(code), Outcome::Rejected, "code {code}");
+        }
+    }
+
+    #[test]
+    fn unknown_and_internal_are_failures() {
+        for code in ["internal", "unknown", "unavailable", "data_loss"] {
+            assert_eq!(outcome_for_code(code), Outcome::Failed, "code {code}");
         }
     }
 }
