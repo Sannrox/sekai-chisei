@@ -4350,7 +4350,7 @@ impl SekaiService for SekaiServiceImpl {
                 .schema
                 .read()
                 .map_err(|_| Status::internal("schema registry unavailable"))?;
-            ontology::project_schema_registry(&schema)
+            ontology::project_schema_registry(&schema).map_err(Status::invalid_argument)?
         };
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let existing_ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
@@ -11257,7 +11257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_projection_rejects_self_inheritance_collision() {
+    async fn schema_projection_rejects_type_interface_name_collision() {
         let svc = service();
         svc.create_interface(with_named_principal(
             CreateInterfaceRequest {
@@ -11292,7 +11292,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
-        assert!(invalid.message().contains("own superclass"));
+        assert!(invalid.message().contains("share ontology class name"));
         assert!(svc.db.list_ontology_classes().unwrap().is_empty());
     }
 
