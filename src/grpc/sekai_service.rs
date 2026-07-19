@@ -4331,8 +4331,18 @@ impl SekaiService for SekaiServiceImpl {
             ontology::project_schema_registry(&schema)
         };
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let existing_ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
         let mut projection_plan = Vec::new();
-        for class in projected.classes() {
+        for mut class in projected.classes() {
+            // Persisted ontology classes are user-owned; the builtin flag is a
+            // schema concept and is not carried into storage.
+            class.is_builtin = false;
+            ontology::validate_class_definition(
+                &class,
+                existing_ontology.get_class(&class.name),
+                &projected,
+            )
+            .map_err(Status::invalid_argument)?;
             let source_object_id = if class.mapped_kind.is_empty() {
                 interface_object_id(&class.name)
             } else {
@@ -4351,10 +4361,7 @@ impl SekaiService for SekaiServiceImpl {
             projection_plan.push((class, source_grants, ontology_object_id, previous_grants));
         }
         let mut classes = Vec::new();
-        for (mut class, source_grants, ontology_object_id, previous_grants) in projection_plan {
-            // Persisted ontology classes are user-owned; the builtin flag is a
-            // schema concept and is not carried into storage.
-            class.is_builtin = false;
+        for (class, source_grants, ontology_object_id, previous_grants) in projection_plan {
             self.db
                 .upsert_projected_ontology_class_with_audit(&class, actor, &source_grants)
                 .map_err(Status::internal)?;
@@ -11153,6 +11160,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.list_ontology_classes().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_projection_rejects_self_inheritance_collision() {
+        let svc = service();
+        svc.create_interface(with_named_principal(
+            CreateInterfaceRequest {
+                interface: Some(InterfaceDef {
+                    name: "Collision".into(),
+                    description: String::new(),
+                    properties: vec![],
+                    is_builtin: false,
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut object_type = widget_schema_type();
+        object_type.kind = "Collision".into();
+        object_type.implements = vec!["Collision".into()];
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(object_type),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+
+        let invalid = svc
+            .project_schema_to_ontology(with_named_principal(
+                ProjectSchemaToOntologyRequest {},
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+        assert!(invalid.message().contains("own superclass"));
         assert!(svc.db.list_ontology_classes().unwrap().is_empty());
     }
 
