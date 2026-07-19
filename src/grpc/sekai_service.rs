@@ -4275,6 +4275,18 @@ impl SekaiService for SekaiServiceImpl {
         registry.remove_relation(&parsed.name);
         ontology::validate_relation_definition(&parsed, existing.as_ref(), &registry)
             .map_err(Status::invalid_argument)?;
+        for referencing in registry
+            .relations()
+            .into_iter()
+            .filter(|relation| relation.inverse == parsed.name)
+        {
+            if referencing.domain != parsed.range || referencing.range != parsed.domain {
+                return Err(Status::invalid_argument(format!(
+                    "relation '{}' would no longer reverse inverse '{}'",
+                    referencing.name, parsed.name
+                )));
+            }
+        }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .upsert_ontology_relation_with_audit(&parsed, actor)
@@ -11050,6 +11062,25 @@ mod tests {
             .await
             .unwrap();
         }
+
+        let incompatible_update = svc
+            .create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+                relation: Some(OntologyRelation {
+                    name: "works_for".into(),
+                    description: String::new(),
+                    domain: "Company".into(),
+                    range: "Person".into(),
+                    cardinality: None,
+                    inverse: String::new(),
+                    transitive: false,
+                    is_builtin: false,
+                    mapped_relation: String::new(),
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(incompatible_update.code(), tonic::Code::InvalidArgument);
+        assert!(incompatible_update.message().contains("no longer reverse"));
 
         let err = svc
             .delete_ontology_relation(with_principal(DeleteOntologyRelationRequest {
