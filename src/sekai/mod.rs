@@ -19,6 +19,7 @@ pub mod learning;
 pub mod ledger;
 pub mod lineage;
 pub mod observation;
+pub mod ontology;
 pub mod propagation;
 pub mod query;
 pub mod relation_object;

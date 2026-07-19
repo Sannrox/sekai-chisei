@@ -20,6 +20,8 @@ in order.
 - [Responses harness profile](responses-harness-profile.md) — implement the
   supported request, streaming, and error contract.
 - [`proto/`](../proto/) — inspect the native gRPC APIs.
+- [Ontology definitions](ontology.md) — model semantic classes and relations,
+  project schemas, and understand current validation boundaries.
 - [External evidence adapters](../adapters/README.md) — submit evidence through
   the versioned adapter contract.
 
