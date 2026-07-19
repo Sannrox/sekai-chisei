@@ -640,6 +640,12 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?;
         if deleted > 0 {
+            transaction
+                .execute(
+                    "DELETE FROM sekai_grants WHERE object_id = ?1",
+                    params![format!("ontology:class:{name}")],
+                )
+                .map_err(|error| error.to_string())?;
             insert_ontology_audit(
                 &transaction,
                 actor,
@@ -815,6 +821,12 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?;
         if deleted > 0 {
+            transaction
+                .execute(
+                    "DELETE FROM sekai_grants WHERE object_id = ?1",
+                    params![format!("ontology:relation:{name}")],
+                )
+                .map_err(|error| error.to_string())?;
             insert_ontology_audit(
                 &transaction,
                 actor,
