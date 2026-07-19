@@ -531,6 +531,12 @@ impl SekaiDb {
         {
             return Err("object namespace is immutable".into());
         }
+        if before
+            .as_ref()
+            .is_some_and(|existing| existing.kind != o.kind)
+        {
+            crate::sekai::ontology::validate_object_kind_change(&tx, &o.id, &o.kind)?;
+        }
         let props = serde_json::to_string(&o.properties).unwrap_or_default();
         tx.execute(
             "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
@@ -961,12 +967,30 @@ impl SekaiDb {
     }
 
     pub fn create_link(&self, l: &Link) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = ?1)",
+                params![l.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        transaction.execute(
             "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
             params![l.id, l.from_id, l.to_id, l.relation, l.created],
         ).map_err(|e| e.to_string())?;
-        Ok(())
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
@@ -993,6 +1017,29 @@ impl SekaiDb {
         )
         .optional()
         .map_err(|e| e.to_string())
+    }
+
+    pub fn list_links_by_relation(&self, relation: &str) -> Result<Vec<Link>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links
+                 WHERE relation = ?1 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![relation], |row| {
+                Ok(Link {
+                    id: row.get(0)?,
+                    from_id: row.get(1)?,
+                    to_id: row.get(2)?,
+                    relation: row.get(3)?,
+                    created: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     pub fn get_links(

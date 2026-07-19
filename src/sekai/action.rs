@@ -1014,6 +1014,14 @@ impl SekaiDb {
                         .ok_or_else(|| format!("missing required param: {}", op.property))?;
                     ensure_object_exists(&tx, &to_id)?;
                     let link_id = format!("{}->{}", target_object.id, to_id);
+                    if get_link_tx(&tx, &link_id)?.is_none() {
+                        crate::sekai::ontology::validate_link_constraint(
+                            &tx,
+                            &target_object.id,
+                            &to_id,
+                            &op.relation,
+                        )?;
+                    }
                     tx.execute(
                         "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
                         params![

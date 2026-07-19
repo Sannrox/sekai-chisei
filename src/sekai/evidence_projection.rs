@@ -313,6 +313,12 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
+        crate::sekai::ontology::validate_link_constraint(
+            &tx,
+            &evidence_object_id,
+            target_object_id,
+            REL_EVIDENCE_FOR,
+        )?;
         tx.execute(
             "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
              VALUES (?1,?2,?3,?4,?5)",
@@ -326,6 +332,12 @@ impl SekaiDb {
         )
         .map_err(|error| error.to_string())?;
         for relationship in &resolved_relationships {
+            crate::sekai::ontology::validate_link_constraint(
+                &tx,
+                &evidence_object_id,
+                &relationship.related_object_id,
+                REL_DERIVED_FROM,
+            )?;
             tx.execute(
                 "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
                  VALUES (?1,?2,?3,?4,?5)",

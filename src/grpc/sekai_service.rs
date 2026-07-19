@@ -2227,6 +2227,47 @@ fn check_ontology_relation_read(
     Ok(())
 }
 
+fn ontology_link_violations(
+    registry: &ontology::OntologyRegistry,
+    relation: &ontology::OntologyRelation,
+    from_kind: &str,
+    to_kind: &str,
+) -> (bool, bool) {
+    (
+        !registry.kind_satisfies_class(from_kind, &relation.domain),
+        !registry.kind_satisfies_class(to_kind, &relation.range),
+    )
+}
+
+fn validate_mapped_link(
+    registry: &ontology::OntologyRegistry,
+    mapped_relation: &str,
+    from_kind: &str,
+    to_kind: &str,
+) -> Result<(), Status> {
+    if registry
+        .constraints_for_mapped_relation(mapped_relation)
+        .into_iter()
+        .any(|relation| {
+            let (domain, range) = ontology_link_violations(registry, relation, from_kind, to_kind);
+            domain || range
+        })
+    {
+        return Err(Status::failed_precondition(
+            "link endpoints violate ontology constraint",
+        ));
+    }
+    Ok(())
+}
+
+fn map_graph_mutation_error(error: String) -> Status {
+    if error == "link endpoints violate ontology constraint" {
+        Status::failed_precondition(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
 fn check_ontology_grant_target(
     db: &SekaiDb,
     security: &SecurityChecker,
@@ -3242,10 +3283,65 @@ impl SekaiService for SekaiServiceImpl {
             .validate(&domain_obj)
             .map_err(Status::invalid_argument)?;
         drop(schema);
+        if existing.kind != domain_obj.kind {
+            let ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
+            let mut linked = self
+                .db
+                .get_links(&domain_obj.id, "", &domain::Direction::Outgoing)
+                .map_err(Status::internal)?;
+            linked.extend(
+                self.db
+                    .get_links(&domain_obj.id, "", &domain::Direction::Incoming)
+                    .map_err(Status::internal)?,
+            );
+            for link in linked {
+                if ontology
+                    .constraints_for_mapped_relation(&link.relation)
+                    .is_empty()
+                {
+                    continue;
+                }
+                if link.from_id != domain_obj.id {
+                    let endpoint = self
+                        .db
+                        .get_object(&link.from_id)
+                        .map_err(Status::internal)?
+                        .ok_or(Status::failed_precondition("link endpoint unavailable"))?;
+                    check_team_namespace(&self.db, &principals, &endpoint.namespace, false)?;
+                    check_read(&self.security, &endpoint.id, &principals)?;
+                }
+                if link.to_id != domain_obj.id {
+                    let endpoint = self
+                        .db
+                        .get_object(&link.to_id)
+                        .map_err(Status::internal)?
+                        .ok_or(Status::failed_precondition("link endpoint unavailable"))?;
+                    check_team_namespace(&self.db, &principals, &endpoint.namespace, false)?;
+                    check_read(&self.security, &endpoint.id, &principals)?;
+                }
+                if ontology
+                    .constraints_for_mapped_relation(&link.relation)
+                    .into_iter()
+                    .any(|constraint| {
+                        let introduces_domain_violation = link.from_id == domain_obj.id
+                            && ontology.kind_satisfies_class(&existing.kind, &constraint.domain)
+                            && !ontology.kind_satisfies_class(&domain_obj.kind, &constraint.domain);
+                        let introduces_range_violation = link.to_id == domain_obj.id
+                            && ontology.kind_satisfies_class(&existing.kind, &constraint.range)
+                            && !ontology.kind_satisfies_class(&domain_obj.kind, &constraint.range);
+                        introduces_domain_violation || introduces_range_violation
+                    })
+                {
+                    return Err(Status::failed_precondition(
+                        "link endpoints violate ontology constraint",
+                    ));
+                }
+            }
+        }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .update_object_with_audit(&domain_obj, actor)
-            .map_err(Status::internal)?
+            .map_err(map_graph_mutation_error)?
             .ok_or(Status::not_found("not found"))?;
         let domain_obj = self.resolve_computed_for_response(domain_obj, &principals)?;
         Ok(Response::new(UpdateObjectResponse {
@@ -3565,6 +3661,7 @@ impl SekaiService for SekaiServiceImpl {
             .into_inner()
             .link
             .ok_or(Status::invalid_argument("link required"))?;
+        let mut endpoints = Vec::with_capacity(2);
         for object_id in [&l.from_id, &l.to_id] {
             let object = self
                 .db
@@ -3573,6 +3670,16 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::not_found("link endpoint not found"))?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
+            endpoints.push(object);
+        }
+        if self.db.get_link(&l.id).map_err(Status::internal)?.is_none() {
+            let ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
+            validate_mapped_link(
+                &ontology,
+                &l.relation,
+                &endpoints[0].kind,
+                &endpoints[1].kind,
+            )?;
         }
         let dl = domain::Link {
             id: l.id.clone(),
@@ -3581,7 +3688,7 @@ impl SekaiService for SekaiServiceImpl {
             relation: l.relation.clone(),
             created: l.created,
         };
-        self.db.create_link(&dl).map_err(Status::internal)?;
+        self.db.create_link(&dl).map_err(map_graph_mutation_error)?;
         Ok(Response::new(CreateLinkResponse { link: Some(l) }))
     }
     async fn delete_link(
@@ -4428,6 +4535,72 @@ impl SekaiService for SekaiServiceImpl {
             classes.push(to_proto_ontology_class(&class));
         }
         Ok(Response::new(ProjectSchemaToOntologyResponse { classes }))
+    }
+
+    async fn report_ontology_link_violations(
+        &self,
+        req: Request<ReportOntologyLinkViolationsRequest>,
+    ) -> Result<Response<ReportOntologyLinkViolationsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().ontology_relation;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("ontology relation required"));
+        }
+        // Authorize the ontology definition before loading or reporting any of
+        // its endpoint details.
+        check_read(
+            &self.security,
+            &ontology_relation_object_id(&name),
+            &principals,
+        )?;
+        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let relation = registry
+            .get_relation(&name)
+            .ok_or(Status::not_found("ontology relation not found"))?;
+        check_ontology_relation_read(&self.security, relation, &principals)?;
+
+        let mut violations = Vec::new();
+        if !relation.mapped_relation.is_empty() {
+            for link in self
+                .db
+                .list_links_by_relation(&relation.mapped_relation)
+                .map_err(Status::internal)?
+            {
+                let Some(from) = self
+                    .db
+                    .get_object(&link.from_id)
+                    .map_err(Status::internal)?
+                else {
+                    continue;
+                };
+                let Some(to) = self.db.get_object(&link.to_id).map_err(Status::internal)? else {
+                    continue;
+                };
+                if check_team_namespace(&self.db, &principals, &from.namespace, false).is_err()
+                    || check_team_namespace(&self.db, &principals, &to.namespace, false).is_err()
+                    || check_read(&self.security, &from.id, &principals).is_err()
+                    || check_read(&self.security, &to.id, &principals).is_err()
+                {
+                    continue;
+                }
+                let (domain_violation, range_violation) =
+                    ontology_link_violations(&registry, relation, &from.kind, &to.kind);
+                if domain_violation || range_violation {
+                    violations.push(OntologyLinkViolation {
+                        link_id: link.id,
+                        from_id: link.from_id,
+                        to_id: link.to_id,
+                        relation: link.relation,
+                        domain_violation,
+                        range_violation,
+                    });
+                }
+            }
+        }
+        Ok(Response::new(ReportOntologyLinkViolationsResponse {
+            violations,
+        }))
     }
 
     async fn create_action_type(
@@ -7820,6 +7993,38 @@ mod tests {
         }
     }
 
+    fn seed_object_kind(svc: &SekaiServiceImpl, id: &str, kind: &str) {
+        svc.db
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: kind.into(),
+                name: id.into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+
+    fn seed_ontology_class(svc: &SekaiServiceImpl, name: &str, kind: &str) {
+        let mut class = ontology::OntologyClass {
+            name: name.into(),
+            description: String::new(),
+            superclasses: vec![],
+            equivalent_classes: vec![],
+            disjoint_classes: vec![],
+            properties: vec![],
+            is_builtin: false,
+            mapped_kind: kind.into(),
+        };
+        if kind.is_empty() {
+            class.mapped_kind.clear();
+        }
+        svc.db.upsert_ontology_class(&class).unwrap();
+    }
+
     fn grant_action_admin(svc: &SekaiServiceImpl) {
         let grant = security::Grant {
             id: format!("action-admin-{}", uuid::Uuid::new_v4().simple()),
@@ -10921,6 +11126,300 @@ mod tests {
             .unwrap();
         assert_eq!(created.domain, "Person");
         assert_eq!(created.range, "Company");
+    }
+
+    #[tokio::test]
+    async fn mapped_relations_enforce_effective_endpoint_classes_and_report_legacy_violations() {
+        let svc = service();
+        seed_ontology_class(&svc, "Person", "");
+        seed_ontology_class(&svc, "Human", "");
+        seed_ontology_class(&svc, "Engineer", "component");
+        seed_ontology_class(&svc, "Company", "model");
+        seed_ontology_class(&svc, "Project", "project");
+
+        let mut person = svc.db.get_ontology_class("Person").unwrap().unwrap();
+        person.equivalent_classes = vec!["Human".into()];
+        svc.db.upsert_ontology_class(&person).unwrap();
+        let mut engineer = svc.db.get_ontology_class("Engineer").unwrap().unwrap();
+        engineer.superclasses = vec!["Human".into()];
+        svc.db.upsert_ontology_class(&engineer).unwrap();
+
+        seed_object_kind(&svc, "engineer", "component");
+        seed_object_kind(&svc, "company", "model");
+        seed_object_kind(&svc, "project", "project");
+        seed_object_kind(&svc, "bad-target", "project");
+
+        // Unconstrained graph relations retain their existing permissive behavior.
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "legacy".into(),
+                from_id: "project".into(),
+                to_id: "company".into(),
+                relation: "works_for".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "legacy-both".into(),
+                from_id: "project".into(),
+                to_id: "bad-target".into(),
+                relation: "works_for".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        svc.db
+            .upsert_ontology_relation(&ontology::OntologyRelation {
+                name: "employment".into(),
+                description: String::new(),
+                domain: "Person".into(),
+                range: "Company".into(),
+                cardinality: ontology::Cardinality::default(),
+                inverse: String::new(),
+                transitive: false,
+                is_builtin: false,
+                mapped_relation: "works_for".into(),
+            })
+            .unwrap();
+
+        // Engineer reaches Person through inheritance and symmetric equivalence.
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "valid".into(),
+                from_id: "engineer".into(),
+                to_id: "company".into(),
+                relation: "works_for".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "legacy".into(),
+                from_id: "project".into(),
+                to_id: "company".into(),
+                relation: "works_for".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let incompatible = svc
+            .create_link(with_principal(CreateLinkRequest {
+                link: Some(Link {
+                    id: "invalid".into(),
+                    from_id: "project".into(),
+                    to_id: "company".into(),
+                    relation: "works_for".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(incompatible.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            incompatible.message(),
+            "link endpoints violate ontology constraint"
+        );
+        assert_eq!(
+            svc.db
+                .create_link(&domain::Link {
+                    id: "invalid-internal".into(),
+                    from_id: "project".into(),
+                    to_id: "company".into(),
+                    relation: "works_for".into(),
+                    created: 0,
+                })
+                .unwrap_err(),
+            "link endpoints violate ontology constraint"
+        );
+        svc.create_link(with_principal(CreateLinkRequest {
+            link: Some(Link {
+                id: "empty-relation".into(),
+                from_id: "project".into(),
+                to_id: "company".into(),
+                relation: String::new(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let report = svc
+            .report_ontology_link_violations(with_principal(ReportOntologyLinkViolationsRequest {
+                ontology_relation: "employment".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(report.violations.len(), 2);
+        assert_eq!(report.violations[0].link_id, "legacy");
+        assert!(report.violations[0].domain_violation);
+        assert!(!report.violations[0].range_violation);
+
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(Object {
+                id: "project".into(),
+                kind: "project".into(),
+                name: "renamed legacy project".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(Object {
+                id: "project".into(),
+                kind: "component".into(),
+                name: "renamed legacy project".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 2,
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let update = svc
+            .update_object(with_principal(UpdateObjectRequest {
+                object: Some(Object {
+                    id: "engineer".into(),
+                    kind: "project".into(),
+                    name: "engineer".into(),
+                    namespace: String::new(),
+                    external_id: String::new(),
+                    properties: HashMap::new(),
+                    created: 0,
+                    updated: 1,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(update.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            update.message(),
+            "link endpoints violate ontology constraint"
+        );
+        let mut internal_update = svc.db.get_object("engineer").unwrap().unwrap();
+        internal_update.kind = "project".into();
+        assert_eq!(
+            svc.db.update_object(&internal_update).unwrap_err(),
+            "link endpoints violate ontology constraint"
+        );
+    }
+
+    #[tokio::test]
+    async fn ontology_constraint_checks_do_not_bypass_endpoint_authorization() {
+        let svc = service();
+        seed_ontology_class(&svc, "Person", "component");
+        seed_ontology_class(&svc, "Company", "model");
+        seed_object_kind(&svc, "person", "project");
+        seed_object_kind(&svc, "hidden", "project");
+        grant_object_role(&svc, "hidden", "other", security::Role::Admin);
+        svc.db
+            .create_link(&domain::Link {
+                id: "existing-hidden-link".into(),
+                from_id: "person".into(),
+                to_id: "hidden".into(),
+                relation: "works_for".into(),
+                created: 0,
+            })
+            .unwrap();
+        svc.db
+            .upsert_ontology_relation(&ontology::OntologyRelation {
+                name: "employment".into(),
+                description: String::new(),
+                domain: "Person".into(),
+                range: "Company".into(),
+                cardinality: ontology::Cardinality::default(),
+                inverse: String::new(),
+                transitive: false,
+                is_builtin: false,
+                mapped_relation: "works_for".into(),
+            })
+            .unwrap();
+
+        let report = svc
+            .report_ontology_link_violations(with_principal(ReportOntologyLinkViolationsRequest {
+                ontology_relation: "employment".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(report.violations.is_empty());
+
+        let error = svc
+            .create_link(with_principal(CreateLinkRequest {
+                link: Some(Link {
+                    id: "hidden-link".into(),
+                    from_id: "person".into(),
+                    to_id: "hidden".into(),
+                    relation: "works_for".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_ne!(
+            error.message(),
+            "link endpoints violate ontology constraint"
+        );
+
+        let update = svc
+            .update_object(with_principal(UpdateObjectRequest {
+                object: Some(Object {
+                    id: "person".into(),
+                    kind: "component".into(),
+                    name: "person".into(),
+                    namespace: String::new(),
+                    external_id: String::new(),
+                    properties: HashMap::new(),
+                    created: 0,
+                    updated: 1,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(update.code(), tonic::Code::PermissionDenied);
+
+        seed_object_kind(&svc, "unconstrained", "project");
+        svc.db
+            .create_link(&domain::Link {
+                id: "unconstrained-hidden-link".into(),
+                from_id: "unconstrained".into(),
+                to_id: "hidden".into(),
+                relation: "unmapped".into(),
+                created: 0,
+            })
+            .unwrap();
+        svc.update_object(with_principal(UpdateObjectRequest {
+            object: Some(Object {
+                id: "unconstrained".into(),
+                kind: "component".into(),
+                name: "unconstrained".into(),
+                namespace: String::new(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 1,
+            }),
+        }))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
