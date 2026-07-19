@@ -442,6 +442,17 @@ message DeleteOntologyRelationResponse {}
 message ProjectSchemaToOntologyRequest {}
 message ProjectSchemaToOntologyResponse { repeated OntologyClass classes = 1; }
 
+message OntologyLinkViolation {
+  string link_id = 1;
+  string from_id = 2;
+  string to_id = 3;
+  string relation = 4;
+  bool domain_violation = 5;
+  bool range_violation = 6;
+}
+message ReportOntologyLinkViolationsRequest { string ontology_relation = 1; }
+message ReportOntologyLinkViolationsResponse { repeated OntologyLinkViolation violations = 1; }
+
 message ExecuteFunctionRequest { string name = 1; map<string, string> params = 2; }
 message ExecuteFunctionResponse { FunctionResult result = 1; }
 message CreateFunctionRequest { Function function = 1; }
@@ -987,6 +998,7 @@ service SekaiService {
   rpc CreateOntologyRelation(CreateOntologyRelationRequest) returns (CreateOntologyRelationResponse);
   rpc DeleteOntologyRelation(DeleteOntologyRelationRequest) returns (DeleteOntologyRelationResponse);
   rpc ProjectSchemaToOntology(ProjectSchemaToOntologyRequest) returns (ProjectSchemaToOntologyResponse);
+  rpc ReportOntologyLinkViolations(ReportOntologyLinkViolationsRequest) returns (ReportOntologyLinkViolationsResponse);
 
   rpc CreateFunction(CreateFunctionRequest) returns (CreateFunctionResponse);
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);

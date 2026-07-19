@@ -783,6 +783,9 @@ impl SekaiDb {
         if before_object.namespace != object.namespace {
             return Err("object namespace is immutable".into());
         }
+        if before_object.kind != object.kind {
+            crate::sekai::ontology::validate_object_kind_change(&tx, &object.id, &object.kind)?;
+        }
         let props = serde_json::to_string(&object.properties).unwrap_or_default();
         tx.execute(
             "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",

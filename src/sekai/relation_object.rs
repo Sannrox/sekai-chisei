@@ -116,6 +116,12 @@ pub fn create_relationship_object(
         ],
     )
     .map_err(|error| error.to_string())?;
+    crate::sekai::ontology::validate_link_constraint(
+        &tx,
+        &relationship.id,
+        &source_id,
+        REL_RELATION_SOURCE,
+    )?;
     tx.execute(
         "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -128,6 +134,12 @@ pub fn create_relationship_object(
         ],
     )
     .map_err(|error| error.to_string())?;
+    crate::sekai::ontology::validate_link_constraint(
+        &tx,
+        &relationship.id,
+        &target_id,
+        REL_RELATION_TARGET,
+    )?;
     tx.execute(
         "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
          VALUES (?1, ?2, ?3, ?4, ?5)",
