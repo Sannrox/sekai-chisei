@@ -739,6 +739,13 @@ pub fn register_capability(
             relation: REL_DEPENDS_ON.to_string(),
             created: now,
         };
+        crate::sekai::ontology::validate_link_constraint(
+            &tx,
+            &link.from_id,
+            &link.to_id,
+            &link.relation,
+        )
+        .map_err(registry_storage)?;
         tx.execute(
             "INSERT INTO sekai_links (id, from_id, to_id, relation, created) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
