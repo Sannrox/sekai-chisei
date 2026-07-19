@@ -102,8 +102,11 @@ struct ResultRow<'a> {
 }
 
 fn main() -> Result<(), String> {
+    // Cargo passes `--bench` to the harness, so positional detection must skip
+    // flags rather than trusting argv[1].
     let manifest_path = env::args()
-        .nth(1)
+        .skip(1)
+        .find(|argument| !argument.starts_with('-'))
         .unwrap_or_else(|| "benchmarks/manifest-v1.json".to_string());
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|error| format!("read benchmark manifest {manifest_path}: {error}"))?;
