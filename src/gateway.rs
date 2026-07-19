@@ -3381,6 +3381,12 @@ async fn check_budget_preflight(
                             && resp.degradation_level == "local_free";
                         if resp.allowed || provisional_local_free {
                             if resp.warning {
+                                // Control plane answered, but degraded the
+                                // route rather than granting the preferred one.
+                                crate::obs::signals::record_fallback(
+                                    crate::obs::labels::Subsystem::Gateway,
+                                    crate::obs::labels::FallbackTrigger::BudgetDegraded,
+                                );
                                 record_gateway_decision(
                                     config,
                                     identity,
@@ -3777,6 +3783,12 @@ async fn reserve_cached_budget(
     let mut response = entry.response.clone();
     response.warning = true;
     response.degradation_level = "last_known".to_string();
+    // The control plane is unreachable and this request is proceeding on a
+    // cached decision rather than a current one.
+    crate::obs::signals::record_fallback(
+        crate::obs::labels::Subsystem::Gateway,
+        crate::obs::labels::FallbackTrigger::GovernanceUnavailable,
+    );
     Some(CachedBudgetReservation {
         response,
         previous_remaining,
@@ -13478,6 +13490,10 @@ mod tests {
         )
         .await;
 
+        // The recorder must exist before the emission: metrics macros are a
+        // no-op with no recorder installed.
+        crate::obs::metrics::handle();
+
         let mut outage_request = request.clone();
         outage_request.estimated_tokens = 30;
         let response = reserve_cached_budget(&runtime, &key, &outage_request)
@@ -13485,6 +13501,17 @@ mod tests {
             .expect("last-known headroom should admit a bounded reservation");
         assert_eq!(response.response.degradation_level, "last_known");
         assert!(response.response.warning);
+
+        // Serving a cached decision during a control-plane outage is a
+        // fallback and must be visible as one.
+        let rendered = crate::obs::metrics::handle().render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("sekai_fallback_total")
+                    && line.contains(r#"trigger="governance_unavailable""#)
+            }),
+            "last-known budget reservation recorded no fallback:\n{rendered}"
+        );
 
         outage_request.estimated_tokens = 50;
         assert!(
