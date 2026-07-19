@@ -4061,6 +4061,18 @@ impl SekaiService for SekaiServiceImpl {
             &ontology_class_object_id(&parsed.name),
             &principals,
         )?;
+        for reference in parsed
+            .superclasses
+            .iter()
+            .chain(&parsed.equivalent_classes)
+            .chain(&parsed.disjoint_classes)
+        {
+            check_read(
+                &self.security,
+                &ontology_class_object_id(reference),
+                &principals,
+            )?;
+        }
         if !parsed.mapped_kind.is_empty() {
             check_read(
                 &self.security,
@@ -4209,6 +4221,20 @@ impl SekaiService for SekaiServiceImpl {
             &ontology_relation_object_id(&parsed.name),
             &principals,
         )?;
+        for endpoint in [&parsed.domain, &parsed.range] {
+            check_read(
+                &self.security,
+                &ontology_class_object_id(endpoint),
+                &principals,
+            )?;
+        }
+        if !parsed.inverse.is_empty() {
+            check_read(
+                &self.security,
+                &ontology_relation_object_id(&parsed.inverse),
+                &principals,
+            )?;
+        }
         let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
         let existing = registry.get_relation(&parsed.name).cloned();
         registry.remove_relation(&parsed.name);
@@ -10784,6 +10810,56 @@ mod tests {
             .unwrap();
         assert_eq!(created.domain, "Person");
         assert_eq!(created.range, "Company");
+    }
+
+    #[tokio::test]
+    async fn ontology_mutations_cannot_reference_unreadable_definitions() {
+        let svc = service();
+        for name in ["Visible", "Hidden"] {
+            svc.create_ontology_class(with_named_principal(
+                CreateOntologyClassRequest {
+                    class: Some(ontology_class(name)),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        grant_ontology_admin(&svc);
+        grant_object_role(
+            &svc,
+            "ontology:class:Hidden",
+            "other-reader",
+            security::Role::Viewer,
+        );
+
+        let mut child = ontology_class("Child");
+        child.superclasses = vec!["Hidden".into()];
+        let class_denied = svc
+            .create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(child),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(class_denied.code(), tonic::Code::PermissionDenied);
+
+        let relation_denied = svc
+            .create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+                relation: Some(OntologyRelation {
+                    name: "reveals_hidden".into(),
+                    description: String::new(),
+                    domain: "Visible".into(),
+                    range: "Hidden".into(),
+                    cardinality: None,
+                    inverse: String::new(),
+                    transitive: false,
+                    is_builtin: false,
+                    mapped_relation: String::new(),
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(relation_denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
