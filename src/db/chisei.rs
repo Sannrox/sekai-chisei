@@ -763,13 +763,20 @@ impl SekaiDb {
             }
             receipt.completed_at_ms = Some(event.timestamp_ms);
         }
+        let produced_at_ms = event.timestamp_ms;
         receipt.events.push(event);
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        let durable_at_ms = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
-            params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
+            params![updated_json, durable_at_ms, operation_id],
         )
         .map_err(|error| error.to_string())?;
+        record_durability_lag(
+            crate::obs::labels::LagSurface::Receipt,
+            produced_at_ms,
+            durable_at_ms,
+        );
         Ok((receipt, true))
     }
 
@@ -1756,5 +1763,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
+}
+
+/// Time between a record being produced and becoming durable.
+///
+/// Both timestamps are wall-clock milliseconds sampled at different points, so
+/// a clock adjustment can make the difference negative. A negative lag is not
+/// meaningful: `None` drops it rather than clamping to zero, because clamping
+/// would report a real clock problem as a run of implausibly fast writes.
+///
+/// Kept pure so it can be tested without the process-global metrics recorder,
+/// which other tests in this binary also write to.
+fn durability_lag(produced_at_ms: i64, durable_at_ms: i64) -> Option<std::time::Duration> {
+    let lag_ms = durable_at_ms.checked_sub(produced_at_ms)?;
+    if lag_ms < 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(lag_ms as u64))
+}
+
+fn record_durability_lag(
+    surface: crate::obs::labels::LagSurface,
+    produced_at_ms: i64,
+    durable_at_ms: i64,
+) {
+    if let Some(lag) = durability_lag(produced_at_ms, durable_at_ms) {
+        crate::obs::signals::record_durability_lag(surface, lag);
+    }
+}
+
+#[cfg(test)]
+mod durability_lag_tests {
+    use super::durability_lag;
+    use std::time::Duration;
+
+    #[test]
+    fn negative_lag_from_clock_skew_is_dropped_not_clamped() {
+        // Produced at t=1000, "durable" at t=900 means the clock moved, not
+        // that the write was instant. Reporting zero would hide a real clock
+        // problem behind a run of implausibly fast writes.
+        assert_eq!(durability_lag(1000, 900), None);
+    }
+
+    #[test]
+    fn ordinary_lag_is_measured_in_milliseconds() {
+        assert_eq!(durability_lag(1000, 1250), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn zero_lag_is_recorded_not_dropped() {
+        assert_eq!(durability_lag(1000, 1000), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn overflowing_timestamps_do_not_panic() {
+        assert_eq!(durability_lag(i64::MIN, i64::MAX), None);
     }
 }
