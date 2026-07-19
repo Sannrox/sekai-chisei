@@ -345,6 +345,12 @@ pub fn validate_relation_definition(
                 inverse.name, inverse.inverse
             ));
         }
+        if inverse.domain != relation.range || inverse.range != relation.domain {
+            return Err(format!(
+                "inverse relation '{}' must reverse domain and range",
+                inverse.name
+            ));
+        }
     }
     Ok(())
 }
@@ -1190,6 +1196,16 @@ mod tests {
         works_for.inverse = "employs".into();
         let error = validate_relation_definition(&works_for, None, &registry).unwrap_err();
         assert!(error.contains("unknown inverse relation"), "got: {error}");
+    }
+
+    #[test]
+    fn relation_inverse_must_reverse_endpoints() {
+        let mut registry = registry_with(&["Person", "Company"]);
+        registry.register_relation(relation("employs", "Person", "Company"));
+        let mut works_for = relation("works_for", "Person", "Company");
+        works_for.inverse = "employs".into();
+        let error = validate_relation_definition(&works_for, None, &registry).unwrap_err();
+        assert!(error.contains("reverse domain and range"), "got: {error}");
     }
 
     #[test]
