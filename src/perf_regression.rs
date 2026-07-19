@@ -235,6 +235,213 @@ pub fn evaluate(
     GateReport { decisions }
 }
 
+// --- Baseline-relative comparison ---
+//
+// The budget gate above answers "is it fast enough". Detecting a regression
+// asks a different question: "did it get slower". Those diverge sharply here,
+// because the checked-in budgets carry between 1.6x and 119.6x headroom over
+// observed values, so a budget gate only fires on a catastrophic slowdown while
+// an ordinary regression passes silently.
+//
+// Comparing against a recorded baseline closes that gap, at the cost of
+// requiring the baseline to describe the same hardware.
+
+/// Relative change smaller than this is never called a regression, however
+/// quiet the measurement. Below it the result is real but not worth a failure.
+pub const MIN_DETECTABLE_REGRESSION_PERCENT: f64 = 5.0;
+
+/// How a workload compares against its recorded baseline.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum BaselineVerdict {
+    /// Within combined measurement noise.
+    Unchanged,
+    /// Measurably faster than baseline.
+    Improved { delta_percent: f64 },
+    /// Measurably slower than baseline, beyond noise and the detection floor.
+    Regressed {
+        delta_percent: f64,
+        threshold_percent: f64,
+    },
+    /// Excluded for the same reasons the budget gate excludes a workload.
+    NotComparable(Ineligibility),
+    /// Present in the current runs but absent from the baseline.
+    MissingFromBaseline,
+}
+
+impl BaselineVerdict {
+    pub fn is_regression(&self) -> bool {
+        matches!(self, BaselineVerdict::Regressed { .. })
+    }
+}
+
+/// One workload's comparison against baseline.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineComparison {
+    pub id: String,
+    pub baseline_p95_us: f64,
+    pub current_median_p95_us: f64,
+    pub delta_percent: f64,
+    pub combined_noise_percent: f64,
+    pub verdict: BaselineVerdict,
+}
+
+/// Comparison across every workload shared by the runs and the baseline.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineReport {
+    pub comparisons: Vec<BaselineComparison>,
+}
+
+impl BaselineReport {
+    pub fn regressions(&self) -> Vec<&BaselineComparison> {
+        self.comparisons
+            .iter()
+            .filter(|comparison| comparison.verdict.is_regression())
+            .collect()
+    }
+
+    pub fn improvements(&self) -> Vec<&BaselineComparison> {
+        self.comparisons
+            .iter()
+            .filter(|comparison| matches!(comparison.verdict, BaselineVerdict::Improved { .. }))
+            .collect()
+    }
+
+    pub fn passed(&self) -> bool {
+        self.regressions().is_empty()
+    }
+}
+
+/// Combine two independent relative uncertainties.
+///
+/// Added in quadrature rather than summed: the baseline and the current runs
+/// are separate measurements, so their variances add while their standard
+/// deviations do not. Summing would overstate the noise and hide real
+/// regressions behind an inflated threshold.
+fn combine_noise(current_percent: f64, baseline_percent: f64) -> f64 {
+    (current_percent.powi(2) + baseline_percent.powi(2)).sqrt()
+}
+
+/// Compare one workload's repeated runs against its baseline sample.
+pub fn compare_workload(
+    id: &str,
+    samples: &[WorkloadSample],
+    baseline: &WorkloadSample,
+) -> BaselineComparison {
+    let mut p95_values: Vec<f64> = samples.iter().map(|s| s.p95_latency_us).collect();
+    let current_median = if p95_values.is_empty() {
+        0.0
+    } else {
+        median(&mut p95_values)
+    };
+
+    let mut comparison = BaselineComparison {
+        id: id.to_string(),
+        baseline_p95_us: baseline.p95_latency_us,
+        current_median_p95_us: current_median,
+        delta_percent: 0.0,
+        combined_noise_percent: 0.0,
+        verdict: BaselineVerdict::Unchanged,
+    };
+
+    // The observed delta is always reported, even when the verdict is
+    // NotComparable. Leaving it at zero made a row read as "no change" while
+    // its baseline and current columns visibly disagreed; comparability is the
+    // verdict's job, not the number's.
+    if baseline.p95_latency_us > 0.0 {
+        comparison.delta_percent =
+            (current_median - baseline.p95_latency_us) / baseline.p95_latency_us * 100.0;
+    }
+
+    if samples.len() < MIN_REPETITIONS {
+        comparison.verdict = BaselineVerdict::NotComparable(Ineligibility::InsufficientSamples);
+        return comparison;
+    }
+    if current_median < MIN_GATEABLE_LATENCY_US || baseline.p95_latency_us < MIN_GATEABLE_LATENCY_US
+    {
+        comparison.verdict = BaselineVerdict::NotComparable(Ineligibility::BelowTimerResolution);
+        return comparison;
+    }
+
+    let spread = spread_percent(&p95_values, current_median);
+    let worst_current_rsd = samples
+        .iter()
+        .map(|s| s.relative_standard_deviation_percent)
+        .fold(0.0_f64, f64::max);
+    let current_dispersion = spread.max(worst_current_rsd);
+    let noise = combine_noise(
+        current_dispersion,
+        baseline.relative_standard_deviation_percent,
+    );
+    comparison.combined_noise_percent = noise;
+
+    if current_dispersion >= NOISE_CEILING_RSD_PERCENT {
+        comparison.verdict = BaselineVerdict::NotComparable(Ineligibility::NoiseDominated);
+        return comparison;
+    }
+
+    let delta = comparison.delta_percent;
+
+    let threshold = (noise * SIGNIFICANCE_FACTOR).max(MIN_DETECTABLE_REGRESSION_PERCENT);
+    comparison.verdict = if delta > threshold {
+        BaselineVerdict::Regressed {
+            delta_percent: delta,
+            threshold_percent: threshold,
+        }
+    } else if -delta > threshold {
+        BaselineVerdict::Improved {
+            delta_percent: delta,
+        }
+    } else {
+        BaselineVerdict::Unchanged
+    };
+    comparison
+}
+
+/// Compare repeated runs against a recorded baseline.
+pub fn compare_to_baseline(
+    runs: &[Vec<WorkloadSample>],
+    baseline: &[WorkloadSample],
+) -> BaselineReport {
+    let mut by_workload: BTreeMap<String, Vec<WorkloadSample>> = BTreeMap::new();
+    for run in runs {
+        for sample in run {
+            by_workload
+                .entry(sample.id.clone())
+                .or_default()
+                .push(sample.clone());
+        }
+    }
+    let baseline_by_id: BTreeMap<&str, &WorkloadSample> = baseline
+        .iter()
+        .map(|sample| (sample.id.as_str(), sample))
+        .collect();
+
+    let comparisons = by_workload
+        .iter()
+        .map(|(id, samples)| match baseline_by_id.get(id.as_str()) {
+            Some(baseline_sample) => compare_workload(id, samples, baseline_sample),
+            None => {
+                let mut p95_values: Vec<f64> = samples.iter().map(|s| s.p95_latency_us).collect();
+                let current_median = if p95_values.is_empty() {
+                    0.0
+                } else {
+                    median(&mut p95_values)
+                };
+                BaselineComparison {
+                    id: id.clone(),
+                    baseline_p95_us: 0.0,
+                    current_median_p95_us: current_median,
+                    delta_percent: 0.0,
+                    combined_noise_percent: 0.0,
+                    verdict: BaselineVerdict::MissingFromBaseline,
+                }
+            }
+        })
+        .collect();
+
+    BaselineReport { comparisons }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +564,157 @@ mod tests {
             decision.outcome,
             GateOutcome::NotGateable(Ineligibility::InsufficientSamples)
         );
+    }
+
+    // --- Baseline comparison ---
+
+    #[test]
+    fn quiet_slowdown_beyond_noise_is_a_regression() {
+        let baseline = sample("egress", 30.0, 2.0);
+        let samples = vec![
+            sample("egress", 40.0, 2.0),
+            sample("egress", 40.5, 2.0),
+            sample("egress", 39.8, 2.0),
+        ];
+        let comparison = compare_workload("egress", &samples, &baseline);
+        assert!(comparison.verdict.is_regression(), "{:?}", comparison);
+        assert!((comparison.delta_percent - 33.3).abs() < 1.0);
+    }
+
+    #[test]
+    fn slowdown_inside_combined_noise_is_unchanged() {
+        // 10% slower, but both measurements are noisy enough that the
+        // combined threshold exceeds the delta.
+        let baseline = sample("egress", 30.0, 12.0);
+        let samples = vec![
+            sample("egress", 33.0, 12.0),
+            sample("egress", 33.0, 12.0),
+            sample("egress", 33.0, 12.0),
+        ];
+        let comparison = compare_workload("egress", &samples, &baseline);
+        assert_eq!(comparison.verdict, BaselineVerdict::Unchanged);
+    }
+
+    #[test]
+    fn small_delta_never_regresses_however_quiet() {
+        // 3% slower with near-zero noise: real, but under the detection floor.
+        let baseline = sample("egress", 100.0, 0.01);
+        let samples = vec![
+            sample("egress", 103.0, 0.01),
+            sample("egress", 103.0, 0.01),
+            sample("egress", 103.0, 0.01),
+        ];
+        let comparison = compare_workload("egress", &samples, &baseline);
+        assert_eq!(comparison.verdict, BaselineVerdict::Unchanged);
+        assert!(comparison.combined_noise_percent < MIN_DETECTABLE_REGRESSION_PERCENT);
+    }
+
+    #[test]
+    fn measurable_speedup_is_reported_not_failed() {
+        let baseline = sample("persist", 100.0, 2.0);
+        let samples = vec![
+            sample("persist", 80.0, 2.0),
+            sample("persist", 81.0, 2.0),
+            sample("persist", 79.0, 2.0),
+        ];
+        let comparison = compare_workload("persist", &samples, &baseline);
+        assert!(matches!(
+            comparison.verdict,
+            BaselineVerdict::Improved { .. }
+        ));
+        assert!(!comparison.verdict.is_regression());
+    }
+
+    #[test]
+    fn noise_dominated_workload_is_not_comparable() {
+        let baseline = sample("startup", 20000.0, 2.0);
+        let samples = vec![
+            sample("startup", 30000.0, 30.0),
+            sample("startup", 31000.0, 30.0),
+            sample("startup", 29000.0, 30.0),
+        ];
+        let comparison = compare_workload("startup", &samples, &baseline);
+        assert_eq!(
+            comparison.verdict,
+            BaselineVerdict::NotComparable(Ineligibility::NoiseDominated)
+        );
+        assert!(!comparison.verdict.is_regression());
+    }
+
+    #[test]
+    fn sub_microsecond_workload_is_not_comparable() {
+        let baseline = sample("fallback", 0.4, 5.0);
+        let samples = vec![
+            sample("fallback", 0.9, 5.0),
+            sample("fallback", 0.9, 5.0),
+            sample("fallback", 0.9, 5.0),
+        ];
+        let comparison = compare_workload("fallback", &samples, &baseline);
+        assert_eq!(
+            comparison.verdict,
+            BaselineVerdict::NotComparable(Ineligibility::BelowTimerResolution)
+        );
+    }
+
+    #[test]
+    fn noise_combines_in_quadrature_not_by_sum() {
+        // 3 and 4 combine to 5, not 7. Summing would inflate the threshold and
+        // hide real regressions.
+        let combined = combine_noise(3.0, 4.0);
+        assert!((combined - 5.0).abs() < 1e-9, "got {combined}");
+    }
+
+    #[test]
+    fn not_comparable_rows_still_report_their_observed_delta() {
+        // A noise-dominated workload whose baseline and current differ by 42%
+        // must not render as 0.0%: that reads as "no change" to anyone
+        // scanning the delta column.
+        let baseline = sample("attestation", 390.1, 2.0);
+        let samples = vec![
+            sample("attestation", 225.5, 30.0),
+            sample("attestation", 226.0, 30.0),
+            sample("attestation", 225.0, 30.0),
+        ];
+        let comparison = compare_workload("attestation", &samples, &baseline);
+        assert_eq!(
+            comparison.verdict,
+            BaselineVerdict::NotComparable(Ineligibility::NoiseDominated)
+        );
+        assert!(
+            comparison.delta_percent < -40.0,
+            "delta not reported for a non-comparable row: {}",
+            comparison.delta_percent
+        );
+    }
+
+    #[test]
+    fn workload_absent_from_baseline_is_flagged_not_silently_passed() {
+        let runs = vec![
+            vec![sample("brand_new", 10.0, 1.0)],
+            vec![sample("brand_new", 10.0, 1.0)],
+            vec![sample("brand_new", 10.0, 1.0)],
+        ];
+        let report = compare_to_baseline(&runs, &[sample("other", 5.0, 1.0)]);
+        assert_eq!(report.comparisons.len(), 1);
+        assert_eq!(
+            report.comparisons[0].verdict,
+            BaselineVerdict::MissingFromBaseline
+        );
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn baseline_report_separates_regressions_from_improvements() {
+        let baseline = vec![sample("slow", 30.0, 2.0), sample("fast", 100.0, 2.0)];
+        let runs: Vec<Vec<WorkloadSample>> = (0..3)
+            .map(|_| vec![sample("slow", 45.0, 2.0), sample("fast", 70.0, 2.0)])
+            .collect();
+        let report = compare_to_baseline(&runs, &baseline);
+        assert!(!report.passed());
+        assert_eq!(report.regressions().len(), 1);
+        assert_eq!(report.regressions()[0].id, "slow");
+        assert_eq!(report.improvements().len(), 1);
+        assert_eq!(report.improvements()[0].id, "fast");
     }
 
     #[test]
