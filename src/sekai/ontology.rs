@@ -173,6 +173,176 @@ impl OntologyRegistry {
         }
         ancestors
     }
+
+    /// Whether an object kind is an instance of `expected`, accounting for
+    /// mapped classes, transitive inheritance, and symmetric/transitive class
+    /// equivalence.
+    pub fn kind_satisfies_class(&self, kind: &str, expected: &str) -> bool {
+        let mut reachable = HashSet::new();
+        let mut stack = self
+            .classes
+            .values()
+            .filter(|class| class.mapped_kind == kind)
+            .map(|class| class.name.clone())
+            .collect::<Vec<_>>();
+
+        while let Some(current) = stack.pop() {
+            if !reachable.insert(current.clone()) {
+                continue;
+            }
+            if current == expected {
+                return true;
+            }
+            let Some(class) = self.classes.get(&current) else {
+                continue;
+            };
+            stack.extend(class.superclasses.iter().cloned());
+            stack.extend(class.equivalent_classes.iter().cloned());
+            stack.extend(
+                self.classes
+                    .values()
+                    .filter(|candidate| candidate.equivalent_classes.contains(&current))
+                    .map(|candidate| candidate.name.clone()),
+            );
+        }
+        false
+    }
+
+    pub fn constraints_for_mapped_relation(&self, mapped_relation: &str) -> Vec<&OntologyRelation> {
+        if mapped_relation.is_empty() {
+            return Vec::new();
+        }
+        let mut constraints = self
+            .relations
+            .values()
+            .filter(|relation| relation.mapped_relation == mapped_relation)
+            .collect::<Vec<_>>();
+        constraints.sort_by(|left, right| left.name.cmp(&right.name));
+        constraints
+    }
+}
+
+pub(crate) fn load_ontology_registry_from_connection(
+    conn: &rusqlite::Connection,
+) -> Result<OntologyRegistry, String> {
+    let mut classes_stmt = conn
+        .prepare(
+            "SELECT name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind
+             FROM sekai_ontology_classes ORDER BY name",
+        )
+        .map_err(|error| error.to_string())?;
+    let classes = classes_stmt
+        .query_map([], row_to_ontology_class)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut relations_stmt = conn
+        .prepare(
+            "SELECT name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation
+             FROM sekai_ontology_relations ORDER BY name",
+        )
+        .map_err(|error| error.to_string())?;
+    let relations = relations_stmt
+        .query_map([], row_to_ontology_relation)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OntologyRegistry::from_parts(classes, relations))
+}
+
+pub(crate) fn validate_link_constraint(
+    conn: &rusqlite::Connection,
+    from_id: &str,
+    to_id: &str,
+    mapped_relation: &str,
+) -> Result<(), String> {
+    if mapped_relation.is_empty() {
+        return Ok(());
+    }
+    let registry = load_ontology_registry_from_connection(conn)?;
+    let constraints = registry.constraints_for_mapped_relation(mapped_relation);
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    let from_kind = conn
+        .query_row(
+            "SELECT kind FROM sekai_objects WHERE id = ?1",
+            params![from_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "link endpoint unavailable".to_string())?;
+    let to_kind = conn
+        .query_row(
+            "SELECT kind FROM sekai_objects WHERE id = ?1",
+            params![to_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "link endpoint unavailable".to_string())?;
+    if constraints.into_iter().any(|constraint| {
+        !registry.kind_satisfies_class(&from_kind, &constraint.domain)
+            || !registry.kind_satisfies_class(&to_kind, &constraint.range)
+    }) {
+        return Err("link endpoints violate ontology constraint".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_object_kind_change(
+    conn: &rusqlite::Connection,
+    object_id: &str,
+    new_kind: &str,
+) -> Result<(), String> {
+    let registry = load_ontology_registry_from_connection(conn)?;
+    let old_kind = conn
+        .query_row(
+            "SELECT kind FROM sekai_objects WHERE id = ?1",
+            params![object_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT from_id, to_id, relation FROM sekai_links
+             WHERE from_id = ?1 OR to_id = ?1 ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let links = stmt
+        .query_map(params![object_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (from_id, to_id, relation) in links {
+        let constraints = registry.constraints_for_mapped_relation(&relation);
+        if constraints.is_empty() {
+            continue;
+        }
+        if constraints.into_iter().any(|constraint| {
+            let introduces_domain_violation = from_id == object_id
+                && registry.kind_satisfies_class(&old_kind, &constraint.domain)
+                && !registry.kind_satisfies_class(new_kind, &constraint.domain);
+            let introduces_range_violation = to_id == object_id
+                && registry.kind_satisfies_class(&old_kind, &constraint.range)
+                && !registry.kind_satisfies_class(new_kind, &constraint.range);
+            introduces_domain_violation || introduces_range_violation
+        }) {
+            return Err("link endpoints violate ontology constraint".into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate an ontology class definition against the current registry.
@@ -1077,6 +1247,22 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn kind_matching_accepts_inherited_and_equivalent_classes() {
+        let mut person = class("Person");
+        person.equivalent_classes = vec!["Human".into()];
+        let human = class("Human");
+        let mut engineer = class("Engineer");
+        engineer.superclasses = vec!["Human".into()];
+        engineer.mapped_kind = "engineer".into();
+        let registry = OntologyRegistry::from_parts(vec![person, human, engineer], vec![]);
+
+        assert!(registry.kind_satisfies_class("engineer", "Engineer"));
+        assert!(registry.kind_satisfies_class("engineer", "Human"));
+        assert!(registry.kind_satisfies_class("engineer", "Person"));
+        assert!(!registry.kind_satisfies_class("engineer", "Company"));
     }
 
     #[test]

@@ -266,6 +266,12 @@ pub(crate) fn record_learning(
         ],
     )
     .map_err(|error| error.to_string())?;
+    crate::sekai::ontology::validate_link_constraint(
+        &tx,
+        &link.from_id,
+        &link.to_id,
+        &link.relation,
+    )?;
     tx.execute(
         "INSERT INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
         params![
