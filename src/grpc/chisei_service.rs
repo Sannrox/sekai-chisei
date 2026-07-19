@@ -53,6 +53,7 @@ pub struct ChiseiServiceImpl {
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
+const WORKER_POLICY_KIND: &str = "worker_policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
@@ -536,6 +537,17 @@ fn canonical_namespace(namespace: &str) -> Result<&str, Status> {
         ));
     }
     Ok(canonical)
+}
+
+fn content_version(value: &impl serde::Serialize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn require_namespace_access(db: &SekaiDb, actor: &str, namespace: &str) -> Result<(), Status> {
@@ -1143,6 +1155,35 @@ fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> R
             kind: POLICY_KIND.to_string(),
             name: namespace.to_string(),
             namespace: namespace.to_string(),
+            external_id,
+            properties,
+            created: now,
+            updated: now,
+        })
+    }
+}
+
+fn persist_namespace_worker_policy(
+    db: &SekaiDb,
+    namespace: &str,
+    contention_scope_id: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let external_id = format!("{WORKER_POLICY_KIND}:{namespace}");
+    let properties = HashMap::from([
+        ("namespace".into(), namespace.into()),
+        ("contention_scope_id".into(), contention_scope_id.into()),
+    ]);
+    if let Some(mut existing) = db.find_by_external_id(&external_id)? {
+        existing.properties = properties;
+        existing.updated = now;
+        db.update_object(&existing)
+    } else {
+        db.create_object(&Object {
+            id: format!("{WORKER_POLICY_KIND}-{namespace}"),
+            kind: WORKER_POLICY_KIND.into(),
+            name: namespace.into(),
+            namespace: namespace.into(),
             external_id,
             properties,
             created: now,
@@ -4242,6 +4283,183 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
         })
         .await
+    }
+
+    async fn get_effective_policy_summary(
+        &self,
+        req: Request<GetEffectivePolicySummaryRequest>,
+    ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
+        require_namespace_access(&self.db, &actor, &namespace)?;
+
+        let routing = self.policy.effective_policy(&namespace).map_or_else(
+            || EffectiveRoutingSummary {
+                configured: false,
+                status: "unconfigured".into(),
+                ..Default::default()
+            },
+            |policy| EffectiveRoutingSummary {
+                configured: true,
+                status: "configured".into(),
+                runtime: policy.default_runtime.clone(),
+                model: policy.default_model.clone(),
+                policy_scope: namespace.clone(),
+                policy_version: policy.version(),
+            },
+        );
+
+        let raw_limits = self
+            .db
+            .budget_limits_for_scope(&format!("project:{namespace}"))
+            .map_err(Status::internal)?;
+        let budget_version = content_version(&raw_limits);
+        let limits = raw_limits
+            .into_iter()
+            .map(
+                |(scope, metric, max_amount, period_type)| EffectiveBudgetLimit {
+                    metric,
+                    max_amount,
+                    period_type,
+                    policy_scope: scope,
+                },
+            )
+            .collect::<Vec<_>>();
+        let budgets = EffectiveBudgetSummary {
+            configured: !limits.is_empty(),
+            status: if limits.is_empty() {
+                "unconfigured"
+            } else {
+                "configured"
+            }
+            .into(),
+            limits,
+            policy_version: budget_version,
+        };
+
+        let project_action_scope = format!("project:{namespace}");
+        let action_policy = match self
+            .db
+            .get_action_policy(&project_action_scope)
+            .map_err(Status::internal)?
+        {
+            some @ Some(_) => some,
+            None => self
+                .db
+                .get_action_policy(&namespace)
+                .map_err(Status::internal)?,
+        };
+        let actions = action_policy.map_or_else(
+            || EffectiveActionPolicySummary {
+                configured: false,
+                status: "unconfigured".into(),
+                ..Default::default()
+            },
+            |policy| {
+                use crate::sekai::action_policy::ActionDecision;
+                let canonical_properties = policy
+                    .to_properties()
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>();
+                let decisions = policy
+                    .action_overrides
+                    .values()
+                    .chain(policy.risk_overrides.values());
+                let (mut allow, mut deny, mut approval) = (0, 0, 0);
+                for decision in decisions {
+                    match decision {
+                        ActionDecision::Allow => allow += 1,
+                        ActionDecision::Deny => deny += 1,
+                        ActionDecision::RequireApproval => approval += 1,
+                    }
+                }
+                EffectiveActionPolicySummary {
+                    configured: true,
+                    status: "configured".into(),
+                    allow_rule_count: allow,
+                    deny_rule_count: deny,
+                    require_approval_rule_count: approval,
+                    default_decision: policy.default_decision.as_str().into(),
+                    policy_scope: policy.scope.clone(),
+                    policy_version: content_version(&canonical_properties),
+                }
+            },
+        );
+
+        let worker_policy = self
+            .db
+            .find_by_external_id(&format!("{WORKER_POLICY_KIND}:{namespace}"))
+            .map_err(Status::internal)?;
+        let worker_scope_id = worker_policy.as_ref().and_then(|policy| {
+            policy
+                .properties
+                .get("contention_scope_id")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+        });
+        let worker_scope = if let Some(scope_id) = worker_scope_id {
+            self.db
+                .contention_scope_chain(scope_id)
+                .map_err(Status::internal)?
+                .into_iter()
+                .min_by_key(|scope| scope.max_concurrency)
+        } else {
+            None
+        };
+        let worker_concurrency = worker_scope.map_or_else(
+            || EffectiveWorkerConcurrencySummary {
+                configured: false,
+                status: "unconfigured".into(),
+                ..Default::default()
+            },
+            |scope| EffectiveWorkerConcurrencySummary {
+                configured: true,
+                status: "configured".into(),
+                max_concurrency: scope.max_concurrency,
+                policy_scope: scope.id.clone(),
+                policy_version: content_version(&(
+                    scope.id,
+                    scope.parent_scope_id,
+                    scope.max_concurrency,
+                    scope.admission_policy,
+                    scope.updated,
+                )),
+            },
+        );
+
+        Ok(Response::new(GetEffectivePolicySummaryResponse {
+            namespace,
+            routing: Some(routing),
+            budgets: Some(budgets),
+            actions: Some(actions),
+            worker_concurrency: Some(worker_concurrency),
+        }))
+    }
+
+    async fn set_namespace_worker_policy(
+        &self,
+        req: Request<SetNamespaceWorkerPolicyRequest>,
+    ) -> Result<Response<SetNamespaceWorkerPolicyResponse>, Status> {
+        require_control_plane_admin(&req, "namespace worker policy mutation")?;
+        let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
+        let scope_id = req.get_ref().contention_scope_id.trim().to_string();
+        if scope_id.is_empty() {
+            return Err(Status::invalid_argument("contention scope required"));
+        }
+        if self
+            .db
+            .get_contention_scope(&scope_id)
+            .map_err(Status::internal)?
+            .is_none()
+        {
+            return Err(Status::invalid_argument(
+                "worker contention scope does not exist",
+            ));
+        }
+        persist_namespace_worker_policy(&self.db, &namespace, &scope_id)
+            .map_err(Status::internal)?;
+        Ok(Response::new(SetNamespaceWorkerPolicyResponse {}))
     }
 
     async fn check_egress(
@@ -7734,6 +7952,184 @@ mod tests {
     fn memory_service() -> ChiseiServiceImpl {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
         ChiseiServiceImpl::new(db, config(":memory:"))
+    }
+
+    fn effective_summary_request(
+        namespace: &str,
+        principal: &str,
+    ) -> Request<GetEffectivePolicySummaryRequest> {
+        let mut request = Request::new(GetEffectivePolicySummaryRequest {
+            namespace: namespace.into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", principal.parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn effective_policy_summary_is_authorized_bounded_and_live() {
+        use crate::sekai::action::RiskClass;
+        use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
+        use crate::sekai::coordination::{ADMISSION_POLICY_FIFO, ContentionScope};
+
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .unwrap();
+        svc.policy.set_namespace_policy(
+            "acme",
+            Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+        svc.db
+            .budget_set_limit("global", METRIC_REQUESTS, 100, "daily")
+            .unwrap();
+        svc.db
+            .budget_set_limit("project:acme", METRIC_TOKENS, 1_000, "weekly")
+            .unwrap();
+        svc.db
+            .budget_adjust_chain("project:acme", METRIC_TOKENS, 37, 1)
+            .unwrap();
+        let mut action_policy = ActionPolicy::allow_all("project:acme");
+        action_policy
+            .action_overrides
+            .insert("shell.exec".into(), ActionDecision::RequireApproval);
+        action_policy
+            .risk_overrides
+            .insert(RiskClass::Destructive, ActionDecision::Deny);
+        svc.db.upsert_action_policy(&action_policy).unwrap();
+        svc.db
+            .create_contention_scope(&ContentionScope {
+                id: "fleet".into(),
+                name: "fleet".into(),
+                parent_scope_id: String::new(),
+                max_concurrency: 3,
+                admission_policy: ADMISSION_POLICY_FIFO.into(),
+                heartbeat_ttl_seconds: 30,
+                timeout_seconds: 60,
+                owner_principal: "local".into(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_contention_scope(&ContentionScope {
+                id: "acme-workers".into(),
+                name: "acme".into(),
+                parent_scope_id: "fleet".into(),
+                max_concurrency: 4,
+                admission_policy: ADMISSION_POLICY_FIFO.into(),
+                heartbeat_ttl_seconds: 30,
+                timeout_seconds: 60,
+                owner_principal: "local".into(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let mut forbidden_binding = Request::new(SetNamespaceWorkerPolicyRequest {
+            namespace: "acme".into(),
+            contention_scope_id: "acme-workers".into(),
+        });
+        forbidden_binding
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.set_namespace_worker_policy(forbidden_binding)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        persist_namespace_worker_policy(&svc.db, "acme", "acme-workers").unwrap();
+
+        let denied = svc
+            .get_effective_policy_summary(effective_summary_request("acme", "mallory"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let first = svc
+            .get_effective_policy_summary(effective_summary_request("acme", "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        let routing = first.routing.unwrap();
+        assert_eq!(routing.runtime, "openai");
+        assert_eq!(routing.model, "gpt-5.5");
+        assert_eq!(routing.policy_scope, "acme");
+        assert_eq!(routing.policy_version.len(), 64);
+        let budgets = first.budgets.unwrap();
+        assert_eq!(budgets.limits.len(), 2);
+        assert!(budgets.limits.iter().all(|limit| limit.max_amount != 37));
+        let actions = first.actions.unwrap();
+        assert_eq!(actions.allow_rule_count, 0);
+        assert_eq!(actions.deny_rule_count, 1);
+        assert_eq!(actions.require_approval_rule_count, 1);
+        assert_eq!(actions.default_decision, "allow");
+        let worker = first.worker_concurrency.unwrap();
+        assert_eq!(worker.max_concurrency, 3);
+        assert_eq!(worker.policy_scope, "fleet");
+
+        svc.policy.set_namespace_policy(
+            "acme",
+            Policy {
+                allowed_runtimes: vec!["anthropic".into()],
+                allowed_models: vec!["claude-sonnet-4-20250514".into()],
+                default_runtime: "anthropic".into(),
+                default_model: "claude-sonnet-4-20250514".into(),
+                data_class: "internal".into(),
+            },
+        );
+        svc.db
+            .budget_set_limit("project:acme", METRIC_TOKENS, 2_000, "weekly")
+            .unwrap();
+        let changed = svc
+            .get_effective_policy_summary(effective_summary_request("acme", "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            changed
+                .budgets
+                .unwrap()
+                .limits
+                .into_iter()
+                .find(|limit| limit.metric == METRIC_TOKENS)
+                .unwrap()
+                .max_amount,
+            2_000
+        );
+        assert_eq!(changed.routing.unwrap().runtime, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn effective_policy_summary_reports_unconfigured_sections() {
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace("empty", "alice", Role::Viewer, "local")
+            .unwrap();
+        let summary = svc
+            .get_effective_policy_summary(effective_summary_request("empty", "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        for (configured, status) in [
+            (summary.routing.unwrap().configured, "routing"),
+            (summary.budgets.unwrap().configured, "budgets"),
+            (summary.actions.unwrap().configured, "actions"),
+            (
+                summary.worker_concurrency.unwrap().configured,
+                "worker_concurrency",
+            ),
+        ] {
+            assert!(!configured, "{status} unexpectedly configured");
+        }
     }
 
     fn file_service(path: &str) -> ChiseiServiceImpl {
