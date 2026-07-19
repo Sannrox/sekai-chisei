@@ -4104,11 +4104,18 @@ async fn cached_egress_decision(
     runtime: &GatewayRuntime,
     key: &str,
 ) -> Option<ContextEgressPreflight> {
+    use crate::obs::labels::{Cache, CacheOutcome};
+
     let cache = runtime.governance_cache.read().await;
-    let cached = cache.egress.get(key)?;
+    let Some(cached) = cache.egress.get(key) else {
+        crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Miss);
+        return None;
+    };
     if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
+        crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Evicted);
         return None;
     }
+    crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Hit);
     Some(ContextEgressPreflight {
         body: cached.body.clone(),
     })
@@ -6929,11 +6936,20 @@ async fn cached_gateway_key_identity(
     state: &GatewayState,
     key_hash: &str,
 ) -> Option<KeyCacheEntry> {
+    use crate::obs::labels::{Cache, CacheOutcome};
+
     let cache = state.runtime.key_cache.read().await;
-    let entry = cache.get(key_hash)?;
+    let Some(entry) = cache.get(key_hash) else {
+        crate::obs::signals::record_cache_event(Cache::GatewayKey, CacheOutcome::Miss);
+        return None;
+    };
     if entry.cached_at.elapsed() < state.runtime.key_cache_ttl {
+        crate::obs::signals::record_cache_event(Cache::GatewayKey, CacheOutcome::Hit);
         return Some(entry.clone());
     }
+    // Present but past its TTL. Counting this as a plain miss would hide
+    // whether the cache is too small or the TTL is too short.
+    crate::obs::signals::record_cache_event(Cache::GatewayKey, CacheOutcome::Evicted);
     None
 }
 
