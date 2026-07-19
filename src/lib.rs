@@ -1,6 +1,7 @@
 pub mod action_cli;
 pub mod attest_cli;
 pub mod chisei;
+pub mod compat_shims;
 pub mod config;
 pub mod cost_estimate;
 pub mod credential_cli;
