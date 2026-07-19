@@ -1,0 +1,66 @@
+name: Performance
+
+# The full benchmark matrix runs on a schedule and on demand, not per pull
+# request. Issue #98 asks CI for a stable smoke budget and scheduled or release
+# validation for the full matrix; a smoke budget needs thresholds calibrated on
+# this runner, which is what these scheduled runs collect.
+on:
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: "Fail the run on a significant regression"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build benchmarks
+        run: cargo build --release --benches --bin perf-gate
+
+      - name: Run benchmark matrix
+        # perf_regression gates on the median of repeated runs, so a single
+        # sample is never enough to separate a regression from noise.
+        run: |
+          set -euo pipefail
+          mkdir -p perf-reports
+          for run in 1 2 3; do
+            SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            SEKAI_BENCH_HARDWARE="github-hosted ubuntu-latest, $(nproc) vCPU, $(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo) bytes RAM" \
+            SEKAI_BENCH_OS="$(. /etc/os-release && echo "$PRETTY_NAME")" \
+            SEKAI_BENCH_RUSTC="$(rustc --version)" \
+            SEKAI_BENCH_PROFILE="release" \
+            cargo bench --bench control_plane -- benchmarks/manifest-v1.json \
+              | sed -n '/^{/,$p' > "perf-reports/run-${run}.json"
+          done
+
+      - name: Evaluate regression gate
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.enforce }}" == "true" ]]; then
+            ./target/release/perf-gate --enforce --manifest benchmarks/manifest-v1.json perf-reports/run-*.json
+          else
+            ./target/release/perf-gate --manifest benchmarks/manifest-v1.json perf-reports/run-*.json
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-reports
+          path: perf-reports/
+          retention-days: 90
