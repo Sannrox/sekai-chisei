@@ -322,7 +322,7 @@ fn every_signal_family_renders_with_bounded_labels() {
     signals::set_queue_depth(Subsystem::Sekai, 7);
     signals::record_cache_event(Cache::GatewayKey, CacheOutcome::Hit);
     signals::record_durability_lag(LagSurface::Receipt, Duration::from_millis(40));
-    signals::record_fallback(Subsystem::Llm, FallbackTrigger::ProviderUnavailable);
+    signals::record_fallback(Subsystem::Llm, FallbackTrigger::GovernanceUnavailable);
     signals::record_rejected_work(Subsystem::Gateway, RejectionReason::Overloaded);
 
     let rendered = sekai_chisei::obs::metrics::handle().render();
@@ -343,7 +343,7 @@ fn every_signal_family_renders_with_bounded_labels() {
     assert!(rendered.contains(r#"wait_kind="connection_acquire""#));
     assert!(rendered.contains(r#"cache="gateway_key""#));
     assert!(rendered.contains(r#"reason="overloaded""#));
-    assert!(rendered.contains(r#"trigger="provider_unavailable""#));
+    assert!(rendered.contains(r#"trigger="governance_unavailable""#));
 }
 
 #[test]
