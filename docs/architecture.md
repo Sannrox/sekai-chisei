@@ -153,6 +153,13 @@ These storage and reconciliation contracts belong to the complete SQLite
 runtime. They do not expand the selected PostgreSQL persistence interfaces or
 change the public protobuf contract.
 
+Ontology relations opt into graph enforcement by setting `mapped_relation`.
+New links and object updates that would violate the relation's effective domain
+or range are rejected after endpoint authorization, including when class
+membership is inherited or equivalent. Existing links are never rewritten;
+operators can call `ReportOntologyLinkViolations` for an authorized,
+read-only inventory before enabling or remediating a constraint.
+
 ## Design constraints
 
 - Local-first and inspectable by default.
