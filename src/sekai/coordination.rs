@@ -351,6 +351,11 @@ impl SekaiDb {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    pub fn contention_scope_chain(&self, scope_id: &str) -> Result<Vec<ContentionScope>, String> {
+        let conn = self.conn();
+        scope_chain_locked(&conn, scope_id)
+    }
+
     pub fn create_work_unit(&self, work_unit: &WorkUnit) -> Result<(), String> {
         validate_work_unit(work_unit)?;
         let conn = self.conn();
