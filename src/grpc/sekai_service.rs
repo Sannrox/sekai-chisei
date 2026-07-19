@@ -2187,6 +2187,46 @@ fn check_ontology_admin(
     Err(Status::permission_denied("ontology admin required"))
 }
 
+fn check_ontology_class_read(
+    security: &SecurityChecker,
+    class: &ontology::OntologyClass,
+    principals: &[String],
+) -> Result<(), Status> {
+    check_read(security, &ontology_class_object_id(&class.name), principals)?;
+    for reference in class
+        .superclasses
+        .iter()
+        .chain(&class.equivalent_classes)
+        .chain(&class.disjoint_classes)
+    {
+        check_read(security, &ontology_class_object_id(reference), principals)?;
+    }
+    Ok(())
+}
+
+fn check_ontology_relation_read(
+    security: &SecurityChecker,
+    relation: &ontology::OntologyRelation,
+    principals: &[String],
+) -> Result<(), Status> {
+    check_read(
+        security,
+        &ontology_relation_object_id(&relation.name),
+        principals,
+    )?;
+    for endpoint in [&relation.domain, &relation.range] {
+        check_read(security, &ontology_class_object_id(endpoint), principals)?;
+    }
+    if !relation.inverse.is_empty() {
+        check_read(
+            security,
+            &ontology_relation_object_id(&relation.inverse),
+            principals,
+        )?;
+    }
+    Ok(())
+}
+
 fn to_proto_ontology_property(property: &ontology::OntologyProperty) -> OntologyProperty {
     OntologyProperty {
         name: property.name.clone(),
@@ -4007,14 +4047,7 @@ impl SekaiService for SekaiServiceImpl {
             .list_ontology_classes()
             .map_err(Status::internal)?
             .iter()
-            .filter(|class| {
-                check_read(
-                    &self.security,
-                    &ontology_class_object_id(&class.name),
-                    &principals,
-                )
-                .is_ok()
-            })
+            .filter(|class| check_ontology_class_read(&self.security, class, &principals).is_ok())
             .map(to_proto_ontology_class)
             .collect();
         Ok(Response::new(ListOntologyClassesResponse { classes }))
@@ -4040,6 +4073,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_ontology_class(&name)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("ontology class not found"))?;
+        check_ontology_class_read(&self.security, &class, &principals)?;
         Ok(Response::new(GetOntologyClassResponse {
             class: Some(to_proto_ontology_class(&class)),
         }))
@@ -4168,12 +4202,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .iter()
             .filter(|relation| {
-                check_read(
-                    &self.security,
-                    &ontology_relation_object_id(&relation.name),
-                    &principals,
-                )
-                .is_ok()
+                check_ontology_relation_read(&self.security, relation, &principals).is_ok()
             })
             .map(to_proto_ontology_relation)
             .collect();
@@ -4200,6 +4229,7 @@ impl SekaiService for SekaiServiceImpl {
             .get_ontology_relation(&name)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("ontology relation not found"))?;
+        check_ontology_relation_read(&self.security, &relation, &principals)?;
         Ok(Response::new(GetOntologyRelationResponse {
             relation: Some(to_proto_ontology_relation(&relation)),
         }))
@@ -10860,6 +10890,81 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(relation_denied.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn ontology_reads_hide_definitions_with_unreadable_references() {
+        let svc = service();
+        for name in ["Visible", "Hidden"] {
+            svc.create_ontology_class(with_named_principal(
+                CreateOntologyClassRequest {
+                    class: Some(ontology_class(name)),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        let mut child = ontology_class("Child");
+        child.superclasses = vec!["Hidden".into()];
+        svc.create_ontology_class(with_named_principal(
+            CreateOntologyClassRequest { class: Some(child) },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_ontology_relation(with_named_principal(
+            CreateOntologyRelationRequest {
+                relation: Some(OntologyRelation {
+                    name: "reveals_hidden".into(),
+                    description: String::new(),
+                    domain: "Visible".into(),
+                    range: "Hidden".into(),
+                    cardinality: None,
+                    inverse: String::new(),
+                    transitive: false,
+                    is_builtin: false,
+                    mapped_relation: String::new(),
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        grant_object_role(
+            &svc,
+            "ontology:class:Hidden",
+            "other-reader",
+            security::Role::Viewer,
+        );
+
+        let class_denied = svc
+            .get_ontology_class(with_principal(GetOntologyClassRequest {
+                name: "Child".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(class_denied.code(), tonic::Code::PermissionDenied);
+        let relation_denied = svc
+            .get_ontology_relation(with_principal(GetOntologyRelationRequest {
+                name: "reveals_hidden".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(relation_denied.code(), tonic::Code::PermissionDenied);
+
+        let classes = svc
+            .list_ontology_classes(with_principal(ListOntologyClassesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!classes.classes.iter().any(|class| class.name == "Child"));
+        let relations = svc
+            .list_ontology_relations(with_principal(ListOntologyRelationsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(relations.relations.is_empty());
     }
 
     #[tokio::test]
