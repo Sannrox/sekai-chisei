@@ -2227,6 +2227,30 @@ fn check_ontology_relation_read(
     Ok(())
 }
 
+fn check_ontology_grant_target(
+    db: &SekaiDb,
+    security: &SecurityChecker,
+    object_id: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    let exists = if let Some(name) = object_id.strip_prefix("ontology:class:") {
+        db.get_ontology_class(name)
+            .map_err(Status::internal)?
+            .is_some()
+    } else if let Some(name) = object_id.strip_prefix("ontology:relation:") {
+        db.get_ontology_relation(name)
+            .map_err(Status::internal)?
+            .is_some()
+    } else {
+        return Ok(false);
+    };
+    if !exists {
+        return Err(Status::not_found("grant target not found"));
+    }
+    check_ontology_admin(security, object_id, principals)?;
+    Ok(true)
+}
+
 fn to_proto_ontology_property(property: &ontology::OntologyProperty) -> OntologyProperty {
     OntologyProperty {
         name: property.name.clone(),
@@ -6438,6 +6462,15 @@ impl SekaiService for SekaiServiceImpl {
             .grant
             .ok_or(Status::invalid_argument("grant required"))?;
         let parsed = from_proto_grant(&grant)?;
+        if check_ontology_grant_target(&self.db, &self.security, &parsed.object_id, &principals)? {
+            self.db
+                .create_grant(&parsed)
+                .map_err(Status::invalid_argument)?;
+            self.security.add_grant(&parsed);
+            return Ok(Response::new(CreateGrantResponse {
+                grant: Some(to_proto_grant(&parsed)),
+            }));
+        }
         let target = self
             .db
             .get_object(&parsed.object_id)
@@ -6469,6 +6502,15 @@ impl SekaiService for SekaiServiceImpl {
             .get_grant(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("grant not found"))?;
+        if check_ontology_grant_target(&self.db, &self.security, &existing.object_id, &principals)?
+        {
+            let deleted = self.db.delete_grant(&id).map_err(Status::internal)?;
+            if let Some(grant) = deleted {
+                self.security
+                    .remove_grant(&grant.object_id, &grant.principal);
+            }
+            return Ok(Response::new(DeleteGrantResponse {}));
+        }
         let target = self
             .db
             .get_object(&existing.object_id)
@@ -6497,6 +6539,16 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let object_id = req.into_inner().object_id;
+        if check_ontology_grant_target(&self.db, &self.security, &object_id, &principals)? {
+            let grants = self
+                .db
+                .list_grants(&object_id)
+                .map_err(Status::internal)?
+                .iter()
+                .map(to_proto_grant)
+                .collect();
+            return Ok(Response::new(ListGrantsResponse { grants }));
+        }
         let target = self
             .db
             .get_object(&object_id)
@@ -11141,6 +11193,66 @@ mod tests {
             assert!(svc.db.list_grants(object_id).unwrap().is_empty());
             assert!(svc.security.can_access(object_id, &["other-reader"]));
         }
+    }
+
+    #[tokio::test]
+    async fn ontology_grants_are_managed_through_public_rpcs() {
+        let svc = service();
+        svc.create_ontology_class(with_named_principal(
+            CreateOntologyClassRequest {
+                class: Some(ontology_class("Restricted")),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        grant_ontology_admin(&svc);
+
+        let created = svc
+            .create_grant(with_principal(CreateGrantRequest {
+                grant: Some(Grant {
+                    id: "ontology-viewer".into(),
+                    object_id: "ontology:class:Restricted".into(),
+                    principal: "alice".into(),
+                    role: "viewer".into(),
+                    created: 1,
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .grant
+            .unwrap();
+        assert_eq!(created.principal, "alice");
+
+        let grants = svc
+            .list_grants(with_principal(ListGrantsRequest {
+                object_id: "ontology:class:Restricted".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(grants.grants.len(), 1);
+        svc.get_ontology_class(with_named_principal(
+            GetOntologyClassRequest {
+                name: "Restricted".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        svc.delete_grant(with_principal(DeleteGrantRequest {
+            id: "ontology-viewer".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            svc.db
+                .list_grants("ontology:class:Restricted")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
