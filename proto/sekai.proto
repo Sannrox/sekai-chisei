@@ -91,6 +91,42 @@ message StructFieldDef {
   repeated string enum_values = 5;
 }
 
+// Ontology layer (issue #141): first-class semantic concepts above the graph.
+message OntologyProperty {
+  string name = 1;
+  string type = 2;
+  bool required = 3;
+  string description = 4;
+}
+
+message Cardinality {
+  uint32 min = 1;
+  optional uint32 max = 2;
+}
+
+message OntologyClass {
+  string name = 1;
+  string description = 2;
+  repeated string superclasses = 3;
+  repeated string equivalent_classes = 4;
+  repeated string disjoint_classes = 5;
+  repeated OntologyProperty properties = 6;
+  bool is_builtin = 7;
+  string mapped_kind = 8;
+}
+
+message OntologyRelation {
+  string name = 1;
+  string description = 2;
+  string domain = 3;
+  string range = 4;
+  Cardinality cardinality = 5;
+  string inverse = 6;
+  bool transitive = 7;
+  bool is_builtin = 8;
+  string mapped_relation = 9;
+}
+
 message Function {
   string name = 1;
   string description = 2;
@@ -384,6 +420,27 @@ message CreateInterfaceRequest { InterfaceDef interface = 1; }
 message CreateInterfaceResponse { InterfaceDef interface = 1; }
 message DeleteInterfaceRequest { string name = 1; }
 message DeleteInterfaceResponse {}
+
+message ListOntologyClassesRequest {}
+message ListOntologyClassesResponse { repeated OntologyClass classes = 1; }
+message GetOntologyClassRequest { string name = 1; }
+message GetOntologyClassResponse { OntologyClass class = 1; }
+message CreateOntologyClassRequest { OntologyClass class = 1; }
+message CreateOntologyClassResponse { OntologyClass class = 1; }
+message DeleteOntologyClassRequest { string name = 1; }
+message DeleteOntologyClassResponse {}
+
+message ListOntologyRelationsRequest {}
+message ListOntologyRelationsResponse { repeated OntologyRelation relations = 1; }
+message GetOntologyRelationRequest { string name = 1; }
+message GetOntologyRelationResponse { OntologyRelation relation = 1; }
+message CreateOntologyRelationRequest { OntologyRelation relation = 1; }
+message CreateOntologyRelationResponse { OntologyRelation relation = 1; }
+message DeleteOntologyRelationRequest { string name = 1; }
+message DeleteOntologyRelationResponse {}
+
+message ProjectSchemaToOntologyRequest {}
+message ProjectSchemaToOntologyResponse { repeated OntologyClass classes = 1; }
 
 message ExecuteFunctionRequest { string name = 1; map<string, string> params = 2; }
 message ExecuteFunctionResponse { FunctionResult result = 1; }
@@ -921,6 +978,15 @@ service SekaiService {
   rpc ListInterfaces(ListInterfacesRequest) returns (ListInterfacesResponse);
   rpc CreateInterface(CreateInterfaceRequest) returns (CreateInterfaceResponse);
   rpc DeleteInterface(DeleteInterfaceRequest) returns (DeleteInterfaceResponse);
+  rpc ListOntologyClasses(ListOntologyClassesRequest) returns (ListOntologyClassesResponse);
+  rpc GetOntologyClass(GetOntologyClassRequest) returns (GetOntologyClassResponse);
+  rpc CreateOntologyClass(CreateOntologyClassRequest) returns (CreateOntologyClassResponse);
+  rpc DeleteOntologyClass(DeleteOntologyClassRequest) returns (DeleteOntologyClassResponse);
+  rpc ListOntologyRelations(ListOntologyRelationsRequest) returns (ListOntologyRelationsResponse);
+  rpc GetOntologyRelation(GetOntologyRelationRequest) returns (GetOntologyRelationResponse);
+  rpc CreateOntologyRelation(CreateOntologyRelationRequest) returns (CreateOntologyRelationResponse);
+  rpc DeleteOntologyRelation(DeleteOntologyRelationRequest) returns (DeleteOntologyRelationResponse);
+  rpc ProjectSchemaToOntology(ProjectSchemaToOntologyRequest) returns (ProjectSchemaToOntologyResponse);
 
   rpc CreateFunction(CreateFunctionRequest) returns (CreateFunctionResponse);
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);
