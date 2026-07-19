@@ -3,8 +3,11 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use crate::obs::labels::{Outcome, Subsystem, WaitKind};
+use crate::obs::signals;
 
 use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, ObjectSet, PropertyFilter,
@@ -85,14 +88,48 @@ impl SekaiDb {
     }
 
     pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
+        let started = Instant::now();
         loop {
             match self.pool.get() {
-                Ok(conn) => return conn,
+                Ok(conn) => {
+                    signals::record_db_wait(
+                        WaitKind::ConnectionAcquire,
+                        Outcome::Ok,
+                        started.elapsed(),
+                    );
+                    self.observe_pool_saturation();
+                    return conn;
+                }
                 Err(error) => {
+                    // r2d2 blocks for `connection_timeout` (30s by default)
+                    // before yielding an error, so this records once per
+                    // failed wait rather than spinning.
+                    signals::record_db_wait(
+                        WaitKind::ConnectionAcquire,
+                        Outcome::Timeout,
+                        started.elapsed(),
+                    );
                     tracing::error!(%error, "database connection pool unavailable; retrying");
                 }
             }
         }
+    }
+
+    /// Sample pool utilization at acquisition time.
+    ///
+    /// Sampling here rather than on a timer keeps the gauge tied to real demand
+    /// and avoids a background task for a value nobody reads while idle.
+    fn observe_pool_saturation(&self) {
+        let state = self.pool.state();
+        let max_size = self.pool.max_size();
+        if max_size == 0 {
+            return;
+        }
+        let in_use = state.connections.saturating_sub(state.idle_connections);
+        signals::set_saturation(
+            Subsystem::Persistence,
+            f64::from(in_use) / f64::from(max_size),
+        );
     }
 
     pub fn db_lock_poisoned_total(&self) -> u64 {
