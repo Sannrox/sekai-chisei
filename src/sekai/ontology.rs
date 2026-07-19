@@ -14,6 +14,7 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
 use crate::sekai::schema::{PropertyType, SchemaRegistry};
+use crate::sekai::security::Grant;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -474,6 +475,27 @@ impl SekaiDb {
         class: &OntologyClass,
         actor: &str,
     ) -> Result<(), String> {
+        self.upsert_ontology_class_with_audit_and_acl(class, actor, None)
+    }
+
+    /// Persist a projected class, its audit decision, and the source schema's
+    /// ACL in one transaction. `source_grants` is `Some` even when empty so a
+    /// newly-public source removes restrictions left by an earlier projection.
+    pub fn upsert_projected_ontology_class_with_audit(
+        &self,
+        class: &OntologyClass,
+        actor: &str,
+        source_grants: &[Grant],
+    ) -> Result<(), String> {
+        self.upsert_ontology_class_with_audit_and_acl(class, actor, Some(source_grants))
+    }
+
+    fn upsert_ontology_class_with_audit_and_acl(
+        &self,
+        class: &OntologyClass,
+        actor: &str,
+        source_grants: Option<&[Grant]>,
+    ) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         let superclasses_json =
             serde_json::to_string(&class.superclasses).map_err(|error| error.to_string())?;
@@ -517,6 +539,30 @@ impl SekaiDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if let Some(source_grants) = source_grants {
+            let object_id = format!("ontology:class:{}", class.name);
+            transaction
+                .execute(
+                    "DELETE FROM sekai_grants WHERE object_id = ?1",
+                    params![object_id],
+                )
+                .map_err(|error| error.to_string())?;
+            for grant in source_grants {
+                transaction
+                    .execute(
+                        "INSERT INTO sekai_grants (id, object_id, principal, role, created)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            format!("ontology-projection-{}", Uuid::new_v4().simple()),
+                            object_id,
+                            grant.principal,
+                            grant.role.as_str(),
+                            grant.created
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         insert_ontology_audit(
             &transaction,
             actor,

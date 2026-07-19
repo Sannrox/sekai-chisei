@@ -4275,14 +4275,47 @@ impl SekaiService for SekaiServiceImpl {
             ontology::project_schema_registry(&schema)
         };
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let mut projection_plan = Vec::new();
+        for class in projected.classes() {
+            let source_object_id = if class.mapped_kind.is_empty() {
+                interface_object_id(&class.name)
+            } else {
+                schema_object_id(&class.mapped_kind)
+            };
+            check_read(&self.security, &source_object_id, &principals)?;
+            let source_grants = self
+                .db
+                .list_grants(&source_object_id)
+                .map_err(Status::internal)?;
+            let ontology_object_id = ontology_class_object_id(&class.name);
+            let previous_grants = self
+                .db
+                .list_grants(&ontology_object_id)
+                .map_err(Status::internal)?;
+            projection_plan.push((class, source_grants, ontology_object_id, previous_grants));
+        }
         let mut classes = Vec::new();
-        for mut class in projected.classes() {
+        for (mut class, source_grants, ontology_object_id, previous_grants) in projection_plan {
             // Persisted ontology classes are user-owned; the builtin flag is a
             // schema concept and is not carried into storage.
             class.is_builtin = false;
             self.db
-                .upsert_ontology_class_with_audit(&class, actor)
+                .upsert_projected_ontology_class_with_audit(&class, actor, &source_grants)
                 .map_err(Status::internal)?;
+            for grant in &previous_grants {
+                self.security
+                    .remove_grant(&ontology_object_id, &grant.principal);
+            }
+            for grant in &source_grants {
+                let projected_grant = security::Grant {
+                    id: grant.id.clone(),
+                    object_id: ontology_object_id.clone(),
+                    principal: grant.principal.clone(),
+                    role: grant.role.clone(),
+                    created: grant.created,
+                };
+                self.security.add_grant(&projected_grant);
+            }
             classes.push(to_proto_ontology_class(&class));
         }
         Ok(Response::new(ProjectSchemaToOntologyResponse { classes }))
@@ -10858,6 +10891,88 @@ mod tests {
             .unwrap();
         assert_eq!(widget.mapped_kind, "widget");
         assert!(widget.properties.iter().any(|prop| prop.name == "name"));
+    }
+
+    #[tokio::test]
+    async fn schema_projection_preserves_source_acl() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        grant_object_role(
+            &svc,
+            "schema:widget",
+            "schema-reader",
+            security::Role::Viewer,
+        );
+        grant_object_role(&svc, "schema:widget", "local", security::Role::Viewer);
+
+        let projected = svc
+            .project_schema_to_ontology(with_named_principal(
+                ProjectSchemaToOntologyRequest {},
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(projected.classes.iter().any(|class| class.name == "widget"));
+
+        let hidden = svc
+            .get_ontology_class(with_named_principal(
+                GetOntologyClassRequest {
+                    name: "widget".into(),
+                },
+                "other-reader",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+
+        let visible = svc
+            .get_ontology_class(with_named_principal(
+                GetOntologyClassRequest {
+                    name: "widget".into(),
+                },
+                "schema-reader",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .class
+            .unwrap();
+        assert_eq!(visible.name, "widget");
+    }
+
+    #[tokio::test]
+    async fn schema_projection_preflights_all_source_access_before_writing() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        grant_ontology_admin(&svc);
+        grant_object_role(
+            &svc,
+            "schema:widget",
+            "other-reader",
+            security::Role::Viewer,
+        );
+
+        let denied = svc
+            .project_schema_to_ontology(with_principal(ProjectSchemaToOntologyRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(svc.db.list_ontology_classes().unwrap().is_empty());
     }
 
     #[tokio::test]
