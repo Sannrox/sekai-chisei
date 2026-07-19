@@ -511,6 +511,57 @@ message ResolvePolicyRequest {
   string budget_route_bias = 11;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
+
+message GetEffectivePolicySummaryRequest { string namespace = 1; }
+message SetNamespaceWorkerPolicyRequest {
+  string namespace = 1;
+  string contention_scope_id = 2;
+}
+message SetNamespaceWorkerPolicyResponse {}
+message EffectiveRoutingSummary {
+  bool configured = 1;
+  string status = 2;
+  string runtime = 3;
+  string model = 4;
+  string policy_scope = 5;
+  string policy_version = 6;
+}
+message EffectiveBudgetLimit {
+  string metric = 1;
+  int64 max_amount = 2;
+  string period_type = 3;
+  string policy_scope = 4;
+}
+message EffectiveBudgetSummary {
+  bool configured = 1;
+  string status = 2;
+  repeated EffectiveBudgetLimit limits = 3;
+  string policy_version = 4;
+}
+message EffectiveActionPolicySummary {
+  bool configured = 1;
+  string status = 2;
+  uint32 allow_rule_count = 3;
+  uint32 deny_rule_count = 4;
+  uint32 require_approval_rule_count = 5;
+  string default_decision = 6;
+  string policy_scope = 7;
+  string policy_version = 8;
+}
+message EffectiveWorkerConcurrencySummary {
+  bool configured = 1;
+  string status = 2;
+  int32 max_concurrency = 3;
+  string policy_scope = 4;
+  string policy_version = 5;
+}
+message GetEffectivePolicySummaryResponse {
+  string namespace = 1;
+  EffectiveRoutingSummary routing = 2;
+  EffectiveBudgetSummary budgets = 3;
+  EffectiveActionPolicySummary actions = 4;
+  EffectiveWorkerConcurrencySummary worker_concurrency = 5;
+}
 message CheckEgressRequest {
   string namespace = 1;
   string payload = 2;
@@ -819,6 +870,9 @@ service ChiseiService {
   // Model Policy
   rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
   rpc ResolvePolicy(ResolvePolicyRequest) returns (ResolvePolicyResponse);
+  // Read-only, operator-safe live projection of effective namespace policy.
+  rpc GetEffectivePolicySummary(GetEffectivePolicySummaryRequest) returns (GetEffectivePolicySummaryResponse);
+  rpc SetNamespaceWorkerPolicy(SetNamespaceWorkerPolicyRequest) returns (SetNamespaceWorkerPolicyResponse);
   rpc CheckEgress(CheckEgressRequest) returns (CheckEgressResponse);
 
   // Pipeline

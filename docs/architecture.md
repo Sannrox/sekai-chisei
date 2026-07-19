@@ -63,6 +63,14 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
 
+Operator clients may use `GetEffectivePolicySummary` to render a live,
+read-only namespace projection of effective routing, configured budget limits,
+bounded action-rule counts, and governed worker concurrency. Each section
+reports its owning scope and revision or an explicit unconfigured state. The
+projection never includes budget usage, request-specific verdicts, raw action
+rules, credentials, or caller-supplied runtime capacity, and every request is
+checked against namespace read access.
+
 Native runtimes can use the namespace-scoped
 [capability catalog](capability-catalog.md) to discover visible object queries,
 bounded retrieval surfaces, and governed actions before invocation. Catalog
