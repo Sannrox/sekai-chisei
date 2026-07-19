@@ -297,3 +297,140 @@ async fn metrics_layer_records_cancelled_when_body_is_dropped() {
     assert!(metrics.contains("grpc_method=\"DeleteObject\""));
     assert!(metrics.contains("grpc_code=\"cancelled\""));
 }
+
+// --- Operability signal surface (Issue #98) ---
+
+use sekai_chisei::obs::labels::{
+    Cache, CacheOutcome, FallbackTrigger, LagSurface, Outcome, RejectionReason, Subsystem, WaitKind,
+};
+use sekai_chisei::obs::signals;
+
+#[test]
+fn every_signal_family_renders_with_bounded_labels() {
+    sekai_chisei::obs::metrics::handle();
+
+    signals::record_control_plane_overhead(
+        Subsystem::Chisei,
+        Outcome::Ok,
+        Duration::from_millis(12),
+    );
+    signals::record_db_wait(
+        WaitKind::ConnectionAcquire,
+        Outcome::Ok,
+        Duration::from_millis(3),
+    );
+    signals::set_queue_depth(Subsystem::Sekai, 7);
+    signals::record_cache_event(Cache::PolicyResolution, CacheOutcome::Hit);
+    signals::record_durability_lag(LagSurface::Receipt, Duration::from_millis(40));
+    signals::record_fallback(Subsystem::Llm, FallbackTrigger::ProviderUnavailable);
+    signals::record_rejected_work(Subsystem::Gateway, RejectionReason::Overloaded);
+
+    let rendered = sekai_chisei::obs::metrics::handle().render();
+
+    for family in [
+        signals::CONTROL_PLANE_OVERHEAD,
+        signals::DB_WAIT,
+        signals::QUEUE_DEPTH,
+        signals::CACHE_EVENTS,
+        signals::DURABILITY_LAG,
+        signals::FALLBACK_TOTAL,
+        signals::REJECTED_WORK_TOTAL,
+    ] {
+        assert!(rendered.contains(family), "missing signal family {family}");
+    }
+
+    assert!(rendered.contains(r#"subsystem="chisei""#));
+    assert!(rendered.contains(r#"wait_kind="connection_acquire""#));
+    assert!(rendered.contains(r#"cache="policy_resolution""#));
+    assert!(rendered.contains(r#"reason="overloaded""#));
+    assert!(rendered.contains(r#"trigger="provider_unavailable""#));
+}
+
+#[test]
+fn saturation_ratio_is_clamped_in_rendered_output() {
+    sekai_chisei::obs::metrics::handle();
+
+    // A miscounted denominator must not render a ratio above 1.0.
+    signals::set_saturation(Subsystem::Persistence, 4.2);
+    let rendered = sekai_chisei::obs::metrics::handle().render();
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
+        .expect("saturation series for persistence");
+    let value: f64 = line
+        .rsplit(' ')
+        .next()
+        .expect("value field")
+        .parse()
+        .expect("numeric gauge value");
+    assert_eq!(value, 1.0, "saturation rendered above unit range: {line}");
+
+    signals::set_saturation(Subsystem::Persistence, f64::NAN);
+    let rendered = sekai_chisei::obs::metrics::handle().render();
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
+        .expect("saturation series for persistence");
+    assert!(
+        !line.contains("NaN"),
+        "non-finite saturation leaked into output: {line}"
+    );
+}
+
+#[test]
+fn signal_labels_never_carry_identifiers_or_digests() {
+    sekai_chisei::obs::metrics::handle();
+
+    signals::record_rejected_work(Subsystem::Sekai, RejectionReason::PolicyBlocked);
+    signals::record_cache_event(Cache::EvidenceSchema, CacheOutcome::Miss);
+
+    let rendered = sekai_chisei::obs::metrics::handle().render();
+
+    // Issue #98 forbids content-derived, high-cardinality, or sensitive labels.
+    // Assert on the label *keys* our families emit rather than scanning values,
+    // since the closed enums already bound the values.
+    let permitted_keys = [
+        "subsystem",
+        "outcome",
+        "wait_kind",
+        "cache",
+        "surface",
+        "trigger",
+        "reason",
+    ];
+    for line in rendered.lines() {
+        let is_ours = [
+            signals::CONTROL_PLANE_OVERHEAD,
+            signals::SATURATION_RATIO,
+            signals::DB_WAIT,
+            signals::QUEUE_DEPTH,
+            signals::CACHE_EVENTS,
+            signals::DURABILITY_LAG,
+            signals::FALLBACK_TOTAL,
+            signals::REJECTED_WORK_TOTAL,
+        ]
+        .iter()
+        .any(|family| line.starts_with(*family));
+        if !is_ours {
+            continue;
+        }
+        let Some(start) = line.find('{') else {
+            continue;
+        };
+        let Some(end) = line.find('}') else { continue };
+        for pair in line[start + 1..end].split(',') {
+            let Some((key, _)) = pair.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            // `le` is the Prometheus histogram bucket boundary, not our label.
+            if key == "le" {
+                continue;
+            }
+            assert!(
+                permitted_keys.contains(&key),
+                "unexpected label key {key:?} in operability signal: {line}"
+            );
+        }
+    }
+}
