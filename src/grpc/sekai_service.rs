@@ -28,7 +28,9 @@ use crate::sekai::evidence_store::{
 };
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
-use crate::sekai::{audit, compute, coordination, dataset, function, retrieval, security};
+use crate::sekai::{
+    audit, compute, coordination, dataset, function, ontology, retrieval, security,
+};
 use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "[redacted]";
@@ -2157,6 +2159,133 @@ fn from_proto_struct_field_def(field: &StructFieldDef) -> Result<schema::StructF
     })
 }
 
+fn ontology_class_object_id(name: &str) -> String {
+    format!("ontology:class:{name}")
+}
+
+fn ontology_relation_object_id(name: &str) -> String {
+    format!("ontology:relation:{name}")
+}
+
+fn check_ontology_admin(
+    security: &SecurityChecker,
+    object_id: &str,
+    principals: &[String],
+) -> Result<(), Status> {
+    let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
+    if principals
+        .iter()
+        .any(|principal| principal == "root" || principal == "local")
+        || security.can_admin("ontology", &refs)
+        // Schema admins govern the object model the ontology projects from, so
+        // they may administer the ontology as well.
+        || security.can_admin("schema", &refs)
+        || security.can_admin(object_id, &refs)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("ontology admin required"))
+}
+
+fn to_proto_ontology_property(property: &ontology::OntologyProperty) -> OntologyProperty {
+    OntologyProperty {
+        name: property.name.clone(),
+        r#type: property.prop_type.as_str().to_string(),
+        required: property.required,
+        description: property.description.clone(),
+    }
+}
+
+fn from_proto_ontology_property(
+    property: &OntologyProperty,
+) -> Result<ontology::OntologyProperty, Status> {
+    let prop_type = schema::PropertyType::parse(&property.r#type).ok_or_else(|| {
+        Status::invalid_argument(format!("unknown property type: {}", property.r#type))
+    })?;
+    Ok(ontology::OntologyProperty {
+        name: property.name.clone(),
+        prop_type,
+        required: property.required,
+        description: property.description.clone(),
+    })
+}
+
+fn to_proto_ontology_class(class: &ontology::OntologyClass) -> OntologyClass {
+    OntologyClass {
+        name: class.name.clone(),
+        description: class.description.clone(),
+        superclasses: class.superclasses.clone(),
+        equivalent_classes: class.equivalent_classes.clone(),
+        disjoint_classes: class.disjoint_classes.clone(),
+        properties: class
+            .properties
+            .iter()
+            .map(to_proto_ontology_property)
+            .collect(),
+        is_builtin: class.is_builtin,
+        mapped_kind: class.mapped_kind.clone(),
+    }
+}
+
+fn from_proto_ontology_class(class: &OntologyClass) -> Result<ontology::OntologyClass, Status> {
+    let properties = class
+        .properties
+        .iter()
+        .map(from_proto_ontology_property)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ontology::OntologyClass {
+        name: class.name.clone(),
+        description: class.description.clone(),
+        superclasses: class.superclasses.clone(),
+        equivalent_classes: class.equivalent_classes.clone(),
+        disjoint_classes: class.disjoint_classes.clone(),
+        properties,
+        is_builtin: class.is_builtin,
+        mapped_kind: class.mapped_kind.clone(),
+    })
+}
+
+fn to_proto_ontology_relation(relation: &ontology::OntologyRelation) -> OntologyRelation {
+    OntologyRelation {
+        name: relation.name.clone(),
+        description: relation.description.clone(),
+        domain: relation.domain.clone(),
+        range: relation.range.clone(),
+        cardinality: Some(Cardinality {
+            min: relation.cardinality.min,
+            max: relation.cardinality.max,
+        }),
+        inverse: relation.inverse.clone(),
+        transitive: relation.transitive,
+        is_builtin: relation.is_builtin,
+        mapped_relation: relation.mapped_relation.clone(),
+    }
+}
+
+fn from_proto_ontology_relation(
+    relation: &OntologyRelation,
+) -> Result<ontology::OntologyRelation, Status> {
+    let cardinality = relation
+        .cardinality
+        .as_ref()
+        .map(|cardinality| ontology::Cardinality {
+            min: cardinality.min,
+            max: cardinality.max,
+        })
+        .unwrap_or_default();
+    Ok(ontology::OntologyRelation {
+        name: relation.name.clone(),
+        description: relation.description.clone(),
+        domain: relation.domain.clone(),
+        range: relation.range.clone(),
+        cardinality,
+        inverse: relation.inverse.clone(),
+        transitive: relation.transitive,
+        is_builtin: relation.is_builtin,
+        mapped_relation: relation.mapped_relation.clone(),
+    })
+}
+
 fn schema_object_id(kind: &str) -> String {
     format!("schema:{kind}")
 }
@@ -3865,6 +3994,298 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::internal("schema registry unavailable"))?
             .remove_interface(&name);
         Ok(Response::new(DeleteInterfaceResponse {}))
+    }
+
+    async fn list_ontology_classes(
+        &self,
+        req: Request<ListOntologyClassesRequest>,
+    ) -> Result<Response<ListOntologyClassesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let classes = self
+            .db
+            .list_ontology_classes()
+            .map_err(Status::internal)?
+            .iter()
+            .filter(|class| {
+                check_read(
+                    &self.security,
+                    &ontology_class_object_id(&class.name),
+                    &principals,
+                )
+                .is_ok()
+            })
+            .map(to_proto_ontology_class)
+            .collect();
+        Ok(Response::new(ListOntologyClassesResponse { classes }))
+    }
+
+    async fn get_ontology_class(
+        &self,
+        req: Request<GetOntologyClassRequest>,
+    ) -> Result<Response<GetOntologyClassResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("class name required"));
+        }
+        check_read(
+            &self.security,
+            &ontology_class_object_id(&name),
+            &principals,
+        )?;
+        let class = self
+            .db
+            .get_ontology_class(&name)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("ontology class not found"))?;
+        Ok(Response::new(GetOntologyClassResponse {
+            class: Some(to_proto_ontology_class(&class)),
+        }))
+    }
+
+    async fn create_ontology_class(
+        &self,
+        req: Request<CreateOntologyClassRequest>,
+    ) -> Result<Response<CreateOntologyClassResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let proto = req
+            .into_inner()
+            .class
+            .ok_or(Status::invalid_argument("class required"))?;
+        let parsed = from_proto_ontology_class(&proto)?;
+        check_ontology_admin(
+            &self.security,
+            &ontology_class_object_id(&parsed.name),
+            &principals,
+        )?;
+        if !parsed.mapped_kind.is_empty() {
+            check_read(
+                &self.security,
+                &schema_object_id(&parsed.mapped_kind),
+                &principals,
+            )?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            if schema.get(&parsed.mapped_kind).is_none() {
+                return Err(Status::invalid_argument("mapped schema kind not found"));
+            }
+        }
+        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let existing = registry.get_class(&parsed.name).cloned();
+        // Validate against the rest of the ontology, not the prior version of
+        // this same class, so cycle/reference checks are deterministic.
+        registry.remove_class(&parsed.name);
+        ontology::validate_class_definition(&parsed, existing.as_ref(), &registry)
+            .map_err(Status::invalid_argument)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        self.db
+            .upsert_ontology_class_with_audit(&parsed, actor)
+            .map_err(Status::internal)?;
+        Ok(Response::new(CreateOntologyClassResponse {
+            class: Some(to_proto_ontology_class(&parsed)),
+        }))
+    }
+
+    async fn delete_ontology_class(
+        &self,
+        req: Request<DeleteOntologyClassRequest>,
+    ) -> Result<Response<DeleteOntologyClassResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("class name required"));
+        }
+        check_ontology_admin(
+            &self.security,
+            &ontology_class_object_id(&name),
+            &principals,
+        )?;
+        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        // Refuse to orphan classes or relations that still reference this one.
+        for class in registry.classes() {
+            if class.name == name {
+                continue;
+            }
+            if class
+                .superclasses
+                .iter()
+                .chain(&class.equivalent_classes)
+                .chain(&class.disjoint_classes)
+                .any(|reference| reference == &name)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "class '{}' still references '{name}'",
+                    class.name
+                )));
+            }
+        }
+        for relation in registry.relations() {
+            if relation.domain == name || relation.range == name {
+                return Err(Status::failed_precondition(format!(
+                    "relation '{}' still uses '{name}' as domain or range",
+                    relation.name
+                )));
+            }
+        }
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        if !self
+            .db
+            .delete_ontology_class_with_audit(&name, actor)
+            .map_err(Status::internal)?
+        {
+            return Err(Status::not_found("ontology class not found"));
+        }
+        Ok(Response::new(DeleteOntologyClassResponse {}))
+    }
+
+    async fn list_ontology_relations(
+        &self,
+        req: Request<ListOntologyRelationsRequest>,
+    ) -> Result<Response<ListOntologyRelationsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let relations = self
+            .db
+            .list_ontology_relations()
+            .map_err(Status::internal)?
+            .iter()
+            .filter(|relation| {
+                check_read(
+                    &self.security,
+                    &ontology_relation_object_id(&relation.name),
+                    &principals,
+                )
+                .is_ok()
+            })
+            .map(to_proto_ontology_relation)
+            .collect();
+        Ok(Response::new(ListOntologyRelationsResponse { relations }))
+    }
+
+    async fn get_ontology_relation(
+        &self,
+        req: Request<GetOntologyRelationRequest>,
+    ) -> Result<Response<GetOntologyRelationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("relation name required"));
+        }
+        check_read(
+            &self.security,
+            &ontology_relation_object_id(&name),
+            &principals,
+        )?;
+        let relation = self
+            .db
+            .get_ontology_relation(&name)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("ontology relation not found"))?;
+        Ok(Response::new(GetOntologyRelationResponse {
+            relation: Some(to_proto_ontology_relation(&relation)),
+        }))
+    }
+
+    async fn create_ontology_relation(
+        &self,
+        req: Request<CreateOntologyRelationRequest>,
+    ) -> Result<Response<CreateOntologyRelationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let proto = req
+            .into_inner()
+            .relation
+            .ok_or(Status::invalid_argument("relation required"))?;
+        let parsed = from_proto_ontology_relation(&proto)?;
+        check_ontology_admin(
+            &self.security,
+            &ontology_relation_object_id(&parsed.name),
+            &principals,
+        )?;
+        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let existing = registry.get_relation(&parsed.name).cloned();
+        registry.remove_relation(&parsed.name);
+        ontology::validate_relation_definition(&parsed, existing.as_ref(), &registry)
+            .map_err(Status::invalid_argument)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        self.db
+            .upsert_ontology_relation_with_audit(&parsed, actor)
+            .map_err(Status::internal)?;
+        Ok(Response::new(CreateOntologyRelationResponse {
+            relation: Some(to_proto_ontology_relation(&parsed)),
+        }))
+    }
+
+    async fn delete_ontology_relation(
+        &self,
+        req: Request<DeleteOntologyRelationRequest>,
+    ) -> Result<Response<DeleteOntologyRelationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let name = req.into_inner().name;
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("relation name required"));
+        }
+        check_ontology_admin(
+            &self.security,
+            &ontology_relation_object_id(&name),
+            &principals,
+        )?;
+        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        if let Some(referencing) = registry
+            .relations()
+            .into_iter()
+            .find(|relation| relation.name != name && relation.inverse == name)
+        {
+            return Err(Status::failed_precondition(format!(
+                "relation '{}' still uses '{name}' as its inverse",
+                referencing.name
+            )));
+        }
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        if !self
+            .db
+            .delete_ontology_relation_with_audit(&name, actor)
+            .map_err(Status::internal)?
+        {
+            return Err(Status::not_found("ontology relation not found"));
+        }
+        Ok(Response::new(DeleteOntologyRelationResponse {}))
+    }
+
+    async fn project_schema_to_ontology(
+        &self,
+        req: Request<ProjectSchemaToOntologyRequest>,
+    ) -> Result<Response<ProjectSchemaToOntologyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        check_ontology_admin(&self.security, "ontology", &principals)?;
+        let projected = {
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            ontology::project_schema_registry(&schema)
+        };
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let mut classes = Vec::new();
+        for mut class in projected.classes() {
+            // Persisted ontology classes are user-owned; the builtin flag is a
+            // schema concept and is not carried into storage.
+            class.is_builtin = false;
+            self.db
+                .upsert_ontology_class_with_audit(&class, actor)
+                .map_err(Status::internal)?;
+            classes.push(to_proto_ontology_class(&class));
+        }
+        Ok(Response::new(ProjectSchemaToOntologyResponse { classes }))
     }
 
     async fn create_action_type(
@@ -7192,6 +7613,43 @@ mod tests {
         svc.security.add_grant(&grant);
     }
 
+    fn grant_ontology_admin(svc: &SekaiServiceImpl) {
+        let grant = security::Grant {
+            id: format!("ontology-admin-{}", uuid::Uuid::new_v4().simple()),
+            object_id: "ontology".into(),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+
+    fn grant_ontology_reader(svc: &SekaiServiceImpl, object_id: &str) {
+        let grant = security::Grant {
+            id: format!("ontology-reader-{}", uuid::Uuid::new_v4().simple()),
+            object_id: object_id.into(),
+            principal: "tester".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+
+    fn ontology_class(name: &str) -> OntologyClass {
+        OntologyClass {
+            name: name.into(),
+            description: String::new(),
+            superclasses: vec![],
+            equivalent_classes: vec![],
+            disjoint_classes: vec![],
+            properties: vec![],
+            is_builtin: false,
+            mapped_kind: String::new(),
+        }
+    }
+
     fn grant_action_admin(svc: &SekaiServiceImpl) {
         let grant = security::Grant {
             id: format!("action-admin-{}", uuid::Uuid::new_v4().simple()),
@@ -10096,6 +10554,310 @@ mod tests {
         }))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ontology_list_requires_authentication() {
+        let svc = service();
+        let err = svc
+            .list_ontology_classes(Request::new(ListOntologyClassesRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn create_ontology_class_requires_admin() {
+        let svc = service();
+        let err = svc
+            .create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(ontology_class("Person")),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn ontology_list_hides_unreadable_definitions() {
+        let svc = service();
+        for name in ["Visible", "Hidden"] {
+            svc.create_ontology_class(with_named_principal(
+                CreateOntologyClassRequest {
+                    class: Some(ontology_class(name)),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        grant_ontology_reader(&svc, "ontology:class:Visible");
+        let hidden_grant = security::Grant {
+            id: format!("ontology-hidden-{}", uuid::Uuid::new_v4().simple()),
+            object_id: "ontology:class:Hidden".into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&hidden_grant).unwrap();
+        svc.security.add_grant(&hidden_grant);
+
+        let listed = svc
+            .list_ontology_classes(with_principal(ListOntologyClassesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            listed
+                .classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Visible"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ontology_class_crud_round_trip() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        let mut person = ontology_class("Person");
+        person.description = "A human".into();
+        person.properties = vec![OntologyProperty {
+            name: "email".into(),
+            r#type: "string".into(),
+            required: false,
+            description: String::new(),
+        }];
+
+        let created = svc
+            .create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(person),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .class
+            .unwrap();
+        assert!(created.mapped_kind.is_empty());
+        assert_eq!(created.properties.len(), 1);
+
+        let fetched = svc
+            .get_ontology_class(with_principal(GetOntologyClassRequest {
+                name: "Person".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .class
+            .unwrap();
+        assert_eq!(fetched.description, "A human");
+
+        let listed = svc
+            .list_ontology_classes(with_principal(ListOntologyClassesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(listed.classes.iter().any(|class| class.name == "Person"));
+
+        svc.delete_ontology_class(with_principal(DeleteOntologyClassRequest {
+            name: "Person".into(),
+        }))
+        .await
+        .unwrap();
+        let err = svc
+            .get_ontology_class(with_principal(GetOntologyClassRequest {
+                name: "Person".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let audit = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                target_id: Some("ontology:class:Person".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|decision| decision.action == "ontology.class.create")
+        );
+        assert!(
+            audit
+                .iter()
+                .any(|decision| decision.action == "ontology.class.delete")
+        );
+        assert!(audit.iter().all(|decision| decision.actor == "tester"));
+    }
+
+    #[tokio::test]
+    async fn create_ontology_class_rejects_unknown_superclass() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        let mut engineer = ontology_class("Engineer");
+        engineer.superclasses = vec!["Person".into()];
+        let err = svc
+            .create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(engineer),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown superclass"));
+    }
+
+    #[tokio::test]
+    async fn ontology_relation_requires_known_endpoints() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        let relation = OntologyRelation {
+            name: "works_for".into(),
+            description: String::new(),
+            domain: "Person".into(),
+            range: "Company".into(),
+            cardinality: None,
+            inverse: String::new(),
+            transitive: false,
+            is_builtin: false,
+            mapped_relation: String::new(),
+        };
+        // Endpoints do not exist yet.
+        let err = svc
+            .create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+                relation: Some(relation.clone()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        for name in ["Person", "Company"] {
+            svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(ontology_class(name)),
+            }))
+            .await
+            .unwrap();
+        }
+        let created = svc
+            .create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+                relation: Some(relation),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .relation
+            .unwrap();
+        assert_eq!(created.domain, "Person");
+        assert_eq!(created.range, "Company");
+    }
+
+    #[tokio::test]
+    async fn delete_ontology_class_blocked_by_relation_reference() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        for name in ["Person", "Company"] {
+            svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(ontology_class(name)),
+            }))
+            .await
+            .unwrap();
+        }
+        svc.create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+            relation: Some(OntologyRelation {
+                name: "works_for".into(),
+                description: String::new(),
+                domain: "Person".into(),
+                range: "Company".into(),
+                cardinality: None,
+                inverse: String::new(),
+                transitive: false,
+                is_builtin: false,
+                mapped_relation: String::new(),
+            }),
+        }))
+        .await
+        .unwrap();
+        let err = svc
+            .delete_ontology_class(with_principal(DeleteOntologyClassRequest {
+                name: "Company".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn delete_ontology_relation_blocked_by_inverse_reference() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        for name in ["Person", "Company"] {
+            svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(ontology_class(name)),
+            }))
+            .await
+            .unwrap();
+        }
+        for (name, domain, range, inverse) in [
+            ("works_for", "Person", "Company", ""),
+            ("employs", "Company", "Person", "works_for"),
+        ] {
+            svc.create_ontology_relation(with_principal(CreateOntologyRelationRequest {
+                relation: Some(OntologyRelation {
+                    name: name.into(),
+                    description: String::new(),
+                    domain: domain.into(),
+                    range: range.into(),
+                    cardinality: None,
+                    inverse: inverse.into(),
+                    transitive: false,
+                    is_builtin: false,
+                    mapped_relation: String::new(),
+                }),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let err = svc
+            .delete_ontology_relation(with_principal(DeleteOntologyRelationRequest {
+                name: "works_for".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn project_schema_to_ontology_via_rpc() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+
+        // A schema admin may project (schema governs the object model).
+        let projected = svc
+            .project_schema_to_ontology(with_principal(ProjectSchemaToOntologyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(projected.classes.iter().any(|class| class.name == "widget"));
+
+        let widget = svc
+            .get_ontology_class(with_principal(GetOntologyClassRequest {
+                name: "widget".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .class
+            .unwrap();
+        assert_eq!(widget.mapped_kind, "widget");
+        assert!(widget.properties.iter().any(|prop| prop.name == "name"));
     }
 
     #[tokio::test]
