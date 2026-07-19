@@ -14,7 +14,8 @@
 //! unchanged on other hardware fails for reasons unrelated to a code change.
 
 use sekai_chisei::perf_regression::{
-    GateOutcome, Ineligibility, MIN_REPETITIONS, WorkloadBudget, WorkloadSample, evaluate,
+    BaselineVerdict, GateOutcome, Ineligibility, MIN_REPETITIONS, WorkloadBudget, WorkloadSample,
+    compare_to_baseline, evaluate,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, String> {
     let mut manifest_path = None;
+    let mut baseline_path = None;
     let mut enforce = false;
     let mut report_paths = Vec::new();
 
@@ -56,6 +58,9 @@ fn run() -> Result<ExitCode, String> {
         match arg.as_str() {
             "--manifest" => {
                 manifest_path = Some(args.next().ok_or("--manifest requires a path")?);
+            }
+            "--baseline" => {
+                baseline_path = Some(args.next().ok_or("--baseline requires a path")?);
             }
             "--enforce" => enforce = true,
             other if other.starts_with("--") => {
@@ -126,6 +131,57 @@ fn run() -> Result<ExitCode, String> {
     }
     println!("{}", "-".repeat(78));
 
+    let mut baseline_regressions = 0usize;
+    if let Some(path) = &baseline_path {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+        let baseline: Report =
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+        let comparison = compare_to_baseline(&runs, &baseline.results);
+
+        println!();
+        println!(
+            "{:<36}{:>12}{:>12}{:>9}  verdict",
+            "workload", "baseline", "current", "delta"
+        );
+        println!("{}", "-".repeat(88));
+        for row in &comparison.comparisons {
+            let verdict = match &row.verdict {
+                BaselineVerdict::Unchanged => "unchanged".to_string(),
+                BaselineVerdict::Improved { delta_percent } => {
+                    format!("improved {delta_percent:.1}%")
+                }
+                BaselineVerdict::Regressed {
+                    delta_percent,
+                    threshold_percent,
+                } => {
+                    format!("REGRESSED +{delta_percent:.1}% over {threshold_percent:.1}% threshold")
+                }
+                BaselineVerdict::NotComparable(reason) => match reason {
+                    Ineligibility::NoiseDominated => "not comparable: noise dominated".to_string(),
+                    Ineligibility::BelowTimerResolution => {
+                        "not comparable: below timer resolution".to_string()
+                    }
+                    Ineligibility::InsufficientSamples => {
+                        "not comparable: insufficient samples".to_string()
+                    }
+                },
+                BaselineVerdict::MissingFromBaseline => "absent from baseline".to_string(),
+            };
+            println!(
+                "{:<36}{:>12.1}{:>12.1}{:>8.1}%  {verdict}",
+                row.id, row.baseline_p95_us, row.current_median_p95_us, row.delta_percent
+            );
+        }
+        println!("{}", "-".repeat(88));
+        baseline_regressions = comparison.regressions().len();
+        println!(
+            "{} compared, {} regressions, {} improvements",
+            comparison.comparisons.len(),
+            baseline_regressions,
+            comparison.improvements().len()
+        );
+    }
+
     let failures = gate.failures();
     let ungateable = gate.ungateable();
     println!(
@@ -136,11 +192,15 @@ fn run() -> Result<ExitCode, String> {
         report_paths.len()
     );
 
-    if failures.is_empty() {
+    let total = failures.len() + baseline_regressions;
+    if total == 0 {
         return Ok(ExitCode::SUCCESS);
     }
     if enforce {
-        eprintln!("perf-gate: {} significant regressions", failures.len());
+        eprintln!(
+            "perf-gate: {} budget regressions, {baseline_regressions} baseline regressions",
+            failures.len()
+        );
         Ok(ExitCode::FAILURE)
     } else {
         println!("perf-gate: reporting only, rerun with --enforce to fail on regressions");
