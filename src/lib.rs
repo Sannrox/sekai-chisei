@@ -20,6 +20,7 @@ pub mod obs;
 pub mod onboarding;
 pub mod operation_report;
 pub mod operation_statistics;
+pub mod perf_regression;
 pub mod provenance;
 pub mod provider_profile;
 pub mod provider_resolution;
