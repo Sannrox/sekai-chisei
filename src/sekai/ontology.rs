@@ -361,9 +361,22 @@ pub fn validate_relation_definition(
 /// list becomes `superclasses`, and each schema `PropertyDef` becomes an
 /// `OntologyProperty`. `mapped_kind` records the originating object kind so the
 /// projection stays reversible.
-pub fn project_schema_registry(schema: &SchemaRegistry) -> OntologyRegistry {
+pub fn project_schema_registry(schema: &SchemaRegistry) -> Result<OntologyRegistry, String> {
     let mut registry = OntologyRegistry::new();
-    for interface in schema.all_interfaces() {
+    let interfaces = schema.all_interfaces();
+    let interface_names: HashSet<_> = interfaces
+        .iter()
+        .map(|interface| interface.name.as_str())
+        .collect();
+    for object_type in schema.all() {
+        if interface_names.contains(object_type.kind.as_str()) {
+            return Err(format!(
+                "schema type and interface share ontology class name '{}'",
+                object_type.kind
+            ));
+        }
+    }
+    for interface in interfaces {
         registry.register_class(OntologyClass {
             name: interface.name.clone(),
             description: interface.description,
@@ -391,7 +404,7 @@ pub fn project_schema_registry(schema: &SchemaRegistry) -> OntologyRegistry {
             mapped_kind: object_type.kind,
         });
     }
-    registry
+    Ok(registry)
 }
 
 fn project_property(property: &crate::sekai::schema::PropertyDef) -> OntologyProperty {
@@ -1243,7 +1256,7 @@ mod tests {
             }],
         });
 
-        let ontology = project_schema_registry(&schema);
+        let ontology = project_schema_registry(&schema).unwrap();
         let invoice = ontology
             .get_class("invoice")
             .expect("invoice projected to a class");
