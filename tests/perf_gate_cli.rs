@@ -157,3 +157,46 @@ fn unknown_flag_is_rejected() {
 
     assert!(!output.status.success(), "unknown flag was accepted");
 }
+
+#[test]
+fn baseline_regression_fails_enforce_even_when_budget_passes() {
+    // The point of baseline comparison: a slowdown well inside a loose budget
+    // is invisible to the budget gate but must still fail.
+    let dir = temp_dir("baseline");
+    let manifest = write_manifest(&dir, 5000.0); // deliberately loose
+    let baseline_path = write_report(&dir, "baseline.json", 30.0);
+    let reports: Vec<PathBuf> = (1..=3)
+        .map(|n| write_report(&dir, &format!("b-{n}.json"), 60.0))
+        .collect();
+
+    let budget_only = Command::new(binary())
+        .arg("--enforce")
+        .arg("--manifest")
+        .arg(&manifest)
+        .args(&reports)
+        .output()
+        .expect("run perf-gate");
+    assert!(
+        budget_only.status.success(),
+        "a 2x slowdown inside a loose budget should pass the budget gate"
+    );
+
+    let with_baseline = Command::new(binary())
+        .arg("--enforce")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(&reports)
+        .output()
+        .expect("run perf-gate");
+    assert!(
+        !with_baseline.status.success(),
+        "baseline comparison missed a 2x slowdown: {}",
+        String::from_utf8_lossy(&with_baseline.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&with_baseline.stdout).contains("REGRESSED"),
+        "regression not shown in output"
+    );
+}
