@@ -100,22 +100,39 @@ impl TokenAuthInterceptor {
     }
 }
 
+/// Record a refused request at the authentication boundary.
+///
+/// The reason stays `Unauthorized` for every path here. Distinguishing a
+/// missing header from an invalid token would let an observer of the metrics
+/// endpoint probe which tokens exist, which is the kind of inference the
+/// bounded-label rule in Issue #98 exists to prevent.
+fn reject_unauthorized() {
+    crate::obs::signals::record_rejected_work(
+        crate::obs::labels::Subsystem::Grpc,
+        crate::obs::labels::RejectionReason::Unauthorized,
+    );
+}
+
 impl tonic::service::Interceptor for TokenAuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
+            reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
         };
 
-        let principal = self
-            .resolve_principal(&token)
-            .ok_or_else(|| Status::unauthenticated("invalid token"))?;
+        let principal = self.resolve_principal(&token).ok_or_else(|| {
+            reject_unauthorized();
+            Status::unauthenticated("invalid token")
+        })?;
 
         while req.metadata_mut().remove("x-principal").is_some() {}
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
         req.metadata_mut().insert(
             "x-principal",
-            MetadataValue::from_str(&principal)
-                .map_err(|_| Status::unauthenticated("invalid principal metadata value"))?,
+            MetadataValue::from_str(&principal).map_err(|_| {
+                reject_unauthorized();
+                Status::unauthenticated("invalid principal metadata value")
+            })?,
         );
         req.metadata_mut()
             .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("token"));

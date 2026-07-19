@@ -145,28 +145,33 @@ impl WaitKind {
 }
 
 /// Named cache within the control plane.
+///
+/// These are the caches that actually exist, both in `src/gateway.rs`. An
+/// earlier revision named four caches taken from the issue text rather than
+/// from the code — `PolicyResolution`, `ProviderProfile`, `EvidenceSchema`,
+/// and `Memory` — none of which were real. `PolicyResolver` is an
+/// authoritative in-memory store where a lookup failure means no policy is
+/// set, not that a fetch is needed, and the provider-profile `cache_*` fields
+/// describe provider-side prompt-token accounting rather than a local cache.
+///
+/// A closed vocabulary is only auditable if its entries correspond to
+/// something; variants that name nothing make the surface look more instrumented
+/// than it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cache {
-    PolicyResolution,
-    ProviderProfile,
-    EvidenceSchema,
-    Memory,
+    /// Gateway identity key cache, TTL from `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS`.
+    GatewayKey,
+    /// Gateway governance cache holding budget, policy, and egress decisions.
+    GatewayGovernance,
 }
 
 impl Cache {
-    pub const ALL: &'static [Cache] = &[
-        Cache::PolicyResolution,
-        Cache::ProviderProfile,
-        Cache::EvidenceSchema,
-        Cache::Memory,
-    ];
+    pub const ALL: &'static [Cache] = &[Cache::GatewayKey, Cache::GatewayGovernance];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Cache::PolicyResolution => "policy_resolution",
-            Cache::ProviderProfile => "provider_profile",
-            Cache::EvidenceSchema => "evidence_schema",
-            Cache::Memory => "memory",
+            Cache::GatewayKey => "gateway_key",
+            Cache::GatewayGovernance => "gateway_governance",
         }
     }
 }
@@ -302,7 +307,7 @@ mod tests {
         assert_eq!(Outcome::ALL.len(), 4);
         assert_eq!(RejectionReason::ALL.len(), 6);
         assert_eq!(WaitKind::ALL.len(), 5);
-        assert_eq!(Cache::ALL.len(), 4);
+        assert_eq!(Cache::ALL.len(), 2);
         assert_eq!(CacheOutcome::ALL.len(), 3);
         assert_eq!(LagSurface::ALL.len(), 3);
         assert_eq!(FallbackTrigger::ALL.len(), 4);
