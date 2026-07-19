@@ -222,28 +222,34 @@ impl LagSurface {
 }
 
 /// Why a request fell back from its preferred execution path.
+///
+/// These name the fallbacks the gateway actually performs. An earlier revision
+/// listed `ProviderUnavailable`, `ProviderError`, `Timeout`, and `BudgetGuard`,
+/// taken from the issue text; none had a production emitter, and the retry
+/// decision they implied (`harness::retry_disposition`) has no production
+/// caller either — only its own tests and a benchmark.
+///
+/// The fallbacks that do run are both about the control plane: serving a
+/// last-known budget while it is unreachable, and accepting a degraded route
+/// when it responds with one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FallbackTrigger {
-    ProviderUnavailable,
-    ProviderError,
-    Timeout,
-    BudgetGuard,
+    /// Control plane unreachable; a cached last-known budget was used.
+    GovernanceUnavailable,
+    /// Control plane responded but degraded the route.
+    BudgetDegraded,
 }
 
 impl FallbackTrigger {
     pub const ALL: &'static [FallbackTrigger] = &[
-        FallbackTrigger::ProviderUnavailable,
-        FallbackTrigger::ProviderError,
-        FallbackTrigger::Timeout,
-        FallbackTrigger::BudgetGuard,
+        FallbackTrigger::GovernanceUnavailable,
+        FallbackTrigger::BudgetDegraded,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            FallbackTrigger::ProviderUnavailable => "provider_unavailable",
-            FallbackTrigger::ProviderError => "provider_error",
-            FallbackTrigger::Timeout => "timeout",
-            FallbackTrigger::BudgetGuard => "budget_guard",
+            FallbackTrigger::GovernanceUnavailable => "governance_unavailable",
+            FallbackTrigger::BudgetDegraded => "budget_degraded",
         }
     }
 }
@@ -310,6 +316,6 @@ mod tests {
         assert_eq!(Cache::ALL.len(), 2);
         assert_eq!(CacheOutcome::ALL.len(), 3);
         assert_eq!(LagSurface::ALL.len(), 3);
-        assert_eq!(FallbackTrigger::ALL.len(), 4);
+        assert_eq!(FallbackTrigger::ALL.len(), 2);
     }
 }
