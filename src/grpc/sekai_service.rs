@@ -4180,12 +4180,17 @@ impl SekaiService for SekaiServiceImpl {
             }
         }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let object_id = ontology_class_object_id(&name);
+        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
         if !self
             .db
             .delete_ontology_class_with_audit(&name, actor)
             .map_err(Status::internal)?
         {
             return Err(Status::not_found("ontology class not found"));
+        }
+        for grant in &grants {
+            self.security.remove_grant(&object_id, &grant.principal);
         }
         Ok(Response::new(DeleteOntologyClassResponse {}))
     }
@@ -4306,12 +4311,17 @@ impl SekaiService for SekaiServiceImpl {
             )));
         }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let object_id = ontology_relation_object_id(&name);
+        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
         if !self
             .db
             .delete_ontology_relation_with_audit(&name, actor)
             .map_err(Status::internal)?
         {
             return Err(Status::not_found("ontology relation not found"));
+        }
+        for grant in &grants {
+            self.security.remove_grant(&object_id, &grant.principal);
         }
         Ok(Response::new(DeleteOntologyRelationResponse {}))
     }
@@ -11048,6 +11058,58 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn ontology_delete_clears_durable_and_cached_grants() {
+        let svc = service();
+        for name in ["Person", "Company"] {
+            svc.create_ontology_class(with_named_principal(
+                CreateOntologyClassRequest {
+                    class: Some(ontology_class(name)),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.create_ontology_relation(with_named_principal(
+            CreateOntologyRelationRequest {
+                relation: Some(OntologyRelation {
+                    name: "works_for".into(),
+                    description: String::new(),
+                    domain: "Person".into(),
+                    range: "Company".into(),
+                    cardinality: None,
+                    inverse: String::new(),
+                    transitive: false,
+                    is_builtin: false,
+                    mapped_relation: String::new(),
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        for object_id in ["ontology:class:Person", "ontology:relation:works_for"] {
+            grant_object_role(&svc, object_id, "tester", security::Role::Admin);
+        }
+
+        svc.delete_ontology_relation(with_principal(DeleteOntologyRelationRequest {
+            name: "works_for".into(),
+        }))
+        .await
+        .unwrap();
+        svc.delete_ontology_class(with_principal(DeleteOntologyClassRequest {
+            name: "Person".into(),
+        }))
+        .await
+        .unwrap();
+
+        for object_id in ["ontology:class:Person", "ontology:relation:works_for"] {
+            assert!(svc.db.list_grants(object_id).unwrap().is_empty());
+            assert!(svc.security.can_access(object_id, &["other-reader"]));
+        }
     }
 
     #[tokio::test]
