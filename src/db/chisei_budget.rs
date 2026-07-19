@@ -77,6 +77,37 @@ pub(crate) fn period_start_ms(period_type: &str, now_ms: i64) -> i64 {
 }
 
 impl SekaiDb {
+    pub(crate) fn budget_limits_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(String, String, i64, String)>, String> {
+        let scopes = scope_chain(scope_id);
+        let conn = self.conn();
+        let mut limits = Vec::new();
+        for scope in scopes {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT metric, max_amount, period_type FROM chisei_budget_limits
+                     WHERE scope_id=?1 ORDER BY metric",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![scope], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (metric, max_amount, period_type) = row.map_err(|e| e.to_string())?;
+                limits.push((scope.clone(), metric, max_amount, period_type));
+            }
+        }
+        Ok(limits)
+    }
+
     pub(crate) fn migrate_budget(&self) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch(
