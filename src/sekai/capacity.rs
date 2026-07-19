@@ -17,7 +17,14 @@ pub struct CapacityMetrics {
 }
 
 pub fn record_snapshot(db: &SekaiDb, metrics: &CapacityMetrics) -> Result<(), String> {
-    gauge!("sekai_queue_depth").set(metrics.queue_depth as f64);
+    // Queue depth is emitted through the labeled operability signal so the
+    // family carries one consistent label set. Emitting it here unlabeled as
+    // well would render two series under one family with different dimensions,
+    // which a scraper would sum across unrelated meanings.
+    crate::obs::signals::set_queue_depth(
+        crate::obs::labels::Subsystem::Sekai,
+        metrics.queue_depth.max(0) as u64,
+    );
     gauge!("sekai_running_tasks").set(metrics.running_tasks as f64);
     gauge!("sekai_agent_count").set(metrics.agent_count as f64);
     gauge!("sekai_utilization").set(metrics.utilization as f64);
