@@ -227,6 +227,28 @@ pub fn validate_class_definition(
             class.name, contradiction
         ));
     }
+    for equivalent in &class.equivalent_classes {
+        if registry
+            .get_class(equivalent)
+            .is_some_and(|other| other.disjoint_classes.contains(&class.name))
+        {
+            return Err(format!(
+                "class '{}' cannot be equivalent to '{}' because it is disjoint",
+                class.name, equivalent
+            ));
+        }
+    }
+    for disjoint in &class.disjoint_classes {
+        if registry
+            .get_class(disjoint)
+            .is_some_and(|other| other.equivalent_classes.contains(&class.name))
+        {
+            return Err(format!(
+                "class '{}' cannot be disjoint with '{}' because it is equivalent",
+                class.name, disjoint
+            ));
+        }
+    }
 
     // A superclass edge that leads back to this class forms an inheritance
     // cycle. Because the candidate is not yet registered, checking each
@@ -1165,6 +1187,17 @@ mod tests {
             error.contains("both equivalent to and disjoint"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn asymmetric_equivalent_disjoint_contradiction_rejected() {
+        let mut person = class("Person");
+        person.disjoint_classes = vec!["Human".into()];
+        let registry = OntologyRegistry::from_parts(vec![person, class("Human")], Vec::new());
+        let mut human = class("Human");
+        human.equivalent_classes = vec!["Person".into()];
+        let error = validate_class_definition(&human, None, &registry).unwrap_err();
+        assert!(error.contains("because it is disjoint"), "got: {error}");
     }
 
     #[test]
