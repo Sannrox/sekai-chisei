@@ -434,3 +434,73 @@ fn signal_labels_never_carry_identifiers_or_digests() {
         }
     }
 }
+
+#[test]
+fn signal_families_are_emitted_only_through_the_typed_surface() {
+    // A runtime scrape cannot guard this: a call site that emits a signal
+    // family directly only shows up if that code path runs in this test binary.
+    // `capacity::record_snapshot` does not, and an earlier runtime-based guard
+    // passed while the collision was live. Scan the source instead.
+    //
+    // Two emissions of one family with different label sets render as one
+    // family with inconsistent dimensions, which is invalid Prometheus
+    // exposition: a scraper aggregating it sums across meanings that are not
+    // comparable.
+    const OWNER: &str = "src/obs/signals.rs";
+    let families = [
+        signals::CONTROL_PLANE_OVERHEAD,
+        signals::SATURATION_RATIO,
+        signals::DB_WAIT,
+        signals::QUEUE_DEPTH,
+        signals::CACHE_EVENTS,
+        signals::DURABILITY_LAG,
+        signals::FALLBACK_TOTAL,
+        signals::REJECTED_WORK_TOTAL,
+    ];
+
+    let mut offenders = Vec::new();
+    for path in rust_sources("src") {
+        let normalized = path.replace('\\', "/");
+        if normalized.ends_with(OWNER) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        for family in families {
+            let needle = format!("\"{family}\"");
+            if !source.contains(&needle) {
+                continue;
+            }
+            for macro_name in ["gauge!", "counter!", "histogram!"] {
+                let direct = format!("{macro_name}({needle}");
+                if source.contains(&direct) {
+                    offenders.push(format!("{path}: {macro_name} emits {family} directly"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "operability signal families must be emitted through obs::signals, not raw macros:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn rust_sources(root: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_string()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.to_string_lossy().into_owned());
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found
+}
