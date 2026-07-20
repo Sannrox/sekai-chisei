@@ -383,9 +383,21 @@ impl SekaiDb {
                 )
                 .map_err(|e| e.to_string())?;
             if stored != (scope_id.to_string(), metric.to_string(), amount) {
+                // Same key, different payload: the caller reused a key rather
+                // than retrying. Distinct from a replay and worth alerting on.
+                crate::obs::signals::record_deduplication(
+                    crate::obs::labels::Subsystem::Chisei,
+                    crate::obs::labels::DeduplicationEvent::IdempotencyConflict,
+                );
                 return Err("idempotency key was already used for different budget usage".into());
             }
             tx.commit().map_err(|e| e.to_string())?;
+            // Same key, same payload: a retry that this write correctly
+            // suppressed.
+            crate::obs::signals::record_deduplication(
+                crate::obs::labels::Subsystem::Chisei,
+                crate::obs::labels::DeduplicationEvent::IdempotentReplay,
+            );
             return Ok(false);
         }
         for scope in &chain {
