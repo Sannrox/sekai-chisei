@@ -44,10 +44,17 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let (grpc_service, grpc_method) = parse_grpc_path(req.uri().path());
         let started = Instant::now();
+        // Every RPC opens a correlated operation. The id is generated, never
+        // derived from the request, so correlating two spans cannot reveal
+        // that they touched the same namespace or content.
+        let correlation = crate::obs::correlation::Correlation::new_operation();
         let span = info_span!(
             "grpc",
             grpc_service = %grpc_service,
-            grpc_method = %grpc_method
+            grpc_method = %grpc_method,
+            stage = crate::obs::correlation::Stage::Operation.as_str(),
+            operation = %correlation.operation,
+            attempt = correlation.attempt,
         );
 
         let future = self.inner.call(req);
