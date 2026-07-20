@@ -15,6 +15,7 @@ data/*.db-*
 data/*.sqlite
 data/*.sqlite-*
 data/chisei-gateway-audit.jsonl*
+data/provider-registry-state.json*
 data/chisei-gateway-budget-reconciliation.json*
 .env
 .env.*
