@@ -10,7 +10,8 @@
 //! the histogram buckets installed in [`crate::obs::metrics::handle`].
 
 use crate::obs::labels::{
-    Cache, CacheOutcome, FallbackTrigger, LagSurface, Outcome, RejectionReason, Subsystem, WaitKind,
+    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, Outcome, RejectionReason,
+    Subsystem, WaitKind,
 };
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -25,6 +26,7 @@ pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
 pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
 pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
 pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
+pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
 
 /// Register descriptions for every signal family.
 ///
@@ -54,6 +56,10 @@ pub fn describe_all() {
     );
     describe_counter!(FALLBACK_TOTAL, "Requests that left their preferred path");
     describe_counter!(REJECTED_WORK_TOTAL, "Work refused, by coarse reason");
+    describe_counter!(
+        DEDUPLICATION_TOTAL,
+        "Deduplication and idempotency decisions"
+    );
 }
 
 /// Record control-plane overhead attributable to a subsystem.
@@ -130,6 +136,16 @@ pub fn record_rejected_work(subsystem: Subsystem, reason: RejectionReason) {
     .increment(1);
 }
 
+/// Record a deduplication or idempotency decision.
+pub fn record_deduplication(subsystem: Subsystem, event: DeduplicationEvent) {
+    counter!(
+        DEDUPLICATION_TOTAL,
+        "subsystem" => subsystem.as_str(),
+        "event" => event.as_str(),
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +165,7 @@ mod tests {
             DURABILITY_LAG,
             FALLBACK_TOTAL,
             REJECTED_WORK_TOTAL,
+            DEDUPLICATION_TOTAL,
         ] {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
@@ -161,7 +178,12 @@ mod tests {
 
     #[test]
     fn counter_families_end_in_total() {
-        for name in [CACHE_EVENTS, FALLBACK_TOTAL, REJECTED_WORK_TOTAL] {
+        for name in [
+            CACHE_EVENTS,
+            FALLBACK_TOTAL,
+            REJECTED_WORK_TOTAL,
+            DEDUPLICATION_TOTAL,
+        ] {
             assert!(
                 name.ends_with("_total"),
                 "{name} is a counter without _total"

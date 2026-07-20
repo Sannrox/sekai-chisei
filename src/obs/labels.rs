@@ -221,6 +221,35 @@ impl LagSurface {
     }
 }
 
+/// A deduplication or idempotency decision.
+///
+/// Only outcomes that a call site actually produces are listed. Issue #98 names
+/// a longer set — duplicate evidence deliveries, projection suppressions,
+/// shared bytes, garbage-collection backlog, merge and split decisions — but
+/// those describe machinery this codebase does not currently reach, and naming
+/// them here would make the surface look more instrumented than it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeduplicationEvent {
+    /// Same idempotency key and same payload: the retry was suppressed.
+    IdempotentReplay,
+    /// Same idempotency key, different payload: the caller reused a key.
+    IdempotencyConflict,
+}
+
+impl DeduplicationEvent {
+    pub const ALL: &'static [DeduplicationEvent] = &[
+        DeduplicationEvent::IdempotentReplay,
+        DeduplicationEvent::IdempotencyConflict,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DeduplicationEvent::IdempotentReplay => "idempotent_replay",
+            DeduplicationEvent::IdempotencyConflict => "idempotency_conflict",
+        }
+    }
+}
+
 /// Why a request fell back from its preferred execution path.
 ///
 /// These name the fallbacks the gateway actually performs. An earlier revision
@@ -278,6 +307,7 @@ mod tests {
             rendered(CacheOutcome::ALL, CacheOutcome::as_str),
             rendered(LagSurface::ALL, LagSurface::as_str),
             rendered(FallbackTrigger::ALL, FallbackTrigger::as_str),
+            rendered(DeduplicationEvent::ALL, DeduplicationEvent::as_str),
         ];
 
         let mut total = 0;
@@ -317,5 +347,6 @@ mod tests {
         assert_eq!(CacheOutcome::ALL.len(), 3);
         assert_eq!(LagSurface::ALL.len(), 3);
         assert_eq!(FallbackTrigger::ALL.len(), 2);
+        assert_eq!(DeduplicationEvent::ALL.len(), 2);
     }
 }
