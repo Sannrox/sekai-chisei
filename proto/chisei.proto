@@ -903,6 +903,41 @@ message ExternalActionPermit {
   bytes signature = 5;
   int64 expires_at_ms = 6;
   repeated string constraints = 7;
+  string issuer = 8;
+  string subject_actor = 9;
+  string namespace = 10;
+  string operation_id = 11;
+  string requesting_harness = 12;
+  string executor = 13;
+  string action_type = 14;
+  string parameter_schema = 15;
+  string canonical_arguments_digest = 16;
+  repeated string target_selectors = 17;
+  map<string, string> immutable_preconditions = 18;
+  repeated string allowed_effects = 19;
+  string risk_class = 20;
+  uint64 budget_micros = 21;
+  uint64 volume_limit = 22;
+  uint32 blast_radius_limit = 23;
+  uint32 max_invocations = 24;
+  int64 not_before_ms = 25;
+  string redemption_mode = 26;
+  repeated string approval_identities = 27;
+  string policy_version = 28;
+  string schema_version = 29;
+  string capability_version = 30;
+  string pricing_version = 31;
+  string nonce = 32;
+  uint32 delegation_depth = 33;
+  string parent_permit_id = 34;
+  string revocation_handle = 35;
+  string signature_algorithm = 36;
+  string key_id = 37;
+  string signed_digest = 38;
+  string public_key = 39;
+  int64 issued_at_ms = 40;
+  int64 revocation_latency_ms = 41;
+  repeated string required_host_capabilities = 42;
 }
 
 message ExternalActionRedemption {
@@ -953,6 +988,42 @@ message CancelExternalActionAuthorizationRequest {
   string reason = 2;
 }
 message CancelExternalActionAuthorizationResponse { ExternalActionDecision decision = 1; }
+message IssueExternalActionPermitRequest {
+  string authorization_id = 1;
+  string idempotency_key = 2;
+}
+message IssueExternalActionPermitResponse { ExternalActionPermit permit = 1; }
+message VerifyExternalActionPermitRequest {
+  ExternalActionPermit permit = 1;
+  string executor = 2;
+  string requesting_harness = 3;
+  string canonical_arguments_digest = 4;
+  repeated string target_selectors = 5;
+  map<string, string> observed_preconditions = 6;
+  repeated string host_capabilities = 7;
+}
+message VerifyExternalActionPermitResponse { bool valid = 1; string reason = 2; }
+message RedeemExternalActionPermitRequest {
+  ExternalActionPermit permit = 1;
+  string executor = 2;
+  string requesting_harness = 3;
+  string canonical_arguments_digest = 4;
+  repeated string target_selectors = 5;
+  map<string, string> observed_preconditions = 6;
+  repeated string host_capabilities = 7;
+  string idempotency_key = 8;
+  string execution_id = 9;
+}
+message RedeemExternalActionPermitResponse { ExternalActionRedemption redemption = 1; }
+message RevokeExternalActionPermitRequest { string revocation_handle = 1; string reason = 2; }
+message RevokeExternalActionPermitResponse { bool revoked = 1; }
+message SetExternalActionKillSwitchRequest {
+  string scope_kind = 1; // action_type | executor | harness | namespace | signing_key
+  string scope_value = 2;
+  bool enabled = 3;
+  string reason = 4;
+}
+message SetExternalActionKillSwitchResponse { bool changed = 1; }
 
 // --- Service ---
 
@@ -963,6 +1034,11 @@ service ChiseiService {
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc ResolveExternalActionApproval(ResolveExternalActionApprovalRequest) returns (ResolveExternalActionApprovalResponse);
   rpc CancelExternalActionAuthorization(CancelExternalActionAuthorizationRequest) returns (CancelExternalActionAuthorizationResponse);
+  rpc IssueExternalActionPermit(IssueExternalActionPermitRequest) returns (IssueExternalActionPermitResponse);
+  rpc VerifyExternalActionPermit(VerifyExternalActionPermitRequest) returns (VerifyExternalActionPermitResponse);
+  rpc RedeemExternalActionPermit(RedeemExternalActionPermitRequest) returns (RedeemExternalActionPermitResponse);
+  rpc RevokeExternalActionPermit(RevokeExternalActionPermitRequest) returns (RevokeExternalActionPermitResponse);
+  rpc SetExternalActionKillSwitch(SetExternalActionKillSwitchRequest) returns (SetExternalActionKillSwitchResponse);
   // Budget
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);

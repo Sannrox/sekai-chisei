@@ -136,6 +136,31 @@ The gateway reduces exposure but does not claim to solve prompt injection.
 Applications must still constrain tool permissions and validate effects at
 execution time.
 
+### External-action permits
+
+An allowed external-action authorization can be exchanged idempotently for a
+short-lived Ed25519-signed permit. The permit binds the actor, namespace,
+operation, harness, executor, versioned action and parameter schemas, exact
+argument digest, targets, resource preconditions, effects, limits, policy
+version, validity window, nonce, and online-redemption mode. Hosts must verify
+the configured issuer and key, every binding, their advertised enforcement
+capabilities, and current resource preconditions immediately before execution.
+
+Online redemption consumes an invocation in the same SQLite transaction that
+records its audit decision. Request, permit, redemption, and execution IDs stay
+distinct, and an idempotency key makes an ambiguous retry return the original
+redemption. Revocation and action/executor/harness/namespace/signing-key kill
+switches stop future redemption without removing issuance or redemption
+history. They cannot undo an effect that already started. The control plane
+does not claim exactly-once external effects: redemption proves consumed
+authorization, not execution or outcome.
+
+Permit signing requires `CHISEI_PERMIT_SIGNING_KEY`, a 32-byte Ed25519 seed
+encoded as 64 lowercase hexadecimal characters. `CHISEI_PERMIT_ISSUER` and
+`CHISEI_PERMIT_KEY_ID` identify the trusted key. Production deployments should
+inject the seed through a secret manager and rotate it as a signing credential;
+it must never enter permits, audit evidence, logs, or exported bundles.
+
 ## Persistence
 
 SQLite is the server's current storage backend and runs in WAL mode for file
