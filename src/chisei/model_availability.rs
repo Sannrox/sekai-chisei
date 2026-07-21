@@ -116,7 +116,13 @@ fn discovery_cache_key(config: &ModelDiscoveryConfig) -> u64 {
     config.native_configured.hash(&mut hasher);
     std::env::var_os("XAI_API_KEY").hash(&mut hasher);
     std::env::var_os("META_MODEL_API_KEY").hash(&mut hasher);
+    std::env::var_os("CHISEI_META_BASE_URL").hash(&mut hasher);
     hasher.finish()
+}
+
+pub fn meta_provider_is_configured() -> bool {
+    std::env::var("META_MODEL_API_KEY").is_ok_and(|value| !value.trim().is_empty())
+        && std::env::var("CHISEI_META_BASE_URL").is_ok_and(|value| !value.trim().is_empty())
 }
 
 pub async fn refresh_model_availability(
@@ -212,7 +218,7 @@ pub async fn refresh_model_availability(
     if std::env::var_os("XAI_API_KEY").is_some() {
         discovered.insert("xai".to_string(), (vec!["grok-4.5".to_string()], true));
     }
-    if std::env::var_os("META_MODEL_API_KEY").is_some() {
+    if meta_provider_is_configured() {
         discovered.insert(
             "meta".to_string(),
             (vec!["muse-spark-1.1".to_string()], true),
