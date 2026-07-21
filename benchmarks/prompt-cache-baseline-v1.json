@@ -1,0 +1,33 @@
+{
+  "version": "prompt-cache-baseline/v1",
+  "sanitized_workloads": [
+    "first_hour_onboarding",
+    "operation_report",
+    "evidence_intake",
+    "team_advisory",
+    "benchmark_matrix"
+  ],
+  "provider_profiles": {
+    "anthropic": {
+      "profile_version": "anthropic.prompt-cache/2026-07-21",
+      "ordinary_input_usd_per_million": 3.0,
+      "cache_read_usd_per_million": 0.3,
+      "cache_write_5m_usd_per_million": 3.75,
+      "cache_write_1h_usd_per_million": 6.0,
+      "rate_limit_headroom": "provider_documented_cache_hits_only"
+    }
+  },
+  "scenarios": [
+    {"name": "uncached", "ordinary": 100000, "read": 0, "write_5m": 0, "write_1h": 0},
+    {"name": "cold_5m", "ordinary": 0, "read": 0, "write_5m": 100000, "write_1h": 0},
+    {"name": "warm_5m", "ordinary": 0, "read": 100000, "write_5m": 0, "write_1h": 0},
+    {"name": "expired_5m", "ordinary": 0, "read": 0, "write_5m": 100000, "write_1h": 0},
+    {"name": "invalidated", "ordinary": 50000, "read": 0, "write_5m": 100000, "write_1h": 0},
+    {"name": "cold_1h", "ordinary": 0, "read": 0, "write_5m": 0, "write_1h": 100000}
+  ],
+  "break_even_hits": {"5m": 1, "1h": 2},
+  "sources": [
+    "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+    "https://platform.openai.com/docs/guides/prompt-caching"
+  ]
+}

@@ -18,6 +18,13 @@ pub struct CostEstimate {
     pub high_output_tokens: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheCreationUsage {
+    pub total_tokens: i64,
+    pub five_minute_tokens: Option<i64>,
+    pub one_hour_tokens: Option<i64>,
+}
+
 impl CostEstimateConfig {
     pub fn from_args<I>(args: I) -> Result<Self, String>
     where
@@ -136,8 +143,29 @@ pub(crate) fn cost_usd_micros(
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
 ) -> Option<i64> {
+    cost_usd_micros_with_cache_classes(
+        model,
+        pricing,
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        CacheCreationUsage {
+            total_tokens: cache_creation_input_tokens,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn cost_usd_micros_with_cache_classes(
+    model: &str,
+    pricing: &ModelPricing,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation: CacheCreationUsage,
+) -> Option<i64> {
     let cache_read = cache_read_input_tokens.max(0) as i128;
-    let cache_creation = cache_creation_input_tokens.max(0) as i128;
+    let cache_creation_total = cache_creation.total_tokens.max(0) as i128;
     let input_tokens = input_tokens.max(0) as i128;
     let uncached_input = if crate::llm::provider_name(model) == "anthropic" {
         input_tokens
@@ -147,10 +175,38 @@ pub(crate) fn cost_usd_micros(
     let input_rate = pricing.input_usd_micros_per_million as i128;
     let output_rate = pricing.output_usd_micros_per_million as i128;
     let cached_rate = pricing.cached_input_usd_micros_per_million as i128;
+    let classified_5m = cache_creation.five_minute_tokens.unwrap_or(0).max(0) as i128;
+    let classified_1h = cache_creation.one_hour_tokens.unwrap_or(0).max(0) as i128;
+    let classified = classified_5m.checked_add(classified_1h)?;
+    if classified > cache_creation_total {
+        return None;
+    }
+    let unclassified_creation = cache_creation_total.checked_sub(classified)?;
+    let write_5m_rate = match (classified_5m, pricing.cache_write_5m_usd_micros_per_million) {
+        (0, _) => 0,
+        (_, Some(rate)) => rate as i128,
+        (_, None) => return None,
+    };
+    let write_1h_rate = match (classified_1h, pricing.cache_write_1h_usd_micros_per_million) {
+        (0, _) => 0,
+        (_, Some(rate)) => rate as i128,
+        (_, None) => return None,
+    };
+    // Legacy providers may report only an aggregate cache-creation count. It
+    // can use the ordinary rate only when this pricing snapshot defines no
+    // premium write classes; otherwise the cost is deliberately unknown.
+    if unclassified_creation > 0
+        && (pricing.cache_write_5m_usd_micros_per_million.is_some()
+            || pricing.cache_write_1h_usd_micros_per_million.is_some())
+    {
+        return None;
+    }
     let total = uncached_input
         .checked_mul(input_rate)?
         .checked_add(cache_read.checked_mul(cached_rate)?)?
-        .checked_add(cache_creation.checked_mul(input_rate)?)?
+        .checked_add(unclassified_creation.checked_mul(input_rate)?)?
+        .checked_add(classified_5m.checked_mul(write_5m_rate)?)?
+        .checked_add(classified_1h.checked_mul(write_1h_rate)?)?
         .checked_add((output_tokens.max(0) as i128).checked_mul(output_rate)?)?
         .checked_div(1_000_000)?;
     i64::try_from(total).ok()
@@ -214,6 +270,7 @@ mod tests {
             input_usd_micros_per_million: 3_000_000,
             output_usd_micros_per_million: 15_000_000,
             cached_input_usd_micros_per_million: 300_000,
+            ..Default::default()
         };
         assert_eq!(
             cost_usd_micros("gpt-5.5", &pricing, 100, 10, 80, 20),
