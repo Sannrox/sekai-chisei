@@ -81,11 +81,15 @@ value to stdout.
 | `CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES` | `67108864` | Audit spool rotation threshold |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
 | `CHISEI_GATEWAY_RUN_PIPELINE` | unset | Set `1` to sample completed calls through Chisei |
-| `CHISEI_GATEWAY_PRICING` | unset | Static per-model input/output pricing table |
+| `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table; class rates must be supplied to price provider cache-write premiums |
 
 The pricing format is
-`model=input_usd_per_1m_tokens:output_usd_per_1m_tokens`, with comma-separated
-models.
+`model=input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]`, with every
+rate expressed as USD per million tokens and models separated by commas. The
+cache-read rate defaults to the ordinary input rate for compatibility. Cache
+write rates have no default: when a provider reports a premium-priced write
+class, configure its 5-minute or 1-hour rate explicitly or the call cost stays
+unknown instead of being billed at a misleading ordinary-input rate.
 
 When starting `chisei-gateway` directly, set either `CHISEI_GRPC_URL` or
 `SEKAI_SOCKET`. The gateway does not inherit the control plane's built-in
