@@ -16,6 +16,7 @@ use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::external_action as external;
+use crate::chisei::external_permit as permit;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{
@@ -618,6 +619,125 @@ fn external_decision_to_proto(
             physical_effect_verified: decision.assurance.physical_effect_verified,
         }),
         permit: None,
+    }
+}
+
+fn permit_signing_key(config: &Config) -> Result<ed25519_dalek::SigningKey, Status> {
+    permit::signing_key_from_hex(config.permit_signing_key.as_deref().ok_or_else(|| {
+        Status::failed_precondition("external-action permit signing is not configured")
+    })?)
+    .map_err(Status::failed_precondition)
+}
+
+fn external_permit_to_proto(value: &permit::Permit) -> ExternalActionPermit {
+    ExternalActionPermit {
+        version: value.version.clone(),
+        permit_id: value.permit_id.clone(),
+        authorization_id: value.authorization_id.clone(),
+        request_digest: value.request_digest.clone(),
+        signature: value.signature.clone(),
+        expires_at_ms: value.expires_at_ms,
+        constraints: value.constraints.clone(),
+        issuer: value.issuer.clone(),
+        subject_actor: value.subject_actor.clone(),
+        namespace: value.namespace.clone(),
+        operation_id: value.operation_id.clone(),
+        requesting_harness: value.requesting_harness.clone(),
+        executor: value.executor.clone(),
+        action_type: value.action_type.clone(),
+        parameter_schema: value.parameter_schema.clone(),
+        canonical_arguments_digest: value.canonical_arguments_digest.clone(),
+        target_selectors: value.target_selectors.clone(),
+        immutable_preconditions: value.immutable_preconditions.clone().into_iter().collect(),
+        allowed_effects: value.allowed_effects.clone(),
+        risk_class: value.risk_class.clone(),
+        budget_micros: value.budget_micros,
+        volume_limit: value.volume_limit,
+        blast_radius_limit: value.blast_radius_limit,
+        max_invocations: value.max_invocations,
+        not_before_ms: value.not_before_ms,
+        redemption_mode: value.redemption_mode.clone(),
+        approval_identities: value.approval_identities.clone(),
+        policy_version: value.policy_version.clone(),
+        schema_version: value.schema_version.clone(),
+        capability_version: value.capability_version.clone(),
+        pricing_version: value.pricing_version.clone(),
+        nonce: value.nonce.clone(),
+        delegation_depth: value.delegation_depth,
+        parent_permit_id: value.parent_permit_id.clone(),
+        revocation_handle: value.revocation_handle.clone(),
+        signature_algorithm: value.signature_algorithm.clone(),
+        key_id: value.key_id.clone(),
+        signed_digest: value.signed_digest.clone(),
+        public_key: value.public_key.clone(),
+        issued_at_ms: value.issued_at_ms,
+        revocation_latency_ms: value.revocation_latency_ms,
+        required_host_capabilities: value.required_host_capabilities.clone(),
+    }
+}
+
+fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
+    permit::Permit {
+        version: value.version,
+        permit_id: value.permit_id,
+        authorization_id: value.authorization_id,
+        request_digest: value.request_digest,
+        issuer: value.issuer,
+        subject_actor: value.subject_actor,
+        namespace: value.namespace,
+        operation_id: value.operation_id,
+        requesting_harness: value.requesting_harness,
+        executor: value.executor,
+        action_type: value.action_type,
+        parameter_schema: value.parameter_schema,
+        canonical_arguments_digest: value.canonical_arguments_digest,
+        target_selectors: value.target_selectors,
+        immutable_preconditions: value.immutable_preconditions.into_iter().collect(),
+        allowed_effects: value.allowed_effects,
+        required_host_capabilities: value.required_host_capabilities,
+        constraints: value.constraints,
+        risk_class: value.risk_class,
+        budget_micros: value.budget_micros,
+        volume_limit: value.volume_limit,
+        blast_radius_limit: value.blast_radius_limit,
+        max_invocations: value.max_invocations,
+        not_before_ms: value.not_before_ms,
+        expires_at_ms: value.expires_at_ms,
+        redemption_mode: value.redemption_mode,
+        approval_identities: value.approval_identities,
+        policy_version: value.policy_version,
+        schema_version: value.schema_version,
+        capability_version: value.capability_version,
+        pricing_version: value.pricing_version,
+        nonce: value.nonce,
+        delegation_depth: value.delegation_depth,
+        parent_permit_id: value.parent_permit_id,
+        revocation_handle: value.revocation_handle,
+        signature_algorithm: value.signature_algorithm,
+        key_id: value.key_id,
+        public_key: value.public_key,
+        issued_at_ms: value.issued_at_ms,
+        revocation_latency_ms: value.revocation_latency_ms,
+        signed_digest: value.signed_digest,
+        signature: value.signature,
+    }
+}
+
+fn external_host_context(
+    executor: String,
+    harness: String,
+    digest: String,
+    targets: Vec<String>,
+    preconditions: HashMap<String, String>,
+    capabilities: Vec<String>,
+) -> permit::HostContext {
+    permit::HostContext {
+        executor,
+        requesting_harness: harness,
+        canonical_arguments_digest: digest,
+        target_selectors: targets,
+        observed_preconditions: preconditions.into_iter().collect(),
+        host_capabilities: capabilities,
     }
 }
 
@@ -4217,6 +4337,272 @@ impl ChiseiService for ChiseiServiceImpl {
         ensure_external_action_audit(&self.db, &record)?;
         Ok(Response::new(CancelExternalActionAuthorizationResponse {
             decision: Some(external_decision_to_proto(&record.decision)),
+        }))
+    }
+
+    async fn issue_external_action_permit(
+        &self,
+        req: Request<IssueExternalActionPermitRequest>,
+    ) -> Result<Response<IssueExternalActionPermitResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        if input.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument("idempotency_key required"));
+        }
+        let authorization = self
+            .db
+            .get_external_action_authorization_by_id(&input.authorization_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
+        if actor != authorization.request.actor && !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied("permit issuance denied"));
+        }
+        require_namespace_write_access(&self.db, &actor, &authorization.request.namespace)?;
+        if let Some(value) = self
+            .db
+            .replay_permit(
+                &authorization.decision.authorization_id,
+                &input.idempotency_key,
+            )
+            .map_err(|error| {
+                if error.contains("different idempotency") {
+                    Status::already_exists(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?
+        {
+            return Ok(Response::new(IssueExternalActionPermitResponse {
+                permit: Some(external_permit_to_proto(&value)),
+            }));
+        }
+        let key = permit_signing_key(&self.config)?;
+        let approvals = if authorization.approval_status == "approved" {
+            vec![authorization.decision_actor.clone()]
+        } else {
+            Vec::new()
+        };
+        let value = permit::issue(
+            &authorization,
+            &key,
+            permit::Issuance {
+                approval_identities: approvals,
+                issuer: &self.config.permit_issuer,
+                key_id: &self.config.permit_key_id,
+                permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
+                nonce: uuid::Uuid::new_v4().simple().to_string(),
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .map_err(Status::failed_precondition)?;
+        let value = self
+            .db
+            .put_permit(&value, &input.idempotency_key, &actor)
+            .map_err(|error| {
+                if error.contains("different idempotency") {
+                    Status::already_exists(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
+        Ok(Response::new(IssueExternalActionPermitResponse {
+            permit: Some(external_permit_to_proto(&value)),
+        }))
+    }
+
+    async fn verify_external_action_permit(
+        &self,
+        req: Request<VerifyExternalActionPermitRequest>,
+    ) -> Result<Response<VerifyExternalActionPermitResponse>, Status> {
+        let _actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        let value = external_permit_from_proto(
+            input
+                .permit
+                .ok_or_else(|| Status::invalid_argument("permit required"))?,
+        );
+        let context = external_host_context(
+            input.executor,
+            input.requesting_harness,
+            input.canonical_arguments_digest,
+            input.target_selectors,
+            input.observed_preconditions,
+            input.host_capabilities,
+        );
+        let key = permit_signing_key(&self.config)?.verifying_key();
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = value
+            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
+            .and_then(|_| value.verify_signature(&key))
+            .and_then(|_| value.verify_host_context(&context, now))
+            .and_then(|_| self.db.validate_permit_state(&value));
+        Ok(Response::new(VerifyExternalActionPermitResponse {
+            valid: result.is_ok(),
+            reason: result.err().unwrap_or_default(),
+        }))
+    }
+
+    async fn redeem_external_action_permit(
+        &self,
+        req: Request<RedeemExternalActionPermitRequest>,
+    ) -> Result<Response<RedeemExternalActionPermitResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        if input.idempotency_key.trim().is_empty() || input.execution_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "idempotency_key and execution_id required",
+            ));
+        }
+        let value = external_permit_from_proto(
+            input
+                .permit
+                .ok_or_else(|| Status::invalid_argument("permit required"))?,
+        );
+        if actor != value.executor && !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "permit redemption requires the bound executor",
+            ));
+        }
+        if let Some(redemption) = self
+            .db
+            .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
+            .map_err(Status::failed_precondition)?
+        {
+            return Ok(Response::new(RedeemExternalActionPermitResponse {
+                redemption: Some(ExternalActionRedemption {
+                    version: redemption.version,
+                    permit_id: redemption.permit_id,
+                    redemption_id: redemption.redemption_id,
+                    executor: redemption.executor,
+                    redeemed_at_ms: redemption.redeemed_at_ms,
+                    invocation_ordinal: redemption.invocation_ordinal,
+                }),
+            }));
+        }
+        let context = external_host_context(
+            input.executor,
+            input.requesting_harness,
+            input.canonical_arguments_digest,
+            input.target_selectors,
+            input.observed_preconditions,
+            input.host_capabilities,
+        );
+        let key = permit_signing_key(&self.config)?.verifying_key();
+        value
+            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
+            .map_err(Status::failed_precondition)?;
+        let redemption = self
+            .db
+            .redeem_permit(
+                &value,
+                &context,
+                &key,
+                &input.idempotency_key,
+                &input.execution_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(RedeemExternalActionPermitResponse {
+            redemption: Some(ExternalActionRedemption {
+                version: redemption.version,
+                permit_id: redemption.permit_id,
+                redemption_id: redemption.redemption_id,
+                executor: redemption.executor,
+                redeemed_at_ms: redemption.redeemed_at_ms,
+                invocation_ordinal: redemption.invocation_ordinal,
+            }),
+        }))
+    }
+
+    async fn revoke_external_action_permit(
+        &self,
+        req: Request<RevokeExternalActionPermitRequest>,
+    ) -> Result<Response<RevokeExternalActionPermitResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        if !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "permit revocation requires control-plane administration",
+            ));
+        }
+        let input = req.into_inner();
+        if input.revocation_handle.trim().is_empty() || input.reason.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "revocation_handle and reason required",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = self
+            .db
+            .revoke_permit(&input.revocation_handle, &input.reason, now)
+            .map_err(Status::internal)?;
+        if changed {
+            self.db
+                .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+                    id: format!("{}:audit:revoked", input.revocation_handle),
+                    timestamp: now,
+                    actor,
+                    action: "external_action_permit/revoke".into(),
+                    reason: input.reason,
+                    evidence: HashMap::from([(
+                        "revocation_handle".into(),
+                        input.revocation_handle.clone(),
+                    )]),
+                    target_id: input.revocation_handle,
+                    outcome: "revoked".into(),
+                }])
+                .map_err(Status::internal)?;
+        }
+        Ok(Response::new(RevokeExternalActionPermitResponse {
+            revoked: changed,
+        }))
+    }
+
+    async fn set_external_action_kill_switch(
+        &self,
+        req: Request<SetExternalActionKillSwitchRequest>,
+    ) -> Result<Response<SetExternalActionKillSwitchResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        if !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "kill-switch changes require control-plane administration",
+            ));
+        }
+        let input = req.into_inner();
+        if input.scope_value.trim().is_empty() || input.reason.trim().is_empty() {
+            return Err(Status::invalid_argument("scope_value and reason required"));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = self
+            .db
+            .set_permit_kill_switch(
+                &input.scope_kind,
+                &input.scope_value,
+                input.enabled,
+                &input.reason,
+                now,
+            )
+            .map_err(Status::invalid_argument)?;
+        self.db
+            .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+                id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
+                timestamp: now,
+                actor,
+                action: "external_action_permit/kill_switch".into(),
+                reason: input.reason,
+                evidence: HashMap::from([
+                    ("scope_kind".into(), input.scope_kind.clone()),
+                    ("scope_value".into(), input.scope_value.clone()),
+                ]),
+                target_id: input.scope_value,
+                outcome: if input.enabled {
+                    "enabled".into()
+                } else {
+                    "disabled".into()
+                },
+            }])
+            .map_err(Status::internal)?;
+        Ok(Response::new(SetExternalActionKillSwitchResponse {
+            changed,
         }))
     }
 
@@ -8751,6 +9137,9 @@ mod tests {
             tls_key: None,
             allow_plaintext: false,
             insecure: false,
+            permit_signing_key: Some("07".repeat(32)),
+            permit_issuer: "issuer:test".into(),
+            permit_key_id: "key-1".into(),
         }
     }
 
@@ -8828,6 +9217,105 @@ mod tests {
         assert_eq!(replay.authorization_id, first.authorization_id);
         assert!(first.permit.is_none());
         assert!(first.assurance.unwrap().authorization_only);
+    }
+
+    #[tokio::test]
+    async fn external_action_permit_rpc_issues_verifies_and_redeems_before_execution() {
+        let svc = memory_service();
+        let decision = svc
+            .authorize_external_action(external_action_request("local", "idem-permit"))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        let authorization_id = decision.authorization_id.clone();
+        let permit = svc
+            .issue_external_action_permit(external_principal_request(
+                IssueExternalActionPermitRequest {
+                    authorization_id: authorization_id.clone(),
+                    idempotency_key: "issue-permit-1".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .permit
+            .unwrap();
+        let verify = VerifyExternalActionPermitRequest {
+            executor: permit.executor.clone(),
+            requesting_harness: permit.requesting_harness.clone(),
+            canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
+            target_selectors: permit.target_selectors.clone(),
+            observed_preconditions: permit.immutable_preconditions.clone(),
+            host_capabilities: permit.required_host_capabilities.clone(),
+            permit: Some(permit.clone()),
+        };
+        assert!(
+            svc.verify_external_action_permit(external_principal_request(verify))
+                .await
+                .unwrap()
+                .into_inner()
+                .valid
+        );
+        let redemption = svc
+            .redeem_external_action_permit(external_principal_request(
+                RedeemExternalActionPermitRequest {
+                    permit: Some(permit.clone()),
+                    executor: permit.executor.clone(),
+                    requesting_harness: permit.requesting_harness.clone(),
+                    canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
+                    target_selectors: permit.target_selectors.clone(),
+                    observed_preconditions: permit.immutable_preconditions.clone(),
+                    host_capabilities: permit.required_host_capabilities.clone(),
+                    idempotency_key: "redeem-permit-1".into(),
+                    execution_id: "execution-1".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .redemption
+            .unwrap();
+        assert_eq!(redemption.invocation_ordinal, 1);
+        assert_eq!(redemption.executor, permit.executor);
+        svc.revoke_external_action_permit(external_principal_request(
+            RevokeExternalActionPermitRequest {
+                revocation_handle: permit.revocation_handle.clone(),
+                reason: "test revocation".into(),
+            },
+        ))
+        .await
+        .unwrap();
+        let verify_revoked = VerifyExternalActionPermitRequest {
+            executor: permit.executor.clone(),
+            requesting_harness: permit.requesting_harness.clone(),
+            canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
+            target_selectors: permit.target_selectors.clone(),
+            observed_preconditions: permit.immutable_preconditions.clone(),
+            host_capabilities: permit.required_host_capabilities.clone(),
+            permit: Some(permit.clone()),
+        };
+        let result = svc
+            .verify_external_action_permit(external_principal_request(verify_revoked))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!result.valid);
+        assert!(result.reason.contains("revoked"));
+        let replayed = svc
+            .issue_external_action_permit(external_principal_request(
+                IssueExternalActionPermitRequest {
+                    authorization_id,
+                    idempotency_key: "issue-permit-1".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .permit
+            .unwrap();
+        assert_eq!(replayed.permit_id, permit.permit_id);
     }
 
     #[tokio::test]
