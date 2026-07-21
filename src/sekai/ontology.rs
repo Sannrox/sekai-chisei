@@ -225,33 +225,10 @@ impl OntologyRegistry {
 pub(crate) fn load_ontology_registry_from_connection(
     conn: &rusqlite::Connection,
 ) -> Result<OntologyRegistry, String> {
-    let mut classes_stmt = conn
-        .prepare(
-            "SELECT name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind
-             FROM sekai_ontology_classes ORDER BY name",
-        )
-        .map_err(|error| error.to_string())?;
-    let classes = classes_stmt
-        .query_map([], row_to_ontology_class)
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut relations_stmt = conn
-        .prepare(
-            "SELECT name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation
-             FROM sekai_ontology_relations ORDER BY name",
-        )
-        .map_err(|error| error.to_string())?;
-    let relations = relations_stmt
-        .query_map([], row_to_ontology_relation)
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(OntologyRegistry::from_parts(classes, relations))
+    Ok(OntologyRegistry::from_parts(
+        select_classes(conn)?,
+        select_relations(conn)?,
+    ))
 }
 
 pub(crate) fn validate_link_constraint(
@@ -645,40 +622,7 @@ impl SekaiDb {
 
     pub fn upsert_ontology_class(&self, class: &OntologyClass) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let superclasses_json =
-            serde_json::to_string(&class.superclasses).map_err(|error| error.to_string())?;
-        let equivalent_json =
-            serde_json::to_string(&class.equivalent_classes).map_err(|error| error.to_string())?;
-        let disjoint_json =
-            serde_json::to_string(&class.disjoint_classes).map_err(|error| error.to_string())?;
-        let properties_json =
-            serde_json::to_string(&class.properties).map_err(|error| error.to_string())?;
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO sekai_ontology_classes
-                (name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
-             ON CONFLICT(name) DO UPDATE SET
-                description = excluded.description,
-                superclasses_json = excluded.superclasses_json,
-                equivalent_json = excluded.equivalent_json,
-                disjoint_json = excluded.disjoint_json,
-                properties_json = excluded.properties_json,
-                mapped_kind = excluded.mapped_kind,
-                updated = excluded.updated",
-            params![
-                class.name,
-                class.description,
-                superclasses_json,
-                equivalent_json,
-                disjoint_json,
-                properties_json,
-                class.mapped_kind,
-                now
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
+        upsert_class_row(&self.conn(), class, now)
     }
 
     pub fn upsert_ontology_class_with_audit(
@@ -708,14 +652,6 @@ impl SekaiDb {
         source_grants: Option<&[Grant]>,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let superclasses_json =
-            serde_json::to_string(&class.superclasses).map_err(|error| error.to_string())?;
-        let equivalent_json =
-            serde_json::to_string(&class.equivalent_classes).map_err(|error| error.to_string())?;
-        let disjoint_json =
-            serde_json::to_string(&class.disjoint_classes).map_err(|error| error.to_string())?;
-        let properties_json =
-            serde_json::to_string(&class.properties).map_err(|error| error.to_string())?;
         let mut conn = self.conn();
         let transaction = conn.transaction().map_err(|error| error.to_string())?;
         let existed = transaction
@@ -725,31 +661,7 @@ impl SekaiDb {
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "INSERT INTO sekai_ontology_classes
-                    (name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind, created, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
-                 ON CONFLICT(name) DO UPDATE SET
-                    description = excluded.description,
-                    superclasses_json = excluded.superclasses_json,
-                    equivalent_json = excluded.equivalent_json,
-                    disjoint_json = excluded.disjoint_json,
-                    properties_json = excluded.properties_json,
-                    mapped_kind = excluded.mapped_kind,
-                    updated = excluded.updated",
-                params![
-                    class.name,
-                    class.description,
-                    superclasses_json,
-                    equivalent_json,
-                    disjoint_json,
-                    properties_json,
-                    class.mapped_kind,
-                    now
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        upsert_class_row(&transaction, class, now)?;
         if let Some(source_grants) = source_grants {
             let object_id = format!("ontology:class:{}", class.name);
             transaction
@@ -790,14 +702,7 @@ impl SekaiDb {
     }
 
     pub fn delete_ontology_class(&self, name: &str) -> Result<bool, String> {
-        let conn = self.conn();
-        let deleted = conn
-            .execute(
-                "DELETE FROM sekai_ontology_classes WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(deleted > 0)
+        delete_class_row(&self.conn(), name)
     }
 
     pub fn delete_ontology_class_with_audit(
@@ -838,13 +743,8 @@ impl SekaiDb {
                 "relation '{relation_name}' still uses '{name}' as domain or range"
             ));
         }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM sekai_ontology_classes WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|error| error.to_string())?;
-        if deleted > 0 {
+        let deleted = delete_class_row(&transaction, name)?;
+        if deleted {
             transaction
                 .execute(
                     "DELETE FROM sekai_grants WHERE object_id = ?1",
@@ -861,70 +761,20 @@ impl SekaiDb {
             )?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(deleted > 0)
+        Ok(deleted)
     }
 
     pub fn get_ontology_class(&self, name: &str) -> Result<Option<OntologyClass>, String> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind
-             FROM sekai_ontology_classes WHERE name = ?1",
-            params![name],
-            row_to_ontology_class,
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .transpose()
+        select_class(&self.conn(), name)
     }
 
     pub fn list_ontology_classes(&self) -> Result<Vec<OntologyClass>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind
-                 FROM sekai_ontology_classes ORDER BY name",
-            )
-            .map_err(|error| error.to_string())?;
-        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
-        let mut classes = Vec::new();
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            classes.push(row_to_ontology_class(row).map_err(|error| error.to_string())??);
-        }
-        Ok(classes)
+        select_classes(&self.conn())
     }
 
     pub fn upsert_ontology_relation(&self, relation: &OntologyRelation) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let cardinality_json =
-            serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO sekai_ontology_relations
-                (name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-             ON CONFLICT(name) DO UPDATE SET
-                description = excluded.description,
-                domain = excluded.domain,
-                range = excluded.range,
-                cardinality_json = excluded.cardinality_json,
-                inverse = excluded.inverse,
-                transitive = excluded.transitive,
-                mapped_relation = excluded.mapped_relation,
-                updated = excluded.updated",
-            params![
-                relation.name,
-                relation.description,
-                relation.domain,
-                relation.range,
-                cardinality_json,
-                relation.inverse,
-                relation.transitive as i64,
-                relation.mapped_relation,
-                now
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
+        upsert_relation_row(&self.conn(), relation, now)
     }
 
     pub fn upsert_ontology_relation_with_audit(
@@ -933,8 +783,6 @@ impl SekaiDb {
         actor: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        let cardinality_json =
-            serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
         let mut conn = self.conn();
         let transaction = conn.transaction().map_err(|error| error.to_string())?;
         let existed = transaction
@@ -944,33 +792,7 @@ impl SekaiDb {
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "INSERT INTO sekai_ontology_relations
-                    (name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation, created, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-                 ON CONFLICT(name) DO UPDATE SET
-                    description = excluded.description,
-                    domain = excluded.domain,
-                    range = excluded.range,
-                    cardinality_json = excluded.cardinality_json,
-                    inverse = excluded.inverse,
-                    transitive = excluded.transitive,
-                    mapped_relation = excluded.mapped_relation,
-                    updated = excluded.updated",
-                params![
-                    relation.name,
-                    relation.description,
-                    relation.domain,
-                    relation.range,
-                    cardinality_json,
-                    relation.inverse,
-                    relation.transitive as i64,
-                    relation.mapped_relation,
-                    now
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        upsert_relation_row(&transaction, relation, now)?;
         insert_ontology_audit(
             &transaction,
             actor,
@@ -987,14 +809,7 @@ impl SekaiDb {
     }
 
     pub fn delete_ontology_relation(&self, name: &str) -> Result<bool, String> {
-        let conn = self.conn();
-        let deleted = conn
-            .execute(
-                "DELETE FROM sekai_ontology_relations WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(deleted > 0)
+        delete_relation_row(&self.conn(), name)
     }
 
     pub fn delete_ontology_relation_with_audit(
@@ -1019,13 +834,8 @@ impl SekaiDb {
                 "relation '{relation_name}' still uses '{name}' as its inverse"
             ));
         }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM sekai_ontology_relations WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|error| error.to_string())?;
-        if deleted > 0 {
+        let deleted = delete_relation_row(&transaction, name)?;
+        if deleted {
             transaction
                 .execute(
                     "DELETE FROM sekai_grants WHERE object_id = ?1",
@@ -1042,36 +852,15 @@ impl SekaiDb {
             )?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(deleted > 0)
+        Ok(deleted)
     }
 
     pub fn get_ontology_relation(&self, name: &str) -> Result<Option<OntologyRelation>, String> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation
-             FROM sekai_ontology_relations WHERE name = ?1",
-            params![name],
-            row_to_ontology_relation,
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .transpose()
+        select_relation(&self.conn(), name)
     }
 
     pub fn list_ontology_relations(&self) -> Result<Vec<OntologyRelation>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation
-                 FROM sekai_ontology_relations ORDER BY name",
-            )
-            .map_err(|error| error.to_string())?;
-        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
-        let mut relations = Vec::new();
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            relations.push(row_to_ontology_relation(row).map_err(|error| error.to_string())??);
-        }
-        Ok(relations)
+        select_relations(&self.conn())
     }
 
     /// Load the durable ontology into an in-memory registry for validation and
@@ -1108,6 +897,170 @@ fn insert_ontology_audit(
             outcome: "applied".into(),
         },
     )
+}
+
+/// Column list for every class read, declared once so it cannot drift from the
+/// positional access in [`row_to_ontology_class`].
+const CLASS_COLUMNS: &str = "name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind";
+
+/// Column list for every relation read; see [`CLASS_COLUMNS`].
+const RELATION_COLUMNS: &str =
+    "name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation";
+
+/// Storage primitives shared by the plain and audited paths. Each takes a bare
+/// `&Connection` so the audited callers can pass their in-flight `Transaction`
+/// (which derefs to `Connection`) and get the same statement the plain path
+/// runs, rather than a second copy of it.
+///
+/// `now` is a parameter rather than read here so an audited mutation stamps the
+/// row and its decision record with one timestamp.
+fn upsert_class_row(
+    conn: &rusqlite::Connection,
+    class: &OntologyClass,
+    now: i64,
+) -> Result<(), String> {
+    let superclasses_json =
+        serde_json::to_string(&class.superclasses).map_err(|error| error.to_string())?;
+    let equivalent_json =
+        serde_json::to_string(&class.equivalent_classes).map_err(|error| error.to_string())?;
+    let disjoint_json =
+        serde_json::to_string(&class.disjoint_classes).map_err(|error| error.to_string())?;
+    let properties_json =
+        serde_json::to_string(&class.properties).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO sekai_ontology_classes
+            (name, description, superclasses_json, equivalent_json, disjoint_json, properties_json, mapped_kind, created, updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(name) DO UPDATE SET
+            description = excluded.description,
+            superclasses_json = excluded.superclasses_json,
+            equivalent_json = excluded.equivalent_json,
+            disjoint_json = excluded.disjoint_json,
+            properties_json = excluded.properties_json,
+            mapped_kind = excluded.mapped_kind,
+            updated = excluded.updated",
+        params![
+            class.name,
+            class.description,
+            superclasses_json,
+            equivalent_json,
+            disjoint_json,
+            properties_json,
+            class.mapped_kind,
+            now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn delete_class_row(conn: &rusqlite::Connection, name: &str) -> Result<bool, String> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM sekai_ontology_classes WHERE name = ?1",
+            params![name],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(deleted > 0)
+}
+
+fn select_class(conn: &rusqlite::Connection, name: &str) -> Result<Option<OntologyClass>, String> {
+    conn.query_row(
+        &format!("SELECT {CLASS_COLUMNS} FROM sekai_ontology_classes WHERE name = ?1"),
+        params![name],
+        row_to_ontology_class,
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .transpose()
+}
+
+fn select_classes(conn: &rusqlite::Connection) -> Result<Vec<OntologyClass>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CLASS_COLUMNS} FROM sekai_ontology_classes ORDER BY name"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+    let mut classes = Vec::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        classes.push(row_to_ontology_class(row).map_err(|error| error.to_string())??);
+    }
+    Ok(classes)
+}
+
+fn upsert_relation_row(
+    conn: &rusqlite::Connection,
+    relation: &OntologyRelation,
+    now: i64,
+) -> Result<(), String> {
+    let cardinality_json =
+        serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO sekai_ontology_relations
+            (name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation, created, updated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT(name) DO UPDATE SET
+            description = excluded.description,
+            domain = excluded.domain,
+            range = excluded.range,
+            cardinality_json = excluded.cardinality_json,
+            inverse = excluded.inverse,
+            transitive = excluded.transitive,
+            mapped_relation = excluded.mapped_relation,
+            updated = excluded.updated",
+        params![
+            relation.name,
+            relation.description,
+            relation.domain,
+            relation.range,
+            cardinality_json,
+            relation.inverse,
+            relation.transitive as i64,
+            relation.mapped_relation,
+            now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn delete_relation_row(conn: &rusqlite::Connection, name: &str) -> Result<bool, String> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM sekai_ontology_relations WHERE name = ?1",
+            params![name],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(deleted > 0)
+}
+
+fn select_relation(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Result<Option<OntologyRelation>, String> {
+    conn.query_row(
+        &format!("SELECT {RELATION_COLUMNS} FROM sekai_ontology_relations WHERE name = ?1"),
+        params![name],
+        row_to_ontology_relation,
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .transpose()
+}
+
+fn select_relations(conn: &rusqlite::Connection) -> Result<Vec<OntologyRelation>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {RELATION_COLUMNS} FROM sekai_ontology_relations ORDER BY name"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+    let mut relations = Vec::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        relations.push(row_to_ontology_relation(row).map_err(|error| error.to_string())??);
+    }
+    Ok(relations)
 }
 
 /// Deserialize a class row. The outer `rusqlite::Result` covers column access;
