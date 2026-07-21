@@ -161,6 +161,14 @@ encoded as 64 lowercase hexadecimal characters. `CHISEI_PERMIT_ISSUER` and
 inject the seed through a secret manager and rotate it as a signing credential;
 it must never enter permits, audit evidence, logs, or exported bundles.
 
+Redeemed permits accept attributed lifecycle observations through the existing
+Sekai evidence funnel. Accepted, started, completed, failed, cancelled, and
+outcome-unknown remain distinct. The signed permit window defines the terminal
+evidence deadline; reconciliation raises an alert after it without treating
+silence as success. Shomei may embed the signed permit and admitted host report,
+while receipts keep host self-report, independent effect verification, and
+downstream outcome separate.
+
 ## Persistence
 
 SQLite is the server's current storage backend and runs in WAL mode for file

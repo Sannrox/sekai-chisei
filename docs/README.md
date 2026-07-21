@@ -26,6 +26,8 @@ in order.
   library and SQLite command-line tool in a separate application.
 - [External evidence adapters](../adapters/README.md) — submit evidence through
   the versioned adapter contract.
+- [External-action execution evidence](external-action-execution.md) — report
+  host lifecycle observations and reconcile missing terminal evidence.
 
 ## Configure and operate
 
