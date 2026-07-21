@@ -3488,22 +3488,31 @@ fn leak_findings_to_decisions(
 
 fn build_prepared_messages(input: &ExecutionInput, enriched_spec: &str) -> Vec<ChatMessage> {
     let mut messages = input.messages.clone();
+    let prepared_spec = if enriched_spec.is_empty() {
+        input.spec.as_str()
+    } else {
+        enriched_spec
+    };
+    if prepared_spec.is_empty() {
+        return messages;
+    }
     if messages.is_empty() {
         return vec![ChatMessage {
             role: "user".into(),
-            content: enriched_spec.into(),
+            content: prepared_spec.into(),
             tool_call_id: String::new(),
             tool_calls: vec![],
         }];
     }
-    if !enriched_spec.is_empty() && enriched_spec != input.spec {
-        messages.push(ChatMessage {
+    messages.insert(
+        0,
+        ChatMessage {
             role: "user".into(),
-            content: format!("[Task spec]\n{enriched_spec}"),
+            content: format!("[Task spec]\n{prepared_spec}"),
             tool_call_id: String::new(),
             tool_calls: vec![],
-        });
-    }
+        },
+    );
     messages
 }
 
@@ -7050,6 +7059,96 @@ mod tests {
     use crate::sekai::security::{Grant, Role};
     use std::fs;
     use std::sync::Arc;
+
+    fn user_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prepared_messages_deliver_a_non_empty_spec_exactly_once() {
+        let input = ExecutionInput {
+            spec: "original task".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_prepared_messages(&input, "original task"),
+            vec![user_message("original task")]
+        );
+        assert_eq!(
+            build_prepared_messages(&input, "enriched task"),
+            vec![user_message("enriched task")]
+        );
+
+        let input = ExecutionInput {
+            spec: "original task".into(),
+            messages: vec![user_message("conversation context")],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_prepared_messages(&input, "original task"),
+            vec![
+                user_message("[Task spec]\noriginal task"),
+                user_message("conversation context"),
+            ]
+        );
+        assert_eq!(
+            build_prepared_messages(&input, "enriched task"),
+            vec![
+                user_message("[Task spec]\nenriched task"),
+                user_message("conversation context"),
+            ]
+        );
+        assert_eq!(
+            build_prepared_messages(&input, ""),
+            vec![
+                user_message("[Task spec]\noriginal task"),
+                user_message("conversation context"),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_spec_preserves_pending_tool_call_order() {
+        let assistant_message = ChatMessage {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                args_json: r#"{"value":1}"#.into(),
+            }],
+            ..Default::default()
+        };
+        let input = ExecutionInput {
+            spec: "original task".into(),
+            messages: vec![assistant_message.clone()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_prepared_messages(&input, "original task"),
+            vec![
+                user_message("[Task spec]\noriginal task"),
+                assistant_message
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_messages_do_not_add_an_empty_spec_message() {
+        let input = ExecutionInput {
+            messages: vec![user_message("conversation context")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_prepared_messages(&input, ""),
+            vec![user_message("conversation context")]
+        );
+    }
 
     #[tokio::test]
     async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
