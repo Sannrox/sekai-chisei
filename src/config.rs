@@ -33,6 +33,10 @@ pub struct Config {
     pub tls_key: Option<String>,
     pub allow_plaintext: bool,
     pub insecure: bool,
+    /// Hex-encoded Ed25519 seed used only to sign short-lived external-action permits.
+    pub permit_signing_key: Option<String>,
+    pub permit_issuer: String,
+    pub permit_key_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +84,9 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
             insecure: env::var("SEKAI_INSECURE").unwrap_or_default() == "1",
+            permit_signing_key: optional_env("CHISEI_PERMIT_SIGNING_KEY"),
+            permit_issuer: env("CHISEI_PERMIT_ISSUER", "chisei.local"),
+            permit_key_id: env("CHISEI_PERMIT_KEY_ID", "permit-key-1"),
         }
     }
 
