@@ -65,6 +65,14 @@ The guided launcher can preserve a supported client's existing provider login.
 The gateway forwards the same-provider authentication header while using
 `x-chisei-agent` and `x-chisei-project` for attribution.
 
+To pin one governed request to an exact discovered route, set
+`x-chisei-route-override: <canonical-provider/model>`. The override bypasses
+cheap/capable selection only; lifecycle admission, sensitive-data provider
+safety, and budget admission still apply. An unavailable or inadmissible target
+is rejected without fallback. Native clients use `ExecutionInput.route_override`
+for the equivalent `PlanExecution`/`ExecutePlan` flow. Receipts record the
+override target and `bias_bypassed=true` on the routing event.
+
 Passthrough credentials form a narrow in-memory trust boundary. They are used
 to authenticate and forward the request but must not be stored in graph data,
 receipts, or audit evidence. All `x-chisei-*` headers are stripped before the
