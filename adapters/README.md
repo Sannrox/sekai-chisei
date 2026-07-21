@@ -55,6 +55,18 @@ cargo run --example evidence_http_health_poll
 Conformance fixtures live in `adapters/fixtures/` and run without network access
 through `cargo test --test evidence_adapters`.
 
+Authorized consumers can retrieve one retained admitted envelope by submission
+ID through `GetEvidenceSubmissionContent`. Access follows the live ACL copied to
+the projected `external_evidence` object from its target; discovering a
+submission does not grant access. The response includes the generic validated
+`content_json` and provenance rather than adapter-specific fields, and the
+server verifies the content digest before returning it. Available, superseded,
+stale, and retracted source records remain readable for historical provenance;
+rejected, quarantined, and incomplete admission states do not expose content.
+`ListEvidenceSubmissions` remains metadata-only and bounded. This additive RPC
+does not change existing client behavior, although clients using the new method
+must regenerate their protobuf bindings.
+
 `batch_responses_harness.rs` is a headless batch-evaluation integration. It uses
 an independent Responses SSE decoder against the complete canonical harness
 fixture corpus, then maps terminal runs into the same operation-receipt and

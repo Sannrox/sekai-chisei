@@ -743,6 +743,20 @@ impl SekaiDb {
         get_submission_conn(&conn, submission_id)
     }
 
+    pub fn get_evidence_projection_object_id(
+        &self,
+        submission_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT evidence_object_id FROM sekai_evidence_projections WHERE submission_id=?1",
+            [submission_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+    }
+
     pub fn evidence_lifecycle_history(
         &self,
         submission_id: &str,
