@@ -81,7 +81,9 @@ change.
   changes require an Issue before implementation.
 - Changes that alter the Sekai/Chisei boundary, namespace model, trust model,
   extension model, or a difficult-to-reverse public contract require a Design
-  Discussion before an Issue is marked `status:ready`.
+  Discussion before an Issue is marked `status:ready`. In a solo-maintained
+  repository, the accountable maintainer may instead use a proposed ADR pull
+  request as the decision-review surface and record the source Issue in it.
 - Refactoring is welcome when tied to an observable constraint: reduced defect
   risk, removal of duplication blocking active work, measurable performance,
   or a named maintainability problem. Pure aesthetic churn is not planned.

@@ -2,7 +2,9 @@
 
 Sekai's ontology layer adds semantic definitions above the existing typed
 object graph. It does not replace graph objects, links, or schema validation,
-and it does not add inference or enforce relation endpoints yet.
+and it does not persist inferred facts. The initial reasoning direction is a
+fixed, opt-in, query-time profile; see
+[ADR 0001](decisions/0001-query-time-ontology-entailment.md).
 
 The native `SekaiService` API exposes ontology classes and relations. Classes
 can declare superclasses, equivalent classes, disjoint classes, and typed
@@ -44,6 +46,6 @@ cardinality, and direct equivalence/disjointness contradictions. A class cannot
 be deleted while another class or relation references it. A relation cannot be
 deleted while another relation names it as an inverse.
 
-Relation metadata is descriptive in this release. Graph links are not rejected
-based on ontology domain, range, cardinality, inverse, or transitivity metadata;
-that enforcement belongs to follow-up work.
+Mapped relation domain and range constraints are enforced on new links and
+relevant object-kind updates. Existing links are not rewritten. Cardinality,
+inverse, and transitivity metadata do not synthesize links or facts.
