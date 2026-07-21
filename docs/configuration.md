@@ -63,6 +63,7 @@ value to stdout.
 | `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address |
 | `CHISEI_GRPC_URL` | unset | Control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
+| `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |
 | `CHISEI_ANTHROPIC_BASE_URL` | Anthropic API | Anthropic-compatible upstream; include `/v1` |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models |
 | `GATEWAY_KEYS` | empty | Explicit `key=agent:project` development/compose allowlist |
