@@ -225,6 +225,9 @@ mod tests {
             tls_key: None,
             allow_plaintext: false,
             insecure: false,
+            permit_signing_key: None,
+            permit_issuer: "chisei.local".into(),
+            permit_key_id: "permit-key-1".into(),
         };
         let safe = safe_providers(&config);
         assert!(provider_safe_to_send("ollama", &safe));
