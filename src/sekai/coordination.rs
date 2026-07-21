@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, params};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 pub const WORK_UNIT_STATUS_PENDING: &str = "pending";
@@ -31,7 +32,7 @@ pub struct ContentionScope {
     pub updated: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkUnit {
     pub id: String,
     pub kind: String,

@@ -15,6 +15,7 @@ pub mod evidence;
 pub mod evidence_projection;
 pub mod evidence_store;
 pub mod function;
+pub mod handoff;
 pub mod learning;
 pub mod ledger;
 pub mod lineage;

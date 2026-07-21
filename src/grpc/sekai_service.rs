@@ -26,6 +26,7 @@ use crate::sekai::evidence_store::{
     EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition, EvidenceSubmissionFilter,
     EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
 };
+use crate::sekai::handoff as handoff_domain;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
@@ -3148,6 +3149,180 @@ fn initialize_work_unit_for_create(work_unit: &mut coordination::WorkUnit, princ
     work_unit.updated_at = work_unit.created_at;
 }
 
+fn to_domain_handoff_reference(reference: &HandoffReference) -> handoff_domain::HandoffReference {
+    handoff_domain::HandoffReference {
+        kind: reference.kind.clone(),
+        id: reference.id.clone(),
+        version: reference.version.clone(),
+        omitted: reference.omitted,
+        omission_reason: reference.omission_reason.clone(),
+    }
+}
+
+fn to_proto_handoff_reference(reference: &handoff_domain::HandoffReference) -> HandoffReference {
+    HandoffReference {
+        kind: reference.kind.clone(),
+        id: reference.id.clone(),
+        version: reference.version.clone(),
+        omitted: reference.omitted,
+        omission_reason: reference.omission_reason.clone(),
+    }
+}
+
+fn to_proto_handoff(manifest: &handoff_domain::HandoffManifest) -> HandoffManifest {
+    HandoffManifest {
+        id: manifest.id.clone(),
+        namespace: manifest.namespace.clone(),
+        parent_operation_id: manifest.parent_operation_id.clone(),
+        parent_attempt_id: manifest.parent_attempt_id.clone(),
+        parent_work_unit_id: manifest.parent_work_unit_id.clone(),
+        references: manifest
+            .references
+            .iter()
+            .map(to_proto_handoff_reference)
+            .collect(),
+        creator_principal: manifest.creator_principal.clone(),
+        intended_principal: manifest.intended_principal.clone(),
+        intended_scope: manifest.intended_scope.clone(),
+        purpose: manifest.purpose.clone(),
+        created_at_ms: manifest.created_at_ms,
+        expires_at_ms: manifest.expires_at_ms,
+        digest: manifest.digest.clone(),
+        supersedes_manifest_id: manifest.supersedes_manifest_id.clone(),
+        revoked: manifest.revoked,
+    }
+}
+
+fn unavailable_reference(
+    reference: &handoff_domain::HandoffReference,
+) -> handoff_domain::HandoffReference {
+    let mut unavailable = reference.clone();
+    unavailable.id.clear();
+    unavailable.version.clear();
+    unavailable.omitted = true;
+    unavailable.omission_reason = "unavailable".into();
+    unavailable
+}
+
+fn redacted_omission(
+    reference: &handoff_domain::HandoffReference,
+) -> handoff_domain::HandoffReference {
+    let mut omission = reference.clone();
+    omission.id.clear();
+    omission.version.clear();
+    omission
+}
+
+fn reference_content_digest(value: &impl serde::Serialize) -> Result<String, Status> {
+    let bytes = serde_json::to_vec(value).map_err(|error| Status::internal(error.to_string()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn handoff_reference_available(
+    service: &SekaiServiceImpl,
+    reference: &handoff_domain::HandoffReference,
+    namespace: &str,
+    principals: &[String],
+    now_ms: i64,
+) -> Result<bool, Status> {
+    let available = match reference.kind.as_str() {
+        "operation_receipt" => {
+            if let Some(receipt) = service
+                .db
+                .get_operation_receipt(&reference.id)
+                .map_err(Status::internal)?
+            {
+                let version = reference_content_digest(&receipt)?;
+                receipt.namespace == namespace
+                    && version == reference.version
+                    && principals.iter().any(|p| {
+                        p == &receipt.initiating_actor || matches!(p.as_str(), "root" | "local")
+                    })
+            } else {
+                false
+            }
+        }
+        "work_unit" => service
+            .db
+            .get_work_unit(&reference.id)
+            .map_err(Status::internal)?
+            .is_some_and(|work_unit| {
+                reference_content_digest(&work_unit).is_ok_and(|digest| digest == reference.version)
+                    // Unbound work units have no namespace fact to match to the
+                    // manifest. Owner readability alone must not widen scope.
+                    && !work_unit.target_object_id.is_empty()
+                    && service
+                        .db
+                        .get_object(&work_unit.target_object_id)
+                        .is_ok_and(|object| {
+                            object.is_some_and(|object| object.namespace == namespace)
+                        })
+                    && check_work_unit_read(&service.db, &service.security, &work_unit, principals)
+                        .is_ok()
+            }),
+        "object" => service
+            .db
+            .get_object(&reference.id)
+            .map_err(Status::internal)?
+            .is_some_and(|object| {
+                object.namespace == namespace
+                    && reference_content_digest(&object)
+                        .is_ok_and(|digest| digest == reference.version)
+                    && check_team_namespace(&service.db, principals, namespace, false).is_ok()
+                    && check_read(&service.security, &object.id, principals).is_ok()
+            }),
+        "evidence_submission" => {
+            if let Some(submission) = service
+                .db
+                .get_evidence_submission(&reference.id)
+                .map_err(Status::internal)?
+            {
+                let projected = service
+                    .db
+                    .get_evidence_projection_object_id(&reference.id)
+                    .map_err(Status::internal)?;
+                submission.namespace == namespace
+                    && submission.content_digest == reference.version
+                    && submission.lifecycle_state.is_usable()
+                    && submission
+                        .expires_at_ms
+                        .is_none_or(|expiry| expiry > now_ms)
+                    && projected
+                        .is_some_and(|id| check_read(&service.security, &id, principals).is_ok())
+            } else {
+                false
+            }
+        }
+        "kioku" => {
+            let Ok(version) = reference.version.parse::<u32>() else {
+                return Ok(false);
+            };
+            if let Some(memory) = service
+                .db
+                .get_kioku_memory(&reference.id, version)
+                .map_err(Status::internal)?
+            {
+                memory.namespace == namespace
+                    && memory.state == crate::chisei::kioku::MemoryLifecycleState::Active
+                    && memory.expires_at_ms.is_none_or(|expiry| expiry > now_ms)
+                    && memory
+                        .retention_until_ms
+                        .is_none_or(|retention| retention > now_ms)
+                    && principals.iter().any(|principal| {
+                        service
+                            .db
+                            .kioku_authorized_classification_ceiling(namespace, principal)
+                            .is_ok_and(|ceiling| memory.classification <= ceiling)
+                    })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    Ok(available)
+}
+
 fn aggregate_reconcile_summary(
     summary: &mut coordination::ReconcileSummary,
     next: coordination::ReconcileSummary,
@@ -3231,6 +3406,214 @@ fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
 
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
+    async fn create_handoff(
+        &self,
+        req: Request<CreateHandoffRequest>,
+    ) -> Result<Response<CreateHandoffResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let proto = inner
+            .manifest
+            .ok_or(Status::invalid_argument("manifest required"))?;
+        check_team_namespace(&self.db, &principals, &proto.namespace, true)?;
+        let creator = principals
+            .first()
+            .cloned()
+            .ok_or(Status::unauthenticated("principal required"))?;
+        if proto.intended_scope != proto.namespace {
+            return Err(Status::invalid_argument(
+                "intended_scope must equal the manifest namespace",
+            ));
+        }
+        let manifest = handoff_domain::HandoffManifest {
+            schema_version: handoff_domain::HANDOFF_VERSION.into(),
+            id: proto.id,
+            namespace: proto.namespace,
+            parent_operation_id: proto.parent_operation_id,
+            parent_attempt_id: proto.parent_attempt_id,
+            parent_work_unit_id: proto.parent_work_unit_id,
+            references: proto
+                .references
+                .iter()
+                .map(to_domain_handoff_reference)
+                .collect(),
+            creator_principal: creator,
+            intended_principal: proto.intended_principal,
+            intended_scope: proto.intended_scope,
+            purpose: proto.purpose,
+            created_at_ms: proto.created_at_ms,
+            expires_at_ms: proto.expires_at_ms,
+            digest: proto.digest,
+            supersedes_manifest_id: proto.supersedes_manifest_id,
+            revoked: false,
+        };
+        manifest.validate().map_err(Status::invalid_argument)?;
+        let request_digest = manifest
+            .canonical_digest()
+            .map_err(Status::invalid_argument)?;
+        if let Some((existing_digest, existing)) = self
+            .db
+            .get_handoff_by_request(&manifest.creator_principal, &inner.request_id)
+            .map_err(Status::internal)?
+        {
+            if existing_digest != request_digest {
+                return Err(Status::already_exists(
+                    "request_id is already bound to different handoff input",
+                ));
+            }
+            return Ok(Response::new(CreateHandoffResponse {
+                manifest: Some(to_proto_handoff(&existing)),
+            }));
+        }
+        let current_time = now_millis();
+        if manifest.created_at_ms > current_time.saturating_add(60_000)
+            || manifest.expires_at_ms <= current_time
+        {
+            return Err(Status::invalid_argument(
+                "handoff timestamps are outside the accepted window",
+            ));
+        }
+        for reference in manifest
+            .references
+            .iter()
+            .filter(|reference| !reference.omitted)
+        {
+            if !handoff_reference_available(
+                self,
+                reference,
+                &manifest.namespace,
+                &principals,
+                current_time,
+            )? {
+                return Err(Status::failed_precondition(
+                    "handoff contains an unavailable reference",
+                ));
+            }
+        }
+        if !manifest.supersedes_manifest_id.is_empty() {
+            let predecessor = self
+                .db
+                .get_handoff(&manifest.supersedes_manifest_id)
+                .map_err(Status::internal)?
+                .ok_or(Status::failed_precondition(
+                    "superseded handoff is unavailable",
+                ))?;
+            if predecessor.creator_principal != manifest.creator_principal
+                || predecessor.intended_principal != manifest.intended_principal
+                || predecessor.namespace != manifest.namespace
+            {
+                return Err(Status::failed_precondition(
+                    "superseded handoff is unavailable",
+                ));
+            }
+        }
+        let stored = self
+            .db
+            .create_handoff(&manifest, &inner.request_id)
+            .map_err(|error| {
+                if error.contains("different handoff") {
+                    Status::already_exists(error)
+                } else {
+                    Status::invalid_argument(error)
+                }
+            })?;
+        Ok(Response::new(CreateHandoffResponse {
+            manifest: Some(to_proto_handoff(&stored)),
+        }))
+    }
+
+    async fn resolve_handoff(
+        &self,
+        req: Request<ResolveHandoffRequest>,
+    ) -> Result<Response<ResolveHandoffResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let not_found = || Status::not_found("handoff not found");
+        let manifest = self
+            .db
+            .get_handoff(&inner.manifest_id)
+            .map_err(Status::internal)?
+            .ok_or_else(not_found)?;
+        if !principals.iter().any(|principal| {
+            principal == &manifest.intended_principal
+                || matches!(principal.as_str(), "root" | "local")
+        }) || check_team_namespace(&self.db, &principals, &manifest.namespace, false).is_err()
+        {
+            return Err(not_found());
+        }
+        let now_ms = now_millis();
+        if manifest.revoked
+            || manifest.expires_at_ms <= now_ms
+            || self
+                .db
+                .handoff_is_superseded(&manifest.id)
+                .map_err(Status::internal)?
+            || manifest.digest != manifest.canonical_digest().map_err(Status::data_loss)?
+        {
+            return Err(not_found());
+        }
+        let mut available = Vec::new();
+        let mut omissions = Vec::new();
+        for reference in &manifest.references {
+            if reference.omitted {
+                omissions.push(redacted_omission(reference));
+            } else if handoff_reference_available(
+                self,
+                reference,
+                &manifest.namespace,
+                &principals,
+                now_ms,
+            )? {
+                available.push(reference.clone());
+            } else {
+                omissions.push(unavailable_reference(reference));
+            }
+        }
+        let mut projected_manifest = manifest.clone();
+        projected_manifest.references = available.iter().chain(omissions.iter()).cloned().collect();
+        Ok(Response::new(ResolveHandoffResponse {
+            manifest: Some(to_proto_handoff(&projected_manifest)),
+            available_references: available.iter().map(to_proto_handoff_reference).collect(),
+            omissions: omissions.iter().map(to_proto_handoff_reference).collect(),
+        }))
+    }
+
+    async fn revoke_handoff(
+        &self,
+        req: Request<RevokeHandoffRequest>,
+    ) -> Result<Response<RevokeHandoffResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let existing = self
+            .db
+            .get_handoff(&inner.manifest_id)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("handoff not found"))?;
+        if !principals.iter().any(|principal| {
+            principal == &existing.creator_principal
+                || matches!(principal.as_str(), "root" | "local")
+        }) {
+            return Err(Status::not_found("handoff not found"));
+        }
+        let actor = principals.first().cloned().unwrap_or_default();
+        let revoked = self
+            .db
+            .revoke_handoff(
+                &inner.manifest_id,
+                &actor,
+                &inner.reason,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(RevokeHandoffResponse {
+            manifest: Some(to_proto_handoff(&revoked)),
+        }))
+    }
+
     async fn create_object(
         &self,
         req: Request<CreateObjectRequest>,
@@ -8200,6 +8583,23 @@ mod tests {
         req.metadata_mut()
             .insert("x-principal", MetadataValue::try_from(principal).unwrap());
         req
+    }
+
+    fn add_object_grant(
+        svc: &SekaiServiceImpl,
+        object_id: &str,
+        principal: &str,
+        role: security::Role,
+    ) {
+        let grant = security::Grant {
+            id: format!("handoff-grant-{object_id}-{principal}"),
+            object_id: object_id.into(),
+            principal: principal.into(),
+            role,
+            created: 0,
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
     }
 
     fn widget_schema_type() -> ObjectType {
@@ -17796,5 +18196,200 @@ mod tests {
             .unwrap_err();
         assert_eq!(resumed.code(), tonic::Code::PermissionDenied);
         assert!(svc.db.get_object("forged-policy").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn planner_worker_reviewer_handoff_rechecks_versions_and_hides_cross_principal_state() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "artifact:plan".into(),
+                kind: "artifact".into(),
+                name: "plan".into(),
+                namespace: "delivery".into(),
+                external_id: "artifact:plan".into(),
+                properties: HashMap::new(),
+                created: 5,
+                updated: 7,
+            })
+            .unwrap();
+        add_object_grant(&svc, "artifact:plan", "planner", security::Role::Editor);
+        add_object_grant(&svc, "artifact:plan", "reviewer", security::Role::Viewer);
+        svc.db
+            .create_work_unit(&coordination::WorkUnit {
+                id: "work-unit:worker".into(),
+                kind: "implementation".into(),
+                actor: "worker".into(),
+                target_object_id: "artifact:plan".into(),
+                status: coordination::WORK_UNIT_STATUS_COMPLETED.into(),
+                requested_spec: "produce reviewable output".into(),
+                scope_id: "delivery".into(),
+                priority: 0,
+                timeout_seconds: 60,
+                heartbeat_ttl_seconds: 30,
+                created_at: 5,
+                admitted_at: 6,
+                started_at: 6,
+                finished_at: 9,
+                last_heartbeat_at: 8,
+                failure_reason: String::new(),
+                cancel_reason: String::new(),
+                owner_principal: "planner".into(),
+                creator_principal: "planner".into(),
+                idempotency_key: "worker-unit-1".into(),
+                updated_at: 9,
+            })
+            .unwrap();
+        let object_version =
+            reference_content_digest(&svc.db.get_object("artifact:plan").unwrap().unwrap())
+                .unwrap();
+        let work_unit_version =
+            reference_content_digest(&svc.db.get_work_unit("work-unit:worker").unwrap().unwrap())
+                .unwrap();
+        let now = now_millis();
+        let request = CreateHandoffRequest {
+            manifest: Some(HandoffManifest {
+                id: "handoff:planner-reviewer".into(),
+                namespace: "delivery".into(),
+                parent_operation_id: "operation:plan".into(),
+                parent_attempt_id: "attempt:1".into(),
+                parent_work_unit_id: "work-unit:worker".into(),
+                references: vec![
+                    HandoffReference {
+                        kind: "object".into(),
+                        id: "artifact:plan".into(),
+                        version: object_version,
+                        omitted: false,
+                        omission_reason: String::new(),
+                    },
+                    HandoffReference {
+                        kind: "work_unit".into(),
+                        id: "work-unit:worker".into(),
+                        version: work_unit_version,
+                        omitted: false,
+                        omission_reason: String::new(),
+                    },
+                    HandoffReference {
+                        kind: "evidence_submission".into(),
+                        id: "evidence:retained-away".into(),
+                        version: String::new(),
+                        omitted: true,
+                        omission_reason: "retention".into(),
+                    },
+                ],
+                creator_principal: "forged".into(),
+                intended_principal: "reviewer".into(),
+                intended_scope: "delivery".into(),
+                purpose: "review the worker output".into(),
+                created_at_ms: now,
+                expires_at_ms: now + 60_000,
+                digest: String::new(),
+                supersedes_manifest_id: String::new(),
+                revoked: false,
+            }),
+            request_id: "handoff-request-1".into(),
+        };
+        let created = svc
+            .create_handoff(with_named_principal(request.clone(), "planner"))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        assert_eq!(created.creator_principal, "planner");
+        assert!(created.digest.starts_with("sha256:"));
+        let replay = svc
+            .create_handoff(with_named_principal(request.clone(), "planner"))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        assert_eq!(replay.digest, created.digest);
+
+        let resolved = svc
+            .resolve_handoff(with_named_principal(
+                ResolveHandoffRequest {
+                    manifest_id: created.id.clone(),
+                },
+                "reviewer",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resolved.available_references.len(), 2);
+        assert_eq!(resolved.omissions[0].omission_reason, "retention");
+        let hidden = svc
+            .resolve_handoff(with_named_principal(
+                ResolveHandoffRequest {
+                    manifest_id: created.id.clone(),
+                },
+                "intruder",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code(), tonic::Code::NotFound);
+
+        let mut artifact = svc.db.get_object("artifact:plan").unwrap().unwrap();
+        artifact.updated = 8;
+        svc.db.update_object(&artifact).unwrap();
+        let stale = svc
+            .resolve_handoff(with_named_principal(
+                ResolveHandoffRequest {
+                    manifest_id: created.id.clone(),
+                },
+                "reviewer",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stale.available_references.len(), 1);
+        assert!(
+            stale
+                .omissions
+                .iter()
+                .any(|reference| reference.id.is_empty()
+                    && reference.version.is_empty()
+                    && reference.omission_reason == "unavailable")
+        );
+        let replay_after_change = svc
+            .create_handoff(with_named_principal(request, "planner"))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        assert_eq!(replay_after_change.digest, created.digest);
+
+        let revoked_manifest = svc
+            .revoke_handoff(with_named_principal(
+                RevokeHandoffRequest {
+                    manifest_id: created.id.clone(),
+                    reason: "planner withdrew context".into(),
+                    request_id: "revoke-1".into(),
+                },
+                "planner",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        assert!(revoked_manifest.revoked);
+        let revoked_domain = svc.db.get_handoff(&revoked_manifest.id).unwrap().unwrap();
+        assert_eq!(
+            revoked_domain.digest,
+            revoked_domain.canonical_digest().unwrap()
+        );
+        let revoked = svc
+            .resolve_handoff(with_named_principal(
+                ResolveHandoffRequest {
+                    manifest_id: created.id,
+                },
+                "reviewer",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(revoked.code(), tonic::Code::NotFound);
     }
 }
