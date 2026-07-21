@@ -27,6 +27,18 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Verify standalone ontology dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          dependency_tree="$(cargo tree -p sekai-ontology --edges normal --prefix none)"
+          for forbidden in tonic tonic-prost tonic-health postgres reqwest axum; do
+            if grep -Eq "^${forbidden} v" <<<"$dependency_tree"; then
+              echo "standalone ontology package includes forbidden dependency: $forbidden" >&2
+              exit 1
+            fi
+          done
+
       - name: Test
         run: cargo test --locked
 
