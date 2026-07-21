@@ -152,6 +152,7 @@ impl SekaiDb {
         self.migrate_coordination()?;
         self.migrate_datasets()?;
         self.migrate_functions()?;
+        self.migrate_handoffs()?;
         self.migrate_chisei()?;
         self.migrate_kioku()?;
         self.migrate_action_types()?;

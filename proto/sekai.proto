@@ -993,6 +993,43 @@ message MarkEvidenceStaleRequest {
 }
 message MarkEvidenceStaleResponse { EvidenceSubmissionResult result = 1; }
 
+// A reference-only, version-pinned context transfer between principals. The
+// manifest never embeds artifact, evidence, receipt, or memory content.
+message HandoffReference {
+  string kind = 1;       // operation_receipt | work_unit | object | evidence_submission | kioku
+  string id = 2;
+  string version = 3;    // content digest, object revision, work-unit revision, or Kioku version
+  bool omitted = 4;
+  string omission_reason = 5; // policy | retention | unavailable
+}
+message HandoffManifest {
+  string id = 1;
+  string namespace = 2;
+  string parent_operation_id = 3;
+  string parent_attempt_id = 4;
+  string parent_work_unit_id = 5;
+  repeated HandoffReference references = 6;
+  string creator_principal = 7;
+  string intended_principal = 8;
+  string intended_scope = 9;
+  string purpose = 10;
+  int64 created_at_ms = 11;
+  int64 expires_at_ms = 12;
+  string digest = 13;
+  string supersedes_manifest_id = 14;
+  bool revoked = 15;
+}
+message CreateHandoffRequest { HandoffManifest manifest = 1; string request_id = 2; }
+message CreateHandoffResponse { HandoffManifest manifest = 1; }
+message ResolveHandoffRequest { string manifest_id = 1; }
+message ResolveHandoffResponse {
+  HandoffManifest manifest = 1;
+  repeated HandoffReference available_references = 2;
+  repeated HandoffReference omissions = 3;
+}
+message RevokeHandoffRequest { string manifest_id = 1; string reason = 2; string request_id = 3; }
+message RevokeHandoffResponse { HandoffManifest manifest = 1; }
+
 // --- Service ---
 
 // Durable, namespace-isolated facts for agent operations. Domain-specific
@@ -1110,4 +1147,7 @@ service SekaiService {
   rpc ReplayEvidenceSubmission(ReplayEvidenceSubmissionRequest) returns (ReplayEvidenceSubmissionResponse);
   rpc RetractEvidence(RetractEvidenceRequest) returns (RetractEvidenceResponse);
   rpc MarkEvidenceStale(MarkEvidenceStaleRequest) returns (MarkEvidenceStaleResponse);
+  rpc CreateHandoff(CreateHandoffRequest) returns (CreateHandoffResponse);
+  rpc ResolveHandoff(ResolveHandoffRequest) returns (ResolveHandoffResponse);
+  rpc RevokeHandoff(RevokeHandoffRequest) returns (RevokeHandoffResponse);
 }
