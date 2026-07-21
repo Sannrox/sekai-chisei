@@ -17,7 +17,9 @@ use crate::sekai::schema::{PropertyType, SchemaRegistry};
 use crate::sekai::security::Grant;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Cardinality bound for the range side of a relation. `max = None` means
@@ -148,6 +150,14 @@ impl OntologyRegistry {
         relations
     }
 
+    /// Stable content revision for an immutable ontology snapshot. It is a
+    /// projection identifier, not a persisted database revision.
+    pub fn revision(&self) -> String {
+        let content = serde_json::to_vec(&(self.classes(), self.relations()))
+            .expect("ontology definitions are serializable");
+        format!("sha256:{:x}", Sha256::digest(content))
+    }
+
     /// Transitive set of ancestor class names reachable via `superclasses`.
     /// Cycle-safe: a class already visited is never expanded twice, so a
     /// pre-existing cycle terminates instead of looping. The starting class is
@@ -178,34 +188,67 @@ impl OntologyRegistry {
     /// mapped classes, transitive inheritance, and symmetric/transitive class
     /// equivalence.
     pub fn kind_satisfies_class(&self, kind: &str, expected: &str) -> bool {
+        self.kind_entailment_path(kind, expected).is_some()
+    }
+
+    /// Deterministic shortest class path for an object's mapped kind. Each
+    /// tuple is `(from, to, rule)` where rule is `subclass` or `equivalence`.
+    pub fn kind_entailment_path(
+        &self,
+        kind: &str,
+        expected: &str,
+    ) -> Option<Vec<(String, String, &'static str)>> {
         let mut reachable = HashSet::new();
-        let mut stack = self
+        let mut starts = self
             .classes
             .values()
             .filter(|class| class.mapped_kind == kind)
             .map(|class| class.name.clone())
             .collect::<Vec<_>>();
-
-        while let Some(current) = stack.pop() {
+        starts.sort();
+        let mut queue = starts
+            .into_iter()
+            .map(|class| (class, Vec::new()))
+            .collect::<VecDeque<_>>();
+        while let Some((current, path)) = queue.pop_front() {
             if !reachable.insert(current.clone()) {
                 continue;
             }
+            if !self.classes.contains_key(&current) {
+                continue;
+            }
             if current == expected {
-                return true;
+                return Some(path);
             }
             let Some(class) = self.classes.get(&current) else {
                 continue;
             };
-            stack.extend(class.superclasses.iter().cloned());
-            stack.extend(class.equivalent_classes.iter().cloned());
-            stack.extend(
-                self.classes
-                    .values()
-                    .filter(|candidate| candidate.equivalent_classes.contains(&current))
-                    .map(|candidate| candidate.name.clone()),
-            );
+            let mut edges = class
+                .superclasses
+                .iter()
+                .map(|target| (target.clone(), "subclass"))
+                .chain(
+                    class
+                        .equivalent_classes
+                        .iter()
+                        .map(|target| (target.clone(), "equivalence")),
+                )
+                .chain(
+                    self.classes
+                        .values()
+                        .filter(|candidate| candidate.equivalent_classes.contains(&current))
+                        .map(|candidate| (candidate.name.clone(), "equivalence")),
+                )
+                .collect::<Vec<_>>();
+            edges.sort();
+            edges.dedup();
+            for (target, rule) in edges {
+                let mut next_path = path.clone();
+                next_path.push((current.clone(), target.clone(), rule));
+                queue.push_back((target, next_path));
+            }
         }
-        false
+        None
     }
 
     pub fn constraints_for_mapped_relation(&self, mapped_relation: &str) -> Vec<&OntologyRelation> {
@@ -772,6 +815,15 @@ impl SekaiDb {
         select_classes(&self.conn())
     }
 
+    pub fn list_readable_ontology_classes(
+        &self,
+        principals: &[String],
+        deadline: Instant,
+        limit: u32,
+    ) -> Result<Vec<OntologyClass>, String> {
+        select_readable_classes(&self.conn(), principals, deadline, limit)
+    }
+
     pub fn upsert_ontology_relation(&self, relation: &OntologyRelation) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         upsert_relation_row(&self.conn(), relation, now)
@@ -861,6 +913,15 @@ impl SekaiDb {
 
     pub fn list_ontology_relations(&self) -> Result<Vec<OntologyRelation>, String> {
         select_relations(&self.conn())
+    }
+
+    pub fn list_readable_ontology_relations(
+        &self,
+        principals: &[String],
+        deadline: Instant,
+        limit: u32,
+    ) -> Result<Vec<OntologyRelation>, String> {
+        select_readable_relations(&self.conn(), principals, deadline, limit)
     }
 
     /// Load the durable ontology into an in-memory registry for validation and
@@ -989,6 +1050,43 @@ fn select_classes(conn: &rusqlite::Connection) -> Result<Vec<OntologyClass>, Str
     Ok(classes)
 }
 
+fn select_readable_classes(
+    conn: &rusqlite::Connection,
+    principals: &[String],
+    deadline: Instant,
+    limit: u32,
+) -> Result<Vec<OntologyClass>, String> {
+    let principals_json = serde_json::to_string(principals).map_err(|error| error.to_string())?;
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {CLASS_COLUMNS} FROM sekai_ontology_classes c
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM sekai_grants g
+                 WHERE g.object_id = 'ontology:class:' || c.name
+             ) OR EXISTS (
+                 SELECT 1 FROM sekai_grants g
+                 WHERE g.object_id = 'ontology:class:' || c.name
+                   AND g.principal IN (SELECT value FROM json_each(?1))
+             ) ORDER BY c.name LIMIT ?2"
+            ))
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt
+            .query(params![principals_json, limit])
+            .map_err(|error| error.to_string())?;
+        let mut classes = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            classes.push(row_to_ontology_class(row).map_err(|error| error.to_string())??);
+        }
+        Ok(classes)
+    })();
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|error| error.to_string())?;
+    result
+}
+
 fn upsert_relation_row(
     conn: &rusqlite::Connection,
     relation: &OntologyRelation,
@@ -1061,6 +1159,43 @@ fn select_relations(conn: &rusqlite::Connection) -> Result<Vec<OntologyRelation>
         relations.push(row_to_ontology_relation(row).map_err(|error| error.to_string())??);
     }
     Ok(relations)
+}
+
+fn select_readable_relations(
+    conn: &rusqlite::Connection,
+    principals: &[String],
+    deadline: Instant,
+    limit: u32,
+) -> Result<Vec<OntologyRelation>, String> {
+    let principals_json = serde_json::to_string(principals).map_err(|error| error.to_string())?;
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {RELATION_COLUMNS} FROM sekai_ontology_relations r
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM sekai_grants g
+                 WHERE g.object_id = 'ontology:relation:' || r.name
+             ) OR EXISTS (
+                 SELECT 1 FROM sekai_grants g
+                 WHERE g.object_id = 'ontology:relation:' || r.name
+                   AND g.principal IN (SELECT value FROM json_each(?1))
+             ) ORDER BY r.name LIMIT ?2"
+            ))
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt
+            .query(params![principals_json, limit])
+            .map_err(|error| error.to_string())?;
+        let mut relations = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            relations.push(row_to_ontology_relation(row).map_err(|error| error.to_string())??);
+        }
+        Ok(relations)
+    })();
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|error| error.to_string())?;
+    result
 }
 
 /// Deserialize a class row. The outer `rusqlite::Result` covers column access;
