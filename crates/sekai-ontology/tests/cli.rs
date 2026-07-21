@@ -157,13 +157,156 @@ fn export_handles_empty_and_invalid_databases_without_partial_output() {
 fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
     let help = String::from_utf8(help.stdout).unwrap();
-    for command in ["export", "explain", "validate", "import"] {
+    for command in ["export", "explain", "query", "validate", "import"] {
         assert!(help.contains(command), "help is missing {command}");
         assert!(
             EMBEDDED_SKILL.contains(command),
             "skill is missing {command}"
         );
     }
+}
+
+#[test]
+fn query_json_answers_bounded_structural_questions() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("knowledge.db");
+    let database = database_path.to_str().unwrap();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "import", fixture])
+            .status
+            .success()
+    );
+
+    let outbound = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "query",
+        "Client",
+        "--direction",
+        "outbound",
+        "--depth",
+        "2",
+    ]);
+    assert!(outbound.status.success());
+    assert!(outbound.stderr.is_empty());
+    let json: Value = serde_json::from_slice(&outbound.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["command"], "query");
+    assert_eq!(json["data"]["start"], "Client");
+    assert_eq!(json["data"]["options"]["direction"], "outbound");
+    assert_eq!(json["data"]["options"]["relation"], Value::Null);
+    assert_eq!(json["data"]["options"]["depth"], 2);
+    assert_eq!(
+        json["data"]["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|class| class["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Api", "Database"]
+    );
+    assert_eq!(
+        json["data"]["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|relation| relation["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["depends_on", "serves"]
+    );
+
+    let inbound = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "query",
+        "Api",
+        "--direction",
+        "inbound",
+    ]);
+    let inbound: Value = serde_json::from_slice(&inbound.stdout).unwrap();
+    assert_eq!(inbound["data"]["classes"][0]["name"], "Client");
+
+    let both = sekai(&["--db", database, "--json", "query", "Api"]);
+    let both: Value = serde_json::from_slice(&both.stdout).unwrap();
+    assert_eq!(both["data"]["options"]["direction"], "both");
+    assert_eq!(both["data"]["options"]["depth"], 1);
+    assert_eq!(
+        both["data"]["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|class| class["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Client", "Database"]
+    );
+
+    let filtered = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "query",
+        "Api",
+        "--relation",
+        "serves",
+    ]);
+    let filtered: Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered["data"]["classes"][0]["name"], "Client");
+    assert_eq!(filtered["data"]["relations"][0]["name"], "serves");
+
+    let empty = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "query",
+        "Database",
+        "--direction",
+        "outbound",
+    ]);
+    assert!(empty.status.success());
+    let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["data"]["classes"], serde_json::json!([]));
+    assert_eq!(empty["data"]["relations"], serde_json::json!([]));
+}
+
+#[test]
+fn query_depth_and_usage_failures_have_stable_exit_codes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("knowledge.db");
+    let database = database_path.to_str().unwrap();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "import", fixture])
+            .status
+            .success()
+    );
+
+    for invalid in [
+        vec!["--db", database, "query", "Api", "--depth", "33"],
+        vec!["--db", database, "query", "Api", "--depth", "nope"],
+        vec!["--db", database, "query", "Api", "--direction", "sideways"],
+        vec!["--db", database, "query"],
+        vec!["--db", database, "explain", "Api", "--depth", "1"],
+    ] {
+        let output = sekai(&invalid);
+        assert_eq!(output.status.code(), Some(2), "arguments: {invalid:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+
+    let zero = sekai(&["--db", database, "--json", "query", "Api", "--depth", "0"]);
+    assert!(zero.status.success());
+    let zero: Value = serde_json::from_slice(&zero.stdout).unwrap();
+    assert_eq!(zero["data"]["classes"], serde_json::json!([]));
+    assert_eq!(zero["data"]["relations"], serde_json::json!([]));
+    assert_eq!(
+        sekai(&["--db", database, "query", "Missing"]).status.code(),
+        Some(3)
+    );
 }
 
 #[test]
