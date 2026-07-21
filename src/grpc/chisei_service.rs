@@ -2698,6 +2698,25 @@ impl ChiseiServiceImpl {
         safe_providers: &std::collections::HashSet<String>,
     ) -> Result<String, String> {
         validate_explicit_requested_model(model)?;
+        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+            openai_base_url: std::env::var("CHISEI_OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            openai_api_key: self.config.openai_api_key.clone(),
+            anthropic_base_url: std::env::var("CHISEI_ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com/v1".into()),
+            anthropic_api_key: self.config.anthropic_api_key.clone(),
+            ollama_url: self.config.ollama_url.clone(),
+            native_configured: self.config.native_llm_url.is_some(),
+        };
+        let availability =
+            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
+        let available_models = availability
+            .models_by_provider
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let discovered_ollama = crate::chisei::model_availability::ollama_models(&availability);
         let empty_allowed = Vec::new();
         let allowed_models = policy
             .map(|policy| policy.allowed_models.as_slice())
@@ -2707,7 +2726,9 @@ impl ChiseiServiceImpl {
             allowed_models,
             route_bias,
             config: &self.config,
-            ollama_models: &[],
+            ollama_models: &discovered_ollama,
+            available_models: &available_models,
+            authoritative_providers: &availability.authoritative_providers,
             safe_only,
             safe_providers,
         };
@@ -2722,11 +2743,7 @@ impl ChiseiServiceImpl {
             return Ok(resolved);
         }
 
-        let ollama_models = crate::llm::ollama::list_models(&self.config.ollama_url)
-            .await
-            .unwrap_or_default();
         crate::chisei::model_routing::resolve_model(crate::chisei::model_routing::RoutingContext {
-            ollama_models: &ollama_models,
             ..base_context
         })
     }

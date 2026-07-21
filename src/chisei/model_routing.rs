@@ -1,3 +1,4 @@
+use crate::chisei::model_availability::AvailableModel;
 use crate::config::Config;
 use crate::llm;
 use crate::llm::ollama::InstalledModel;
@@ -10,6 +11,8 @@ pub struct RoutingContext<'a> {
     pub route_bias: Option<&'a str>,
     pub config: &'a Config,
     pub ollama_models: &'a [InstalledModel],
+    pub available_models: &'a [AvailableModel],
+    pub authoritative_providers: &'a [String],
     pub safe_only: bool,
     pub safe_providers: &'a HashSet<String>,
 }
@@ -79,7 +82,20 @@ fn validate_or_fallback_provider_model(ctx: RoutingContext<'_>) -> Result<String
             "provider {provider:?} is not safe for sensitive data"
         ));
     }
-    if provider_is_available(provider, ctx.config) {
+    let provider_has_live_catalog = ctx
+        .authoritative_providers
+        .iter()
+        .any(|available| available == provider);
+    let requested_is_available = ctx.available_models.iter().any(|available| {
+        available.provider == provider
+            && available.discovery_source != "static_fallback"
+            && available.routable
+            && (available.canonical_model == ctx.requested
+                || available.upstream_model == ctx.requested)
+    });
+    if provider_is_available(provider, ctx.config)
+        && (!provider_has_live_catalog || requested_is_available)
+    {
         return Ok(ctx.requested.to_string());
     }
 
@@ -135,24 +151,77 @@ fn candidate_pool(ctx: &RoutingContext<'_>) -> Vec<Candidate> {
 }
 
 fn discover_default_candidates(ctx: &RoutingContext<'_>) -> Vec<String> {
-    let mut models = Vec::new();
-    if ctx.config.anthropic_api_key.is_some() {
+    let mut models = ctx
+        .available_models
+        .iter()
+        .filter(|model| model.routable)
+        .map(|model| model.canonical_model.clone())
+        .collect::<Vec<_>>();
+    let authoritative = |provider: &str| {
+        ctx.authoritative_providers
+            .iter()
+            .any(|available| available == provider)
+    };
+    if !authoritative("anthropic") && provider_is_available("anthropic", ctx.config) {
         models.push("claude-sonnet-4-20250514".to_string());
     }
-    if ctx.config.openai_api_key.is_some() {
+    if !authoritative("openai") && provider_is_available("openai", ctx.config) {
         models.push("gpt-4.1-mini".to_string());
         models.push("gpt-4.1".to_string());
     }
-    if ctx.config.native_llm_url.is_some() {
+    if !authoritative("native") && provider_is_available("native", ctx.config) {
         models.push("native-default".to_string());
     }
-    for model in ctx.ollama_models {
-        models.push(format!("ollama/{}", model.name));
+    if !authoritative("ollama") {
+        for model in ctx.ollama_models {
+            models.push(format!("ollama/{}", model.name));
+        }
     }
+    models.sort();
+    models.dedup();
     models
 }
 
 fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
+    if !ctx.available_models.is_empty() {
+        let inferred_provider = llm::provider_name(model);
+        let intended_provider = if inferred_provider == "native"
+            && exact_available_ollama_name(model, ctx.ollama_models).is_some()
+        {
+            "ollama"
+        } else {
+            inferred_provider
+        };
+        let available = ctx.available_models.iter().find(|available| {
+            available.routable
+                && available.provider == intended_provider
+                && (available.canonical_model == model || available.upstream_model == model)
+        });
+        if let Some(available) = available {
+            if !provider_is_available(&available.provider, ctx.config) {
+                return None;
+            }
+            if ctx.safe_only && !provider_is_safe(&available.provider, ctx) {
+                return None;
+            }
+            return Some(Candidate {
+                model: available.canonical_model.clone(),
+                cost_rank: available
+                    .cost_rank
+                    .unwrap_or_else(|| named_model_cost_rank(&available.upstream_model)),
+                capability_rank: available
+                    .capability_rank
+                    .unwrap_or_else(|| named_model_capability_rank(&available.upstream_model)),
+            });
+        }
+        if ctx
+            .authoritative_providers
+            .iter()
+            .any(|available| available == intended_provider)
+        {
+            return None;
+        }
+    }
     if let Some(name) = exact_available_ollama_name(model, ctx.ollama_models) {
         let installed = ctx
             .ollama_models
@@ -293,6 +362,8 @@ fn provider_is_available(provider: &str, config: &Config) -> bool {
         "openai" => config.openai_api_key.is_some(),
         "ollama" => true,
         "native" => config.native_llm_url.is_some(),
+        "xai" => std::env::var_os("XAI_API_KEY").is_some(),
+        "meta" => std::env::var_os("META_MODEL_API_KEY").is_some(),
         _ => false,
     }
 }
@@ -361,8 +432,10 @@ fn display_allowed_models(allowed_models: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{RoutingContext, resolve_model};
+    use crate::chisei::model_availability::AvailableModel;
     use crate::config::Config;
     use crate::llm::ollama::InstalledModel;
+    use crate::provider_profile::ProviderRegistry;
 
     fn config() -> Config {
         Config {
@@ -404,6 +477,24 @@ mod tests {
         }
     }
 
+    fn discovered(provider: &str, model: &str) -> AvailableModel {
+        let profile = ProviderRegistry::built_in()
+            .effective_profile(provider)
+            .unwrap();
+        AvailableModel {
+            provider: provider.into(),
+            upstream_model: model.into(),
+            canonical_model: format!("{provider}/{model}"),
+            lifecycle: "enabled".into(),
+            routable: true,
+            discovery_source: "provider_catalog".into(),
+            capabilities: Some(profile.capabilities),
+            pricing: Some(profile.pricing),
+            cost_rank: None,
+            capability_rank: None,
+        }
+    }
+
     fn keyless_config() -> Config {
         // ChatGPT-plan style: the control-plane server holds no provider keys.
         let mut config = config();
@@ -423,11 +514,153 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "gpt-5.5");
+    }
+
+    #[test]
+    fn gateway_provided_alias_survives_unrelated_authoritative_catalog() {
+        let mut config = keyless_config();
+        config.gateway_provided_providers = vec!["openai".into()];
+        let resolved = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &["ollama".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn aliases_use_discovered_models_and_static_candidates_only_without_a_snapshot() {
+        let config = config();
+        let discovered = vec![discovered("openai", "gpt-discovered-mini")];
+        let resolved = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &discovered,
+            authoritative_providers: &["openai".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "openai/gpt-discovered-mini");
+
+        let fallback = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &[],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(fallback, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn lifecycle_unroutable_discovered_models_are_excluded() {
+        let mut config = config();
+        config.anthropic_api_key = None;
+        config.native_llm_url = None;
+        let mut disabled = discovered("openai", "gpt-disabled-mini");
+        disabled.lifecycle = "disabled".into();
+        disabled.routable = false;
+        let result = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[disabled],
+            authoritative_providers: &["openai".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn authoritative_empty_catalog_does_not_fall_back_to_static_models() {
+        let mut config = config();
+        config.native_llm_url = None;
+        let result = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &["openai".into(), "anthropic".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exact_policy_model_preserves_provider_when_upstream_names_collide() {
+        let config = config();
+        let discovered = vec![
+            discovered("openai", "gpt-4.1"),
+            discovered("ollama", "gpt-4.1"),
+        ];
+        let installed = vec![model("gpt-4.1", 7.0)];
+        let resolved = resolve_model(RoutingContext {
+            requested: "cheap",
+            allowed_models: &["gpt-4.1".into()],
+            route_bias: None,
+            config: &config,
+            ollama_models: &installed,
+            available_models: &discovered,
+            authoritative_providers: &["openai".into(), "ollama".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "openai/gpt-4.1");
+    }
+
+    #[test]
+    fn discovered_ollama_candidates_preserve_metadata_ranking() {
+        let config = config();
+        let mut small = discovered("ollama", "z-small");
+        small.cost_rank = Some(100);
+        small.capability_rank = Some(100);
+        let mut large = discovered("ollama", "a-large");
+        large.cost_rank = Some(1000);
+        large.capability_rank = Some(1000);
+        let models = vec![small, large];
+        let resolved = resolve_model(RoutingContext {
+            requested: "ollama/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &models,
+            authoritative_providers: &["ollama".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "ollama/a-large");
     }
 
     #[test]
@@ -439,6 +672,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         });
@@ -455,6 +690,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -472,6 +709,8 @@ mod tests {
             route_bias: Some("cheap"),
             config: &config,
             ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -489,6 +728,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -507,6 +748,8 @@ mod tests {
             route_bias: Some("capable"),
             config: &config,
             ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -528,6 +771,8 @@ mod tests {
             route_bias: Some("capable"),
             config: &config,
             ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: true,
             safe_providers: &safe,
         })
@@ -545,6 +790,8 @@ mod tests {
             route_bias: None,
             config: &config,
             ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &[],
             safe_only: true,
             safe_providers: &safe,
         })
