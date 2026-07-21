@@ -186,6 +186,29 @@ states fail closed. Evidence classification is enforced through the projected
 object ACL in the current contract; there is no separate caller-clearance
 model.
 
+### Governed context handoffs
+
+Native integrations can transfer bounded context between principals with the
+Sekai handoff API. A handoff is a versioned manifest of references to existing
+operation receipts, work units, graph objects such as artifacts and
+verification records, evidence submissions, and Kioku memories. It never
+copies their content or grants access. The creator names one receiving
+principal, namespace scope, purpose, expiry, lineage, and any references
+deliberately omitted by policy, retention, or availability.
+
+Creation validates every included reference through the creator's current read
+path. Resolution is receiver-bound and rechecks the manifest digest, expiry,
+revocation, supersession, exact referenced version, namespace access, object
+ACLs, evidence lifecycle, Kioku lifecycle, and retention. A reference that has
+become unavailable is returned only as a non-disclosing omission; an expired,
+revoked, superseded, unauthorized, or corrupt manifest fails as not found.
+Resolved manifests are receiver projections: unavailable reference identities
+and versions are removed, so their digest identifies the creator's immutable
+manifest but cannot be recomputed from a redacted projection.
+Creation and revocation are idempotent and recorded with the manifest in the
+SQLite handoff audit tables. This contract is not implemented by the selected
+PostgreSQL persistence interfaces.
+
 ### Identity, content, and reconciliation
 
 Retry identity is scoped to an operation and idempotency key and is bound to a
