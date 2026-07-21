@@ -673,6 +673,26 @@ fn retrieve_context_capability() -> CapabilityEntry {
             name: "max_objects".into(),
             value: 100,
         },
+        CapabilityLimit {
+            name: "max_source_rows".into(),
+            value: 1000,
+        },
+        CapabilityLimit {
+            name: "max_derived_rows".into(),
+            value: 500,
+        },
+        CapabilityLimit {
+            name: "max_derivation_steps".into(),
+            value: 32,
+        },
+        CapabilityLimit {
+            name: "max_time_ms".into(),
+            value: 1000,
+        },
+        CapabilityLimit {
+            name: "max_explanation_bytes".into(),
+            value: 16 * 1024 * 1024,
+        },
     ];
     entry
 }
@@ -3857,6 +3877,7 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RetrieveContextRequest>,
     ) -> Result<Response<RetrieveContextResponse>, Status> {
+        let reasoning_started = std::time::Instant::now();
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
@@ -3867,7 +3888,9 @@ impl SekaiService for SekaiServiceImpl {
             .collect::<Result<Vec<_>, _>>()?;
         let direction =
             retrieval::RetrievalDirection::parse(&inner.direction).map_err(map_retrieval_error)?;
-        let query = retrieval::RetrievalQuery {
+        let reasoning_mode =
+            retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
+        let mut query = retrieval::RetrievalQuery {
             roots,
             relations: inner.relations,
             direction,
@@ -3875,11 +3898,141 @@ impl SekaiService for SekaiServiceImpl {
             max_objects: inner.max_objects,
             max_links: inner.max_links,
             kind_filter: inner.kind_filter,
+            reasoning_mode,
+            max_source_rows: inner.max_source_rows,
+            max_derived_rows: inner.max_derived_rows,
+            max_derivation_steps: inner.max_derivation_steps,
+            max_time_ms: inner.max_time_ms,
+            max_explanation_bytes: inner.max_explanation_bytes,
+            initial_source_rows: 0,
+            source_rows_truncated: false,
+        };
+        let reasoning_timeout =
+            std::time::Duration::from_millis(u64::from(if query.max_time_ms == 0 {
+                retrieval::DEFAULT_MAX_TIME_MS
+            } else {
+                query.max_time_ms.min(retrieval::MAX_TIME_MS)
+            }));
+        let reasoning_deadline = reasoning_started + reasoning_timeout;
+        let ontology_row_limit = if query.max_source_rows == 0 {
+            retrieval::DEFAULT_MAX_SOURCE_ROWS
+        } else {
+            query.max_source_rows.min(retrieval::MAX_SOURCE_ROWS)
         };
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut result = retrieval::retrieve(
+        // Build one authorization-filtered immutable snapshot before inference.
+        // Hidden definitions cannot influence closure, counts, explanations,
+        // errors, or truncation metadata.
+        let mut ontology_source_rows = 0u32;
+        let mut ontology_source_truncated = false;
+        let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
+            let class_rows = match self.db.list_readable_ontology_classes(
+                &principals,
+                reasoning_deadline,
+                ontology_row_limit.saturating_add(1),
+            ) {
+                Ok(classes) => classes,
+                Err(_) if reasoning_started.elapsed() >= reasoning_timeout => Vec::new(),
+                Err(error) => return Err(Status::internal(error)),
+            };
+            let mut classes = class_rows;
+            if classes.len() > ontology_row_limit as usize {
+                classes.truncate(ontology_row_limit as usize);
+                ontology_source_truncated = true;
+            }
+            ontology_source_rows = classes.len().min(u32::MAX as usize) as u32;
+            let mut classes = classes
+                .into_iter()
+                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
+                .filter(|class| {
+                    check_read(
+                        &self.security,
+                        &ontology_class_object_id(&class.name),
+                        &principals,
+                    )
+                    .is_ok()
+                })
+                .collect::<Vec<_>>();
+            let visible_class_names = classes
+                .iter()
+                .map(|class| class.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for class in &mut classes {
+                class
+                    .superclasses
+                    .retain(|name| visible_class_names.contains(name));
+                class
+                    .equivalent_classes
+                    .retain(|name| visible_class_names.contains(name));
+                class
+                    .disjoint_classes
+                    .retain(|name| visible_class_names.contains(name));
+            }
+            let remaining_rows = ontology_row_limit.saturating_sub(ontology_source_rows);
+            let relation_rows =
+                if !ontology_source_truncated && reasoning_started.elapsed() < reasoning_timeout {
+                    self.db
+                        .list_readable_ontology_relations(
+                            &principals,
+                            reasoning_deadline,
+                            remaining_rows.saturating_add(1),
+                        )
+                        .or_else(|error| {
+                            if reasoning_started.elapsed() >= reasoning_timeout {
+                                Ok(Vec::new())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .map_err(Status::internal)?
+                } else {
+                    Vec::new()
+                };
+            let mut relation_rows = relation_rows;
+            if relation_rows.len() > remaining_rows as usize {
+                relation_rows.truncate(remaining_rows as usize);
+                ontology_source_truncated = true;
+            }
+            ontology_source_rows = ontology_source_rows
+                .saturating_add(relation_rows.len().min(u32::MAX as usize) as u32);
+            let mut relations = relation_rows
+                .into_iter()
+                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
+                .filter(|relation| {
+                    check_read(
+                        &self.security,
+                        &ontology_relation_object_id(&relation.name),
+                        &principals,
+                    )
+                    .is_ok()
+                })
+                .filter(|relation| {
+                    visible_class_names.contains(&relation.domain)
+                        && visible_class_names.contains(&relation.range)
+                })
+                .collect::<Vec<_>>();
+            let visible_relation_names = relations
+                .iter()
+                .map(|relation| relation.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for relation in &mut relations {
+                if !relation.inverse.is_empty()
+                    && !visible_relation_names.contains(&relation.inverse)
+                {
+                    relation.inverse.clear();
+                }
+            }
+            Some(ontology::OntologyRegistry::from_parts(classes, relations))
+        } else {
+            None
+        };
+        query.initial_source_rows = ontology_source_rows;
+        query.source_rows_truncated = ontology_source_truncated;
+        let mut result = retrieval::retrieve_with_ontology_started(
             &self.db,
             &query,
+            ontology.as_ref(),
+            reasoning_started,
             |object| {
                 self.security.can_access(&object.id, &principal_refs)
                     && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
@@ -3887,6 +4040,20 @@ impl SekaiService for SekaiServiceImpl {
             |object| is_reserved_governance_kind(&object.kind),
         )
         .map_err(map_retrieval_error)?;
+        if reasoning_mode == retrieval::ReasoningMode::Entailment {
+            // Hidden objects are intentionally indistinguishable from absent
+            // objects in inference metadata.
+            result.denied_objects = 0;
+            if reasoning_started.elapsed() >= reasoning_timeout
+                && !result
+                    .truncation_reasons
+                    .iter()
+                    .any(|reason| reason == "time")
+            {
+                result.truncation_reasons.push("time".into());
+                result.truncated = true;
+            }
+        }
         for candidate in &mut result.candidates {
             candidate.object =
                 self.resolve_computed_for_response(candidate.object.clone(), &principals)?;
@@ -3901,6 +4068,25 @@ impl SekaiService for SekaiServiceImpl {
                     depth: candidate.depth,
                     via_relation: candidate.via_relation.clone(),
                     affinity: candidate.affinity,
+                    explanation: Some(ContextExplanation {
+                        steps: candidate
+                            .explanation
+                            .steps
+                            .iter()
+                            .map(|step| ContextDerivationStep {
+                                kind: step.kind.into(),
+                                relation: step.relation.clone(),
+                                from_id: step.from_id.clone(),
+                                to_id: step.to_id.clone(),
+                                source_fact_ids: step.source_fact_ids.clone(),
+                                ontology_revision: step.ontology_revision.clone(),
+                                rule: step.rule.into(),
+                            })
+                            .collect(),
+                        source_fact_ids: candidate.explanation.source_fact_ids.clone(),
+                        ontology_revision: candidate.explanation.ontology_revision.clone(),
+                        derived: candidate.explanation.derived,
+                    }),
                 })
                 .collect(),
             links: result.links.iter().map(to_proto_link).collect(),
@@ -3909,6 +4095,10 @@ impl SekaiService for SekaiServiceImpl {
             denied_objects: result.denied_objects,
             truncated_objects: result.truncated_objects,
             truncated_links: result.truncated_links,
+            truncation_reasons: result.truncation_reasons,
+            source_rows: result.source_rows,
+            derived_rows: result.derived_rows,
+            ontology_revision: result.ontology_revision,
         }))
     }
     async fn discover_capabilities(
@@ -16357,6 +16547,7 @@ mod tests {
                     max_objects: 20,
                     max_links: 20,
                     kind_filter: Vec::new(),
+                    ..Default::default()
                 },
                 "alice",
             ))

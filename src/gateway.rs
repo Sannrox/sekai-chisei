@@ -5511,6 +5511,7 @@ async fn resolve_gateway_context(
                 max_objects,
                 max_links,
                 kind_filter,
+                ..Default::default()
             },
             context_principal,
         )?)

@@ -1,8 +1,10 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
+use crate::sekai::ontology::OntologyRegistry;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_DEPTH: u32 = 0;
 pub const MAX_DEPTH: u32 = 3;
@@ -13,6 +15,35 @@ pub const MAX_LINKS: u32 = 200;
 pub const MAX_ROOTS: usize = 32;
 pub const MAX_RELATIONS: usize = 32;
 pub const MAX_KIND_FILTERS: usize = 32;
+pub const DEFAULT_MAX_SOURCE_ROWS: u32 = 200;
+pub const MAX_SOURCE_ROWS: u32 = 1000;
+pub const DEFAULT_MAX_DERIVED_ROWS: u32 = 100;
+pub const MAX_DERIVED_ROWS: u32 = 500;
+pub const DEFAULT_MAX_DERIVATION_STEPS: u32 = 12;
+pub const MAX_DERIVATION_STEPS: u32 = 32;
+pub const DEFAULT_MAX_TIME_MS: u32 = 100;
+pub const MAX_TIME_MS: u32 = 1000;
+pub const DEFAULT_MAX_EXPLANATION_BYTES: u64 = 1024 * 1024;
+pub const MAX_EXPLANATION_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningMode {
+    #[default]
+    AssertedOnly,
+    Entailment,
+}
+
+impl ReasoningMode {
+    pub fn parse(value: &str) -> Result<Self, RetrievalError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "asserted_only" => Ok(Self::AssertedOnly),
+            "entailment" => Ok(Self::Entailment),
+            _ => Err(RetrievalError::InvalidArgument(
+                "reasoning_mode must be asserted_only or entailment".into(),
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetrievalDirection {
@@ -62,6 +93,34 @@ pub struct RetrievalQuery {
     pub max_objects: u32,
     pub max_links: u32,
     pub kind_filter: Vec<String>,
+    pub reasoning_mode: ReasoningMode,
+    pub max_source_rows: u32,
+    pub max_derived_rows: u32,
+    pub max_derivation_steps: u32,
+    pub max_time_ms: u32,
+    pub max_explanation_bytes: u64,
+    pub initial_source_rows: u32,
+    pub source_rows_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivationStep {
+    pub kind: &'static str,
+    pub relation: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub source_fact_ids: Vec<String>,
+    pub ontology_revision: String,
+    pub rule: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Explanation {
+    pub steps: Vec<DerivationStep>,
+    pub source_fact_ids: Vec<String>,
+    pub ontology_revision: String,
+    pub derived: bool,
+    pub steps_truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +129,8 @@ pub struct RetrievalCandidate {
     pub depth: u32,
     pub via_relation: String,
     pub affinity: f64,
+    pub explanation: Explanation,
+    requires_derivation: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +142,10 @@ pub struct RetrievalResult {
     pub denied_objects: u32,
     pub truncated_objects: u32,
     pub truncated_links: u32,
+    pub truncation_reasons: Vec<String>,
+    pub source_rows: u32,
+    pub derived_rows: u32,
+    pub ontology_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +178,7 @@ struct CandidateState {
     via_relation: String,
     origins: BTreeSet<String>,
     is_root: bool,
+    path: Vec<Link>,
 }
 
 impl CandidateState {
@@ -129,6 +195,7 @@ impl CandidateState {
             via_relation,
             origins: BTreeSet::from([origin]),
             is_root,
+            path: Vec::new(),
         }
     }
 
@@ -148,6 +215,12 @@ impl CandidateState {
             self.via_relation.clear();
         }
     }
+
+    fn observe_path(&mut self, path: &[Link]) {
+        if self.path.is_empty() || path.len() < self.path.len() {
+            self.path = path.to_vec();
+        }
+    }
 }
 
 pub fn retrieve<F, G>(
@@ -160,6 +233,40 @@ where
     F: Fn(&Object) -> bool,
     G: Fn(&Object) -> bool,
 {
+    retrieve_with_ontology_started(db, query, None, Instant::now(), can_read, is_forbidden)
+}
+
+pub fn retrieve_with_ontology<F, G>(
+    db: &SekaiDb,
+    query: &RetrievalQuery,
+    ontology: Option<&OntologyRegistry>,
+    can_read: F,
+    is_forbidden: G,
+) -> Result<RetrievalResult, RetrievalError>
+where
+    F: Fn(&Object) -> bool,
+    G: Fn(&Object) -> bool,
+{
+    retrieve_with_ontology_started(db, query, ontology, Instant::now(), can_read, is_forbidden)
+}
+
+pub fn retrieve_with_ontology_started<F, G>(
+    db: &SekaiDb,
+    query: &RetrievalQuery,
+    ontology: Option<&OntologyRegistry>,
+    started: Instant,
+    can_read: F,
+    is_forbidden: G,
+) -> Result<RetrievalResult, RetrievalError>
+where
+    F: Fn(&Object) -> bool,
+    G: Fn(&Object) -> bool,
+{
+    if query.reasoning_mode == ReasoningMode::Entailment && ontology.is_none() {
+        return Err(RetrievalError::InvalidArgument(
+            "entailment reasoning requires an ontology snapshot".into(),
+        ));
+    }
     if query.roots.is_empty() {
         return Err(RetrievalError::InvalidArgument(
             "at least one context root is required".into(),
@@ -216,13 +323,57 @@ where
         .filter(|kind| !kind.is_empty())
         .cloned()
         .collect::<BTreeSet<_>>();
+    let entailment_requested = query.reasoning_mode == ReasoningMode::Entailment;
+    let max_source_rows = if entailment_requested {
+        bounded(
+            query.max_source_rows,
+            DEFAULT_MAX_SOURCE_ROWS,
+            MAX_SOURCE_ROWS,
+        )
+    } else {
+        u32::MAX
+    };
+    let max_derived_rows = bounded(
+        query.max_derived_rows,
+        DEFAULT_MAX_DERIVED_ROWS,
+        MAX_DERIVED_ROWS,
+    );
+    let max_steps = bounded(
+        query.max_derivation_steps,
+        DEFAULT_MAX_DERIVATION_STEPS,
+        MAX_DERIVATION_STEPS,
+    ) as usize;
+    let max_time = if entailment_requested {
+        Duration::from_millis(u64::from(bounded(
+            query.max_time_ms,
+            DEFAULT_MAX_TIME_MS,
+            MAX_TIME_MS,
+        )))
+    } else {
+        Duration::MAX
+    };
+    let max_explanation_bytes = if query.max_explanation_bytes == 0 {
+        DEFAULT_MAX_EXPLANATION_BYTES
+    } else {
+        query.max_explanation_bytes.min(MAX_EXPLANATION_BYTES)
+    };
 
-    let mut result = RetrievalResult::default();
+    let mut result = RetrievalResult {
+        source_rows: query.initial_source_rows,
+        ..Default::default()
+    };
+    if query.source_rows_truncated {
+        add_truncation(&mut result, "source_rows");
+    }
+    if let Some(ontology) = ontology {
+        result.ontology_revision = ontology.revision();
+    }
     let mut denied_ids = BTreeSet::new();
     let mut object_cache = HashMap::<String, Option<Object>>::new();
     let mut seeds = BTreeSet::<(String, String)>::new(); // (object id, root origin)
     let mut root_object_ids = BTreeSet::new();
     let mut explicit_links = BTreeMap::<String, Link>::new();
+    let mut counted_source_ids = BTreeSet::new();
 
     for root in &query.roots {
         match root {
@@ -292,6 +443,14 @@ where
                 if !from_allowed || !to_allowed {
                     continue;
                 }
+                if entailment_requested && !counted_source_ids.contains(&link.id) {
+                    if result.source_rows >= max_source_rows {
+                        add_truncation(&mut result, "source_rows");
+                        continue;
+                    }
+                    counted_source_ids.insert(link.id.clone());
+                    result.source_rows = result.source_rows.saturating_add(1);
+                }
                 let origin = format!("link:{}", link.id);
                 root_object_ids.insert(from.id.clone());
                 root_object_ids.insert(to.id.clone());
@@ -316,8 +475,11 @@ where
 
     let mut candidates = BTreeMap::<String, CandidateState>::new();
     let mut visited = HashSet::<(String, String)>::new(); // (origin, object id)
-    let mut frontier = seeds.into_iter().collect::<Vec<_>>();
-    for (id, origin) in &frontier {
+    let mut frontier = seeds
+        .into_iter()
+        .map(|(id, origin)| (id, origin, Vec::<Link>::new()))
+        .collect::<Vec<_>>();
+    for (id, origin, _) in &frontier {
         let object = load_object(db, id, &mut object_cache)?.ok_or_else(|| {
             RetrievalError::Storage(format!("resolved context root disappeared: {id}"))
         })?;
@@ -330,14 +492,26 @@ where
 
     let mut accepted_links = explicit_links;
     let mut overflow_link_ids = BTreeSet::new();
-    let adjacency_scan_cap = MAX_LINKS as usize + 1;
+    let adjacency_scan_cap = if entailment_requested {
+        max_source_rows.saturating_add(1) as usize
+    } else {
+        MAX_LINKS as usize + 1
+    };
     let mut adjacency_cache = HashMap::<String, Vec<(Link, String)>>::new();
 
-    for depth in 0..max_depth {
-        frontier.sort();
-        frontier.dedup();
+    'traversal: for depth in 0..max_depth {
+        frontier.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        frontier.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
         let mut next_frontier = Vec::new();
-        for (current_id, origin) in frontier {
+        for (current_id, origin, path) in frontier {
+            if started.elapsed() >= max_time {
+                add_truncation(&mut result, "time");
+                break 'traversal;
+            }
+            if result.source_rows >= max_source_rows && !adjacency_cache.contains_key(&current_id) {
+                add_truncation(&mut result, "source_rows");
+                break 'traversal;
+            }
             let adjacent = if let Some(adjacent) = adjacency_cache.get(&current_id) {
                 adjacent.clone()
             } else {
@@ -353,12 +527,6 @@ where
             };
 
             for (link, target_id) in adjacent {
-                if !accepted_links.contains_key(&link.id) && accepted_links.len() >= max_links {
-                    if overflow_link_ids.len() <= MAX_LINKS as usize {
-                        overflow_link_ids.insert(link.id);
-                    }
-                    continue;
-                }
                 let Some(target) = load_object(db, &target_id, &mut object_cache)? else {
                     continue;
                 };
@@ -366,26 +534,47 @@ where
                     denied_ids.insert(target.id);
                     continue;
                 }
-
-                if !accepted_links.contains_key(&link.id) {
+                if !counted_source_ids.contains(&link.id) {
+                    if result.source_rows >= max_source_rows {
+                        add_truncation(&mut result, "source_rows");
+                        break 'traversal;
+                    }
+                    counted_source_ids.insert(link.id.clone());
+                    result.source_rows = result.source_rows.saturating_add(1);
+                }
+                if !accepted_links.contains_key(&link.id) && accepted_links.len() >= max_links {
+                    if overflow_link_ids.len() <= MAX_LINKS as usize {
+                        overflow_link_ids.insert(link.id.clone());
+                    }
+                    if !entailment_requested {
+                        continue;
+                    }
+                } else if !accepted_links.contains_key(&link.id) {
                     accepted_links.insert(link.id.clone(), link.clone());
                 }
 
                 let next_depth = depth.saturating_add(1);
+                let mut next_path = path.clone();
+                next_path.push(link.clone());
                 candidates
                     .entry(target.id.clone())
-                    .and_modify(|state| state.observe(next_depth, &link.relation, &origin, false))
+                    .and_modify(|state| {
+                        state.observe(next_depth, &link.relation, &origin, false);
+                        state.observe_path(&next_path);
+                    })
                     .or_insert_with(|| {
-                        CandidateState::new(
+                        let mut state = CandidateState::new(
                             target.clone(),
                             next_depth,
                             link.relation.clone(),
                             origin.clone(),
                             false,
-                        )
+                        );
+                        state.path = next_path.clone();
+                        state
                     });
                 if visited.insert((origin.clone(), target.id.clone())) {
-                    next_frontier.push((target.id, origin.clone()));
+                    next_frontier.push((target.id, origin.clone(), next_path));
                 }
             }
         }
@@ -395,23 +584,115 @@ where
         frontier = next_frontier;
     }
 
-    let mut ranked = candidates
-        .into_values()
-        .filter(|state| state.is_root || kinds.is_empty() || kinds.contains(&state.object.kind))
-        .map(|state| RetrievalCandidate {
+    let revision = result.ontology_revision.clone();
+    let timed_out = started.elapsed() >= max_time;
+    if timed_out {
+        add_truncation(&mut result, "time");
+    }
+    let entailment = query.reasoning_mode == ReasoningMode::Entailment && !timed_out;
+    let mut ranked = Vec::new();
+    for state in candidates.into_values() {
+        if started.elapsed() >= max_time && !state.is_root {
+            add_truncation(&mut result, "time");
+            continue;
+        }
+        let satisfies_filter = state.is_root
+            || kinds.is_empty()
+            || kinds.contains(&state.object.kind)
+            || (entailment
+                && ontology.is_some_and(|registry| {
+                    kinds
+                        .iter()
+                        .any(|kind| registry.kind_satisfies_class(&state.object.kind, kind))
+                }));
+        if !satisfies_filter {
+            continue;
+        }
+        let requires_derivation =
+            !state.is_root && !kinds.is_empty() && !kinds.contains(&state.object.kind);
+        let explanation = if started.elapsed() < max_time || state.is_root {
+            explanation_for(
+                &state,
+                ontology,
+                &kinds,
+                &revision,
+                max_steps,
+                query.direction,
+            )
+        } else {
+            add_truncation(&mut result, "time");
+            Explanation::default()
+        };
+        ranked.push(RetrievalCandidate {
             affinity: context_affinity_score(state.depth, state.origins.len()),
             object: state.object,
             depth: state.depth,
             via_relation: state.via_relation,
-        })
-        .collect::<Vec<_>>();
+            explanation,
+            requires_derivation,
+        });
+    }
+    if ranked
+        .iter()
+        .any(|candidate| candidate.explanation.steps_truncated)
+    {
+        add_truncation(&mut result, "derivation_steps");
+    }
+    ranked.retain(|candidate| {
+        !candidate.requires_derivation || !candidate.explanation.steps_truncated
+    });
+    let total_derived_rows = ranked
+        .iter()
+        .filter(|candidate| candidate.explanation.derived)
+        .count()
+        .min(u32::MAX as usize) as u32;
     ranked.sort_by(candidate_order);
+    let mut retained_derived = 0u32;
+    for candidate in &mut ranked {
+        let derived_row = u32::from(candidate.explanation.derived);
+        if retained_derived.saturating_add(derived_row) <= max_derived_rows {
+            retained_derived = retained_derived.saturating_add(derived_row);
+        } else {
+            // A derivation proof is atomic: never retain a prefix that does
+            // not establish the candidate's asserted class or relation.
+            candidate
+                .explanation
+                .steps
+                .retain(|step| step.kind != "derived");
+        }
+        candidate.explanation.derived = candidate
+            .explanation
+            .steps
+            .iter()
+            .any(|step| step.kind == "derived");
+    }
+    if retained_derived < total_derived_rows {
+        add_truncation(&mut result, "derived_rows");
+    }
+    ranked.retain(|candidate| !candidate.requires_derivation || candidate.explanation.derived);
+
+    let mut explanation_bytes = 0u64;
+    for candidate in &mut ranked {
+        let candidate_bytes = explanation_payload_bytes(&candidate.explanation);
+        if explanation_bytes.saturating_add(candidate_bytes) <= max_explanation_bytes {
+            explanation_bytes = explanation_bytes.saturating_add(candidate_bytes);
+            continue;
+        }
+        add_truncation(&mut result, "explanation_bytes");
+        candidate.explanation = Explanation::default();
+    }
+    ranked.retain(|candidate| !candidate.requires_derivation || candidate.explanation.derived);
     let eligible_ids = ranked
         .iter()
         .map(|candidate| candidate.object.id.clone())
         .collect::<HashSet<_>>();
     result.truncated_objects = to_u32(ranked.len().saturating_sub(max_objects));
     ranked.truncate(max_objects);
+    result.derived_rows = ranked
+        .iter()
+        .filter(|candidate| candidate.explanation.derived)
+        .count()
+        .min(u32::MAX as usize) as u32;
     let returned_ids = ranked
         .iter()
         .map(|candidate| candidate.object.id.clone())
@@ -442,8 +723,184 @@ where
             .len()
             .saturating_add(object_truncated_links),
     );
-    result.truncated = result.truncated_objects > 0 || result.truncated_links > 0;
+    result.truncated = result.truncated_objects > 0
+        || result.truncated_links > 0
+        || !result.truncation_reasons.is_empty();
     Ok(result)
+}
+
+fn derivation_step_bytes(step: &DerivationStep) -> u64 {
+    32 + step.kind.len() as u64
+        + step.relation.len() as u64
+        + step.from_id.len() as u64
+        + step.to_id.len() as u64
+        + step.ontology_revision.len() as u64
+        + step.rule.len() as u64
+        + step
+            .source_fact_ids
+            .iter()
+            .map(|id| id.len() as u64 + 8)
+            .sum::<u64>()
+}
+
+fn explanation_payload_bytes(explanation: &Explanation) -> u64 {
+    32 + explanation.ontology_revision.len() as u64
+        + explanation
+            .source_fact_ids
+            .iter()
+            .map(|id| id.len() as u64 + 8)
+            .sum::<u64>()
+        + explanation
+            .steps
+            .iter()
+            .map(derivation_step_bytes)
+            .sum::<u64>()
+}
+
+fn add_truncation(result: &mut RetrievalResult, reason: &str) {
+    if !result
+        .truncation_reasons
+        .iter()
+        .any(|existing| existing == reason)
+    {
+        result.truncation_reasons.push(reason.to_string());
+    }
+}
+
+fn explanation_for(
+    state: &CandidateState,
+    ontology: Option<&OntologyRegistry>,
+    kinds: &BTreeSet<String>,
+    revision: &str,
+    max_steps: usize,
+    direction: RetrievalDirection,
+) -> Explanation {
+    let mut explanation = Explanation {
+        ontology_revision: revision.to_string(),
+        ..Default::default()
+    };
+    if state.is_root {
+        explanation.steps.push(DerivationStep {
+            kind: "asserted",
+            relation: String::new(),
+            from_id: state.object.id.clone(),
+            to_id: state.object.id.clone(),
+            source_fact_ids: vec![state.object.id.clone()],
+            ontology_revision: revision.to_string(),
+            rule: "root",
+        });
+        explanation.source_fact_ids.push(state.object.id.clone());
+    } else {
+        for link in &state.path {
+            explanation.source_fact_ids.push(link.id.clone());
+            explanation.steps.push(DerivationStep {
+                kind: "asserted",
+                relation: link.relation.clone(),
+                from_id: link.from_id.clone(),
+                to_id: link.to_id.clone(),
+                source_fact_ids: vec![link.id.clone()],
+                ontology_revision: revision.to_string(),
+                rule: "graph_link",
+            });
+        }
+    }
+    if let Some(registry) = ontology {
+        let transitive_endpoints = transitive_endpoints(&state.path, direction);
+        let transitive = transitive_endpoints.is_some()
+            && registry
+                .constraints_for_mapped_relation(&state.path[0].relation)
+                .iter()
+                .any(|relation| relation.transitive);
+        if transitive {
+            let (from_id, to_id) = transitive_endpoints.expect("checked above");
+            explanation.derived = true;
+            explanation.steps.push(DerivationStep {
+                kind: "derived",
+                relation: state.path[0].relation.clone(),
+                from_id,
+                to_id,
+                source_fact_ids: explanation.source_fact_ids.clone(),
+                ontology_revision: revision.to_string(),
+                rule: "transitive",
+            });
+        }
+        if !kinds.is_empty()
+            && !kinds.contains(&state.object.kind)
+            && let Some(class) = kinds
+                .iter()
+                .find(|class| registry.kind_satisfies_class(&state.object.kind, class))
+        {
+            explanation.derived = true;
+            let path = registry
+                .kind_entailment_path(&state.object.kind, class)
+                .unwrap_or_default();
+            let mapped_class = path
+                .first()
+                .map(|(from, _, _)| from.clone())
+                .unwrap_or_else(|| class.clone());
+            let ontology_fact = format!("ontology:class:{mapped_class}");
+            explanation.source_fact_ids.push(ontology_fact.clone());
+            explanation.steps.push(DerivationStep {
+                kind: "derived",
+                relation: "is_a".into(),
+                from_id: state.object.kind.clone(),
+                to_id: mapped_class,
+                source_fact_ids: vec![state.object.id.clone(), ontology_fact],
+                ontology_revision: revision.to_string(),
+                rule: "mapping",
+            });
+            for (from, to, rule) in path {
+                let ontology_facts = vec![
+                    format!("ontology:class:{from}"),
+                    format!("ontology:class:{to}"),
+                ];
+                explanation.source_fact_ids.extend(ontology_facts.clone());
+                explanation.steps.push(DerivationStep {
+                    kind: "derived",
+                    relation: "is_a".into(),
+                    from_id: from,
+                    to_id: to,
+                    source_fact_ids: ontology_facts,
+                    ontology_revision: revision.to_string(),
+                    rule,
+                });
+            }
+            if !explanation.source_fact_ids.contains(&state.object.id) {
+                explanation.source_fact_ids.push(state.object.id.clone());
+            }
+        }
+    }
+    if explanation.steps.len() > max_steps {
+        explanation.steps.truncate(max_steps);
+        explanation.steps_truncated = true;
+        explanation.derived = explanation.steps.iter().any(|step| step.kind == "derived");
+    }
+    explanation.source_fact_ids.sort();
+    explanation.source_fact_ids.dedup();
+    explanation
+}
+
+fn transitive_endpoints(path: &[Link], direction: RetrievalDirection) -> Option<(String, String)> {
+    if path.len() < 2 || !path.iter().all(|link| link.relation == path[0].relation) {
+        return None;
+    }
+    let outgoing = path.windows(2).all(|pair| pair[0].to_id == pair[1].from_id);
+    let incoming = path.windows(2).all(|pair| pair[0].from_id == pair[1].to_id);
+    match direction {
+        RetrievalDirection::Outgoing if outgoing => {
+            Some((path.first()?.from_id.clone(), path.last()?.to_id.clone()))
+        }
+        RetrievalDirection::Incoming if incoming => {
+            Some((path.last()?.from_id.clone(), path.first()?.to_id.clone()))
+        }
+        RetrievalDirection::Both if outgoing => {
+            Some((path.first()?.from_id.clone(), path.last()?.to_id.clone()))
+        }
+        RetrievalDirection::Both if incoming => {
+            Some((path.last()?.from_id.clone(), path.first()?.to_id.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn load_bounded_adjacency(
@@ -569,6 +1026,7 @@ fn candidate_order(left: &RetrievalCandidate, right: &RetrievalCandidate) -> Ord
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sekai::ontology::{Cardinality, OntologyClass, OntologyRelation};
     use std::collections::HashMap;
 
     fn object(id: &str, kind: &str) -> Object {
@@ -611,6 +1069,458 @@ mod tests {
         db.create_link(&link("deep-link", "a", "deep", "depends_on"))
             .unwrap();
         db
+    }
+
+    fn reasoning_ontology() -> OntologyRegistry {
+        OntologyRegistry::from_parts(
+            vec![
+                OntologyClass {
+                    name: "Resource".into(),
+                    description: String::new(),
+                    superclasses: Vec::new(),
+                    equivalent_classes: Vec::new(),
+                    disjoint_classes: Vec::new(),
+                    properties: Vec::new(),
+                    is_builtin: false,
+                    mapped_kind: String::new(),
+                },
+                OntologyClass {
+                    name: "Component".into(),
+                    description: String::new(),
+                    superclasses: vec!["Intermediate".into()],
+                    equivalent_classes: vec!["Asset".into()],
+                    disjoint_classes: Vec::new(),
+                    properties: Vec::new(),
+                    is_builtin: false,
+                    mapped_kind: "component".into(),
+                },
+                OntologyClass {
+                    name: "Intermediate".into(),
+                    description: String::new(),
+                    superclasses: vec!["Resource".into()],
+                    equivalent_classes: Vec::new(),
+                    disjoint_classes: Vec::new(),
+                    properties: Vec::new(),
+                    is_builtin: false,
+                    mapped_kind: String::new(),
+                },
+                OntologyClass {
+                    name: "Asset".into(),
+                    description: String::new(),
+                    superclasses: Vec::new(),
+                    equivalent_classes: Vec::new(),
+                    disjoint_classes: Vec::new(),
+                    properties: Vec::new(),
+                    is_builtin: false,
+                    mapped_kind: String::new(),
+                },
+            ],
+            vec![OntologyRelation {
+                name: "impacts".into(),
+                description: String::new(),
+                domain: "Resource".into(),
+                range: "Resource".into(),
+                cardinality: Cardinality::default(),
+                inverse: String::new(),
+                transitive: true,
+                is_builtin: false,
+                mapped_relation: "impacts".into(),
+            }],
+        )
+    }
+
+    #[test]
+    fn entailment_mode_adds_subclass_results_without_changing_the_default() {
+        let db = graph();
+        let query = RetrievalQuery {
+            roots: vec![RetrievalRoot::Object("root".into())],
+            kind_filter: vec!["Resource".into()],
+            max_depth: 1,
+            ..Default::default()
+        };
+        let asserted = retrieve(&db, &query, |_| true, |_| false).unwrap();
+        assert_eq!(asserted.candidates.len(), 1);
+
+        let ontology = reasoning_ontology();
+        let entailed = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                reasoning_mode: ReasoningMode::Entailment,
+                ..query
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        let component = entailed
+            .candidates
+            .iter()
+            .find(|candidate| candidate.object.id == "a")
+            .unwrap();
+        assert!(component.explanation.derived);
+        assert!(
+            component
+                .explanation
+                .steps
+                .iter()
+                .any(|step| step.rule == "subclass")
+        );
+        assert_eq!(component.explanation.ontology_revision, ontology.revision());
+
+        let equivalent = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("root".into())],
+                kind_filter: vec!["Asset".into()],
+                max_depth: 1,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert!(equivalent.candidates.iter().any(|candidate| {
+            candidate.object.id == "a"
+                && candidate
+                    .explanation
+                    .steps
+                    .iter()
+                    .any(|step| step.rule == "equivalence")
+        }));
+
+        let directly_mapped = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("root".into())],
+                kind_filter: vec!["Component".into()],
+                max_depth: 1,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert!(directly_mapped.candidates.iter().any(|candidate| {
+            candidate.object.id == "a"
+                && candidate
+                    .explanation
+                    .steps
+                    .iter()
+                    .any(|step| step.rule == "mapping")
+        }));
+
+        let proof_bounded = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("root".into())],
+                kind_filter: vec!["Resource".into()],
+                max_depth: 1,
+                reasoning_mode: ReasoningMode::Entailment,
+                max_derived_rows: 1,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(
+            proof_bounded
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.object.kind == "component")
+                .count(),
+            1
+        );
+        assert!(
+            proof_bounded
+                .truncation_reasons
+                .contains(&"derived_rows".into())
+        );
+    }
+
+    #[test]
+    fn transitive_derivation_cites_asserted_links_and_obeys_bounds() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["a", "b", "c"] {
+            db.create_object(&object(id, "component")).unwrap();
+        }
+        db.create_link(&link("impact-1", "a", "b", "impacts"))
+            .unwrap();
+        db.create_link(&link("impact-2", "b", "c", "impacts"))
+            .unwrap();
+        let ontology = reasoning_ontology();
+        let result = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                relations: vec!["impacts".into()],
+                direction: RetrievalDirection::Outgoing,
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        let derived = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.object.id == "c")
+            .unwrap();
+        assert!(derived.explanation.derived);
+        assert_eq!(
+            derived.explanation.source_fact_ids,
+            vec!["impact-1", "impact-2"]
+        );
+
+        let step_bounded = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                relations: vec!["impacts".into()],
+                direction: RetrievalDirection::Outgoing,
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                max_derivation_steps: 2,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert!(
+            step_bounded
+                .truncation_reasons
+                .contains(&"derivation_steps".into())
+        );
+
+        let memory_bounded = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                max_explanation_bytes: 1,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert!(
+            memory_bounded
+                .truncation_reasons
+                .contains(&"explanation_bytes".into())
+        );
+
+        let source_bounded = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                max_source_rows: 1,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(source_bounded.source_rows, 1);
+        assert!(
+            source_bounded
+                .truncation_reasons
+                .contains(&"source_rows".into())
+        );
+
+        let timed_out = retrieve_with_ontology_started(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                max_time_ms: 1,
+                ..Default::default()
+            },
+            Some(&ontology),
+            Instant::now() - Duration::from_millis(2),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert!(timed_out.truncation_reasons.contains(&"time".into()));
+        assert_eq!(timed_out.candidates.len(), 1);
+    }
+
+    #[test]
+    fn denied_intermediate_cannot_contribute_to_derivation_or_metadata() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["a", "hidden", "c"] {
+            db.create_object(&object(id, "component")).unwrap();
+        }
+        db.create_link(&link("hidden-1", "a", "hidden", "impacts"))
+            .unwrap();
+        db.create_link(&link("hidden-2", "hidden", "c", "impacts"))
+            .unwrap();
+        let result = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("a".into())],
+                max_depth: 3,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&reasoning_ontology()),
+            |object| object.id != "hidden",
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.source_rows, 0);
+        assert_eq!(result.derived_rows, 0);
+        assert!(result.truncation_reasons.is_empty());
+    }
+
+    #[test]
+    fn source_row_accounting_deduplicates_asserted_facts() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["a", "b"] {
+            db.create_object(&object(id, "component")).unwrap();
+        }
+        db.create_link(&link("ab", "a", "b", "impacts")).unwrap();
+        let result = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![
+                    RetrievalRoot::Object("a".into()),
+                    RetrievalRoot::Object("b".into()),
+                ],
+                max_depth: 1,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&reasoning_ontology()),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(result.source_rows, 1);
+    }
+
+    #[test]
+    fn ontology_content_changes_produce_a_new_snapshot_revision() {
+        let first = reasoning_ontology();
+        let mut second = reasoning_ontology();
+        second.register_class(OntologyClass {
+            name: "NewClass".into(),
+            description: String::new(),
+            superclasses: Vec::new(),
+            equivalent_classes: Vec::new(),
+            disjoint_classes: Vec::new(),
+            properties: Vec::new(),
+            is_builtin: false,
+            mapped_kind: String::new(),
+        });
+        assert_ne!(first.revision(), second.revision());
+    }
+
+    #[test]
+    fn missing_ontology_references_cannot_participate_in_entailment() {
+        let registry = OntologyRegistry::from_parts(
+            vec![OntologyClass {
+                name: "Visible".into(),
+                description: String::new(),
+                superclasses: vec!["Hidden".into()],
+                equivalent_classes: Vec::new(),
+                disjoint_classes: Vec::new(),
+                properties: Vec::new(),
+                is_builtin: false,
+                mapped_kind: "component".into(),
+            }],
+            Vec::new(),
+        );
+        assert!(!registry.kind_satisfies_class("component", "Hidden"));
+    }
+
+    #[test]
+    fn transitive_explanations_follow_direction_and_reject_mixed_paths() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["a", "b", "c", "x"] {
+            db.create_object(&object(id, "component")).unwrap();
+        }
+        for asserted in [
+            link("ab", "a", "b", "impacts"),
+            link("bc", "b", "c", "impacts"),
+            link("ax", "a", "x", "impacts"),
+        ] {
+            db.create_link(&asserted).unwrap();
+        }
+        let ontology = reasoning_ontology();
+        let incoming = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("c".into())],
+                relations: vec!["impacts".into()],
+                direction: RetrievalDirection::Incoming,
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        let step = incoming
+            .candidates
+            .iter()
+            .find(|candidate| candidate.object.id == "a")
+            .unwrap()
+            .explanation
+            .steps
+            .iter()
+            .find(|step| step.rule == "transitive")
+            .unwrap();
+        assert_eq!(step.from_id, "a");
+        assert_eq!(step.to_id, "c");
+
+        let mixed = retrieve_with_ontology(
+            &db,
+            &RetrievalQuery {
+                roots: vec![RetrievalRoot::Object("b".into())],
+                relations: vec!["impacts".into()],
+                direction: RetrievalDirection::Both,
+                max_depth: 2,
+                reasoning_mode: ReasoningMode::Entailment,
+                ..Default::default()
+            },
+            Some(&ontology),
+            |_| true,
+            |_| false,
+        )
+        .unwrap();
+        let x = mixed
+            .candidates
+            .iter()
+            .find(|candidate| candidate.object.id == "x")
+            .unwrap();
+        assert!(
+            !x.explanation
+                .steps
+                .iter()
+                .any(|step| step.rule == "transitive")
+        );
     }
 
     #[test]
@@ -865,6 +1775,9 @@ mod tests {
                 max_depth: 1,
                 max_objects: 100,
                 max_links: 3,
+                // Entailment-only budgets do not alter asserted traversal.
+                max_source_rows: 1,
+                max_time_ms: 1,
                 ..Default::default()
             },
             |_| true,
