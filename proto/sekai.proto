@@ -954,6 +954,15 @@ message GetEvidenceSubmissionResponse {
   EvidenceSubmissionRecord submission = 1;
   repeated string lifecycle_history = 2;
 }
+message GetEvidenceSubmissionContentRequest { string submission_id = 1; }
+// Returns one retained admitted envelope after rechecking the live ACL on its
+// projected external_evidence object. Missing, unreadable, and non-disclosable
+// lifecycle states all return NOT_FOUND.
+message GetEvidenceSubmissionContentResponse {
+  string submission_id = 1;
+  EvidenceEnvelope envelope = 2;
+  string lifecycle_state = 3;
+}
 message ListEvidenceSubmissionsRequest {
   string producer_identity = 1;
   string source_instance = 2;
@@ -1096,6 +1105,7 @@ service SekaiService {
   rpc SubmitEvidence(SubmitEvidenceRequest) returns (SubmitEvidenceResponse);
   rpc SubmitEvidenceBatch(SubmitEvidenceBatchRequest) returns (SubmitEvidenceBatchResponse);
   rpc GetEvidenceSubmission(GetEvidenceSubmissionRequest) returns (GetEvidenceSubmissionResponse);
+  rpc GetEvidenceSubmissionContent(GetEvidenceSubmissionContentRequest) returns (GetEvidenceSubmissionContentResponse);
   rpc ListEvidenceSubmissions(ListEvidenceSubmissionsRequest) returns (ListEvidenceSubmissionsResponse);
   rpc ReplayEvidenceSubmission(ReplayEvidenceSubmissionRequest) returns (ReplayEvidenceSubmissionResponse);
   rpc RetractEvidence(RetractEvidenceRequest) returns (RetractEvidenceResponse);
