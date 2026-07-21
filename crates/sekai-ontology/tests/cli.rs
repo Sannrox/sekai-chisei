@@ -1,4 +1,6 @@
+use sekai_ontology::{EMBEDDED_SKILL, ImportDocument, Ontology, SqliteOntology};
 use serde_json::Value;
+use std::fs;
 use std::process::{Command, Output};
 
 fn sekai(arguments: &[&str]) -> Output {
@@ -42,6 +44,126 @@ fn fresh_file_workflow_has_stable_machine_output() {
     assert_eq!(json["data"]["outbound_relations"][0]["name"], "depends_on");
     assert_eq!(json["data"]["inbound_relations"][0]["name"], "serves");
     assert_eq!(json["data"]["provenance"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn export_is_deterministic_read_only_and_round_trips() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let destination_path = directory.path().join("destination.db");
+    let source = source_path.to_str().unwrap();
+    let destination = destination_path.to_str().unwrap();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+
+    assert!(sekai(&["--db", source, "init"]).status.success());
+    assert!(sekai(&["--db", source, "import", fixture]).status.success());
+    let before = SqliteOntology::open_read_only(source)
+        .unwrap()
+        .export()
+        .unwrap();
+
+    let first = sekai(&["--db", source, "--json", "export"]);
+    let second = sekai(&["export", "--json", "--db", source]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    let envelope: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "export");
+    let document: ImportDocument = serde_json::from_value(envelope["data"].clone()).unwrap();
+    assert_eq!(document, before);
+    let human = sekai(&["--db", source, "export"]);
+    assert!(human.status.success());
+    assert_eq!(
+        serde_json::from_slice::<ImportDocument>(&human.stdout).unwrap(),
+        before
+    );
+
+    assert!(sekai(&["--db", destination, "init"]).status.success());
+    let exchange_path = directory.path().join("exchange.json");
+    fs::write(
+        &exchange_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        sekai(&[
+            "--db",
+            destination,
+            "import",
+            exchange_path.to_str().unwrap(),
+        ])
+        .status
+        .success()
+    );
+    let destination_ontology = SqliteOntology::open_read_only(destination).unwrap();
+    assert_eq!(destination_ontology.export().unwrap(), before);
+    assert_eq!(destination_ontology.validate().unwrap(), Vec::new());
+    assert_eq!(
+        SqliteOntology::open_read_only(source)
+            .unwrap()
+            .export()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn export_handles_empty_and_invalid_databases_without_partial_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let empty_path = directory.path().join("empty.db");
+    let empty = empty_path.to_str().unwrap();
+    assert!(sekai(&["--db", empty, "init"]).status.success());
+    let output = sekai(&["--db", empty, "--json", "export"]);
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["classes"], serde_json::json!([]));
+    assert_eq!(json["data"]["relations"], serde_json::json!([]));
+    assert_eq!(json["data"]["provenance"], serde_json::json!([]));
+
+    let malformed_path = directory.path().join("malformed.db");
+    fs::write(&malformed_path, b"not a sqlite database").unwrap();
+    let malformed = sekai(&["--db", malformed_path.to_str().unwrap(), "--json", "export"]);
+    assert_eq!(malformed.status.code(), Some(4));
+    assert!(malformed.stdout.is_empty());
+    assert!(!malformed.stderr.is_empty());
+
+    let incompatible_path = directory.path().join("incompatible.db");
+    let connection = rusqlite::Connection::open(&incompatible_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE ontology_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO ontology_metadata(key, value) VALUES ('schema_version', '2');",
+        )
+        .unwrap();
+    drop(connection);
+    for invalid_path in [
+        incompatible_path,
+        directory.path().join("missing.db"),
+        directory.path().into(),
+    ] {
+        let output = sekai(&["--db", invalid_path.to_str().unwrap(), "--json", "export"]);
+        assert_eq!(output.status.code(), Some(4));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn embedded_skill_only_documents_shipping_commands() {
+    let help = sekai(&["--help"]);
+    let help = String::from_utf8(help.stdout).unwrap();
+    for command in ["export", "explain", "validate", "import"] {
+        assert!(help.contains(command), "help is missing {command}");
+        assert!(
+            EMBEDDED_SKILL.contains(command),
+            "skill is missing {command}"
+        );
+    }
 }
 
 #[test]
