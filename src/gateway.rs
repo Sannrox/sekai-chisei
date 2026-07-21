@@ -150,12 +150,17 @@ pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
     "request_bytes",
     "latency_ms",
     "input_tokens",
+    "uncached_input_tokens",
     "output_tokens",
     "total_tokens",
+    "provider_total_tokens",
     "cost_usd_micros",
     "cost_usd",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
+    "cache_creation_5m_input_tokens",
+    "cache_creation_1h_input_tokens",
+    "pricing_snapshot_version",
     "cache_savings_usd_micros",
     "cache_savings_usd",
 ];
@@ -350,7 +355,7 @@ fn validate_gateway_security(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModelPricing {
     pub input_usd_micros_per_million: i64,
     pub output_usd_micros_per_million: i64,
@@ -358,6 +363,12 @@ pub struct ModelPricing {
     /// Defaults to `input_usd_micros_per_million` when the pricing entry omits
     /// the optional third field, so uncached traffic is priced unchanged.
     pub cached_input_usd_micros_per_million: i64,
+    /// Anthropic-style five-minute cache creation rate. `None` means the
+    /// pricing snapshot does not define this price class.
+    pub cache_write_5m_usd_micros_per_million: Option<i64>,
+    /// Anthropic-style one-hour cache creation rate. `None` means the pricing
+    /// snapshot does not define this price class.
+    pub cache_write_1h_usd_micros_per_million: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7325,9 +7336,9 @@ pub fn parse_pricing_table(
             return Err("invalid gateway pricing entry with empty model".into());
         }
         let rate_parts = rates.split(':').map(str::trim).collect::<Vec<_>>();
-        if rate_parts.len() < 2 || rate_parts.len() > 3 {
+        if rate_parts.len() < 2 || rate_parts.len() > 5 {
             return Err(format!(
-                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m[:cached_input_usd_per_1m]"
+                "invalid gateway pricing rates for {model:?}; expected input_usd_per_1m:output_usd_per_1m[:cached_input_usd_per_1m[:cache_write_5m_usd_per_1m[:cache_write_1h_usd_per_1m]]]"
             )
             .into());
         }
@@ -7340,12 +7351,22 @@ pub fn parse_pricing_table(
             Some(cached) => parse_usd_micros(cached)?,
             None => input_usd_micros_per_million,
         };
+        let cache_write_5m_usd_micros_per_million = rate_parts
+            .get(3)
+            .map(|rate| parse_usd_micros(rate))
+            .transpose()?;
+        let cache_write_1h_usd_micros_per_million = rate_parts
+            .get(4)
+            .map(|rate| parse_usd_micros(rate))
+            .transpose()?;
         pricing.insert(
             model.to_string(),
             ModelPricing {
                 input_usd_micros_per_million,
                 output_usd_micros_per_million,
                 cached_input_usd_micros_per_million,
+                cache_write_5m_usd_micros_per_million,
+                cache_write_1h_usd_micros_per_million,
             },
         );
     }
@@ -7389,6 +7410,47 @@ fn estimate_cost_usd_micros(
 ) -> Option<i64> {
     let (model, pricing) = lookup_model_pricing(config, context)?;
     cost_for_model(model, pricing, usage)
+}
+
+fn insert_normalized_usage_values(values: &mut HashMap<String, String>, usage: &ResponseUsage) {
+    values.insert("input_tokens".into(), usage.input_tokens.to_string());
+    values.insert("output_tokens".into(), usage.output_tokens.to_string());
+    values.insert("total_tokens".into(), usage.total_tokens.to_string());
+    let uncached_input = if usage.cache_read_included_in_input {
+        usage
+            .input_tokens
+            .saturating_sub(usage.cache_read_input_tokens)
+    } else {
+        usage.input_tokens
+    };
+    values.insert("uncached_input_tokens".into(), uncached_input.to_string());
+    if let Some(provider_total) = usage.provider_total_tokens {
+        values.insert("provider_total_tokens".into(), provider_total.to_string());
+    }
+    if usage.cache_read_reported {
+        values.insert(
+            "cache_read_input_tokens".into(),
+            usage.cache_read_input_tokens.to_string(),
+        );
+    }
+    if usage.cache_creation_reported {
+        values.insert(
+            "cache_creation_input_tokens".into(),
+            usage.cache_creation_input_tokens.to_string(),
+        );
+    }
+    if usage.cache_creation_5m_reported {
+        values.insert(
+            "cache_creation_5m_input_tokens".into(),
+            usage.cache_creation_5m_input_tokens.to_string(),
+        );
+    }
+    if usage.cache_creation_1h_reported {
+        values.insert(
+            "cache_creation_1h_input_tokens".into(),
+            usage.cache_creation_1h_input_tokens.to_string(),
+        );
+    }
 }
 
 /// Dollar savings attributable to prompt caching on this call: the cache-read
@@ -7463,15 +7525,27 @@ fn effective_pricing_snapshot_version(
     let mut entries = config.pricing.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(model, _)| *model);
     let mut hasher = Sha256::new();
-    hasher.update(b"chisei.gateway-pricing/v1\0");
+    hasher.update(b"chisei.gateway-pricing/v2\0");
     for (model, pricing) in entries {
         hasher.update(model.as_bytes());
         hasher.update([0]);
         hasher.update(pricing.input_usd_micros_per_million.to_be_bytes());
         hasher.update(pricing.output_usd_micros_per_million.to_be_bytes());
         hasher.update(pricing.cached_input_usd_micros_per_million.to_be_bytes());
+        hasher.update(
+            pricing
+                .cache_write_5m_usd_micros_per_million
+                .unwrap_or(-1)
+                .to_be_bytes(),
+        );
+        hasher.update(
+            pricing
+                .cache_write_1h_usd_micros_per_million
+                .unwrap_or(-1)
+                .to_be_bytes(),
+        );
     }
-    Some(format!("chisei.gateway-pricing/v1:{:x}", hasher.finalize()))
+    Some(format!("chisei.gateway-pricing/v2:{:x}", hasher.finalize()))
 }
 
 fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
@@ -7486,13 +7560,21 @@ fn cache_savings_for_pricing(pricing: &ModelPricing, usage: &ResponseUsage) -> O
 /// Pure cost math for a resolved model/pricing pair, split out so it can be
 /// tested without constructing a full gateway config/context.
 fn cost_for_model(model: &str, pricing: &ModelPricing, usage: &ResponseUsage) -> Option<i64> {
-    crate::cost_estimate::cost_usd_micros(
+    crate::cost_estimate::cost_usd_micros_with_cache_classes(
         model,
         pricing,
         i64::from(usage.input_tokens),
         i64::from(usage.output_tokens),
         i64::from(usage.cache_read_input_tokens),
-        i64::from(usage.cache_creation_input_tokens),
+        crate::cost_estimate::CacheCreationUsage {
+            total_tokens: i64::from(usage.cache_creation_input_tokens),
+            five_minute_tokens: usage
+                .cache_creation_5m_reported
+                .then_some(i64::from(usage.cache_creation_5m_input_tokens)),
+            one_hour_tokens: usage
+                .cache_creation_1h_reported
+                .then_some(i64::from(usage.cache_creation_1h_input_tokens)),
+        },
     )
 }
 
@@ -8502,6 +8584,12 @@ async fn record_usage_and_append(
             if let Some(profile_version) = &context.profile_version {
                 values.insert("profile_version".to_string(), profile_version.clone());
             }
+            if let Some(pricing_version) = &context.pricing_snapshot_version {
+                values.insert(
+                    "pricing_snapshot_version".to_string(),
+                    pricing_version.clone(),
+                );
+            }
             if let Some(snapshot_version) = &context.capability_snapshot_version {
                 values.insert(
                     "capability_snapshot_version".to_string(),
@@ -8567,23 +8655,7 @@ async fn record_usage_and_append(
             );
             values.insert("latency_ms".to_string(), elapsed_ms.max(0).to_string());
             if let Some(usage) = usage {
-                values.insert("input_tokens".to_string(), usage.input_tokens.to_string());
-                values.insert("output_tokens".to_string(), usage.output_tokens.to_string());
-                values.insert("total_tokens".to_string(), usage.total_tokens.to_string());
-                // Cache-token counts are recorded only when present, so
-                // non-caching calls keep the row shape unchanged.
-                if usage.cache_read_input_tokens > 0 {
-                    values.insert(
-                        "cache_read_input_tokens".to_string(),
-                        usage.cache_read_input_tokens.to_string(),
-                    );
-                }
-                if usage.cache_creation_input_tokens > 0 {
-                    values.insert(
-                        "cache_creation_input_tokens".to_string(),
-                        usage.cache_creation_input_tokens.to_string(),
-                    );
-                }
+                insert_normalized_usage_values(&mut values, &usage);
                 if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
                     values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
                     values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
@@ -8691,6 +8763,10 @@ fn gateway_recovery_llm_values(
         ("resolved_model", context.resolved_model.as_deref()),
         ("profile_version", context.profile_version.as_deref()),
         (
+            "pricing_snapshot_version",
+            context.pricing_snapshot_version.as_deref(),
+        ),
+        (
             "capability_snapshot_version",
             context.capability_snapshot_version.as_deref(),
         ),
@@ -8716,21 +8792,7 @@ fn gateway_recovery_llm_values(
         values.insert("terminal_outcome".into(), terminal.into());
     }
     if let Some(usage) = usage {
-        values.insert("input_tokens".into(), usage.input_tokens.to_string());
-        values.insert("output_tokens".into(), usage.output_tokens.to_string());
-        values.insert("total_tokens".into(), usage.total_tokens.to_string());
-        if usage.cache_read_input_tokens > 0 {
-            values.insert(
-                "cache_read_input_tokens".into(),
-                usage.cache_read_input_tokens.to_string(),
-            );
-        }
-        if usage.cache_creation_input_tokens > 0 {
-            values.insert(
-                "cache_creation_input_tokens".into(),
-                usage.cache_creation_input_tokens.to_string(),
-            );
-        }
+        insert_normalized_usage_values(&mut values, usage);
         if let Some(cost) = estimate_cost_usd_micros(config, context, usage) {
             values.insert("cost_usd_micros".into(), cost.to_string());
             values.insert("cost_usd".into(), format_usd_micros(cost));
@@ -8891,6 +8953,12 @@ async fn record_refusal_with_usage_and_append(
     if let Some(profile_version) = &context.profile_version {
         values.insert("profile_version".to_string(), profile_version.clone());
     }
+    if let Some(pricing_version) = &context.pricing_snapshot_version {
+        values.insert(
+            "pricing_snapshot_version".to_string(),
+            pricing_version.clone(),
+        );
+    }
     if let Some(snapshot_version) = &context.capability_snapshot_version {
         values.insert(
             "capability_snapshot_version".to_string(),
@@ -8909,21 +8977,7 @@ async fn record_refusal_with_usage_and_append(
     );
     values.insert("latency_ms".to_string(), elapsed_ms.max(0).to_string());
     if let Some(usage) = usage {
-        values.insert("input_tokens".to_string(), usage.input_tokens.to_string());
-        values.insert("output_tokens".to_string(), usage.output_tokens.to_string());
-        values.insert("total_tokens".to_string(), usage.total_tokens.to_string());
-        if usage.cache_read_input_tokens > 0 {
-            values.insert(
-                "cache_read_input_tokens".to_string(),
-                usage.cache_read_input_tokens.to_string(),
-            );
-        }
-        if usage.cache_creation_input_tokens > 0 {
-            values.insert(
-                "cache_creation_input_tokens".to_string(),
-                usage.cache_creation_input_tokens.to_string(),
-            );
-        }
+        insert_normalized_usage_values(&mut values, &usage);
         if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
             values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
             values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
@@ -9021,6 +9075,7 @@ fn build_gateway_operation_receipt(
     rejection: Option<ReceiptRejection<'_>>,
     terminal_outcome: Option<ReceiptTerminalOutcome<'_>>,
     cost_usd_micros: Option<i64>,
+    cache_savings_usd_micros: Option<i64>,
 ) -> OperationReceipt {
     let model_attempted = rejection
         .map(|failure| failure.model_attempted)
@@ -9222,9 +9277,39 @@ fn build_gateway_operation_receipt(
     if let Some(usage) = usage {
         model_call_attributes.insert("input_tokens".into(), usage.input_tokens.to_string());
         model_call_attributes.insert("output_tokens".into(), usage.output_tokens.to_string());
+        model_call_attributes.insert("total_tokens".into(), usage.total_tokens.to_string());
+        let mut normalized = HashMap::new();
+        insert_normalized_usage_values(&mut normalized, usage);
+        for key in [
+            "uncached_input_tokens",
+            "provider_total_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation_5m_input_tokens",
+            "cache_creation_1h_input_tokens",
+        ] {
+            if let Some(value) = normalized.remove(key) {
+                model_call_attributes.insert(key.into(), value);
+            }
+        }
+    }
+    for (key, value) in [
+        ("resolved_model", context.resolved_model.as_deref()),
+        ("profile_version", context.profile_version.as_deref()),
+        (
+            "pricing_snapshot_version",
+            context.pricing_snapshot_version.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            model_call_attributes.insert(key.into(), value.into());
+        }
     }
     if let Some(cost_usd_micros) = cost_usd_micros {
         model_call_attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
+    }
+    if let Some(savings) = cache_savings_usd_micros {
+        model_call_attributes.insert("cache_savings_usd_micros".into(), savings.to_string());
     }
     let outcome_parent = if rejection.is_some() && !model_attempted {
         "egress"
@@ -9378,6 +9463,7 @@ async fn record_gateway_operation_receipt(
         rejection,
         terminal_outcome,
         usage.and_then(|usage| estimate_cost_usd_micros(config, context, usage)),
+        usage.and_then(|usage| estimate_cache_savings_usd_micros(config, context, usage)),
     );
     let Ok(receipt_json) = serde_json::to_string(&receipt) else {
         error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
@@ -9802,10 +9888,18 @@ fn llm_call_object_properties(
         "resolved_model",
         "status",
         "input_tokens",
+        "uncached_input_tokens",
         "output_tokens",
         "total_tokens",
+        "provider_total_tokens",
         "cost_usd_micros",
         "cost_usd",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+        "cache_savings_usd_micros",
+        "pricing_snapshot_version",
     ] {
         if let Some(value) = values.get(key).filter(|value| !value.is_empty()) {
             properties.insert(key.to_string(), value.clone());
@@ -10532,6 +10626,19 @@ struct ResponseUsage {
     /// (Anthropic `cache_creation_input_tokens`). Billed at the normal (or
     /// cache-write) input rate; tracked for reporting completeness.
     cache_creation_input_tokens: i32,
+    /// Cache writes split by provider price class. Presence is tracked
+    /// separately so an explicit zero is not confused with an unsupported or
+    /// malformed field.
+    cache_creation_5m_input_tokens: i32,
+    cache_creation_1h_input_tokens: i32,
+    cache_read_reported: bool,
+    cache_read_included_in_input: bool,
+    cache_creation_reported: bool,
+    cache_creation_5m_reported: bool,
+    cache_creation_1h_reported: bool,
+    /// Provider-reported total, kept separate from the normalized total
+    /// because provider definitions differ.
+    provider_total_tokens: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -10564,30 +10671,54 @@ fn extract_response_usage(body: &[u8]) -> Option<ResponseUsage> {
         .or_else(|| usage.get("completion_tokens"))
         .and_then(|value| value.as_i64())
         .unwrap_or(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(input_tokens + output_tokens);
+    let provider_total_tokens = non_negative_token_field(usage.get("total_tokens"));
     // Anthropic reports cache tokens as siblings of `input_tokens`; OpenAI nests
     // the cache-read count under `prompt_tokens_details.cached_tokens`. Absent
     // fields stay 0, so non-caching providers and responses are unchanged.
-    let cache_read_input_tokens = usage
+    let cache_read_is_separate = usage.get("cache_read_input_tokens").is_some();
+    let cache_read = usage
         .get("cache_read_input_tokens")
         .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0);
-    let cache_creation_input_tokens = usage
+        .and_then(|value| non_negative_token_field(Some(value)));
+    let cache_creation = usage
         .get("cache_creation_input_tokens")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0);
+        .and_then(|value| non_negative_token_field(Some(value)));
+    let cache_creation_5m = usage
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(|value| non_negative_token_field(Some(value)));
+    let cache_creation_1h = usage
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(|value| non_negative_token_field(Some(value)));
+    let normalized_total = input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(cache_creation.unwrap_or(0))
+        .saturating_add(if cache_read_is_separate {
+            cache_read.unwrap_or(0)
+        } else {
+            0
+        });
 
     Some(ResponseUsage {
         input_tokens: clamp_i64_to_i32(input_tokens),
         output_tokens: clamp_i64_to_i32(output_tokens),
-        total_tokens: clamp_i64_to_i32(total_tokens),
-        cache_read_input_tokens: clamp_i64_to_i32(cache_read_input_tokens),
-        cache_creation_input_tokens: clamp_i64_to_i32(cache_creation_input_tokens),
+        total_tokens: clamp_i64_to_i32(normalized_total),
+        cache_read_input_tokens: clamp_i64_to_i32(cache_read.unwrap_or(0)),
+        cache_creation_input_tokens: clamp_i64_to_i32(cache_creation.unwrap_or(0)),
+        cache_creation_5m_input_tokens: clamp_i64_to_i32(cache_creation_5m.unwrap_or(0)),
+        cache_creation_1h_input_tokens: clamp_i64_to_i32(cache_creation_1h.unwrap_or(0)),
+        cache_read_reported: cache_read.is_some(),
+        cache_read_included_in_input: cache_read.is_some() && !cache_read_is_separate,
+        cache_creation_reported: cache_creation.is_some(),
+        cache_creation_5m_reported: cache_creation_5m.is_some(),
+        cache_creation_1h_reported: cache_creation_1h.is_some(),
+        provider_total_tokens: provider_total_tokens.map(clamp_i64_to_i32),
     })
+}
+
+fn non_negative_token_field(value: Option<&serde_json::Value>) -> Option<i64> {
+    value
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value >= 0)
 }
 
 fn extract_response_observation(body: &[u8]) -> Option<ResponseObservation> {
@@ -10666,28 +10797,59 @@ fn merge_usage(existing: Option<ResponseUsage>, next: ResponseUsage) -> Response
     } else {
         existing.output_tokens
     };
-    let total_tokens =
-        if next.total_tokens > 0 && next.total_tokens != next.input_tokens + next.output_tokens {
-            next.total_tokens
-        } else {
-            input_tokens.saturating_add(output_tokens)
-        };
-    let cache_read_input_tokens = if next.cache_read_input_tokens > 0 {
+    let cache_read_input_tokens = if next.cache_read_reported {
         next.cache_read_input_tokens
     } else {
         existing.cache_read_input_tokens
     };
-    let cache_creation_input_tokens = if next.cache_creation_input_tokens > 0 {
+    let cache_creation_input_tokens = if next.cache_creation_reported {
         next.cache_creation_input_tokens
     } else {
         existing.cache_creation_input_tokens
     };
+    let cache_creation_5m_input_tokens = if next.cache_creation_5m_reported {
+        next.cache_creation_5m_input_tokens
+    } else {
+        existing.cache_creation_5m_input_tokens
+    };
+    let cache_creation_1h_input_tokens = if next.cache_creation_1h_reported {
+        next.cache_creation_1h_input_tokens
+    } else {
+        existing.cache_creation_1h_input_tokens
+    };
     ResponseUsage {
         input_tokens,
         output_tokens,
-        total_tokens,
+        total_tokens: input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(
+                if next.cache_read_included_in_input
+                    || (!next.cache_read_reported && existing.cache_read_included_in_input)
+                {
+                    0
+                } else {
+                    cache_read_input_tokens
+                },
+            )
+            .saturating_add(cache_creation_input_tokens),
         cache_read_input_tokens,
         cache_creation_input_tokens,
+        cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens,
+        cache_read_reported: next.cache_read_reported || existing.cache_read_reported,
+        cache_read_included_in_input: if next.cache_read_reported {
+            next.cache_read_included_in_input
+        } else {
+            existing.cache_read_included_in_input
+        },
+        cache_creation_reported: next.cache_creation_reported || existing.cache_creation_reported,
+        cache_creation_5m_reported: next.cache_creation_5m_reported
+            || existing.cache_creation_5m_reported,
+        cache_creation_1h_reported: next.cache_creation_1h_reported
+            || existing.cache_creation_1h_reported,
+        provider_total_tokens: next
+            .provider_total_tokens
+            .or(existing.provider_total_tokens),
     }
 }
 
@@ -12582,6 +12744,7 @@ mod tests {
                 total_tokens: 9,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                ..Default::default()
             }),
         );
         let mut decoder = crate::harness::SseDecoder::default();
@@ -13133,13 +13296,22 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 15,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 100,
+                cache_creation_input_tokens: 30,
+                cache_creation_5m_input_tokens: 20,
+                cache_creation_1h_input_tokens: 10,
+                cache_read_reported: true,
+                cache_creation_reported: true,
+                cache_creation_5m_reported: true,
+                cache_creation_1h_reported: true,
+                provider_total_tokens: Some(145),
+                ..Default::default()
             }),
             Some(&observation),
             None,
             None,
             Some(45),
+            Some(27),
         );
 
         assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
@@ -13168,6 +13340,26 @@ mod tests {
             .find(|event| event.kind == ReceiptEventKind::ModelCalled)
             .unwrap();
         assert_eq!(priced_call.attributes["cost_usd_micros"], "45");
+        assert_eq!(priced_call.attributes["cache_read_input_tokens"], "100");
+        assert_eq!(
+            priced_call.attributes["cache_creation_5m_input_tokens"],
+            "20"
+        );
+        assert_eq!(
+            priced_call.attributes["cache_creation_1h_input_tokens"],
+            "10"
+        );
+        assert_eq!(priced_call.attributes["provider_total_tokens"], "145");
+        assert_eq!(priced_call.attributes["resolved_model"], "openai/gpt-5.5");
+        assert_eq!(
+            priced_call.attributes["profile_version"],
+            "openai.builtin/v3"
+        );
+        assert_eq!(
+            priced_call.attributes["pricing_snapshot_version"],
+            "openai.unpriced/v1"
+        );
+        assert_eq!(priced_call.attributes["cache_savings_usd_micros"], "27");
         let incomplete_receipt = build_gateway_operation_receipt(
             &identity,
             &context,
@@ -13176,6 +13368,7 @@ mod tests {
             Some(&observation),
             None,
             Some(ReceiptTerminalOutcome::Incomplete("max_output_tokens")),
+            None,
             None,
         );
         let outcome = incomplete_receipt
@@ -13210,6 +13403,7 @@ mod tests {
                 rejection: &circuit_rejection,
                 model_attempted: false,
             }),
+            None,
             None,
             None,
         );
@@ -13446,6 +13640,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         );
         assert_eq!(
             receipt.parent_operation_id.as_deref(),
@@ -13477,6 +13672,7 @@ mod tests {
                 rejection: &budget_rejection,
                 model_attempted: false,
             }),
+            None,
             None,
             None,
         );
@@ -14090,6 +14286,18 @@ mod tests {
             ("request_id".into(), "recovered-request".into()),
             ("timestamp_ms".into(), "1".into()),
             ("status".into(), "200".into()),
+            (
+                "resolved_model".into(),
+                "anthropic/claude-sonnet-4-6".into(),
+            ),
+            ("profile_version".into(), "anthropic.builtin/v3".into()),
+            (
+                "pricing_snapshot_version".into(),
+                "anthropic.cache/v1".into(),
+            ),
+            ("cache_creation_5m_input_tokens".into(), "20".into()),
+            ("cache_creation_1h_input_tokens".into(), "10".into()),
+            ("cache_savings_usd_micros".into(), "270".into()),
         ]);
         assert!(
             append_gateway_recovery(
@@ -14119,6 +14327,34 @@ mod tests {
                 .filter(|row| row.get("request_id") == Some(&"recovered-request".into()))
                 .count(),
             1
+        );
+        let recovered = rows
+            .iter()
+            .find(|row| row.get("request_id") == Some(&"recovered-request".into()))
+            .unwrap();
+        assert_eq!(
+            recovered
+                .get("pricing_snapshot_version")
+                .map(String::as_str),
+            Some("anthropic.cache/v1")
+        );
+        assert_eq!(
+            recovered
+                .get("cache_creation_5m_input_tokens")
+                .map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            recovered
+                .get("cache_creation_1h_input_tokens")
+                .map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            recovered
+                .get("cache_savings_usd_micros")
+                .map(String::as_str),
+            Some("270")
         );
         assert!(!recovery_path.exists());
         let _ = std::fs::remove_dir_all(directory);
@@ -15139,6 +15375,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::any;
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use tonic::transport::Server;
 
@@ -15164,6 +15401,7 @@ mod tests {
                 output_usd_micros_per_million: 10_000_000,
                 // 2-field entry defaults the cached rate to the input rate.
                 cached_input_usd_micros_per_million: 1_250_000,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -15172,6 +15410,7 @@ mod tests {
                 input_usd_micros_per_million: 3_000_000,
                 output_usd_micros_per_million: 15_000_001,
                 cached_input_usd_micros_per_million: 3_000_000,
+                ..Default::default()
             })
         );
         assert!(parse_pricing_table("gpt-5.5=1").is_err());
@@ -15186,10 +15425,25 @@ mod tests {
                 input_usd_micros_per_million: 3_000_000,
                 output_usd_micros_per_million: 15_000_000,
                 cached_input_usd_micros_per_million: 300_000,
+                ..Default::default()
             })
         );
         // Too many rate fields is rejected.
-        assert!(parse_pricing_table("gpt-5.5=1:2:3:4").is_err());
+        assert!(parse_pricing_table("gpt-5.5=1:2:3:4:5:6").is_err());
+    }
+
+    #[test]
+    fn parses_gateway_pricing_table_with_cache_write_classes() {
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3:3.75:6").unwrap();
+        let pricing = pricing.get("claude-sonnet-4-6").unwrap();
+        assert_eq!(
+            pricing.cache_write_5m_usd_micros_per_million,
+            Some(3_750_000)
+        );
+        assert_eq!(
+            pricing.cache_write_1h_usd_micros_per_million,
+            Some(6_000_000)
+        );
     }
 
     #[test]
@@ -15207,7 +15461,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(version.starts_with("chisei.gateway-pricing/v1:"));
+        assert!(version.starts_with("chisei.gateway-pricing/v2:"));
         assert_ne!(version, profile.pricing.version);
         assert_eq!(
             effective_pricing_snapshot_version(
@@ -15254,6 +15508,7 @@ mod tests {
             total_tokens: 0,
             cache_read_input_tokens: 1_000_000,
             cache_creation_input_tokens: 0,
+            ..Default::default()
         };
         let fresh_cost = cost_for_model("claude-sonnet-4-6", pricing, &fresh).unwrap();
         let cached_cost = cost_for_model("claude-sonnet-4-6", pricing, &cached).unwrap();
@@ -15274,6 +15529,9 @@ mod tests {
             total_tokens: 1_000_000,
             cache_read_input_tokens: 800_000,
             cache_creation_input_tokens: 0,
+            cache_read_reported: true,
+            cache_read_included_in_input: true,
+            ..Default::default()
         };
         // 200k uncached * 1 + 800k cached * 0.1 = 200000 + 80000 micros.
         let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
@@ -15293,6 +15551,79 @@ mod tests {
         };
         let cost = cost_for_model("gpt-5.5", pricing, &usage).unwrap();
         assert_eq!(cost, 1_250_000 + 5_000_000);
+    }
+
+    #[test]
+    fn cache_write_classes_include_premiums_and_break_even() {
+        let pricing = parse_pricing_table("claude-sonnet-4-6=3:15:0.3:3.75:6").unwrap();
+        let pricing = pricing.get("claude-sonnet-4-6").unwrap();
+        let five_minute_write = ResponseUsage {
+            cache_creation_input_tokens: 1_000_000,
+            cache_creation_5m_input_tokens: 1_000_000,
+            cache_creation_reported: true,
+            cache_creation_5m_reported: true,
+            ..Default::default()
+        };
+        let one_hour_write = ResponseUsage {
+            cache_creation_input_tokens: 1_000_000,
+            cache_creation_1h_input_tokens: 1_000_000,
+            cache_creation_reported: true,
+            cache_creation_1h_reported: true,
+            ..Default::default()
+        };
+        let hit = ResponseUsage {
+            cache_read_input_tokens: 1_000_000,
+            cache_read_reported: true,
+            ..Default::default()
+        };
+        let five_minute_cost = cost_for_model("claude-sonnet-4-6", pricing, &five_minute_write);
+        let one_hour_cost = cost_for_model("claude-sonnet-4-6", pricing, &one_hour_write);
+        let hit_cost = cost_for_model("claude-sonnet-4-6", pricing, &hit);
+        assert_eq!(five_minute_cost, Some(3_750_000));
+        assert_eq!(one_hour_cost, Some(6_000_000));
+        assert_eq!(hit_cost, Some(300_000));
+        // 5m breaks even after one hit; 1h requires two hits.
+        let ordinary = pricing.input_usd_micros_per_million;
+        let hit = hit_cost.unwrap();
+        assert!(five_minute_cost.unwrap() + hit < 2 * ordinary);
+        assert!(one_hour_cost.unwrap() + hit > 2 * ordinary);
+        assert!(one_hour_cost.unwrap() + 2 * hit < 3 * ordinary);
+        // An aggregate-only write cannot be assigned a premium price class.
+        let aggregate_only = ResponseUsage {
+            cache_creation_input_tokens: 1_000_000,
+            cache_creation_reported: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            cost_for_model("claude-sonnet-4-6", pricing, &aggregate_only),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_cache_baseline_covers_required_scenarios() {
+        let baseline: serde_json::Value =
+            serde_json::from_str(include_str!("../benchmarks/prompt-cache-baseline-v1.json"))
+                .unwrap();
+        assert_eq!(baseline["version"], "prompt-cache-baseline/v1");
+        let names = baseline["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|scenario| scenario["name"].as_str())
+            .collect::<HashSet<_>>();
+        for required in [
+            "uncached",
+            "cold_5m",
+            "warm_5m",
+            "expired_5m",
+            "invalidated",
+            "cold_1h",
+        ] {
+            assert!(names.contains(required), "missing {required} baseline");
+        }
+        assert_eq!(baseline["break_even_hits"]["5m"], 1);
+        assert_eq!(baseline["break_even_hits"]["1h"], 2);
     }
 
     #[derive(Clone)]
@@ -16983,6 +17314,7 @@ mod tests {
                 input_usd_micros_per_million: 3_000_000,
                 output_usd_micros_per_million: 15_000_000,
                 cached_input_usd_micros_per_million: 300_000,
+                ..Default::default()
             },
         )]);
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -17503,7 +17835,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_messages_streaming_merges_usage_events() {
         let sse = "event: message_start\n\
-                   data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n\
+                   data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":30,\"cache_creation\":{\"ephemeral_5m_input_tokens\":20,\"ephemeral_1h_input_tokens\":10},\"output_tokens\":1}}}\n\n\
                    event: content_block_delta\n\
                    data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n\
                    event: message_delta\n\
@@ -17555,7 +17887,23 @@ mod tests {
         );
         assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("10"));
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("7"));
-        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("17"));
+        assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("147"));
+        assert_eq!(
+            rows[0].get("cache_read_input_tokens").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            rows[0]
+                .get("cache_creation_5m_input_tokens")
+                .map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            rows[0]
+                .get("cache_creation_1h_input_tokens")
+                .map(String::as_str),
+            Some("10")
+        );
     }
 
     #[tokio::test]
@@ -19232,6 +19580,7 @@ mod tests {
                 input_usd_micros_per_million: 1_000_000,
                 output_usd_micros_per_million: 2_000_000,
                 cached_input_usd_micros_per_million: 1_000_000,
+                ..Default::default()
             },
         )]);
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -19403,6 +19752,7 @@ mod tests {
                 input_usd_micros_per_million: 1_000_000,
                 output_usd_micros_per_million: 2_000_000,
                 cached_input_usd_micros_per_million: 100_000,
+                ..Default::default()
             },
         )]);
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
@@ -19772,6 +20122,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 input_tokens: 45,
                 output_tokens: 5,
                 total_tokens: 50,
+                provider_total_tokens: Some(50),
                 ..Default::default()
             })
         );
@@ -19806,6 +20157,33 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cache_read_input_tokens, 120);
         assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.total_tokens, 167);
+        assert_eq!(usage.provider_total_tokens, None);
+    }
+
+    #[test]
+    fn extract_response_usage_preserves_anthropic_cache_write_classes() {
+        let body = br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10},"output_tokens":5,"total_tokens":145}}"#;
+        let usage = extract_response_usage(body).expect("usage");
+        assert_eq!(usage.total_tokens, 145);
+        assert_eq!(usage.provider_total_tokens, Some(145));
+        assert_eq!(usage.cache_creation_5m_input_tokens, 20);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 10);
+        assert!(usage.cache_creation_5m_reported);
+        assert!(usage.cache_creation_1h_reported);
+    }
+
+    #[test]
+    fn malformed_or_absent_cache_fields_remain_unknown() {
+        let malformed = br#"{"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":"many","cache_creation":{"ephemeral_5m_input_tokens":-1}}}"#;
+        let usage = extract_response_usage(malformed).expect("usage");
+        assert!(!usage.cache_read_reported);
+        assert!(!usage.cache_creation_reported);
+        assert!(!usage.cache_creation_5m_reported);
+        let mut values = HashMap::new();
+        insert_normalized_usage_values(&mut values, &usage);
+        assert!(!values.contains_key("cache_read_input_tokens"));
+        assert!(!values.contains_key("cache_creation_5m_input_tokens"));
     }
 
     #[test]
@@ -19815,6 +20193,8 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         assert_eq!(usage.input_tokens, 200);
         assert_eq!(usage.output_tokens, 40);
         assert_eq!(usage.cache_read_input_tokens, 150);
+        assert_eq!(usage.total_tokens, 240);
+        assert!(usage.cache_read_included_in_input);
         assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 
@@ -19844,6 +20224,21 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
     }
 
     #[test]
+    fn streaming_and_non_streaming_cache_accounting_are_equivalent() {
+        let body = br#"{"usage":{"input_tokens":10,"cache_read_input_tokens":120,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10},"output_tokens":25,"total_tokens":185}}"#;
+        let buffered = extract_response_usage(body).unwrap();
+        let mut tap = SseUsageTap::new();
+        tap.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":120,\"cache_creation_input_tokens\":30,\"cache_creation\":{\"ephemeral_5m_input_tokens\":20,\"ephemeral_1h_input_tokens\":10},\"output_tokens\":0}}}\n\n",
+        );
+        tap.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":25,\"total_tokens\":185}}\n\n",
+        );
+        let streamed = tap.finish().0.unwrap();
+        assert_eq!(streamed, buffered);
+    }
+
+    #[test]
     fn merge_usage_carries_cache_tokens_from_earlier_event() {
         let start = ResponseUsage {
             input_tokens: 10,
@@ -19851,6 +20246,9 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             total_tokens: 11,
             cache_read_input_tokens: 120,
             cache_creation_input_tokens: 30,
+            cache_read_reported: true,
+            cache_creation_reported: true,
+            ..Default::default()
         };
         let delta = ResponseUsage {
             output_tokens: 25,
