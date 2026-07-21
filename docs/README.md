@@ -22,6 +22,8 @@ in order.
 - [`proto/`](../proto/) — inspect the native gRPC APIs.
 - [Ontology definitions](ontology.md) — model semantic classes and relations,
   project schemas, and understand current validation boundaries.
+- [Standalone ontology](../crates/sekai-ontology/README.md) — use an ontology
+  library and SQLite command-line tool in a separate application.
 - [External evidence adapters](../adapters/README.md) — submit evidence through
   the versioned adapter contract.
 
