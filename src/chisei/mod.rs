@@ -6,6 +6,7 @@ pub mod egress;
 pub mod eval;
 pub mod evolve;
 pub mod external_action;
+pub mod external_permit;
 pub mod federation;
 pub mod gate;
 pub mod gunshi;

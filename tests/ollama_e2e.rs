@@ -78,6 +78,9 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         tls_key: None,
         allow_plaintext: false,
         insecure: false,
+        permit_signing_key: None,
+        permit_issuer: "chisei.local".into(),
+        permit_key_id: "permit-key-1".into(),
     };
     let model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
@@ -191,6 +194,9 @@ async fn delegation_chain_keeps_private_context_local() {
         tls_key: None,
         allow_plaintext: false,
         insecure: false,
+        permit_signing_key: None,
+        permit_issuer: "chisei.local".into(),
+        permit_key_id: "permit-key-1".into(),
     };
     let local_model = e2e_model();
     let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
