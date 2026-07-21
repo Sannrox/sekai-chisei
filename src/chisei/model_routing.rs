@@ -363,7 +363,7 @@ fn provider_is_available(provider: &str, config: &Config) -> bool {
         "ollama" => true,
         "native" => config.native_llm_url.is_some(),
         "xai" => std::env::var_os("XAI_API_KEY").is_some(),
-        "meta" => std::env::var_os("META_MODEL_API_KEY").is_some(),
+        "meta" => crate::chisei::model_availability::meta_provider_is_configured(),
         _ => false,
     }
 }
