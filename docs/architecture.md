@@ -77,6 +77,14 @@ bounded retrieval surfaces, and governed actions before invocation. Catalog
 visibility is filtered for the authenticated authorization context and never
 acts as an authorization token; invocation always rechecks live controls.
 
+`RetrieveContext` is asserted-only by default. Callers may opt into the fixed
+query-time entailment profile for class inheritance/equivalence and explicitly
+transitive ontology relations. Entailment uses an authorization-filtered,
+content-revisioned ontology snapshot and returns asserted/derived explanation
+steps with source fact references. Independent source-row, derived-row,
+derivation-step, elapsed-time, and explanation-byte bounds return non-sensitive
+truncation reasons; no derived facts are persisted.
+
 ## Core vocabulary
 
 The public contract is namespace-first and domain-neutral:
