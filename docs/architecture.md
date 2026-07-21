@@ -149,6 +149,18 @@ links, and evidence observations are rebuildable projections. Conflicting
 submissions remain separately attributable instead of being collapsed into a
 single asserted truth.
 
+`GetEvidenceSubmissionContent` is the governed, single-record read path for an
+admitted envelope. It resolves the submission's projected `external_evidence`
+object and rechecks that object's live ACL before returning the immutable
+content and provenance. Missing and unauthorized submissions are deliberately
+indistinguishable to callers, retained content is verified against its
+canonical digest before disclosure, and metadata listing never includes
+payloads. Available, superseded, stale, and retracted records remain readable
+as retained source evidence; rejected, quarantined, and incomplete admission
+states fail closed. Evidence classification is enforced through the projected
+object ACL in the current contract; there is no separate caller-clearance
+model.
+
 ### Identity, content, and reconciliation
 
 Retry identity is scoped to an operation and idempotency key and is bound to a
