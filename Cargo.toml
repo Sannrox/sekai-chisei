@@ -34,7 +34,7 @@ axum = "0.8"
 async-stream = "0.3"
 
 # Database
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.35"
 postgres = "0.19"
