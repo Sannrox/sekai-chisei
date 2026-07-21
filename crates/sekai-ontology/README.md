@@ -11,6 +11,7 @@ sekai --db knowledge.db import ontology.json
 sekai --db knowledge.db export
 sekai --db knowledge.db validate
 sekai --db knowledge.db --json explain Api
+sekai --db knowledge.db --json query Api --direction outbound --depth 2
 ```
 
 Set `SEKAI_DB` instead of passing `--db`. The default is `knowledge.db`.
@@ -44,9 +45,26 @@ deterministically, so the output is suitable for review and round trips without
 depending on the private SQLite table layout. Use `export --json` to wrap that
 document in the stable command envelope used by other read commands.
 
+## Bounded traversal
+
+`query <name>` traverses relation definitions from a starting class. Direction
+is `outbound`, `inbound`, or `both` (the default); `--relation <name>` limits
+traversal to one relation name. Depth defaults to 1, depth 0 returns empty
+reached-class and relation lists, and depths through 32 are supported. A class
+is expanded at most once, so cycles terminate. Reached classes and traversed
+relations are deduplicated and ordered by name.
+
+```bash
+sekai --db knowledge.db --json query Api --direction both --relation depends_on --depth 3
+```
+
+The JSON envelope's `data` contains `start`, the effective `options`, `classes`,
+and `relations`. A missing start exits 3; a valid start with no matching edge
+succeeds with empty lists. Invalid directions and depths above 32 exit 2.
+
 ## Process contract
 
-`export --json`, `explain --json`, and `validate --json` return an envelope with
+`export --json`, `explain --json`, `query --json`, and `validate --json` return an envelope with
 `schema_version`, `command`, and `data`. Structured results are written to
 stdout and diagnostics to stderr.
 
