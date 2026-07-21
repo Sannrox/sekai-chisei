@@ -77,3 +77,7 @@ Responses SSE stream from standard input and emits the assembled terminal result
 ```sh
 cargo run --example batch_responses_harness < response.sse
 ```
+
+Host executors reporting redeemed external actions use the same SDK and outbox.
+See [external-action execution evidence](../docs/external-action-execution.md)
+for the lifecycle schema, permit verification, and reconciliation contract.

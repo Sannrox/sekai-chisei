@@ -4485,6 +4485,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     executor: redemption.executor,
                     redeemed_at_ms: redemption.redeemed_at_ms,
                     invocation_ordinal: redemption.invocation_ordinal,
+                    evidence_due_at_ms: redemption.evidence_due_at_ms,
                 }),
             }));
         }
@@ -4519,6 +4520,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 executor: redemption.executor,
                 redeemed_at_ms: redemption.redeemed_at_ms,
                 invocation_ordinal: redemption.invocation_ordinal,
+                evidence_due_at_ms: redemption.evidence_due_at_ms,
             }),
         }))
     }
