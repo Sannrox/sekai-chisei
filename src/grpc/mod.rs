@@ -501,7 +501,7 @@ fn build_services(
         ),
     );
     let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        db,
+        db.clone(),
         config.clone(),
         budget,
     ));
@@ -520,8 +520,32 @@ fn build_services(
                 .run_loop(),
         );
     }
+    spawn_execution_evidence_reconciler(db);
 
     (sekai_svc, chisei_svc)
+}
+
+fn spawn_execution_evidence_reconciler(db: Arc<SekaiDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db.reconcile_missing_execution_evidence(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "execution evidence reconciliation failed")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "execution evidence reconciliation task failed")
+                }
+            }
+        }
+    });
 }
 
 fn spawn_health_reporter(

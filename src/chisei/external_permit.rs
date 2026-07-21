@@ -77,6 +77,8 @@ pub struct Redemption {
     pub idempotency_key: String,
     pub redeemed_at_ms: i64,
     pub invocation_ordinal: u32,
+    #[serde(default)]
+    pub evidence_due_at_ms: i64,
 }
 
 pub struct Issuance<'a> {
@@ -256,8 +258,9 @@ pub fn issue(
 }
 
 impl SekaiDb {
-    fn ensure_external_permit_tables(&self) -> Result<(), String> {
-        self.conn().execute_batch(
+    pub(crate) fn ensure_external_permit_tables(&self) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisei_external_action_permits (
                 permit_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL UNIQUE,
                 issuance_idempotency_key TEXT NOT NULL, permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
@@ -265,7 +268,8 @@ impl SekaiDb {
              CREATE TABLE IF NOT EXISTS chisei_external_action_redemptions (
                 permit_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, execution_id TEXT NOT NULL,
                 redemption_json TEXT NOT NULL, redeemed_at_ms INTEGER NOT NULL,
-                invocation_ordinal INTEGER NOT NULL,
+                invocation_ordinal INTEGER NOT NULL, redemption_id TEXT,
+                evidence_due_at_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(permit_id,idempotency_key), UNIQUE(permit_id,execution_id),
                 UNIQUE(permit_id,invocation_ordinal)
              );
@@ -276,7 +280,59 @@ impl SekaiDb {
                 scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL, reason TEXT NOT NULL,
                 enabled_at_ms INTEGER NOT NULL, PRIMARY KEY(scope_kind,scope_value)
              );"
-        ).map(|_| ()).map_err(|error| error.to_string())
+        ).map_err(|error| error.to_string())?;
+        for (column, definition) in [
+            ("redemption_id", "TEXT"),
+            ("evidence_due_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let exists = {
+                let mut statement = conn
+                    .prepare("PRAGMA table_info(chisei_external_action_redemptions)")
+                    .map_err(|error| error.to_string())?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|name| name == column)
+            };
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE chisei_external_action_redemptions ADD COLUMN {column} {definition}"
+                )).map_err(|error| error.to_string())?;
+            }
+        }
+        conn.execute_batch(
+            "UPDATE chisei_external_action_redemptions
+             SET redemption_id=COALESCE(
+                     redemption_id,
+                     json_extract(redemption_json,'$.redemption_id')
+                 ),
+                 evidence_due_at_ms=CASE
+                     WHEN evidence_due_at_ms=0 THEN COALESCE(
+                         json_extract(redemption_json,'$.evidence_due_at_ms'),
+                         (SELECT json_extract(p.permit_json,'$.expires_at_ms')
+                          FROM chisei_external_action_permits p
+                          WHERE p.permit_id=chisei_external_action_redemptions.permit_id),
+                         0
+                     )
+                     ELSE evidence_due_at_ms
+                 END
+             WHERE redemption_id IS NULL OR evidence_due_at_ms=0;
+             UPDATE chisei_external_action_redemptions
+             SET redemption_json=json_set(
+                 redemption_json,
+                 '$.evidence_due_at_ms',
+                 evidence_due_at_ms
+             )
+             WHERE COALESCE(json_extract(redemption_json,'$.evidence_due_at_ms'),0)
+                   != evidence_due_at_ms;
+             CREATE INDEX IF NOT EXISTS idx_external_action_redemptions_evidence_due
+             ON chisei_external_action_redemptions(evidence_due_at_ms,redemption_id);",
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     pub fn put_permit(
@@ -473,9 +529,10 @@ impl SekaiDb {
             idempotency_key: idempotency_key.into(),
             redeemed_at_ms: now_ms,
             invocation_ordinal: count + 1,
+            evidence_due_at_ms: permit.expires_at_ms,
         };
         let json = serde_json::to_string(&redemption).map_err(|error| error.to_string())?;
-        tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,now_ms,redemption.invocation_ordinal]).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,now_ms,redemption.invocation_ordinal,redemption.redemption_id,redemption.evidence_due_at_ms]).map_err(|error| error.to_string())?;
         crate::sekai::ledger::insert_chained_decision(
             &tx,
             &crate::sekai::audit::Decision {

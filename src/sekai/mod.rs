@@ -14,6 +14,7 @@ pub mod escalation;
 pub mod evidence;
 pub mod evidence_projection;
 pub mod evidence_store;
+pub mod execution_evidence;
 pub mod function;
 pub mod learning;
 pub mod ledger;

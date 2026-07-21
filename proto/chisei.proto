@@ -947,6 +947,7 @@ message ExternalActionRedemption {
   string executor = 4;
   int64 redeemed_at_ms = 5;
   uint32 invocation_ordinal = 6;
+  int64 evidence_due_at_ms = 7; // terminal host evidence deadline from the signed permit window
 }
 
 message ExternalActionEvidence {
@@ -957,6 +958,22 @@ message ExternalActionEvidence {
   string evidence_submission_id = 5;
   string observed_outcome_digest = 6;
   string observer = 7;
+  string execution_id = 8;
+  string lifecycle_state = 9; // accepted | started | completed | failed | cancelled | outcome_unknown
+  int64 observed_at_ms = 10;
+  optional int64 started_at_ms = 11;
+  optional int64 finished_at_ms = 12;
+  map<string, string> enforced_preconditions = 13;
+  repeated string normalized_effects = 14;
+  repeated string affected_resource_references = 15;
+  uint64 cost_micros = 16;
+  map<string, uint64> resource_use = 17;
+  repeated string artifact_hashes = 18;
+  string exit_classification = 19;
+  string error_classification = 20;
+  repeated string compensation_evidence_hashes = 21;
+  string host_schema_version = 22;
+  string host_software_version = 23;
 }
 
 message ExternalActionDecision {
@@ -972,7 +989,7 @@ message ExternalActionDecision {
   int64 expires_at_ms = 10;
   int64 cancelled_at_ms = 11;
   ExternalActionAssuranceDeclaration assurance = 12;
-  ExternalActionPermit permit = 13; // absent until permit issuance is implemented
+  ExternalActionPermit permit = 13;
 }
 
 message AuthorizeExternalActionRequest { ExternalActionRequest request = 1; }

@@ -488,10 +488,29 @@ impl SekaiServiceImpl {
         producer: &str,
         now_ms: i64,
     ) -> Result<EvidenceSubmissionResult, Status> {
-        let admission = self
+        let mut admission = self
             .db
             .submit_evidence(envelope, producer, now_ms)
             .map_err(|_| Status::internal("evidence admission failed"))?;
+        if admission.accepted
+            && admission.submission.evidence_type
+                == crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE
+        {
+            if let Err(error) = self
+                .db
+                .validate_execution_evidence_envelope(envelope, producer)
+            {
+                admission = self
+                    .db
+                    .reject_evidence_submission(
+                        &admission.submission.id,
+                        now_ms,
+                        "invalid_execution_evidence",
+                        &error,
+                    )
+                    .map_err(|_| Status::internal("evidence rejection failed"))?;
+            }
+        }
         let projection = if admission.accepted {
             Some(
                 self.db
@@ -508,6 +527,14 @@ impl SekaiServiceImpl {
             for grant in self.db.list_grants(object_id).map_err(Status::internal)? {
                 self.security.add_grant(&grant);
             }
+        }
+        if admission.accepted
+            && admission.submission.evidence_type
+                == crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE
+        {
+            self.db
+                .record_execution_evidence(&admission.submission.id)
+                .map_err(Status::failed_precondition)?;
         }
         evidence_submission_result(&self.db, admission, projection)
     }
