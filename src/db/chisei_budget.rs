@@ -180,11 +180,62 @@ impl SekaiDb {
         amount: i64,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.budget_check_and_reserve_chain_inner(scope_id, metric, amount, now_ms, None)
+    }
+
+    pub(crate) fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String> {
+        self.budget_check_and_reserve_chain_inner(
+            scope_id,
+            metric,
+            amount,
+            now_ms,
+            Some(idempotency_key),
+        )
+    }
+
+    fn budget_check_and_reserve_chain_inner(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+    ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
         let mut conn = self.conn();
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if let Some(idempotency_key) = idempotency_key {
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO chisei_budget_usage_events
+                 (idempotency_key, scope_id, metric, amount, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![idempotency_key, scope_id, metric, amount, now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 0 {
+                let stored = transaction.query_row(
+                    "SELECT scope_id,metric,amount FROM chisei_budget_usage_events WHERE idempotency_key=?1",
+                    params![idempotency_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+                ).map_err(|error| error.to_string())?;
+                if stored != (scope_id.to_string(), metric.to_string(), amount) {
+                    return Err(
+                        "idempotency key was already used for different budget reservation".into(),
+                    );
+                }
+                return transaction.commit().map_err(|error| error.to_string());
+            }
+        }
         for scope in &chain {
             let limit: Option<(i64, String)> = transaction
                 .query_row(
