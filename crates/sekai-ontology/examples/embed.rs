@@ -12,6 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut ontology = SqliteOntology::initialize(path)?;
     ontology.import_json(&std::fs::read_to_string(definitions)?)?;
+    let exported = ontology.export()?;
+    println!("{}", serde_json::to_string_pretty(&exported)?);
     let explanation = ontology.explain("Api")?;
     println!("{}", serde_json::to_string_pretty(&explanation)?);
     Ok(())

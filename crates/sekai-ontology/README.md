@@ -8,6 +8,7 @@ runs one command and exits; the library offers the same operations in process.
 ```bash
 sekai --db knowledge.db init
 sekai --db knowledge.db import ontology.json
+sekai --db knowledge.db export
 sekai --db knowledge.db validate
 sekai --db knowledge.db --json explain Api
 ```
@@ -37,9 +38,15 @@ to classes present in either the file or the existing database. Unknown
 fields, unsupported schema versions, invalid references, inheritance cycles,
 invalid cardinalities, and invalid provenance are rejected.
 
+`export` writes the complete logical ontology as the same versioned document
+accepted by `import`. Classes, relations, and provenance records are ordered
+deterministically, so the output is suitable for review and round trips without
+depending on the private SQLite table layout. Use `export --json` to wrap that
+document in the stable command envelope used by other read commands.
+
 ## Process contract
 
-`explain --json` and `validate --json` return an envelope with
+`export --json`, `explain --json`, and `validate --json` return an envelope with
 `schema_version`, `command`, and `data`. Structured results are written to
 stdout and diagnostics to stderr.
 
