@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const MAX_QUERY_DEPTH: u32 = 32;
 pub const EMBEDDED_SKILL: &str = include_str!("../assets/SKILL.md");
 
 #[derive(Debug)]
@@ -129,11 +130,49 @@ pub struct ExplainResult {
     pub provenance: Vec<Provenance>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraversalDirection {
+    Outbound,
+    Inbound,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryOptions {
+    pub direction: TraversalDirection,
+    pub relation: Option<String>,
+    pub depth: u32,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            direction: TraversalDirection::Both,
+            relation: None,
+            depth: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueryResult {
+    pub start: String,
+    pub options: QueryOptions,
+    pub classes: Vec<Class>,
+    pub relations: Vec<Relation>,
+}
+
 pub trait Ontology {
     fn class(&self, name: &str) -> Result<Option<Class>, Error>;
     fn relations(&self, name: &str) -> Result<Vec<Relation>, Error>;
     fn validate(&self) -> Result<Vec<ValidationIssue>, Error>;
     fn explain(&self, name: &str) -> Result<ExplainResult, Error>;
+    fn query(&self, _start: &str, _options: QueryOptions) -> Result<QueryResult, Error> {
+        Err(Error::Input(
+            "bounded traversal is not supported by this ontology implementation".into(),
+        ))
+    }
 }
 
 pub struct SqliteOntology {
@@ -367,6 +406,78 @@ impl Ontology for SqliteOntology {
             outbound_relations,
             inbound_relations,
             provenance,
+        })
+    }
+
+    fn query(&self, start: &str, options: QueryOptions) -> Result<QueryResult, Error> {
+        self.check_schema_version()?;
+        if options.depth > MAX_QUERY_DEPTH {
+            return Err(Error::Input(format!(
+                "query depth {} exceeds maximum {MAX_QUERY_DEPTH}",
+                options.depth
+            )));
+        }
+        let (classes, relations, _) = load_all(&self.connection)?;
+        if !classes.contains_key(start) {
+            return Err(Error::NotFound(format!("class '{start}' was not found")));
+        }
+
+        let mut visited = BTreeSet::from([start.to_string()]);
+        let mut frontier = BTreeSet::from([start.to_string()]);
+        let mut reached = BTreeSet::new();
+        let mut traversed = BTreeSet::new();
+        for _ in 0..options.depth {
+            let mut next = BTreeSet::new();
+            for class_name in &frontier {
+                for relation in relations.values() {
+                    if options
+                        .relation
+                        .as_ref()
+                        .is_some_and(|name| name != &relation.name)
+                    {
+                        continue;
+                    }
+                    let endpoint = match options.direction {
+                        TraversalDirection::Outbound if relation.domain == *class_name => {
+                            Some(&relation.range)
+                        }
+                        TraversalDirection::Inbound if relation.range == *class_name => {
+                            Some(&relation.domain)
+                        }
+                        TraversalDirection::Both if relation.domain == *class_name => {
+                            Some(&relation.range)
+                        }
+                        TraversalDirection::Both if relation.range == *class_name => {
+                            Some(&relation.domain)
+                        }
+                        _ => None,
+                    };
+                    if let Some(endpoint) = endpoint {
+                        traversed.insert(relation.name.clone());
+                        if visited.insert(endpoint.clone()) {
+                            reached.insert(endpoint.clone());
+                            next.insert(endpoint.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+
+        Ok(QueryResult {
+            start: start.to_string(),
+            options,
+            classes: reached
+                .into_iter()
+                .filter_map(|name| classes.get(&name).cloned())
+                .collect(),
+            relations: traversed
+                .into_iter()
+                .filter_map(|name| relations.get(&name).cloned())
+                .collect(),
         })
     }
 }
@@ -713,6 +824,135 @@ mod tests {
                 provenance: vec![],
             }
         );
+    }
+
+    #[test]
+    fn bounded_query_handles_directions_filters_depth_and_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ontology = SqliteOntology::initialize(directory.path().join("query.db")).unwrap();
+        ontology
+            .import(ImportDocument {
+                schema_version: SCHEMA_VERSION,
+                classes: ["A", "B", "C", "D"]
+                    .into_iter()
+                    .map(|name| Class {
+                        name: name.into(),
+                        description: String::new(),
+                        superclasses: vec![],
+                        properties: vec![],
+                    })
+                    .collect(),
+                relations: [
+                    ("a_to_b", "A", "B"),
+                    ("b_to_c", "B", "C"),
+                    ("c_to_a", "C", "A"),
+                    ("d_to_a", "D", "A"),
+                ]
+                .into_iter()
+                .map(|(name, domain, range)| Relation {
+                    name: name.into(),
+                    description: String::new(),
+                    domain: domain.into(),
+                    range: range.into(),
+                    cardinality: Cardinality::default(),
+                    transitive: false,
+                })
+                .collect(),
+                provenance: vec![],
+            })
+            .unwrap();
+
+        let outbound = ontology
+            .query(
+                "A",
+                QueryOptions {
+                    direction: TraversalDirection::Outbound,
+                    relation: None,
+                    depth: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            outbound
+                .classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["B", "C"]
+        );
+        assert_eq!(
+            outbound
+                .relations
+                .iter()
+                .map(|relation| relation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a_to_b", "b_to_c", "c_to_a"]
+        );
+
+        let inbound = ontology
+            .query(
+                "A",
+                QueryOptions {
+                    direction: TraversalDirection::Inbound,
+                    relation: None,
+                    depth: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            inbound
+                .classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["C", "D"]
+        );
+
+        let both = ontology.query("A", QueryOptions::default()).unwrap();
+        assert_eq!(
+            both.classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["B", "C", "D"]
+        );
+        let filtered = ontology
+            .query(
+                "A",
+                QueryOptions {
+                    relation: Some("a_to_b".into()),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(filtered.classes[0].name, "B");
+        assert_eq!(filtered.relations[0].name, "a_to_b");
+
+        let empty = ontology
+            .query(
+                "A",
+                QueryOptions {
+                    depth: 0,
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(empty.classes.is_empty());
+        assert!(empty.relations.is_empty());
+        assert!(matches!(
+            ontology.query(
+                "A",
+                QueryOptions {
+                    depth: MAX_QUERY_DEPTH + 1,
+                    ..QueryOptions::default()
+                }
+            ),
+            Err(Error::Input(_))
+        ));
+        assert!(matches!(
+            ontology.query("Missing", QueryOptions::default()),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

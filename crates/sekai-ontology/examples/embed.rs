@@ -1,4 +1,4 @@
-use sekai_ontology::{Ontology, SqliteOntology};
+use sekai_ontology::{Ontology, QueryOptions, SqliteOntology, TraversalDirection};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -16,5 +16,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(&exported)?);
     let explanation = ontology.explain("Api")?;
     println!("{}", serde_json::to_string_pretty(&explanation)?);
+    let traversal = ontology.query(
+        "Api",
+        QueryOptions {
+            direction: TraversalDirection::Outbound,
+            relation: None,
+            depth: 2,
+        },
+    )?;
+    println!("{}", serde_json::to_string_pretty(&traversal)?);
     Ok(())
 }
