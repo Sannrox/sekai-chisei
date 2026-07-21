@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const EMBEDDED_SKILL: &str = include_str!("../assets/SKILL.md");
 
 #[derive(Debug)]
 pub enum Error {
@@ -43,6 +44,12 @@ pub struct ImportDocument {
     #[serde(default)]
     pub provenance: Vec<Provenance>,
 }
+
+/// The versioned, storage-independent ontology exchange document.
+///
+/// Export deliberately reuses the import contract so a document can be moved
+/// between databases without exposing the private SQLite schema.
+pub type ExportDocument = ImportDocument;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +153,12 @@ impl SqliteOntology {
             .map_err(database_error)
     }
 
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map(|connection| Self { connection })
+            .map_err(database_error)
+    }
+
     pub fn initialize(path: impl AsRef<Path>) -> Result<Self, Error> {
         let mut connection = Connection::open_with_flags(
             path,
@@ -236,25 +249,43 @@ impl SqliteOntology {
         transaction.commit().map_err(database_error)
     }
 
-    fn check_schema_version(&self) -> Result<(), Error> {
-        let version = self
+    pub fn export(&self) -> Result<ExportDocument, Error> {
+        let transaction = self
             .connection
-            .query_row(
-                "SELECT value FROM ontology_metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
+            .unchecked_transaction()
             .map_err(database_error)?;
-        match version.as_deref() {
-            Some("1") => Ok(()),
-            Some(value) => Err(Error::Database(format!(
-                "unsupported database schema version {value}"
-            ))),
-            None => Err(Error::Database(
-                "not an initialized ontology database".into(),
-            )),
-        }
+        check_schema_version(&transaction)?;
+        let (classes, relations, provenance) = load_all(&transaction)?;
+        Ok(ExportDocument {
+            schema_version: SCHEMA_VERSION,
+            classes: classes.into_values().collect(),
+            relations: relations.into_values().collect(),
+            provenance,
+        })
+    }
+
+    fn check_schema_version(&self) -> Result<(), Error> {
+        check_schema_version(&self.connection)
+    }
+}
+
+fn check_schema_version(connection: &Connection) -> Result<(), Error> {
+    let version = connection
+        .query_row(
+            "SELECT value FROM ontology_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    match version.as_deref() {
+        Some("1") => Ok(()),
+        Some(value) => Err(Error::Database(format!(
+            "unsupported database schema version {value}"
+        ))),
+        None => Err(Error::Database(
+            "not an initialized ontology database".into(),
+        )),
     }
 }
 
@@ -633,6 +664,55 @@ mod tests {
             Err(Error::Validation(_))
         ));
         assert_eq!(ontology.explain("Api").unwrap(), explanation);
+    }
+
+    #[test]
+    fn export_round_trips_the_complete_logical_ontology() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.db");
+        let destination_path = directory.path().join("destination.db");
+        let mut source = SqliteOntology::initialize(&source_path).unwrap();
+        source.import(document()).unwrap();
+
+        let exported = source.export().unwrap();
+        assert_eq!(exported.schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            exported
+                .classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Api", "Client", "Component", "Database", "Service"]
+        );
+        assert_eq!(
+            exported
+                .relations
+                .iter()
+                .map(|relation| relation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["depends_on", "serves"]
+        );
+        assert_eq!(exported.provenance.len(), 4);
+
+        let mut destination = SqliteOntology::initialize(&destination_path).unwrap();
+        destination.import(exported.clone()).unwrap();
+        assert_eq!(destination.export().unwrap(), exported);
+        assert_eq!(destination.validate().unwrap(), source.validate().unwrap());
+    }
+
+    #[test]
+    fn empty_ontology_exports_empty_collections() {
+        let directory = tempfile::tempdir().unwrap();
+        let ontology = SqliteOntology::initialize(directory.path().join("empty.db")).unwrap();
+        assert_eq!(
+            ontology.export().unwrap(),
+            ExportDocument {
+                schema_version: SCHEMA_VERSION,
+                classes: vec![],
+                relations: vec![],
+                provenance: vec![],
+            }
+        );
     }
 
     #[test]

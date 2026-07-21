@@ -67,6 +67,18 @@ fn run() -> Result<(), Error> {
             ontology.import_json(&input)?;
             println!("imported {}", arguments.operands[0]);
         }
+        "export" => {
+            expect_operands(&arguments, 0, "export")?;
+            let ontology = SqliteOntology::open_read_only(&arguments.database)?;
+            let document = ontology.export()?;
+            if arguments.json {
+                print_json("export", document)?;
+            } else {
+                let output = serde_json::to_string_pretty(&document)
+                    .map_err(|error| Error::Input(format!("cannot encode output: {error}")))?;
+                println!("{output}");
+            }
+        }
         "validate" => {
             expect_operands(&arguments, 0, "validate")?;
             let ontology = SqliteOntology::open(&arguments.database)?;
@@ -187,7 +199,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  validate\n  explain <name>\n\nSEKAI_DB selects the database when --db is omitted."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n\nSEKAI_DB selects the database when --db is omitted."
 }
 
 fn print_help() {
