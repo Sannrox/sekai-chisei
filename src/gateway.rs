@@ -79,6 +79,7 @@ const X_CHISEI_ADMISSION: HeaderName = HeaderName::from_static("x-chisei-admissi
 const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
 const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
+const X_CHISEI_ROUTE_OVERRIDE: HeaderName = HeaderName::from_static("x-chisei-route-override");
 const X_CHISEI_OPERATION_ID: HeaderName = HeaderName::from_static("x-chisei-operation-id");
 const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
     HeaderName::from_static("x-chisei-parent-operation-id");
@@ -1968,6 +1969,28 @@ fn correlation_header(headers: &HeaderMap, name: &HeaderName) -> Result<Option<S
     Ok(Some(value.to_string()))
 }
 
+fn route_override_header(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = header_str(headers, &X_CHISEI_ROUTE_OVERRIDE) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let canonical = value.split_once('/').is_some_and(|(provider, model)| {
+        !provider.is_empty()
+            && !model.is_empty()
+            && !model.contains('/')
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+            })
+    });
+    if value.len() > 128 || !canonical {
+        return Err(
+            "x-chisei-route-override must be a canonical provider/model of at most 128 characters"
+                .into(),
+        );
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn validate_traceparent(value: &str) -> Result<String, String> {
     let parts = value.split('-').collect::<Vec<_>>();
     let valid_hex = |part: &str, len: usize| {
@@ -2220,6 +2243,26 @@ async fn proxy_gateway_inner_scoped(
     let request_bytes = body.len();
     let request_hash = format!("{:x}", Sha256::digest(&body));
     let requested_model = extract_request_model(&body);
+    let route_override = match route_override_header(&headers) {
+        Ok(value) => value,
+        Err(reason) => {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &reason);
+        }
+    };
+    if route_override.is_some() && requested_model.is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "x-chisei-route-override requires a request body model",
+        );
+    }
+    if route_override.is_some() && state.config.no_preflight {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "x-chisei-route-override requires governed availability preflight",
+        );
+    }
     let request_id = correlation.request_id.clone();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
@@ -2317,6 +2360,7 @@ async fn proxy_gateway_inner_scoped(
         provider: requested_provider,
         requested_model: requested_model.clone(),
         resolved_model: None,
+        route_override: route_override.clone(),
         requested_alias: requested_registry_model
             .as_ref()
             .and_then(|resolved| resolved.requested_alias.clone()),
@@ -2501,6 +2545,7 @@ async fn proxy_gateway_inner_scoped(
             client_provider,
             &body,
             requested_model.as_deref(),
+            route_override.as_deref(),
             &task_class,
             &budget,
             &request_id,
@@ -2882,6 +2927,7 @@ async fn proxy_gateway_inner_scoped(
         provider: prepared.provider,
         requested_model,
         resolved_model: resolved.resolved_model,
+        route_override,
         requested_alias: requested_registry_model
             .as_ref()
             .and_then(|resolved| resolved.requested_alias.clone()),
@@ -3116,6 +3162,7 @@ struct UsageContext {
     provider: ProviderKind,
     requested_model: Option<String>,
     resolved_model: Option<String>,
+    route_override: Option<String>,
     requested_alias: Option<String>,
     profile_version: Option<String>,
     capability_snapshot_version: Option<String>,
@@ -3165,6 +3212,7 @@ fn early_refusal_context(
         provider,
         requested_model,
         resolved_model: None,
+        route_override: None,
         requested_alias: None,
         profile_version: None,
         capability_snapshot_version: Some(capability_snapshot_version),
@@ -4302,6 +4350,7 @@ async fn resolve_policy_preflight(
     provider: ProviderKind,
     body: &[u8],
     requested_model: Option<&str>,
+    route_override: Option<&str>,
     task_class: &str,
     budget: &BudgetPreflight,
     request_id: &str,
@@ -4309,6 +4358,13 @@ async fn resolve_policy_preflight(
     failure_posture: &GovernanceFailurePosture,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
+        if route_override.is_some() {
+            return Err(GatewayRejection::json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "route overrides require a request body model",
+            ));
+        }
         return Ok(PolicyPreflight {
             body: body.to_vec(),
             resolved_model: None,
@@ -4320,7 +4376,17 @@ async fn resolve_policy_preflight(
             data_class: None,
         });
     };
-    let requested_registry_model = if requested_model == "auto" {
+    let requested_registry_model = if let Some(route_override) = route_override {
+        Some(
+            crate::provider_resolution::resolve_model(route_override).map_err(|reason| {
+                GatewayRejection::json(
+                    StatusCode::FORBIDDEN,
+                    "policy_denied",
+                    format!("route override denied: {reason}"),
+                )
+            })?,
+        )
+    } else if requested_model == "auto" {
         None
     } else {
         Some(
@@ -4353,8 +4419,18 @@ async fn resolve_policy_preflight(
         })
         .transpose()?
         .unwrap_or(provider);
-    let cache_key = policy_cache_key(identity, provider, requested_model, task_class, budget);
+    let cache_model = route_override
+        .map(|model| format!("route-override:{model}"))
+        .unwrap_or_else(|| requested_model.to_string());
+    let cache_key = policy_cache_key(identity, provider, &cache_model, task_class, budget);
     let Some(target) = &config.chisei_grpc_target else {
+        if route_override.is_some() {
+            return Err(GatewayRejection::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_unavailable",
+                "route overrides require a configured Chisei control plane",
+            ));
+        }
         if requested_model == "auto" {
             return Err(GatewayRejection::json(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4396,6 +4472,7 @@ async fn resolve_policy_preflight(
                 user_id: String::new(),
                 expected_calls: 1,
                 budget_route_bias: budget.route_bias.clone().unwrap_or_default(),
+                route_override: route_override.unwrap_or_default().to_string(),
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
@@ -4407,6 +4484,19 @@ async fn resolve_policy_preflight(
                             "Chisei returned an empty policy resolution",
                         )
                     })?;
+                    if route_override.is_some()
+                        && (Some(resolution.model.as_str())
+                            != requested_registry_model
+                                .as_ref()
+                                .map(|model| model.canonical_model.as_str())
+                            || !resolution.fallback_models.is_empty())
+                    {
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "governance_unavailable",
+                            "Chisei did not preserve the exact route override",
+                        ));
+                    }
                     let Some(runtime_provider) = ProviderKind::from_runtime(&resolution.runtime)
                     else {
                         return policy_denied(
@@ -4606,6 +4696,19 @@ async fn resolve_policy_preflight(
                     if let Some(decision) =
                         cached_policy_decision(runtime, &cache_key, body, requested_model).await
                     {
+                        if route_override.is_some()
+                            && (decision.resolved_model.as_deref()
+                                != requested_registry_model
+                                    .as_ref()
+                                    .map(|model| model.canonical_model.as_str())
+                                || !decision.fallback_models.is_empty())
+                        {
+                            return Err(GatewayRejection::json(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "governance_unavailable",
+                                "cached route override decision is not exact",
+                            ));
+                        }
                         if !record_resilience_decision(
                             config,
                             runtime,
@@ -4627,6 +4730,13 @@ async fn resolve_policy_preflight(
                             ));
                         }
                         return Ok(decision);
+                    }
+                    if route_override.is_some() {
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "governance_unavailable",
+                            format!("route override governance unavailable: {err}"),
+                        ));
                     }
                     governance_error(
                         config,
@@ -4660,6 +4770,19 @@ async fn resolve_policy_preflight(
             if let Some(decision) =
                 cached_policy_decision(runtime, &cache_key, body, requested_model).await
             {
+                if route_override.is_some()
+                    && (decision.resolved_model.as_deref()
+                        != requested_registry_model
+                            .as_ref()
+                            .map(|model| model.canonical_model.as_str())
+                        || !decision.fallback_models.is_empty())
+                {
+                    return Err(GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_unavailable",
+                        "cached route override decision is not exact",
+                    ));
+                }
                 if !record_resilience_decision(
                     config,
                     runtime,
@@ -4678,6 +4801,13 @@ async fn resolve_policy_preflight(
                     ));
                 }
                 return Ok(decision);
+            }
+            if route_override.is_some() {
+                return Err(GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    format!("route override governance unavailable: {err}"),
+                ));
             }
             governance_error(
                 config,
@@ -9004,6 +9134,14 @@ fn build_gateway_operation_receipt(
                     context.resolved_model.clone().unwrap_or_default(),
                 ),
                 (
+                    "route_override".into(),
+                    context.route_override.clone().unwrap_or_default(),
+                ),
+                (
+                    "bias_bypassed".into(),
+                    context.route_override.is_some().to_string(),
+                ),
+                (
                     "requested_alias".into(),
                     context.requested_alias.clone().unwrap_or_default(),
                 ),
@@ -12130,6 +12268,23 @@ mod tests {
     }
 
     #[test]
+    fn route_override_header_accepts_only_canonical_model_ids() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&X_CHISEI_ROUTE_OVERRIDE, "openai/gpt-5.5".parse().unwrap());
+        assert_eq!(
+            route_override_header(&headers).unwrap().as_deref(),
+            Some("openai/gpt-5.5")
+        );
+        headers.insert(&X_CHISEI_ROUTE_OVERRIDE, "gpt-5.5".parse().unwrap());
+        assert!(route_override_header(&headers).is_err());
+        headers.insert(
+            &X_CHISEI_ROUTE_OVERRIDE,
+            "openai/gpt/escape".parse().unwrap(),
+        );
+        assert!(route_override_header(&headers).is_err());
+    }
+
+    #[test]
     fn request_alias_derives_stable_operation_identity_when_unspecified() {
         let mut headers = HeaderMap::new();
         headers.insert(&X_CHISEI_REQUEST_ID, "retryable-alias".parse().unwrap());
@@ -12946,6 +13101,7 @@ mod tests {
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
             resolved_model: Some("openai/gpt-5.5".into()),
+            route_override: Some("openai/gpt-5.5".into()),
             requested_alias: Some("gpt-5.5".into()),
             profile_version: Some("openai.builtin/v3".into()),
             capability_snapshot_version: Some(CAPABILITY_MATRIX_VERSION.into()),
@@ -12999,6 +13155,13 @@ mod tests {
             .unwrap();
         assert_eq!(intent.attributes["logical_operation_id"], "gateway-op-1");
         assert_eq!(intent.attributes["attempt_id"], "2");
+        let route = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+            .unwrap();
+        assert_eq!(route.attributes["route_override"], "openai/gpt-5.5");
+        assert_eq!(route.attributes["bias_bypassed"], "true");
         let priced_call = receipt
             .events
             .iter()
@@ -13249,6 +13412,7 @@ mod tests {
             provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             requested_model: Some("gpt-5.5".into()),
             resolved_model: None,
+            route_override: None,
             requested_alias: Some("gpt-5.5".into()),
             profile_version: Some("openai.builtin/v3".into()),
             capability_snapshot_version: Some(CAPABILITY_MATRIX_VERSION.into()),
@@ -15542,6 +15706,7 @@ mod tests {
                         user_id: String::new(),
                         expected_calls: 1,
                         budget_route_bias: String::new(),
+                        route_override: String::new(),
                     }))
                     .await
                     .map(|_| true)

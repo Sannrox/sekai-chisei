@@ -2153,6 +2153,18 @@ impl ChiseiServiceImpl {
                 BTreeMap::from([
                     ("runtime".into(), plan.resolved_runtime.clone()),
                     ("model".into(), plan.resolved_model.clone()),
+                    (
+                        "route_override".into(),
+                        if input.route_override.trim().is_empty() {
+                            String::new()
+                        } else {
+                            plan.resolved_model.clone()
+                        },
+                    ),
+                    (
+                        "bias_bypassed".into(),
+                        (!input.route_override.trim().is_empty()).to_string(),
+                    ),
                 ]),
             ),
             receipt_event(
@@ -2340,6 +2352,12 @@ impl ChiseiServiceImpl {
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
     ) -> Result<(String, String), Status> {
+        let route_override = input.route_override.trim();
+        if !route_override.is_empty() && !route_override_allowed(policy, route_override) {
+            return Err(Status::invalid_argument(format!(
+                "route override {route_override:?} is not allowed by namespace policy"
+            )));
+        }
         let recommended_model = run
             .recommended_model()
             .map(|(model, _)| model.to_string())
@@ -2347,13 +2365,24 @@ impl ChiseiServiceImpl {
         let route_bias_value =
             crate::chisei::model_routing::route_bias(&run.steps).map(str::to_string);
         let route_bias = route_bias_value.as_deref();
-        let preferred_model = choose_preferred_model(
-            &input.preferred_model,
-            &recommended_model,
-            route_bias,
-            policy,
-        );
-        let preferred_runtime = if input.preferred_runtime.is_empty() {
+        let preferred_model = if route_override.is_empty() {
+            choose_preferred_model(
+                &input.preferred_model,
+                &recommended_model,
+                route_bias,
+                policy,
+            )
+        } else {
+            route_override.to_string()
+        };
+        let override_runtime = (!route_override.is_empty())
+            .then(|| crate::provider_resolution::resolve_model(route_override))
+            .transpose()
+            .map_err(Status::invalid_argument)?
+            .map(|model| model.provider);
+        let preferred_runtime = if let Some(runtime) = override_runtime.as_deref() {
+            runtime
+        } else if input.preferred_runtime.is_empty() {
             fallback_runtime
         } else {
             &input.preferred_runtime
@@ -2363,7 +2392,18 @@ impl ChiseiServiceImpl {
             .resolve(&input.namespace, preferred_runtime, &preferred_model)
             .map_err(Status::invalid_argument)?;
         let model = self
-            .resolve_live_model(&model, policy, route_bias, safe_only, safe_providers)
+            .resolve_live_model_with_override(
+                &model,
+                policy,
+                if route_override.is_empty() {
+                    route_bias
+                } else {
+                    None
+                },
+                safe_only,
+                safe_providers,
+                !route_override.is_empty(),
+            )
             .await
             .map_err(Status::failed_precondition)?;
         let runtime = final_runtime_for_model(policy, &runtime, &model)
@@ -2697,6 +2737,26 @@ impl ChiseiServiceImpl {
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
     ) -> Result<String, String> {
+        self.resolve_live_model_with_override(
+            model,
+            policy,
+            route_bias,
+            safe_only,
+            safe_providers,
+            false,
+        )
+        .await
+    }
+
+    async fn resolve_live_model_with_override(
+        &self,
+        model: &str,
+        policy: Option<&crate::chisei::policy::Policy>,
+        route_bias: Option<&str>,
+        safe_only: bool,
+        safe_providers: &std::collections::HashSet<String>,
+        exact_override: bool,
+    ) -> Result<String, String> {
         validate_explicit_requested_model(model)?;
         let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
             openai_base_url: std::env::var("CHISEI_OPENAI_BASE_URL")
@@ -2737,6 +2797,9 @@ impl ChiseiServiceImpl {
             && model != "cheap"
             && model != "capable"
             && crate::llm::provider_name(model) == "native";
+        if exact_override {
+            return crate::chisei::model_routing::resolve_override(base_context);
+        }
         if !needs_ollama_first
             && let Ok(resolved) = crate::chisei::model_routing::resolve_model(base_context.clone())
         {
@@ -2986,6 +3049,16 @@ fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
     policy.is_none_or(|policy| {
         policy.allowed_models.is_empty()
             || policy.allowed_models.iter().any(|allowed| allowed == model)
+    })
+}
+
+fn route_override_allowed(policy: Option<&Policy>, model: &str) -> bool {
+    policy.is_none_or(|policy| {
+        policy.allowed_models.is_empty()
+            || policy
+                .allowed_models
+                .iter()
+                .any(|allowed| models_have_same_identity(allowed, model))
     })
 }
 
@@ -4000,22 +4073,39 @@ impl ChiseiService for ChiseiServiceImpl {
         let eval_regressed = !regression_reasons.is_empty();
         let eval_regression_reason = regression_reasons.join(" | ");
         validate_explicit_requested_model(&r.preferred_model).map_err(Status::invalid_argument)?;
+        let route_override = r.route_override.trim();
+        if !route_override.is_empty() {
+            validate_explicit_requested_model(route_override).map_err(Status::invalid_argument)?;
+            if !route_override_allowed(effective_policy.as_ref(), route_override) {
+                return Err(Status::invalid_argument(format!(
+                    "route override {route_override:?} is not allowed by effective policy"
+                )));
+            }
+        }
         let requested_preferred_model = &r.preferred_model;
-        let preferred_model = eval_regressed
+        let preferred_model = if !route_override.is_empty() {
+            route_override
+        } else { eval_regressed
             .then_some(())
             .as_ref()
             .and(effective_policy.as_ref())
             .map(|policy| policy.default_model.as_str())
             .filter(|model| !model.is_empty())
-            .unwrap_or(requested_preferred_model);
+            .unwrap_or(requested_preferred_model) };
         validate_explicit_requested_model(preferred_model).map_err(Status::invalid_argument)?;
+        let override_runtime = (!route_override.is_empty())
+            .then(|| crate::provider_resolution::resolve_model(route_override))
+            .transpose()
+            .map_err(Status::invalid_argument)?
+            .map(|model| model.provider);
+        let preferred_runtime = override_runtime.as_deref().unwrap_or(&r.preferred_runtime);
         let (mut runtime, model) = if let Some(policy) = effective_policy.as_ref() {
             self.policy
-                .apply_policy(policy, &r.preferred_runtime, preferred_model)
+                .apply_policy(policy, preferred_runtime, preferred_model)
                 .map_err(Status::invalid_argument)?
         } else {
             self.policy
-                .resolve(&policy_scope, &r.preferred_runtime, preferred_model)
+                .resolve(&policy_scope, preferred_runtime, preferred_model)
                 .map_err(Status::invalid_argument)?
         };
 
@@ -4045,12 +4135,13 @@ impl ChiseiService for ChiseiServiceImpl {
             }
             resolved.canonical_model
         } else {
-            self.resolve_live_model(
+            self.resolve_live_model_with_override(
                 &model,
                 effective_policy.as_ref(),
                 None,
                 safe_only,
                 &safe_providers,
+                !route_override.is_empty(),
             )
             .await
             .map_err(|err| {
@@ -4092,6 +4183,11 @@ impl ChiseiService for ChiseiServiceImpl {
                 .active_promotions
                 .capable_override_active(&r.namespace, &normalized_task_class);
         let wants_local_free = r.budget_route_bias == "local_free";
+        if !route_override.is_empty() && wants_local_free {
+            return Err(Status::resource_exhausted(
+                "hard budget cap reached; a route override cannot fall back to local-free routing",
+            ));
+        }
         if wants_local_free && (eval_regressed || capable_override_active) {
             let safety_reason = if eval_regressed {
                 eval_regression_reason.as_str()
@@ -4124,7 +4220,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 "hard budget cap reached and no policy-allowed local-free model is available",
             ));
         }
-        let wants_cheap = !capable_override_active
+        let wants_cheap = route_override.is_empty() && !capable_override_active
             && cheap_route_bias(&r.task_class, eval_regressed) == Some("cheap");
         let cheap_model = if wants_cheap && is_known_provider_runtime(&runtime) {
             self.resolve_live_model(
@@ -4176,7 +4272,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         .map(|objective| (r.namespace.clone(), objective))
                 }
             });
-        if !wants_local_free && let Some((portfolio_scope, objective)) = objective {
+        if route_override.is_empty() && !wants_local_free && let Some((portfolio_scope, objective)) = objective {
             let now = chrono::Utc::now().timestamp_millis();
             if eval_regressed || capable_override_active {
                 if let Ok(selection) = self.portfolio.damped_route(
@@ -4267,26 +4363,30 @@ impl ChiseiService for ChiseiServiceImpl {
                 crate::chisei::privacy::gate_reason(data_class, task_class, provider),
             ));
         }
-        let fallback_models = effective_policy
-            .as_ref()
-            .into_iter()
-            .flat_map(|policy| policy.allowed_models.iter())
-            .filter_map(|candidate| {
-                crate::provider_resolution::resolve_model(candidate)
-                    .ok()
-                    .map(|resolved| resolved.canonical_model)
-            })
-            .filter(|candidate| candidate != &model)
-            .filter(|candidate| {
-                final_runtime_for_model(effective_policy.as_ref(), &runtime, candidate).is_ok()
-            })
-            .filter(|candidate| {
-                let provider = crate::llm::provider_name(candidate);
-                !safe_only
-                    || crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers)
-            })
-            .take(8)
-            .collect();
+        let fallback_models = if route_override.is_empty() {
+            effective_policy
+                .as_ref()
+                .into_iter()
+                .flat_map(|policy| policy.allowed_models.iter())
+                .filter_map(|candidate| {
+                    crate::provider_resolution::resolve_model(candidate)
+                        .ok()
+                        .map(|resolved| resolved.canonical_model)
+                })
+                .filter(|candidate| candidate != &model)
+                .filter(|candidate| {
+                    final_runtime_for_model(effective_policy.as_ref(), &runtime, candidate).is_ok()
+                })
+                .filter(|candidate| {
+                    let provider = crate::llm::provider_name(candidate);
+                    !safe_only
+                        || crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers)
+                })
+                .take(8)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(Response::new(ResolvePolicyResponse {
             resolution: Some(PolicyResolution {
@@ -8383,6 +8483,7 @@ mod tests {
             user_id: String::new(),
             expected_calls: 1,
             budget_route_bias: String::new(),
+            route_override: String::new(),
         }
     }
 
@@ -10511,6 +10612,7 @@ mod tests {
                 task_class: String::new(),
                 logical_operation_id: "external-operation-7".into(),
                 attempt_id: "retry-b".into(),
+                route_override: String::new(),
             }),
         });
         request
@@ -11471,6 +11573,7 @@ mod tests {
                 user_id: String::new(),
                 expected_calls: 1,
                 budget_route_bias: String::new(),
+                route_override: String::new(),
             }))
             .await
             .expect_err("sensitive private preflight should deny unsafe provider");

@@ -178,6 +178,8 @@ message ExecutionInput {
   // Chisei-owned identifier for this governed execution.
   string logical_operation_id = 16;
   string attempt_id = 17;
+  // Optional canonical provider/model pinned for this one governed execution.
+  string route_override = 18;
 }
 
 message ExecutionPlan {
@@ -509,6 +511,8 @@ message ResolvePolicyRequest {
   int64 expected_calls = 10;
   // Advisory bias returned by CheckBudget (cheap or local_free).
   string budget_route_bias = 11;
+  // Optional canonical provider/model pinned for this one governed resolution.
+  string route_override = 12;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 

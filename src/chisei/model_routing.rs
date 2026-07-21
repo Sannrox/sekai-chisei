@@ -75,6 +75,32 @@ pub fn resolve_model(ctx: RoutingContext<'_>) -> Result<String, String> {
     validate_or_fallback_provider_model(ctx)
 }
 
+/// Resolve an exact caller-pinned route without applying aliases or fallback.
+pub fn resolve_override(ctx: RoutingContext<'_>) -> Result<String, String> {
+    if ctx.requested.trim().is_empty() || alias_parts(ctx.requested).is_some() {
+        return Err("route override must be a canonical provider/model".into());
+    }
+    let provider = llm::provider_name(ctx.requested);
+    if ctx.safe_only && !provider_is_safe(provider, &ctx) {
+        return Err(format!(
+            "provider {provider:?} is not safe for sensitive data"
+        ));
+    }
+    let Some(available) = ctx.available_models.iter().find(|available| {
+        available.provider == provider
+            && available.routable
+            && available.discovery_source != "static_fallback"
+            && (available.canonical_model == ctx.requested
+                || available.upstream_model == ctx.requested)
+    }) else {
+        return Err(format!("model_unavailable: {:?}", ctx.requested));
+    };
+    if !provider_is_available(provider, ctx.config) {
+        return Err(format!("model_unavailable: {:?}", ctx.requested));
+    }
+    Ok(available.canonical_model.clone())
+}
+
 fn validate_or_fallback_provider_model(ctx: RoutingContext<'_>) -> Result<String, String> {
     let provider = llm::provider_name(ctx.requested);
     if ctx.safe_only && !provider_is_safe(provider, &ctx) {
@@ -431,7 +457,7 @@ fn display_allowed_models(allowed_models: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RoutingContext, resolve_model};
+    use super::{RoutingContext, resolve_model, resolve_override};
     use crate::chisei::model_availability::AvailableModel;
     use crate::config::Config;
     use crate::llm::ollama::InstalledModel;
@@ -797,5 +823,85 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("not safe"));
+    }
+
+    #[test]
+    fn override_pins_available_model_and_bypasses_bias() {
+        let config = config();
+        let available = vec![
+            discovered("openai", "gpt-cheap-mini"),
+            discovered("openai", "gpt-capable"),
+        ];
+        let resolved = resolve_override(RoutingContext {
+            requested: "openai/gpt-capable",
+            allowed_models: &[],
+            route_bias: Some("cheap"),
+            config: &config,
+            ollama_models: &[],
+            available_models: &available,
+            authoritative_providers: &["openai".into()],
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+        assert_eq!(resolved, "openai/gpt-capable");
+    }
+
+    #[test]
+    fn override_fails_closed_for_disabled_unsafe_or_unavailable_model() {
+        let config = config();
+        let mut disabled = discovered("openai", "gpt-disabled");
+        disabled.routable = false;
+        disabled.lifecycle = "disabled".into();
+        let authoritative = vec!["openai".into()];
+        let safe = std::collections::HashSet::new();
+        let context = |safe_only: bool| RoutingContext {
+            requested: "openai/gpt-disabled",
+            allowed_models: &[],
+            route_bias: Some("capable"),
+            config: &config,
+            ollama_models: &[],
+            available_models: std::slice::from_ref(&disabled),
+            authoritative_providers: &authoritative,
+            safe_only,
+            safe_providers: &safe,
+        };
+        assert!(
+            resolve_override(context(false))
+                .unwrap_err()
+                .contains("model_unavailable")
+        );
+        assert!(
+            {
+                let mut missing = context(false);
+                missing.requested = "openai/gpt-missing";
+                resolve_override(missing)
+            }
+            .unwrap_err()
+            .contains("model_unavailable")
+        );
+        assert!(
+            resolve_override(context(true))
+                .unwrap_err()
+                .contains("not safe")
+        );
+        let mut fallback = discovered("openai", "gpt-fallback");
+        fallback.discovery_source = "static_fallback".into();
+        let fallback_context = RoutingContext {
+            requested: "openai/gpt-fallback",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: std::slice::from_ref(&fallback),
+            authoritative_providers: &authoritative,
+            safe_only: false,
+            safe_providers: &safe,
+        };
+        assert!(
+            resolve_override(fallback_context)
+                .unwrap_err()
+                .contains("model_unavailable")
+        );
     }
 }
