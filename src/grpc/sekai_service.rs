@@ -1050,6 +1050,77 @@ fn from_proto_evidence_envelope(
     })
 }
 
+fn to_proto_evidence_envelope(envelope: &evidence_domain::EvidenceEnvelope) -> EvidenceEnvelope {
+    EvidenceEnvelope {
+        contract_version: envelope.contract_version.clone(),
+        source_type: envelope.source_type.clone(),
+        source_instance: envelope.source_instance.clone(),
+        source_record_id: envelope.source_record_id.clone(),
+        source_version: envelope.source_version.clone(),
+        source_sequence: envelope.source_sequence,
+        namespace: envelope.target.namespace.clone(),
+        target_external_id: envelope.target.object_external_id.clone(),
+        target_kind: envelope.target.object_kind.clone(),
+        evidence_type: envelope.evidence_type.clone(),
+        signal: envelope.signal.as_str().into(),
+        schema_id: envelope.schema_id.clone(),
+        schema_version: envelope.schema_version.clone(),
+        schema_compatibility: match envelope.schema_compatibility {
+            evidence_domain::SchemaCompatibility::Exact => "exact",
+            evidence_domain::SchemaCompatibility::BackwardCompatible => "backward_compatible",
+        }
+        .into(),
+        observed_at_ms: envelope.observed_at_ms,
+        collected_at_ms: envelope.collected_at_ms,
+        expires_at_ms: envelope.expires_at_ms,
+        content_json: serde_json::to_vec(&envelope.content)
+            .expect("validated evidence content must serialize"),
+        relationships: envelope
+            .relationships
+            .iter()
+            .map(|relationship| EvidenceRelationship {
+                relation: relationship.relation.clone(),
+                target_source_type: relationship.target_source_type.clone(),
+                target_source_instance: relationship.target_source_instance.clone(),
+                target_source_record_id: relationship.target_source_record_id.clone(),
+            })
+            .collect(),
+        producer_identity: envelope.producer_identity.clone(),
+        confidence_bps: u32::from(envelope.confidence_bps),
+        classification: envelope.classification.as_str().into(),
+        provenance: envelope.provenance.clone().into_iter().collect(),
+        idempotency_key: envelope.idempotency_key.clone(),
+        content_digest: envelope.content_digest.clone(),
+        intent: match envelope.intent {
+            evidence_domain::EvidenceIntent::Upsert => "upsert",
+            evidence_domain::EvidenceIntent::Retract => "retract",
+            evidence_domain::EvidenceIntent::MarkStale => "mark_stale",
+        }
+        .into(),
+        causality: envelope
+            .causality
+            .as_ref()
+            .map(|causality| EvidenceCausality {
+                operation_id: causality.operation_id.clone().unwrap_or_default(),
+                parent_operation_id: causality.parent_operation_id.clone().unwrap_or_default(),
+                attempt_id: causality.attempt_id.clone().unwrap_or_default(),
+                model_call_id: causality.model_call_id.clone().unwrap_or_default(),
+                subject_references: causality.subject_references.clone(),
+                trace_context: causality.trace_context.clone().into_iter().collect(),
+            }),
+    }
+}
+
+fn evidence_content_is_readable(state: evidence_domain::EvidenceLifecycleState) -> bool {
+    matches!(
+        state,
+        evidence_domain::EvidenceLifecycleState::Available
+            | evidence_domain::EvidenceLifecycleState::Superseded
+            | evidence_domain::EvidenceLifecycleState::Retracted
+            | evidence_domain::EvidenceLifecycleState::Stale
+    )
+}
+
 fn from_proto_evidence_producer(
     capability: EvidenceProducerCapability,
 ) -> Result<DomainEvidenceProducerCapability, Status> {
@@ -7650,6 +7721,49 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(GetEvidenceSubmissionResponse {
             submission: Some(to_proto_evidence_submission(&submission)),
             lifecycle_history: history,
+        }))
+    }
+
+    async fn get_evidence_submission_content(
+        &self,
+        req: Request<GetEvidenceSubmissionContentRequest>,
+    ) -> Result<Response<GetEvidenceSubmissionContentResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let submission_id = req.into_inner().submission_id;
+        let not_found = || Status::not_found("evidence submission content not found");
+        let submission = self
+            .db
+            .get_evidence_submission(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(not_found)?;
+        if !evidence_content_is_readable(submission.lifecycle_state) {
+            return Err(not_found());
+        }
+        let evidence_object_id = self
+            .db
+            .get_evidence_projection_object_id(&submission_id)
+            .map_err(Status::internal)?
+            .ok_or_else(not_found)?;
+        let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        if !self.security.can_access(&evidence_object_id, &refs) {
+            return Err(not_found());
+        }
+        let envelope = submission.envelope.as_ref().ok_or_else(not_found)?;
+        let computed_digest =
+            crate::sekai::evidence_store::canonical_content_digest(&envelope.content)
+                .map_err(Status::internal)?;
+        if computed_digest != submission.content_digest
+            || envelope.content_digest != submission.content_digest
+        {
+            return Err(Status::data_loss(
+                "retained evidence content digest mismatch",
+            ));
+        }
+        Ok(Response::new(GetEvidenceSubmissionContentResponse {
+            submission_id,
+            envelope: Some(to_proto_evidence_envelope(envelope)),
+            lifecycle_state: submission.lifecycle_state.as_str().into(),
         }))
     }
 
@@ -16959,6 +17073,116 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(listed.submissions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authorized_consumer_reads_retained_evidence_content() {
+        let svc = configured_evidence_service(true).await;
+        let grant = security::Grant {
+            id: "grant-service-consumer".into(),
+            object_id: "service-1".into(),
+            principal: "consumer:onmyoji".into(),
+            role: security::Role::Viewer,
+            created: now_millis(),
+        };
+        svc.db.create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+
+        let mut envelope = proto_evidence("run-content", 1);
+        envelope
+            .provenance
+            .insert("run_url".into(), "https://ci.example/runs/42".into());
+        let submitted = svc
+            .submit_evidence(with_named_principal(
+                SubmitEvidenceRequest {
+                    envelope: Some(envelope.clone()),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let submission_id = submitted.submission.unwrap().id;
+
+        let content = svc
+            .get_evidence_submission_content(with_named_principal(
+                GetEvidenceSubmissionContentRequest {
+                    submission_id: submission_id.clone(),
+                },
+                "consumer:onmyoji",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(content.submission_id, submission_id);
+        assert_eq!(content.lifecycle_state, "available");
+        let returned = content.envelope.unwrap();
+        assert_eq!(returned.content_json, envelope.content_json);
+        assert_eq!(returned.content_digest, envelope.content_digest);
+        assert_eq!(returned.provenance, envelope.provenance);
+
+        let evidence_object_id = svc
+            .db
+            .get_evidence_projection_object_id(&submission_id)
+            .unwrap()
+            .unwrap();
+        let links = svc
+            .db
+            .list_links_by_relation(domain::REL_EVIDENCE_FOR)
+            .unwrap();
+        assert!(
+            links
+                .iter()
+                .any(|link| { link.from_id == evidence_object_id && link.to_id == "service-1" })
+        );
+
+        let denied = svc
+            .get_evidence_submission_content(with_named_principal(
+                GetEvidenceSubmissionContentRequest {
+                    submission_id: submission_id.clone(),
+                },
+                "consumer:other",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+
+        let replayed = svc
+            .submit_evidence(with_named_principal(
+                SubmitEvidenceRequest {
+                    envelope: Some(envelope),
+                },
+                "producer:checks",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(replayed.deduplicated);
+        assert_eq!(replayed.submission.unwrap().id, submission_id);
+    }
+
+    #[test]
+    fn evidence_content_lifecycle_is_fail_closed() {
+        use evidence_domain::EvidenceLifecycleState::*;
+
+        for state in [Available, Superseded, Retracted, Stale] {
+            assert!(evidence_content_is_readable(state), "{state:?}");
+        }
+        for state in [
+            Received,
+            Validated,
+            Deduplicated,
+            Authorized,
+            Projected,
+            Rejected,
+            Quarantined,
+        ] {
+            assert!(!evidence_content_is_readable(state), "{state:?}");
+        }
     }
 
     #[tokio::test]
