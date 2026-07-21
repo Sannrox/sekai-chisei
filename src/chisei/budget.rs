@@ -146,6 +146,21 @@ impl BudgetTracker {
             .budget_check_and_reserve_chain(scope_id, metric, estimated as i64, now_ms())
     }
 
+    pub fn check_and_reserve_idempotent(
+        &self,
+        scope_id: &str,
+        estimated: i32,
+        idempotency_key: &str,
+    ) -> Result<(), String> {
+        self.db.budget_check_and_reserve_chain_idempotent(
+            scope_id,
+            METRIC_TOKENS,
+            i64::from(estimated),
+            now_ms(),
+            idempotency_key,
+        )
+    }
+
     /// Adjust reservation to actual usage after the call completes.
     pub fn adjust(&self, scope_id: &str, reserved: i32, actual: i32) {
         self.adjust_with_metric(scope_id, reserved, actual, METRIC_TOKENS)

@@ -63,6 +63,24 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
 
+### External host actions
+
+Host harnesses can submit a versioned external-action authorization request to
+Chisei before invoking a tool, command, API, browser, or device executor.
+Chisei binds the authenticated actor, namespace, operation lineage, canonical
+argument digest, targets, preconditions, risk, expected effects, limits,
+executor, and deadline into one stable request digest. The decision path reuses
+action policy, approval, budget, blast-radius, namespace authorization, audit,
+and idempotency boundaries while keeping external actions distinct from native
+`ExecuteAction` calls.
+
+An authorization decision is not execution evidence. The v1 decision contract
+does not issue a signed permit; permit issuance, redemption, and submitted host
+evidence are separate protocol stages. A host must refuse execution unless it
+can verify the eventual permit and enforce every declared constraint. Chisei
+does not claim that an authorization or host observation proves a physical
+effect occurred.
+
 Operator clients may use `GetEffectivePolicySummary` to render a live,
 read-only namespace projection of effective routing, configured budget limits,
 bounded action-rule counts, and governed worker concurrency. Each section
