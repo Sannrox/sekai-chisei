@@ -1117,7 +1117,7 @@ impl ProviderRegistry {
                         Some("https://api.anthropic.com/v1"),
                         Some("ANTHROPIC_API_KEY"),
                     ),
-                    &["messages", "count_tokens"],
+                    &["messages", "count_tokens", "models"],
                     &[],
                     ProviderCapabilities {
                         responses: false,
@@ -1492,10 +1492,20 @@ pub struct CapabilityMatrix {
     pub registry_state_version: u64,
     pub lifecycle_overrides: Vec<RegistryLifecycleOverride>,
     pub profiles: Vec<ProviderProfile>,
+    #[serde(default)]
+    pub available_models: Vec<crate::chisei::model_availability::AvailableModel>,
 }
 
 impl CapabilityMatrix {
     pub fn built_in() -> Self {
+        Self::with_model_availability(
+            crate::chisei::model_availability::model_availability_snapshot(),
+        )
+    }
+
+    pub fn with_model_availability(
+        availability: crate::chisei::model_availability::ModelAvailabilitySnapshot,
+    ) -> Self {
         let registry = provider_registry_snapshot();
         let profiles = registry
             .profiles
@@ -1518,6 +1528,11 @@ impl CapabilityMatrix {
             registry_state_version: registry.state_version,
             lifecycle_overrides: public_lifecycle_overrides(registry.lifecycle_overrides),
             profiles,
+            available_models: availability
+                .models_by_provider
+                .into_values()
+                .flatten()
+                .collect(),
         }
     }
 

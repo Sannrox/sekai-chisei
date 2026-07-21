@@ -2114,9 +2114,23 @@ async fn proxy_gateway_inner_scoped(
                 "capability discovery requires GET",
             );
         }
+        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+            openai_base_url: state.config.openai_base_url.clone(),
+            openai_api_key: state.config.openai_api_key.clone(),
+            anthropic_base_url: state.config.anthropic_base_url.clone(),
+            anthropic_api_key: state.config.anthropic_api_key.clone(),
+            ollama_url: state
+                .config
+                .ollama_base_url
+                .trim_end_matches("/v1")
+                .to_string(),
+            native_configured: state.config.native_base_url.is_some(),
+        };
+        let availability =
+            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
         let mut response = json_response(
             StatusCode::OK,
-            serde_json::to_value(CapabilityMatrix::built_in())
+            serde_json::to_value(CapabilityMatrix::with_model_availability(availability))
                 .expect("built-in capability matrix is serializable"),
         );
         insert_header(
@@ -2126,13 +2140,16 @@ async fn proxy_gateway_inner_scoped(
         );
         return response;
     }
-    let Some((client_provider, normalized_path)) = upstream_path(&uri) else {
+    let Some((mut client_provider, normalized_path)) = upstream_path(&uri) else {
         return json_error(
             StatusCode::NOT_FOUND,
             "not_found",
             "chisei-gateway currently supports /v1/responses, /v1/chat/completions, /v1/models, /v1/messages, and /v1/messages/count_tokens",
         );
     };
+    if normalized_path.starts_with("/models") && headers.contains_key("anthropic-version") {
+        client_provider = ProviderKind::Anthropic;
+    }
     let responses_profile = normalized_path.starts_with("/responses");
     let responses_create = is_responses_create(&method, &normalized_path);
     if responses_profile && !responses_create {
@@ -15994,6 +16011,52 @@ mod tests {
             Some("Bearer real-openai-key")
         );
         assert_eq!(requests[1].path, "/v1/models/gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn anthropic_models_proxy_uses_anthropic_path_and_api_key() {
+        let upstream_body = r#"{"data":[{"id":"claude-sonnet-4-20250514","type":"model"}]}"#;
+        let (upstream_base, requests) =
+            spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _) = spawn_control_plane().await;
+        let gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+            openai_api_key: None,
+            anthropic_base_url: upstream_base,
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{gateway_base}/v1/models"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), upstream_body);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v1/models");
+        assert_eq!(requests[0].x_api_key.as_deref(), Some("real-anthropic-key"));
+        assert_eq!(requests[0].authorization, None);
     }
 
     #[tokio::test]
