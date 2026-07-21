@@ -1231,6 +1231,7 @@ mod tests {
                 key_id: "codex-app".to_string(),
                 expected_calls: 1,
                 budget_route_bias: String::new(),
+                route_override: String::new(),
             }))
             .await
             .unwrap()
