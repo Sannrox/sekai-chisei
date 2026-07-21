@@ -854,12 +854,115 @@ message IssueGunshiRecommendationsResponse {
 message GetGunshiScorecardRequest { string namespace = 1; }
 message GetGunshiScorecardResponse { string scorecard_json = 1; }
 
+// --- Host-executed external-action authorization ---
+// These contracts describe bounded authority and causal evidence. Chisei does
+// not execute host actions, and v1 authorization decisions do not issue a
+// signed permit; permit issuance is a separate protocol stage.
+message ExternalActionRequest {
+  string version = 1; // external-action.request/v1
+  string operation_id = 2;
+  string parent_operation_id = 3;
+  string attempt_id = 4;
+  string request_id = 5;
+  string actor = 6; // must match the authenticated principal
+  string namespace = 7;
+  string requesting_harness = 8;
+  string intended_executor = 9;
+  string action_type = 10;
+  string parameter_schema = 11;
+  string canonical_arguments_digest = 12;
+  map<string, string> policy_summary = 13; // classified, policy-inspectable fields only
+  repeated string target_selectors = 14;
+  map<string, string> immutable_preconditions = 15;
+  string risk_class = 16; // read | write | destructive
+  repeated string expected_effects = 17;
+  uint32 requested_invocation_count = 18;
+  int64 deadline_ms = 19;
+  uint64 estimated_cost_micros = 20;
+  uint64 estimated_volume = 21;
+  uint32 affected_resource_count = 22;
+  string rollback_capability = 23;
+  repeated string required_host_capabilities = 24;
+  string idempotency_key = 25;
+  string policy_project = 26; // canonical project scope used for policy resolution
+}
+
+message ExternalActionAssuranceDeclaration {
+  string version = 1; // external-action.assurance/v1
+  bool authorization_only = 2;
+  bool host_must_verify_permit = 3;
+  bool host_must_enforce_constraints = 4;
+  bool physical_effect_verified = 5;
+}
+
+message ExternalActionPermit {
+  string version = 1; // external-action.permit/v1
+  string permit_id = 2;
+  string authorization_id = 3;
+  string request_digest = 4;
+  bytes signature = 5;
+  int64 expires_at_ms = 6;
+  repeated string constraints = 7;
+}
+
+message ExternalActionRedemption {
+  string version = 1; // external-action.redemption/v1
+  string permit_id = 2;
+  string redemption_id = 3;
+  string executor = 4;
+  int64 redeemed_at_ms = 5;
+  uint32 invocation_ordinal = 6;
+}
+
+message ExternalActionEvidence {
+  string version = 1; // external-action.evidence/v1
+  string authorization_id = 2;
+  string permit_id = 3;
+  string redemption_id = 4;
+  string evidence_submission_id = 5;
+  string observed_outcome_digest = 6;
+  string observer = 7;
+}
+
+message ExternalActionDecision {
+  string version = 1; // external-action.decision/v1
+  string authorization_id = 2;
+  string request_digest = 3;
+  string decision = 4; // deny | require_approval | permit
+  string reason = 5;
+  string approval_id = 6;
+  string policy_scope = 7;
+  string policy_version = 8;
+  int64 created_at_ms = 9;
+  int64 expires_at_ms = 10;
+  int64 cancelled_at_ms = 11;
+  ExternalActionAssuranceDeclaration assurance = 12;
+  ExternalActionPermit permit = 13; // absent until permit issuance is implemented
+}
+
+message AuthorizeExternalActionRequest { ExternalActionRequest request = 1; }
+message AuthorizeExternalActionResponse { ExternalActionDecision decision = 1; }
+message ResolveExternalActionApprovalRequest {
+  string authorization_id = 1;
+  bool approve = 2;
+  string reason = 3;
+}
+message ResolveExternalActionApprovalResponse { ExternalActionDecision decision = 1; }
+message CancelExternalActionAuthorizationRequest {
+  string authorization_id = 1;
+  string reason = 2;
+}
+message CancelExternalActionAuthorizationResponse { ExternalActionDecision decision = 1; }
+
 // --- Service ---
 
 // Governed decisions for agent operations: context, policy, budgets, routing,
 // evaluation, approvals, and learning. Agent runtimes remain replaceable
 // clients of this service.
 service ChiseiService {
+  rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
+  rpc ResolveExternalActionApproval(ResolveExternalActionApprovalRequest) returns (ResolveExternalActionApprovalResponse);
+  rpc CancelExternalActionAuthorization(CancelExternalActionAuthorizationRequest) returns (CancelExternalActionAuthorizationResponse);
   // Budget
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
