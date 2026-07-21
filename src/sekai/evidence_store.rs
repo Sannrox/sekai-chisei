@@ -735,6 +735,42 @@ impl SekaiDb {
         })
     }
 
+    /// Convert an admitted but not yet projected submission into the normal
+    /// durable rejection outcome used by the evidence funnel.
+    pub fn reject_evidence_submission(
+        &self,
+        submission_id: &str,
+        now_ms: i64,
+        code: &str,
+        summary: &str,
+    ) -> Result<EvidenceAdmission, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let state: String = tx
+            .query_row(
+                "SELECT lifecycle_state FROM sekai_evidence_submissions WHERE id=?1",
+                [submission_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if state != EvidenceLifecycleState::Authorized.as_str() {
+            return Err("only authorized unprojected evidence can be rejected".into());
+        }
+        tx.execute(
+            "DELETE FROM sekai_evidence_idempotency WHERE submission_id=?1",
+            [submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_evidence_source_identity WHERE submission_id=?1",
+            [submission_id],
+        )
+        .map_err(|error| error.to_string())?;
+        reject_existing(tx, submission_id, now_ms, code, summary)
+    }
+
     pub fn get_evidence_submission(
         &self,
         submission_id: &str,
