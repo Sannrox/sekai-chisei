@@ -9,7 +9,9 @@ Routine implementation detail stays in its Issue and pull request.
 
 ## Process
 
-1. Resolve meaningful alternatives in a GitHub Design Discussion.
+1. Resolve meaningful alternatives in a GitHub Design Discussion. In a
+   solo-maintained repository, the accountable maintainer may instead resolve
+   them in the source Issue and proposed ADR pull request.
 2. Copy `0000-template.md` to the next zero-padded number and a short slug.
 3. Open the ADR and implementation in the same PR when practical.
 4. Set the status to `accepted` when merged.
@@ -18,4 +20,4 @@ Routine implementation detail stays in its Issue and pull request.
 
 ## Index
 
-No project decisions have been recorded yet.
+- [ADR 0001: Evaluate bounded ontology entailment at query time](0001-query-time-ontology-entailment.md)
