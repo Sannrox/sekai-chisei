@@ -11,6 +11,10 @@ documentation = "https://github.com/Sannrox/sekai-chisei/tree/main/docs"
 keywords = ["agents", "governance", "llm", "grpc", "local-first"]
 categories = ["development-tools", "web-programming"]
 
+[workspace]
+members = ["crates/sekai-ontology"]
+resolver = "2"
+
 [features]
 default = []
 secret-command = []
