@@ -181,6 +181,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             print!("{}", report.report);
             Ok(())
         }
+        "ontology" => match args.get(1).map(String::as_str) {
+            Some("inspect") => {
+                sekai_chisei::launch::load_local_env();
+                let config = sekai_chisei::ontology_inspect::InspectConfig::from_env_and_args(
+                    args.into_iter().skip(2),
+                )
+                .map_err(std::io::Error::other)?;
+                let output = config.output.clone();
+                sekai_chisei::ontology_inspect::run_inspect(config).await?;
+                println!("created {}", output.display());
+                Ok(())
+            }
+            _ => Err(std::io::Error::other(sekai_chisei::ontology_inspect::usage()).into()),
+        },
         other => {
             eprintln!("unknown command {other:?}");
             print_root_usage();
@@ -305,7 +319,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|replay|report|memory|team|gunshi> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|ontology|receipt|replay|report|memory|team|gunshi> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -330,6 +344,10 @@ fn print_root_usage() {
         sekai_chisei::attest_cli::usage()
     );
     println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
+    println!(
+        "\nOntology inspection:\n  {}",
+        sekai_chisei::ontology_inspect::usage()
+    );
     println!(
         "\nOperation receipt:\n  {}",
         sekai_chisei::receipt_cli::usage()
