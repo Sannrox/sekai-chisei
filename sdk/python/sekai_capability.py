@@ -40,6 +40,8 @@ def native_metadata(call: dict) -> dict[str, str]:
         "x-sekai-namespace": call["namespace"],
         "x-sekai-capability": call["capability"],
         "x-sekai-operation-id": call["operation_id"],
+        "x-chisei-work-unit": call["operation_id"],
+        "x-sekai-catalog-version": call["catalog_version"],
     }
 
 

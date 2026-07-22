@@ -57,6 +57,7 @@ struct CatalogReceiptGuard<'a> {
     namespace: String,
     actor: String,
     capability_name: String,
+    catalog_version: Option<String>,
     policy_decision: Option<String>,
     budget_decision: Option<String>,
     finalized: bool,
@@ -77,6 +78,7 @@ impl CatalogReceiptGuard<'_> {
             &self.namespace,
             &self.actor,
             &self.capability_name,
+            self.catalog_version.as_deref(),
             decision,
             outcome,
             false,
@@ -106,6 +108,7 @@ impl Drop for CatalogReceiptGuard<'_> {
                 &self.namespace,
                 &self.actor,
                 &self.capability_name,
+                self.catalog_version.as_deref(),
                 decision,
                 outcome,
                 false,
@@ -122,6 +125,7 @@ impl SekaiServiceImpl {
         namespace: &str,
         actor: &str,
         capability_name: &str,
+        catalog_version: Option<&str>,
         decision: &str,
         outcome: &str,
         insert_only: bool,
@@ -161,11 +165,15 @@ impl SekaiServiceImpl {
                 attributes("outcome", outcome)
             }
         };
+        let mut intent_attributes = attributes("capability", capability_name);
+        if let Some(catalog_version) = catalog_version.filter(|value| !value.trim().is_empty()) {
+            intent_attributes.insert("reported_catalog_version".into(), catalog_version.into());
+        }
         let mut intent = event(
             "intent",
             None,
             ReceiptEventKind::IntentRecorded,
-            attributes("capability", capability_name),
+            intent_attributes,
         );
         intent.timestamp_ms = started_at_ms;
         let (completed_at_ms, events, uncovered_surfaces) = if insert_only && decision == "pending"
@@ -324,6 +332,84 @@ impl SekaiServiceImpl {
             self.db.put_operation_receipt(&receipt)
         }
         .map_err(Status::internal)
+    }
+
+    fn resolve_catalog_approval_receipt(
+        &self,
+        operation_id: &str,
+        approval_id: &str,
+        actor: &str,
+        decision: &str,
+        action: Option<&str>,
+        outcome: &str,
+    ) -> Result<(), Status> {
+        if operation_id.is_empty() {
+            return Ok(());
+        }
+        let Some(mut receipt) = self
+            .db
+            .get_operation_receipt(operation_id)
+            .map_err(Status::internal)?
+        else {
+            return Ok(());
+        };
+        if receipt.operation_class != "catalog_invocation"
+            || !receipt.events.iter().any(|event| {
+                event.kind == ReceiptEventKind::OutcomeRecorded
+                    && event.attributes.get("approval_id").map(String::as_str) == Some(approval_id)
+            })
+        {
+            return Ok(());
+        }
+        receipt
+            .events
+            .retain(|event| event.kind != ReceiptEventKind::OutcomeRecorded);
+        let now = now_millis();
+        let event =
+            |suffix: &str,
+             parent: &str,
+             kind: ReceiptEventKind,
+             attributes: BTreeMap<String, String>| OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.into(),
+                parent_event_id: Some(format!("{operation_id}:{parent}")),
+                timestamp_ms: now,
+                kind,
+                surface: kind.surface(),
+                actor: actor.into(),
+                references: Vec::new(),
+                attributes,
+            };
+        receipt.events.push(event(
+            "approval",
+            "budget",
+            ReceiptEventKind::ApprovalDecided,
+            BTreeMap::from([
+                ("approval_id".into(), approval_id.into()),
+                ("decision".into(), decision.into()),
+            ]),
+        ));
+        let outcome_parent = if let Some(action) = action {
+            receipt.events.push(event(
+                "action",
+                "approval",
+                ReceiptEventKind::ActionPerformed,
+                BTreeMap::from([("action".into(), action.into())]),
+            ));
+            "action"
+        } else {
+            "approval"
+        };
+        receipt.events.push(event(
+            "outcome",
+            outcome_parent,
+            ReceiptEventKind::OutcomeRecorded,
+            BTreeMap::from([("outcome".into(), outcome.into())]),
+        ));
+        receipt.completed_at_ms = Some(now);
+        self.db
+            .put_operation_receipt(&receipt)
+            .map_err(Status::internal)
     }
 
     pub fn new(db: Arc<SekaiDb>) -> Self {
@@ -4242,6 +4328,13 @@ impl SekaiService for SekaiServiceImpl {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let catalog_version = req
+            .metadata()
+            .get("x-sekai-catalog-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
         if tenant_context.is_some() {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
@@ -4273,6 +4366,7 @@ impl SekaiService for SekaiServiceImpl {
                 namespace,
                 &actor,
                 capability_name,
+                catalog_version.as_deref(),
                 "pending",
                 "invocation_started",
                 true,
@@ -4283,6 +4377,7 @@ impl SekaiService for SekaiServiceImpl {
                 namespace: namespace.to_string(),
                 actor,
                 capability_name: capability_name.clone(),
+                catalog_version: catalog_version.clone(),
                 policy_decision: None,
                 budget_decision: None,
                 finalized: false,
@@ -5885,7 +5980,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ExecuteActionResponse>, Status> {
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&req)?;
-        let work_unit = work_unit_from_metadata(&req);
+        let mut work_unit = work_unit_from_metadata(&req);
         let invoked_capability = req
             .metadata()
             .get("x-sekai-capability")
@@ -5902,6 +5997,13 @@ impl SekaiService for SekaiServiceImpl {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()))
         });
+        let catalog_version = req
+            .metadata()
+            .get("x-sekai-catalog-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let catalog_namespace = req
             .metadata()
             .get("x-sekai-namespace")
@@ -5909,6 +6011,15 @@ impl SekaiService for SekaiServiceImpl {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        if let Some(operation_id) = operation_id.as_deref() {
+            if work_unit.is_empty() {
+                work_unit = operation_id.to_string();
+            } else if work_unit != operation_id {
+                return Err(Status::invalid_argument(
+                    "catalog operation and work-unit correlation must match",
+                ));
+            }
+        }
         let inner = req.into_inner();
         let dry_run = inner.dry_run;
         let r = inner
@@ -5945,6 +6056,7 @@ impl SekaiService for SekaiServiceImpl {
                         invocation_namespace,
                         actor,
                         capability_name,
+                        catalog_version.as_deref(),
                         "refuse",
                         "capability_unavailable",
                         true,
@@ -5962,6 +6074,7 @@ impl SekaiService for SekaiServiceImpl {
                 invocation_namespace,
                 &actor,
                 capability_name,
+                catalog_version.as_deref(),
                 "pending",
                 "invocation_started",
                 true,
@@ -5972,6 +6085,7 @@ impl SekaiService for SekaiServiceImpl {
                 namespace: invocation_namespace.to_string(),
                 actor,
                 capability_name: capability_name.clone(),
+                catalog_version: catalog_version.clone(),
                 policy_decision: None,
                 budget_decision: None,
                 finalized: false,
@@ -6793,6 +6907,22 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(Status::internal)?;
 
+        if let Err(error) = self.resolve_catalog_approval_receipt(
+            &approval.work_unit,
+            &approval.id,
+            &approval.decided_by,
+            "approved",
+            Some(&approval.action),
+            "succeeded",
+        ) {
+            tracing::error!(
+                operation_id = approval.work_unit,
+                approval_id = approval.id,
+                error = %error,
+                "approved action committed but catalog receipt projection failed"
+            );
+        }
+
         Ok(Response::new(ApproveActionResponse {
             result: Some(ActionResult {
                 action: approval.action.clone(),
@@ -6859,6 +6989,21 @@ impl SekaiService for SekaiServiceImpl {
                 outcome: approval.outcome.clone(),
             })
             .map_err(Status::internal)?;
+        if let Err(error) = self.resolve_catalog_approval_receipt(
+            &approval.work_unit,
+            &approval.id,
+            &approval.decided_by,
+            "denied",
+            None,
+            "denied",
+        ) {
+            tracing::error!(
+                operation_id = approval.work_unit,
+                approval_id = approval.id,
+                error = %error,
+                "approval denial committed but catalog receipt projection failed"
+            );
+        }
         Ok(Response::new(DenyActionResponse {
             approval: Some(to_proto_action_approval(&approval)),
         }))
@@ -18968,13 +19113,16 @@ mod tests {
         .unwrap();
         svc.create_object(with_named_principal(
             CreateObjectRequest {
-                object: Some(widget_object(
-                    "widget-1",
-                    HashMap::from([
-                        ("name".into(), "one".into()),
-                        ("color".into(), "red".into()),
-                    ]),
-                )),
+                object: Some(Object {
+                    namespace: "acme".into(),
+                    ..widget_object(
+                        "widget-1",
+                        HashMap::from([
+                            ("name".into(), "one".into()),
+                            ("color".into(), "red".into()),
+                        ]),
+                    )
+                }),
             },
             "local",
         ))
@@ -18997,6 +19145,10 @@ mod tests {
         );
         read.metadata_mut()
             .insert("x-sekai-operation-id", "catalog-read-1".parse().unwrap());
+        read.metadata_mut().insert(
+            "x-sekai-catalog-version",
+            "sha256:observed-catalog".parse().unwrap(),
+        );
         let read_response = svc.list_objects(read).await.unwrap();
         assert_eq!(
             read_response
@@ -19012,6 +19164,10 @@ mod tests {
             .unwrap();
         assert!(read_receipt.completeness().complete);
         assert_eq!(read_receipt.operation_class, "catalog_invocation");
+        assert_eq!(
+            read_receipt.events[0].attributes["reported_catalog_version"],
+            "sha256:observed-catalog"
+        );
 
         let mut collision = with_named_principal(
             ListObjectsRequest {
@@ -19101,6 +19257,81 @@ mod tests {
         svc.db
             .upsert_action_policy(&action_policy::ActionPolicy {
                 scope: "acme".into(),
+                default_decision: ActionDecision::RequireApproval,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let mut held = with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "assign_color".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("color".into(), "blue".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            },
+            "local",
+        );
+        for (key, value) in [
+            ("x-sekai-capability", "sekai.actions.assign_color"),
+            ("x-sekai-namespace", "acme"),
+            ("x-sekai-operation-id", "catalog-write-approved-1"),
+            ("x-chisei-work-unit", "catalog-write-approved-1"),
+            (
+                "x-sekai-catalog-version",
+                discovered.catalog_version.as_str(),
+            ),
+        ] {
+            held.metadata_mut().insert(
+                key,
+                value.parse().expect("test metadata must be valid ASCII"),
+            );
+        }
+        let approval_id = svc
+            .execute_action(held)
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap()
+            .approval_id;
+        svc.approve_action(with_named_principal(
+            ApproveActionRequest { approval_id },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let approved_receipt = svc
+            .db
+            .get_operation_receipt("catalog-write-approved-1")
+            .unwrap()
+            .unwrap();
+        assert!(approved_receipt.completeness().complete);
+        assert!(
+            approved_receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::ApprovalDecided)
+        );
+        assert!(
+            approved_receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::ActionPerformed)
+        );
+        assert_eq!(
+            svc.db.get_object("widget-1").unwrap().unwrap().properties["color"],
+            "blue"
+        );
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "acme".into(),
                 default_decision: ActionDecision::Deny,
                 action_overrides: HashMap::new(),
                 risk_overrides: HashMap::new(),
@@ -19148,7 +19379,7 @@ mod tests {
         );
         assert_eq!(
             svc.db.get_object("widget-1").unwrap().unwrap().properties["color"],
-            "red"
+            "blue"
         );
     }
 
