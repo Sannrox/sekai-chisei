@@ -34,6 +34,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
+        "replay" => match args.get(1).map(String::as_str) {
+            Some("export") => {
+                let config = sekai_chisei::replay_cli::ReplayExportConfig::from_args(
+                    args.into_iter().skip(2),
+                )
+                .map_err(std::io::Error::other)?;
+                sekai_chisei::replay_cli::run_export(config).await
+            }
+            _ => Err(std::io::Error::other(sekai_chisei::replay_cli::usage()).into()),
+        },
         "report" => {
             sekai_chisei::report_cli::run_report_command(args.into_iter().skip(1).collect()).await
         }
@@ -295,7 +305,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|report|memory|team|gunshi> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|receipt|replay|report|memory|team|gunshi> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -314,6 +324,7 @@ fn print_root_usage() {
     println!("  {}", sekai_chisei::weekly_report_cli::usage());
     println!("\nGoverned action commands:");
     println!("{}", sekai_chisei::action_cli::usage());
+    println!("\nReplay export:\n  {}", sekai_chisei::replay_cli::usage());
     println!(
         "\nAttestation commands:\n  {}",
         sekai_chisei::attest_cli::usage()
