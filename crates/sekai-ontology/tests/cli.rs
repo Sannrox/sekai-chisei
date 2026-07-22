@@ -346,6 +346,28 @@ fn skill_install_handles_read_only_existing_files() {
 }
 
 #[test]
+fn skill_uninstall_preserves_unrecognized_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("skill");
+    let skill_path = target.join("SKILL.md");
+    fs::create_dir_all(skill_path.join("nested")).unwrap();
+
+    assert_eq!(
+        sekai(&[
+            "skill",
+            "install",
+            "--path",
+            target.to_str().unwrap(),
+            "--uninstall",
+        ])
+        .status
+        .code(),
+        Some(11)
+    );
+    assert!(skill_path.join("nested").is_dir());
+}
+
+#[test]
 fn installed_skill_and_json_query_complete_agent_scenario() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("knowledge.db");
