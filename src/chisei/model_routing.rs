@@ -2,6 +2,9 @@ use crate::chisei::model_availability::AvailableModel;
 use crate::config::Config;
 use crate::llm;
 use crate::llm::ollama::InstalledModel;
+use crate::provider_profile::{
+    CapabilityRequirements, ProviderCapabilities, provider_registry_snapshot,
+};
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -13,6 +16,7 @@ pub struct RoutingContext<'a> {
     pub ollama_models: &'a [InstalledModel],
     pub available_models: &'a [AvailableModel],
     pub authoritative_providers: &'a [String],
+    pub requirements: Option<&'a CapabilityRequirements>,
     pub safe_only: bool,
     pub safe_providers: &'a HashSet<String>,
 }
@@ -51,24 +55,38 @@ pub fn resolve_model(ctx: RoutingContext<'_>) -> Result<String, String> {
 
     if let Some((provider, alias)) = alias_parts(ctx.requested) {
         let candidates = candidate_pool(&ctx);
-        let candidate = choose_candidate(provider, alias, &candidates)?;
+        let capability_rejected = capability_filter_removed_all(&ctx, provider, &candidates);
+        let candidate = choose_candidate(provider, alias, &candidates, capability_rejected)?;
         return Ok(candidate.model.clone());
     }
 
     if let Some(name) = exact_available_ollama_name(ctx.requested, ctx.ollama_models) {
-        return safe_resolved(format!("ollama/{name}"), &ctx);
+        let resolved = format!("ollama/{name}");
+        ensure_model_capabilities(&resolved, &ctx)?;
+        return safe_resolved(resolved, &ctx);
     }
 
     if let Some(name) = ctx.requested.strip_prefix("ollama/") {
         if has_available_model(name, ctx.ollama_models) {
+            ensure_model_capabilities(ctx.requested, &ctx)?;
             return safe_resolved(ctx.requested.to_string(), &ctx);
         }
         let fallback_alias = ctx.route_bias.unwrap_or("capable");
         let candidates = candidate_pool(&ctx);
-        let candidate =
-            choose_candidate(Some("ollama"), fallback_alias, &candidates).map_err(|_| {
+        let capability_rejected = capability_filter_removed_all(&ctx, Some("ollama"), &candidates);
+        let candidate = choose_candidate(
+            Some("ollama"),
+            fallback_alias,
+            &candidates,
+            capability_rejected,
+        )
+        .map_err(|error| {
+            if error.starts_with("capability_unsupported:") {
+                error
+            } else {
                 missing_model_message(ctx.requested, ctx.ollama_models, ctx.allowed_models)
-            })?;
+            }
+        })?;
         return Ok(candidate.model.clone());
     }
 
@@ -98,6 +116,7 @@ pub fn resolve_override(ctx: RoutingContext<'_>) -> Result<String, String> {
     if !provider_is_available(provider, ctx.config) {
         return Err(format!("model_unavailable: {:?}", ctx.requested));
     }
+    ensure_available_capabilities(available, &ctx)?;
     Ok(available.canonical_model.clone())
 }
 
@@ -122,17 +141,24 @@ fn validate_or_fallback_provider_model(ctx: RoutingContext<'_>) -> Result<String
     if provider_is_available(provider, ctx.config)
         && (!provider_has_live_catalog || requested_is_available)
     {
+        ensure_model_capabilities(ctx.requested, &ctx)?;
         return Ok(ctx.requested.to_string());
     }
 
     let fallback_alias = ctx.route_bias.unwrap_or("capable");
     let candidates = candidate_pool(&ctx);
-    let candidate = choose_candidate(None, fallback_alias, &candidates).map_err(|_| {
-        format!(
-            "provider {provider:?} is not configured for model {:?}",
-            ctx.requested
-        )
-    })?;
+    let capability_rejected = capability_filter_removed_all(&ctx, None, &candidates);
+    let candidate = choose_candidate(None, fallback_alias, &candidates, capability_rejected)
+        .map_err(|error| {
+            if error.starts_with("capability_unsupported:") {
+                error
+            } else {
+                format!(
+                    "provider {provider:?} is not configured for model {:?}",
+                    ctx.requested
+                )
+            }
+        })?;
     Ok(candidate.model.clone())
 }
 
@@ -174,6 +200,25 @@ fn candidate_pool(ctx: &RoutingContext<'_>) -> Vec<Candidate> {
     }
 
     candidates
+}
+
+fn capability_filter_removed_all(
+    ctx: &RoutingContext<'_>,
+    provider: Option<&str>,
+    constrained: &[Candidate],
+) -> bool {
+    if ctx.requirements.is_none()
+        || constrained.iter().any(|candidate| {
+            provider.is_none_or(|provider| llm::provider_name(&candidate.model) == provider)
+        })
+    {
+        return false;
+    }
+    let mut unconstrained = ctx.clone();
+    unconstrained.requirements = None;
+    candidate_pool(&unconstrained).iter().any(|candidate| {
+        provider.is_none_or(|provider| llm::provider_name(&candidate.model) == provider)
+    })
 }
 
 fn discover_default_candidates(ctx: &RoutingContext<'_>) -> Vec<String> {
@@ -230,6 +275,9 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
             if ctx.safe_only && !provider_is_safe(&available.provider, ctx) {
                 return None;
             }
+            if !available_capabilities_satisfy(available, ctx) {
+                return None;
+            }
             return Some(Candidate {
                 model: available.canonical_model.clone(),
                 cost_rank: available
@@ -237,7 +285,16 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
                     .unwrap_or_else(|| named_model_cost_rank(&available.upstream_model)),
                 capability_rank: available
                     .capability_rank
-                    .unwrap_or_else(|| named_model_capability_rank(&available.upstream_model)),
+                    .or_else(|| {
+                        // Equal catalog metadata means equal capability tier. Do not
+                        // recreate the removed model-name heuristic here; the normal
+                        // cost/model tie-breakers provide deterministic selection.
+                        available
+                            .capabilities
+                            .as_ref()
+                            .map(capability_metadata_rank)
+                    })
+                    .unwrap_or_default(),
             });
         }
         if ctx
@@ -249,6 +306,9 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
         }
     }
     if let Some(name) = exact_available_ollama_name(model, ctx.ollama_models) {
+        if !provider_capabilities_satisfy("ollama", ctx) {
+            return None;
+        }
         let installed = ctx
             .ollama_models
             .iter()
@@ -261,6 +321,9 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
     }
 
     if let Some(name) = model.strip_prefix("ollama/") {
+        if !provider_capabilities_satisfy("ollama", ctx) {
+            return None;
+        }
         let installed = ctx
             .ollama_models
             .iter()
@@ -277,6 +340,9 @@ fn build_candidate(model: &str, ctx: &RoutingContext<'_>) -> Option<Candidate> {
         return None;
     }
     if ctx.safe_only && !provider_is_safe(provider, ctx) {
+        return None;
+    }
+    if !provider_capabilities_satisfy(provider, ctx) {
         return None;
     }
 
@@ -297,6 +363,98 @@ fn safe_resolved(model: String, ctx: &RoutingContext<'_>) -> Result<String, Stri
     Ok(model)
 }
 
+fn available_capabilities_satisfy(available: &AvailableModel, ctx: &RoutingContext<'_>) -> bool {
+    let Some(requirements) = ctx.requirements else {
+        return true;
+    };
+    available
+        .capabilities
+        .as_ref()
+        .is_some_and(|capabilities| requirements.unsupported_by(capabilities).is_empty())
+}
+
+fn provider_capabilities_satisfy(provider: &str, ctx: &RoutingContext<'_>) -> bool {
+    let Some(requirements) = ctx.requirements else {
+        return true;
+    };
+    provider_registry_snapshot()
+        .effective_profile(provider)
+        .is_some_and(|profile| {
+            requirements
+                .unsupported_by(&profile.capabilities)
+                .is_empty()
+        })
+}
+
+fn ensure_available_capabilities(
+    available: &AvailableModel,
+    ctx: &RoutingContext<'_>,
+) -> Result<(), String> {
+    let Some(requirements) = ctx.requirements else {
+        return Ok(());
+    };
+    let Some(capabilities) = available.capabilities.as_ref() else {
+        return Err(format!(
+            "capability_unsupported: model {:?} has no capability metadata",
+            available.canonical_model
+        ));
+    };
+    capability_result(&available.canonical_model, requirements, capabilities)
+}
+
+fn ensure_model_capabilities(model: &str, ctx: &RoutingContext<'_>) -> Result<(), String> {
+    let Some(requirements) = ctx.requirements else {
+        return Ok(());
+    };
+    if let Some(available) = ctx.available_models.iter().find(|available| {
+        available.routable
+            && (available.canonical_model == model || available.upstream_model == model)
+    }) {
+        return ensure_available_capabilities(available, ctx);
+    }
+    let provider = llm::provider_name(model);
+    let profile = provider_registry_snapshot()
+        .effective_profile(provider)
+        .ok_or_else(|| {
+            format!("capability_unsupported: provider {provider:?} has no capability profile")
+        })?;
+    capability_result(model, requirements, &profile.capabilities)
+}
+
+fn capability_result(
+    model: &str,
+    requirements: &CapabilityRequirements,
+    capabilities: &ProviderCapabilities,
+) -> Result<(), String> {
+    let missing = requirements.unsupported_by(capabilities);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "capability_unsupported: model {model:?} cannot preserve required capabilities: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn capability_metadata_rank(capabilities: &ProviderCapabilities) -> i32 {
+    let boolean_tier = [
+        capabilities.responses,
+        capabilities.streaming,
+        capabilities.tools,
+        capabilities.parallel_tools,
+        capabilities.structured_output,
+        capabilities.reasoning_controls,
+        capabilities.provider_continuation,
+    ]
+    .into_iter()
+    .filter(|supported| *supported)
+    .count() as i32;
+    boolean_tier * 100
+        + capabilities.modalities.len() as i32 * 10
+        + capabilities.built_in_tools.len() as i32
+}
+
 fn provider_is_safe(provider: &str, ctx: &RoutingContext<'_>) -> bool {
     crate::chisei::privacy::provider_safe_to_send(provider, ctx.safe_providers)
 }
@@ -305,6 +463,7 @@ fn choose_candidate(
     provider: Option<&str>,
     alias: &str,
     candidates: &[Candidate],
+    capability_constrained: bool,
 ) -> Result<Candidate, String> {
     let mut sorted = candidates
         .iter()
@@ -322,13 +481,23 @@ fn choose_candidate(
         _ => right
             .capability_rank
             .cmp(&left.capability_rank)
-            .then_with(|| left.cost_rank.cmp(&right.cost_rank))
+            // When capability metadata is equal, the capable tier prefers the
+            // higher cost tier instead of silently demoting to the cheap tier.
+            .then_with(|| right.cost_rank.cmp(&left.cost_rank))
             .then_with(|| left.model.cmp(&right.model)),
     });
     sorted
         .into_iter()
         .next()
-        .ok_or_else(|| format!("no candidate available for alias {alias:?}"))
+        .ok_or_else(|| {
+            if capability_constrained {
+                format!(
+                    "capability_unsupported: no available candidate can preserve required capabilities for alias {alias:?}"
+                )
+            } else {
+                format!("no candidate available for alias {alias:?}")
+            }
+        })
 }
 
 fn ollama_cost_rank(model: &InstalledModel) -> i32 {
@@ -461,7 +630,7 @@ mod tests {
     use crate::chisei::model_availability::AvailableModel;
     use crate::config::Config;
     use crate::llm::ollama::InstalledModel;
-    use crate::provider_profile::ProviderRegistry;
+    use crate::provider_profile::{CapabilityRequirements, ProviderRegistry};
 
     fn config() -> Config {
         Config {
@@ -545,6 +714,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -564,6 +734,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &["ollama".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -583,6 +754,7 @@ mod tests {
             ollama_models: &[],
             available_models: &discovered,
             authoritative_providers: &["openai".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -597,6 +769,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -620,6 +793,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[disabled],
             authoritative_providers: &["openai".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         });
@@ -638,6 +812,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &["openai".into(), "anthropic".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         });
@@ -660,6 +835,7 @@ mod tests {
             ollama_models: &installed,
             available_models: &discovered,
             authoritative_providers: &["openai".into(), "ollama".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -685,11 +861,156 @@ mod tests {
             ollama_models: &[],
             available_models: &models,
             authoritative_providers: &["ollama".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "ollama/a-large");
+    }
+
+    #[test]
+    fn structured_output_requirement_excludes_incapable_discovered_model() {
+        let config = config();
+        let mut incapable = discovered("openai", "gpt-incapable");
+        incapable.capabilities.as_mut().unwrap().structured_output = false;
+        incapable.capability_rank = Some(1_000);
+        let mut capable = discovered("openai", "gpt-capable");
+        capable.capabilities.as_mut().unwrap().structured_output = true;
+        capable.capability_rank = Some(10);
+        let available = vec![incapable, capable];
+        let requirements = CapabilityRequirements {
+            structured_output: true,
+            ..CapabilityRequirements::default()
+        };
+
+        let resolved = resolve_model(RoutingContext {
+            requested: "openai/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &available,
+            authoritative_providers: &["openai".into()],
+            requirements: Some(&requirements),
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+
+        assert_eq!(resolved, "openai/gpt-capable");
+        let selected = available
+            .iter()
+            .find(|model| model.canonical_model == resolved)
+            .unwrap();
+        assert!(
+            requirements
+                .unsupported_by(selected.capabilities.as_ref().unwrap())
+                .is_empty(),
+            "the router and gateway post-route capability check must agree"
+        );
+    }
+
+    #[test]
+    fn capability_requirement_fails_before_selecting_only_incapable_model() {
+        let config = config();
+        let mut incapable = discovered("openai", "gpt-only-model");
+        incapable.capabilities.as_mut().unwrap().structured_output = false;
+        let requirements = CapabilityRequirements {
+            structured_output: true,
+            ..CapabilityRequirements::default()
+        };
+
+        let error = resolve_model(RoutingContext {
+            requested: "openai/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[incapable],
+            authoritative_providers: &["openai".into()],
+            requirements: Some(&requirements),
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap_err();
+
+        assert!(error.starts_with("capability_unsupported:"));
+    }
+
+    #[test]
+    fn capable_ranking_uses_discovered_tier_not_model_name() {
+        let config = config();
+        let mut misleading_opus = discovered("openai", "looks-like-opus");
+        misleading_opus.capability_rank = Some(1);
+        let mut misleading_mini = discovered("openai", "looks-like-mini");
+        misleading_mini.capability_rank = Some(100);
+        let available = vec![misleading_opus, misleading_mini];
+
+        let resolved = resolve_model(RoutingContext {
+            requested: "openai/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &available,
+            authoritative_providers: &["openai".into()],
+            requirements: None,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+
+        assert_eq!(resolved, "openai/looks-like-mini");
+    }
+
+    #[test]
+    fn capable_ranking_does_not_demote_when_catalog_tiers_are_equal() {
+        let config = config();
+        let available = vec![
+            discovered("openai", "gpt-high"),
+            discovered("openai", "gpt-low-mini"),
+        ];
+
+        let resolved = resolve_model(RoutingContext {
+            requested: "openai/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &available,
+            authoritative_providers: &["openai".into()],
+            requirements: None,
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+
+        assert_eq!(resolved, "openai/gpt-high");
+    }
+
+    #[test]
+    fn empty_pool_without_capability_rejection_keeps_availability_error() {
+        let config = keyless_config();
+        let requirements = CapabilityRequirements {
+            structured_output: true,
+            ..CapabilityRequirements::default()
+        };
+        let error = resolve_model(RoutingContext {
+            requested: "openai/capable",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &[],
+            available_models: &[],
+            authoritative_providers: &[],
+            requirements: Some(&requirements),
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap_err();
+
+        assert!(!error.starts_with("capability_unsupported:"));
     }
 
     #[test]
@@ -703,6 +1024,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         });
@@ -721,6 +1043,7 @@ mod tests {
             ollama_models: &available,
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -740,6 +1063,7 @@ mod tests {
             ollama_models: &available,
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -759,11 +1083,64 @@ mod tests {
             ollama_models: &available,
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
         .unwrap();
         assert_eq!(resolved, "ollama/llama3.2:latest");
+    }
+
+    #[test]
+    fn canonical_installed_ollama_model_still_enforces_requirements() {
+        let config = config();
+        let available = vec![model("llama3.2:latest", 3.2)];
+        let requirements = CapabilityRequirements {
+            provider_continuation: true,
+            ..CapabilityRequirements::default()
+        };
+
+        let error = resolve_model(RoutingContext {
+            requested: "ollama/llama3.2:latest",
+            allowed_models: &[],
+            route_bias: None,
+            config: &config,
+            ollama_models: &available,
+            available_models: &[],
+            authoritative_providers: &[],
+            requirements: Some(&requirements),
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap_err();
+
+        assert!(error.starts_with("capability_unsupported:"));
+    }
+
+    #[test]
+    fn capability_constrained_alias_skips_installed_ollama_for_capable_provider() {
+        let config = config();
+        let installed = vec![model("llama3.2:latest", 3.2)];
+        let requirements = CapabilityRequirements {
+            reasoning_controls: true,
+            ..CapabilityRequirements::default()
+        };
+
+        let resolved = resolve_model(RoutingContext {
+            requested: "capable",
+            allowed_models: &["ollama/llama3.2:latest".into(), "gpt-4.1".into()],
+            route_bias: None,
+            config: &config,
+            ollama_models: &installed,
+            available_models: &[],
+            authoritative_providers: &[],
+            requirements: Some(&requirements),
+            safe_only: false,
+            safe_providers: &std::collections::HashSet::new(),
+        })
+        .unwrap();
+
+        assert_eq!(resolved, "gpt-4.1");
     }
 
     #[test]
@@ -779,6 +1156,7 @@ mod tests {
             ollama_models: &available,
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -802,6 +1180,7 @@ mod tests {
             ollama_models: &available,
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: true,
             safe_providers: &safe,
         })
@@ -821,6 +1200,7 @@ mod tests {
             ollama_models: &[],
             available_models: &[],
             authoritative_providers: &[],
+            requirements: None,
             safe_only: true,
             safe_providers: &safe,
         })
@@ -843,6 +1223,7 @@ mod tests {
             ollama_models: &[],
             available_models: &available,
             authoritative_providers: &["openai".into()],
+            requirements: None,
             safe_only: false,
             safe_providers: &std::collections::HashSet::new(),
         })
@@ -866,6 +1247,7 @@ mod tests {
             ollama_models: &[],
             available_models: std::slice::from_ref(&disabled),
             authoritative_providers: &authoritative,
+            requirements: None,
             safe_only,
             safe_providers: &safe,
         };
@@ -898,6 +1280,7 @@ mod tests {
             ollama_models: &[],
             available_models: std::slice::from_ref(&fallback),
             authoritative_providers: &authoritative,
+            requirements: None,
             safe_only: false,
             safe_providers: &safe,
         };

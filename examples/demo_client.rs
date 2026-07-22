@@ -349,6 +349,7 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             expected_calls: 1,
             budget_route_bias: String::new(),
             route_override: String::new(),
+            capability_requirements_json: Vec::new(),
         })
         .await
     {
