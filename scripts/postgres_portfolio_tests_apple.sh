@@ -78,4 +78,7 @@ container exec "$CONTAINER_NAME" pg_isready -U sekai -d sekai_test >/dev/null
 
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt" \
+  cargo test --locked 'db::postgres::tests::' -- --ignored --nocapture
+SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}/sekai_test" \
+SEKAI_TEST_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt" \
   cargo test --locked 'db::postgres_portfolio::tests::' -- --ignored --nocapture
