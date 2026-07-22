@@ -36,6 +36,7 @@ message PortfolioPoint {
   int64 cost_usd_micros = 3;
   int64 sample_count = 4;
   int64 updated_at = 5;
+  string prompt_variant = 6;
 }
 
 message PortfolioObjective {
@@ -62,6 +63,7 @@ message PortfolioAllocation {
   double quality_score = 3;
   int64 cost_per_call_usd_micros = 4;
   int64 expected_calls = 5;
+  string prompt_variant = 6;
 }
 
 message PipelineRequest {
@@ -470,6 +472,8 @@ message RecordPortfolioObservationRequest {
   int64 cost_usd_micros = 5;
   int64 sample_count = 6;
   int64 updated_at = 7;
+  // Omitted or empty values use the reserved legacy@1 identity.
+  string prompt_variant = 8;
 }
 message RecordPortfolioObservationResponse { repeated PortfolioPoint frontier = 1; }
 message GetPortfolioFrontierRequest { string namespace = 1; string task_class = 2; }

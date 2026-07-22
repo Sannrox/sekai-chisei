@@ -362,6 +362,7 @@ impl ScoringJob {
                         namespace: obs.namespace.clone(),
                         task_class: obs.task_class.clone(),
                         model: obs.resolved_model.clone(),
+                        prompt_variant: crate::chisei::portfolio::LEGACY_PROMPT_VARIANT.into(),
                         // A judge score cannot override deterministic authored
                         // assertions. Failed gates contribute zero portfolio
                         // value so routing never optimizes toward outputs that
