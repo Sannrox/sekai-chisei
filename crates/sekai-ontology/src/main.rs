@@ -4,7 +4,8 @@ use sekai_ontology::{
 };
 use serde::Serialize;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -302,9 +303,7 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
     }
     if target.exists() {
-        let current = fs::read_to_string(target).map_err(|error| {
-            Error::Input(format!("cannot read '{}': {error}", target.display()))
-        })?;
+        let (mut file, current) = open_existing_skill(target)?;
         if current == EMBEDDED_SKILL {
             eprintln!("skill already current at {}", target.display());
             return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
@@ -323,16 +322,49 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
             );
             return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
         }
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            Error::Input(format!("cannot seek '{}': {error}", target.display()))
+        })?;
+        file.set_len(0).map_err(|error| {
+            Error::Input(format!("cannot truncate '{}': {error}", target.display()))
+        })?;
+        file.write_all(EMBEDDED_SKILL.as_bytes()).map_err(|error| {
+            Error::Input(format!("cannot write '{}': {error}", target.display()))
+        })?;
+        println!("installed {}", target.display());
+        return Ok(ExitCode::SUCCESS);
     }
     let parent = target
         .parent()
         .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
     fs::create_dir_all(parent)
         .map_err(|error| Error::Input(format!("cannot create '{}': {error}", parent.display())))?;
-    fs::write(target, EMBEDDED_SKILL)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|error| Error::Input(format!("cannot create '{}': {error}", target.display())))?;
+    file.write_all(EMBEDDED_SKILL.as_bytes())
         .map_err(|error| Error::Input(format!("cannot write '{}': {error}", target.display())))?;
     println!("installed {}", target.display());
     Ok(ExitCode::SUCCESS)
+}
+
+fn open_existing_skill(target: &Path) -> Result<(File, String), Error> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(target)
+        .map_err(|error| Error::Input(format!("cannot open '{}': {error}", target.display())))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| Error::Input(format!("cannot read '{}': {error}", target.display())))?;
+    Ok((file, content))
 }
 
 fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
