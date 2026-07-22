@@ -1,6 +1,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+#[cfg(test)]
+use native_tls::Certificate;
 use native_tls::TlsConnector;
 use postgres::{Config as PostgresConfig, config::SslMode};
 use postgres_native_tls::MakeTlsConnector;
@@ -38,6 +40,35 @@ impl std::fmt::Debug for PostgresDb {
 
 impl PostgresDb {
     pub fn connect(database_url: &str, max_connections: u32) -> Result<Self, String> {
+        let tls = TlsConnector::builder()
+            .build()
+            .map(MakeTlsConnector::new)
+            .map_err(|error| format!("build PostgreSQL TLS connector: {error}"))?;
+        Self::connect_with_tls(database_url, max_connections, tls)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_with_test_ca(
+        database_url: &str,
+        max_connections: u32,
+        ca_certificate_pem: &[u8],
+    ) -> Result<Self, String> {
+        let certificate = Certificate::from_pem(ca_certificate_pem)
+            .map_err(|error| format!("parse PostgreSQL test CA certificate: {error}"))?;
+        let mut builder = TlsConnector::builder();
+        builder.add_root_certificate(certificate);
+        let tls = builder
+            .build()
+            .map(MakeTlsConnector::new)
+            .map_err(|error| format!("build PostgreSQL test TLS connector: {error}"))?;
+        Self::connect_with_tls(database_url, max_connections, tls)
+    }
+
+    fn connect_with_tls(
+        database_url: &str,
+        max_connections: u32,
+        tls: MakeTlsConnector,
+    ) -> Result<Self, String> {
         if database_url.trim().is_empty() {
             return Err("PostgreSQL database URL must not be empty".into());
         }
@@ -45,10 +76,6 @@ impl PostgresDb {
             return Err("PostgreSQL pool size must be greater than zero".into());
         }
         let config = secure_config(database_url)?;
-        let tls = TlsConnector::builder()
-            .build()
-            .map(MakeTlsConnector::new)
-            .map_err(|error| format!("build PostgreSQL TLS connector: {error}"))?;
         let manager = PostgresConnectionManager::new(config, tls);
         let pool = Pool::builder()
             .max_size(max_connections)

@@ -36,6 +36,21 @@ curl -sS -X POST "http://localhost:8080/v1/chat/completions" \
 
 Use `docker compose down` to stop and keep the persisted data volume.
 
+## PostgreSQL portfolio tests with Apple container
+
+On Apple silicon with macOS 26 and the Apple `container` CLI, run the ignored
+PostgreSQL portfolio contract and advisory-lock tests against an ephemeral,
+TLS-enabled PostgreSQL instance:
+
+```bash
+scripts/postgres_portfolio_tests_apple.sh
+```
+
+The script generates a one-day test CA and server certificate, publishes
+PostgreSQL on `127.0.0.1:55432`, runs the focused tests, and removes the
+container and certificates on exit. Override the port or OCI image with
+`SEKAI_TEST_POSTGRES_PORT` or `SEKAI_TEST_POSTGRES_IMAGE`.
+
 ## Container env vars
 
 | Variable | Default | Meaning |
