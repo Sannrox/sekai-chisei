@@ -90,6 +90,8 @@ impl Provider for Anthropic {
             input_tokens: v["usage"]["input_tokens"].as_i64().unwrap_or(0) as i32,
             output_tokens: v["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32,
             stop_reason: v["stop_reason"].as_str().unwrap_or("").to_string(),
+            cache_read_input_tokens: usage_tokens(&v["usage"], "cache_read_input_tokens"),
+            cache_creation_input_tokens: usage_tokens(&v["usage"], "cache_creation_input_tokens"),
         })
     }
 
@@ -122,6 +124,8 @@ impl Provider for Anthropic {
             let mut content = String::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
+            let mut cache_read_input_tokens = 0;
+            let mut cache_creation_input_tokens = 0;
             let mut stop_reason = String::new();
             let mut emitted_done = false;
 
@@ -143,6 +147,8 @@ impl Provider for Anthropic {
                         &mut content,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut cache_read_input_tokens,
+                        &mut cache_creation_input_tokens,
                         &mut stop_reason,
                         &mut emitted_done,
                     ) {
@@ -156,6 +162,8 @@ impl Provider for Anthropic {
                     &mut content,
                     &mut input_tokens,
                     &mut output_tokens,
+                    &mut cache_read_input_tokens,
+                    &mut cache_creation_input_tokens,
                     &mut stop_reason,
                     &mut emitted_done,
                 ) {
@@ -171,6 +179,8 @@ impl Provider for Anthropic {
                     output_tokens,
                     stop_reason,
                     done: true,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
                 });
             }
         }))
@@ -178,7 +188,7 @@ impl Provider for Anthropic {
 }
 
 fn messages_body(req: &ChatRequest, stream: bool) -> Value {
-    let messages: Vec<Value> = req
+    let mut messages: Vec<Value> = req
         .messages
         .iter()
         .map(|m| {
@@ -201,7 +211,11 @@ fn messages_body(req: &ChatRequest, stream: bool) -> Value {
                         "type": "tool_use",
                         "id": tc.id,
                         "name": tc.name,
-                        "input": tc.args,
+                        "input": if req.prompt_cache.enabled {
+                            canonical_json(&tc.args)
+                        } else {
+                            tc.args.clone()
+                        },
                     }));
                 }
                 json!({
@@ -213,25 +227,47 @@ fn messages_body(req: &ChatRequest, stream: bool) -> Value {
             }
         })
         .collect();
+    if req.prompt_cache.enabled
+        && req.prompt_cache.cacheable_message_count > 0
+        && let Some(message) =
+            messages.get_mut(req.prompt_cache.cacheable_message_count.saturating_sub(1))
+    {
+        add_cache_control_to_message(message);
+    }
     let mut body = json!({
         "model": req.model,
         "max_tokens": if req.max_tokens > 0 { req.max_tokens } else { 4096 },
         "messages": messages,
     });
     if !req.system.is_empty() {
-        body["system"] = json!(req.system);
+        body["system"] = if req.prompt_cache.enabled {
+            json!([{"type": "text", "text": req.system, "cache_control": {"type": "ephemeral"}}])
+        } else {
+            json!(req.system)
+        };
     }
     if !req.tools.is_empty() {
-        body["tools"] = json!(
-            req.tools
-                .iter()
-                .map(|t| json!({
+        let mut tools = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
                     "name": t.name,
                     "description": t.description,
-                    "input_schema": t.input_schema,
-                }))
-                .collect::<Vec<_>>()
-        );
+                    "input_schema": if req.prompt_cache.enabled {
+                        canonical_json(&t.input_schema)
+                    } else {
+                        t.input_schema.clone()
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        if req.prompt_cache.enabled
+            && let Some(last) = tools.last_mut()
+        {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["tools"] = json!(tools);
     }
     if stream {
         body["stream"] = json!(true);
@@ -239,11 +275,49 @@ fn messages_body(req: &ChatRequest, stream: bool) -> Value {
     body
 }
 
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn add_cache_control_to_message(message: &mut Value) {
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    if let Some(text) = content.as_str().map(str::to_string) {
+        *content = json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
+    } else if let Some(block) = content.as_array_mut().and_then(|blocks| blocks.last_mut()) {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+}
+
+fn usage_tokens(usage: &Value, field: &str) -> i32 {
+    usage[field]
+        .as_i64()
+        .and_then(|value| i32::try_from(value.max(0)).ok())
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn parse_anthropic_sse_event(
     event: &str,
     content: &mut String,
     input_tokens: &mut i32,
     output_tokens: &mut i32,
+    cache_read_input_tokens: &mut i32,
+    cache_creation_input_tokens: &mut i32,
     stop_reason: &mut String,
     emitted_done: &mut bool,
 ) -> Vec<ChatStreamChunk> {
@@ -257,6 +331,10 @@ fn parse_anthropic_sse_event(
                 *input_tokens = value["message"]["usage"]["input_tokens"]
                     .as_i64()
                     .unwrap_or(0) as i32;
+                *cache_read_input_tokens =
+                    usage_tokens(&value["message"]["usage"], "cache_read_input_tokens");
+                *cache_creation_input_tokens =
+                    usage_tokens(&value["message"]["usage"], "cache_creation_input_tokens");
             }
             "content_block_delta" => {
                 if let Some(delta) = value["delta"]["text"]
@@ -272,6 +350,8 @@ fn parse_anthropic_sse_event(
                         output_tokens: *output_tokens,
                         stop_reason: stop_reason.clone(),
                         done: false,
+                        cache_read_input_tokens: *cache_read_input_tokens,
+                        cache_creation_input_tokens: *cache_creation_input_tokens,
                     });
                 }
             }
@@ -291,6 +371,8 @@ fn parse_anthropic_sse_event(
                     output_tokens: *output_tokens,
                     stop_reason: stop_reason.clone(),
                     done: true,
+                    cache_read_input_tokens: *cache_read_input_tokens,
+                    cache_creation_input_tokens: *cache_creation_input_tokens,
                 });
             }
             _ => {}
@@ -312,8 +394,8 @@ fn event_data_values(event: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anthropic, parse_anthropic_sse_event};
-    use crate::llm::{ChatRequest, HttpTimeouts, Provider};
+    use super::{Anthropic, messages_body, parse_anthropic_sse_event};
+    use crate::llm::{ChatRequest, HttpTimeouts, Message, PromptCacheIntent, Provider, ToolDef};
     use axum::Router;
     use axum::routing::post;
     use std::time::Duration;
@@ -334,6 +416,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             max_tokens: 16,
+            prompt_cache: Default::default(),
         }
     }
 
@@ -361,6 +444,8 @@ mod tests {
         let mut content = String::new();
         let mut input_tokens = 0;
         let mut output_tokens = 0;
+        let mut cache_read_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
         let mut stop_reason = String::new();
         let mut emitted_done = false;
 
@@ -370,6 +455,8 @@ mod tests {
             &mut content,
             &mut input_tokens,
             &mut output_tokens,
+            &mut cache_read_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut stop_reason,
             &mut emitted_done,
         );
@@ -381,6 +468,8 @@ mod tests {
             &mut content,
             &mut input_tokens,
             &mut output_tokens,
+            &mut cache_read_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut stop_reason,
             &mut emitted_done,
         );
@@ -395,6 +484,8 @@ mod tests {
             &mut content,
             &mut input_tokens,
             &mut output_tokens,
+            &mut cache_read_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut stop_reason,
             &mut emitted_done,
         );
@@ -407,6 +498,8 @@ mod tests {
             &mut content,
             &mut input_tokens,
             &mut output_tokens,
+            &mut cache_read_input_tokens,
+            &mut cache_creation_input_tokens,
             &mut stop_reason,
             &mut emitted_done,
         );
@@ -416,6 +509,99 @@ mod tests {
         assert_eq!(chunks[0].input_tokens, 11);
         assert_eq!(chunks[0].output_tokens, 3);
         assert_eq!(chunks[0].stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn native_cache_fixture_places_breakpoints_before_dynamic_context() {
+        let request = ChatRequest {
+            model: "claude-sonnet-4-8".into(),
+            system: "Stable system".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: "Stable document".into(),
+                    tool_call_id: String::new(),
+                    tool_calls: vec![],
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: "Stable answer".into(),
+                    tool_call_id: String::new(),
+                    tool_calls: vec![],
+                },
+                Message {
+                    role: "user".into(),
+                    content: "request-id=dynamic".into(),
+                    tool_call_id: String::new(),
+                    tool_calls: vec![],
+                },
+            ],
+            tools: vec![ToolDef {
+                name: "lookup".into(),
+                description: "Stable tool".into(),
+                input_schema: serde_json::json!({"z": 1, "a": {"y": 2, "b": 3}}),
+            }],
+            max_tokens: 64,
+            prompt_cache: PromptCacheIntent {
+                enabled: true,
+                cacheable_message_count: 2,
+            },
+        };
+
+        let body = messages_body(&request, false);
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(body["messages"][2]["content"].is_string());
+        assert_eq!(
+            serde_json::to_string(&body["tools"][0]["input_schema"]).unwrap(),
+            r#"{"a":{"b":3,"y":2},"z":1}"#
+        );
+
+        let mut changed = request.clone();
+        changed.messages[2].content = "request-id=other".into();
+        let changed_body = messages_body(&changed, false);
+        assert_eq!(body["tools"], changed_body["tools"]);
+        assert_eq!(body["system"], changed_body["system"]);
+        assert_eq!(body["messages"][0], changed_body["messages"][0]);
+        assert_eq!(body["messages"][1], changed_body["messages"][1]);
+        assert_ne!(body["messages"][2], changed_body["messages"][2]);
+    }
+
+    #[test]
+    fn uncached_and_tool_result_requests_keep_expected_wire_shape() {
+        let uncached = ChatRequest {
+            model: "claude-sonnet-4-8".into(),
+            system: "system".into(),
+            messages: vec![Message {
+                role: "tool".into(),
+                content: "result".into(),
+                tool_call_id: "call-1".into(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            max_tokens: 16,
+            prompt_cache: PromptCacheIntent::default(),
+        };
+        let body = messages_body(&uncached, true);
+        assert_eq!(body["system"], "system");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "tool_result");
+        assert!(!body.to_string().contains("cache_control"));
+        assert_eq!(body["stream"], true);
+
+        let mut cached = uncached;
+        cached.prompt_cache = PromptCacheIntent {
+            enabled: true,
+            cacheable_message_count: 1,
+        };
+        let cached_body = messages_body(&cached, false);
+        assert_eq!(
+            cached_body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[tokio::test]

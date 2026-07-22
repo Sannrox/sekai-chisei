@@ -38,7 +38,35 @@ pub async fn execute_chat_request(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatResponse, Status> {
+    execute_chat_request_with_cache(config, budget, r, llm::PromptCacheIntent::default()).await
+}
+
+pub async fn execute_native_chat_request(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    r: ChatRequest,
+    cacheable_message_count: usize,
+) -> Result<ChatResponse, Status> {
+    execute_chat_request_with_cache(
+        config,
+        budget,
+        r,
+        llm::PromptCacheIntent {
+            enabled: true,
+            cacheable_message_count,
+        },
+    )
+    .await
+}
+
+async fn execute_chat_request_with_cache(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    r: ChatRequest,
+    prompt_cache: llm::PromptCacheIntent,
+) -> Result<ChatResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
+    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache);
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.as_deref().unwrap_or("default");
@@ -93,6 +121,7 @@ pub async fn execute_chat_request(
             })
             .collect(),
         max_tokens: r.max_tokens,
+        prompt_cache,
     };
     let resp = match provider.chat(&chat_req).await {
         Ok(r) => r,
@@ -101,7 +130,11 @@ pub async fn execute_chat_request(
             return Err(provider_error_status(e));
         }
     };
-    let actual_tokens = resp.input_tokens + resp.output_tokens;
+    let actual_tokens = resp
+        .input_tokens
+        .saturating_add(resp.output_tokens)
+        .saturating_add(resp.cache_read_input_tokens)
+        .saturating_add(resp.cache_creation_input_tokens);
     budget.adjust(user_id, estimated, actual_tokens);
     let tool_calls = resp
         .tool_calls
@@ -118,6 +151,8 @@ pub async fn execute_chat_request(
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
         stop_reason: resp.stop_reason,
+        cache_read_input_tokens: resp.cache_read_input_tokens,
+        cache_creation_input_tokens: resp.cache_creation_input_tokens,
     })
 }
 
@@ -129,7 +164,36 @@ pub async fn execute_chat_request_stream(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatStreamResponse, Status> {
+    execute_chat_request_stream_with_cache(config, budget, r, llm::PromptCacheIntent::default())
+        .await
+}
+
+pub async fn execute_native_chat_request_stream(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    r: ChatRequest,
+    cacheable_message_count: usize,
+) -> Result<ChatStreamResponse, Status> {
+    execute_chat_request_stream_with_cache(
+        config,
+        budget,
+        r,
+        llm::PromptCacheIntent {
+            enabled: true,
+            cacheable_message_count,
+        },
+    )
+    .await
+}
+
+async fn execute_chat_request_stream_with_cache(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    r: ChatRequest,
+    prompt_cache: llm::PromptCacheIntent,
+) -> Result<ChatStreamResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
+    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache);
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
@@ -152,7 +216,7 @@ pub async fn execute_chat_request_stream(
             return Err(Status::failed_precondition(e));
         }
     };
-    let chat_req = pb_chat_to_domain(r);
+    let chat_req = pb_chat_to_domain(r, prompt_cache);
     let stream = match provider.chat_stream(&chat_req).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -170,7 +234,11 @@ pub async fn execute_chat_request_stream(
         while let Some(next) = stream.next().await {
             match next {
                 Ok(chunk) => {
-                    let actual_tokens = chunk.input_tokens + chunk.output_tokens;
+                    let actual_tokens = chunk
+                        .input_tokens
+                        .saturating_add(chunk.output_tokens)
+                        .saturating_add(chunk.cache_read_input_tokens)
+                        .saturating_add(chunk.cache_creation_input_tokens);
                     if actual_tokens > 0 {
                         last_tokens = actual_tokens;
                     }
@@ -205,7 +273,7 @@ fn provider_error_status(error: String) -> Status {
     }
 }
 
-fn pb_chat_to_domain(r: ChatRequest) -> llm::ChatRequest {
+fn pb_chat_to_domain(r: ChatRequest, prompt_cache: llm::PromptCacheIntent) -> llm::ChatRequest {
     llm::ChatRequest {
         model: r.model,
         system: r.system,
@@ -238,6 +306,57 @@ fn pb_chat_to_domain(r: ChatRequest) -> llm::ChatRequest {
             })
             .collect(),
         max_tokens: r.max_tokens,
+        prompt_cache,
+    }
+}
+
+fn eligible_prompt_cache_intent(
+    registry: &crate::provider_profile::ProviderRegistry,
+    request: &ChatRequest,
+    requested: llm::PromptCacheIntent,
+) -> llm::PromptCacheIntent {
+    if !requested.enabled {
+        return requested;
+    }
+    let Ok(resolved) = registry.resolve_model(&request.model) else {
+        return llm::PromptCacheIntent::default();
+    };
+    let Some(profile) = registry.effective_profile(&resolved.provider) else {
+        return llm::PromptCacheIntent::default();
+    };
+    if !profile.prompt_cache.explicit_breakpoints {
+        return llm::PromptCacheIntent::default();
+    }
+    let stable_bytes = request.system.len()
+        + request
+            .tools
+            .iter()
+            .map(|tool| tool.name.len() + tool.description.len() + tool.input_schema_json.len())
+            .sum::<usize>()
+        + request
+            .messages
+            .iter()
+            .take(requested.cacheable_message_count)
+            .map(|message| {
+                message.role.len()
+                    + message.content.len()
+                    + message.tool_call_id.len()
+                    + message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.id.len() + call.name.len() + call.args_json.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+    let estimated_tokens = stable_bytes.div_ceil(4) as u64;
+    if profile
+        .prompt_cache
+        .minimum_cacheable_tokens
+        .is_some_and(|minimum| estimated_tokens < minimum)
+    {
+        llm::PromptCacheIntent::default()
+    } else {
+        requested
     }
 }
 
@@ -258,6 +377,8 @@ fn domain_chunk_to_pb(chunk: llm::ChatStreamChunk) -> ChatStreamChunk {
         output_tokens: chunk.output_tokens,
         stop_reason: chunk.stop_reason,
         done: chunk.done,
+        cache_read_input_tokens: chunk.cache_read_input_tokens,
+        cache_creation_input_tokens: chunk.cache_creation_input_tokens,
     }
 }
 
@@ -366,5 +487,35 @@ mod tests {
         assert_eq!(precondition.code(), tonic::Code::FailedPrecondition);
         assert_eq!(unavailable.code(), tonic::Code::Unavailable);
         assert_eq!(upstream.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn native_prompt_cache_requires_profile_support_and_minimum_size() {
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let requested = llm::PromptCacheIntent {
+            enabled: true,
+            cacheable_message_count: 0,
+        };
+        let mut request = ChatRequest {
+            model: "anthropic/claude-sonnet-4-8".into(),
+            system: "short".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible_prompt_cache_intent(&registry, &request, requested),
+            llm::PromptCacheIntent::default()
+        );
+
+        request.system = "s".repeat(4 * 4_096);
+        assert_eq!(
+            eligible_prompt_cache_intent(&registry, &request, requested),
+            requested
+        );
+
+        request.model = "openai/gpt-5.5".into();
+        assert_eq!(
+            eligible_prompt_cache_intent(&registry, &request, requested),
+            llm::PromptCacheIntent::default()
+        );
     }
 }
