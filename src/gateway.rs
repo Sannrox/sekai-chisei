@@ -1112,6 +1112,15 @@ pub fn app(config: GatewayConfig) -> Router {
     app_with_runtime(config, GatewayRuntime::from_env())
 }
 
+pub const COMMUNITY_GATEWAY_ROUTES: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/statusz",
+    "/_chisei/admin/refresh",
+    "/_chisei/admin/provider-lifecycle",
+    "/{*path}",
+];
+
 fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
     let state = GatewayState {
         client: runtime.http_timeouts.gateway_client(),
@@ -1119,16 +1128,31 @@ fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> Router {
         runtime,
     };
 
-    Router::new()
-        .route("/healthz", axum::routing::get(gateway_health))
-        .route("/readyz", axum::routing::get(gateway_readiness))
-        .route("/statusz", axum::routing::get(gateway_status))
-        .route("/_chisei/admin/refresh", post(refresh_gateway_admin))
-        .route(
-            "/_chisei/admin/provider-lifecycle",
+    let routes = [
+        (
+            COMMUNITY_GATEWAY_ROUTES[0],
+            axum::routing::get(gateway_health),
+        ),
+        (
+            COMMUNITY_GATEWAY_ROUTES[1],
+            axum::routing::get(gateway_readiness),
+        ),
+        (
+            COMMUNITY_GATEWAY_ROUTES[2],
+            axum::routing::get(gateway_status),
+        ),
+        (COMMUNITY_GATEWAY_ROUTES[3], post(refresh_gateway_admin)),
+        (
+            COMMUNITY_GATEWAY_ROUTES[4],
             put(update_provider_lifecycle_admin),
-        )
-        .route("/{*path}", any(proxy_gateway))
+        ),
+        (COMMUNITY_GATEWAY_ROUTES[5], any(proxy_gateway)),
+    ];
+    routes
+        .into_iter()
+        .fold(Router::new(), |router, (path, method)| {
+            router.route(path, method)
+        })
         .with_state(state)
 }
 

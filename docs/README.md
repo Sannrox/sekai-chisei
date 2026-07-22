@@ -30,6 +30,8 @@ in order.
   the versioned adapter contract.
 - [External-action execution evidence](external-action-execution.md) — report
   host lifecycle observations and reconcile missing terminal evidence.
+- [Tenant isolation conformance](tenant-isolation-conformance.md) — run the
+  reusable enterprise extension isolation suite or community negative profile.
 
 ## Configure and operate
 
