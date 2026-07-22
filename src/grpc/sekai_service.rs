@@ -7939,6 +7939,85 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    async fn create_tenant(
+        &self,
+        req: Request<CreateTenantRequest>,
+    ) -> Result<Response<CreateTenantResponse>, Status> {
+        let actor = tenant_admin_actor(&req)?;
+        let key = require_tenant_request_key(&req.get_ref().idempotency_key)?;
+        let tenant = self
+            .db
+            .create_tenant(&actor, &key, chrono::Utc::now().timestamp_millis())
+            .map_err(tenant_status)?;
+        Ok(Response::new(CreateTenantResponse {
+            tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
+    async fn get_tenant(
+        &self,
+        req: Request<GetTenantRequest>,
+    ) -> Result<Response<GetTenantResponse>, Status> {
+        tenant_admin_actor(&req)?;
+        let id = require_tenant_id(&req.get_ref().tenant_id)?;
+        let tenant = self
+            .db
+            .get_tenant(&id)
+            .map_err(tenant_status)?
+            .ok_or_else(|| Status::not_found("tenant not found"))?;
+        Ok(Response::new(GetTenantResponse {
+            tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
+    async fn suspend_tenant(
+        &self,
+        req: Request<SuspendTenantRequest>,
+    ) -> Result<Response<SuspendTenantResponse>, Status> {
+        let actor = tenant_admin_actor(&req)?;
+        let id = require_tenant_id(&req.get_ref().tenant_id)?;
+        let key = require_tenant_request_key(&req.get_ref().idempotency_key)?;
+        let tenant = self
+            .db
+            .suspend_tenant(&id, &actor, &key, chrono::Utc::now().timestamp_millis())
+            .map_err(tenant_status)?;
+        Ok(Response::new(SuspendTenantResponse {
+            tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
+    async fn reactivate_tenant(
+        &self,
+        req: Request<ReactivateTenantRequest>,
+    ) -> Result<Response<ReactivateTenantResponse>, Status> {
+        let actor = tenant_admin_actor(&req)?;
+        let id = require_tenant_id(&req.get_ref().tenant_id)?;
+        let key = require_tenant_request_key(&req.get_ref().idempotency_key)?;
+        let tenant = self
+            .db
+            .reactivate_tenant(&id, &actor, &key, chrono::Utc::now().timestamp_millis())
+            .map_err(tenant_status)?;
+        Ok(Response::new(ReactivateTenantResponse {
+            tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
+    async fn request_tenant_closure(
+        &self,
+        req: Request<RequestTenantClosureRequest>,
+    ) -> Result<Response<RequestTenantClosureResponse>, Status> {
+        let actor = tenant_admin_actor(&req)?;
+        let id = require_tenant_id(&req.get_ref().tenant_id)?;
+        let key = require_tenant_request_key(&req.get_ref().idempotency_key)?;
+        let tenant = self
+            .db
+            .request_tenant_closure(&id, &actor, &key, chrono::Utc::now().timestamp_millis())
+            .map_err(tenant_status)?;
+        Ok(Response::new(RequestTenantClosureResponse {
+            tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
     async fn rotate_credential(
         &self,
         req: Request<RotateCredentialRequest>,
@@ -8345,6 +8424,71 @@ fn require_credential_admin(principals: &[String]) -> Result<(), Status> {
         return Ok(());
     }
     Err(Status::permission_denied("credential admin required"))
+}
+
+fn tenant_admin_actor(req: &Request<impl std::any::Any>) -> Result<String, Status> {
+    let principals = caller_principals(req);
+    require_credential_admin(&principals)?;
+    principals
+        .into_iter()
+        .find(|principal| matches!(principal.as_str(), "root" | "local"))
+        .ok_or_else(|| Status::permission_denied("tenant admin required"))
+}
+
+fn require_tenant_id(value: &str) -> Result<String, Status> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value.starts_with("tenant_")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(Status::invalid_argument("invalid tenant_id"));
+    }
+    Ok(value.to_string())
+}
+
+fn require_tenant_request_key(value: &str) -> Result<String, Status> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 200 {
+        return Err(Status::invalid_argument(
+            "idempotency_key must be 1..=200 characters",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn tenant_status(error: crate::sekai::tenant::TenantError) -> Status {
+    use crate::sekai::tenant::TenantError;
+    match error {
+        TenantError::NotFound => Status::not_found("tenant not found"),
+        TenantError::Conflict(message) => Status::already_exists(message),
+        TenantError::InvalidTransition { from, action } => Status::failed_precondition(format!(
+            "cannot {action} tenant in {} state",
+            from.as_str()
+        )),
+        TenantError::AdmissionBlocked(state) => Status::failed_precondition(format!(
+            "tenant in {} state cannot admit new work",
+            state.as_str()
+        )),
+        TenantError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn to_proto_tenant(record: crate::sekai::tenant::TenantRecord) -> TenantRecord {
+    let state = match record.state {
+        crate::sekai::tenant::TenantState::Active => TenantLifecycleState::Active,
+        crate::sekai::tenant::TenantState::Suspended => TenantLifecycleState::Suspended,
+        crate::sekai::tenant::TenantState::ClosurePending => TenantLifecycleState::ClosurePending,
+    };
+    TenantRecord {
+        contract_version: record.contract_version,
+        id: record.id,
+        state: state as i32,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+    }
 }
 
 fn validate_credential_principal(principal: &str) -> Result<String, Status> {
@@ -17159,6 +17303,96 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn tenant_rpcs_enforce_admin_lifecycle_and_idempotency() {
+        let svc = service();
+        let denied = svc
+            .create_tenant(with_named_principal(
+                CreateTenantRequest {
+                    idempotency_key: "tenant-create-denied".into(),
+                },
+                "member",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let create = || {
+            with_named_principal(
+                CreateTenantRequest {
+                    idempotency_key: "tenant-create-1".into(),
+                },
+                "root",
+            )
+        };
+        let created = svc
+            .create_tenant(create())
+            .await
+            .unwrap()
+            .into_inner()
+            .tenant
+            .unwrap();
+        let replayed = svc
+            .create_tenant(create())
+            .await
+            .unwrap()
+            .into_inner()
+            .tenant
+            .unwrap();
+        assert_eq!(created, replayed);
+        assert_eq!(
+            created.contract_version,
+            crate::sekai::tenant::TENANT_CONTRACT_VERSION
+        );
+        assert_eq!(created.state(), TenantLifecycleState::Active);
+
+        let suspended = svc
+            .suspend_tenant(with_named_principal(
+                SuspendTenantRequest {
+                    tenant_id: created.id.clone(),
+                    idempotency_key: "tenant-suspend-1".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .tenant
+            .unwrap();
+        assert_eq!(suspended.state(), TenantLifecycleState::Suspended);
+        assert!(matches!(
+            svc.db.require_tenant_admission(&created.id),
+            Err(crate::sekai::tenant::TenantError::AdmissionBlocked(_))
+        ));
+
+        let invalid = svc
+            .suspend_tenant(with_named_principal(
+                SuspendTenantRequest {
+                    tenant_id: created.id.clone(),
+                    idempotency_key: "tenant-suspend-2".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.get_tenant(with_named_principal(
+                GetTenantRequest {
+                    tenant_id: created.id
+                },
+                "root"
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .tenant
+            .unwrap()
+            .state(),
+            TenantLifecycleState::Suspended
+        );
     }
 
     #[tokio::test]
