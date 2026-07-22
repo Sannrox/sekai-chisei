@@ -305,6 +305,16 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
     }
     if target.exists() {
+        let metadata = fs::symlink_metadata(target).map_err(|error| {
+            Error::Input(format!("cannot inspect '{}': {error}", target.display()))
+        })?;
+        if !metadata.file_type().is_file() {
+            eprintln!(
+                "refusing to overwrite non-file skill target at {}",
+                target.display()
+            );
+            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        }
         let current = read_skill_file(target)?;
         if current == EMBEDDED_SKILL {
             eprintln!("skill already current at {}", target.display());
