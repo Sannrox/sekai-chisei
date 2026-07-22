@@ -18,6 +18,7 @@ pub mod execution_evidence;
 pub mod function;
 pub mod handoff;
 pub mod learning;
+pub mod lease;
 pub mod ledger;
 pub mod lineage;
 pub mod observation;
