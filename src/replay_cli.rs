@@ -158,16 +158,22 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
         .map(|object| object.created)
         .min()
         .unwrap_or_default();
-    let decisions = client
-        .list_decisions(ListDecisionsRequest {
-            after: earliest.saturating_sub(1),
-            limit: 500,
-            ..Default::default()
-        })
-        .await?
-        .into_inner()
-        .decisions;
-    let decisions_truncated = decisions.len() == 500;
+    let mut decisions = Vec::new();
+    let mut decisions_truncated = false;
+    for object_id in &visible_ids {
+        let mut object_decisions = client
+            .list_decisions(ListDecisionsRequest {
+                after: earliest.saturating_sub(1),
+                limit: 500,
+                target_id: object_id.clone(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .decisions;
+        decisions_truncated |= object_decisions.len() == 500;
+        decisions.append(&mut object_decisions);
+    }
 
     let mut timeline = Vec::new();
     let mut changes_truncated = false;
@@ -206,32 +212,27 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
             }
         }));
     }
-    timeline.extend(
-        decisions
-            .into_iter()
-            .filter(|decision| {
-                decision.target_id.is_empty() || visible_ids.contains(&decision.target_id)
-            })
-            .map(|decision| TimelineEvent {
-                id: decision.id,
-                timestamp_ms: decision.timestamp,
-                kind: "decision".into(),
-                subject_id: decision.target_id,
-                label: format!("{}: {}", decision.action, decision.outcome),
-                details: decision
-                    .evidence
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let value = sanitize_field_value(&key, value);
-                        (key, value)
-                    })
-                    .chain([
-                        ("actor".into(), decision.actor),
-                        ("reason".into(), decision.reason),
-                    ])
-                    .collect(),
-            }),
-    );
+    timeline.extend(decisions.into_iter().map(|decision| {
+        TimelineEvent {
+            id: decision.id,
+            timestamp_ms: decision.timestamp,
+            kind: "decision".into(),
+            subject_id: decision.target_id,
+            label: format!("{}: {}", decision.action, decision.outcome),
+            details: decision
+                .evidence
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = sanitize_field_value(&key, value);
+                    (key, value)
+                })
+                .chain([
+                    ("actor".into(), decision.actor),
+                    ("reason".into(), decision.reason),
+                ])
+                .collect(),
+        }
+    }));
     timeline.sort_by(|left, right| {
         left.timestamp_ms
             .cmp(&right.timestamp_ms)
