@@ -209,7 +209,12 @@ fn known_rpc(service: &str, method: &str) -> bool {
     match service {
         "sekai.SekaiService" => matches!(
             method,
-            "CreateObject"
+            "AcquireLease"
+                | "GetLease"
+                | "RefreshLease"
+                | "ReleaseLease"
+                | "TakeoverExpiredLease"
+                | "CreateObject"
                 | "GetObject"
                 | "UpdateObject"
                 | "DeleteObject"
