@@ -2175,6 +2175,46 @@ async fn proxy_gateway_inner_scoped(
         );
         return response;
     }
+    if uri.path() == "/v1/chisei/models" {
+        if method != Method::GET {
+            return json_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                "available model discovery requires GET",
+            );
+        }
+        let provider = uri.query().and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("provider="))
+                .map(str::to_string)
+        });
+        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+            openai_base_url: state.config.openai_base_url.clone(),
+            openai_api_key: state.config.openai_api_key.clone(),
+            anthropic_base_url: state.config.anthropic_base_url.clone(),
+            anthropic_api_key: state.config.anthropic_api_key.clone(),
+            ollama_url: state
+                .config
+                .ollama_base_url
+                .trim_end_matches("/v1")
+                .to_string(),
+            native_configured: state.config.native_base_url.is_some(),
+        };
+        let availability =
+            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
+        let mut response = json_response(
+            StatusCode::OK,
+            serde_json::to_value(availability.public_models(provider.as_deref()))
+                .expect("available models view is serializable"),
+        );
+        insert_header(
+            response.headers_mut(),
+            &X_CHISEI_CALLER_SCOPE,
+            &correlation.caller_scope,
+        );
+        return response;
+    }
     let Some((mut client_provider, normalized_path)) = upstream_path(&uri) else {
         return json_error(
             StatusCode::NOT_FOUND,
@@ -18335,6 +18375,43 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn available_models_endpoint_is_authenticated_filterable_and_redacted() {
+        let (upstream_base, _) =
+            spawn_fake_upstream(r#"{"data":[{"id":"gpt-5.5"}]}"#, "application/json").await;
+        let gateway_base = spawn_gateway(upstream_base).await;
+        let client = reqwest::Client::new();
+
+        let unauthenticated = client
+            .get(format!("{gateway_base}/v1/chisei/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = client
+            .get(format!("{gateway_base}/v1/chisei/models?provider=openai"))
+            .bearer_auth("sk-chisei-codex-app")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["version"], "chisei.available-models/v1");
+        assert!(
+            value["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|model| model["provider"] == "openai")
+        );
+        assert!(body.contains("openai/gpt-5.5"));
+        assert!(!body.contains("real-openai-key"));
+        assert!(!body.contains("real-anthropic-key"));
+        assert!(!body.contains("discovery_source"));
     }
 
     #[tokio::test]
