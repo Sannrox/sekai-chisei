@@ -283,10 +283,119 @@ fn route_lock_key(namespace: &str, task_class: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
     use super::*;
+    use crate::db::portfolio_route_test_cases::assert_route_contract;
+
+    const TEST_DATABASE_URL_ENV: &str = "SEKAI_TEST_POSTGRES_URL";
+
+    fn test_database() -> PostgresDb {
+        let database_url = std::env::var(TEST_DATABASE_URL_ENV).unwrap_or_else(|_| {
+            panic!("{TEST_DATABASE_URL_ENV} must point to an isolated PostgreSQL test database")
+        });
+        PostgresDb::connect(&database_url, 4).unwrap()
+    }
 
     #[test]
     fn route_lock_key_is_unambiguous() {
         assert_ne!(route_lock_key("a:b", "c"), route_lock_key("a", "b:c"));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    fn damped_route_matches_shared_contract() {
+        let db = test_database();
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        assert_route_contract(|case, task_class, proposed_model, now_ms, force| {
+            db.portfolio_damped_route(
+                &format!("route-contract-{run_id}-{case}"),
+                task_class,
+                proposed_model,
+                now_ms,
+                force,
+            )
+        });
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    fn advisory_lock_serializes_updates_for_the_same_route() {
+        let db = Arc::new(test_database());
+        let namespace = format!("route-lock-{}", uuid::Uuid::new_v4().simple());
+        let task_class = "primary";
+        db.portfolio_damped_route(&namespace, task_class, "small", 0, false)
+            .unwrap();
+
+        let mut lock_connection = db.connection().unwrap();
+        let mut lock_transaction = lock_connection.transaction().unwrap();
+        let lock_key = route_lock_key(&namespace, task_class);
+        lock_transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&lock_key],
+            )
+            .unwrap();
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let workers = (0..2)
+            .map(|_| {
+                let worker_db = Arc::clone(&db);
+                let worker_namespace = namespace.clone();
+                let worker_started = started_sender.clone();
+                let worker_result = result_sender.clone();
+                std::thread::spawn(move || {
+                    worker_started.send(()).unwrap();
+                    let result = worker_db.portfolio_damped_route(
+                        &worker_namespace,
+                        task_class,
+                        "large",
+                        15 * 60 * 1000,
+                        false,
+                    );
+                    worker_result.send(result).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(started_sender);
+        drop(result_sender);
+
+        for _ in 0..2 {
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("route worker did not start");
+        }
+
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "route update completed while the matching advisory lock was held"
+        );
+        lock_transaction.commit().unwrap();
+
+        let mut reasons = (0..2)
+            .map(|_| {
+                let selection = result_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("route update remained blocked after advisory lock release")
+                    .unwrap();
+                assert_eq!(selection.model, "small");
+                selection.reason
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        reasons.sort();
+        assert_eq!(
+            reasons,
+            [
+                "waiting for allocation confirmation 1/3",
+                "waiting for allocation confirmation 2/3",
+            ]
+        );
     }
 }
