@@ -291,3 +291,17 @@ impl SekaiDb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::portfolio_route_test_cases::assert_route_contract;
+
+    #[test]
+    fn damped_route_matches_shared_contract() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        assert_route_contract(|namespace, task_class, proposed_model, now_ms, force| {
+            db.portfolio_damped_route(namespace, task_class, proposed_model, now_ms, force)
+        });
+    }
+}
