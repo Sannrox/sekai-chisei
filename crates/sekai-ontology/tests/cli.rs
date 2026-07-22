@@ -352,6 +352,15 @@ fn skill_uninstall_preserves_unrecognized_directories() {
     let skill_path = target.join("SKILL.md");
     fs::create_dir_all(skill_path.join("nested")).unwrap();
 
+    for extra in [None, Some("--force")] {
+        let mut arguments = vec!["skill", "install", "--path", target.to_str().unwrap()];
+        if let Some(extra) = extra {
+            arguments.push(extra);
+        }
+        assert_eq!(sekai(&arguments).status.code(), Some(11));
+        assert!(skill_path.join("nested").is_dir());
+    }
+
     assert_eq!(
         sekai(&[
             "skill",
