@@ -22,3 +22,4 @@ Routine implementation detail stays in its Issue and pull request.
 
 - [ADR 0001: Evaluate bounded ontology entailment at query time](0001-query-time-ontology-entailment.md)
 - [ADR 0002: Identify prompt variants by immutable versioned names](0002-versioned-prompt-variant-identity.md)
+- [ADR 0003: Inspect ontology through authenticated static artifacts](0003-authenticated-static-ontology-inspection.md)
