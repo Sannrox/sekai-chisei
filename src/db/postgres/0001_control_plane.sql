@@ -212,9 +212,10 @@ CREATE TABLE IF NOT EXISTS chisei_budget_usage (
 );
 CREATE TABLE IF NOT EXISTS chisei_portfolio_observations (
     namespace TEXT NOT NULL, task_class TEXT NOT NULL, model TEXT NOT NULL,
+    prompt_variant TEXT NOT NULL DEFAULT 'legacy@1',
     quality_score DOUBLE PRECISION NOT NULL, cost_usd_micros BIGINT NOT NULL,
     sample_count BIGINT NOT NULL, updated_at BIGINT NOT NULL,
-    PRIMARY KEY (namespace, task_class, model)
+    PRIMARY KEY (namespace, task_class, model, prompt_variant)
 );
 CREATE INDEX IF NOT EXISTS idx_chisei_portfolio_frontier
     ON chisei_portfolio_observations(namespace, task_class, cost_usd_micros);
@@ -224,7 +225,9 @@ CREATE TABLE IF NOT EXISTS chisei_portfolio_objectives (
 );
 CREATE TABLE IF NOT EXISTS chisei_portfolio_routes (
     namespace TEXT NOT NULL, task_class TEXT NOT NULL, current_model TEXT NOT NULL,
+    current_prompt_variant TEXT NOT NULL DEFAULT 'legacy@1',
     pending_model TEXT NOT NULL DEFAULT '', pending_count BIGINT NOT NULL DEFAULT 0,
+    pending_prompt_variant TEXT NOT NULL DEFAULT '',
     shifted_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
     PRIMARY KEY (namespace, task_class)
 );
