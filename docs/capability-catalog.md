@@ -108,6 +108,14 @@ binding fails closed on version drift and binds these native metadata fields:
 - `x-sekai-namespace`
 - `x-sekai-capability`
 - `x-sekai-operation-id`
+- `x-chisei-work-unit` (the same operation ID, for approval and budget correlation)
+- `x-sekai-catalog-version`
+
+The catalog version is observational provenance rather than authority. The
+server records it as the runtime-reported catalog version in the operation
+receipt so an operator can distinguish what the runtime says it discovered
+from the capability that it selected; live policy and authorization are still
+rechecked at invocation time.
 
 The server still rechecks live namespace access, object ACLs, action policy,
 budget, and approval state. A cached projection is therefore discovery data,
