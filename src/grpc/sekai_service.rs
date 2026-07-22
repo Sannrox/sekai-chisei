@@ -642,7 +642,12 @@ impl SekaiServiceImpl {
         actor: &str,
         principals: &[String],
     ) -> Result<String, Status> {
-        let tenant_context = super::tenant_id_from_principal(actor);
+        if self.db.enterprise_extension().is_some() {
+            return Err(Status::failed_precondition(
+                "enterprise action resumption requires a durable approval identity contract",
+            ));
+        }
+        let tenant_context: Option<RequestEnterpriseContext> = None;
         let actions = self
             .actions
             .read()
@@ -667,7 +672,7 @@ impl SekaiServiceImpl {
             if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
                 enforce_namespace_tenant_context(
                     &self.db,
-                    tenant_context.as_deref(),
+                    tenant_context.as_ref(),
                     &target.namespace,
                     true,
                 )?;
@@ -676,7 +681,7 @@ impl SekaiServiceImpl {
             check_write(&self.security, target_id, principals)?;
         }
         if let Some(namespace) = params.get("namespace") {
-            enforce_namespace_tenant_context(&self.db, tenant_context.as_deref(), namespace, true)?;
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, true)?;
             check_team_namespace(&self.db, principals, namespace, true)?;
         } else if action_name == "create_object"
             && (tenant_context.is_some() || is_managed_team_principal(&self.db, principals)?)
@@ -780,7 +785,7 @@ impl SekaiServiceImpl {
         &self,
         mut object: domain::Object,
         principals: &[String],
-        tenant_context: Option<&str>,
+        tenant_context: Option<&RequestEnterpriseContext>,
     ) -> Result<domain::Object, Status> {
         let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let schema = self
@@ -813,7 +818,7 @@ impl SekaiServiceImpl {
         &self,
         objects: Vec<domain::Object>,
         principals: &[String],
-        tenant_context: Option<&str>,
+        tenant_context: Option<&RequestEnterpriseContext>,
     ) -> Result<Vec<domain::Object>, Status> {
         objects
             .into_iter()
@@ -4002,11 +4007,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<AcquireLeaseResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &input.namespace,
             true,
         )?;
@@ -4035,11 +4040,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetLeaseResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &input.namespace,
             false,
         )?;
@@ -4060,11 +4065,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<RefreshLeaseResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &input.namespace,
             true,
         )?;
@@ -4093,11 +4098,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ReleaseLeaseResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &input.namespace,
             true,
         )?;
@@ -4125,11 +4130,11 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<TakeoverExpiredLeaseResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &input.namespace,
             true,
         )?;
@@ -4160,7 +4165,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input
             .lease_precondition
@@ -4184,13 +4189,13 @@ impl SekaiService for SekaiServiceImpl {
         }
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &object.namespace,
             true,
         )?;
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &precondition.namespace,
             true,
         )?;
@@ -4211,11 +4216,8 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(map_lease_error)?
         {
-            let created = self.resolve_computed_for_response(
-                created,
-                &principals,
-                tenant_context.as_deref(),
-            )?;
+            let created =
+                self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
             return Ok(Response::new(GuardedCreateObjectResponse {
                 object: Some(to_proto_obj(&created)),
             }));
@@ -4254,7 +4256,7 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(map_lease_error)?;
         let created =
-            self.resolve_computed_for_response(created, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GuardedCreateObjectResponse {
             object: Some(to_proto_obj(&created)),
         }))
@@ -4266,7 +4268,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input
             .lease_precondition
@@ -4293,7 +4295,7 @@ impl SekaiService for SekaiServiceImpl {
         if let Some(existing) = &existing {
             enforce_namespace_tenant_context(
                 &self.db,
-                tenant_context.as_deref(),
+                tenant_context.as_ref(),
                 &existing.namespace,
                 true,
             )?;
@@ -4301,13 +4303,13 @@ impl SekaiService for SekaiServiceImpl {
         }
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &object.namespace,
             true,
         )?;
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &precondition.namespace,
             true,
         )?;
@@ -4329,11 +4331,8 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(map_lease_error)?
         {
-            let updated = self.resolve_computed_for_response(
-                updated,
-                &principals,
-                tenant_context.as_deref(),
-            )?;
+            let updated =
+                self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
             return Ok(Response::new(GuardedUpdateObjectResponse {
                 object: Some(to_proto_obj(&updated)),
             }));
@@ -4390,7 +4389,7 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(map_lease_error)?;
         let updated =
-            self.resolve_computed_for_response(updated, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GuardedUpdateObjectResponse {
             object: Some(to_proto_obj(&updated)),
         }))
@@ -4402,14 +4401,14 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GuardedDeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input
             .lease_precondition
             .ok_or(Status::invalid_argument("lease_precondition required"))?;
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &precondition.namespace,
             true,
         )?;
@@ -4419,7 +4418,7 @@ impl SekaiService for SekaiServiceImpl {
         if let Some(existing) = &expected {
             enforce_namespace_tenant_context(
                 &self.db,
-                tenant_context.as_deref(),
+                tenant_context.as_ref(),
                 &existing.namespace,
                 true,
             )?;
@@ -4671,7 +4670,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateObjectRequest>,
     ) -> Result<Response<CreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let obj = req
             .into_inner()
             .object
@@ -4695,12 +4694,7 @@ impl SekaiService for SekaiServiceImpl {
                 "namespace objects must be managed through EnsureTeamNamespace",
             ));
         }
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &obj.namespace,
-            true,
-        )?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, true)?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
@@ -4729,7 +4723,7 @@ impl SekaiService for SekaiServiceImpl {
             .create_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?;
         let domain_obj =
-            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(CreateObjectResponse {
             object: Some(to_proto_obj(&domain_obj)),
         }))
@@ -4739,27 +4733,21 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let id = req.into_inner().id;
         let obj = self
             .db
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &obj.namespace,
-            false,
-        )
-        .map_err(|_| Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, false)
+            .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &id, &principals)?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
-        let obj =
-            self.resolve_computed_for_response(obj, &principals, tenant_context.as_deref())?;
+        let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -4769,7 +4757,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<UpdateObjectRequest>,
     ) -> Result<Response<UpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let obj = req
             .into_inner()
             .object
@@ -4798,16 +4786,11 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::not_found("not found"))?;
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &existing.namespace,
             true,
         )?;
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &obj.namespace,
-            true,
-        )?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, true)?;
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
@@ -4900,7 +4883,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(map_graph_mutation_error)?
             .ok_or(Status::not_found("not found"))?;
         let domain_obj =
-            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(UpdateObjectResponse {
             object: Some(to_proto_obj(&domain_obj)),
         }))
@@ -4910,14 +4893,14 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let id = req.into_inner().id;
         let Some(existing) = self.db.get_object(&id).map_err(Status::internal)? else {
             return Ok(Response::new(DeleteObjectResponse {}));
         };
         enforce_namespace_tenant_context(
             &self.db,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
             &existing.namespace,
             true,
         )?;
@@ -4956,7 +4939,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let invoked_capability = req
             .metadata()
             .get("x-sekai-capability")
@@ -4983,12 +4966,7 @@ impl SekaiService for SekaiServiceImpl {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
             })?;
-            enforce_namespace_tenant_context(
-                &self.db,
-                tenant_context.as_deref(),
-                namespace,
-                false,
-            )?;
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, false)?;
         }
         let operation_id = invoked_capability.as_ref().map(|_| {
             requested_operation_id
@@ -5086,7 +5064,7 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(Status::internal)?;
         let objects =
-            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_ref())?;
         let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -5112,30 +5090,40 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<FindByExternalIdRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let external_id = req.into_inner().external_id;
-        let obj = match tenant_context.as_deref() {
-            Some(tenant_id) => self
-                .db
-                .find_by_external_id_for_tenant(&external_id, tenant_id),
-            None => self.db.find_by_external_id(&external_id),
+        let obj = if tenant_context.is_some() {
+            self.db
+                .find_all_by_external_id(&external_id)
+                .map_err(Status::internal)?
+                .into_iter()
+                .find(|candidate| {
+                    !is_reserved_governance_kind(&candidate.kind)
+                        && enforce_namespace_tenant_context(
+                            &self.db,
+                            tenant_context.as_ref(),
+                            &candidate.namespace,
+                            false,
+                        )
+                        .is_ok()
+                        && check_team_namespace(&self.db, &principals, &candidate.namespace, false)
+                            .is_ok()
+                        && check_read(&self.security, &candidate.id, &principals).is_ok()
+                })
+        } else {
+            self.db
+                .find_by_external_id(&external_id)
+                .map_err(Status::internal)?
         }
-        .map_err(Status::internal)?
         .ok_or(Status::not_found("not found"))?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &obj.namespace,
-            false,
-        )
-        .map_err(|_| Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, false)
+            .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &obj.id, &principals)?;
-        let obj =
-            self.resolve_computed_for_response(obj, &principals, tenant_context.as_deref())?;
+        let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -5145,7 +5133,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<FindByPropertyRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
             return Ok(Response::new(ListObjectsResponse {
@@ -5172,7 +5160,7 @@ impl SekaiService for SekaiServiceImpl {
                 check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
                     && enforce_namespace_tenant_context(
                         &self.db,
-                        tenant_context.as_deref(),
+                        tenant_context.as_ref(),
                         &object.namespace,
                         false,
                     )
@@ -5182,7 +5170,7 @@ impl SekaiService for SekaiServiceImpl {
         let filtered = self.resolve_computed_for_responses(
             filtered.into_iter().cloned().collect(),
             &principals,
-            tenant_context.as_deref(),
+            tenant_context.as_ref(),
         )?;
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(to_proto_obj).collect(),
@@ -5283,7 +5271,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ResolveObjectSetRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         let set = self
@@ -5315,12 +5303,7 @@ impl SekaiService for SekaiServiceImpl {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires a namespace-scoped object set")
             })?;
-            enforce_namespace_tenant_context(
-                &self.db,
-                tenant_context.as_deref(),
-                namespace,
-                false,
-            )?;
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, false)?;
         }
         {
             let schema = self
@@ -5339,7 +5322,7 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(Status::internal)?;
         let objects =
-            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_ref())?;
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -5350,7 +5333,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         let fail_if_exists = inner.fail_if_exists;
@@ -5366,7 +5349,7 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::not_found("link endpoint not found"))?;
             enforce_namespace_tenant_context(
                 &self.db,
-                tenant_context.as_deref(),
+                tenant_context.as_ref(),
                 &object.namespace,
                 true,
             )?;
@@ -5408,7 +5391,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let id = req.into_inner().id;
         let Some(link) = self.db.get_link(&id).map_err(Status::internal)? else {
@@ -5422,7 +5405,7 @@ impl SekaiService for SekaiServiceImpl {
                 .ok_or(Status::not_found("link endpoint not found"))?;
             enforce_namespace_tenant_context(
                 &self.db,
-                tenant_context.as_deref(),
+                tenant_context.as_ref(),
                 &object.namespace,
                 true,
             )?;
@@ -5437,7 +5420,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetLinksRequest>,
     ) -> Result<Response<GetLinksResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
         let root = self
@@ -5445,13 +5428,8 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &root.namespace,
-            false,
-        )
-        .map_err(|_| Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &root.namespace, false)
+            .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
@@ -5476,7 +5454,7 @@ impl SekaiService for SekaiServiceImpl {
                                 .is_ok()
                                 && enforce_namespace_tenant_context(
                                     &self.db,
-                                    tenant_context.as_deref(),
+                                    tenant_context.as_ref(),
                                     &object.namespace,
                                     false,
                                 )
@@ -5495,20 +5473,15 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetLinkedObjectsRequest>,
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(
-            &self.db,
-            tenant_context.as_deref(),
-            &root.namespace,
-            false,
-        )
-        .map_err(|_| Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &root.namespace, false)
+            .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
@@ -5526,7 +5499,7 @@ impl SekaiService for SekaiServiceImpl {
                 check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
                     && enforce_namespace_tenant_context(
                         &self.db,
-                        tenant_context.as_deref(),
+                        tenant_context.as_ref(),
                         &object.namespace,
                         false,
                     )
@@ -5535,7 +5508,7 @@ impl SekaiService for SekaiServiceImpl {
             })
             .collect();
         let objs =
-            self.resolve_computed_for_responses(objs, &principals, tenant_context.as_deref())?;
+            self.resolve_computed_for_responses(objs, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
         }))
@@ -5545,7 +5518,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let q = req
             .into_inner()
             .query
@@ -5588,7 +5561,7 @@ impl SekaiService for SekaiServiceImpl {
             check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
                 && enforce_namespace_tenant_context(
                     &self.db,
-                    tenant_context.as_deref(),
+                    tenant_context.as_ref(),
                     &object.namespace,
                     false,
                 )
@@ -5603,11 +5576,8 @@ impl SekaiService for SekaiServiceImpl {
         res.links.retain(|link| {
             visible_ids.contains(link.from_id.as_str()) && visible_ids.contains(link.to_id.as_str())
         });
-        res.objects = self.resolve_computed_for_responses(
-            res.objects,
-            &principals,
-            tenant_context.as_deref(),
-        )?;
+        res.objects =
+            self.resolve_computed_for_responses(res.objects, &principals, tenant_context.as_ref())?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -6807,8 +6777,13 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<ExecuteActionRequest>,
     ) -> Result<Response<ExecuteActionResponse>, Status> {
+        if self.db.enterprise_extension().is_some() {
+            return Err(Status::failed_precondition(
+                "enterprise action execution requires a durable approval identity contract",
+            ));
+        }
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let mut work_unit = work_unit_from_metadata(&req);
         let invoked_capability = req
             .metadata()
@@ -6964,7 +6939,7 @@ impl SekaiService for SekaiServiceImpl {
             if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
                 enforce_namespace_tenant_context(
                     &self.db,
-                    tenant_context.as_deref(),
+                    tenant_context.as_ref(),
                     &target.namespace,
                     true,
                 )?;
@@ -6973,7 +6948,7 @@ impl SekaiService for SekaiServiceImpl {
             check_write(&self.security, target_id, &principals)?;
         }
         if let Some(namespace) = r.params.get("namespace") {
-            enforce_namespace_tenant_context(&self.db, tenant_context.as_deref(), namespace, true)?;
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, true)?;
             check_team_namespace(&self.db, &principals, namespace, true)?;
         } else if r.action == "create_object"
             && (tenant_context.is_some() || is_managed_team_principal(&self.db, &principals)?)
@@ -9306,7 +9281,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectChangesRequest>,
     ) -> Result<Response<ListObjectChangesResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&req)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         check_object_namespace_access(&self.db, &principals, &inner.object_id, false)?;
@@ -9318,7 +9293,7 @@ impl SekaiService for SekaiServiceImpl {
         match object.as_ref() {
             Some(object) => enforce_namespace_tenant_context(
                 &self.db,
-                tenant_context.as_deref(),
+                tenant_context.as_ref(),
                 &object.namespace,
                 false,
             )
@@ -9627,26 +9602,16 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CreateCredentialRequest>,
     ) -> Result<Response<CreateCredentialResponse>, Status> {
-        let (actor, platform_admin) =
-            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
+        credential_admin_actor(&self.db, &req, "")?;
         let request = req.into_inner();
-        if !request.tenant_id.is_empty() {
-            self.db
-                .require_tenant_admission(&request.tenant_id)
-                .map_err(tenant_status)?;
-        }
         let principal = if request.managed_team_principal {
             validate_team_principal(&request.principal)?
         } else {
             validate_new_credential_principal(&request.principal)?
         };
-        let existing = if request.tenant_id.is_empty() {
-            self.db
-                .list_unbound_credentials(Some(&principal), Some("active"))
-        } else {
-            self.db
-                .list_tenant_credentials(&request.tenant_id, Some(&principal), Some("active"))
-        };
+        let existing = self
+            .db
+            .list_unbound_credentials(Some(&principal), Some("active"));
         if !existing.map_err(Status::internal)?.is_empty() {
             return Err(Status::already_exists(format!(
                 "active credential already exists for {principal:?}; rotate it instead"
@@ -9655,21 +9620,7 @@ impl SekaiService for SekaiServiceImpl {
         let token = new_credential_token();
         let token_hash = hash_gateway_key(&token);
         let now = chrono::Utc::now().timestamp_millis();
-        let credential = if !request.tenant_id.is_empty() {
-            if request.managed_team_principal {
-                return Err(Status::invalid_argument(
-                    "managed team credentials cannot be tenant-bound",
-                ));
-            }
-            self.db.create_tenant_credential(
-                &request.tenant_id,
-                &principal,
-                &token_hash,
-                &actor,
-                platform_admin,
-                now,
-            )
-        } else if request.managed_team_principal {
+        let credential = if request.managed_team_principal {
             self.db
                 .create_managed_team_credential(&principal, &token_hash, now)
         } else {
@@ -9683,6 +9634,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn create_tenant(
         &self,
         req: Request<CreateTenantRequest>,
@@ -9698,6 +9650,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn get_tenant(
         &self,
         req: Request<GetTenantRequest>,
@@ -9714,6 +9667,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn suspend_tenant(
         &self,
         req: Request<SuspendTenantRequest>,
@@ -9730,6 +9684,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn reactivate_tenant(
         &self,
         req: Request<ReactivateTenantRequest>,
@@ -9746,6 +9701,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn request_tenant_closure(
         &self,
         req: Request<RequestTenantClosureRequest>,
@@ -9762,6 +9718,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn create_tenant_namespace(
         &self,
         req: Request<CreateTenantNamespaceRequest>,
@@ -9796,6 +9753,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn get_namespace_ownership(
         &self,
         req: Request<GetNamespaceOwnershipRequest>,
@@ -9813,6 +9771,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn create_tenant_membership(
         &self,
         req: Request<CreateTenantMembershipRequest>,
@@ -9839,6 +9798,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn change_tenant_membership_role(
         &self,
         req: Request<ChangeTenantMembershipRoleRequest>,
@@ -9863,6 +9823,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn list_tenant_memberships(
         &self,
         req: Request<ListTenantMembershipsRequest>,
@@ -9879,6 +9840,7 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    #[cfg(any())]
     async fn revoke_tenant_membership(
         &self,
         req: Request<RevokeTenantMembershipRequest>,
@@ -9906,26 +9868,16 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RotateCredentialRequest>,
     ) -> Result<Response<RotateCredentialResponse>, Status> {
-        let (actor, platform_admin) =
-            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
+        credential_admin_actor(&self.db, &req, "")?;
         let request = req.into_inner();
-        if !request.tenant_id.is_empty() {
-            self.db
-                .require_tenant_admission(&request.tenant_id)
-                .map_err(tenant_status)?;
-        }
         let principal = if request.managed_team_principal {
             validate_team_principal(&request.principal)?
         } else {
             validate_new_credential_principal(&request.principal)?
         };
-        let existing = if request.tenant_id.is_empty() {
-            self.db
-                .list_unbound_credentials(Some(&principal), Some("active"))
-        } else {
-            self.db
-                .list_tenant_credentials(&request.tenant_id, Some(&principal), Some("active"))
-        };
+        let existing = self
+            .db
+            .list_unbound_credentials(Some(&principal), Some("active"));
         if existing.map_err(Status::internal)?.is_empty() {
             return Err(Status::not_found(format!(
                 "no active credential for {principal:?}"
@@ -9933,24 +9885,7 @@ impl SekaiService for SekaiServiceImpl {
         }
         let token = new_credential_token();
         let token_hash = hash_gateway_key(&token);
-        let credential = if !request.tenant_id.is_empty() {
-            if request.managed_team_principal {
-                return Err(Status::invalid_argument(
-                    "managed team credentials cannot be tenant-bound",
-                ));
-            }
-            self.db
-                .rotate_tenant_credential(
-                    &request.tenant_id,
-                    &principal,
-                    &token_hash,
-                    &actor,
-                    platform_admin,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .map_err(Status::internal)?
-                .ok_or_else(|| Status::not_found("no active tenant credential"))
-        } else if request.managed_team_principal {
+        let credential = if request.managed_team_principal {
             self.db
                 .rotate_managed_team_credential(&principal, &token_hash)
                 .map_err(Status::internal)
@@ -9969,23 +9904,14 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RevokeCredentialRequest>,
     ) -> Result<Response<RevokeCredentialResponse>, Status> {
-        let (actor, platform_admin) =
-            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
+        credential_admin_actor(&self.db, &req, "")?;
         let request = req.into_inner();
         let principal = validate_credential_principal(&request.principal)?;
-        let credential = if request.tenant_id.is_empty() {
-            self.db.revoke_principal_credential(&principal)
-        } else {
-            self.db.revoke_tenant_credential(
-                &request.tenant_id,
-                &principal,
-                &actor,
-                platform_admin,
-                chrono::Utc::now().timestamp_millis(),
-            )
-        }
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
+        let credential = self
+            .db
+            .revoke_principal_credential(&principal)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
         Ok(Response::new(RevokeCredentialResponse {
             credential: Some(to_proto_credential(credential)),
         }))
@@ -9995,17 +9921,14 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<ListCredentialsResponse>, Status> {
-        credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
-        let tenant_id = req.into_inner().tenant_id;
-        let credentials = if tenant_id.is_empty() {
-            self.db.list_unbound_credentials(None, None)
-        } else {
-            self.db.list_tenant_credentials(&tenant_id, None, None)
-        }
-        .map_err(Status::internal)?
-        .into_iter()
-        .map(to_proto_credential)
-        .collect();
+        credential_admin_actor(&self.db, &req, "")?;
+        let credentials = self
+            .db
+            .list_unbound_credentials(None, None)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(to_proto_credential)
+            .collect();
         Ok(Response::new(ListCredentialsResponse { credentials }))
     }
 
@@ -10361,40 +10284,12 @@ fn credential_admin_actor(
         .into_iter()
         .next()
         .ok_or_else(|| Status::unauthenticated("authenticated principal required"))?;
-    if requested_tenant.trim().is_empty() {
-        require_credential_admin(std::slice::from_ref(&actor))?;
-        return Ok((actor, true));
-    }
-    let tenant_id = require_tenant_id(requested_tenant)?;
-    if requested_tenant != tenant_id {
-        return Err(Status::invalid_argument(
-            "tenant_id must use canonical form without surrounding whitespace",
-        ));
-    }
-    if matches!(actor.as_str(), "root" | "local") {
-        return Ok((actor, true));
-    }
-    let context = request_tenant_context(req)?
-        .ok_or_else(|| Status::permission_denied("tenant context required"))?;
-    if context != tenant_id {
-        return Err(Status::permission_denied("tenant context mismatch"));
-    }
-    let subject = actor
-        .strip_prefix(&format!("{tenant_id}."))
-        .unwrap_or(&actor);
-    match db
-        .tenant_membership_role(&tenant_id, subject)
-        .map_err(tenant_status)?
-    {
-        Some(crate::sekai::tenant::TenantRole::Owner | crate::sekai::tenant::TenantRole::Admin) => {
-            Ok((subject.to_string(), false))
-        }
-        _ => Err(Status::permission_denied(
-            "tenant credential admin required",
-        )),
-    }
+    let _ = (db, requested_tenant);
+    require_credential_admin(std::slice::from_ref(&actor))?;
+    Ok((actor, true))
 }
 
+#[cfg(any())]
 fn tenant_admin_actor(req: &Request<impl std::any::Any>) -> Result<String, Status> {
     let principals = caller_principals(req);
     require_credential_admin(&principals)?;
@@ -10404,6 +10299,7 @@ fn tenant_admin_actor(req: &Request<impl std::any::Any>) -> Result<String, Statu
         .ok_or_else(|| Status::permission_denied("tenant admin required"))
 }
 
+#[cfg(any())]
 fn require_tenant_id(value: &str) -> Result<String, Status> {
     let value = value.trim();
     if value.is_empty()
@@ -10418,6 +10314,7 @@ fn require_tenant_id(value: &str) -> Result<String, Status> {
     Ok(value.to_string())
 }
 
+#[cfg(any())]
 fn require_tenant_request_key(value: &str) -> Result<String, Status> {
     let value = value.trim();
     if value.is_empty() || value.len() > 200 {
@@ -10428,49 +10325,93 @@ fn require_tenant_request_key(value: &str) -> Result<String, Status> {
     Ok(value.to_string())
 }
 
-fn request_tenant_context(req: &Request<impl std::any::Any>) -> Result<Option<String>, Status> {
+enum RequestEnterpriseContext {
+    Tenant(crate::enterprise::TenantContext),
+    Unscoped(crate::enterprise::AuthenticatedPrincipal),
+}
+
+fn request_tenant_context(
+    db: &SekaiDb,
+    req: &Request<impl std::any::Any>,
+) -> Result<Option<RequestEnterpriseContext>, Status> {
     let auth_source = req
         .metadata()
         .get("x-sekai-auth-source")
         .and_then(|value| value.to_str().ok());
-    // Direct in-process callers predate transport metadata and retain local
-    // semantics. Production interceptors always set the authentication source.
-    if auth_source.is_none() || auth_source == Some("local") {
+    if !matches!(auth_source, Some("enterprise" | "token")) {
         return Ok(None);
     }
-    let tenant_id = req
+    let Some(extension) = db.enterprise_extension() else {
+        return Ok(None);
+    };
+    let subject = caller_principals(req)
+        .into_iter()
+        .next()
+        .ok_or_else(|| Status::unauthenticated("authenticated principal required"))?;
+    let credential_id = req
         .metadata()
-        .get("x-sekai-tenant-id")
+        .get("x-sekai-credential-id")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| Status::permission_denied("tenant context required"))?;
-    require_tenant_id(tenant_id).map(Some)
+        .unwrap_or_default()
+        .to_string();
+    let principal = crate::enterprise::AuthenticatedPrincipal {
+        subject,
+        credential_id,
+    };
+    if auth_source == Some("enterprise") {
+        extension
+            .tenant_context(&principal)
+            .map(RequestEnterpriseContext::Tenant)
+            .map(Some)
+            .map_err(extension_status)
+    } else {
+        Ok(Some(RequestEnterpriseContext::Unscoped(principal)))
+    }
 }
 
 fn enforce_namespace_tenant_context(
     db: &SekaiDb,
-    tenant_context: Option<&str>,
+    tenant_context: Option<&RequestEnterpriseContext>,
     namespace: &str,
     write: bool,
 ) -> Result<(), Status> {
-    let Some(tenant_id) = tenant_context else {
+    let Some(extension) = db.enterprise_extension() else {
         return Ok(());
     };
-    let ownership = db
-        .namespace_ownership(namespace)
-        .map_err(tenant_status)?
-        .ok_or_else(|| Status::permission_denied("namespace tenant ownership required"))?;
-    if ownership.tenant_id != tenant_id {
-        return Err(Status::permission_denied(
-            "namespace tenant context mismatch",
-        ));
+    let Some(context) = tenant_context else {
+        return Ok(());
+    };
+    let action = if write {
+        crate::enterprise::NamespaceAction::Write
+    } else {
+        crate::enterprise::NamespaceAction::Read
+    };
+    match context {
+        RequestEnterpriseContext::Tenant(context) => extension
+            .authorize_namespace(context, namespace, action)
+            .map_err(extension_status),
+        RequestEnterpriseContext::Unscoped(principal) => extension
+            .authorize_unscoped_namespace(principal, namespace, action)
+            .map_err(extension_status),
     }
-    if write {
-        db.require_tenant_admission(tenant_id)
-            .map_err(tenant_status)?;
-    }
-    Ok(())
 }
 
+fn extension_status(error: crate::enterprise::ExtensionError) -> Status {
+    match error {
+        crate::enterprise::ExtensionError::CredentialNotFound => {
+            Status::unauthenticated("enterprise credential not found")
+        }
+        crate::enterprise::ExtensionError::Unauthenticated => {
+            Status::unauthenticated("enterprise authentication failed")
+        }
+        crate::enterprise::ExtensionError::PermissionDenied => {
+            Status::permission_denied("enterprise authorization denied")
+        }
+        crate::enterprise::ExtensionError::Unavailable(message) => Status::unavailable(message),
+    }
+}
+
+#[cfg(any())]
 fn tenant_status(error: crate::sekai::tenant::TenantError) -> Status {
     use crate::sekai::tenant::TenantError;
     match error {
@@ -10494,6 +10435,7 @@ fn tenant_status(error: crate::sekai::tenant::TenantError) -> Status {
     }
 }
 
+#[cfg(any())]
 fn to_proto_tenant(record: crate::sekai::tenant::TenantRecord) -> TenantRecord {
     let state = match record.state {
         crate::sekai::tenant::TenantState::Active => TenantLifecycleState::Active,
@@ -10509,6 +10451,7 @@ fn to_proto_tenant(record: crate::sekai::tenant::TenantRecord) -> TenantRecord {
     }
 }
 
+#[cfg(any())]
 fn to_proto_namespace_ownership(
     ownership: crate::sekai::tenant::NamespaceOwnership,
 ) -> NamespaceOwnership {
@@ -10521,6 +10464,7 @@ fn to_proto_namespace_ownership(
     }
 }
 
+#[cfg(any())]
 fn membership_authority(
     req: &Request<impl std::any::Any>,
 ) -> Result<(String, bool, Option<String>), Status> {
@@ -10542,6 +10486,7 @@ fn membership_authority(
     Ok((require_subject_id(subject)?, false, tenant_id))
 }
 
+#[cfg(any())]
 fn enforce_membership_tenant_scope(
     tenant_context: Option<&str>,
     tenant_id: &str,
@@ -10553,6 +10498,7 @@ fn enforce_membership_tenant_scope(
     }
 }
 
+#[cfg(any())]
 fn require_subject_id(value: &str) -> Result<String, Status> {
     let value = value.trim();
     if value.is_empty()
@@ -10568,6 +10514,7 @@ fn require_subject_id(value: &str) -> Result<String, Status> {
     Ok(value.to_string())
 }
 
+#[cfg(any())]
 fn membership_role(value: i32) -> Result<crate::sekai::tenant::TenantRole, Status> {
     match TenantMembershipRole::try_from(value).ok() {
         Some(TenantMembershipRole::Owner) => Ok(crate::sekai::tenant::TenantRole::Owner),
@@ -10580,6 +10527,7 @@ fn membership_role(value: i32) -> Result<crate::sekai::tenant::TenantRole, Statu
     }
 }
 
+#[cfg(any())]
 fn to_proto_membership(membership: crate::sekai::tenant::TenantMembership) -> TenantMembership {
     let role = match membership.role {
         crate::sekai::tenant::TenantRole::Owner => TenantMembershipRole::Owner,
@@ -10649,7 +10597,7 @@ fn to_proto_credential(credential: crate::db::sekai::PrincipalCredential) -> Cre
         created: credential.created,
         rotated_at: credential.rotated_at,
         revoked_at: credential.revoked_at,
-        tenant_id: credential.tenant_id,
+        tenant_id: String::new(),
     }
 }
 
@@ -10854,6 +10802,121 @@ mod tests {
         SekaiServiceImpl::new(db)
     }
 
+    struct TestEnterpriseExtension;
+
+    impl crate::enterprise::EnterpriseExtension for TestEnterpriseExtension {
+        fn authenticate_bearer(
+            &self,
+            bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            (bearer_token == "enterprise-token")
+                .then(|| crate::enterprise::AuthenticatedPrincipal {
+                    subject: "subject-a".into(),
+                    credential_id: "credential-a".into(),
+                })
+                .ok_or(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn tenant_context(
+            &self,
+            principal: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            if principal.credential_id != "credential-a" {
+                return Err(crate::enterprise::ExtensionError::Unauthenticated);
+            }
+            Ok(crate::enterprise::TenantContext {
+                tenant_id: "tenant-test".into(),
+                subject: principal.subject.clone(),
+            })
+        }
+
+        fn authorize_namespace(
+            &self,
+            _context: &crate::enterprise::TenantContext,
+            namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            (namespace == "allowed")
+                .then_some(())
+                .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            principal: &crate::enterprise::AuthenticatedPrincipal,
+            namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            (principal.credential_id == "community-credential" && namespace == "community")
+                .then_some(())
+                .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+    }
+
+    #[test]
+    fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
+        let db = SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(TestEnterpriseExtension)),
+        )
+        .unwrap();
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("subject-a"));
+        request.metadata_mut().insert(
+            "x-sekai-credential-id",
+            MetadataValue::from_static("credential-a"),
+        );
+        request.metadata_mut().insert(
+            "x-sekai-auth-source",
+            MetadataValue::from_static("enterprise"),
+        );
+        let tenant = request_tenant_context(&db, &request).unwrap().unwrap();
+        assert!(matches!(
+            &tenant,
+            RequestEnterpriseContext::Tenant(context) if context.tenant_id == "tenant-test"
+        ));
+        assert!(enforce_namespace_tenant_context(&db, Some(&tenant), "allowed", false).is_ok());
+        assert_eq!(
+            enforce_namespace_tenant_context(&db, Some(&tenant), "denied", true)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn community_request_is_authorized_by_installed_enterprise_extension() {
+        let db = SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(TestEnterpriseExtension)),
+        )
+        .unwrap();
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("community-user"));
+        request.metadata_mut().insert(
+            "x-sekai-credential-id",
+            MetadataValue::from_static("community-credential"),
+        );
+        request
+            .metadata_mut()
+            .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+
+        let context = request_tenant_context(&db, &request).unwrap().unwrap();
+        assert!(matches!(context, RequestEnterpriseContext::Unscoped(_)));
+        assert!(enforce_namespace_tenant_context(&db, Some(&context), "community", true).is_ok());
+        assert_eq!(
+            enforce_namespace_tenant_context(&db, Some(&context), "tenant-private", false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     fn with_principal<T>(payload: T) -> Request<T> {
         with_named_principal(payload, "tester")
     }
@@ -10865,6 +10928,7 @@ mod tests {
         req
     }
 
+    #[cfg(any())]
     fn with_tenant_context<T>(payload: T, principal: &str, tenant_id: &str) -> Request<T> {
         let mut req = with_named_principal(payload, principal);
         req.metadata_mut()
@@ -19555,6 +19619,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn tenant_rpcs_enforce_admin_lifecycle_and_idempotency() {
         let svc = service();
         let denied = svc
@@ -19645,6 +19710,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn tenant_context_fails_closed_while_local_mode_skips_tenant_state() {
         let svc = service();
         let tenant_a = svc
@@ -19733,6 +19799,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn tenant_membership_rpcs_filter_scope_and_recheck_live_roles() {
         let svc = service();
         let tenant_a = svc.db.create_tenant("root", "membership-a", 1).unwrap();
@@ -19909,6 +19976,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn tenant_credentials_are_scoped_and_require_live_admin_membership() {
         let svc = service();
         let tenant = svc
