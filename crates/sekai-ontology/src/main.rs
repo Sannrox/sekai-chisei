@@ -5,9 +5,10 @@ use sekai_ontology::{
 use serde::Serialize;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const EXIT_USAGE_OR_INPUT: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
@@ -15,6 +16,7 @@ const EXIT_DATABASE: u8 = 4;
 const EXIT_VALIDATION: u8 = 5;
 const EXIT_ALREADY_CURRENT: u8 = 10;
 const EXIT_SKILL_DRIFT: u8 = 11;
+static SKILL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 struct Envelope<T> {
@@ -303,7 +305,7 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
     }
     if target.exists() {
-        let (mut file, current) = open_existing_skill(target)?;
+        let (_file, current) = open_existing_skill(target)?;
         if current == EMBEDDED_SKILL {
             eprintln!("skill already current at {}", target.display());
             return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
@@ -322,15 +324,7 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
             );
             return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
         }
-        file.seek(SeekFrom::Start(0)).map_err(|error| {
-            Error::Input(format!("cannot seek '{}': {error}", target.display()))
-        })?;
-        file.set_len(0).map_err(|error| {
-            Error::Input(format!("cannot truncate '{}': {error}", target.display()))
-        })?;
-        file.write_all(EMBEDDED_SKILL.as_bytes()).map_err(|error| {
-            Error::Input(format!("cannot write '{}': {error}", target.display()))
-        })?;
+        write_skill_atomically(target, true)?;
         println!("installed {}", target.display());
         return Ok(ExitCode::SUCCESS);
     }
@@ -339,15 +333,71 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
     fs::create_dir_all(parent)
         .map_err(|error| Error::Input(format!("cannot create '{}': {error}", parent.display())))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|error| Error::Input(format!("cannot create '{}': {error}", target.display())))?;
-    file.write_all(EMBEDDED_SKILL.as_bytes())
-        .map_err(|error| Error::Input(format!("cannot write '{}': {error}", target.display())))?;
+    write_skill_atomically(target, false)?;
     println!("installed {}", target.display());
     Ok(ExitCode::SUCCESS)
+}
+
+fn write_skill_atomically(target: &Path, replace: bool) -> Result<(), Error> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
+    let (temporary_path, mut temporary_file) = create_skill_temp(parent)?;
+    let staged = temporary_file
+        .write_all(EMBEDDED_SKILL.as_bytes())
+        .and_then(|()| temporary_file.sync_all());
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(Error::Input(format!(
+            "cannot stage '{}': {error}",
+            target.display()
+        )));
+    }
+    drop(temporary_file);
+
+    let installed = if replace {
+        fs::rename(&temporary_path, target)
+    } else {
+        fs::hard_link(&temporary_path, target)
+    };
+    if let Err(error) = installed {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(Error::Input(format!(
+            "cannot install '{}': {error}",
+            target.display()
+        )));
+    }
+    if !replace {
+        fs::remove_file(&temporary_path).map_err(|error| {
+            Error::Input(format!(
+                "installed '{}' but cannot remove temporary file '{}': {error}",
+                target.display(),
+                temporary_path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn create_skill_temp(parent: &Path) -> Result<(PathBuf, File), Error> {
+    for _ in 0..100 {
+        let sequence = SKILL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".SKILL.md.{}.{}.tmp", std::process::id(), sequence));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::Input(format!(
+                    "cannot create temporary skill in '{}': {error}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    Err(Error::Input(format!(
+        "cannot allocate a temporary skill file in '{}'",
+        parent.display()
+    )))
 }
 
 fn open_existing_skill(target: &Path) -> Result<(File, String), Error> {
