@@ -160,6 +160,7 @@ pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
     "cache_creation_input_tokens",
     "cache_creation_5m_input_tokens",
     "cache_creation_1h_input_tokens",
+    "cache_requested",
     "pricing_snapshot_version",
     "cache_savings_usd_micros",
     "cache_savings_usd",
@@ -2277,6 +2278,7 @@ async fn proxy_gateway_inner_scoped(
     let request_id = correlation.request_id.clone();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
+    let cache_requested = prompt_cache_requested(&body);
     let started_ms = Utc::now().timestamp_millis();
     let task_class = resolve_task_class(&headers, requested_model.as_deref());
     let registry_snapshot = provider_registry_snapshot();
@@ -2400,6 +2402,7 @@ async fn proxy_gateway_inner_scoped(
         budget_subject: None,
         budget_status: "not_evaluated".into(),
         egress_applied: false,
+        cache_requested: false,
     };
     if !client_provider.same_family(requested_provider) && !state.config.allow_cross_provider {
         let rejection = GatewayRejection::json(
@@ -2833,6 +2836,9 @@ async fn proxy_gateway_inner_scoped(
         .resolved_model
         .as_deref()
         .and_then(|model| registry_snapshot.resolve_model(model).ok());
+    let resolved_profile = resolved_registry_metadata
+        .as_ref()
+        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
     let prepared = match prepare_upstream_request(
         &state.config,
         &identity,
@@ -2847,6 +2853,7 @@ async fn proxy_gateway_inner_scoped(
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
+    let automatic_cache_requested = automatic_cache_attempted(resolved_profile, &prepared.body);
 
     let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
@@ -2914,9 +2921,6 @@ async fn proxy_gateway_inner_scoped(
         return alias_reservation_error_response(error);
     }
 
-    let resolved_profile = resolved_registry_metadata
-        .as_ref()
-        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
     let pricing_snapshot_version = effective_pricing_snapshot_version(
         &state.config,
         resolved_profile,
@@ -2975,6 +2979,7 @@ async fn proxy_gateway_inner_scoped(
             .unwrap_or("not_evaluated")
             .into(),
         egress_applied: !state.config.no_preflight,
+        cache_requested: cache_requested || automatic_cache_requested,
     };
     match send_upstream_with_resilience(&state.runtime, prepared.provider, upstream, &contact_guard)
         .await
@@ -3192,6 +3197,7 @@ struct UsageContext {
     budget_subject: Option<String>,
     budget_status: String,
     egress_applied: bool,
+    cache_requested: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3242,6 +3248,7 @@ fn early_refusal_context(
         budget_subject: None,
         budget_status: "not_evaluated".into(),
         egress_applied: false,
+        cache_requested: false,
     }
 }
 
@@ -6575,6 +6582,45 @@ fn anthropic_has_cache_control(object: &serde_json::Map<String, serde_json::Valu
     tools_have || system_has || messages_have
 }
 
+/// Records only whether the caller explicitly requested a provider cache.
+/// The control value and all surrounding prompt content remain unpersisted.
+fn prompt_cache_requested(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| anthropic_has_cache_control(&object))
+}
+
+fn automatic_cache_attempted(profile: Option<&ProviderProfile>, prepared_body: &[u8]) -> bool {
+    profile.is_some_and(|profile| {
+        let minimum = profile
+            .prompt_cache
+            .minimum_cacheable_tokens
+            .or_else(|| (profile.provider == "openai").then_some(1_024));
+        !profile.prompt_cache.explicit_breakpoints
+            && profile.usage_normalization.cache_read_tokens
+            && minimum
+                .is_some_and(|minimum| estimate_cacheable_prompt_tokens(prepared_body) >= minimum)
+    })
+}
+
+fn estimate_cacheable_prompt_tokens(body: &[u8]) -> u64 {
+    fn string_tokens(value: &serde_json::Value) -> u64 {
+        match value {
+            serde_json::Value::String(text) => text.split_whitespace().count() as u64,
+            serde_json::Value::Array(values) => values.iter().map(string_tokens).sum(),
+            serde_json::Value::Object(values) => values.values().map(string_tokens).sum(),
+            _ => 0,
+        }
+    }
+
+    let byte_estimate = body.len().div_ceil(4) as u64;
+    let token_dense_estimate = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .map_or(0, |value| string_tokens(&value));
+    byte_estimate.max(token_dense_estimate)
+}
+
 fn block_has_cache_control(block: &serde_json::Value) -> bool {
     block
         .as_object()
@@ -9029,6 +9075,9 @@ async fn record_refusal_with_usage_and_append(
 fn insert_correlation_values(values: &mut HashMap<String, String>, context: &UsageContext) {
     values.insert("operation_id".into(), context.operation_id.clone());
     values.insert("attempt".into(), context.attempt.to_string());
+    if context.cache_requested {
+        values.insert("cache_requested".into(), "true".into());
+    }
     if let Some(value) = &context.parent_operation_id {
         values.insert("parent_operation_id".into(), value.clone());
     }
@@ -13283,6 +13332,7 @@ mod tests {
             budget_subject: Some("project:project-a".into()),
             budget_status: "allowed".into(),
             egress_applied: true,
+            cache_requested: true,
         };
         let observation = ResponseObservation {
             output_content: "private model output".into(),
@@ -13625,6 +13675,7 @@ mod tests {
             budget_subject: None,
             budget_status: "not_evaluated".into(),
             egress_applied: false,
+            cache_requested: false,
         };
         let rejection =
             GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", "request denied");
@@ -20724,5 +20775,23 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
         // No real breakpoint, so the normal system-injection path is used.
         assert!(value["system"].as_str().unwrap().contains("score: 0.91"));
         assert_eq!(value["messages"][0]["content"], "analyze ticker:{MSFT}");
+    }
+
+    #[test]
+    fn automatic_cache_attempt_requires_profile_support_and_minimum_size() {
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let openai = registry.effective_profile("openai");
+        let anthropic = registry.effective_profile("anthropic");
+        assert!(!automatic_cache_attempted(openai.as_ref(), &[b'x'; 1_000]));
+        assert!(automatic_cache_attempted(
+            openai.as_ref(),
+            &[b'x'; 4 * 4_096]
+        ));
+        let dense = serde_json::json!({"input": vec!["x"; 1_024]}).to_string();
+        assert!(automatic_cache_attempted(openai.as_ref(), dense.as_bytes()));
+        assert!(!automatic_cache_attempted(
+            anthropic.as_ref(),
+            &[b'x'; 4 * 4_096]
+        ));
     }
 }

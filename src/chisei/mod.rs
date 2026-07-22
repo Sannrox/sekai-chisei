@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod budget;
+pub mod cache_policy;
 pub mod capability;
 pub mod controller;
 pub mod egress;
