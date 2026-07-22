@@ -41,6 +41,10 @@ property fields.
 Reusable coordination leases use a dedicated namespace-scoped API. Every
 acquisition receives a monotonically increasing generation and unique fencing
 token; stale generations cannot refresh, release, or take over current state.
+Lease-guarded create, update, and delete RPCs validate the active generation and
+commit the graph mutation, object audit, and idempotency record in the same
+SQLite transaction. Guarded mutations are unavailable on partial storage
+interfaces that cannot provide this cross-table transaction.
 See [Generation-fenced leases](leases.md) for the client and downstream-executor
 contract.
 
