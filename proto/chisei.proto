@@ -523,6 +523,44 @@ message ResolvePolicyRequest {
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 
 message GetEffectivePolicySummaryRequest { string namespace = 1; }
+message ListAvailableModelsRequest {
+  string namespace = 1;
+  string provider = 2;
+}
+message AvailableModelCapabilities {
+  bool responses = 1;
+  bool streaming = 2;
+  bool tools = 3;
+  bool parallel_tools = 4;
+  bool structured_output = 5;
+  bool reasoning_controls = 6;
+  repeated string modalities = 7;
+  bool provider_continuation = 8;
+  bool reports_usage = 9;
+  bool partial_usage = 10;
+  uint64 context_tokens = 11;
+  optional uint64 output_tokens = 12;
+  repeated string built_in_tools = 13;
+}
+message AvailableModelPricing {
+  string version = 1;
+  string source = 2;
+  optional string observed_at = 3;
+  repeated string dimensions = 4;
+}
+message AvailableModelRecord {
+  string provider = 1;
+  string upstream_model = 2;
+  string canonical_model = 3;
+  string lifecycle = 4;
+  AvailableModelCapabilities capabilities = 5;
+  AvailableModelPricing pricing = 6;
+}
+message ListAvailableModelsResponse {
+  string version = 1;
+  string namespace = 2;
+  repeated AvailableModelRecord models = 3;
+}
 message SetNamespaceWorkerPolicyRequest {
   string namespace = 1;
   string contention_scope_id = 2;
@@ -1109,6 +1147,8 @@ service ChiseiService {
   rpc ResolvePolicy(ResolvePolicyRequest) returns (ResolvePolicyResponse);
   // Read-only, operator-safe live projection of effective namespace policy.
   rpc GetEffectivePolicySummary(GetEffectivePolicySummaryRequest) returns (GetEffectivePolicySummaryResponse);
+  // Compact namespace-authorized projection of the governed routing availability map.
+  rpc ListAvailableModels(ListAvailableModelsRequest) returns (ListAvailableModelsResponse);
   rpc SetNamespaceWorkerPolicy(SetNamespaceWorkerPolicyRequest) returns (SetNamespaceWorkerPolicyResponse);
   rpc CheckEgress(CheckEgressRequest) returns (CheckEgressResponse);
 

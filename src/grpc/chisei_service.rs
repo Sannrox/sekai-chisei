@@ -5701,6 +5701,65 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn list_available_models(
+        &self,
+        req: Request<ListAvailableModelsRequest>,
+    ) -> Result<Response<ListAvailableModelsResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
+        require_namespace_access(&self.db, &actor, &namespace)?;
+        let provider = req.get_ref().provider.trim();
+        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+            openai_base_url: std::env::var("CHISEI_OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            openai_api_key: self.config.openai_api_key.clone(),
+            anthropic_base_url: std::env::var("CHISEI_ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com/v1".into()),
+            anthropic_api_key: self.config.anthropic_api_key.clone(),
+            ollama_url: self.config.ollama_url.clone(),
+            native_configured: self.config.native_llm_url.is_some(),
+        };
+        let availability =
+            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
+        let view = availability.public_models((!provider.is_empty()).then_some(provider));
+        let models = view
+            .models
+            .into_iter()
+            .map(|model| AvailableModelRecord {
+                provider: model.provider,
+                upstream_model: model.upstream_model,
+                canonical_model: model.canonical_model,
+                lifecycle: model.lifecycle,
+                capabilities: model.capabilities.map(|value| AvailableModelCapabilities {
+                    responses: value.responses,
+                    streaming: value.streaming,
+                    tools: value.tools,
+                    parallel_tools: value.parallel_tools,
+                    structured_output: value.structured_output,
+                    reasoning_controls: value.reasoning_controls,
+                    modalities: value.modalities,
+                    provider_continuation: value.provider_continuation,
+                    reports_usage: value.reports_usage,
+                    partial_usage: value.partial_usage,
+                    context_tokens: value.context_tokens,
+                    output_tokens: value.output_tokens,
+                    built_in_tools: value.built_in_tools,
+                }),
+                pricing: model.pricing.map(|value| AvailableModelPricing {
+                    version: value.version,
+                    source: value.source,
+                    observed_at: value.observed_at,
+                    dimensions: value.dimensions,
+                }),
+            })
+            .collect();
+        Ok(Response::new(ListAvailableModelsResponse {
+            version: view.version,
+            namespace,
+            models,
+        }))
+    }
+
     async fn set_namespace_worker_policy(
         &self,
         req: Request<SetNamespaceWorkerPolicyRequest>,
@@ -9688,6 +9747,53 @@ mod tests {
             .metadata_mut()
             .insert("x-principal", principal.parse().unwrap());
         request
+    }
+
+    fn available_models_request(
+        namespace: &str,
+        provider: &str,
+        principal: Option<&str>,
+    ) -> Request<ListAvailableModelsRequest> {
+        let mut request = Request::new(ListAvailableModelsRequest {
+            namespace: namespace.into(),
+            provider: provider.into(),
+        });
+        if let Some(principal) = principal {
+            request
+                .metadata_mut()
+                .insert("x-principal", principal.parse().unwrap());
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn available_models_are_authenticated_namespace_scoped_and_filterable() {
+        let svc = memory_service();
+        svc.db
+            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .unwrap();
+
+        let missing_auth = svc
+            .list_available_models(available_models_request("acme", "", None))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_auth.code(), tonic::Code::Unauthenticated);
+        let denied = svc
+            .list_available_models(available_models_request("acme", "", Some("mallory")))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        let response = svc
+            .list_available_models(available_models_request("acme", "native", Some("alice")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.namespace, "acme");
+        assert_eq!(response.models.len(), 1);
+        assert_eq!(response.models[0].provider, "native");
+        assert_eq!(response.models[0].canonical_model, "native/native-default");
+        assert!(response.models[0].capabilities.is_some());
+        assert!(response.models[0].pricing.is_some());
     }
 
     #[tokio::test]
