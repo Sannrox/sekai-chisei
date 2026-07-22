@@ -63,6 +63,20 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
 
+For native Anthropic execution, provider profiles publish the versioned prompt-
+cache contract and Chisei may opt into explicit upstream breakpoints only when
+the stable prefix meets the conservative configured minimum. Cache identity
+follows the provider's `tools` → `system` → `messages` order. Governed task
+context and the current request remain after the final reusable breakpoint;
+pending tool-call adjacency is preserved even when that makes conversation
+history ineligible. Provider adapters canonicalize cache-relevant JSON and
+return cache-read and cache-creation usage, but Chisei never stores prompt
+content or upstream cache representations.
+
+Compatible gateway traffic remains caller-owned. Existing client breakpoints
+are forwarded without Chisei adding, moving, or removing cache controls; any
+future managed gateway caching requires its own explicit policy contract.
+
 ### External host actions
 
 Host harnesses can submit a versioned external-action authorization request to

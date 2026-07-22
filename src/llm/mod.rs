@@ -129,6 +129,17 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub max_tokens: i32,
+    /// Internal execution intent. Public LLM/gateway requests leave this disabled;
+    /// governed native execution may opt into provider-owned breakpoint placement.
+    pub prompt_cache: PromptCacheIntent,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptCacheIntent {
+    pub enabled: bool,
+    /// Messages before this index are stable conversation history. The
+    /// remaining messages contain current, governed request context.
+    pub cacheable_message_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +149,8 @@ pub struct ChatResponse {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub stop_reason: String,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +162,8 @@ pub struct ChatStreamChunk {
     pub output_tokens: i32,
     pub stop_reason: String,
     pub done: bool,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
 }
 
 impl ChatStreamChunk {
@@ -161,6 +176,8 @@ impl ChatStreamChunk {
             output_tokens: resp.output_tokens,
             stop_reason: resp.stop_reason,
             done: true,
+            cache_read_input_tokens: resp.cache_read_input_tokens,
+            cache_creation_input_tokens: resp.cache_creation_input_tokens,
         }
     }
 }
@@ -445,6 +462,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 stop_reason: "stop".into(),
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
     }
@@ -465,6 +484,7 @@ mod tests {
                 messages: Vec::new(),
                 tools: Vec::new(),
                 max_tokens: 1,
+                prompt_cache: Default::default(),
             })
             .await
             .unwrap();
@@ -491,6 +511,7 @@ mod tests {
                     input_schema: serde_json::json!({"type":"object"}),
                 }],
                 max_tokens: 1,
+                prompt_cache: Default::default(),
             })
             .await
             .unwrap_err();
@@ -519,6 +540,7 @@ mod tests {
                     input_schema: serde_json::json!({"type":"object"}),
                 }],
                 max_tokens: 1,
+                prompt_cache: Default::default(),
             })
             .await;
         let error = match result {
@@ -543,6 +565,7 @@ mod tests {
             }],
             tools: Vec::new(),
             max_tokens: 1,
+            prompt_cache: Default::default(),
         };
         let capabilities = crate::provider_profile::ProviderRegistry::built_in()
             .profile("openai")
@@ -577,6 +600,7 @@ mod tests {
                 messages: Vec::new(),
                 tools: Vec::new(),
                 max_tokens: 1,
+                prompt_cache: Default::default(),
             })
             .await
             .unwrap_err();

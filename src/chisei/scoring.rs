@@ -806,6 +806,7 @@ impl Judge for LlmJudge {
             }],
             tools: vec![tool],
             max_tokens: JUDGE_MAX_TOKENS,
+            prompt_cache: Default::default(),
         };
 
         // Account judge usage against the shared budget tracker under the `chisei.scoring` bucket
@@ -1604,6 +1605,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: "end_turn".to_string(),
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         }
     }
 
