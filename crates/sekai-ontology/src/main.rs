@@ -305,7 +305,7 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
     }
     if target.exists() {
-        let (file, current) = open_existing_skill(target)?;
+        let current = read_skill_file(target)?;
         if current == EMBEDDED_SKILL {
             eprintln!("skill already current at {}", target.display());
             return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
@@ -324,7 +324,7 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
             );
             return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
         }
-        write_skill_atomically(target, Some(&file))?;
+        replace_claimed_skill(target)?;
         println!("installed {}", target.display());
         return Ok(ExitCode::SUCCESS);
     }
@@ -333,12 +333,12 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
         .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
     fs::create_dir_all(parent)
         .map_err(|error| Error::Input(format!("cannot create '{}': {error}", parent.display())))?;
-    write_skill_atomically(target, None)?;
+    install_new_skill(target)?;
     println!("installed {}", target.display());
     Ok(ExitCode::SUCCESS)
 }
 
-fn write_skill_atomically(target: &Path, expected: Option<&File>) -> Result<(), Error> {
+fn stage_skill(target: &Path) -> Result<PathBuf, Error> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
@@ -355,34 +355,111 @@ fn write_skill_atomically(target: &Path, expected: Option<&File>) -> Result<(), 
     }
     drop(temporary_file);
 
-    if let Some(file) = expected
-        && let Err(error) = ensure_target_identity(target, file)
-    {
-        let _ = fs::remove_file(&temporary_path);
-        return Err(error);
-    }
-    let installed = if expected.is_some() {
-        fs::rename(&temporary_path, target)
-    } else {
-        fs::hard_link(&temporary_path, target)
-    };
-    if let Err(error) = installed {
+    Ok(temporary_path)
+}
+
+fn install_new_skill(target: &Path) -> Result<(), Error> {
+    let temporary_path = stage_skill(target)?;
+    if let Err(error) = fs::hard_link(&temporary_path, target) {
         let _ = fs::remove_file(&temporary_path);
         return Err(Error::Input(format!(
             "cannot install '{}': {error}",
             target.display()
         )));
     }
-    if expected.is_none() {
-        fs::remove_file(&temporary_path).map_err(|error| {
-            Error::Input(format!(
-                "installed '{}' but cannot remove temporary file '{}': {error}",
-                target.display(),
-                temporary_path.display()
-            ))
-        })?;
-    }
+    fs::remove_file(&temporary_path).map_err(|error| {
+        Error::Input(format!(
+            "installed '{}' but cannot remove temporary file '{}': {error}",
+            target.display(),
+            temporary_path.display()
+        ))
+    })?;
     Ok(())
+}
+
+fn replace_claimed_skill(target: &Path) -> Result<(), Error> {
+    let staged = stage_skill(target)?;
+    let claimed = match claim_skill_target(target) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(staged);
+            return Err(error);
+        }
+    };
+    let captured = read_skill_file(&claimed);
+    if !matches!(captured.as_deref(), Ok(content) if is_sekai_skill(content)) {
+        let _ = fs::remove_file(&staged);
+        restore_claim(target, &claimed)?;
+        return Err(Error::Input(format!(
+            "skill changed before replacement at {}; refusing",
+            target.display()
+        )));
+    }
+    if let Err(error) = fs::hard_link(&staged, target) {
+        let _ = fs::remove_file(&staged);
+        return Err(Error::Input(format!(
+            "cannot install '{}': {error}; original preserved at '{}'",
+            target.display(),
+            claimed.display()
+        )));
+    }
+    fs::remove_file(&staged).map_err(|error| {
+        Error::Input(format!(
+            "installed '{}' but cannot remove temporary file '{}': {error}",
+            target.display(),
+            staged.display()
+        ))
+    })?;
+    fs::remove_file(&claimed).map_err(|error| {
+        Error::Input(format!(
+            "installed '{}' but cannot remove previous skill '{}': {error}",
+            target.display(),
+            claimed.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn claim_skill_target(target: &Path) -> Result<PathBuf, Error> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
+    for _ in 0..100 {
+        let sequence = SKILL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let claimed = parent.join(format!(
+            ".SKILL.md.{}.{}.claimed",
+            std::process::id(),
+            sequence
+        ));
+        if fs::symlink_metadata(&claimed).is_ok() {
+            continue;
+        }
+        fs::rename(target, &claimed).map_err(|error| {
+            Error::Input(format!("cannot claim '{}': {error}", target.display()))
+        })?;
+        return Ok(claimed);
+    }
+    Err(Error::Input(format!(
+        "cannot allocate a recovery path for '{}'",
+        target.display()
+    )))
+}
+
+fn restore_claim(target: &Path, claimed: &Path) -> Result<(), Error> {
+    fs::hard_link(claimed, target).map_err(|error| {
+        Error::Input(format!(
+            "cannot restore '{}': {error}; original preserved at '{}'",
+            target.display(),
+            claimed.display()
+        ))
+    })?;
+    fs::remove_file(claimed).map_err(|error| {
+        Error::Input(format!(
+            "restored '{}' but cannot remove recovery file '{}': {error}",
+            target.display(),
+            claimed.display()
+        ))
+    })
 }
 
 fn create_skill_temp(parent: &Path) -> Result<(PathBuf, File), Error> {
@@ -406,7 +483,7 @@ fn create_skill_temp(parent: &Path) -> Result<(PathBuf, File), Error> {
     )))
 }
 
-fn open_existing_skill(target: &Path) -> Result<(File, String), Error> {
+fn read_skill_file(target: &Path) -> Result<String, Error> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -420,7 +497,7 @@ fn open_existing_skill(target: &Path) -> Result<(File, String), Error> {
     let mut content = String::new();
     file.read_to_string(&mut content)
         .map_err(|error| Error::Input(format!("cannot read '{}': {error}", target.display())))?;
-    Ok((file, content))
+    Ok(content)
 }
 
 fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
@@ -432,51 +509,20 @@ fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
         eprintln!("skill is not installed at {}", target.display());
         return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
     }
-    let (file, current) = open_existing_skill(target)?;
-    if current != EMBEDDED_SKILL {
+    let claimed = claim_skill_target(target)?;
+    let current = read_skill_file(&claimed);
+    if !matches!(current.as_deref(), Ok(content) if content == EMBEDDED_SKILL) {
+        restore_claim(target, &claimed)?;
         eprintln!(
             "refusing to remove modified or unrecognized skill at {}",
             target.display()
         );
         return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
     }
-    ensure_target_identity(target, &file)?;
-    fs::remove_file(target)
-        .map_err(|error| Error::Input(format!("cannot remove '{}': {error}", target.display())))?;
+    fs::remove_file(&claimed)
+        .map_err(|error| Error::Input(format!("cannot remove '{}': {error}", claimed.display())))?;
     println!("removed {}", target.display());
     Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(unix)]
-fn ensure_target_identity(target: &Path, file: &File) -> Result<(), Error> {
-    use std::os::unix::fs::MetadataExt;
-
-    let opened = file
-        .metadata()
-        .map_err(|error| Error::Input(format!("cannot inspect '{}': {error}", target.display())))?;
-    let current = fs::symlink_metadata(target)
-        .map_err(|error| Error::Input(format!("cannot inspect '{}': {error}", target.display())))?;
-    if current.file_type().is_symlink()
-        || opened.dev() != current.dev()
-        || opened.ino() != current.ino()
-    {
-        return Err(Error::Input(format!(
-            "skill changed while it was being inspected at {}; refusing",
-            target.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_target_identity(target: &Path, _file: &File) -> Result<(), Error> {
-    if target_is_symlink(target)? {
-        return Err(Error::Input(format!(
-            "skill changed while it was being inspected at {}; refusing",
-            target.display()
-        )));
-    }
-    Ok(())
 }
 
 fn is_sekai_skill(content: &str) -> bool {
