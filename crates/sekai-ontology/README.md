@@ -12,6 +12,8 @@ sekai --db knowledge.db export
 sekai --db knowledge.db validate
 sekai --db knowledge.db --json explain Api
 sekai --db knowledge.db --json query Api --direction outbound --depth 2
+sekai --db knowledge.db --json entity list
+sekai --db knowledge.db --json relation list
 ```
 
 Set `SEKAI_DB` instead of passing `--db`. The default is `knowledge.db`.
@@ -78,3 +80,28 @@ stdout and diagnostics to stderr.
 
 The JSON contract is version 1. New optional fields may be added within version
 1; incompatible changes require a new schema version.
+
+## Agent skill
+
+The matching agent skill is embedded in the binary and installs offline:
+
+```bash
+sekai skill install --path /chosen/skill/directory
+sekai skill path --path /chosen/skill/directory
+sekai skill install --path /chosen/skill/directory --uninstall
+```
+
+Without `--path`, `SEKAI_SKILL_PATH` is used, followed by
+`$HOME/.agents/skills/sekai-ontology`. The named directory receives `SKILL.md`
+directly. Reinstalling an unchanged skill exits 10. A modified or unrecognized
+file is never overwritten or removed and exits 11; `--force` explicitly
+replaces it during installation.
+
+## Installation
+
+Tagged releases publish prebuilt `sekai` archives for macOS and Linux on
+Arm64 and x86-64. The supported Homebrew installation does not require Rust:
+
+```bash
+brew install Sannrox/tap/sekai
+```
