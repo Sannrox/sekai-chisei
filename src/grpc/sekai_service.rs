@@ -1742,6 +1742,63 @@ fn check_write(
     Ok(())
 }
 
+fn validate_object_kind_change_access(
+    db: &SekaiDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    existing: &domain::Object,
+    updated: &domain::Object,
+) -> Result<(), Status> {
+    if existing.kind == updated.kind {
+        return Ok(());
+    }
+    let ontology = db.load_ontology_registry().map_err(Status::internal)?;
+    let mut linked = db
+        .get_links(&updated.id, "", &domain::Direction::Outgoing)
+        .map_err(Status::internal)?;
+    linked.extend(
+        db.get_links(&updated.id, "", &domain::Direction::Incoming)
+            .map_err(Status::internal)?,
+    );
+    for link in linked {
+        if ontology
+            .constraints_for_mapped_relation(&link.relation)
+            .is_empty()
+        {
+            continue;
+        }
+        for endpoint_id in [&link.from_id, &link.to_id] {
+            if endpoint_id == &updated.id {
+                continue;
+            }
+            let endpoint = db
+                .get_object(endpoint_id)
+                .map_err(Status::internal)?
+                .ok_or(Status::failed_precondition("link endpoint unavailable"))?;
+            check_team_namespace(db, principals, &endpoint.namespace, false)?;
+            check_read(security, &endpoint.id, principals)?;
+        }
+        if ontology
+            .constraints_for_mapped_relation(&link.relation)
+            .into_iter()
+            .any(|constraint| {
+                let introduces_domain_violation = link.from_id == updated.id
+                    && ontology.kind_satisfies_class(&existing.kind, &constraint.domain)
+                    && !ontology.kind_satisfies_class(&updated.kind, &constraint.domain);
+                let introduces_range_violation = link.to_id == updated.id
+                    && ontology.kind_satisfies_class(&existing.kind, &constraint.range)
+                    && !ontology.kind_satisfies_class(&updated.kind, &constraint.range);
+                introduces_domain_violation || introduces_range_violation
+            })
+        {
+            return Err(Status::failed_precondition(
+                "link endpoints violate ontology constraint",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_object_admin(
     db: &SekaiDb,
     security: &SecurityChecker,
@@ -3822,6 +3879,8 @@ fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
         LeaseError::Stale(message) => Status::failed_precondition(message),
         LeaseError::NotExpired => Status::failed_precondition("lease has not expired"),
         LeaseError::Storage(message) => Status::internal(message),
+        LeaseError::Mutation(message) if message == "not found" => Status::not_found(message),
+        LeaseError::Mutation(message) => Status::failed_precondition(message),
     }
 }
 
@@ -4093,6 +4152,310 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(TakeoverExpiredLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
+    }
+
+    async fn guarded_create_object(
+        &self,
+        req: Request<GuardedCreateObjectRequest>,
+    ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        let precondition = input
+            .lease_precondition
+            .ok_or(Status::invalid_argument("lease_precondition required"))?;
+        let object = input
+            .object
+            .ok_or(Status::invalid_argument("object required"))?;
+        if object.id.is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        if object.kind == "namespace" {
+            require_credential_admin(&principals)?;
+            return Err(Status::failed_precondition(
+                "namespace objects must be managed through EnsureTeamNamespace",
+            ));
+        }
+        if object.id.starts_with("namespace:") || object.external_id.starts_with("namespace:") {
+            return Err(Status::invalid_argument(
+                "namespace:* identifiers are reserved for namespace boundaries",
+            ));
+        }
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &object.namespace,
+            true,
+        )?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &precondition.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+        check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
+        check_write(&self.security, &object.id, &principals)?;
+        let domain_object = from_proto_obj(&object);
+        if let Some(created) = self
+            .db
+            .guarded_object_replay(
+                &precondition.namespace,
+                &precondition.key,
+                &precondition.fencing_token,
+                &precondition.request_id,
+                "create",
+                &domain_object.id,
+                &domain_object,
+            )
+            .map_err(map_lease_error)?
+        {
+            let created = self.resolve_computed_for_response(
+                created,
+                &principals,
+                tenant_context.as_deref(),
+            )?;
+            return Ok(Response::new(GuardedCreateObjectResponse {
+                object: Some(to_proto_obj(&created)),
+            }));
+        }
+        if is_reserved_governance_kind(&domain_object.kind) {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
+        self.require_schema_kind_loaded(&domain_object.kind)?;
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        schema
+            .validate(&domain_object)
+            .map_err(Status::invalid_argument)?;
+        ensure_restricted_create_properties_allowed(
+            &schema,
+            &self.security,
+            &principals,
+            &domain_object,
+        )?;
+        drop(schema);
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let created = self
+            .db
+            .guarded_create_object(
+                &domain_object,
+                &precondition.namespace,
+                &precondition.key,
+                &precondition.fencing_token,
+                &precondition.request_id,
+                actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        let created =
+            self.resolve_computed_for_response(created, &principals, tenant_context.as_deref())?;
+        Ok(Response::new(GuardedCreateObjectResponse {
+            object: Some(to_proto_obj(&created)),
+        }))
+    }
+
+    async fn guarded_update_object(
+        &self,
+        req: Request<GuardedUpdateObjectRequest>,
+    ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        let precondition = input
+            .lease_precondition
+            .ok_or(Status::invalid_argument("lease_precondition required"))?;
+        let object = input
+            .object
+            .ok_or(Status::invalid_argument("object required"))?;
+        if object.id.is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
+            return Err(Status::invalid_argument(
+                "namespace:* external IDs are reserved for namespace boundaries",
+            ));
+        }
+        let existing = self.db.get_object(&object.id).map_err(Status::internal)?;
+        if object.kind == "namespace"
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == "namespace")
+        {
+            require_credential_admin(&principals)?;
+        }
+        if let Some(existing) = &existing {
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                &existing.namespace,
+                true,
+            )?;
+            check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+        }
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &object.namespace,
+            true,
+        )?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &precondition.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+        check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
+        check_write(&self.security, &object.id, &principals)?;
+        let mut domain_object = from_proto_obj(&object);
+        let request_object = domain_object.clone();
+        if let Some(updated) = self
+            .db
+            .guarded_object_replay(
+                &precondition.namespace,
+                &precondition.key,
+                &precondition.fencing_token,
+                &precondition.request_id,
+                "update",
+                &request_object.id,
+                &request_object,
+            )
+            .map_err(map_lease_error)?
+        {
+            let updated = self.resolve_computed_for_response(
+                updated,
+                &principals,
+                tenant_context.as_deref(),
+            )?;
+            return Ok(Response::new(GuardedUpdateObjectResponse {
+                object: Some(to_proto_obj(&updated)),
+            }));
+        }
+        if is_reserved_governance_kind(&domain_object.kind)
+            || existing
+                .as_ref()
+                .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
+        {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
+        self.require_schema_kind_loaded(&domain_object.kind)?;
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        if existing.is_some() {
+            preserve_redacted_restricted_properties(
+                &self.db,
+                &schema,
+                &self.security,
+                &principals,
+                &mut domain_object,
+            )?;
+        }
+        schema
+            .validate(&domain_object)
+            .map_err(Status::invalid_argument)?;
+        drop(schema);
+        if let Some(existing) = &existing {
+            validate_object_kind_change_access(
+                &self.db,
+                &self.security,
+                &principals,
+                existing,
+                &domain_object,
+            )?;
+        }
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let updated = self
+            .db
+            .guarded_update_object(
+                &domain_object,
+                &request_object,
+                existing.as_ref(),
+                &precondition.namespace,
+                &precondition.key,
+                &precondition.fencing_token,
+                &precondition.request_id,
+                actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        let updated =
+            self.resolve_computed_for_response(updated, &principals, tenant_context.as_deref())?;
+        Ok(Response::new(GuardedUpdateObjectResponse {
+            object: Some(to_proto_obj(&updated)),
+        }))
+    }
+
+    async fn guarded_delete_object(
+        &self,
+        req: Request<GuardedDeleteObjectRequest>,
+    ) -> Result<Response<GuardedDeleteObjectResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        let precondition = input
+            .lease_precondition
+            .ok_or(Status::invalid_argument("lease_precondition required"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &precondition.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
+        check_write(&self.security, &input.id, &principals)?;
+        let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
+        if let Some(existing) = &expected {
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                &existing.namespace,
+                true,
+            )?;
+            check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+            if existing.kind == "namespace" {
+                require_credential_admin(&principals)?;
+                if existing
+                    .properties
+                    .get("team_managed")
+                    .is_some_and(|value| value == "true")
+                {
+                    return Err(Status::failed_precondition(
+                        "team-managed namespaces cannot be deleted through the generic object API",
+                    ));
+                }
+            }
+            if is_reserved_governance_kind(&existing.kind) {
+                return Err(Status::permission_denied(
+                    "object cannot be deleted through the guarded object API",
+                ));
+            }
+        }
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        self.db
+            .guarded_delete_object(
+                &input.id,
+                expected.as_ref(),
+                &precondition.namespace,
+                &precondition.key,
+                &precondition.fencing_token,
+                &precondition.request_id,
+                actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        Ok(Response::new(GuardedDeleteObjectResponse {}))
     }
 
     async fn create_handoff(
@@ -13476,6 +13839,80 @@ mod tests {
                 .types
                 .iter()
                 .any(|object_type| object_type.kind == "namespace" && object_type.is_builtin)
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_update_requires_object_and_lease_namespace_authorization() {
+        let svc = service();
+        let lease = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: "environment".into(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "acquire".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        let original = Object {
+            id: "guarded-auth".into(),
+            kind: "component".into(),
+            name: "before".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        svc.db
+            .create_object_with_audit(&from_proto_obj(&original), "alice")
+            .unwrap();
+        grant_object_role(&svc, "guarded-auth", "alice", security::Role::Editor);
+
+        let mut updated = original.clone();
+        updated.name = "after".into();
+        updated.updated = 2;
+        let precondition = LeasePrecondition {
+            namespace: "default".into(),
+            key: "environment".into(),
+            fencing_token: lease.fencing_token,
+            request_id: "update".into(),
+        };
+        svc.guarded_update_object(with_named_principal(
+            GuardedUpdateObjectRequest {
+                object: Some(updated.clone()),
+                lease_precondition: Some(precondition.clone()),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        updated.name = "unauthorized".into();
+        let error = svc
+            .guarded_update_object(with_named_principal(
+                GuardedUpdateObjectRequest {
+                    object: Some(updated),
+                    lease_precondition: Some(LeasePrecondition {
+                        request_id: "denied".into(),
+                        ..precondition
+                    }),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            svc.db.get_object("guarded-auth").unwrap().unwrap().name,
+            "after"
         );
     }
 
