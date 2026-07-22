@@ -430,18 +430,45 @@ fn claim_skill_target(target: &Path) -> Result<PathBuf, Error> {
         .parent()
         .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
     for _ in 0..100 {
+        let target_metadata = fs::symlink_metadata(target).map_err(|error| {
+            Error::Input(format!("cannot inspect '{}': {error}", target.display()))
+        })?;
         let sequence = SKILL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let claimed = parent.join(format!(
             ".SKILL.md.{}.{}.claimed",
             std::process::id(),
             sequence
         ));
-        if fs::symlink_metadata(&claimed).is_ok() {
-            continue;
+        let reserved = if target_metadata.file_type().is_dir() {
+            fs::create_dir(&claimed)
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&claimed)
+                .map(drop)
+        };
+        match reserved {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::Input(format!(
+                    "cannot reserve recovery path in '{}': {error}",
+                    parent.display()
+                )));
+            }
         }
-        fs::rename(target, &claimed).map_err(|error| {
-            Error::Input(format!("cannot claim '{}': {error}", target.display()))
-        })?;
+        if let Err(error) = fs::rename(target, &claimed) {
+            if target_metadata.file_type().is_dir() {
+                let _ = fs::remove_dir(&claimed);
+            } else {
+                let _ = fs::remove_file(&claimed);
+            }
+            return Err(Error::Input(format!(
+                "cannot claim '{}': {error}",
+                target.display()
+            )));
+        }
         return Ok(claimed);
     }
     Err(Error::Input(format!(
