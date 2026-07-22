@@ -164,6 +164,23 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn create_link_once(&self, link: &Link) -> Result<bool, String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+                &[
+                    &link.id,
+                    &link.from_id,
+                    &link.to_id,
+                    &link.relation,
+                    &link.created,
+                ],
+            )
+            .map(|inserted| inserted == 1)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
         self.connection()?
             .execute("DELETE FROM sekai_links WHERE id = $1", &[&id])

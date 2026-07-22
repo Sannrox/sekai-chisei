@@ -4989,8 +4989,9 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
-        let l = req
-            .into_inner()
+        let inner = req.into_inner();
+        let fail_if_exists = inner.fail_if_exists;
+        let l = inner
             .link
             .ok_or(Status::invalid_argument("link required"))?;
         let mut endpoints = Vec::with_capacity(2);
@@ -5026,7 +5027,17 @@ impl SekaiService for SekaiServiceImpl {
             relation: l.relation.clone(),
             created: l.created,
         };
-        self.db.create_link(&dl).map_err(map_graph_mutation_error)?;
+        if fail_if_exists {
+            if !self
+                .db
+                .create_link_once(&dl)
+                .map_err(map_graph_mutation_error)?
+            {
+                return Err(Status::already_exists("link already exists"));
+            }
+        } else {
+            self.db.create_link(&dl).map_err(map_graph_mutation_error)?;
+        }
         Ok(Response::new(CreateLinkResponse { link: Some(l) }))
     }
     async fn delete_link(
@@ -11094,6 +11105,20 @@ mod tests {
         ))
         .await
         .unwrap();
+        let duplicate = svc
+            .create_link(with_principal(CreateLinkRequest {
+                fail_if_exists: true,
+                link: Some(Link {
+                    id: "cluster-component".into(),
+                    from_id: "cluster-1".into(),
+                    to_id: "component-1".into(),
+                    relation: "contains".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
 
         let got = svc
             .get_object(with_principal(GetObjectRequest {
@@ -12771,6 +12796,7 @@ mod tests {
         .await
         .unwrap();
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "cluster-component".into(),
                 from_id: "cluster-1".into(),
@@ -12891,6 +12917,7 @@ mod tests {
         for child in ["acme-child", "beta-child"] {
             svc.create_link(with_named_principal(
                 CreateLinkRequest {
+                    fail_if_exists: false,
                     link: Some(Link {
                         id: format!("team-cluster->{child}"),
                         from_id: "team-cluster".into(),
@@ -13666,6 +13693,7 @@ mod tests {
 
         // Unconstrained graph relations retain their existing permissive behavior.
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "legacy".into(),
                 from_id: "project".into(),
@@ -13677,6 +13705,7 @@ mod tests {
         .await
         .unwrap();
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "legacy-both".into(),
                 from_id: "project".into(),
@@ -13704,6 +13733,7 @@ mod tests {
 
         // Engineer reaches Person through inheritance and symmetric equivalence.
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "valid".into(),
                 from_id: "engineer".into(),
@@ -13715,6 +13745,7 @@ mod tests {
         .await
         .unwrap();
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "legacy".into(),
                 from_id: "project".into(),
@@ -13728,6 +13759,7 @@ mod tests {
 
         let incompatible = svc
             .create_link(with_principal(CreateLinkRequest {
+                fail_if_exists: false,
                 link: Some(Link {
                     id: "invalid".into(),
                     from_id: "project".into(),
@@ -13756,6 +13788,7 @@ mod tests {
             "link endpoints violate ontology constraint"
         );
         svc.create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: "empty-relation".into(),
                 from_id: "project".into(),
@@ -13878,6 +13911,7 @@ mod tests {
 
         let error = svc
             .create_link(with_principal(CreateLinkRequest {
+                fail_if_exists: false,
                 link: Some(Link {
                     id: "hidden-link".into(),
                     from_id: "person".into(),
@@ -15355,6 +15389,7 @@ mod tests {
 
         svc.create_link(with_named_principal(
             CreateLinkRequest {
+                fail_if_exists: false,
                 link: Some(Link {
                     id: "cross-namespace-link".into(),
                     from_id: "acme-object".into(),
@@ -15383,6 +15418,7 @@ mod tests {
         let viewer_link = svc
             .create_link(with_named_principal(
                 CreateLinkRequest {
+                    fail_if_exists: false,
                     link: Some(Link {
                         id: "viewer-link".into(),
                         from_id: "acme-object".into(),
