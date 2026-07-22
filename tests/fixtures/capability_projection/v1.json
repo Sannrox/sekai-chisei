@@ -1,0 +1,53 @@
+{
+  "projection_version": "sekai.capability-projection/v1",
+  "context": {
+    "namespace": "team-a",
+    "principal": "agent-a",
+    "contract_version": "1.0",
+    "catalog_version": "sha256:catalog"
+  },
+  "capability": {
+    "name": "sekai.actions.write",
+    "description": "Write a governed value.",
+    "kind": "action",
+    "lifecycle_state": "active",
+    "contract_version": "1.0",
+    "minimum_compatible_version": "1.0",
+    "maximum_compatible_version": "1.0",
+    "replacement_capability": "",
+    "input_type": "sekai.ExecuteActionRequest",
+    "output_type": "sekai.ExecuteActionResponse",
+    "required_scopes": ["namespace:write"],
+    "policy_decision_points": ["namespace_access", "action_policy"],
+    "risk_class": "write",
+    "approval_behavior": "may_require",
+    "limits": {"max_mutations_per_invocation": 1},
+    "evidence_requirements": ["audit_receipt"],
+    "object_schema": null,
+    "action_schema": {
+      "type": "object",
+      "properties": {"value": {"type": "string", "x-sekai-required": true}},
+      "required": ["value"],
+      "additionalProperties": false,
+      "x-sekai-action": "write",
+      "x-sekai-target-kind": "record"
+    }
+  },
+  "invocation": {
+    "operation_id": "operation-1",
+    "input": {"value": "safe"}
+  },
+  "expected_metadata": {
+    "x-principal": "agent-a",
+    "x-sekai-namespace": "team-a",
+    "x-sekai-capability": "sekai.actions.write",
+    "x-sekai-operation-id": "operation-1"
+  },
+  "expected_error": {
+    "code": "permission_denied",
+    "message": "write denied",
+    "capability": "sekai.actions.write",
+    "operation_id": "operation-1",
+    "retryable": false
+  }
+}

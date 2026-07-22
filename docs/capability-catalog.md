@@ -86,6 +86,35 @@ either form of authority.
 
 ## Related capability surfaces
 
+### MCP and SDK projections
+
+`ProjectedCapability` is the replaceable projection boundary for MCP tools and
+thin Rust, TypeScript, and Python clients. It is constructed only from an
+authorization-filtered native catalog entry and records the exact namespace,
+principal, contract version, and catalog snapshot that produced it.
+
+The MCP projection exposes the canonical capability name as the tool name. Its
+`_meta` field carries the complete projected contract, including native input
+and output types, embedded object or action schemas, required scopes, decision
+points, limits, lifecycle state, and compatibility bounds. MCP annotations are
+only descriptive hints and never grant authority. Tool calls require an
+explicit `operation_id` and are rebound to the native RPC rather than executed
+by an independent MCP policy path.
+
+The SDK bindings under `sdk/` consume the same serialized projection. Every
+binding fails closed on version drift and binds these native metadata fields:
+
+- `x-principal`
+- `x-sekai-namespace`
+- `x-sekai-capability`
+- `x-sekai-operation-id`
+
+The server still rechecks live namespace access, object ACLs, action policy,
+budget, and approval state. A cached projection is therefore discovery data,
+not a credential or authorization token. Shared conformance fixtures verify
+that Rust, TypeScript, and Python preserve authority, error codes, attribution,
+and operation correlation.
+
 `GET /v1/chisei/capabilities` describes effective provider protocol features
 for the compatible gateway. It is distinct from this namespace-scoped native
 ontology catalog. Provider-owned tools are not projected into the native
