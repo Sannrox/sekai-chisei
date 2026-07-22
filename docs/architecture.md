@@ -263,6 +263,14 @@ interfaces, but they are not a drop-in replacement for the server's complete
 SQLite path. The graph, policy state, receipts, evidence, and audit history are
 durable; provider streams and secrets are not treated as durable credentials.
 
+Runtime composition uses the versioned `sekai.runtime-backend/v1` contract.
+Its public metadata names the backend and the reusable Sekai, Chisei, gateway,
+and operations surfaces it supports. Startup validates the complete community
+requirement before binding listeners. SQLite advertises that complete set;
+PostgreSQL selection fails early until later parity work can truthfully
+advertise it. This contract does not activate tenant persistence or identity
+endpoints.
+
 External evidence submissions are retained source records. Graph objects,
 links, and evidence observations are rebuildable projections. Conflicting
 submissions remain separately attributable instead of being collapsed into a
