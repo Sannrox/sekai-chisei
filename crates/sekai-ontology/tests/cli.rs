@@ -312,6 +312,39 @@ fn skill_install_refuses_symlink_targets() {
     assert_eq!(fs::read_to_string(referent).unwrap(), "outside\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn skill_install_handles_read_only_existing_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("skill");
+    let target_arg = target.to_str().unwrap();
+    assert!(
+        sekai(&["skill", "install", "--path", target_arg])
+            .status
+            .success()
+    );
+    let skill_file = target.join("SKILL.md");
+    fs::set_permissions(&skill_file, fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(
+        sekai(&["skill", "install", "--path", target_arg])
+            .status
+            .code(),
+        Some(10)
+    );
+
+    fs::set_permissions(&skill_file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&skill_file, format!("{EMBEDDED_SKILL}\n# modified\n")).unwrap();
+    fs::set_permissions(&skill_file, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(
+        sekai(&["skill", "install", "--path", target_arg, "--force"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(skill_file).unwrap(), EMBEDDED_SKILL);
+}
+
 #[test]
 fn installed_skill_and_json_query_complete_agent_scenario() {
     let directory = tempfile::tempdir().unwrap();
