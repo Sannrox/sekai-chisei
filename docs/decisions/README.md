@@ -3,6 +3,9 @@
 Architecture Decision Records (ADRs) preserve accepted choices whose rationale
 will still matter after the originating Issue or Discussion closes.
 
+Proposed ADRs may accompany an open Design Discussion, but do not become
+project policy until the discussion is resolved and their status is accepted.
+
 Create an ADR only when a decision changes a durable boundary, public contract,
 trust model, persistence strategy, or difficult-to-reverse technical direction.
 Routine implementation detail stays in its Issue and pull request.
@@ -23,3 +26,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0001: Evaluate bounded ontology entailment at query time](0001-query-time-ontology-entailment.md)
 - [ADR 0002: Identify prompt variants by immutable versioned names](0002-versioned-prompt-variant-identity.md)
 - [ADR 0003: Inspect ontology through authenticated static artifacts](0003-authenticated-static-ontology-inspection.md)
+- [ADR 0004: Represent graph history as bitemporal assertions](0003-bitemporal-graph-assertions.md)
