@@ -1019,6 +1019,26 @@ impl SekaiDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    pub fn create_link_once(&self, l: &Link) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|error| error.to_string())?
+            == 1;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
+    }
+
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
         let conn = self.conn();
         conn.execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
