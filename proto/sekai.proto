@@ -309,6 +309,57 @@ message DiscoverCapabilitiesResponse {
   string cache_scope = 6; // always authorization_context
 }
 
+// Closed declarative capability-package content. definition_json accepts only
+// the kind-specific identifier, enum, list, and bounded-integer fields.
+message CapabilityPackageComponent {
+  string kind = 1;
+  string name = 2;
+  string definition_json = 3;
+}
+
+message CapabilityPackageManifest {
+  string manifest_version = 1;
+  string name = 2;
+  string version = 3;
+  repeated CapabilityPackageComponent components = 4;
+}
+
+message CapabilityPackageInstallation {
+  string namespace = 1;
+  string package_name = 2;
+  string current_version = 3;
+  string previous_version = 4;
+  string state = 5;
+  string installed_by = 6;
+  string updated_by = 7;
+  int64 installed_at_ms = 8;
+  int64 updated_at_ms = 9;
+}
+
+message CapabilityPackageEvent {
+  int64 sequence = 1;
+  string namespace = 2;
+  string package_name = 3;
+  string package_version = 4;
+  string action = 5;
+  string actor = 6;
+  string request_id = 7;
+  string manifest_digest = 8;
+  string evidence = 9;
+  int64 recorded_at_ms = 10;
+}
+
+message InstallCapabilityPackageRequest { string namespace = 1; CapabilityPackageManifest manifest = 2; string request_id = 3; }
+message InstallCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; }
+message UpgradeCapabilityPackageRequest { string namespace = 1; CapabilityPackageManifest manifest = 2; string request_id = 3; }
+message UpgradeCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; }
+message CapabilityPackageTransitionRequest { string namespace = 1; string package_name = 2; string request_id = 3; }
+message CapabilityPackageTransitionResponse { CapabilityPackageInstallation installation = 1; }
+message GetCapabilityPackageRequest { string namespace = 1; string package_name = 2; }
+message GetCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; CapabilityPackageManifest manifest = 2; repeated CapabilityPackageEvent events = 3; }
+message EvaluateCapabilityPackageResponse { bool passed = 1; }
+message UninstallCapabilityPackageResponse {}
+
 message LineageNode {
   Object object = 1;
   string role = 2;
@@ -1188,6 +1239,13 @@ service SekaiService {
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
   rpc DiscoverCapabilities(DiscoverCapabilitiesRequest) returns (DiscoverCapabilitiesResponse);
+  rpc InstallCapabilityPackage(InstallCapabilityPackageRequest) returns (InstallCapabilityPackageResponse);
+  rpc GetCapabilityPackage(GetCapabilityPackageRequest) returns (GetCapabilityPackageResponse);
+  rpc EvaluateCapabilityPackage(CapabilityPackageTransitionRequest) returns (EvaluateCapabilityPackageResponse);
+  rpc UpgradeCapabilityPackage(UpgradeCapabilityPackageRequest) returns (UpgradeCapabilityPackageResponse);
+  rpc RollbackCapabilityPackage(CapabilityPackageTransitionRequest) returns (CapabilityPackageTransitionResponse);
+  rpc DisableCapabilityPackage(CapabilityPackageTransitionRequest) returns (CapabilityPackageTransitionResponse);
+  rpc UninstallCapabilityPackage(CapabilityPackageTransitionRequest) returns (UninstallCapabilityPackageResponse);
 
   rpc ListSchemaTypes(ListSchemaTypesRequest) returns (ListSchemaTypesResponse);
   rpc CreateSchemaType(CreateSchemaTypeRequest) returns (CreateSchemaTypeResponse);
