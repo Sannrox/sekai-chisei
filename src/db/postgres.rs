@@ -16,6 +16,8 @@ const MIGRATION_LOCK_ID: i64 = 0x5345_4b41_4948_4101;
 const CONTROL_PLANE_SCHEMA: &str = include_str!("postgres/0001_control_plane.sql");
 const SAMPLE_LEASE_SCHEMA: &str = include_str!("postgres/0002_sample_leases.sql");
 const UNIQUE_GRANT_SCHEMA: &str = include_str!("postgres/0003_unique_grants.sql");
+const PORTFOLIO_PROMPT_VARIANT_SCHEMA: &str =
+    include_str!("postgres/0004_portfolio_prompt_variants.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -312,6 +314,24 @@ impl PostgresDb {
                 )
                 .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
         }
+        let portfolio_prompt_variants_applied = transaction
+            .query_opt(
+                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
+                &[&4_i64],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
+            .is_some();
+        if !portfolio_prompt_variants_applied {
+            transaction
+                .batch_execute(PORTFOLIO_PROMPT_VARIANT_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL portfolio prompt variants: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                    &[&4_i64, &"portfolio_prompt_variants", &chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -390,5 +410,10 @@ mod tests {
         assert!(!CONTROL_PLANE_SCHEMA.contains("INSERT OR"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
+        assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));
+        assert!(
+            PORTFOLIO_PROMPT_VARIANT_SCHEMA
+                .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")
+        );
     }
 }

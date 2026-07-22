@@ -1838,7 +1838,15 @@ impl ChiseiServiceImpl {
             evidence: HashMap::from([
                 ("task_class".into(), task_class.to_string()),
                 ("previous_model".into(), selection.previous_model.clone()),
+                (
+                    "previous_prompt_variant".into(),
+                    selection.previous_prompt_variant.clone(),
+                ),
                 ("selected_model".into(), selection.model.clone()),
+                (
+                    "selected_prompt_variant".into(),
+                    selection.prompt_variant.clone(),
+                ),
                 ("objective_mode".into(), objective.mode.as_str().into()),
                 (
                     "budget_usd_micros".into(),
@@ -3968,6 +3976,7 @@ fn eval_iteration_pb(iteration: crate::chisei::eval::Iteration) -> EvalIteration
 fn portfolio_point_pb(point: crate::chisei::portfolio::FrontierPoint) -> PortfolioPoint {
     PortfolioPoint {
         model: point.model,
+        prompt_variant: point.prompt_variant,
         quality_score: point.quality_score,
         cost_usd_micros: point.cost_usd_micros,
         sample_count: point.sample_count,
@@ -4832,6 +4841,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 namespace: r.namespace.clone(),
                 task_class: r.task_class.clone(),
                 model: r.model,
+                prompt_variant: r.prompt_variant,
                 quality_score: r.quality_score,
                 cost_usd_micros: r.cost_usd_micros,
                 sample_count: r.sample_count,
@@ -4930,6 +4940,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map(|allocation| PortfolioAllocation {
                     task_class: allocation.task_class,
                     model: allocation.model,
+                    prompt_variant: allocation.prompt_variant,
                     quality_score: allocation.quality_score,
                     cost_per_call_usd_micros: allocation.cost_per_call_usd_micros,
                     expected_calls: allocation.expected_calls,
@@ -5254,6 +5265,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     &portfolio_scope,
                     &normalized_task_class,
                     &capable_model,
+                    crate::chisei::portfolio::LEGACY_PROMPT_VARIANT,
                     now,
                     true,
                 ) {
@@ -5296,6 +5308,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         &portfolio_scope,
                         &normalized_task_class,
                         &proposed,
+                        &allocation.prompt_variant,
                         now,
                         false,
                     )
@@ -9736,7 +9749,10 @@ mod tests {
     #[tokio::test]
     async fn portfolio_rpcs_persist_frontier_and_allocate_objective() {
         let svc = memory_service();
-        for (model, quality, cost) in [("small", 80.0, 10), ("large", 95.0, 30)] {
+        for (model, variant, quality, cost) in [
+            ("small", "economy@1", 80.0, 10),
+            ("large", "quality@2", 95.0, 30),
+        ] {
             svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
                 namespace: "acme".into(),
                 task_class: "primary".into(),
@@ -9745,6 +9761,7 @@ mod tests {
                 cost_usd_micros: cost,
                 sample_count: 5,
                 updated_at: 1,
+                prompt_variant: variant.into(),
             }))
             .await
             .unwrap();
@@ -9776,6 +9793,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(response.allocations[0].model, "large");
+        assert_eq!(response.allocations[0].prompt_variant, "quality@2");
         assert_eq!(response.total_cost_usd_micros, 60);
     }
 
@@ -10243,6 +10261,7 @@ mod tests {
             cost_usd_micros: 1,
             sample_count: 100,
             updated_at: 1,
+            prompt_variant: String::new(),
         });
         portfolio
             .metadata_mut()
@@ -11527,6 +11546,7 @@ mod tests {
                 cost_usd_micros: cost,
                 sample_count: 5,
                 updated_at: 1,
+                prompt_variant: String::new(),
             }))
             .await
             .unwrap();

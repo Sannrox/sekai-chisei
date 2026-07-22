@@ -5,13 +5,15 @@ use crate::db::postgres::PostgresDb;
 
 impl PostgresDb {
     pub fn portfolio_record_observation(&self, observation: &Observation) -> Result<(), String> {
+        let prompt_variant =
+            crate::chisei::portfolio::normalize_prompt_variant(&observation.prompt_variant);
         self.connection()?
             .execute(
                 "INSERT INTO chisei_portfolio_observations
-                    (namespace, task_class, model, quality_score, cost_usd_micros,
+                    (namespace, task_class, model, prompt_variant, quality_score, cost_usd_micros,
                      sample_count, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT(namespace, task_class, model) DO UPDATE SET
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(namespace, task_class, model, prompt_variant) DO UPDATE SET
                     quality_score =
                         ((chisei_portfolio_observations.quality_score * chisei_portfolio_observations.sample_count)
                          + (excluded.quality_score * excluded.sample_count))
@@ -27,6 +29,7 @@ impl PostgresDb {
                     &observation.namespace,
                     &observation.task_class,
                     &observation.model,
+                    &prompt_variant,
                     &observation.quality_score,
                     &observation.cost_usd_micros,
                     &observation.sample_count,
@@ -44,20 +47,21 @@ impl PostgresDb {
     ) -> Result<Vec<FrontierPoint>, String> {
         self.connection()?
             .query(
-                "SELECT model, quality_score, cost_usd_micros, sample_count, updated_at
+                "SELECT model, prompt_variant, quality_score, cost_usd_micros, sample_count, updated_at
                  FROM chisei_portfolio_observations
                  WHERE namespace = $1 AND task_class = $2
-                 ORDER BY cost_usd_micros, quality_score DESC, model",
+                 ORDER BY cost_usd_micros, quality_score DESC, model, prompt_variant",
                 &[&namespace, &task_class],
             )
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| FrontierPoint {
                         model: row.get(0),
-                        quality_score: row.get(1),
-                        cost_usd_micros: row.get(2),
-                        sample_count: row.get(3),
-                        updated_at: row.get(4),
+                        prompt_variant: row.get(1),
+                        quality_score: row.get(2),
+                        cost_usd_micros: row.get(3),
+                        sample_count: row.get(4),
+                        updated_at: row.get(5),
                     })
                     .collect()
             })
@@ -117,11 +121,14 @@ impl PostgresDb {
         namespace: &str,
         task_class: &str,
         proposed_model: &str,
+        proposed_prompt_variant: &str,
         now_ms: i64,
         force: bool,
     ) -> Result<RouteSelection, String> {
         const CONFIRMATIONS: i64 = 3;
         const COOLDOWN_MS: i64 = 15 * 60 * 1000;
+        let proposed_prompt_variant =
+            crate::chisei::portfolio::normalize_prompt_variant(proposed_prompt_variant);
 
         let mut connection = self.connection()?;
         let mut transaction = connection
@@ -136,7 +143,7 @@ impl PostgresDb {
             .map_err(|error| format!("lock portfolio route: {error}"))?;
         let state = transaction
             .query_opt(
-                "SELECT current_model, pending_model, pending_count, shifted_at
+                "SELECT current_model, current_prompt_variant, pending_model, pending_prompt_variant, pending_count, shifted_at
                  FROM chisei_portfolio_routes WHERE namespace = $1 AND task_class = $2",
                 &[&namespace, &task_class],
             )
@@ -145,16 +152,24 @@ impl PostgresDb {
             transaction
                 .execute(
                     "INSERT INTO chisei_portfolio_routes
-                        (namespace, task_class, current_model, pending_model,
-                         pending_count, shifted_at, updated_at)
-                     VALUES ($1, $2, $3, '', 0, $4, $4)",
-                    &[&namespace, &task_class, &proposed_model, &now_ms],
+                    (namespace, task_class, current_model, current_prompt_variant, pending_model,
+                         pending_prompt_variant, pending_count, shifted_at, updated_at)
+                     VALUES ($1, $2, $3, $4, '', '', 0, $5, $5)",
+                    &[
+                        &namespace,
+                        &task_class,
+                        &proposed_model,
+                        &proposed_prompt_variant,
+                        &now_ms,
+                    ],
                 )
                 .map_err(|error| error.to_string())?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(RouteSelection {
                 model: proposed_model.to_string(),
+                prompt_variant: proposed_prompt_variant.to_string(),
                 previous_model: String::new(),
+                previous_prompt_variant: String::new(),
                 shifted: !force,
                 reason: if force {
                     "initialized on regression-safe model".into()
@@ -164,15 +179,17 @@ impl PostgresDb {
             });
         };
         let current: String = state.get(0);
-        let pending: String = state.get(1);
-        let pending_count: i64 = state.get(2);
-        let shifted_at: i64 = state.get(3);
+        let current_variant: String = state.get(1);
+        let pending: String = state.get(2);
+        let pending_variant: String = state.get(3);
+        let pending_count: i64 = state.get(4);
+        let shifted_at: i64 = state.get(5);
 
-        if current == proposed_model {
+        if current == proposed_model && current_variant == proposed_prompt_variant {
             transaction
                 .execute(
                     "UPDATE chisei_portfolio_routes
-                     SET pending_model = '', pending_count = 0, updated_at = $3
+                     SET pending_model = '', pending_prompt_variant = '', pending_count = 0, updated_at = $3
                      WHERE namespace = $1 AND task_class = $2",
                     &[&namespace, &task_class, &now_ms],
                 )
@@ -180,7 +197,9 @@ impl PostgresDb {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(RouteSelection {
                 model: current.clone(),
+                prompt_variant: current_variant.clone(),
                 previous_model: current,
+                previous_prompt_variant: current_variant,
                 shifted: false,
                 reason: "allocation unchanged".into(),
             });
@@ -192,18 +211,22 @@ impl PostgresDb {
                 namespace,
                 task_class,
                 proposed_model,
+                &proposed_prompt_variant,
                 now_ms,
             )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(RouteSelection {
                 model: proposed_model.to_string(),
+                prompt_variant: proposed_prompt_variant.to_string(),
                 previous_model: current,
+                previous_prompt_variant: current_variant,
                 shifted: true,
                 reason: "forced regression reversion".into(),
             });
         }
 
-        let next_count = if pending == proposed_model {
+        let next_count = if pending == proposed_model && pending_variant == proposed_prompt_variant
+        {
             pending_count + 1
         } else {
             1
@@ -215,11 +238,14 @@ impl PostgresDb {
                 namespace,
                 task_class,
                 proposed_model,
+                &proposed_prompt_variant,
                 now_ms,
             )?;
             RouteSelection {
                 model: proposed_model.to_string(),
+                prompt_variant: proposed_prompt_variant.to_string(),
                 previous_model: current,
+                previous_prompt_variant: current_variant,
                 shifted: true,
                 reason: format!("allocation confirmed {CONFIRMATIONS} times after cooldown"),
             }
@@ -227,12 +253,13 @@ impl PostgresDb {
             transaction
                 .execute(
                     "UPDATE chisei_portfolio_routes
-                     SET pending_model = $3, pending_count = $4, updated_at = $5
+                     SET pending_model = $3, pending_prompt_variant = $4, pending_count = $5, updated_at = $6
                      WHERE namespace = $1 AND task_class = $2",
                     &[
                         &namespace,
                         &task_class,
                         &proposed_model,
+                        &proposed_prompt_variant,
                         &next_count,
                         &now_ms,
                     ],
@@ -240,7 +267,9 @@ impl PostgresDb {
                 .map_err(|error| error.to_string())?;
             RouteSelection {
                 model: current.clone(),
+                prompt_variant: current_variant.clone(),
                 previous_model: current,
+                previous_prompt_variant: current_variant,
                 shifted: false,
                 reason: if cooldown_elapsed {
                     format!("waiting for allocation confirmation {next_count}/{CONFIRMATIONS}")
@@ -259,15 +288,16 @@ fn update_current_route(
     namespace: &str,
     task_class: &str,
     proposed_model: &str,
+    proposed_prompt_variant: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     transaction
         .execute(
             "UPDATE chisei_portfolio_routes
-             SET current_model = $3, pending_model = '', pending_count = 0,
-                 shifted_at = $4, updated_at = $4
+             SET current_model = $3, current_prompt_variant = $4, pending_model = '', pending_prompt_variant = '', pending_count = 0,
+                 shifted_at = $5, updated_at = $5
              WHERE namespace = $1 AND task_class = $2",
-            &[&namespace, &task_class, &proposed_model, &now_ms],
+            &[&namespace, &task_class, &proposed_model, &proposed_prompt_variant, &now_ms],
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -321,6 +351,7 @@ mod tests {
                 &format!("route-contract-{run_id}-{case}"),
                 task_class,
                 proposed_model,
+                crate::chisei::portfolio::LEGACY_PROMPT_VARIANT,
                 now_ms,
                 force,
             )
@@ -333,8 +364,15 @@ mod tests {
         let db = Arc::new(test_database());
         let namespace = format!("route-lock-{}", uuid::Uuid::new_v4().simple());
         let task_class = "primary";
-        db.portfolio_damped_route(&namespace, task_class, "small", 0, false)
-            .unwrap();
+        db.portfolio_damped_route(
+            &namespace,
+            task_class,
+            "small",
+            crate::chisei::portfolio::LEGACY_PROMPT_VARIANT,
+            0,
+            false,
+        )
+        .unwrap();
 
         let mut lock_connection = db.connection().unwrap();
         let mut lock_transaction = lock_connection.transaction().unwrap();
@@ -360,6 +398,7 @@ mod tests {
                         &worker_namespace,
                         task_class,
                         "large",
+                        crate::chisei::portfolio::LEGACY_PROMPT_VARIANT,
                         15 * 60 * 1000,
                         false,
                     );
