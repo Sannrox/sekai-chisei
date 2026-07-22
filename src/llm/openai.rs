@@ -90,6 +90,8 @@ impl Provider for OpenAI {
                 .and_then(|v| v.as_str())
                 .unwrap_or("stop")
                 .to_string(),
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         })
     }
 
@@ -172,6 +174,8 @@ impl Provider for OpenAI {
                     output_tokens,
                     stop_reason,
                     done: true,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 });
             }
         }))
@@ -259,6 +263,8 @@ fn parse_openai_sse_event(
                     output_tokens: *output_tokens,
                     stop_reason: stop_reason.clone(),
                     done: true,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 });
             }
             continue;
@@ -287,6 +293,8 @@ fn parse_openai_sse_event(
                     output_tokens: *output_tokens,
                     stop_reason: stop_reason.clone(),
                     done: false,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 });
             }
         }
@@ -333,6 +341,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             max_tokens: 16,
+            prompt_cache: Default::default(),
         }
     }
 

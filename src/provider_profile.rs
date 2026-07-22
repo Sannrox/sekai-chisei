@@ -127,6 +127,19 @@ pub struct ProviderGovernanceProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheProfile {
+    pub version: String,
+    pub explicit_breakpoints: bool,
+    pub lifetime: Option<String>,
+    pub minimum_cacheable_tokens: Option<u64>,
+    pub pricing_class: Option<String>,
+    pub usage_fields: Vec<String>,
+    pub rate_limit_treatment: Option<String>,
+    pub protocol_portability: String,
+    pub privacy_assurance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProfile {
     pub provider: String,
     pub profile_version: String,
@@ -147,6 +160,7 @@ pub struct ProviderProfile {
     pub error_normalization_version: String,
     pub pricing: PricingProfile,
     pub governance: ProviderGovernanceProfile,
+    pub prompt_cache: PromptCacheProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1108,33 +1122,7 @@ impl ProviderRegistry {
                         built_in_tools: vec![],
                     },
                 ),
-                profile(
-                    "anthropic",
-                    "anthropic-messages",
-                    Some("anthropic/"),
-                    (
-                        "CHISEI_ANTHROPIC_BASE_URL",
-                        Some("https://api.anthropic.com/v1"),
-                        Some("ANTHROPIC_API_KEY"),
-                    ),
-                    &["messages", "count_tokens", "models"],
-                    &[],
-                    ProviderCapabilities {
-                        responses: false,
-                        streaming: true,
-                        tools: true,
-                        parallel_tools: true,
-                        structured_output: true,
-                        reasoning_controls: true,
-                        modalities: vec!["text".into(), "image".into()],
-                        provider_continuation: false,
-                        reports_usage: true,
-                        partial_usage: true,
-                        context_tokens: 200_000,
-                        output_tokens: Some(64_000),
-                        built_in_tools: vec![],
-                    },
-                ),
+                anthropic_profile(),
                 xai_profile(),
                 meta_profile(),
             ],
@@ -1673,7 +1661,74 @@ fn profile(
             contractual_status: None,
             terms_version: None,
         },
+        prompt_cache: PromptCacheProfile {
+            version: "chisei.prompt-cache-capabilities/v1".into(),
+            explicit_breakpoints: false,
+            lifetime: None,
+            minimum_cacheable_tokens: None,
+            pricing_class: None,
+            usage_fields: Vec::new(),
+            rate_limit_treatment: None,
+            protocol_portability: "not_supported".into(),
+            privacy_assurance: "no_upstream_prompt_cache_assurance".into(),
+        },
     }
+}
+
+fn anthropic_profile() -> ProviderProfile {
+    let mut profile = profile(
+        "anthropic",
+        "anthropic-messages",
+        Some("anthropic/"),
+        (
+            "CHISEI_ANTHROPIC_BASE_URL",
+            Some("https://api.anthropic.com/v1"),
+            Some("ANTHROPIC_API_KEY"),
+        ),
+        &["messages", "count_tokens", "models"],
+        &[],
+        ProviderCapabilities {
+            responses: false,
+            streaming: true,
+            tools: true,
+            parallel_tools: true,
+            structured_output: true,
+            reasoning_controls: true,
+            modalities: vec!["text".into(), "image".into()],
+            provider_continuation: false,
+            reports_usage: true,
+            partial_usage: true,
+            context_tokens: 200_000,
+            output_tokens: Some(64_000),
+            built_in_tools: vec![],
+        },
+    );
+    profile.profile_version = "anthropic.builtin/v4".into();
+    profile.prompt_cache = PromptCacheProfile {
+        version: "anthropic.prompt-caching/2026-07-22".into(),
+        explicit_breakpoints: true,
+        lifetime: Some("ephemeral_5m".into()),
+        // Anthropic thresholds vary from 512 to 4096 tokens by model. Native
+        // placement uses the conservative cross-model floor so the profile
+        // never overstates eligibility for an admitted model alias.
+        minimum_cacheable_tokens: Some(4_096),
+        pricing_class: Some("anthropic_cache_read_and_ephemeral_write".into()),
+        usage_fields: vec![
+            "cache_read_input_tokens".into(),
+            "cache_creation_input_tokens".into(),
+            "cache_creation.ephemeral_5m_input_tokens".into(),
+            "cache_creation.ephemeral_1h_input_tokens".into(),
+        ],
+        rate_limit_treatment: Some(
+            "input_and_cache_creation_count_toward_itpm; cache_reads_exempt_except_haiku_3_5"
+                .into(),
+        ),
+        protocol_portability: "anthropic_messages_only".into(),
+        privacy_assurance:
+            "upstream_cache; no_chisei_prompt_storage; zdr_eligible_when_contractually_enabled"
+                .into(),
+    };
+    profile
 }
 
 fn xai_profile() -> ProviderProfile {
