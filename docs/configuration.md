@@ -9,7 +9,9 @@ template.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection. `postgres` is recognized but rejected until the complete reusable surface is implemented. |
 | `DB_PATH` | `./data/sekai.db` | SQLite database path |
+| `DATABASE_URL` | unset | PostgreSQL connection URL; valid only with `SEKAI_DB_BACKEND=postgres` |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
 | `SEKAI_BIND` | inferred | TCP bind address; see [transport modes](operations.md#transport-modes) |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path; set empty to disable |
@@ -27,6 +29,13 @@ template.
 When authenticated mode is active and `SEKAI_BIND` is unset, TCP binds to
 `0.0.0.0`. A public bind requires TLS unless `SEKAI_ALLOW_PLAINTEXT=1` is an
 explicit operator decision.
+
+Backend configuration is validated before any listener binds. `DB_PATH` and
+`DATABASE_URL` are mutually exclusive. The public
+`sekai.runtime-backend/v1` capability contract identifies the backend and its
+supported reusable surfaces; the community server requires the complete
+SQLite capability set and refuses incomplete PostgreSQL support. Backend
+selection does not enable tenant, OIDC, OAuth, or identity endpoints.
 
 ## Providers and outbound calls
 

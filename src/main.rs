@@ -1,5 +1,5 @@
 use sekai_chisei::config::Config;
-use sekai_chisei::db::sekai::SekaiDb;
+use sekai_chisei::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use std::sync::Arc;
 use tokio::signal;
 
@@ -29,7 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let db = Arc::new(SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?);
+    let backend_config =
+        RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
+    let backend =
+        Arc::new(RuntimeBackend::initialize(backend_config).map_err(std::io::Error::other)?);
+    let db = backend.database();
     let active_credentials = db.list_active_credentials()?;
     let external_credentials_active = active_credentials.iter().any(|credential| {
         !matches!(
@@ -69,6 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(
         db_path = %config.db_path,
+        backend = ?backend.capabilities().backend,
+        backend_contract = %backend.capabilities().contract_version,
         db_lock_poisoned_total = db.db_lock_poisoned_total(),
         "database configured"
     );
@@ -79,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "LLM providers configured"
     );
 
-    let server = sekai_chisei::grpc::run(config, db, active_credentials, grpc_tcp_mode);
+    let server = sekai_chisei::grpc::run(config, backend, active_credentials, grpc_tcp_mode);
     let shutdown = async {
         signal::ctrl_c().await.ok();
         tracing::info!("shutting down");
@@ -108,7 +114,10 @@ fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(500);
 
-    let db = SekaiDb::new(&config.db_path).map_err(std::io::Error::other)?;
+    let backend_config =
+        RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
+    let backend = RuntimeBackend::initialize(backend_config).map_err(std::io::Error::other)?;
+    let db = backend.database();
     let rows = sekai_chisei::gateway_report::egress_rows(&db, after, limit)?;
 
     match format {

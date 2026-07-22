@@ -1,0 +1,15 @@
+{
+  "contract_version": "sekai.runtime-backend/v1",
+  "backend": "sqlite",
+  "reusable_surfaces": [
+    "chisei.budget",
+    "chisei.execution",
+    "chisei.policy",
+    "gateway.governance",
+    "operations.health",
+    "sekai.audit",
+    "sekai.authorization",
+    "sekai.coordination",
+    "sekai.graph"
+  ]
+}
