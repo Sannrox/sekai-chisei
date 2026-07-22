@@ -159,42 +159,31 @@ There is no separate first-class application scope. Repositories, incidents,
 tickets, deployments, contracts, and other domain concepts belong in typed
 schemas and adapters.
 
-### Tenant lifecycle
+### Enterprise extension boundary
 
-Service credentials may be explicitly bound to one tenant. Authentication
-loads that durable binding and replaces caller-supplied tenant metadata before
-authorization. Unbound compatibility credentials do not infer tenancy from the
-principal string. Tenant credential administration rechecks durable owner or
-admin membership for every operation, and credential mutations commit their
-audit decision in the same SQLite transaction as the secret-hash lifecycle
-change.
+The SQLite/community runtime is single-operator and tenant-free. It creates no
+tenant, membership, namespace-ownership, or tenant-credential state; exposes no
+tenant administration RPCs; and strips caller-provided `x-sekai-tenant-id`
+metadata at the authentication boundary. Credential protocol fields retained
+for wire compatibility are ignored and never activate tenant authority.
 
-The versioned `tenant.v1` record is an administrative identity above, and
-separate from, namespaces, principals, projects, and providers. Platform
-administrators can create, inspect, suspend, reactivate, or request closure of
-a tenant through authenticated Sekai RPCs. Lifecycle mutations and their audit
-entries commit atomically and use durable idempotency keys.
+The public crate exports backend-neutral authenticated-principal,
+tenant-context, namespace-action, authorization-hook, and error contracts in
+`enterprise`. A PostgreSQL enterprise distribution may implement and inject
+those contracts into this authoritative process. Concrete tenant persistence,
+OIDC/OAuth behavior, and enterprise composition are not part of the community
+runtime.
 
-Only an active tenant may admit new governed work. Suspension and
-`closure_pending` preserve existing records; neither state performs physical
-deletion. In authenticated non-local operation, every namespace is bound once
-through `namespace-ownership.v1`, and namespace-scoped requests carry
-`x-sekai-tenant-id`. The service checks that context before object data access;
-missing or mismatched context fails closed, and writes additionally require an
-active tenant. Ownership cannot be changed in place. `CreateTenantNamespace`
-can instead create a new boundary with `migrated_from_namespace` provenance so
-data migration remains explicit. The local interceptor bypasses tenant lookup
-and never creates a synthetic tenant.
+The current injection seam admits enterprise credentials only to the
+namespace-aware object, link, lease, traversal, and object-change RPCs that
+invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
+enterprise-scoped credentials. Action execution and approval resumption also
+remain unavailable until an enterprise composition can persist and re-derive
+the authenticated approval identity.
 
-Tenant administration uses versioned `tenant-membership.v1` records keyed by
-tenant and external subject identifier. Active owners and admins may list and
-manage members in their authenticated tenant context; only owners may create or
-change owner/admin authority. Membership mutations and audit entries commit in
-one transaction, and an atomic guard rejects revoking or demoting the final
-active owner. Revoked memberships remain durable history but stop authorizing
-the subject on the next membership check. Tenant-scoped credentials map the
-authenticated `<tenant_id>.<subject_id>` principal to the stored subject suffix.
-These roles do not replace namespace or object grants for governed data access.
+SQLite startup detects populated legacy tenant tables or tenant-bound
+credentials before normal migrations. It fails without changing them and
+directs the operator to [Migrating legacy SQLite tenant state](tenant-migration.md).
 
 ## Trust boundaries
 
