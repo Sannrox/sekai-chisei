@@ -350,9 +350,22 @@ fn sanitize_field_value(field: &str, value: String) -> String {
     {
         return "[redacted structured payload]".into();
     }
-    if ["secret", "token", "password", "credential", "api_key"]
-        .iter()
-        .any(|needle| field.contains(needle))
+    let normalized = field
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if [
+        "secret",
+        "token",
+        "password",
+        "passphrase",
+        "credential",
+        "apikey",
+        "privatekey",
+        "accesskey",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
     {
         return "[redacted sensitive value]".into();
     }
@@ -510,6 +523,10 @@ mod tests {
             "[redacted sensitive value]"
         );
         assert_eq!(sanitize_field_value("status", "failed".into()), "failed");
+        assert_eq!(
+            sanitize_field_value("accessKeyId", "value".into()),
+            "[redacted sensitive value]"
+        );
         let terminal = sanitize_terminal(
             "authorization: Bearer abc\nOPENAI_API_KEY=sk-secret\n/home/alice/project\n",
         );
