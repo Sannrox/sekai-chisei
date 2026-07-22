@@ -10,6 +10,30 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const SIGNATURE_ALGORITHM: &str = crate::shomei::SIGNATURE_ALGORITHM;
 pub const REDEMPTION_MODE: &str = "online_atomic";
+pub const OFFLINE_REDEMPTION_MODE: &str = "offline_bounded";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalPermitPolicy {
+    pub scope: String,
+    pub offline_action_types: Vec<String>,
+    pub offline_max_duration_ms: i64,
+    pub offline_max_invocations: u32,
+    pub permitted_delegators: Vec<String>,
+    pub max_delegation_depth: u32,
+}
+
+impl ExternalPermitPolicy {
+    pub fn disabled(scope: impl Into<String>) -> Self {
+        Self {
+            scope: scope.into(),
+            offline_action_types: Vec::new(),
+            offline_max_duration_ms: 0,
+            offline_max_invocations: 0,
+            permitted_delegators: Vec::new(),
+            max_delegation_depth: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Permit {
@@ -41,18 +65,26 @@ pub struct Permit {
     pub redemption_mode: String,
     pub approval_identities: Vec<String>,
     pub policy_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub policy_scope: String,
     pub schema_version: String,
     pub capability_version: String,
     pub pricing_version: String,
     pub nonce: String,
     pub delegation_depth: u32,
     pub parent_permit_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub initiating_actor: String,
     pub revocation_handle: String,
     pub signature_algorithm: String,
     pub key_id: String,
     pub public_key: String,
     pub issued_at_ms: i64,
     pub revocation_latency_ms: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub offline_revocation_unavailable: bool,
     pub signed_digest: String,
     pub signature: Vec<u8>,
 }
@@ -79,6 +111,12 @@ pub struct Redemption {
     pub invocation_ordinal: u32,
     #[serde(default)]
     pub evidence_due_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedemptionTiming {
+    pub invoked_at_ms: i64,
+    pub reconciled_at_ms: i64,
 }
 
 pub struct Issuance<'a> {
@@ -144,8 +182,26 @@ impl Permit {
         if now_ms < self.not_before_ms || now_ms >= self.expires_at_ms {
             return Err("permit is outside its validity window".into());
         }
-        if self.redemption_mode != REDEMPTION_MODE || self.delegation_depth != 0 {
-            return Err("permit requires unsupported redemption or delegation semantics".into());
+        if !matches!(
+            self.redemption_mode.as_str(),
+            REDEMPTION_MODE | OFFLINE_REDEMPTION_MODE
+        ) {
+            return Err("permit uses an unsupported redemption mode".into());
+        }
+        if self.initiating_actor.trim().is_empty()
+            && (self.delegation_depth != 0 || self.redemption_mode == OFFLINE_REDEMPTION_MODE)
+        {
+            return Err("permit does not preserve the initiating actor".into());
+        }
+        if self.delegation_depth as usize != self.parent_chain.len()
+            || self.parent_chain.last().map(String::as_str).unwrap_or("") != self.parent_permit_id
+        {
+            return Err("permit delegation chain is incomplete".into());
+        }
+        if self.redemption_mode == OFFLINE_REDEMPTION_MODE
+            && (!self.offline_revocation_unavailable || self.revocation_latency_ms <= 0)
+        {
+            return Err("offline permit does not declare its revocation limitation".into());
         }
         if context.executor != self.executor
             || context.requesting_harness != self.requesting_harness
@@ -170,7 +226,15 @@ impl Permit {
             .iter()
             .map(|value| format!("host_capability:{value}"))
             .collect::<Vec<_>>();
-        if self.constraints != expected {
+        let mut declared = expected.clone();
+        if self.redemption_mode == OFFLINE_REDEMPTION_MODE {
+            declared.push("offline_no_global_single_use".into());
+            declared.push("offline_revocation_unavailable_until_expiry".into());
+        }
+        declared.sort();
+        let mut constraints = self.constraints.clone();
+        constraints.sort();
+        if constraints != declared {
             return Err("permit constraint declaration is inconsistent".into());
         }
         Ok(())
@@ -238,23 +302,210 @@ pub fn issue(
         redemption_mode: REDEMPTION_MODE.into(),
         approval_identities: issuance.approval_identities,
         policy_version: authorization.decision.policy_version.clone(),
+        policy_scope: authorization.decision.policy_scope.clone(),
         schema_version: request.parameter_schema.clone(),
         capability_version: request.action_type.clone(),
         pricing_version: "request-estimate/v1".into(),
         nonce: issuance.nonce,
         delegation_depth: 0,
         parent_permit_id: String::new(),
+        parent_chain: Vec::new(),
+        initiating_actor: request.actor.clone(),
         revocation_handle: format!("revoke-{}", authorization.decision.authorization_id),
         signature_algorithm: SIGNATURE_ALGORITHM.into(),
         key_id: issuance.key_id.into(),
         public_key: String::new(),
         issued_at_ms: issuance.now_ms,
         revocation_latency_ms: 0,
+        offline_revocation_unavailable: false,
         signed_digest: String::new(),
         signature: Vec::new(),
     };
     permit.sign(signing_key)?;
     Ok(permit)
+}
+
+pub fn issue_offline(
+    authorization: &AuthorizationRecord,
+    policy: &ExternalPermitPolicy,
+    signing_key: &SigningKey,
+    issuance: Issuance<'_>,
+) -> Result<Permit, String> {
+    if !policy
+        .offline_action_types
+        .iter()
+        .any(|value| value == &authorization.request.action_type)
+        || policy.offline_max_duration_ms <= 0
+        || policy.offline_max_invocations == 0
+    {
+        return Err("action policy does not permit bounded offline operation".into());
+    }
+    if authorization.request.risk_class == "destructive" {
+        return Err("action class requires online revocation and single-use guarantees".into());
+    }
+    let now_ms = issuance.now_ms;
+    let mut permit = issue(authorization, signing_key, issuance)?;
+    permit.redemption_mode = OFFLINE_REDEMPTION_MODE.into();
+    permit.max_invocations = permit.max_invocations.min(policy.offline_max_invocations);
+    permit.expires_at_ms = permit
+        .expires_at_ms
+        .min(now_ms.saturating_add(policy.offline_max_duration_ms));
+    permit.revocation_latency_ms = permit.expires_at_ms.saturating_sub(now_ms);
+    permit.offline_revocation_unavailable = true;
+    permit
+        .constraints
+        .push("offline_no_global_single_use".into());
+    permit
+        .constraints
+        .push("offline_revocation_unavailable_until_expiry".into());
+    permit.sign(signing_key)?;
+    Ok(permit)
+}
+
+pub struct Delegation<'a> {
+    pub delegator: &'a str,
+    pub subject_actor: &'a str,
+    pub permit_id: String,
+    pub nonce: String,
+    pub now_ms: i64,
+    pub expires_at_ms: i64,
+    pub target_selectors: Vec<String>,
+    pub allowed_effects: Vec<String>,
+    pub budget_micros: u64,
+    pub volume_limit: u64,
+    pub blast_radius_limit: u32,
+    pub max_invocations: u32,
+    pub risk_class: &'a str,
+}
+
+pub fn delegate(
+    parent: &Permit,
+    policy: &ExternalPermitPolicy,
+    signing_key: &SigningKey,
+    input: Delegation<'_>,
+) -> Result<Permit, String> {
+    parent.verify_signature(&signing_key.verifying_key())?;
+    if parent.redemption_mode != REDEMPTION_MODE {
+        return Err("offline permits cannot be delegated because local consumption is not globally observable".into());
+    }
+    if !policy
+        .permitted_delegators
+        .iter()
+        .any(|value| value == input.delegator)
+    {
+        return Err("policy does not name this actor as a permitted delegator".into());
+    }
+    if input.delegator != parent.subject_actor {
+        return Err("delegator is not the current permit subject".into());
+    }
+    let depth = parent.delegation_depth.saturating_add(1);
+    if policy.max_delegation_depth == 0 || depth > policy.max_delegation_depth {
+        return Err("delegation depth exceeds policy".into());
+    }
+    if input.now_ms < parent.not_before_ms
+        || input.now_ms >= parent.expires_at_ms
+        || input.expires_at_ms > parent.expires_at_ms
+        || input.expires_at_ms <= input.now_ms
+        || input.max_invocations == 0
+        || input.max_invocations > parent.max_invocations
+        || input.budget_micros > parent.budget_micros
+        || input.volume_limit > parent.volume_limit
+        || input.blast_radius_limit > parent.blast_radius_limit
+        || input.risk_class != parent.risk_class
+        || !is_subset(&input.target_selectors, &parent.target_selectors)
+        || !is_subset(&input.allowed_effects, &parent.allowed_effects)
+    {
+        return Err("delegation would expand or invalidate the parent envelope".into());
+    }
+    let mut child = parent.clone();
+    child.permit_id = input.permit_id;
+    child.subject_actor = input.subject_actor.into();
+    child.target_selectors = input.target_selectors;
+    child.allowed_effects = input.allowed_effects;
+    child.budget_micros = input.budget_micros;
+    child.volume_limit = input.volume_limit;
+    child.blast_radius_limit = input.blast_radius_limit;
+    child.max_invocations = input.max_invocations;
+    child.not_before_ms = input.now_ms;
+    child.expires_at_ms = input.expires_at_ms;
+    child.nonce = input.nonce;
+    child.delegation_depth = depth;
+    child.parent_permit_id = parent.permit_id.clone();
+    child.parent_chain.push(parent.permit_id.clone());
+    child.revocation_handle = format!("revoke-{}", child.permit_id);
+    child.issued_at_ms = input.now_ms;
+    child.sign(signing_key)?;
+    Ok(child)
+}
+
+fn is_subset(values: &[String], parent: &[String]) -> bool {
+    values.iter().all(|value| parent.contains(value))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn validate_delegation_chain_on(
+    conn: &rusqlite::Connection,
+    permit: &Permit,
+) -> Result<(), String> {
+    if permit.delegation_depth as usize != permit.parent_chain.len() {
+        return Err("delegation chain depth mismatch".into());
+    }
+    let current_policy = if permit.delegation_depth == 0 {
+        None
+    } else {
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT policy_json FROM chisei_external_permit_policies WHERE scope=?1",
+                [&permit.policy_scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let policy: ExternalPermitPolicy = json
+            .ok_or_else(|| "delegation policy is missing or disabled".to_string())
+            .and_then(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))?;
+        if permit.delegation_depth > policy.max_delegation_depth {
+            return Err("delegation exceeds the current policy depth".into());
+        }
+        Some(policy)
+    };
+    for (index, parent_id) in permit.parent_chain.iter().enumerate() {
+        let json: Option<String> = conn.query_row(
+            "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1
+             UNION ALL SELECT permit_json FROM chisei_external_action_delegated_permits WHERE permit_id=?1 LIMIT 1",
+            [parent_id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        let parent: Permit = json
+            .ok_or_else(|| "delegation parent is missing".to_string())
+            .and_then(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))?;
+        if parent.expires_at_ms <= permit.issued_at_ms {
+            return Err("delegation parent expired before child issuance".into());
+        }
+        if !current_policy
+            .as_ref()
+            .is_some_and(|policy| policy.permitted_delegators.contains(&parent.subject_actor))
+        {
+            return Err("delegation chain contains an actor no longer permitted by policy".into());
+        }
+        let revoked: Option<String> = conn
+            .query_row(
+                "SELECT reason FROM chisei_external_action_revocations WHERE revocation_handle=?1",
+                [&parent.revocation_handle],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if revoked.is_some() {
+            return Err("delegation parent is revoked".into());
+        }
+        if parent.parent_chain != permit.parent_chain[..index] {
+            return Err("delegation parent chain is malformed".into());
+        }
+    }
+    Ok(())
 }
 
 impl SekaiDb {
@@ -279,6 +530,15 @@ impl SekaiDb {
              CREATE TABLE IF NOT EXISTS chisei_external_action_kill_switches (
                 scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL, reason TEXT NOT NULL,
                 enabled_at_ms INTEGER NOT NULL, PRIMARY KEY(scope_kind,scope_value)
+             );
+             CREATE TABLE IF NOT EXISTS chisei_external_action_delegated_permits (
+                permit_id TEXT PRIMARY KEY, parent_permit_id TEXT NOT NULL,
+                permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_external_action_one_child_per_parent
+             ON chisei_external_action_delegated_permits(parent_permit_id);
+             CREATE TABLE IF NOT EXISTS chisei_external_permit_policies (
+                scope TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
              );"
         ).map_err(|error| error.to_string())?;
         for (column, definition) in [
@@ -386,6 +646,97 @@ impl SekaiDb {
         Ok(stored)
     }
 
+    pub fn put_delegated_permit(&self, permit: &Permit, issued_by: &str) -> Result<Permit, String> {
+        self.ensure_external_permit_tables()?;
+        if permit.delegation_depth == 0 || permit.parent_permit_id.is_empty() {
+            return Err("delegated permit must name its parent".into());
+        }
+        self.validate_delegation_chain(permit)?;
+        let json = serde_json::to_string(permit).map_err(|error| error.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let parent_redemptions: u32 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM chisei_external_action_redemptions WHERE permit_id=?1",
+                [&permit.parent_permit_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if parent_redemptions != 0 {
+            return Err("partially consumed permit authority cannot be delegated".into());
+        }
+        tx.execute(
+            "INSERT INTO chisei_external_action_delegated_permits(permit_id,parent_permit_id,permit_json,issued_at_ms) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![permit.permit_id, permit.parent_permit_id, json, permit.issued_at_ms],
+        ).map_err(|error| error.to_string())?;
+        crate::sekai::ledger::insert_chained_decision(
+            &tx,
+            &crate::sekai::audit::Decision {
+                id: format!("{}:audit:delegated", permit.permit_id),
+                timestamp: permit.issued_at_ms,
+                actor: issued_by.into(),
+                action: "external_action_permit/delegate".into(),
+                reason: "narrow_child_permit_issued".into(),
+                evidence: HashMap::from([
+                    ("parent_permit_id".into(), permit.parent_permit_id.clone()),
+                    ("initiating_actor".into(), permit.initiating_actor.clone()),
+                    (
+                        "delegation_depth".into(),
+                        permit.delegation_depth.to_string(),
+                    ),
+                ]),
+                target_id: permit.permit_id.clone(),
+                outcome: "delegated".into(),
+            },
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(permit.clone())
+    }
+
+    pub fn set_external_permit_policy(
+        &self,
+        policy: &ExternalPermitPolicy,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if policy.scope.trim().is_empty()
+            || policy.max_delegation_depth > 8
+            || policy.offline_max_duration_ms < 0
+        {
+            return Err("invalid external permit policy bounds".into());
+        }
+        self.ensure_external_permit_tables()?;
+        let json = serde_json::to_string(policy).map_err(|error| error.to_string())?;
+        self.conn().execute(
+            "INSERT INTO chisei_external_permit_policies(scope,policy_json,updated_at_ms) VALUES(?1,?2,?3)
+             ON CONFLICT(scope) DO UPDATE SET policy_json=?2,updated_at_ms=?3",
+            rusqlite::params![policy.scope, json, now_ms],
+        ).map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    pub fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String> {
+        self.ensure_external_permit_tables()?;
+        let json: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT policy_json FROM chisei_external_permit_policies WHERE scope=?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        json.map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+            .map(|value| value.unwrap_or_else(|| ExternalPermitPolicy::disabled(scope)))
+    }
+
+    pub fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String> {
+        self.ensure_external_permit_tables()?;
+        let conn = self.conn();
+        validate_delegation_chain_on(&conn, permit)
+    }
+
     pub fn replay_permit(
         &self,
         authorization_id: &str,
@@ -447,14 +798,53 @@ impl SekaiDb {
         execution_id: &str,
         now_ms: i64,
     ) -> Result<Redemption, String> {
+        self.redeem_or_reconcile_permit(
+            permit,
+            context,
+            trusted_key,
+            idempotency_key,
+            execution_id,
+            RedemptionTiming {
+                invoked_at_ms: 0,
+                reconciled_at_ms: now_ms,
+            },
+        )
+    }
+
+    pub fn redeem_or_reconcile_permit(
+        &self,
+        permit: &Permit,
+        context: &HostContext,
+        trusted_key: &VerifyingKey,
+        idempotency_key: &str,
+        execution_id: &str,
+        timing: RedemptionTiming,
+    ) -> Result<Redemption, String> {
+        let RedemptionTiming {
+            invoked_at_ms,
+            reconciled_at_ms: now_ms,
+        } = timing;
         self.ensure_external_permit_tables()?;
+        let offline_reconciliation = permit.redemption_mode == OFFLINE_REDEMPTION_MODE;
+        if offline_reconciliation
+            && (invoked_at_ms < permit.not_before_ms
+                || invoked_at_ms >= permit.expires_at_ms
+                || invoked_at_ms > now_ms)
+        {
+            return Err("offline invocation time must be within the signed lease and no later than reconciliation".into());
+        }
+        if !offline_reconciliation && invoked_at_ms != 0 {
+            return Err("invoked_at_ms is only valid for offline reconciliation".into());
+        }
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        validate_delegation_chain_on(&tx, permit)?;
         let stored_json: Option<String> = tx
             .query_row(
-                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1",
+                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1
+                 UNION ALL SELECT permit_json FROM chisei_external_action_delegated_permits WHERE permit_id=?1 LIMIT 1",
                 [&permit.permit_id],
                 |row| row.get(0),
             )
@@ -474,16 +864,35 @@ impl SekaiDb {
             if existing.execution_id != execution_id { return Err("redemption idempotency key reused for a different execution".into()); }
             return Ok(existing);
         }
+        let delegated_child: Option<String> = tx.query_row(
+            "SELECT permit_id FROM chisei_external_action_delegated_permits WHERE parent_permit_id=?1",
+            [&permit.permit_id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        if delegated_child.is_some() {
+            return Err("permit authority was transferred to a delegated child".into());
+        }
         permit.verify_signature(trusted_key)?;
-        permit.verify_host_context(context, now_ms)?;
+        // Online redemption authorizes a future invocation and therefore uses
+        // live time, revocation, authorization, and kill-switch state. Offline
+        // reconciliation records an invocation that may already have happened
+        // while disconnected: validate its signed host binding, but never hide
+        // the resulting evidence merely because the lease later expired or was
+        // revoked before the executor reconnected.
+        let validation_time = if offline_reconciliation {
+            invoked_at_ms
+        } else {
+            now_ms
+        };
+        permit.verify_host_context(context, validation_time)?;
         let authorization_json: Option<String> = tx.query_row("SELECT record_json FROM chisei_external_action_authorizations WHERE authorization_id=?1", [&permit.authorization_id], |row| row.get(0)).optional().map_err(|error| error.to_string())?.flatten();
         let authorization: AuthorizationRecord = authorization_json
             .as_deref()
             .ok_or_else(|| "permit authorization is missing".to_string())
             .and_then(|json| serde_json::from_str(json).map_err(|error| error.to_string()))?;
-        if authorization.decision.decision != "permit"
-            || authorization.decision.cancelled_at_ms != 0
-            || authorization.decision.request_digest != permit.request_digest
+        if !offline_reconciliation
+            && (authorization.decision.decision != "permit"
+                || authorization.decision.cancelled_at_ms != 0
+                || authorization.decision.request_digest != permit.request_digest)
         {
             return Err("permit authorization is no longer active".into());
         }
@@ -495,7 +904,7 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some(reason) = revoked {
+        if !offline_reconciliation && let Some(reason) = revoked {
             return Err(format!("permit revoked: {reason}"));
         }
         for (kind, value) in [
@@ -506,7 +915,7 @@ impl SekaiDb {
             ("signing_key", &permit.key_id),
         ] {
             let reason: Option<String> = tx.query_row("SELECT reason FROM chisei_external_action_kill_switches WHERE scope_kind=?1 AND scope_value=?2", rusqlite::params![kind,value], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
-            if let Some(reason) = reason {
+            if !offline_reconciliation && let Some(reason) = reason {
                 return Err(format!("{kind} kill switch active: {reason}"));
             }
         }
@@ -527,20 +936,36 @@ impl SekaiDb {
             executor: context.executor.clone(),
             execution_id: execution_id.into(),
             idempotency_key: idempotency_key.into(),
-            redeemed_at_ms: now_ms,
+            redeemed_at_ms: if offline_reconciliation {
+                invoked_at_ms
+            } else {
+                now_ms
+            },
             invocation_ordinal: count + 1,
             evidence_due_at_ms: permit.expires_at_ms,
         };
         let json = serde_json::to_string(&redemption).map_err(|error| error.to_string())?;
-        tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,now_ms,redemption.invocation_ordinal,redemption.redemption_id,redemption.evidence_due_at_ms]).map_err(|error| error.to_string())?;
+        tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,redemption.redeemed_at_ms,redemption.invocation_ordinal,redemption.redemption_id,redemption.evidence_due_at_ms]).map_err(|error| error.to_string())?;
         crate::sekai::ledger::insert_chained_decision(
             &tx,
             &crate::sekai::audit::Decision {
                 id: format!("{}:audit:redeemed", redemption.redemption_id),
                 timestamp: redemption.redeemed_at_ms,
                 actor: context.executor.clone(),
-                action: format!("external_action_redeem/{}", permit.action_type),
-                reason: "external_action_permit_redeemed_before_execution".into(),
+                action: format!(
+                    "external_action_{}/{}",
+                    if offline_reconciliation {
+                        "reconcile"
+                    } else {
+                        "redeem"
+                    },
+                    permit.action_type
+                ),
+                reason: if offline_reconciliation {
+                    "offline_invocation_reconciled_after_local_consumption".into()
+                } else {
+                    "external_action_permit_redeemed_before_execution".into()
+                },
                 evidence: HashMap::from([
                     ("permit_id".into(), permit.permit_id.clone()),
                     ("execution_id".into(), redemption.execution_id.clone()),
@@ -550,7 +975,11 @@ impl SekaiDb {
                     ),
                 ]),
                 target_id: permit.permit_id.clone(),
-                outcome: "authorization_consumed".into(),
+                outcome: if offline_reconciliation {
+                    "offline_invocation_recorded_with_weaker_guarantees".into()
+                } else {
+                    "authorization_consumed".into()
+                },
             },
         )?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -562,10 +991,12 @@ impl SekaiDb {
     /// checks atomically with consumption.
     pub fn validate_permit_state(&self, permit: &Permit) -> Result<(), String> {
         self.ensure_external_permit_tables()?;
+        self.validate_delegation_chain(permit)?;
         let conn = self.conn();
         let stored_json: Option<String> = conn
             .query_row(
-                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1",
+                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1
+                 UNION ALL SELECT permit_json FROM chisei_external_action_delegated_permits WHERE permit_id=?1 LIMIT 1",
                 [&permit.permit_id],
                 |row| row.get(0),
             )
@@ -574,6 +1005,17 @@ impl SekaiDb {
         let supplied = serde_json::to_string(permit).map_err(|error| error.to_string())?;
         if stored_json.as_deref() != Some(supplied.as_str()) {
             return Err("permit is not the issued durable permit".into());
+        }
+        let delegated_child: Option<String> = conn
+            .query_row(
+                "SELECT permit_id FROM chisei_external_action_delegated_permits WHERE parent_permit_id=?1",
+                [&permit.permit_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if delegated_child.is_some() {
+            return Err("permit authority was transferred to a delegated child".into());
         }
         let authorization_json: Option<String> = conn.query_row("SELECT record_json FROM chisei_external_action_authorizations WHERE authorization_id=?1", [&permit.authorization_id], |row| row.get(0)).optional().map_err(|error| error.to_string())?.flatten();
         let authorization: AuthorizationRecord = authorization_json
@@ -632,7 +1074,8 @@ impl SekaiDb {
         let conn = self.conn();
         let stored_json: Option<String> = conn
             .query_row(
-                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1",
+                "SELECT permit_json FROM chisei_external_action_permits WHERE permit_id=?1
+                 UNION ALL SELECT permit_json FROM chisei_external_action_delegated_permits WHERE permit_id=?1 LIMIT 1",
                 [&permit.permit_id],
                 |row| row.get(0),
             )
@@ -658,6 +1101,22 @@ impl SekaiDb {
                     Ok(value)
                 }
             })
+    }
+
+    pub fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String> {
+        self.validate_permit_state(permit)?;
+        let count: u32 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chisei_external_action_redemptions WHERE permit_id=?1",
+                [&permit.permit_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if count != 0 {
+            return Err("partially consumed permit authority cannot be delegated".into());
+        }
+        Ok(())
     }
 }
 
@@ -818,6 +1277,24 @@ mod tests {
         first.verify_trust("issuer:test", "key-1").unwrap();
         first.verify_signature(&key.verifying_key()).unwrap();
         first.verify_host_context(&context(&first), 2_001).unwrap();
+    }
+
+    #[test]
+    fn legacy_online_v1_permit_without_append_only_fields_still_verifies() {
+        let record = authorization(10_000, 1);
+        let (mut legacy, key) = signed(&record);
+        legacy.policy_scope.clear();
+        legacy.initiating_actor.clear();
+        legacy.parent_chain.clear();
+        legacy.offline_revocation_unavailable = false;
+        legacy.sign(&key).unwrap();
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("initiating_actor"));
+        let restored: Permit = serde_json::from_str(&json).unwrap();
+        restored.verify_signature(&key.verifying_key()).unwrap();
+        restored
+            .verify_host_context(&context(&restored), 2_001)
+            .unwrap();
     }
 
     #[test]
@@ -1028,6 +1505,350 @@ mod tests {
             )
             .unwrap_err()
             .contains("kill switch")
+        );
+    }
+
+    fn permit_policy() -> ExternalPermitPolicy {
+        ExternalPermitPolicy {
+            scope: "project:test".into(),
+            offline_action_types: vec!["repository.read/v1".into()],
+            offline_max_duration_ms: 2_000,
+            offline_max_invocations: 2,
+            permitted_delegators: vec!["agent:test".into(), "agent:child".into()],
+            max_delegation_depth: 2,
+        }
+    }
+
+    #[test]
+    fn offline_lease_is_bounded_and_declares_weaker_guarantees() {
+        let record = authorization(10_000, 9);
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let permit = issue_offline(
+            &record,
+            &permit_policy(),
+            &key,
+            Issuance {
+                approval_identities: vec![],
+                issuer: "issuer:test",
+                key_id: "key-1",
+                permit_id: "offline-1".into(),
+                nonce: "offline-nonce".into(),
+                now_ms: 2_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(permit.redemption_mode, OFFLINE_REDEMPTION_MODE);
+        assert_eq!(permit.max_invocations, 2);
+        assert_eq!(permit.expires_at_ms, 4_000);
+        assert!(permit.offline_revocation_unavailable);
+        assert!(
+            permit
+                .constraints
+                .contains(&"offline_no_global_single_use".into())
+        );
+        permit
+            .verify_host_context(&context(&permit), 3_999)
+            .unwrap();
+
+        let db = SekaiDb::new(":memory:").unwrap();
+        persist_authorization(&db, &record);
+        db.put_permit(&permit, "offline-issue", "agent:test")
+            .unwrap();
+        db.revoke_permit(
+            &permit.revocation_handle,
+            "learned after disconnected execution",
+            4_001,
+        )
+        .unwrap();
+        let reconciled = db
+            .redeem_or_reconcile_permit(
+                &permit,
+                &context(&permit),
+                &key.verifying_key(),
+                "offline-reconcile-1",
+                "offline-execution-1",
+                RedemptionTiming {
+                    invoked_at_ms: 3_000,
+                    reconciled_at_ms: 5_000,
+                },
+            )
+            .unwrap();
+        assert_eq!(reconciled.invocation_ordinal, 1);
+        assert_eq!(reconciled.execution_id, "offline-execution-1");
+        assert_eq!(
+            db.replay_redemption(&permit, "offline-reconcile-1", "offline-execution-1")
+                .unwrap(),
+            Some(reconciled)
+        );
+        db.redeem_or_reconcile_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "offline-reconcile-2",
+            "offline-execution-2",
+            RedemptionTiming {
+                invoked_at_ms: 3_500,
+                reconciled_at_ms: 5_001,
+            },
+        )
+        .unwrap();
+        assert!(
+            db.redeem_or_reconcile_permit(
+                &permit,
+                &context(&permit),
+                &key.verifying_key(),
+                "offline-reconcile-3",
+                "offline-execution-3",
+                RedemptionTiming {
+                    invoked_at_ms: 3_750,
+                    reconciled_at_ms: 5_002,
+                },
+            )
+            .unwrap_err()
+            .contains("invocation count exhausted")
+        );
+
+        let mut destructive = authorization(10_000, 1);
+        destructive.request.action_type = "repository.delete.destructive/v1".into();
+        destructive.request.parameter_schema = "repository.delete.params/v1".into();
+        destructive.request.risk_class = "destructive".into();
+        destructive.decision.request_digest = destructive.request.canonical_digest().unwrap();
+        let mut destructive_policy = permit_policy();
+        destructive_policy
+            .offline_action_types
+            .push("repository.delete.destructive/v1".into());
+        assert!(
+            issue_offline(
+                &destructive,
+                &destructive_policy,
+                &key,
+                Issuance {
+                    approval_identities: vec![],
+                    issuer: "issuer:test",
+                    key_id: "key-1",
+                    permit_id: "offline-2".into(),
+                    nonce: "n".into(),
+                    now_ms: 2_000,
+                }
+            )
+            .unwrap_err()
+            .contains("online revocation")
+        );
+
+        let mut ineligible = permit_policy();
+        ineligible.offline_action_types.clear();
+        assert!(
+            issue_offline(
+                &record,
+                &ineligible,
+                &key,
+                Issuance {
+                    approval_identities: vec![],
+                    issuer: "issuer:test",
+                    key_id: "key-1",
+                    permit_id: "offline-3".into(),
+                    nonce: "n".into(),
+                    now_ms: 2_000,
+                }
+            )
+            .unwrap_err()
+            .contains("does not permit")
+        );
+    }
+
+    #[test]
+    fn delegation_is_narrow_policy_named_and_parent_chain_is_live() {
+        let record = authorization(10_000, 3);
+        let (root, key) = signed(&record);
+        let db = SekaiDb::new(":memory:").unwrap();
+        persist_authorization(&db, &record);
+        db.set_external_permit_policy(&permit_policy(), 2_500)
+            .unwrap();
+        db.put_permit(&root, "root", "agent:test").unwrap();
+        let child = delegate(
+            &root,
+            &permit_policy(),
+            &key,
+            Delegation {
+                delegator: "agent:test",
+                subject_actor: "agent:child",
+                permit_id: "child-1".into(),
+                nonce: "child-nonce".into(),
+                now_ms: 3_000,
+                expires_at_ms: 8_000,
+                target_selectors: root.target_selectors.clone(),
+                allowed_effects: root.allowed_effects.clone(),
+                budget_micros: 5,
+                volume_limit: 512,
+                blast_radius_limit: 1,
+                max_invocations: 1,
+                risk_class: &root.risk_class,
+            },
+        )
+        .unwrap();
+        assert_eq!(child.initiating_actor, "agent:test");
+        assert_eq!(child.parent_chain, vec![root.permit_id.clone()]);
+        db.put_delegated_permit(&child, "agent:test").unwrap();
+        db.validate_delegation_chain(&child).unwrap();
+        assert!(
+            db.validate_permit_state(&root)
+                .unwrap_err()
+                .contains("transferred")
+        );
+        let sibling = delegate(
+            &root,
+            &permit_policy(),
+            &key,
+            Delegation {
+                delegator: "agent:test",
+                subject_actor: "agent:sibling",
+                permit_id: "child-2".into(),
+                nonce: "sibling".into(),
+                now_ms: 3_001,
+                expires_at_ms: 8_000,
+                target_selectors: root.target_selectors.clone(),
+                allowed_effects: root.allowed_effects.clone(),
+                budget_micros: 5,
+                volume_limit: 512,
+                blast_radius_limit: 1,
+                max_invocations: 1,
+                risk_class: &root.risk_class,
+            },
+        )
+        .unwrap();
+        assert!(
+            db.put_delegated_permit(&sibling, "agent:test")
+                .unwrap_err()
+                .contains("UNIQUE")
+        );
+
+        let mut expanding_targets = root.target_selectors.clone();
+        expanding_targets.push("project:test/secret".into());
+        assert!(
+            delegate(
+                &root,
+                &permit_policy(),
+                &key,
+                Delegation {
+                    delegator: "agent:test",
+                    subject_actor: "agent:child",
+                    permit_id: "bad".into(),
+                    nonce: "bad".into(),
+                    now_ms: 3_000,
+                    expires_at_ms: 8_000,
+                    target_selectors: expanding_targets,
+                    allowed_effects: root.allowed_effects.clone(),
+                    budget_micros: 5,
+                    volume_limit: 512,
+                    blast_radius_limit: 1,
+                    max_invocations: 1,
+                    risk_class: &root.risk_class,
+                }
+            )
+            .unwrap_err()
+            .contains("expand")
+        );
+
+        db.revoke_permit(&root.revocation_handle, "root revoked", 3_100)
+            .unwrap();
+        assert!(
+            db.validate_delegation_chain(&child)
+                .unwrap_err()
+                .contains("revoked")
+        );
+        let mut missing = child.clone();
+        missing.parent_chain = vec!["missing".into()];
+        missing.parent_permit_id = "missing".into();
+        assert!(
+            db.validate_delegation_chain(&missing)
+                .unwrap_err()
+                .contains("missing")
+        );
+    }
+
+    #[test]
+    fn delegation_rejects_unnamed_delegator_and_over_depth() {
+        let record = authorization(10_000, 2);
+        let (root, key) = signed(&record);
+        let mut policy = permit_policy();
+        assert!(
+            delegate(
+                &root,
+                &policy,
+                &key,
+                Delegation {
+                    delegator: "agent:unknown",
+                    subject_actor: "agent:child",
+                    permit_id: "bad".into(),
+                    nonce: "bad".into(),
+                    now_ms: 3_000,
+                    expires_at_ms: 8_000,
+                    target_selectors: root.target_selectors.clone(),
+                    allowed_effects: root.allowed_effects.clone(),
+                    budget_micros: 5,
+                    volume_limit: 512,
+                    blast_radius_limit: 1,
+                    max_invocations: 1,
+                    risk_class: &root.risk_class,
+                }
+            )
+            .unwrap_err()
+            .contains("permitted delegator")
+        );
+        policy.max_delegation_depth = 0;
+        assert!(
+            delegate(
+                &root,
+                &policy,
+                &key,
+                Delegation {
+                    delegator: "agent:test",
+                    subject_actor: "agent:child",
+                    permit_id: "bad".into(),
+                    nonce: "bad".into(),
+                    now_ms: 3_000,
+                    expires_at_ms: 8_000,
+                    target_selectors: root.target_selectors.clone(),
+                    allowed_effects: root.allowed_effects.clone(),
+                    budget_micros: 5,
+                    volume_limit: 512,
+                    blast_radius_limit: 1,
+                    max_invocations: 1,
+                    risk_class: &root.risk_class,
+                }
+            )
+            .unwrap_err()
+            .contains("depth")
+        );
+
+        let mut offline = root.clone();
+        offline.redemption_mode = OFFLINE_REDEMPTION_MODE.into();
+        offline.offline_revocation_unavailable = true;
+        offline.revocation_latency_ms = 1_000;
+        offline.sign(&key).unwrap();
+        assert!(
+            delegate(
+                &offline,
+                &permit_policy(),
+                &key,
+                Delegation {
+                    delegator: "agent:test",
+                    subject_actor: "agent:child",
+                    permit_id: "offline-child".into(),
+                    nonce: "bad".into(),
+                    now_ms: 3_000,
+                    expires_at_ms: 8_000,
+                    target_selectors: offline.target_selectors.clone(),
+                    allowed_effects: offline.allowed_effects.clone(),
+                    budget_micros: 5,
+                    volume_limit: 512,
+                    blast_radius_limit: 1,
+                    max_invocations: 1,
+                    risk_class: &offline.risk_class,
+                }
+            )
+            .unwrap_err()
+            .contains("cannot be delegated")
         );
     }
 }

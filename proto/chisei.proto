@@ -942,6 +942,10 @@ message ExternalActionPermit {
   int64 issued_at_ms = 40;
   int64 revocation_latency_ms = 41;
   repeated string required_host_capabilities = 42;
+  repeated string parent_chain = 43; // ordered root-to-immediate-parent permit ids
+  string initiating_actor = 44; // immutable actor that began the chain
+  bool offline_revocation_unavailable = 45;
+  string policy_scope = 46;
 }
 
 message ExternalActionRedemption {
@@ -1012,6 +1016,7 @@ message CancelExternalActionAuthorizationResponse { ExternalActionDecision decis
 message IssueExternalActionPermitRequest {
   string authorization_id = 1;
   string idempotency_key = 2;
+  bool offline = 3; // requires explicit action eligibility in stored permit policy
 }
 message IssueExternalActionPermitResponse { ExternalActionPermit permit = 1; }
 message VerifyExternalActionPermitRequest {
@@ -1034,6 +1039,7 @@ message RedeemExternalActionPermitRequest {
   repeated string host_capabilities = 7;
   string idempotency_key = 8;
   string execution_id = 9;
+  int64 invoked_at_ms = 10; // required for offline reconciliation; zero for online pre-execution redemption
 }
 message RedeemExternalActionPermitResponse { ExternalActionRedemption redemption = 1; }
 message RevokeExternalActionPermitRequest { string revocation_handle = 1; string reason = 2; }
@@ -1045,6 +1051,29 @@ message SetExternalActionKillSwitchRequest {
   string reason = 4;
 }
 message SetExternalActionKillSwitchResponse { bool changed = 1; }
+message ExternalPermitPolicy {
+  string scope = 1;
+  repeated string offline_action_types = 2;
+  int64 offline_max_duration_ms = 3;
+  uint32 offline_max_invocations = 4;
+  repeated string permitted_delegators = 5;
+  uint32 max_delegation_depth = 6;
+}
+message SetExternalPermitPolicyRequest { ExternalPermitPolicy policy = 1; }
+message SetExternalPermitPolicyResponse { ExternalPermitPolicy policy = 1; }
+message DelegateExternalActionPermitRequest {
+  ExternalActionPermit parent = 1;
+  string subject_actor = 2;
+  repeated string target_selectors = 3;
+  repeated string allowed_effects = 4;
+  uint64 budget_micros = 5;
+  uint64 volume_limit = 6;
+  uint32 blast_radius_limit = 7;
+  uint32 max_invocations = 8;
+  int64 expires_at_ms = 9;
+  string risk_class = 10;
+}
+message DelegateExternalActionPermitResponse { ExternalActionPermit permit = 1; }
 
 // --- Service ---
 
@@ -1060,6 +1089,8 @@ service ChiseiService {
   rpc RedeemExternalActionPermit(RedeemExternalActionPermitRequest) returns (RedeemExternalActionPermitResponse);
   rpc RevokeExternalActionPermit(RevokeExternalActionPermitRequest) returns (RevokeExternalActionPermitResponse);
   rpc SetExternalActionKillSwitch(SetExternalActionKillSwitchRequest) returns (SetExternalActionKillSwitchResponse);
+  rpc SetExternalPermitPolicy(SetExternalPermitPolicyRequest) returns (SetExternalPermitPolicyResponse);
+  rpc DelegateExternalActionPermit(DelegateExternalActionPermitRequest) returns (DelegateExternalActionPermitResponse);
   // Budget
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
