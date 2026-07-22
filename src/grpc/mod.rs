@@ -176,6 +176,10 @@ fn tenant_safe_method(method: &str) -> bool {
     matches!(
         method,
         "GetNamespaceOwnership"
+            | "CreateTenantMembership"
+            | "ChangeTenantMembershipRole"
+            | "ListTenantMemberships"
+            | "RevokeTenantMembership"
             | "CreateObject"
             | "GetObject"
             | "UpdateObject"

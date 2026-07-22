@@ -143,6 +143,7 @@ impl SekaiDb {
         self.migrate_audit()?;
         self.migrate_ledger()?;
         self.migrate_tenants()?;
+        self.migrate_tenant_memberships()?;
         self.migrate_namespace_ownership()?;
         self.migrate_retention()?;
         self.migrate_attestations()?;
