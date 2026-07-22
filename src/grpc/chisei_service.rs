@@ -673,6 +673,10 @@ fn external_permit_to_proto(value: &permit::Permit) -> ExternalActionPermit {
         issued_at_ms: value.issued_at_ms,
         revocation_latency_ms: value.revocation_latency_ms,
         required_host_capabilities: value.required_host_capabilities.clone(),
+        parent_chain: value.parent_chain.clone(),
+        initiating_actor: value.initiating_actor.clone(),
+        offline_revocation_unavailable: value.offline_revocation_unavailable,
+        policy_scope: value.policy_scope.clone(),
     }
 }
 
@@ -695,6 +699,10 @@ fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
         immutable_preconditions: value.immutable_preconditions.into_iter().collect(),
         allowed_effects: value.allowed_effects,
         required_host_capabilities: value.required_host_capabilities,
+        parent_chain: value.parent_chain,
+        initiating_actor: value.initiating_actor,
+        offline_revocation_unavailable: value.offline_revocation_unavailable,
+        policy_scope: value.policy_scope,
         constraints: value.constraints,
         risk_class: value.risk_class,
         budget_micros: value.budget_micros,
@@ -720,6 +728,17 @@ fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
         revocation_latency_ms: value.revocation_latency_ms,
         signed_digest: value.signed_digest,
         signature: value.signature,
+    }
+}
+
+fn external_permit_policy_to_proto(value: &permit::ExternalPermitPolicy) -> ExternalPermitPolicy {
+    ExternalPermitPolicy {
+        scope: value.scope.clone(),
+        offline_action_types: value.offline_action_types.clone(),
+        offline_max_duration_ms: value.offline_max_duration_ms,
+        offline_max_invocations: value.offline_max_invocations,
+        permitted_delegators: value.permitted_delegators.clone(),
+        max_delegation_depth: value.max_delegation_depth,
     }
 }
 
@@ -4381,6 +4400,16 @@ impl ChiseiService for ChiseiServiceImpl {
                 }
             })?
         {
+            let requested_mode = if input.offline {
+                permit::OFFLINE_REDEMPTION_MODE
+            } else {
+                permit::REDEMPTION_MODE
+            };
+            if value.redemption_mode != requested_mode {
+                return Err(Status::already_exists(
+                    "authorization already issued with a different redemption mode",
+                ));
+            }
             return Ok(Response::new(IssueExternalActionPermitResponse {
                 permit: Some(external_permit_to_proto(&value)),
             }));
@@ -4391,18 +4420,24 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             Vec::new()
         };
-        let value = permit::issue(
-            &authorization,
-            &key,
-            permit::Issuance {
-                approval_identities: approvals,
-                issuer: &self.config.permit_issuer,
-                key_id: &self.config.permit_key_id,
-                permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
-                nonce: uuid::Uuid::new_v4().simple().to_string(),
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            },
-        )
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let issuance = permit::Issuance {
+            approval_identities: approvals,
+            issuer: &self.config.permit_issuer,
+            key_id: &self.config.permit_key_id,
+            permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            now_ms,
+        };
+        let value = if input.offline {
+            let policy = self
+                .db
+                .get_external_permit_policy(&authorization.decision.policy_scope)
+                .map_err(Status::internal)?;
+            permit::issue_offline(&authorization, &policy, &key, issuance)
+        } else {
+            permit::issue(&authorization, &key, issuance)
+        }
         .map_err(Status::failed_precondition)?;
         let value = self
             .db
@@ -4503,13 +4538,16 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::failed_precondition)?;
         let redemption = self
             .db
-            .redeem_permit(
+            .redeem_or_reconcile_permit(
                 &value,
                 &context,
                 &key,
                 &input.idempotency_key,
                 &input.execution_id,
-                chrono::Utc::now().timestamp_millis(),
+                crate::chisei::external_permit::RedemptionTiming {
+                    invoked_at_ms: input.invoked_at_ms,
+                    reconciled_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
             )
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(RedeemExternalActionPermitResponse {
@@ -4565,6 +4603,93 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         Ok(Response::new(RevokeExternalActionPermitResponse {
             revoked: changed,
+        }))
+    }
+
+    async fn set_external_permit_policy(
+        &self,
+        req: Request<SetExternalPermitPolicyRequest>,
+    ) -> Result<Response<SetExternalPermitPolicyResponse>, Status> {
+        require_control_plane_admin(&req, "external permit policy mutation")?;
+        let input = req
+            .into_inner()
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy required"))?;
+        let policy = permit::ExternalPermitPolicy {
+            scope: input.scope,
+            offline_action_types: input.offline_action_types,
+            offline_max_duration_ms: input.offline_max_duration_ms,
+            offline_max_invocations: input.offline_max_invocations,
+            permitted_delegators: input.permitted_delegators,
+            max_delegation_depth: input.max_delegation_depth,
+        };
+        self.db
+            .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(SetExternalPermitPolicyResponse {
+            policy: Some(external_permit_policy_to_proto(&policy)),
+        }))
+    }
+
+    async fn delegate_external_action_permit(
+        &self,
+        req: Request<DelegateExternalActionPermitRequest>,
+    ) -> Result<Response<DelegateExternalActionPermitResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        let parent = external_permit_from_proto(
+            input
+                .parent
+                .ok_or_else(|| Status::invalid_argument("parent permit required"))?,
+        );
+        if actor != parent.subject_actor {
+            return Err(Status::permission_denied(
+                "delegation requires the current permit subject",
+            ));
+        }
+        require_namespace_write_access(&self.db, &actor, &parent.namespace)?;
+        let key = permit_signing_key(&self.config)?;
+        parent
+            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
+            .and_then(|_| parent.verify_signature(&key.verifying_key()))
+            .map_err(Status::failed_precondition)?;
+        self.db
+            .validate_permit_for_delegation(&parent)
+            .map_err(Status::failed_precondition)?;
+        self.db
+            .validate_delegation_chain(&parent)
+            .map_err(Status::failed_precondition)?;
+        let policy = self
+            .db
+            .get_external_permit_policy(&parent.policy_scope)
+            .map_err(Status::internal)?;
+        let child = permit::delegate(
+            &parent,
+            &policy,
+            &key,
+            permit::Delegation {
+                delegator: &actor,
+                subject_actor: &input.subject_actor,
+                permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
+                nonce: uuid::Uuid::new_v4().simple().to_string(),
+                now_ms: chrono::Utc::now().timestamp_millis(),
+                expires_at_ms: input.expires_at_ms,
+                target_selectors: input.target_selectors,
+                allowed_effects: input.allowed_effects,
+                budget_micros: input.budget_micros,
+                volume_limit: input.volume_limit,
+                blast_radius_limit: input.blast_radius_limit,
+                max_invocations: input.max_invocations,
+                risk_class: &input.risk_class,
+            },
+        )
+        .map_err(Status::failed_precondition)?;
+        let child = self
+            .db
+            .put_delegated_permit(&child, &actor)
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(DelegateExternalActionPermitResponse {
+            permit: Some(external_permit_to_proto(&child)),
         }))
     }
 
@@ -9250,6 +9375,7 @@ mod tests {
                 IssueExternalActionPermitRequest {
                     authorization_id: authorization_id.clone(),
                     idempotency_key: "issue-permit-1".into(),
+                    offline: false,
                 },
             ))
             .await
@@ -9285,6 +9411,7 @@ mod tests {
                     host_capabilities: permit.required_host_capabilities.clone(),
                     idempotency_key: "redeem-permit-1".into(),
                     execution_id: "execution-1".into(),
+                    invoked_at_ms: 0,
                 },
             ))
             .await
@@ -9323,6 +9450,7 @@ mod tests {
                 IssueExternalActionPermitRequest {
                     authorization_id,
                     idempotency_key: "issue-permit-1".into(),
+                    offline: false,
                 },
             ))
             .await
