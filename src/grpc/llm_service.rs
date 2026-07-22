@@ -66,7 +66,7 @@ async fn execute_chat_request_with_cache(
     prompt_cache: llm::PromptCacheIntent,
 ) -> Result<ChatResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
-    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache);
+    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.as_deref().unwrap_or("default");
@@ -193,7 +193,7 @@ async fn execute_chat_request_stream_with_cache(
     prompt_cache: llm::PromptCacheIntent,
 ) -> Result<ChatStreamResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
-    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache);
+    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
@@ -314,19 +314,19 @@ fn eligible_prompt_cache_intent(
     registry: &crate::provider_profile::ProviderRegistry,
     request: &ChatRequest,
     requested: llm::PromptCacheIntent,
-) -> llm::PromptCacheIntent {
+) -> Result<llm::PromptCacheIntent, Status> {
+    use crate::chisei::cache_policy::{
+        CacheDecisionKind, CachePolicyInput, POLICY_VERSION, evaluate,
+    };
     if !requested.enabled {
-        return requested;
+        return Ok(requested);
     }
     let Ok(resolved) = registry.resolve_model(&request.model) else {
-        return llm::PromptCacheIntent::default();
+        return Ok(llm::PromptCacheIntent::default());
     };
     let Some(profile) = registry.effective_profile(&resolved.provider) else {
-        return llm::PromptCacheIntent::default();
+        return Ok(llm::PromptCacheIntent::default());
     };
-    if !profile.prompt_cache.explicit_breakpoints {
-        return llm::PromptCacheIntent::default();
-    }
     let stable_bytes = request.system.len()
         + request
             .tools
@@ -349,14 +349,45 @@ fn eligible_prompt_cache_intent(
             })
             .sum::<usize>();
     let estimated_tokens = stable_bytes.div_ceil(4) as u64;
-    if profile
-        .prompt_cache
-        .minimum_cacheable_tokens
-        .is_some_and(|minimum| estimated_tokens < minimum)
-    {
-        llm::PromptCacheIntent::default()
+    let decision = evaluate(CachePolicyInput {
+        requested: true,
+        provider_supported: profile.prompt_cache.explicit_breakpoints,
+        model_supported: profile.prompt_cache.explicit_breakpoints,
+        // Registry resolution has already enforced experimental/canary
+        // admission. Only a disabled effective profile is unavailable here.
+        provider_enabled: profile.lifecycle != "disabled",
+        stable_prefix_tokens: estimated_tokens,
+        minimum_cacheable_tokens: profile.prompt_cache.minimum_cacheable_tokens,
+        // Native execution reaches this boundary only after Chisei privacy and
+        // egress checks. The provider adapter never broadens that decision.
+        data_class_allowed: true,
+        controls_valid: requested.cacheable_message_count <= request.messages.len(),
+        accounting_available: !profile.prompt_cache.usage_fields.is_empty(),
+        uncached_fallback_allowed: true,
+        // Native caching is selected for stable conversation history expected
+        // to be reused; provider profiles currently expose price classes, not
+        // numeric ratios, so break-even remains unquantified here.
+        expected_requests: 2,
+        write_price_ratio_millionths: None,
+        read_price_ratio_millionths: None,
+    });
+    tracing::info!(
+        policy_version = POLICY_VERSION,
+        outcome = decision.kind.as_str(),
+        reason = decision.reason.as_str(),
+        stable_prefix_tokens = estimated_tokens,
+        break_even_requests = decision.break_even_requests,
+        "prompt cache policy evaluated"
+    );
+    if decision.kind == CacheDecisionKind::Invalid {
+        Err(Status::failed_precondition(format!(
+            "prompt cache policy rejected request: {}",
+            decision.reason.as_str()
+        )))
+    } else if decision.enabled() {
+        Ok(requested)
     } else {
-        requested
+        Ok(llm::PromptCacheIntent::default())
     }
 }
 
@@ -502,20 +533,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            eligible_prompt_cache_intent(&registry, &request, requested),
+            eligible_prompt_cache_intent(&registry, &request, requested).unwrap(),
             llm::PromptCacheIntent::default()
         );
 
         request.system = "s".repeat(4 * 4_096);
         assert_eq!(
-            eligible_prompt_cache_intent(&registry, &request, requested),
+            eligible_prompt_cache_intent(&registry, &request, requested).unwrap(),
             requested
         );
 
         request.model = "openai/gpt-5.5".into();
         assert_eq!(
-            eligible_prompt_cache_intent(&registry, &request, requested),
+            eligible_prompt_cache_intent(&registry, &request, requested).unwrap(),
             llm::PromptCacheIntent::default()
         );
+    }
+
+    #[test]
+    fn invalid_native_cache_controls_fail_before_provider_contact() {
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let request = ChatRequest {
+            model: "anthropic/claude-sonnet-4-8".into(),
+            system: "s".repeat(4 * 4_096),
+            ..Default::default()
+        };
+        let error = eligible_prompt_cache_intent(
+            &registry,
+            &request,
+            llm::PromptCacheIntent {
+                enabled: true,
+                cacheable_message_count: 1,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("invalid_controls"));
     }
 }
