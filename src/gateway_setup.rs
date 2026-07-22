@@ -1236,6 +1236,7 @@ mod tests {
                 expected_calls: 1,
                 budget_route_bias: String::new(),
                 route_override: String::new(),
+                capability_requirements_json: Vec::new(),
             }))
             .await
             .unwrap()

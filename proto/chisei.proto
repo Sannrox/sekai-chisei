@@ -519,6 +519,10 @@ message ResolvePolicyRequest {
   string budget_route_bias = 11;
   // Optional canonical provider/model pinned for this one governed resolution.
   string route_override = 12;
+  // Gateway-derived request capabilities used to exclude unusable routes before
+  // selection. JSON encoding preserves backwards compatibility for callers
+  // that do not perform model routing.
+  bytes capability_requirements_json = 13;
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 
