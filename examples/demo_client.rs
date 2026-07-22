@@ -186,6 +186,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     // context --deploys--> service
     match sekai
         .create_link(CreateLinkRequest {
+            fail_if_exists: false,
             link: Some(Link {
                 id: format!("link-{namespace_id}-{service_id}"),
                 from_id: namespace_id.to_string(),
