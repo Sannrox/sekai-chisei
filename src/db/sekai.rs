@@ -44,7 +44,7 @@ fn register_sql_helpers(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrincipalCredential {
     pub id: String,
     pub principal: String,
@@ -53,6 +53,7 @@ pub struct PrincipalCredential {
     pub created: i64,
     pub rotated_at: i64,
     pub revoked_at: i64,
+    pub tenant_id: String,
 }
 
 impl SekaiDb {
@@ -219,7 +220,33 @@ impl SekaiDb {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_token_hash ON sekai_principal_credentials(token_hash);
             CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let has_tenant_id = conn
+            .prepare("PRAGMA table_info(sekai_principal_credentials)")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows
+                    .filter_map(Result::ok)
+                    .any(|column| column == "tenant_id"))
+            })
+            .map_err(|error| error.to_string())?;
+        if !has_tenant_id {
+            conn.execute_batch(
+                "ALTER TABLE sekai_principal_credentials ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+                 CREATE INDEX idx_sekai_principal_credentials_tenant ON sekai_principal_credentials(tenant_id,principal);",
+            )
+            .map_err(|error| error.to_string())?;
+        } else {
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_tenant ON sekai_principal_credentials(tenant_id,principal);")
+                .map_err(|error| error.to_string())?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_active_tenant
+             ON sekai_principal_credentials(tenant_id,principal)
+             WHERE tenant_id<>'' AND status='active';",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -234,7 +261,7 @@ impl SekaiDb {
     ) -> Result<Option<PrincipalCredential>, String> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             params![token_hash],
             row_to_principal_credential,
         )
@@ -287,6 +314,7 @@ impl SekaiDb {
             created: now,
             rotated_at: now,
             revoked_at: 0,
+            tenant_id: String::new(),
         })
     }
 
@@ -318,6 +346,7 @@ impl SekaiDb {
             created: now,
             rotated_at: now,
             revoked_at: 0,
+            tenant_id: String::new(),
         })
     }
 
@@ -332,7 +361,7 @@ impl SekaiDb {
 
         let mut active_stmt = tx
             .prepare(
-                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND tenant_id='' AND status = 'active' ORDER BY created DESC LIMIT 1",
             )
             .map_err(|e| e.to_string())?;
         let active_id = active_stmt
@@ -370,6 +399,7 @@ impl SekaiDb {
             created: now,
             rotated_at: now,
             revoked_at: 0,
+            tenant_id: String::new(),
         })
     }
 
@@ -389,7 +419,7 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?;
         let revoked = tx
             .execute(
-                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND status='active'",
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND tenant_id='' AND status='active'",
                 params![now, principal],
             )
             .map_err(|e| e.to_string())?;
@@ -410,6 +440,7 @@ impl SekaiDb {
             created: now,
             rotated_at: now,
             revoked_at: 0,
+            tenant_id: String::new(),
         })
     }
 
@@ -421,7 +452,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE principal = ?1 AND tenant_id='' AND status = 'active' ORDER BY created DESC LIMIT 1",
             )
             .map_err(|e| e.to_string())?;
         let credential: Option<PrincipalCredential> = stmt
@@ -450,7 +481,7 @@ impl SekaiDb {
         status: Option<&str>,
     ) -> Result<Vec<PrincipalCredential>, String> {
         let conn = self.conn();
-        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE 1=1".to_string();
+        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE 1=1".to_string();
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(principal) = principal {
             sql.push_str(&format!(" AND principal = ?{}", args.len() + 1));
@@ -472,6 +503,167 @@ impl SekaiDb {
 
     pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
         self.list_credentials(None, Some("active"))
+    }
+
+    pub fn list_unbound_credentials(
+        &self,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        Ok(self
+            .list_credentials(principal, status)?
+            .into_iter()
+            .filter(|credential| credential.tenant_id.is_empty())
+            .collect())
+    }
+
+    pub fn list_tenant_credentials(
+        &self,
+        tenant_id: &str,
+        principal: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<PrincipalCredential>, String> {
+        let conn = self.conn();
+        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE tenant_id=?1".to_string();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(tenant_id.to_string())];
+        for (column, value) in [("principal", principal), ("status", status)] {
+            if let Some(value) = value {
+                sql.push_str(&format!(" AND {column}=?{}", args.len() + 1));
+                args.push(Box::new(value.to_string()));
+            }
+        }
+        sql.push_str(" ORDER BY created,id");
+        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        statement
+            .query_map(refs.as_slice(), row_to_principal_credential)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn create_tenant_credential(
+        &self,
+        tenant_id: &str,
+        principal: &str,
+        token_hash: &str,
+        actor: &str,
+        platform_admin: bool,
+        now: i64,
+    ) -> Result<PrincipalCredential, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id) VALUES (?1,?2,?3,'active',?4,?4,0,?5)",
+            params![id, principal, token_hash, now, tenant_id],
+        ).map_err(|error| error.to_string())?;
+        insert_tenant_credential_audit(
+            &tx,
+            actor,
+            tenant_id,
+            principal,
+            "credential.create",
+            "created",
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(PrincipalCredential {
+            id,
+            principal: principal.into(),
+            token_hash: token_hash.into(),
+            status: "active".into(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: tenant_id.into(),
+        })
+    }
+
+    pub fn rotate_tenant_credential(
+        &self,
+        tenant_id: &str,
+        principal: &str,
+        token_hash: &str,
+        actor: &str,
+        platform_admin: bool,
+        now: i64,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let id = format!("credential-{}", Uuid::new_v4().simple());
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
+        let revoked = tx.execute(
+            "UPDATE sekai_principal_credentials SET status='revoked',revoked_at=?1 WHERE tenant_id=?2 AND principal=?3 AND status='active'",
+            params![now, tenant_id, principal],
+        ).map_err(|error| error.to_string())?;
+        if revoked == 0 {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO sekai_principal_credentials (id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id) VALUES (?1,?2,?3,'active',?4,?4,0,?5)",
+            params![id, principal, token_hash, now, tenant_id],
+        ).map_err(|error| error.to_string())?;
+        insert_tenant_credential_audit(
+            &tx,
+            actor,
+            tenant_id,
+            principal,
+            "credential.rotate",
+            "rotated",
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(PrincipalCredential {
+            id,
+            principal: principal.into(),
+            token_hash: token_hash.into(),
+            status: "active".into(),
+            created: now,
+            rotated_at: now,
+            revoked_at: 0,
+            tenant_id: tenant_id.into(),
+        }))
+    }
+
+    pub fn revoke_tenant_credential(
+        &self,
+        tenant_id: &str,
+        principal: &str,
+        actor: &str,
+        platform_admin: bool,
+        now: i64,
+    ) -> Result<Option<PrincipalCredential>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
+        let credential = tx.query_row(
+            "SELECT id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id FROM sekai_principal_credentials WHERE tenant_id=?1 AND principal=?2 AND status='active' ORDER BY created DESC LIMIT 1",
+            params![tenant_id, principal], row_to_principal_credential,
+        ).optional().map_err(|error| error.to_string())?;
+        let Some(mut credential) = credential else {
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE sekai_principal_credentials SET status='revoked',revoked_at=?1
+             WHERE tenant_id=?2 AND principal=?3 AND status='active'",
+            params![now, tenant_id, principal],
+        )
+        .map_err(|error| error.to_string())?;
+        insert_tenant_credential_audit(
+            &tx,
+            actor,
+            tenant_id,
+            principal,
+            "credential.revoke",
+            "revoked",
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        credential.status = "revoked".into();
+        credential.revoked_at = now;
+        Ok(Some(credential))
     }
 
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
@@ -1493,7 +1685,62 @@ fn row_to_principal_credential(
         created: row.get(4)?,
         rotated_at: row.get(5)?,
         revoked_at: row.get(6)?,
+        tenant_id: row.get(7)?,
     })
+}
+
+fn insert_tenant_credential_audit(
+    conn: &rusqlite::Connection,
+    actor: &str,
+    tenant_id: &str,
+    principal: &str,
+    action: &str,
+    outcome: &str,
+    now: i64,
+) -> Result<(), String> {
+    crate::sekai::ledger::insert_chained_decision(
+        conn,
+        &crate::sekai::audit::Decision {
+            id: Uuid::new_v4().to_string(),
+            timestamp: now,
+            actor: actor.into(),
+            action: action.into(),
+            reason: "tenant service credential changed".into(),
+            evidence: HashMap::from([
+                ("tenant_id".into(), tenant_id.into()),
+                ("data_class".into(), "internal".into()),
+            ]),
+            target_id: format!("tenant-credential:{tenant_id}:{principal}"),
+            outcome: outcome.into(),
+        },
+    )
+}
+
+fn require_tenant_credential_admin_tx(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    actor: &str,
+    platform_admin: bool,
+) -> Result<(), String> {
+    if platform_admin {
+        return Ok(());
+    }
+    let authorized: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sekai_tenant_memberships
+                WHERE tenant_id=?1 AND subject_id=?2 AND status='active'
+                  AND role IN ('owner','admin')
+             )",
+            params![tenant_id, actor],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if authorized {
+        Ok(())
+    } else {
+        Err("tenant credential admin required".into())
+    }
 }
 
 fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
@@ -2364,5 +2611,85 @@ mod tests {
                 .len(),
             2..=2
         ));
+    }
+
+    #[test]
+    fn tenant_credentials_preserve_binding_rotation_revocation_and_audit() {
+        let db = test_db();
+        let tenant = db.create_tenant("root", "credential-db", 1).unwrap();
+        let created = db
+            .create_tenant_credential(&tenant.id, "worker", "hash-one", "owner", true, 2)
+            .unwrap();
+        assert!(
+            db.create_tenant_credential(&tenant.id, "worker", "hash-duplicate", "owner", true, 2,)
+                .is_err()
+        );
+        db.create_principal_credential("worker", "unbound-hash", 2)
+            .unwrap();
+        db.rotate_principal_credential("worker", "unbound-hash-2")
+            .unwrap();
+        assert!(db.get_principal_credential("hash-one").unwrap().is_some());
+        db.revoke_principal_credential("worker").unwrap().unwrap();
+        assert!(db.get_principal_credential("hash-one").unwrap().is_some());
+        assert_eq!(created.tenant_id, tenant.id);
+        assert_eq!(
+            db.get_principal_credential("hash-one").unwrap(),
+            Some(created.clone())
+        );
+
+        let rotated = db
+            .rotate_tenant_credential(&tenant.id, "worker", "hash-two", "owner", true, 3)
+            .unwrap()
+            .unwrap();
+        assert!(db.get_principal_credential("hash-one").unwrap().is_none());
+        assert_eq!(
+            db.get_principal_credential("hash-two").unwrap(),
+            Some(rotated)
+        );
+
+        db.revoke_tenant_credential(&tenant.id, "worker", "owner", true, 4)
+            .unwrap()
+            .unwrap();
+        assert!(db.get_principal_credential("hash-two").unwrap().is_none());
+        let audit = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                target_id: Some(format!("tenant-credential:{}:worker", tenant.id)),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .map(|decision| decision.action.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "credential.revoke",
+                "credential.rotate",
+                "credential.create"
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_migration_upgrades_unbound_rows_without_inference() {
+        let db = test_db();
+        let conn = db.conn();
+        conn.execute_batch(
+            "DROP TABLE sekai_principal_credentials;
+             CREATE TABLE sekai_principal_credentials (
+                id TEXT PRIMARY KEY, principal TEXT NOT NULL, token_hash TEXT NOT NULL,
+                status TEXT NOT NULL, created INTEGER NOT NULL,
+                rotated_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO sekai_principal_credentials
+                (id,principal,token_hash,status,created,rotated_at,revoked_at)
+             VALUES ('legacy','tenant_fake.worker','legacy-hash','active',1,1,0);",
+        )
+        .unwrap();
+        drop(conn);
+        db.migrate_principal_credentials().unwrap();
+        let upgraded = db.get_principal_credential("legacy-hash").unwrap().unwrap();
+        assert!(upgraded.tenant_id.is_empty());
     }
 }

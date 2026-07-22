@@ -112,6 +112,14 @@ pub enum TenantError {
 }
 
 impl SekaiDb {
+    pub fn tenant_membership_role(
+        &self,
+        tenant_id: &str,
+        subject_id: &str,
+    ) -> Result<Option<TenantRole>, TenantError> {
+        actor_membership_role(&self.conn(), tenant_id, subject_id)
+    }
+
     pub(crate) fn migrate_tenant_memberships(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(

@@ -9264,19 +9264,27 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CreateCredentialRequest>,
     ) -> Result<Response<CreateCredentialResponse>, Status> {
-        require_credential_admin(&caller_principals(&req))?;
+        let (actor, platform_admin) =
+            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
         let request = req.into_inner();
+        if !request.tenant_id.is_empty() {
+            self.db
+                .require_tenant_admission(&request.tenant_id)
+                .map_err(tenant_status)?;
+        }
         let principal = if request.managed_team_principal {
             validate_team_principal(&request.principal)?
         } else {
             validate_new_credential_principal(&request.principal)?
         };
-        if !self
-            .db
-            .list_credentials(Some(&principal), Some("active"))
-            .map_err(Status::internal)?
-            .is_empty()
-        {
+        let existing = if request.tenant_id.is_empty() {
+            self.db
+                .list_unbound_credentials(Some(&principal), Some("active"))
+        } else {
+            self.db
+                .list_tenant_credentials(&request.tenant_id, Some(&principal), Some("active"))
+        };
+        if !existing.map_err(Status::internal)?.is_empty() {
             return Err(Status::already_exists(format!(
                 "active credential already exists for {principal:?}; rotate it instead"
             )));
@@ -9284,7 +9292,21 @@ impl SekaiService for SekaiServiceImpl {
         let token = new_credential_token();
         let token_hash = hash_gateway_key(&token);
         let now = chrono::Utc::now().timestamp_millis();
-        let credential = if request.managed_team_principal {
+        let credential = if !request.tenant_id.is_empty() {
+            if request.managed_team_principal {
+                return Err(Status::invalid_argument(
+                    "managed team credentials cannot be tenant-bound",
+                ));
+            }
+            self.db.create_tenant_credential(
+                &request.tenant_id,
+                &principal,
+                &token_hash,
+                &actor,
+                platform_admin,
+                now,
+            )
+        } else if request.managed_team_principal {
             self.db
                 .create_managed_team_credential(&principal, &token_hash, now)
         } else {
@@ -9521,32 +9543,59 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RotateCredentialRequest>,
     ) -> Result<Response<RotateCredentialResponse>, Status> {
-        require_credential_admin(&caller_principals(&req))?;
+        let (actor, platform_admin) =
+            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
         let request = req.into_inner();
+        if !request.tenant_id.is_empty() {
+            self.db
+                .require_tenant_admission(&request.tenant_id)
+                .map_err(tenant_status)?;
+        }
         let principal = if request.managed_team_principal {
             validate_team_principal(&request.principal)?
         } else {
             validate_new_credential_principal(&request.principal)?
         };
-        if self
-            .db
-            .list_credentials(Some(&principal), Some("active"))
-            .map_err(Status::internal)?
-            .is_empty()
-        {
+        let existing = if request.tenant_id.is_empty() {
+            self.db
+                .list_unbound_credentials(Some(&principal), Some("active"))
+        } else {
+            self.db
+                .list_tenant_credentials(&request.tenant_id, Some(&principal), Some("active"))
+        };
+        if existing.map_err(Status::internal)?.is_empty() {
             return Err(Status::not_found(format!(
                 "no active credential for {principal:?}"
             )));
         }
         let token = new_credential_token();
         let token_hash = hash_gateway_key(&token);
-        let credential = if request.managed_team_principal {
+        let credential = if !request.tenant_id.is_empty() {
+            if request.managed_team_principal {
+                return Err(Status::invalid_argument(
+                    "managed team credentials cannot be tenant-bound",
+                ));
+            }
+            self.db
+                .rotate_tenant_credential(
+                    &request.tenant_id,
+                    &principal,
+                    &token_hash,
+                    &actor,
+                    platform_admin,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::not_found("no active tenant credential"))
+        } else if request.managed_team_principal {
             self.db
                 .rotate_managed_team_credential(&principal, &token_hash)
+                .map_err(Status::internal)
         } else {
-            self.db.rotate_principal_credential(&principal, &token_hash)
-        }
-        .map_err(Status::internal)?;
+            self.db
+                .rotate_principal_credential(&principal, &token_hash)
+                .map_err(Status::internal)
+        }?;
         Ok(Response::new(RotateCredentialResponse {
             token,
             credential: Some(to_proto_credential(credential)),
@@ -9557,13 +9606,23 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RevokeCredentialRequest>,
     ) -> Result<Response<RevokeCredentialResponse>, Status> {
-        require_credential_admin(&caller_principals(&req))?;
-        let principal = validate_credential_principal(&req.into_inner().principal)?;
-        let credential = self
-            .db
-            .revoke_principal_credential(&principal)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
+        let (actor, platform_admin) =
+            credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
+        let request = req.into_inner();
+        let principal = validate_credential_principal(&request.principal)?;
+        let credential = if request.tenant_id.is_empty() {
+            self.db.revoke_principal_credential(&principal)
+        } else {
+            self.db.revoke_tenant_credential(
+                &request.tenant_id,
+                &principal,
+                &actor,
+                platform_admin,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        }
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
         Ok(Response::new(RevokeCredentialResponse {
             credential: Some(to_proto_credential(credential)),
         }))
@@ -9573,14 +9632,17 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<ListCredentialsResponse>, Status> {
-        require_credential_admin(&caller_principals(&req))?;
-        let credentials = self
-            .db
-            .list_credentials(None, None)
-            .map_err(Status::internal)?
-            .into_iter()
-            .map(to_proto_credential)
-            .collect();
+        credential_admin_actor(&self.db, &req, &req.get_ref().tenant_id)?;
+        let tenant_id = req.into_inner().tenant_id;
+        let credentials = if tenant_id.is_empty() {
+            self.db.list_unbound_credentials(None, None)
+        } else {
+            self.db.list_tenant_credentials(&tenant_id, None, None)
+        }
+        .map_err(Status::internal)?
+        .into_iter()
+        .map(to_proto_credential)
+        .collect();
         Ok(Response::new(ListCredentialsResponse { credentials }))
     }
 
@@ -9925,6 +9987,51 @@ fn require_credential_admin(principals: &[String]) -> Result<(), Status> {
     Err(Status::permission_denied("credential admin required"))
 }
 
+fn credential_admin_actor(
+    db: &SekaiDb,
+    req: &Request<impl std::any::Any>,
+    requested_tenant: &str,
+) -> Result<(String, bool), Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    let actor = principals
+        .into_iter()
+        .next()
+        .ok_or_else(|| Status::unauthenticated("authenticated principal required"))?;
+    if requested_tenant.trim().is_empty() {
+        require_credential_admin(std::slice::from_ref(&actor))?;
+        return Ok((actor, true));
+    }
+    let tenant_id = require_tenant_id(requested_tenant)?;
+    if requested_tenant != tenant_id {
+        return Err(Status::invalid_argument(
+            "tenant_id must use canonical form without surrounding whitespace",
+        ));
+    }
+    if matches!(actor.as_str(), "root" | "local") {
+        return Ok((actor, true));
+    }
+    let context = request_tenant_context(req)?
+        .ok_or_else(|| Status::permission_denied("tenant context required"))?;
+    if context != tenant_id {
+        return Err(Status::permission_denied("tenant context mismatch"));
+    }
+    let subject = actor
+        .strip_prefix(&format!("{tenant_id}."))
+        .unwrap_or(&actor);
+    match db
+        .tenant_membership_role(&tenant_id, subject)
+        .map_err(tenant_status)?
+    {
+        Some(crate::sekai::tenant::TenantRole::Owner | crate::sekai::tenant::TenantRole::Admin) => {
+            Ok((subject.to_string(), false))
+        }
+        _ => Err(Status::permission_denied(
+            "tenant credential admin required",
+        )),
+    }
+}
+
 fn tenant_admin_actor(req: &Request<impl std::any::Any>) -> Result<String, Status> {
     let principals = caller_principals(req);
     require_credential_admin(&principals)?;
@@ -10068,9 +10175,7 @@ fn membership_authority(
     let tenant = tenant_id
         .as_deref()
         .ok_or_else(|| Status::permission_denied("tenant context required"))?;
-    let subject = actor
-        .strip_prefix(&format!("{tenant}."))
-        .ok_or_else(|| Status::permission_denied("tenant principal mismatch"))?;
+    let subject = actor.strip_prefix(&format!("{tenant}.")).unwrap_or(&actor);
     Ok((require_subject_id(subject)?, false, tenant_id))
 }
 
@@ -10181,6 +10286,7 @@ fn to_proto_credential(credential: crate::db::sekai::PrincipalCredential) -> Cre
         created: credential.created,
         rotated_at: credential.rotated_at,
         revoked_at: credential.revoked_at,
+        tenant_id: credential.tenant_id,
     }
 }
 
@@ -19267,6 +19373,7 @@ mod tests {
                 CreateCredentialRequest {
                     principal: "agent-a".into(),
                     managed_team_principal: false,
+                    tenant_id: String::new(),
                 },
                 "local",
             ))
@@ -19281,6 +19388,7 @@ mod tests {
                 RotateCredentialRequest {
                     principal: "agent-a".into(),
                     managed_team_principal: false,
+                    tenant_id: String::new(),
                 },
                 "local",
             ))
@@ -19290,7 +19398,12 @@ mod tests {
         assert_ne!(rotated.token, created.token);
 
         let listed = svc
-            .list_credentials(with_named_principal(ListCredentialsRequest {}, "local"))
+            .list_credentials(with_named_principal(
+                ListCredentialsRequest {
+                    tenant_id: String::new(),
+                },
+                "local",
+            ))
             .await
             .unwrap()
             .into_inner();
@@ -19308,6 +19421,7 @@ mod tests {
             .revoke_credential(with_named_principal(
                 RevokeCredentialRequest {
                     principal: "agent-a".into(),
+                    tenant_id: String::new(),
                 },
                 "local",
             ))
@@ -19322,10 +19436,141 @@ mod tests {
     #[tokio::test]
     async fn credential_rpcs_require_control_plane_admin() {
         let error = service()
-            .list_credentials(with_named_principal(ListCredentialsRequest {}, "tester"))
+            .list_credentials(with_named_principal(
+                ListCredentialsRequest {
+                    tenant_id: String::new(),
+                },
+                "tester",
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn tenant_credentials_are_scoped_and_require_live_admin_membership() {
+        let svc = service();
+        let tenant = svc
+            .db
+            .create_tenant("root", "credential-tenant", 1)
+            .unwrap();
+        svc.db
+            .create_tenant_membership(
+                &tenant.id,
+                "owner",
+                crate::sekai::tenant::TenantRole::Owner,
+                "root",
+                true,
+                2,
+            )
+            .unwrap();
+        svc.db
+            .create_tenant_membership(
+                &tenant.id,
+                "member",
+                crate::sekai::tenant::TenantRole::Member,
+                "owner",
+                false,
+                3,
+            )
+            .unwrap();
+
+        let created = svc
+            .create_credential(with_tenant_context(
+                CreateCredentialRequest {
+                    principal: "worker".into(),
+                    managed_team_principal: false,
+                    tenant_id: tenant.id.clone(),
+                },
+                "owner",
+                &tenant.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(created.credential.unwrap().tenant_id, tenant.id);
+
+        let denied = svc
+            .create_credential(with_tenant_context(
+                CreateCredentialRequest {
+                    principal: "other-worker".into(),
+                    managed_team_principal: false,
+                    tenant_id: tenant.id.clone(),
+                },
+                "member",
+                &tenant.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        svc.db
+            .create_tenant_membership(
+                &tenant.id,
+                "owner-2",
+                crate::sekai::tenant::TenantRole::Owner,
+                "owner",
+                false,
+                4,
+            )
+            .unwrap();
+        svc.db
+            .change_tenant_membership_role(
+                &tenant.id,
+                "owner",
+                crate::sekai::tenant::TenantRole::Member,
+                "root",
+                true,
+                5,
+            )
+            .unwrap();
+        let revoked_authority = svc
+            .list_credentials(with_tenant_context(
+                ListCredentialsRequest {
+                    tenant_id: tenant.id.clone(),
+                },
+                "owner",
+                &tenant.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(revoked_authority.code(), tonic::Code::PermissionDenied);
+
+        let platform_visible = svc
+            .list_credentials(with_named_principal(
+                ListCredentialsRequest {
+                    tenant_id: tenant.id.clone(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(platform_visible.credentials.len(), 1);
+
+        let non_canonical = svc
+            .list_credentials(with_named_principal(
+                ListCredentialsRequest {
+                    tenant_id: format!(" {} ", platform_visible.credentials[0].tenant_id),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(non_canonical.code(), tonic::Code::InvalidArgument);
+
+        svc.db
+            .suspend_tenant(&tenant.id, "root", "suspend-credential-tenant", 6)
+            .unwrap();
+        svc.revoke_credential(with_named_principal(
+            RevokeCredentialRequest {
+                principal: "worker".into(),
+                tenant_id: tenant.id.clone(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -19335,6 +19580,7 @@ mod tests {
             CreateCredentialRequest {
                 principal: "team-agent".into(),
                 managed_team_principal: false,
+                tenant_id: String::new(),
             },
             "local",
         ))
@@ -19346,6 +19592,7 @@ mod tests {
             RotateCredentialRequest {
                 principal: "team-agent".into(),
                 managed_team_principal: true,
+                tenant_id: String::new(),
             },
             "local",
         ))
@@ -19369,6 +19616,7 @@ mod tests {
                     CreateCredentialRequest {
                         principal: principal.into(),
                         managed_team_principal: false,
+                        tenant_id: String::new(),
                     },
                     "local",
                 ))
@@ -19385,6 +19633,7 @@ mod tests {
                 CreateCredentialRequest {
                     principal: "chisei-gateway".into(),
                     managed_team_principal: true,
+                    tenant_id: String::new(),
                 },
                 "local",
             ))

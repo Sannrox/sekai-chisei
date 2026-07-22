@@ -138,7 +138,9 @@ pub async fn run_team_join(config: TeamJoinConfig) -> Result<TeamJoinBundle, Str
     let mut sekai = SekaiServiceClient::new(channel.clone());
     let mut chisei = ChiseiServiceClient::new(channel);
     let active_credential_exists = sekai
-        .list_credentials(ListCredentialsRequest {})
+        .list_credentials(ListCredentialsRequest {
+            tenant_id: String::new(),
+        })
         .await
         .map_err(|error| format!("list principal credentials: {error}"))?
         .into_inner()
@@ -162,6 +164,7 @@ pub async fn run_team_join(config: TeamJoinConfig) -> Result<TeamJoinBundle, Str
             .rotate_credential(RotateCredentialRequest {
                 principal: config.principal.clone(),
                 managed_team_principal: true,
+                tenant_id: String::new(),
             })
             .await
             .map_err(|error| format!("rotate principal credential: {error}"))?
@@ -172,6 +175,7 @@ pub async fn run_team_join(config: TeamJoinConfig) -> Result<TeamJoinBundle, Str
             .create_credential(CreateCredentialRequest {
                 principal: config.principal.clone(),
                 managed_team_principal: true,
+                tenant_id: String::new(),
             })
             .await
             .map_err(|error| format!("create principal credential: {error}"))?

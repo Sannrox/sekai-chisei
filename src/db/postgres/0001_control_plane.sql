@@ -23,12 +23,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_object_sets_owner_name
 CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
     id TEXT PRIMARY KEY, principal TEXT NOT NULL, token_hash TEXT NOT NULL,
     status TEXT NOT NULL, created BIGINT NOT NULL, rotated_at BIGINT NOT NULL DEFAULT 0,
-    revoked_at BIGINT NOT NULL DEFAULT 0
+    revoked_at BIGINT NOT NULL DEFAULT 0, tenant_id TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_token_hash
     ON sekai_principal_credentials(token_hash);
 CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal
     ON sekai_principal_credentials(principal);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_active_tenant
+    ON sekai_principal_credentials(tenant_id, principal)
+    WHERE tenant_id <> '' AND status = 'active';
 
 CREATE TABLE IF NOT EXISTS sekai_grants (
     id TEXT PRIMARY KEY, object_id TEXT NOT NULL, principal TEXT NOT NULL,
