@@ -9856,7 +9856,10 @@ async fn link_work_unit_usage(
         created: Utc::now().timestamp_millis(),
     };
     match sekai
-        .create_link(gateway_request(CreateLinkRequest { link: Some(link) }))
+        .create_link(gateway_request(CreateLinkRequest {
+            fail_if_exists: false,
+            link: Some(link),
+        }))
         .await
     {
         Ok(_) => {}
