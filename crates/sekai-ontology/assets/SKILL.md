@@ -15,6 +15,8 @@ The command is single-shot and local; it does not require a server or network.
   for bounded traversal from a class. Add `--relation <name>` to follow only
   matching relations. Read `data.classes` and `data.relations`; both are
   deduplicated and ordered by name.
+- Run `sekai --db <path> --json entity list`, `entity show <name>`, or
+  `relation list` for direct deterministic inspection.
 - Run `sekai --db <path> --json validate` before relying on an ontology whose
   definitions may have changed.
 - Run `sekai --db <path> --json export` to inspect or exchange the complete,

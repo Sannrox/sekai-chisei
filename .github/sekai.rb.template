@@ -1,0 +1,34 @@
+class Sekai < Formula
+  desc "Portable local SQLite ontology"
+  homepage "https://github.com/Sannrox/sekai-chisei"
+  version "@VERSION@"
+  license "AGPL-3.0-only"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "@BASE@/sekai-@TAG@-aarch64-apple-darwin.tar.gz"
+      sha256 "@MAC_ARM_SHA@"
+    else
+      url "@BASE@/sekai-@TAG@-x86_64-apple-darwin.tar.gz"
+      sha256 "@MAC_INTEL_SHA@"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "@BASE@/sekai-@TAG@-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "@LINUX_ARM_SHA@"
+    else
+      url "@BASE@/sekai-@TAG@-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "@LINUX_INTEL_SHA@"
+    end
+  end
+
+  def install
+    bin.install "sekai"
+  end
+
+  test do
+    system bin/"sekai", "--db", testpath/"knowledge.db", "init"
+  end
+end
