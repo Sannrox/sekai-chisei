@@ -38,6 +38,7 @@ use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
+const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
 
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
@@ -115,6 +116,13 @@ fn reject_unauthorized() {
 
 impl tonic::service::Interceptor for TokenAuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        let requested_root_tenant = req
+            .metadata()
+            .get(TENANT_CONTEXT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
             reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
@@ -127,6 +135,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
 
         while req.metadata_mut().remove("x-principal").is_some() {}
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
+        while req.metadata_mut().remove(TENANT_CONTEXT_HEADER).is_some() {}
         req.metadata_mut().insert(
             "x-principal",
             MetadataValue::from_str(&principal).map_err(|_| {
@@ -136,8 +145,68 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
         );
         req.metadata_mut()
             .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("token"));
+        let tenant_id = if principal == "root" {
+            requested_root_tenant
+        } else {
+            tenant_id_from_principal(&principal)
+        };
+        if principal != "root" && tenant_id.is_some() {
+            let method = req
+                .extensions()
+                .get::<tonic::GrpcMethod<'_>>()
+                .map(|method| method.method());
+            if method.is_none_or(|method| !tenant_safe_method(method)) {
+                return Err(Status::permission_denied(
+                    "RPC is not available for tenant-scoped credentials",
+                ));
+            }
+        }
+        if let Some(tenant_id) = tenant_id {
+            req.metadata_mut().insert(
+                TENANT_CONTEXT_HEADER,
+                MetadataValue::from_str(&tenant_id)
+                    .map_err(|_| Status::unauthenticated("invalid tenant principal"))?,
+            );
+        }
         Ok(req)
     }
+}
+
+fn tenant_safe_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GetNamespaceOwnership"
+            | "CreateObject"
+            | "GetObject"
+            | "UpdateObject"
+            | "DeleteObject"
+            | "ListObjects"
+            | "FindByExternalId"
+            | "FindByProperty"
+            | "ResolveObjectSet"
+            | "CreateLink"
+            | "DeleteLink"
+            | "GetLinks"
+            | "GetLinkedObjects"
+            | "Traverse"
+            | "ExecuteAction"
+            | "ListObjectChanges"
+    )
+}
+
+fn is_tenant_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.starts_with("tenant_")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+pub(super) fn tenant_id_from_principal(principal: &str) -> Option<String> {
+    principal
+        .split_once('.')
+        .map(|(tenant_id, _)| tenant_id.to_string())
+        .filter(|tenant_id| is_tenant_id(tenant_id))
 }
 
 #[derive(Clone)]
@@ -178,6 +247,7 @@ impl tonic::service::Interceptor for LocalOrTokenAuthInterceptor {
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
+        while req.metadata_mut().remove(TENANT_CONTEXT_HEADER).is_some() {}
         req.metadata_mut()
             .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("local"));
         if self.overwrite_principal {
@@ -639,6 +709,13 @@ mod tests {
         request
             .metadata_mut()
             .insert("x-principal", MetadataValue::from_static("attacker"));
+        request.metadata_mut().insert(
+            TENANT_CONTEXT_HEADER,
+            MetadataValue::from_static("tenant_forged"),
+        );
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
         let request = interceptor.call(request).unwrap();
 
         assert_eq!(
@@ -650,6 +727,7 @@ mod tests {
                 .unwrap(),
             "agent-a"
         );
+        assert!(request.metadata().get(TENANT_CONTEXT_HEADER).is_none());
 
         db.revoke_principal_credential("agent-a").unwrap();
 
@@ -662,6 +740,59 @@ mod tests {
             .metadata_mut()
             .insert("x-principal", MetadataValue::from_static("attacker"));
         assert!(interceptor.call(revoked_request).is_err());
+    }
+
+    #[test]
+    fn tenant_scoped_credentials_fail_closed_on_uncovered_rpcs() {
+        let db = in_memory_db();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("tenant-client-token");
+        db.create_principal_credential("tenant_alpha.agent-a", &token, 1)
+            .unwrap();
+        store.load(&db.list_active_credentials().unwrap());
+        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer tenant-client-token"),
+        );
+        request.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "ExecuteFunction",
+        ));
+        assert_eq!(
+            interceptor.call(request).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn token_auth_interceptor_derives_tenant_from_authenticated_principal() {
+        let db = in_memory_db();
+        let store = PrincipalCredentialStore::new();
+        let token = hash_gateway_key("tenant-client-token");
+        db.create_principal_credential("tenant_alpha.agent-a", &token, 1)
+            .unwrap();
+        store.load(&db.list_active_credentials().unwrap());
+        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
+
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer tenant-client-token"),
+        );
+        request.metadata_mut().insert(
+            TENANT_CONTEXT_HEADER,
+            MetadataValue::from_static("tenant_forged"),
+        );
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
+        let request = interceptor.call(request).unwrap();
+        assert_eq!(
+            request.metadata().get(TENANT_CONTEXT_HEADER).unwrap(),
+            "tenant_alpha"
+        );
     }
 
     #[test]
