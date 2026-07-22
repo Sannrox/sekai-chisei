@@ -33,6 +33,7 @@ pub mod provider_resolution;
 pub mod receipt_cli;
 pub mod replay_cli;
 pub mod report_cli;
+pub mod runtime_backend;
 pub mod secrets;
 pub mod sekai;
 pub mod shomei;
