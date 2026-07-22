@@ -60,27 +60,31 @@ impl TokenAuthInterceptor {
         }
     }
 
-    fn resolve_principal(&self, token: &str) -> Option<String> {
-        let cache_trustworthy = self.store.maybe_reload(&self.db);
+    fn resolve_credential(&self, token: &str) -> Option<PrincipalCredential> {
+        self.store.maybe_reload(&self.db);
         let token_hash = hash_gateway_key(token);
-        let cached_principal = self.store.resolve(token);
 
         if let Some(principal) = self.legacy_root_token.as_ref()
             && token.as_bytes().ct_eq(principal.as_bytes()).into()
         {
-            return Some("root".to_string());
+            return Some(PrincipalCredential {
+                id: "legacy-root".into(),
+                principal: "root".into(),
+                token_hash,
+                status: "active".into(),
+                created: 0,
+                rotated_at: 0,
+                revoked_at: 0,
+                tenant_id: String::new(),
+            });
         }
 
-        if let Some(cached_principal) = cached_principal
-            && cache_trustworthy
-        {
-            return Some(cached_principal);
-        }
-
+        // Recheck durable state for every authentication. The cache accelerates
+        // startup discovery but never extends a rotated or revoked credential.
         match self.db.get_principal_credential(&token_hash) {
             Ok(Some(credential)) => {
                 self.store.load_credential(&credential);
-                Some(credential.principal)
+                Some(credential)
             }
             Ok(None) => None,
             Err(_) => None,
@@ -128,10 +132,11 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             return Err(Status::unauthenticated("missing authorization"));
         };
 
-        let principal = self.resolve_principal(&token).ok_or_else(|| {
+        let credential = self.resolve_credential(&token).ok_or_else(|| {
             reject_unauthorized();
             Status::unauthenticated("invalid token")
         })?;
+        let principal = credential.principal.clone();
 
         while req.metadata_mut().remove("x-principal").is_some() {}
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
@@ -147,8 +152,10 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("token"));
         let tenant_id = if principal == "root" {
             requested_root_tenant
+        } else if credential.tenant_id.is_empty() {
+            None
         } else {
-            tenant_id_from_principal(&principal)
+            Some(credential.tenant_id)
         };
         if principal != "root" && tenant_id.is_some() {
             let method = req
@@ -200,6 +207,10 @@ fn tenant_safe_method(method: &str) -> bool {
             | "Traverse"
             | "ExecuteAction"
             | "ListObjectChanges"
+            | "CreateCredential"
+            | "RotateCredential"
+            | "RevokeCredential"
+            | "ListCredentials"
     )
 }
 
@@ -756,7 +767,8 @@ mod tests {
         let db = in_memory_db();
         let store = PrincipalCredentialStore::new();
         let token = hash_gateway_key("tenant-client-token");
-        db.create_principal_credential("tenant_alpha.agent-a", &token, 1)
+        let tenant = db.create_tenant("root", "tenant-auth-a", 1).unwrap();
+        db.create_tenant_credential(&tenant.id, "agent-a", &token, "root", true, 2)
             .unwrap();
         store.load(&db.list_active_credentials().unwrap());
         let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
@@ -776,11 +788,12 @@ mod tests {
     }
 
     #[test]
-    fn token_auth_interceptor_derives_tenant_from_authenticated_principal() {
+    fn token_auth_interceptor_derives_tenant_from_credential_and_overwrites_forgery() {
         let db = in_memory_db();
         let store = PrincipalCredentialStore::new();
         let token = hash_gateway_key("tenant-client-token");
-        db.create_principal_credential("tenant_alpha.agent-a", &token, 1)
+        let tenant = db.create_tenant("root", "tenant-auth-b", 1).unwrap();
+        db.create_tenant_credential(&tenant.id, "agent-a", &token, "root", true, 2)
             .unwrap();
         store.load(&db.list_active_credentials().unwrap());
         let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
@@ -799,8 +812,13 @@ mod tests {
             .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
         let request = interceptor.call(request).unwrap();
         assert_eq!(
-            request.metadata().get(TENANT_CONTEXT_HEADER).unwrap(),
-            "tenant_alpha"
+            request
+                .metadata()
+                .get(TENANT_CONTEXT_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            tenant.id.as_str()
         );
     }
 

@@ -21,6 +21,7 @@ const PORTFOLIO_PROMPT_VARIANT_SCHEMA: &str =
 const TENANT_SCHEMA: &str = include_str!("postgres/0005_tenants.sql");
 const NAMESPACE_OWNERSHIP_SCHEMA: &str = include_str!("postgres/0006_namespace_ownership.sql");
 const TENANT_MEMBERSHIP_SCHEMA: &str = include_str!("postgres/0007_tenant_memberships.sql");
+const TENANT_CREDENTIAL_SCHEMA: &str = include_str!("postgres/0008_tenant_credentials.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -111,7 +112,7 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         connection
             .query_opt(
-                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id
                  FROM sekai_principal_credentials
                  WHERE token_hash = $1 AND status = 'active'
                  ORDER BY created DESC LIMIT 1",
@@ -149,7 +150,7 @@ impl PostgresDb {
                 "INSERT INTO sekai_principal_credentials
                     (id, principal, token_hash, status, created, rotated_at, revoked_at)
                  VALUES ($1, $2, $3, 'active', $4, $4, 0)
-                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id",
                 &[&id, &principal, &token_hash, &now],
             )
             .map_err(|error| format!("create principal credential: {error}"))?;
@@ -177,7 +178,7 @@ impl PostgresDb {
             .execute(
                 "UPDATE sekai_principal_credentials
                  SET status = 'revoked', revoked_at = $2
-                 WHERE principal = $1 AND status = 'active'",
+                 WHERE principal = $1 AND tenant_id = '' AND status = 'active'",
                 &[&principal, &now],
             )
             .map_err(|error| error.to_string())?;
@@ -186,7 +187,7 @@ impl PostgresDb {
                 "INSERT INTO sekai_principal_credentials
                     (id, principal, token_hash, status, created, rotated_at, revoked_at)
                  VALUES ($1, $2, $3, 'active', $4, $4, 0)
-                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id",
                 &[&id, &principal, &token_hash, &now],
             )
             .map_err(|error| error.to_string())?;
@@ -207,10 +208,10 @@ impl PostgresDb {
                  SET status = 'revoked', revoked_at = $2
                  WHERE id = (
                     SELECT id FROM sekai_principal_credentials
-                    WHERE principal = $1 AND status = 'active'
+                    WHERE principal = $1 AND tenant_id = '' AND status = 'active'
                     ORDER BY created DESC LIMIT 1 FOR UPDATE
                  )
-                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at",
+                 RETURNING id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id",
                 &[&principal, &now],
             )
             .map_err(|error| error.to_string())?;
@@ -225,7 +226,7 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         connection
             .query(
-                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id
                  FROM sekai_principal_credentials
                  WHERE ($1::text IS NULL OR principal = $1)
                    AND ($2::text IS NULL OR status = $2)
@@ -389,6 +390,22 @@ impl PostgresDb {
                 )
                 .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
         }
+        let tenant_credentials_applied = transaction
+            .query_opt(
+                "SELECT 1 FROM sekai_schema_migrations WHERE version = $1",
+                &[&8_i64],
+            )
+            .map_err(|error| format!("check PostgreSQL tenant credential migration: {error}"))?
+            .is_some();
+        if !tenant_credentials_applied {
+            transaction
+                .batch_execute(TENANT_CREDENTIAL_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL tenant credentials: {error}"))?;
+            transaction.execute(
+                "INSERT INTO sekai_schema_migrations (version,name,applied_at) VALUES ($1,$2,$3)",
+                &[&8_i64, &"tenant_credentials", &chrono::Utc::now().timestamp_millis()],
+            ).map_err(|error| format!("record PostgreSQL tenant credential migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -404,6 +421,7 @@ fn row_to_principal_credential(row: postgres::Row) -> PrincipalCredential {
         created: row.get(4),
         rotated_at: row.get(5),
         revoked_at: row.get(6),
+        tenant_id: row.get(7),
     }
 }
 

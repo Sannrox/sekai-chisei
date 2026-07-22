@@ -4929,7 +4929,7 @@ mod tests {
         .unwrap();
         let store = crate::sekai::credentials::PrincipalCredentialStore::new();
         assert!(store.maybe_reload(&db));
-        assert_eq!(store.resolve("secret").as_deref(), Some("alice"));
+        assert_eq!(store.resolve("secret").unwrap().principal, "alice");
         db.record_decision(&Decision {
             id: "typed-user".into(),
             timestamp: 1,
