@@ -8861,6 +8861,13 @@ impl SekaiService for SekaiServiceImpl {
         } else {
             Some(inner.action.clone())
         };
+        let target_filter = if inner.target_id.is_empty() {
+            None
+        } else {
+            check_object_namespace_access(&self.db, &principals, &inner.target_id, false)?;
+            check_read(&self.security, &inner.target_id, &principals)?;
+            Some(inner.target_id.clone())
+        };
         let mut decisions = Vec::new();
         let mut offset = 0;
         let mut scanned = 0usize;
@@ -8871,7 +8878,7 @@ impl SekaiService for SekaiServiceImpl {
                 .list_decisions(&audit::DecisionFilter {
                     actor: actor_filter.clone(),
                     action: action_filter.clone(),
-                    target_id: None,
+                    target_id: target_filter.clone(),
                     after: inner.after,
                     limit: batch_size as i32,
                     offset,
@@ -14966,6 +14973,7 @@ mod tests {
                 action: "".into(),
                 after: 0,
                 limit: 10,
+                target_id: String::new(),
             }))
             .await
             .unwrap()
