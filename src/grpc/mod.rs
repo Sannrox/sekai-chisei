@@ -40,6 +40,9 @@ use tonic_health::server::HealthReporter;
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 const CREDENTIAL_ID_HEADER: &str = "x-sekai-credential-id";
 const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
+/// Caller metadata that the community authentication boundary accepts as
+/// authority-bearing. Tenant hints are stripped and therefore absent here.
+pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization", "x-principal"];
 
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
