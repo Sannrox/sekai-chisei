@@ -1355,17 +1355,6 @@ service SekaiService {
   rpc RotateCredential(RotateCredentialRequest) returns (RotateCredentialResponse);
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
-  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
-  rpc GetTenant(GetTenantRequest) returns (GetTenantResponse);
-  rpc SuspendTenant(SuspendTenantRequest) returns (SuspendTenantResponse);
-  rpc ReactivateTenant(ReactivateTenantRequest) returns (ReactivateTenantResponse);
-  rpc RequestTenantClosure(RequestTenantClosureRequest) returns (RequestTenantClosureResponse);
-  rpc CreateTenantNamespace(CreateTenantNamespaceRequest) returns (CreateTenantNamespaceResponse);
-  rpc GetNamespaceOwnership(GetNamespaceOwnershipRequest) returns (GetNamespaceOwnershipResponse);
-  rpc CreateTenantMembership(CreateTenantMembershipRequest) returns (CreateTenantMembershipResponse);
-  rpc ChangeTenantMembershipRole(ChangeTenantMembershipRoleRequest) returns (ChangeTenantMembershipRoleResponse);
-  rpc ListTenantMemberships(ListTenantMembershipsRequest) returns (ListTenantMembershipsResponse);
-  rpc RevokeTenantMembership(RevokeTenantMembershipRequest) returns (RevokeTenantMembershipResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
   rpc RegisterEvidenceProducer(RegisterEvidenceProducerRequest) returns (RegisterEvidenceProducerResponse);
   rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);

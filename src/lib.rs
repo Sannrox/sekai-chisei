@@ -8,6 +8,7 @@ pub mod cost_estimate;
 pub mod credential_cli;
 pub mod db;
 pub mod domain;
+pub mod enterprise;
 pub mod gateway;
 pub mod gateway_keys;
 pub mod gateway_report;
