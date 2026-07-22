@@ -18,6 +18,7 @@ const SAMPLE_LEASE_SCHEMA: &str = include_str!("postgres/0002_sample_leases.sql"
 const UNIQUE_GRANT_SCHEMA: &str = include_str!("postgres/0003_unique_grants.sql");
 const PORTFOLIO_PROMPT_VARIANT_SCHEMA: &str =
     include_str!("postgres/0004_portfolio_prompt_variants.sql");
+const TENANT_SCHEMA: &str = include_str!("postgres/0005_tenants.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -332,6 +333,24 @@ impl PostgresDb {
                 )
                 .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
         }
+        let tenants_applied = transaction
+            .query_opt(
+                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
+                &[&5_i64],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
+            .is_some();
+        if !tenants_applied {
+            transaction
+                .batch_execute(TENANT_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL tenant schema: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                    &[&5_i64, &"tenants", &chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -411,6 +430,8 @@ mod tests {
         assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
         assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));
+        assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenants"));
+        assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenant_requests"));
         assert!(
             PORTFOLIO_PROMPT_VARIANT_SCHEMA
                 .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")
