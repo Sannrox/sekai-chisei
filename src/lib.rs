@@ -18,6 +18,7 @@ pub mod harness;
 pub mod launch;
 pub mod llm;
 pub mod memory_cli;
+pub mod models_cli;
 pub mod obs;
 pub mod onboarding;
 pub mod ontology_inspect;
