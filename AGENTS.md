@@ -16,6 +16,12 @@ Use `.env.example` as the configuration reference. Important variables include `
 
 GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
 
+## Ontology Policy
+
+For work involving portable ontology definitions, classes, relations, provenance, validation, import, export, or structural queries, always use the project-local `sekai-ontology` Skill in `.agents/skills/sekai-ontology/`.
+
+Select the ontology database explicitly with `--db <path>` or `SEKAI_DB`, then run `sekai --db <path> --json validate` before relying on its contents. Treat successful ontology output as structured repository evidence, preserve its provenance in answers, and state when validation fails or the requested fact is absent rather than inferring it. Do not use the control-plane database at `data/sekai.db` as a portable ontology database.
+
 ## Coding Style & Naming Conventions
 
 Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `src/llm/` abstractions. Prefer explicit policy, audit, and authorization behavior over hidden side effects.

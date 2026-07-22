@@ -7,6 +7,7 @@
 !.agents/skills/capture-project-decision/
 !.agents/skills/deliver-ready-issue/
 !.agents/skills/prepare-release/
+!.agents/skills/sekai-ontology/
 !.agents/skills/shape-work-item/
 !.agents/skills/verify-change/
 .claude/
@@ -16,6 +17,7 @@ data/*.sqlite
 data/*.sqlite-*
 data/chisei-gateway-audit.jsonl*
 data/provider-registry-state.json*
+/provider-registry-state.json*
 data/chisei-gateway-budget-reconciliation.json*
 .env
 .env.*
