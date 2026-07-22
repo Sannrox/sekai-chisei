@@ -128,3 +128,29 @@ for the compatible gateway. It is distinct from this namespace-scoped native
 ontology catalog. Provider-owned tools are not projected into the native
 catalog unless a future contract can prove both an effective provider profile
 and explicit policy permission.
+
+## Capability packages
+
+The `sekai.capability-package/v1` manifest groups declarative schema, relation,
+action, policy-default, evaluation-suite, retrieval-rule, and adapter
+declarations into one immutable package version. Package content is data only
+and uses closed, kind-specific schemas with no free-form payload, executable,
+credential-value, or authority-grant fields. Identifier validation also rejects
+common credential shapes before storage. Installation cannot widen authority;
+normal namespace, action-policy, approval, retention, and audit boundaries
+still apply when packaged declarations are consumed.
+
+Lifecycle RPCs require namespace write access and action-admin authority. The
+server derives the actor from authenticated metadata and records install,
+evaluate, upgrade, rollback, disable, and uninstall events atomically with
+lifecycle state. Request IDs are actor- and namespace-scoped and bound to
+canonical input, so an ambiguous retry cannot apply different content.
+
+Uninstall removes only the active installation. Immutable manifests and the
+append-only event stream remain as evidence. Package state is namespace-scoped,
+so neither installation nor removal mutates another namespace. The manually
+authored versions under `examples/capability-packages/` are the single proving
+package; they are not a registry or distribution mechanism.
+
+This contract is SQLite-only. It does not claim PostgreSQL parity, automatic
+authoring, remote distribution, or executable plugin installation.

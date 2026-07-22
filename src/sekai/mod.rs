@@ -4,6 +4,7 @@ pub mod action_policy;
 pub mod attestation;
 pub mod audit;
 pub mod capability;
+pub mod capability_package;
 pub mod capacity;
 pub mod compute;
 pub mod coordination;
