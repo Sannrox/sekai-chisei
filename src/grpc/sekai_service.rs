@@ -22,6 +22,7 @@ use crate::sekai::action_approval;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::attestation;
 use crate::sekai::capability;
+use crate::sekai::capability_package as package_domain;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::{
@@ -3839,6 +3840,101 @@ fn to_proto_lease(lease: &crate::sekai::lease::Lease) -> Lease {
     }
 }
 
+fn from_proto_package_manifest(
+    manifest: CapabilityPackageManifest,
+) -> Result<package_domain::CapabilityPackageManifest, Status> {
+    let components = manifest
+        .components
+        .into_iter()
+        .map(|component| {
+            let definition = serde_json::from_str(&component.definition_json)
+                .map_err(|_| Status::invalid_argument("component definition_json must be JSON"))?;
+            Ok(package_domain::PackageComponent {
+                kind: component.kind,
+                name: component.name,
+                definition,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    let manifest = package_domain::CapabilityPackageManifest {
+        manifest_version: manifest.manifest_version,
+        name: manifest.name,
+        version: manifest.version,
+        components,
+    };
+    manifest.validate().map_err(Status::invalid_argument)?;
+    Ok(manifest)
+}
+
+fn to_proto_package_manifest(
+    manifest: &package_domain::CapabilityPackageManifest,
+) -> CapabilityPackageManifest {
+    CapabilityPackageManifest {
+        manifest_version: manifest.manifest_version.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        components: manifest
+            .components
+            .iter()
+            .map(|component| CapabilityPackageComponent {
+                kind: component.kind.clone(),
+                name: component.name.clone(),
+                definition_json: serde_json::to_string(&component.definition)
+                    .expect("JSON values always serialize"),
+            })
+            .collect(),
+    }
+}
+
+fn to_proto_package_installation(
+    installation: &package_domain::PackageInstallation,
+) -> CapabilityPackageInstallation {
+    CapabilityPackageInstallation {
+        namespace: installation.namespace.clone(),
+        package_name: installation.package_name.clone(),
+        current_version: installation.current_version.clone(),
+        previous_version: installation.previous_version.clone(),
+        state: installation.state.clone(),
+        installed_by: installation.installed_by.clone(),
+        updated_by: installation.updated_by.clone(),
+        installed_at_ms: installation.installed_at_ms,
+        updated_at_ms: installation.updated_at_ms,
+    }
+}
+
+fn to_proto_package_event(event: &package_domain::PackageLifecycleEvent) -> CapabilityPackageEvent {
+    CapabilityPackageEvent {
+        sequence: event.sequence,
+        namespace: event.namespace.clone(),
+        package_name: event.package_name.clone(),
+        package_version: event.package_version.clone(),
+        action: event.action.clone(),
+        actor: event.actor.clone(),
+        request_id: event.request_id.clone(),
+        manifest_digest: event.manifest_digest.clone(),
+        evidence: event.evidence.clone(),
+        recorded_at_ms: event.recorded_at_ms,
+    }
+}
+
+fn authorize_package_mutation(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> Result<String, Status> {
+    require_authenticated(principals)?;
+    check_team_namespace(&service.db, principals, namespace, true)?;
+    check_action_admin(
+        &service.security,
+        &format!("capability_package:{namespace}"),
+        principals,
+    )?;
+    principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
     async fn acquire_lease(
@@ -5412,6 +5508,181 @@ impl SekaiService for SekaiServiceImpl {
             total_size: entries.len().min(u32::MAX as usize) as u32,
             cache_scope: "authorization_context".into(),
         }))
+    }
+
+    async fn install_capability_package(
+        &self,
+        req: Request<InstallCapabilityPackageRequest>,
+    ) -> Result<Response<InstallCapabilityPackageResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let manifest = from_proto_package_manifest(
+            inner
+                .manifest
+                .ok_or_else(|| Status::invalid_argument("manifest required"))?,
+        )?;
+        let installation = self
+            .db
+            .install_capability_package(
+                &inner.namespace,
+                &manifest,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(InstallCapabilityPackageResponse {
+            installation: Some(to_proto_package_installation(&installation)),
+        }))
+    }
+
+    async fn get_capability_package(
+        &self,
+        req: Request<GetCapabilityPackageRequest>,
+    ) -> Result<Response<GetCapabilityPackageResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        check_action_admin(
+            &self.security,
+            &format!("capability_package:{}", inner.namespace),
+            &principals,
+        )?;
+        let installation = self
+            .db
+            .get_capability_package(&inner.namespace, &inner.package_name)
+            .map_err(Status::internal)?;
+        let events = self
+            .db
+            .list_capability_package_events(&inner.namespace, &inner.package_name)
+            .map_err(Status::internal)?;
+        let version = installation
+            .as_ref()
+            .map(|installation| installation.current_version.as_str())
+            .or_else(|| events.last().map(|event| event.package_version.as_str()))
+            .ok_or_else(|| Status::not_found("capability package not found"))?;
+        let manifest = self
+            .db
+            .get_capability_package_manifest(&inner.namespace, &inner.package_name, version)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("capability package manifest missing"))?;
+        Ok(Response::new(GetCapabilityPackageResponse {
+            installation: installation.as_ref().map(to_proto_package_installation),
+            manifest: Some(to_proto_package_manifest(&manifest)),
+            events: events.iter().map(to_proto_package_event).collect(),
+        }))
+    }
+
+    async fn evaluate_capability_package(
+        &self,
+        req: Request<CapabilityPackageTransitionRequest>,
+    ) -> Result<Response<EvaluateCapabilityPackageResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let passed = self
+            .db
+            .evaluate_capability_package(
+                &inner.namespace,
+                &inner.package_name,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(EvaluateCapabilityPackageResponse { passed }))
+    }
+
+    async fn upgrade_capability_package(
+        &self,
+        req: Request<UpgradeCapabilityPackageRequest>,
+    ) -> Result<Response<UpgradeCapabilityPackageResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let manifest = from_proto_package_manifest(
+            inner
+                .manifest
+                .ok_or_else(|| Status::invalid_argument("manifest required"))?,
+        )?;
+        let installation = self
+            .db
+            .upgrade_capability_package(
+                &inner.namespace,
+                &manifest,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(UpgradeCapabilityPackageResponse {
+            installation: Some(to_proto_package_installation(&installation)),
+        }))
+    }
+
+    async fn rollback_capability_package(
+        &self,
+        req: Request<CapabilityPackageTransitionRequest>,
+    ) -> Result<Response<CapabilityPackageTransitionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let installation = self
+            .db
+            .rollback_capability_package(
+                &inner.namespace,
+                &inner.package_name,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(CapabilityPackageTransitionResponse {
+            installation: Some(to_proto_package_installation(&installation)),
+        }))
+    }
+
+    async fn disable_capability_package(
+        &self,
+        req: Request<CapabilityPackageTransitionRequest>,
+    ) -> Result<Response<CapabilityPackageTransitionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let installation = self
+            .db
+            .disable_capability_package(
+                &inner.namespace,
+                &inner.package_name,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(CapabilityPackageTransitionResponse {
+            installation: Some(to_proto_package_installation(&installation)),
+        }))
+    }
+
+    async fn uninstall_capability_package(
+        &self,
+        req: Request<CapabilityPackageTransitionRequest>,
+    ) -> Result<Response<UninstallCapabilityPackageResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        self.db
+            .uninstall_capability_package(
+                &inner.namespace,
+                &inner.package_name,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(UninstallCapabilityPackageResponse {}))
     }
 
     async fn list_schema_types(
