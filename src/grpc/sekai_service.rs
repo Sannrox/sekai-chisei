@@ -13637,6 +13637,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Visible"]
         );
+
+        let now = chrono::Utc::now();
+        let artifact = crate::ontology_inspect::render_html(
+            &crate::ontology_inspect::InspectionSnapshot::new(
+                &crate::ontology_inspect::InspectConfig {
+                    root: "visible-root".into(),
+                    authorization_context: "tester-visible-scope".into(),
+                    output: "unused.html".into(),
+                    ttl_seconds: 60,
+                    target: "authenticated-test-service".into(),
+                },
+                now,
+                listed.classes,
+                vec![],
+                vec![],
+                "test-revision".into(),
+                "authorized-test-revision".into(),
+            ),
+        )
+        .unwrap();
+        assert!(artifact.contains("Visible"));
+        assert!(!artifact.contains("Hidden"));
+        assert!(!artifact.contains("denied_objects"));
+        assert!(!artifact.contains("Bearer"));
     }
 
     #[tokio::test]
