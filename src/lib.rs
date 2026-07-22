@@ -27,6 +27,7 @@ pub mod provenance;
 pub mod provider_profile;
 pub mod provider_resolution;
 pub mod receipt_cli;
+pub mod replay_cli;
 pub mod report_cli;
 pub mod secrets;
 pub mod sekai;
