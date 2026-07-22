@@ -11105,21 +11105,6 @@ mod tests {
         ))
         .await
         .unwrap();
-        let duplicate = svc
-            .create_link(with_principal(CreateLinkRequest {
-                fail_if_exists: true,
-                link: Some(Link {
-                    id: "cluster-component".into(),
-                    from_id: "cluster-1".into(),
-                    to_id: "component-1".into(),
-                    relation: "contains".into(),
-                    created: 0,
-                }),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
-
         let got = svc
             .get_object(with_principal(GetObjectRequest {
                 id: "widget-secret".into(),
@@ -12807,6 +12792,20 @@ mod tests {
         }))
         .await
         .unwrap();
+        let duplicate = svc
+            .create_link(with_principal(CreateLinkRequest {
+                fail_if_exists: true,
+                link: Some(Link {
+                    id: "cluster-component".into(),
+                    from_id: "cluster-1".into(),
+                    to_id: "component-1".into(),
+                    relation: "contains".into(),
+                    created: 0,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
 
         let got = svc
             .get_object(with_principal(GetObjectRequest {
