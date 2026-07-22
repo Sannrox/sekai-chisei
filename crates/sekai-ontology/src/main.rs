@@ -397,11 +397,16 @@ fn replace_claimed_skill(target: &Path) -> Result<(), Error> {
     }
     if let Err(error) = fs::hard_link(&staged, target) {
         let _ = fs::remove_file(&staged);
-        return Err(Error::Input(format!(
-            "cannot install '{}': {error}; original preserved at '{}'",
-            target.display(),
-            claimed.display()
-        )));
+        return match restore_claim(target, &claimed) {
+            Ok(()) => Err(Error::Input(format!(
+                "cannot install '{}': {error}; original restored",
+                target.display()
+            ))),
+            Err(restore_error) => Err(Error::Input(format!(
+                "cannot install '{}': {error}; {restore_error}",
+                target.display()
+            ))),
+        };
     }
     fs::remove_file(&staged).map_err(|error| {
         Error::Input(format!(
@@ -470,20 +475,27 @@ fn restore_claim(target: &Path, claimed: &Path) -> Result<(), Error> {
         }
         return Ok(());
     }
-    fs::hard_link(claimed, target).map_err(|error| {
-        Error::Input(format!(
+    let placeholder = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|error| {
+            Error::Input(format!(
+                "cannot reserve '{}' for restoration: {error}; original preserved at '{}'",
+                target.display(),
+                claimed.display()
+            ))
+        })?;
+    drop(placeholder);
+    if let Err(error) = fs::rename(claimed, target) {
+        let _ = fs::remove_file(target);
+        return Err(Error::Input(format!(
             "cannot restore '{}': {error}; original preserved at '{}'",
             target.display(),
             claimed.display()
-        ))
-    })?;
-    fs::remove_file(claimed).map_err(|error| {
-        Error::Input(format!(
-            "restored '{}' but cannot remove recovery file '{}': {error}",
-            target.display(),
-            claimed.display()
-        ))
-    })
+        )));
+    }
+    Ok(())
 }
 
 fn create_skill_temp(parent: &Path) -> Result<(PathBuf, File), Error> {
