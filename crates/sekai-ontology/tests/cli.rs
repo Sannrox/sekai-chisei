@@ -157,13 +157,202 @@ fn export_handles_empty_and_invalid_databases_without_partial_output() {
 fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
     let help = String::from_utf8(help.stdout).unwrap();
-    for command in ["export", "explain", "query", "validate", "import"] {
+    for command in [
+        "export", "explain", "query", "validate", "import", "entity", "relation",
+    ] {
         assert!(help.contains(command), "help is missing {command}");
         assert!(
             EMBEDDED_SKILL.contains(command),
             "skill is missing {command}"
         );
     }
+}
+
+#[test]
+fn entity_and_relation_reads_have_stable_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("knowledge.db");
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    let database = database.to_str().unwrap();
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "import", fixture])
+            .status
+            .success()
+    );
+
+    let entities = sekai(&["--db", database, "--json", "entity", "list"]);
+    let entities: Value = serde_json::from_slice(&entities.stdout).unwrap();
+    assert_eq!(entities["command"], "entity.list");
+    assert_eq!(entities["data"][0]["name"], "Api");
+
+    let entity = sekai(&["--db", database, "--json", "entity", "show", "Api"]);
+    let entity: Value = serde_json::from_slice(&entity.stdout).unwrap();
+    assert_eq!(entity["command"], "entity.show");
+    assert_eq!(entity["data"]["class"]["name"], "Api");
+
+    let relations = sekai(&["--db", database, "--json", "relation", "list"]);
+    let relations: Value = serde_json::from_slice(&relations.stdout).unwrap();
+    assert_eq!(relations["command"], "relation.list");
+    assert_eq!(relations["data"][0]["name"], "depends_on");
+}
+
+#[test]
+fn skill_install_is_idempotent_and_protects_user_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("nested/skill");
+    let target_arg = target.to_str().unwrap();
+
+    let path = sekai(&["skill", "path", "--path", target_arg]);
+    assert!(path.status.success());
+    assert_eq!(String::from_utf8(path.stdout).unwrap().trim(), target_arg);
+    assert_eq!(
+        sekai(&["skill", "path", "--path", target_arg, "--uninstall"])
+            .status
+            .code(),
+        Some(2)
+    );
+
+    let installed = sekai(&["skill", "install", "--path", target_arg]);
+    assert!(installed.status.success());
+    let skill_file = target.join("SKILL.md");
+    assert_eq!(fs::read_to_string(&skill_file).unwrap(), EMBEDDED_SKILL);
+    assert_eq!(
+        sekai(&["skill", "install", "--path", target_arg])
+            .status
+            .code(),
+        Some(10)
+    );
+
+    fs::write(&skill_file, format!("{EMBEDDED_SKILL}\n# user changes\n")).unwrap();
+    assert_eq!(
+        sekai(&["skill", "install", "--path", target_arg])
+            .status
+            .code(),
+        Some(11)
+    );
+    assert!(
+        fs::read_to_string(&skill_file)
+            .unwrap()
+            .contains("# user changes")
+    );
+    assert!(
+        sekai(&["skill", "install", "--path", target_arg, "--force"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        sekai(&["skill", "install", "--path", target_arg, "--uninstall"])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert!(!skill_file.exists());
+
+    fs::write(&skill_file, "unrelated file\n").unwrap();
+    assert_eq!(
+        sekai(&["skill", "install", "--path", target_arg, "--force"])
+            .status
+            .code(),
+        Some(11)
+    );
+    assert_eq!(fs::read_to_string(&skill_file).unwrap(), "unrelated file\n");
+    assert_eq!(
+        sekai(&[
+            "skill",
+            "install",
+            "--path",
+            target_arg,
+            "--force",
+            "--uninstall",
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    assert_eq!(fs::read_to_string(&skill_file).unwrap(), "unrelated file\n");
+}
+
+#[test]
+fn malformed_entity_command_fails_before_database_access() {
+    let output = sekai(&[
+        "--db",
+        "/definitely/missing/knowledge.db",
+        "entity",
+        "bogus",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_install_refuses_symlink_targets() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("skill");
+    fs::create_dir(&target).unwrap();
+    let referent = directory.path().join("outside.md");
+    fs::write(&referent, "outside\n").unwrap();
+    symlink(&referent, target.join("SKILL.md")).unwrap();
+
+    assert_eq!(
+        sekai(&[
+            "skill",
+            "install",
+            "--path",
+            target.to_str().unwrap(),
+            "--force",
+        ])
+        .status
+        .code(),
+        Some(11)
+    );
+    assert_eq!(fs::read_to_string(referent).unwrap(), "outside\n");
+}
+
+#[test]
+fn installed_skill_and_json_query_complete_agent_scenario() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("knowledge.db");
+    let skill_directory = directory.path().join("agent-skill");
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(
+        sekai(&[
+            "skill",
+            "install",
+            "--path",
+            skill_directory.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    assert!(skill_directory.join("SKILL.md").exists());
+    assert!(
+        sekai(&["--db", database.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    assert!(
+        sekai(&["--db", database.to_str().unwrap(), "import", fixture])
+            .status
+            .success()
+    );
+    let answer = sekai(&[
+        "--db",
+        database.to_str().unwrap(),
+        "--json",
+        "query",
+        "Client",
+        "--direction",
+        "outbound",
+        "--depth",
+        "2",
+    ]);
+    let answer: Value = serde_json::from_slice(&answer.stdout).unwrap();
+    assert_eq!(answer["data"]["classes"][0]["name"], "Api");
+    assert_eq!(answer["data"]["classes"][1]["name"], "Database");
 }
 
 #[test]

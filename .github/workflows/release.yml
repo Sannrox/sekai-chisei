@@ -9,6 +9,85 @@ permissions:
   packages: write
 
 jobs:
+  sekai-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  sekai-binaries:
+    name: sekai (${{ matrix.target }})
+    needs: sekai-release
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            build_tool: cross
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: sekai
+          package: sekai-ontology
+          target: ${{ matrix.target }}
+          archive: sekai-${{ github.ref_name }}-${{ matrix.target }}
+          checksum: sha256
+          locked: true
+          build-tool: ${{ matrix.build_tool || 'cargo' }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: sekai-binaries
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download release checksums
+        run: gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --pattern '*.sha256' --dir checksums
+      - name: Generate formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          checksum() { awk '{print $1}' "checksums/sekai-${GITHUB_REF_NAME}-$1.tar.gz.sha256"; }
+          mkdir -p formula
+          sed \
+            -e "s|@VERSION@|${version}|g" \
+            -e "s|@BASE@|${base}|g" \
+            -e "s|@TAG@|${GITHUB_REF_NAME}|g" \
+            -e "s|@MAC_ARM_SHA@|$(checksum aarch64-apple-darwin)|g" \
+            -e "s|@MAC_INTEL_SHA@|$(checksum x86_64-apple-darwin)|g" \
+            -e "s|@LINUX_ARM_SHA@|$(checksum aarch64-unknown-linux-gnu)|g" \
+            -e "s|@LINUX_INTEL_SHA@|$(checksum x86_64-unknown-linux-gnu)|g" \
+            .github/sekai.rb.template > formula/sekai.rb
+      - name: Update formula in Sannrox/homebrew-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          encoded="$(base64 -w0 formula/sekai.rb)"
+          current_sha="$(gh api repos/Sannrox/homebrew-tap/contents/Formula/sekai.rb --jq .sha 2>/dev/null || true)"
+          args=(-f message="chore: update sekai to ${GITHUB_REF_NAME}" -f content="$encoded")
+          if [[ -n "$current_sha" ]]; then args+=(-f sha="$current_sha"); fi
+          gh api --method PUT repos/Sannrox/homebrew-tap/contents/Formula/sekai.rb "${args[@]}"
+
   image:
     runs-on: ubuntu-latest
     steps:

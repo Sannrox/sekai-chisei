@@ -39,6 +39,17 @@ jobs:
             fi
           done
 
+      - name: Measure standalone ontology cold start
+        shell: bash
+        run: |
+          set -euo pipefail
+          start_ns="$(date +%s%N)"
+          for _ in {1..20}; do target/debug/sekai --help >/dev/null; done
+          elapsed_ns="$(( $(date +%s%N) - start_ns ))"
+          average_ms="$(( elapsed_ns / 20000000 ))"
+          echo "sekai average cold-start subprocess time: ${average_ms} ms"
+          test "$average_ms" -lt 250
+
       - name: Test
         run: cargo test --locked
 
