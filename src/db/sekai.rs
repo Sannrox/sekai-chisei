@@ -3,6 +3,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ use crate::domain::{
 
 pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
+    enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,13 @@ pub struct PrincipalCredential {
 
 impl SekaiDb {
     pub fn new(path: &str) -> Result<Self, String> {
+        Self::new_with_enterprise_extension(path, None)
+    }
+
+    pub fn new_with_enterprise_extension(
+        path: &str,
+        enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
         let persistent = path != ":memory:";
         let manager = if persistent {
             std::fs::create_dir_all(
@@ -66,6 +75,12 @@ impl SekaiDb {
                     .unwrap_or(std::path::Path::new(".")),
             )
             .ok();
+            if std::path::Path::new(path).exists() {
+                let conn =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .map_err(|error| error.to_string())?;
+                Self::reject_legacy_tenant_state(&conn)?;
+            }
             let conn = Connection::open(path).map_err(|e| e.to_string())?;
             conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(|e| e.to_string())?;
@@ -83,7 +98,10 @@ impl SekaiDb {
             .connection_customizer(Box::new(SqliteConnectionSetup))
             .build(manager)
             .map_err(|e| e.to_string())?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            enterprise_extension,
+        };
         db.migrate_all()?;
         Ok(db)
     }
@@ -143,9 +161,6 @@ impl SekaiDb {
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
         self.migrate_ledger()?;
-        self.migrate_tenants()?;
-        self.migrate_tenant_memberships()?;
-        self.migrate_namespace_ownership()?;
         self.migrate_retention()?;
         self.migrate_attestations()?;
         self.migrate_task_observations()?;
@@ -221,32 +236,75 @@ impl SekaiDb {
             CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);",
         )
         .map_err(|e| e.to_string())?;
-        let has_tenant_id = conn
-            .prepare("PRAGMA table_info(sekai_principal_credentials)")
-            .and_then(|mut statement| {
-                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows
-                    .filter_map(Result::ok)
-                    .any(|column| column == "tenant_id"))
-            })
-            .map_err(|error| error.to_string())?;
-        if !has_tenant_id {
-            conn.execute_batch(
-                "ALTER TABLE sekai_principal_credentials ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
-                 CREATE INDEX idx_sekai_principal_credentials_tenant ON sekai_principal_credentials(tenant_id,principal);",
+        Ok(())
+    }
+
+    fn reject_legacy_tenant_state(conn: &Connection) -> Result<(), String> {
+        let tables = [
+            "sekai_tenants",
+            "sekai_tenant_requests",
+            "sekai_tenant_memberships",
+            "sekai_namespace_ownership",
+        ];
+        for table in tables {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if exists {
+                let populated: bool = conn
+                    .query_row(
+                        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if populated {
+                    return Err(legacy_tenant_state_message());
+                }
+            }
+        }
+
+        let credential_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sekai_principal_credentials')",
+                [],
+                |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        } else {
-            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_tenant ON sekai_principal_credentials(tenant_id,principal);")
+        if credential_table {
+            let has_tenant_column = conn
+                .prepare("PRAGMA table_info(sekai_principal_credentials)")
+                .and_then(|mut statement| {
+                    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                    Ok(rows
+                        .filter_map(Result::ok)
+                        .any(|column| column == "tenant_id"))
+                })
                 .map_err(|error| error.to_string())?;
+            if has_tenant_column {
+                let populated: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sekai_principal_credentials WHERE tenant_id<>'' LIMIT 1)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if populated {
+                    return Err(legacy_tenant_state_message());
+                }
+            }
         }
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_active_tenant
-             ON sekai_principal_credentials(tenant_id,principal)
-             WHERE tenant_id<>'' AND status='active';",
-        )
-        .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub(crate) fn enterprise_extension(
+        &self,
+    ) -> Option<&Arc<dyn crate::enterprise::EnterpriseExtension>> {
+        self.enterprise_extension.as_ref()
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -261,7 +319,7 @@ impl SekaiDb {
     ) -> Result<Option<PrincipalCredential>, String> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
+            "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE token_hash = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             params![token_hash],
             row_to_principal_credential,
         )
@@ -361,7 +419,7 @@ impl SekaiDb {
 
         let mut active_stmt = tx
             .prepare(
-                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND tenant_id='' AND status = 'active' ORDER BY created DESC LIMIT 1",
+                "SELECT id FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             )
             .map_err(|e| e.to_string())?;
         let active_id = active_stmt
@@ -419,7 +477,7 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?;
         let revoked = tx
             .execute(
-                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND tenant_id='' AND status='active'",
+                "UPDATE sekai_principal_credentials SET status='revoked', revoked_at=?1 WHERE principal=?2 AND status='active'",
                 params![now, principal],
             )
             .map_err(|e| e.to_string())?;
@@ -452,7 +510,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE principal = ?1 AND tenant_id='' AND status = 'active' ORDER BY created DESC LIMIT 1",
+                "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE principal = ?1 AND status = 'active' ORDER BY created DESC LIMIT 1",
             )
             .map_err(|e| e.to_string())?;
         let credential: Option<PrincipalCredential> = stmt
@@ -481,7 +539,7 @@ impl SekaiDb {
         status: Option<&str>,
     ) -> Result<Vec<PrincipalCredential>, String> {
         let conn = self.conn();
-        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE 1=1".to_string();
+        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at FROM sekai_principal_credentials WHERE 1=1".to_string();
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(principal) = principal {
             sql.push_str(&format!(" AND principal = ?{}", args.len() + 1));
@@ -510,13 +568,10 @@ impl SekaiDb {
         principal: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<PrincipalCredential>, String> {
-        Ok(self
-            .list_credentials(principal, status)?
-            .into_iter()
-            .filter(|credential| credential.tenant_id.is_empty())
-            .collect())
+        self.list_credentials(principal, status)
     }
 
+    #[cfg(any())]
     pub fn list_tenant_credentials(
         &self,
         tenant_id: &str,
@@ -542,6 +597,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(any())]
     pub fn create_tenant_credential(
         &self,
         tenant_id: &str,
@@ -581,6 +637,7 @@ impl SekaiDb {
         })
     }
 
+    #[cfg(any())]
     pub fn rotate_tenant_credential(
         &self,
         tenant_id: &str,
@@ -627,6 +684,7 @@ impl SekaiDb {
         }))
     }
 
+    #[cfg(any())]
     pub fn revoke_tenant_credential(
         &self,
         tenant_id: &str,
@@ -1144,6 +1202,22 @@ impl SekaiDb {
         ).optional().map_err(|e| e.to_string())
     }
 
+    pub fn find_all_by_external_id(&self, external_id: &str) -> Result<Vec<Object>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE external_id = ?1 ORDER BY id",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![external_id], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any())]
     pub fn find_by_external_id_for_tenant(
         &self,
         external_id: &str,
@@ -1685,10 +1759,15 @@ fn row_to_principal_credential(
         created: row.get(4)?,
         rotated_at: row.get(5)?,
         revoked_at: row.get(6)?,
-        tenant_id: row.get(7)?,
+        tenant_id: String::new(),
     })
 }
 
+fn legacy_tenant_state_message() -> String {
+    "legacy SQLite tenant state detected; this community runtime is tenant-free. Back up the database and export/migrate tenant records to the PostgreSQL enterprise distribution before starting this version; no legacy tenant data was changed".into()
+}
+
+#[cfg(any())]
 fn insert_tenant_credential_audit(
     conn: &rusqlite::Connection,
     actor: &str,
@@ -1716,6 +1795,7 @@ fn insert_tenant_credential_audit(
     )
 }
 
+#[cfg(any())]
 fn require_tenant_credential_admin_tx(
     conn: &rusqlite::Connection,
     tenant_id: &str,
@@ -2614,6 +2694,53 @@ mod tests {
     }
 
     #[test]
+    fn fresh_sqlite_database_contains_no_tenant_schema() {
+        let db = test_db();
+        let conn = db.conn();
+        let tenant_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sekai_tenants','sekai_tenant_requests','sekai_tenant_memberships','sekai_namespace_ownership')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tenant_tables, 0);
+        drop(conn);
+        assert!(
+            !table_columns(&db, "sekai_principal_credentials")
+                .iter()
+                .any(|column| column == "tenant_id")
+        );
+    }
+
+    #[test]
+    fn startup_rejects_legacy_tenant_state_without_mutating_it() {
+        let path = temp_db_path("legacy-tenant-state");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sekai_tenants (id TEXT PRIMARY KEY);
+             INSERT INTO sekai_tenants (id) VALUES ('tenant_legacy');",
+        )
+        .unwrap();
+        drop(conn);
+        let error = SekaiDb::new(path.to_str().unwrap()).err().unwrap();
+        assert!(error.contains("legacy SQLite tenant state detected"));
+        assert!(error.contains("Back up the database"));
+        let conn = Connection::open(&path).unwrap();
+        let retained: String = conn
+            .query_row("SELECT id FROM sekai_tenants", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, "tenant_legacy");
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(journal_mode, "wal");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(any())]
     fn tenant_credentials_preserve_binding_rotation_revocation_and_audit() {
         let db = test_db();
         let tenant = db.create_tenant("root", "credential-db", 1).unwrap();
@@ -2672,6 +2799,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn credential_migration_upgrades_unbound_rows_without_inference() {
         let db = test_db();
         let conn = db.conn();
