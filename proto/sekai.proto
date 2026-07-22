@@ -872,6 +872,40 @@ message CreateTenantNamespaceResponse { NamespaceOwnership ownership = 1; }
 message GetNamespaceOwnershipRequest { string namespace = 1; }
 message GetNamespaceOwnershipResponse { NamespaceOwnership ownership = 1; }
 
+enum TenantMembershipRole {
+  TENANT_MEMBERSHIP_ROLE_UNSPECIFIED = 0;
+  TENANT_MEMBERSHIP_ROLE_OWNER = 1;
+  TENANT_MEMBERSHIP_ROLE_ADMIN = 2;
+  TENANT_MEMBERSHIP_ROLE_MEMBER = 3;
+  TENANT_MEMBERSHIP_ROLE_BILLING_VIEWER = 4;
+}
+message TenantMembership {
+  string contract_version = 1;
+  string tenant_id = 2;
+  string subject_id = 3;
+  TenantMembershipRole role = 4;
+  bool active = 5;
+  int64 created_at_ms = 6;
+  int64 updated_at_ms = 7;
+  optional int64 revoked_at_ms = 8;
+}
+message CreateTenantMembershipRequest {
+  string tenant_id = 1;
+  string subject_id = 2;
+  TenantMembershipRole role = 3;
+}
+message CreateTenantMembershipResponse { TenantMembership membership = 1; }
+message ChangeTenantMembershipRoleRequest {
+  string tenant_id = 1;
+  string subject_id = 2;
+  TenantMembershipRole role = 3;
+}
+message ChangeTenantMembershipRoleResponse { TenantMembership membership = 1; }
+message ListTenantMembershipsRequest { string tenant_id = 1; }
+message ListTenantMembershipsResponse { repeated TenantMembership memberships = 1; }
+message RevokeTenantMembershipRequest { string tenant_id = 1; string subject_id = 2; }
+message RevokeTenantMembershipResponse { TenantMembership membership = 1; }
+
 message GetProvenanceReportRequest { string work_unit_id = 1; }
 message GetProvenanceReportResponse { string report = 1; }
 
@@ -1184,6 +1218,10 @@ service SekaiService {
   rpc RequestTenantClosure(RequestTenantClosureRequest) returns (RequestTenantClosureResponse);
   rpc CreateTenantNamespace(CreateTenantNamespaceRequest) returns (CreateTenantNamespaceResponse);
   rpc GetNamespaceOwnership(GetNamespaceOwnershipRequest) returns (GetNamespaceOwnershipResponse);
+  rpc CreateTenantMembership(CreateTenantMembershipRequest) returns (CreateTenantMembershipResponse);
+  rpc ChangeTenantMembershipRole(ChangeTenantMembershipRoleRequest) returns (ChangeTenantMembershipRoleResponse);
+  rpc ListTenantMemberships(ListTenantMembershipsRequest) returns (ListTenantMembershipsResponse);
+  rpc RevokeTenantMembership(RevokeTenantMembershipRequest) returns (RevokeTenantMembershipResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
   rpc RegisterEvidenceProducer(RegisterEvidenceProducerRequest) returns (RegisterEvidenceProducerResponse);
   rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);
