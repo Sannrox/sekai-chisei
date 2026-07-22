@@ -1301,6 +1301,12 @@ fn map_capability_error(error: capability::CatalogError) -> Status {
 }
 
 fn caller_principals(req: &Request<impl std::any::Any>) -> Vec<String> {
+    if let Some(context) = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return vec![context.principal.subject.clone()];
+    }
     req.metadata()
         .get("x-principal")
         .and_then(|v| v.to_str().ok())
@@ -10325,48 +10331,19 @@ fn require_tenant_request_key(value: &str) -> Result<String, Status> {
     Ok(value.to_string())
 }
 
-enum RequestEnterpriseContext {
-    Tenant(crate::enterprise::TenantContext),
-    Unscoped(crate::enterprise::AuthenticatedPrincipal),
-}
+type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
 fn request_tenant_context(
-    db: &SekaiDb,
+    _db: &SekaiDb,
     req: &Request<impl std::any::Any>,
 ) -> Result<Option<RequestEnterpriseContext>, Status> {
-    let auth_source = req
-        .metadata()
-        .get("x-sekai-auth-source")
-        .and_then(|value| value.to_str().ok());
-    if !matches!(auth_source, Some("enterprise" | "token")) {
-        return Ok(None);
+    if let Some(context) = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return Ok(Some(context.clone()));
     }
-    let Some(extension) = db.enterprise_extension() else {
-        return Ok(None);
-    };
-    let subject = caller_principals(req)
-        .into_iter()
-        .next()
-        .ok_or_else(|| Status::unauthenticated("authenticated principal required"))?;
-    let credential_id = req
-        .metadata()
-        .get("x-sekai-credential-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let principal = crate::enterprise::AuthenticatedPrincipal {
-        subject,
-        credential_id,
-    };
-    if auth_source == Some("enterprise") {
-        extension
-            .tenant_context(&principal)
-            .map(RequestEnterpriseContext::Tenant)
-            .map(Some)
-            .map_err(extension_status)
-    } else {
-        Ok(Some(RequestEnterpriseContext::Unscoped(principal)))
-    }
+    Ok(None)
 }
 
 fn enforce_namespace_tenant_context(
@@ -10386,14 +10363,9 @@ fn enforce_namespace_tenant_context(
     } else {
         crate::enterprise::NamespaceAction::Read
     };
-    match context {
-        RequestEnterpriseContext::Tenant(context) => extension
-            .authorize_namespace(context, namespace, action)
-            .map_err(extension_status),
-        RequestEnterpriseContext::Unscoped(principal) => extension
-            .authorize_unscoped_namespace(principal, namespace, action)
-            .map_err(extension_status),
-    }
+    extension
+        .authorize_authenticated_context(context, namespace, action)
+        .map_err(extension_status)
 }
 
 fn extension_status(error: crate::enterprise::ExtensionError) -> Status {
@@ -10406,6 +10378,22 @@ fn extension_status(error: crate::enterprise::ExtensionError) -> Status {
         }
         crate::enterprise::ExtensionError::PermissionDenied => {
             Status::permission_denied("enterprise authorization denied")
+        }
+        crate::enterprise::ExtensionError::UnsupportedVersion => {
+            Status::failed_precondition("unsupported enterprise identity contract version")
+        }
+        crate::enterprise::ExtensionError::Expired
+        | crate::enterprise::ExtensionError::Revoked
+        | crate::enterprise::ExtensionError::Replayed
+        | crate::enterprise::ExtensionError::MembershipRevoked
+        | crate::enterprise::ExtensionError::TenantSuspended
+        | crate::enterprise::ExtensionError::InvalidState
+        | crate::enterprise::ExtensionError::InvalidNonce
+        | crate::enterprise::ExtensionError::InvalidRedirectUri
+        | crate::enterprise::ExtensionError::InvalidPkce
+        | crate::enterprise::ExtensionError::IssuerMismatch
+        | crate::enterprise::ExtensionError::ResourceMismatch => {
+            Status::permission_denied("enterprise credential validation failed")
         }
         crate::enterprise::ExtensionError::Unavailable(message) => Status::unavailable(message),
     }
@@ -10818,6 +10806,24 @@ mod tests {
                 .ok_or(crate::enterprise::ExtensionError::CredentialNotFound)
         }
 
+        fn authenticate_context(
+            &self,
+            bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            let principal = self.authenticate_bearer(bearer_token)?;
+            Ok(crate::enterprise::AuthenticatedContext {
+                contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+                tenant: Some(self.tenant_context(&principal)?),
+                principal,
+                credential_kind: crate::enterprise::CredentialKind::HumanSession,
+                scopes: vec!["sekai.read".into(), "sekai.write".into()],
+                issuer: "https://issuer.test".into(),
+                resource: "https://sekai.test".into(),
+                expires_at: 100,
+            })
+        }
+
         fn tenant_context(
             &self,
             principal: &crate::enterprise::AuthenticatedPrincipal,
@@ -10863,21 +10869,39 @@ mod tests {
         .unwrap();
         let mut request = Request::new(());
         request
+            .extensions_mut()
+            .insert(crate::enterprise::AuthenticatedContext {
+                contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+                principal: crate::enterprise::AuthenticatedPrincipal {
+                    subject: "subject-a".into(),
+                    credential_id: "credential-a".into(),
+                },
+                credential_kind: crate::enterprise::CredentialKind::HumanSession,
+                tenant: Some(crate::enterprise::TenantContext {
+                    tenant_id: "tenant-test".into(),
+                    subject: "subject-a".into(),
+                }),
+                scopes: vec!["sekai.read".into()],
+                issuer: "https://issuer.test".into(),
+                resource: "https://sekai.test".into(),
+                expires_at: 100,
+            });
+        request
             .metadata_mut()
-            .insert("x-principal", MetadataValue::from_static("subject-a"));
+            .insert("x-principal", MetadataValue::from_static("attacker"));
         request.metadata_mut().insert(
-            "x-sekai-credential-id",
-            MetadataValue::from_static("credential-a"),
-        );
-        request.metadata_mut().insert(
-            "x-sekai-auth-source",
-            MetadataValue::from_static("enterprise"),
+            "x-sekai-tenant-id",
+            MetadataValue::from_static("attacker-tenant"),
         );
         let tenant = request_tenant_context(&db, &request).unwrap().unwrap();
-        assert!(matches!(
-            &tenant,
-            RequestEnterpriseContext::Tenant(context) if context.tenant_id == "tenant-test"
-        ));
+        assert_eq!(caller_principals(&request), ["subject-a"]);
+        assert_eq!(
+            tenant
+                .tenant
+                .as_ref()
+                .map(|context| context.tenant_id.as_str()),
+            Some("tenant-test")
+        );
         assert!(enforce_namespace_tenant_context(&db, Some(&tenant), "allowed", false).is_ok());
         assert_eq!(
             enforce_namespace_tenant_context(&db, Some(&tenant), "denied", true)
@@ -10896,18 +10920,16 @@ mod tests {
         .unwrap();
         let mut request = Request::new(());
         request
-            .metadata_mut()
-            .insert("x-principal", MetadataValue::from_static("community-user"));
-        request.metadata_mut().insert(
-            "x-sekai-credential-id",
-            MetadataValue::from_static("community-credential"),
-        );
-        request
-            .metadata_mut()
-            .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+            .extensions_mut()
+            .insert(crate::enterprise::AuthenticatedContext::machine(
+                crate::enterprise::AuthenticatedPrincipal {
+                    subject: "community-user".into(),
+                    credential_id: "community-credential".into(),
+                },
+            ));
 
         let context = request_tenant_context(&db, &request).unwrap().unwrap();
-        assert!(matches!(context, RequestEnterpriseContext::Unscoped(_)));
+        assert!(context.tenant.is_none());
         assert!(enforce_namespace_tenant_context(&db, Some(&context), "community", true).is_ok());
         assert_eq!(
             enforce_namespace_tenant_context(&db, Some(&context), "tenant-private", false)

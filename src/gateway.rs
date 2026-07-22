@@ -409,6 +409,23 @@ enum UpstreamAuthMode {
 struct IdentityContext {
     identity: GatewayIdentity,
     upstream_auth: UpstreamAuthMode,
+    authenticated: crate::enterprise::AuthenticatedContext,
+}
+
+impl IdentityContext {
+    fn machine(identity: GatewayIdentity, upstream_auth: UpstreamAuthMode) -> Self {
+        let authenticated = crate::enterprise::AuthenticatedContext::machine(
+            crate::enterprise::AuthenticatedPrincipal {
+                subject: identity.context_principal().to_string(),
+                credential_id: identity.key_id.clone(),
+            },
+        );
+        Self {
+            identity,
+            upstream_auth,
+            authenticated,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2088,6 +2105,15 @@ async fn proxy_gateway_inner(
     correlation: GatewayCorrelation,
     identity_context: IdentityContext,
 ) -> Response<Body> {
+    if identity_context.authenticated.principal.subject
+        != identity_context.identity.context_principal()
+    {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "validated identity context mismatch",
+        );
+    }
     let registry = match state.runtime.refresh_registry_snapshot(false).await {
         Ok(registry) => registry,
         Err(reason) => {
@@ -7134,33 +7160,33 @@ async fn resolve_identity(
     if config.allow_auth_passthrough
         && let Some(identity) = passthrough_identity(headers, &config.default_project)
     {
-        return Ok(IdentityContext {
+        return Ok(IdentityContext::machine(
             identity,
-            upstream_auth: UpstreamAuthMode::Passthrough,
-        });
+            UpstreamAuthMode::Passthrough,
+        ));
     }
 
     if let Some(identity) = config.gateway_keys.get(key) {
-        return Ok(IdentityContext {
-            identity: identity.clone(),
-            upstream_auth: UpstreamAuthMode::GatewayKey,
-        });
+        return Ok(IdentityContext::machine(
+            identity.clone(),
+            UpstreamAuthMode::GatewayKey,
+        ));
     }
     if !config.gateway_keys.is_empty() {
         return Err(IdentityError::UnknownKey);
     }
 
     if let Some(identity) = resolve_identity_from_key_store(state, key).await? {
-        return Ok(IdentityContext {
+        return Ok(IdentityContext::machine(
             identity,
-            upstream_auth: UpstreamAuthMode::GatewayKey,
-        });
+            UpstreamAuthMode::GatewayKey,
+        ));
     }
 
-    Ok(IdentityContext {
-        identity: derive_identity_from_key(key, &config.default_project),
-        upstream_auth: UpstreamAuthMode::GatewayKey,
-    })
+    Ok(IdentityContext::machine(
+        derive_identity_from_key(key, &config.default_project),
+        UpstreamAuthMode::GatewayKey,
+    ))
 }
 
 async fn resolve_identity_from_key_store(
@@ -14710,10 +14736,7 @@ mod tests {
             key_id: "test".into(),
             tier: "untrusted".into(),
         };
-        let mut context = IdentityContext {
-            identity,
-            upstream_auth: UpstreamAuthMode::GatewayKey,
-        };
+        let mut context = IdentityContext::machine(identity, UpstreamAuthMode::GatewayKey);
         assert!(!canary_admission_allowed(&context, &headers));
         context.identity.tier = "low-risk".into();
         assert!(canary_admission_allowed(&context, &headers));

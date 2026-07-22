@@ -129,24 +129,60 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
         let enterprise_result = self
             .db
             .enterprise_extension()
-            .map(|extension| extension.authenticate_bearer(&token));
-        let (principal, credential_id, enterprise_scoped) = match enterprise_result {
-            Some(Ok(authenticated)) => (authenticated.subject, authenticated.credential_id, true),
-            Some(Err(crate::enterprise::ExtensionError::CredentialNotFound)) | None => {
-                let credential = self.resolve_credential(&token).ok_or_else(|| {
+            .map(|extension| extension.authenticate_context(&token));
+        let (principal, credential_id, authenticated_context, enterprise_scoped) =
+            match enterprise_result {
+                Some(Ok(context)) => {
+                    let extension_version = self
+                        .db
+                        .enterprise_extension()
+                        .expect("enterprise authentication requires an installed extension")
+                        .contract_version();
+                    if extension_version != crate::enterprise::IDENTITY_EXTENSION_VERSION
+                        || context.contract_version != extension_version
+                    {
+                        reject_unauthorized();
+                        return Err(Status::failed_precondition(
+                            "unsupported enterprise identity contract version",
+                        ));
+                    }
+                    if context.expires_at <= chrono::Utc::now().timestamp() {
+                        reject_unauthorized();
+                        return Err(Status::unauthenticated(
+                            "enterprise authenticated context expired",
+                        ));
+                    }
+                    (
+                        context.principal.subject.clone(),
+                        context.principal.credential_id.clone(),
+                        context,
+                        true,
+                    )
+                }
+                Some(Err(crate::enterprise::ExtensionError::CredentialNotFound)) | None => {
+                    let credential = self.resolve_credential(&token).ok_or_else(|| {
+                        reject_unauthorized();
+                        Status::unauthenticated("invalid token")
+                    })?;
+                    let principal = crate::enterprise::AuthenticatedPrincipal {
+                        subject: credential.principal,
+                        credential_id: credential.id,
+                    };
+                    (
+                        principal.subject.clone(),
+                        principal.credential_id.clone(),
+                        crate::enterprise::AuthenticatedContext::machine(principal),
+                        false,
+                    )
+                }
+                Some(Err(crate::enterprise::ExtensionError::Unavailable(message))) => {
+                    return Err(Status::unavailable(message));
+                }
+                Some(Err(_)) => {
                     reject_unauthorized();
-                    Status::unauthenticated("invalid token")
-                })?;
-                (credential.principal, credential.id, false)
-            }
-            Some(Err(crate::enterprise::ExtensionError::Unavailable(message))) => {
-                return Err(Status::unavailable(message));
-            }
-            Some(Err(_)) => {
-                reject_unauthorized();
-                return Err(Status::unauthenticated("invalid token"));
-            }
-        };
+                    return Err(Status::unauthenticated("invalid token"));
+                }
+            };
         if !valid_single_principal(&principal) {
             reject_unauthorized();
             return Err(Status::unauthenticated("invalid principal identity"));
@@ -177,21 +213,13 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 .map_err(|_| Status::unauthenticated("invalid credential identity"))?,
         );
         if enterprise_scoped {
-            let extension = self
-                .db
-                .enterprise_extension()
-                .expect("enterprise authentication requires an installed extension");
-            extension
-                .tenant_context(&crate::enterprise::AuthenticatedPrincipal {
-                    subject: principal.clone(),
-                    credential_id: credential_id.clone(),
-                })
-                .map_err(|error| match error {
-                    crate::enterprise::ExtensionError::Unavailable(message) => {
-                        Status::unavailable(message)
-                    }
-                    _ => Status::permission_denied("enterprise authentication denied"),
-                })?;
+            if let Some(tenant) = authenticated_context.tenant.as_ref() {
+                req.metadata_mut().insert(
+                    TENANT_CONTEXT_HEADER,
+                    MetadataValue::from_str(&tenant.tenant_id)
+                        .map_err(|_| Status::unauthenticated("invalid tenant identity"))?,
+                );
+            }
             let method = req
                 .extensions()
                 .get::<tonic::GrpcMethod<'_>>()
@@ -202,6 +230,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 ));
             }
         }
+        req.extensions_mut().insert(authenticated_context);
         Ok(req)
     }
 }
@@ -712,6 +741,128 @@ mod tests {
 
         let request = Request::new(());
         assert!(interceptor.call(request).is_err());
+    }
+
+    #[test]
+    fn token_auth_interceptor_rejects_unsupported_or_expired_enterprise_context() {
+        struct BoundedExtension {
+            version: &'static str,
+            expires_at: i64,
+        }
+
+        impl crate::enterprise::EnterpriseExtension for BoundedExtension {
+            fn contract_version(&self) -> &'static str {
+                self.version
+            }
+
+            fn authenticate_bearer(
+                &self,
+                _bearer_token: &str,
+            ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+            {
+                Ok(crate::enterprise::AuthenticatedPrincipal {
+                    subject: "human:alice".into(),
+                    credential_id: "credential-1".into(),
+                })
+            }
+
+            fn authenticate_context(
+                &self,
+                bearer_token: &str,
+            ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+            {
+                let principal = self.authenticate_bearer(bearer_token)?;
+                Ok(crate::enterprise::AuthenticatedContext {
+                    contract_version: self.contract_version(),
+                    tenant: Some(self.tenant_context(&principal)?),
+                    principal,
+                    credential_kind: crate::enterprise::CredentialKind::HumanSession,
+                    scopes: vec!["sekai.read".into()],
+                    issuer: "https://issuer.test".into(),
+                    resource: "https://sekai.test".into(),
+                    expires_at: self.expires_at,
+                })
+            }
+
+            fn tenant_context(
+                &self,
+                principal: &crate::enterprise::AuthenticatedPrincipal,
+            ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError>
+            {
+                Ok(crate::enterprise::TenantContext {
+                    tenant_id: "tenant-1".into(),
+                    subject: principal.subject.clone(),
+                })
+            }
+
+            fn authorize_namespace(
+                &self,
+                _context: &crate::enterprise::TenantContext,
+                _namespace: &str,
+                _action: crate::enterprise::NamespaceAction,
+            ) -> Result<(), crate::enterprise::ExtensionError> {
+                Ok(())
+            }
+
+            fn authorize_unscoped_namespace(
+                &self,
+                _principal: &crate::enterprise::AuthenticatedPrincipal,
+                _namespace: &str,
+                _action: crate::enterprise::NamespaceAction,
+            ) -> Result<(), crate::enterprise::ExtensionError> {
+                Ok(())
+            }
+        }
+
+        let db = Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(BoundedExtension {
+                    version: "sekai.identity-extension/v0",
+                    expires_at: i64::MAX,
+                })),
+            )
+            .unwrap(),
+        );
+        let mut interceptor =
+            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer enterprise-token"),
+        );
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
+        assert_eq!(
+            interceptor.call(request).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let db = Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(BoundedExtension {
+                    version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+                    expires_at: 0,
+                })),
+            )
+            .unwrap(),
+        );
+        let mut interceptor =
+            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer enterprise-token"),
+        );
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
+        assert_eq!(
+            interceptor.call(request).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[test]

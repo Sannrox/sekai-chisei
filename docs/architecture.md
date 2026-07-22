@@ -187,6 +187,12 @@ directs the operator to [Migrating legacy SQLite tenant state](tenant-migration.
 
 ## Trust boundaries
 
+Enterprise human identity composes through the versioned, backend-neutral
+contract documented in [Enterprise identity extension contract](enterprise-identity-extension.md).
+The default SQLite service remains tenant-free and exposes no OAuth/OIDC
+runtime endpoints. Validated human and machine credentials converge on one
+internal authenticated context; caller metadata never constructs that context.
+
 - Namespace and object access control apply when data is read or mutated.
 - Gateway virtual keys and control-plane credentials identify principals; raw
   credential material must not enter audit evidence.
