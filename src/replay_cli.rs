@@ -91,6 +91,8 @@ struct ReplaySource {
     control_plane_version: &'static str,
     traversal_max_depth: i32,
     graph_truncated: bool,
+    timeline_truncated: bool,
+    timeline_truncation_reasons: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -165,8 +167,10 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
         .await?
         .into_inner()
         .decisions;
+    let decisions_truncated = decisions.len() == 500;
 
     let mut timeline = Vec::new();
+    let mut changes_truncated = false;
     for object in &objects {
         timeline.push(TimelineEvent {
             id: format!("object:{}:created", object.id),
@@ -176,15 +180,9 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
             label: format!("created {}", object.name),
             details: BTreeMap::from([("object_kind".into(), object.kind.clone())]),
         });
-        let changes = client
-            .list_object_changes(ListObjectChangesRequest {
-                object_id: object.id.clone(),
-                limit: 500,
-                offset: 0,
-            })
-            .await?
-            .into_inner()
-            .changes;
+        let (changes, object_changes_truncated) =
+            list_object_changes(&mut client, &object.id).await?;
+        changes_truncated |= object_changes_truncated;
         timeline.extend(changes.into_iter().map(|change| {
             let field = change.field;
             TimelineEvent {
@@ -248,6 +246,14 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
             control_plane_version: env!("CARGO_PKG_VERSION"),
             traversal_max_depth: config.max_depth,
             graph_truncated,
+            timeline_truncated: decisions_truncated || changes_truncated,
+            timeline_truncation_reasons: [
+                decisions_truncated.then(|| "decision_limit".into()),
+                changes_truncated.then(|| "object_change_limit".into()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         },
         timeline,
         graph: ReplayGraph {
@@ -300,6 +306,36 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
     fs::write(&config.output, encoded)?;
     println!("exported {}", config.output.display());
     Ok(())
+}
+
+async fn list_object_changes(
+    client: &mut SekaiServiceClient<crate::grpc::client::GatewayClient>,
+    object_id: &str,
+) -> Result<(Vec<crate::grpc::pb::sekai::ObjectChange>, bool), BoxError> {
+    const PAGE_SIZE: i32 = 500;
+    const MAX_CHANGES: usize = 10_000;
+    let mut changes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = client
+            .list_object_changes(ListObjectChangesRequest {
+                object_id: object_id.into(),
+                limit: PAGE_SIZE,
+                offset,
+            })
+            .await?
+            .into_inner()
+            .changes;
+        let page_len = page.len();
+        changes.extend(page.into_iter().take(MAX_CHANGES - changes.len()));
+        if page_len < PAGE_SIZE as usize {
+            return Ok((changes, false));
+        }
+        if changes.len() >= MAX_CHANGES {
+            return Ok((changes, true));
+        }
+        offset += PAGE_SIZE;
+    }
 }
 
 fn sanitize_field_value(field: &str, value: String) -> String {
