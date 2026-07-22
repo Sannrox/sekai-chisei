@@ -24,6 +24,7 @@ use crate::config::{Config, GrpcTcpMode};
 use crate::db::sekai::{PrincipalCredential, SekaiDb};
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
+use crate::runtime_backend::RuntimeBackend;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
 use std::convert::Infallible;
@@ -354,10 +355,15 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 
 pub async fn run(
     config: Config,
-    db: Arc<SekaiDb>,
+    backend: Arc<RuntimeBackend>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    backend
+        .capabilities()
+        .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+        .map_err(std::io::Error::other)?;
+    let db = backend.database();
     let provider_registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     if let Some(ops_port) = config.ops_port {
