@@ -873,14 +873,15 @@ message CredentialRecord {
   int64 created = 4;
   int64 rotated_at = 5;
   int64 revoked_at = 6;
+  string tenant_id = 7;
 }
-message CreateCredentialRequest { string principal = 1; bool managed_team_principal = 2; }
+message CreateCredentialRequest { string principal = 1; bool managed_team_principal = 2; string tenant_id = 3; }
 message CreateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
-message RotateCredentialRequest { string principal = 1; bool managed_team_principal = 2; }
+message RotateCredentialRequest { string principal = 1; bool managed_team_principal = 2; string tenant_id = 3; }
 message RotateCredentialResponse { string token = 1; CredentialRecord credential = 2; }
-message RevokeCredentialRequest { string principal = 1; }
+message RevokeCredentialRequest { string principal = 1; string tenant_id = 2; }
 message RevokeCredentialResponse { CredentialRecord credential = 1; }
-message ListCredentialsRequest {}
+message ListCredentialsRequest { string tenant_id = 1; }
 message ListCredentialsResponse { repeated CredentialRecord credentials = 1; }
 
 enum TenantLifecycleState {

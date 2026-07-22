@@ -15,7 +15,7 @@ fn in_progress_epoch(activity_epoch: i64) -> i64 {
 
 #[derive(Debug)]
 pub struct PrincipalCredentialStore {
-    pub by_hash: RwLock<HashMap<String, String>>,
+    pub by_hash: RwLock<HashMap<String, PrincipalCredential>>,
     pub last_reload_ms: AtomicI64,
     pub last_data_version: AtomicI64,
 }
@@ -33,28 +33,24 @@ impl PrincipalCredentialStore {
         let mut map = self.by_hash.write().unwrap();
         map.clear();
         for credential in credentials.iter().filter(|c| c.status == "active") {
-            map.insert(credential.token_hash.clone(), credential.principal.clone());
+            map.insert(credential.token_hash.clone(), credential.clone());
         }
     }
 
     pub fn load_credential(&self, credential: &PrincipalCredential) {
         let mut map = self.by_hash.write().unwrap();
-        map.insert(credential.token_hash.clone(), credential.principal.clone());
+        map.insert(credential.token_hash.clone(), credential.clone());
     }
 
     pub fn remove_hash(&self, token_hash: &str) {
         self.by_hash.write().unwrap().remove(token_hash);
     }
 
-    fn resolve_hashed(&self, token_hash: &str) -> Option<String> {
-        self.by_hash
-            .read()
-            .unwrap()
-            .get(token_hash)
-            .map(std::string::ToString::to_string)
+    fn resolve_hashed(&self, token_hash: &str) -> Option<PrincipalCredential> {
+        self.by_hash.read().unwrap().get(token_hash).cloned()
     }
 
-    pub fn resolve(&self, token: &str) -> Option<String> {
+    pub fn resolve(&self, token: &str) -> Option<PrincipalCredential> {
         self.resolve_hashed(&hash_gateway_key(token))
     }
 
@@ -156,8 +152,8 @@ mod tests {
         let store = PrincipalCredentialStore::new();
         store.load(&credentials);
 
-        assert_eq!(store.resolve("alice-token"), Some("alice".to_string()));
-        assert_eq!(store.resolve("bob-token"), Some("bob".to_string()));
+        assert_eq!(store.resolve("alice-token").unwrap().principal, "alice");
+        assert_eq!(store.resolve("bob-token").unwrap().principal, "bob");
     }
 
     #[test]
@@ -169,7 +165,7 @@ mod tests {
             .unwrap();
         assert!(store.resolve("token-alice").is_none());
         store.maybe_reload(&db);
-        assert_eq!(store.resolve("token-alice"), Some("alice".to_string()));
+        assert_eq!(store.resolve("token-alice").unwrap().principal, "alice");
         assert!(store.has_any());
     }
 
@@ -182,7 +178,7 @@ mod tests {
             .unwrap();
 
         assert!(store.maybe_reload(&db));
-        assert_eq!(store.resolve("token-alice"), Some("alice".to_string()));
+        assert_eq!(store.resolve("token-alice").unwrap().principal, "alice");
 
         db.revoke_principal_credential("alice").unwrap();
 

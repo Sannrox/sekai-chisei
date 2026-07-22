@@ -43,6 +43,15 @@ appropriate.
 `SEKAI_AUTH_TOKEN` is a deprecated compatibility path that maps all callers to
 the fixed `root` principal. Do not use it as the long-term credential model.
 
+Multi-tenant deployments create credentials with a `tenant_id` through the
+credential RPCs. The authenticated credential row, not request metadata or a
+principal naming convention, supplies the tenant context. Tenant credential
+creation, rotation, revocation, and listing require a live owner or admin
+membership in that tenant; platform `root`/`local` administrators may bootstrap
+the first credential. Rotation and revocation invalidate the old secret on the
+next authentication check. Existing credentials with an empty `tenant_id`
+remain compatibility credentials and never acquire tenant scope implicitly.
+
 ## Observability
 
 The loopback ops listener exposes unauthenticated process endpoints:

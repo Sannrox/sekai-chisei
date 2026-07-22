@@ -142,6 +142,7 @@ pub async fn create_credential(principal: &str) -> Result<String, String> {
         .create_credential(CreateCredentialRequest {
             principal: principal.to_string(),
             managed_team_principal: false,
+            tenant_id: String::new(),
         })
         .await
         .map_err(|error| format!("create credential: {error}"))?;
@@ -157,6 +158,7 @@ pub async fn rotate_credential(principal: &str) -> Result<String, String> {
         .rotate_credential(RotateCredentialRequest {
             principal: principal.to_string(),
             managed_team_principal: false,
+            tenant_id: String::new(),
         })
         .await
         .map_err(|error| format!("rotate credential: {error}"))?;
@@ -171,6 +173,7 @@ pub async fn revoke_credential(principal: &str) -> Result<CredentialRecord, Stri
     SekaiServiceClient::new(channel)
         .revoke_credential(RevokeCredentialRequest {
             principal: principal.to_string(),
+            tenant_id: String::new(),
         })
         .await
         .map_err(|error| format!("revoke credential: {error}"))?
@@ -184,7 +187,9 @@ pub async fn list_credentials() -> Result<Vec<CredentialRecord>, String> {
         .await
         .map_err(|error| format!("connect to control plane: {error}"))?;
     Ok(SekaiServiceClient::new(channel)
-        .list_credentials(ListCredentialsRequest {})
+        .list_credentials(ListCredentialsRequest {
+            tenant_id: String::new(),
+        })
         .await
         .map_err(|error| format!("list credentials: {error}"))?
         .into_inner()
