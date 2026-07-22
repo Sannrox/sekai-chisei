@@ -36,11 +36,11 @@ curl -sS -X POST "http://localhost:8080/v1/chat/completions" \
 
 Use `docker compose down` to stop and keep the persisted data volume.
 
-## PostgreSQL portfolio tests with Apple container
+## PostgreSQL migration and portfolio tests
 
 On Apple silicon with macOS 26 and the Apple `container` CLI, run the ignored
-PostgreSQL portfolio contract and advisory-lock tests against an ephemeral,
-TLS-enabled PostgreSQL instance:
+PostgreSQL migration, portfolio contract, and advisory-lock tests against an
+ephemeral, TLS-enabled PostgreSQL instance:
 
 ```bash
 scripts/postgres_portfolio_tests_apple.sh
@@ -50,6 +50,22 @@ The script generates a one-day test CA and server certificate, publishes
 PostgreSQL on `127.0.0.1:55432`, runs the focused tests, and removes the
 container and certificates on exit. Override the port or OCI image with
 `SEKAI_TEST_POSTGRES_PORT` or `SEKAI_TEST_POSTGRES_IMAGE`.
+
+Other local and CI environments can provide their own isolated, disposable
+database and run the same test groups directly:
+
+```bash
+export SEKAI_TEST_POSTGRES_URL='postgresql://user:password@localhost/sekai_test'
+# Set this when the test server uses a private certificate authority.
+export SEKAI_TEST_POSTGRES_CA_CERT='/path/to/test-ca.pem'
+cargo test --locked 'db::postgres::tests::' -- --ignored --nocapture
+cargo test --locked 'db::postgres_portfolio::tests::' -- --ignored --nocapture
+```
+
+The configured database must not contain valuable data: migration fixtures
+drop and recreate its `public` schema. CI must allocate a database exclusively
+to this test process. Production PostgreSQL connections and these fixtures both
+require TLS; the optional CA path only extends trust for a private test CA.
 
 ## Container env vars
 
