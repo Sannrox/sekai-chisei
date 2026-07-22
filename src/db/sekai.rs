@@ -153,6 +153,7 @@ impl SekaiDb {
         self.migrate_schema_types()?;
         self.migrate_ontology()?;
         self.migrate_coordination()?;
+        self.migrate_leases()?;
         self.migrate_datasets()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
