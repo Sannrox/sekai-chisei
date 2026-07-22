@@ -50,6 +50,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "memory" => {
             sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
         }
+        "models" => {
+            let config =
+                sekai_chisei::models_cli::ModelsListConfig::from_args(args.into_iter().skip(1))
+                    .map_err(std::io::Error::other)?;
+            print!(
+                "{}",
+                sekai_chisei::models_cli::run_models_list(config).await?
+            );
+            Ok(())
+        }
         "gunshi" => match args.get(1).map(String::as_str) {
             Some("recommend") => {
                 let config =
@@ -319,7 +329,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|ontology|receipt|replay|report|memory|team|gunshi> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -360,6 +370,7 @@ fn print_root_usage() {
         "\nMemory commands:\n  {}",
         sekai_chisei::memory_cli::usage()
     );
+    println!("\nModel commands:\n  {}", sekai_chisei::models_cli::USAGE);
     println!(
         "\nGunshi recommendations:\n  {}",
         sekai_chisei::gunshi_cli::usage()

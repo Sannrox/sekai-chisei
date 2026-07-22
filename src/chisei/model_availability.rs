@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_TTL_SECS: u64 = 300;
 const DISCOVERY_TIMEOUT_SECS: u64 = 3;
+pub const AVAILABLE_MODELS_VERSION: &str = "chisei.available-models/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvailableModel {
@@ -23,6 +24,24 @@ pub struct AvailableModel {
     pub pricing: Option<PricingProfile>,
     pub cost_rank: Option<i32>,
     pub capability_rank: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicAvailableModel {
+    pub provider: String,
+    pub upstream_model: String,
+    pub canonical_model: String,
+    pub lifecycle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ProviderCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<PricingProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableModelsView {
+    pub version: String,
+    pub models: Vec<PublicAvailableModel>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +60,30 @@ impl ModelAvailabilitySnapshot {
             .filter(|model| model.routable)
             .cloned()
             .collect()
+    }
+
+    pub fn public_models(&self, provider: Option<&str>) -> AvailableModelsView {
+        let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+        let mut models = self
+            .routable_models()
+            .into_iter()
+            .filter(|model| provider.is_none_or(|provider| model.provider == provider))
+            .map(|model| PublicAvailableModel {
+                provider: model.provider,
+                upstream_model: model.upstream_model,
+                canonical_model: model.canonical_model,
+                lifecycle: model.lifecycle,
+                capabilities: model.capabilities,
+                pricing: model.pricing,
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            (&left.provider, &left.canonical_model).cmp(&(&right.provider, &right.canonical_model))
+        });
+        AvailableModelsView {
+            version: AVAILABLE_MODELS_VERSION.into(),
+            models,
+        }
     }
 }
 
@@ -293,7 +336,7 @@ pub async fn refresh_model_availability(
     snapshot
 }
 
-fn available_model(
+pub(crate) fn available_model(
     registry: &ProviderRegistry,
     provider: &str,
     upstream_model: String,
@@ -314,8 +357,8 @@ fn available_model(
         lifecycle,
         routable,
         discovery_source: discovery_source.into(),
-        capabilities: None,
-        pricing: None,
+        capabilities: Some(profile.capabilities.clone()),
+        pricing: Some(profile.pricing.clone()),
         cost_rank: None,
         capability_rank: None,
     })
@@ -470,7 +513,8 @@ pub fn replace_model_availability_for_test(snapshot: ModelAvailabilitySnapshot) 
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelDiscoveryConfig, available_model, discover_catalog, refresh_model_availability,
+        ModelAvailabilitySnapshot, ModelDiscoveryConfig, available_model, discover_catalog,
+        refresh_model_availability,
     };
     use crate::provider_profile::{ProviderRegistry, RegistryLifecycleOverride};
     use axum::Router;
@@ -479,6 +523,7 @@ mod tests {
     use axum::http::{StatusCode, Uri};
     use axum::response::Response;
     use axum::routing::get;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -630,6 +675,46 @@ mod tests {
     }
 
     #[test]
+    fn public_projection_is_sorted_filtered_and_excludes_disabled_models() {
+        let registry = ProviderRegistry::built_in();
+        let openai =
+            available_model(&registry, "openai", "gpt-5.5".into(), "provider_catalog").unwrap();
+        let anthropic = available_model(
+            &registry,
+            "anthropic",
+            "claude-sonnet-4-20250514".into(),
+            "provider_catalog",
+        )
+        .unwrap();
+        let mut disabled = openai.clone();
+        disabled.upstream_model = "gpt-disabled".into();
+        disabled.canonical_model = "openai/gpt-disabled".into();
+        disabled.lifecycle = "disabled".into();
+        disabled.routable = false;
+        let snapshot = ModelAvailabilitySnapshot {
+            refreshed_at: None,
+            models_by_provider: BTreeMap::from([
+                ("openai".into(), vec![disabled, openai]),
+                ("anthropic".into(), vec![anthropic]),
+            ]),
+            authoritative_providers: vec![],
+        };
+
+        let all = snapshot.public_models(None);
+        assert_eq!(all.models.len(), 2);
+        assert_eq!(all.models[0].provider, "anthropic");
+        assert!(all.models.iter().all(|model| model.lifecycle != "disabled"));
+        let openai = snapshot.public_models(Some("openai"));
+        assert_eq!(openai.models.len(), 1);
+        assert_eq!(openai.models[0].canonical_model, "openai/gpt-5.5");
+        assert!(
+            !serde_json::to_string(&openai)
+                .unwrap()
+                .contains("provider_catalog")
+        );
+    }
+
+    #[test]
     fn non_generation_catalog_entries_are_visible_but_not_routable() {
         let registry = ProviderRegistry::built_in();
         let model = available_model(
@@ -640,8 +725,8 @@ mod tests {
         )
         .unwrap();
         assert!(!model.routable);
-        assert_eq!(model.capabilities, None);
-        assert_eq!(model.pricing, None);
+        assert!(model.capabilities.is_some());
+        assert!(model.pricing.is_some());
 
         let fine_tuned = available_model(
             &registry,
