@@ -3,7 +3,7 @@
 //! A capability proposal groups an agent spec, its action allowlist, a seed eval suite, and a
 //! routing policy. Authoring is deliberately side-effect free: proposals are review artifacts,
 //! not registered agents or live routing changes.
-//! Governed invocation through the capability catalog is staged for GitHub Issue #107.
+//! Live invocation binding remains owned by the canonical Sekai query and action RPCs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

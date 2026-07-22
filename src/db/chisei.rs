@@ -414,6 +414,24 @@ impl SekaiDb {
         let conn = self.conn();
         upsert_operation_receipt(&conn, receipt)
     }
+
+    pub fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO chisei_operation_receipts(operation_id, initiating_actor, namespace, receipt_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                receipt.operation_id,
+                receipt.initiating_actor,
+                receipt.namespace,
+                receipt_json,
+                chrono::Utc::now().timestamp_millis(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn upsert_operation_receipt(
