@@ -168,6 +168,16 @@ can instead create a new boundary with `migrated_from_namespace` provenance so
 data migration remains explicit. The local interceptor bypasses tenant lookup
 and never creates a synthetic tenant.
 
+Tenant administration uses versioned `tenant-membership.v1` records keyed by
+tenant and external subject identifier. Active owners and admins may list and
+manage members in their authenticated tenant context; only owners may create or
+change owner/admin authority. Membership mutations and audit entries commit in
+one transaction, and an atomic guard rejects revoking or demoting the final
+active owner. Revoked memberships remain durable history but stop authorizing
+the subject on the next membership check. Tenant-scoped credentials map the
+authenticated `<tenant_id>.<subject_id>` principal to the stored subject suffix.
+These roles do not replace namespace or object grants for governed data access.
+
 ## Trust boundaries
 
 - Namespace and object access control apply when data is read or mutated.
