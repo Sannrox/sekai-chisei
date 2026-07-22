@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use tonic::{Request, Response, Status};
 
 use super::llm_service::{
-    estimate_chat_request, execute_chat_request, execute_chat_request_stream,
+    estimate_chat_request, execute_native_chat_request, execute_native_chat_request_stream,
 };
 use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
@@ -1296,8 +1296,8 @@ fn native_execution_cost(
         rates,
         i64::from(response.input_tokens),
         i64::from(response.output_tokens),
-        0,
-        0,
+        i64::from(response.cache_read_input_tokens),
+        i64::from(response.cache_creation_input_tokens),
     )
 }
 
@@ -3062,6 +3062,7 @@ impl ChiseiServiceImpl {
             }],
             tools: vec![],
             max_tokens: 64,
+            prompt_cache: Default::default(),
         };
         match reviewer.chat(&req).await {
             Ok(resp) => {
@@ -3964,16 +3965,38 @@ fn build_prepared_messages(input: &ExecutionInput, enriched_spec: &str) -> Vec<C
             tool_calls: vec![],
         }];
     }
-    messages.insert(
-        0,
-        ChatMessage {
-            role: "user".into(),
-            content: format!("[Task spec]\n{prepared_spec}"),
-            tool_call_id: String::new(),
-            tool_calls: vec![],
-        },
-    );
+    let task_message = ChatMessage {
+        role: "user".into(),
+        content: format!("[Task spec]\n{prepared_spec}"),
+        tool_call_id: String::new(),
+        tool_calls: vec![],
+    };
+    // A pending assistant tool call must remain adjacent to its tool result.
+    // Such a history is not cacheable across the current governed task spec.
+    if messages
+        .last()
+        .is_some_and(|message| !message.tool_calls.is_empty())
+    {
+        messages.insert(0, task_message);
+    } else {
+        messages.push(task_message);
+    }
     messages
+}
+
+fn native_cacheable_message_count(input: &ExecutionInput, prepared: &[ChatMessage]) -> usize {
+    let has_dynamic_spec = !input.spec.is_empty() || prepared.len() > input.messages.len();
+    if has_dynamic_spec
+        && prepared
+            .first()
+            .is_some_and(|message| message.content.starts_with("[Task spec]\n"))
+    {
+        0
+    } else if has_dynamic_spec {
+        input.messages.len().min(prepared.len())
+    } else {
+        prepared.len().saturating_sub(1)
+    }
 }
 
 fn eval_iteration_pb(iteration: crate::chisei::eval::Iteration) -> EvalIteration {
@@ -6272,7 +6295,16 @@ impl ChiseiService for ChiseiServiceImpl {
             &plan.memory_holdouts,
         )?;
         self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
-        let chat = match execute_chat_request(&self.config, self.budget.clone(), llm_req).await {
+        let cacheable_message_count =
+            native_cacheable_message_count(&input, &plan.prepared_messages);
+        let chat = match execute_native_chat_request(
+            &self.config,
+            self.budget.clone(),
+            llm_req,
+            cacheable_message_count,
+        )
+        .await
+        {
             Ok(chat) => chat,
             Err(status) => {
                 record_failed_operation_on(&self.db, &plan, &actor, "model_call_failed")
@@ -6295,6 +6327,8 @@ impl ChiseiService for ChiseiServiceImpl {
             output_tokens: chat.output_tokens,
             stop_reason: chat.stop_reason.clone(),
             provider: provider.clone(),
+            cache_read_input_tokens: chat.cache_read_input_tokens,
+            cache_creation_input_tokens: chat.cache_creation_input_tokens,
         };
         if let Err(error) = self.record_evolve_task(
             &input.request_id,
@@ -6486,20 +6520,23 @@ impl ChiseiService for ChiseiServiceImpl {
             &plan.memory_holdouts,
         )?;
         self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
-        let chat_stream =
-            match execute_chat_request_stream(&self.config, self.budget.clone(), llm_req).await {
-                Ok(stream) => stream,
-                Err(status) => {
-                    record_failed_operation_on(
-                        &self.db,
-                        &plan,
-                        &actor,
-                        "model_stream_start_failed",
-                    )
+        let cacheable_message_count =
+            native_cacheable_message_count(&input, &plan.prepared_messages);
+        let chat_stream = match execute_native_chat_request_stream(
+            &self.config,
+            self.budget.clone(),
+            llm_req,
+            cacheable_message_count,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(status) => {
+                record_failed_operation_on(&self.db, &plan, &actor, "model_stream_start_failed")
                     .map_err(Status::internal)?;
-                    return Err(status);
-                }
-            };
+                return Err(status);
+            }
+        };
         let db = self.db.clone();
         let evolve_history = self.evolve_history.clone();
         let request_id = input.request_id.clone();
@@ -6521,6 +6558,8 @@ impl ChiseiService for ChiseiServiceImpl {
             let mut tool_calls = Vec::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
+            let mut cache_read_input_tokens = 0;
+            let mut cache_creation_input_tokens = 0;
             let mut stop_reason = String::new();
             let mut finished = false;
 
@@ -6556,6 +6595,12 @@ impl ChiseiService for ChiseiServiceImpl {
                 if chunk.output_tokens > 0 {
                     output_tokens = chunk.output_tokens;
                 }
+                if chunk.cache_read_input_tokens > 0 {
+                    cache_read_input_tokens = chunk.cache_read_input_tokens;
+                }
+                if chunk.cache_creation_input_tokens > 0 {
+                    cache_creation_input_tokens = chunk.cache_creation_input_tokens;
+                }
                 if !chunk.stop_reason.is_empty() {
                     stop_reason = chunk.stop_reason.clone();
                 }
@@ -6575,6 +6620,8 @@ impl ChiseiService for ChiseiServiceImpl {
                         output_tokens,
                         stop_reason: stop_reason.clone(),
                         provider: provider.clone(),
+                        cache_read_input_tokens,
+                        cache_creation_input_tokens,
                     };
                     let execution = FinishStreamedExecution {
                         db: &db,
@@ -6634,6 +6681,8 @@ impl ChiseiService for ChiseiServiceImpl {
                     output_tokens,
                     stop_reason,
                     provider,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
                 };
                 let execution = FinishStreamedExecution {
                     db: &db,
@@ -8306,22 +8355,22 @@ mod tests {
         assert_eq!(
             build_prepared_messages(&input, "original task"),
             vec![
-                user_message("[Task spec]\noriginal task"),
                 user_message("conversation context"),
+                user_message("[Task spec]\noriginal task"),
             ]
         );
         assert_eq!(
             build_prepared_messages(&input, "enriched task"),
             vec![
-                user_message("[Task spec]\nenriched task"),
                 user_message("conversation context"),
+                user_message("[Task spec]\nenriched task"),
             ]
         );
         assert_eq!(
             build_prepared_messages(&input, ""),
             vec![
-                user_message("[Task spec]\noriginal task"),
                 user_message("conversation context"),
+                user_message("[Task spec]\noriginal task"),
             ]
         );
     }
@@ -8449,6 +8498,8 @@ mod tests {
             output_tokens: 1,
             stop_reason: "tool_use".into(),
             provider: "native".into(),
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         };
         assert_ne!(
             planned_response_hash(&response("read")),
@@ -12155,6 +12206,8 @@ mod tests {
                 output_tokens: 4,
                 stop_reason: "end_turn".into(),
                 provider: "native".into(),
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
             plan.created_at,
             plan.created_at,

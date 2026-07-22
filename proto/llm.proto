@@ -35,6 +35,8 @@ message ChatResponse {
   int32 input_tokens = 3;
   int32 output_tokens = 4;
   string stop_reason = 5;
+  int32 cache_read_input_tokens = 6;
+  int32 cache_creation_input_tokens = 7;
 }
 
 message ChatStreamChunk {
@@ -45,6 +47,8 @@ message ChatStreamChunk {
   int32 output_tokens = 5;
   string stop_reason = 6;
   bool done = 7;
+  int32 cache_read_input_tokens = 8;
+  int32 cache_creation_input_tokens = 9;
 }
 
 message ResolveProviderRequest { string model = 1; }
