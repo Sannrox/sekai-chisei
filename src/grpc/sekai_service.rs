@@ -3813,8 +3813,192 @@ fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
     }
 }
 
+fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
+    use crate::sekai::lease::LeaseError;
+    match error {
+        LeaseError::Invalid(message) => Status::invalid_argument(message),
+        LeaseError::Conflict(message) => Status::already_exists(message),
+        LeaseError::Stale(message) => Status::failed_precondition(message),
+        LeaseError::NotExpired => Status::failed_precondition("lease has not expired"),
+        LeaseError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn to_proto_lease(lease: &crate::sekai::lease::Lease) -> Lease {
+    Lease {
+        namespace: lease.namespace.clone(),
+        key: lease.key.clone(),
+        generation: lease.generation,
+        fencing_token: lease.fencing_token.clone(),
+        owner: lease.owner.clone(),
+        status: lease.status.clone(),
+        acquired_at_ms: lease.acquired_at_ms,
+        refreshed_at_ms: lease.refreshed_at_ms,
+        expires_at_ms: lease.expires_at_ms,
+        released_at_ms: lease.released_at_ms,
+    }
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
+    async fn acquire_lease(
+        &self,
+        req: Request<AcquireLeaseRequest>,
+    ) -> Result<Response<AcquireLeaseResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let lease = self
+            .db
+            .acquire_lease(
+                &input.namespace,
+                &input.key,
+                &input.owner,
+                input.ttl_ms,
+                &input.request_id,
+                &actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        Ok(Response::new(AcquireLeaseResponse {
+            lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
+    async fn get_lease(
+        &self,
+        req: Request<GetLeaseRequest>,
+    ) -> Result<Response<GetLeaseResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &input.namespace,
+            false,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, false)?;
+        let lease = self
+            .db
+            .get_lease(&input.namespace, &input.key)
+            .map_err(map_lease_error)?
+            .ok_or(Status::not_found("lease not found"))?;
+        Ok(Response::new(GetLeaseResponse {
+            lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
+    async fn refresh_lease(
+        &self,
+        req: Request<RefreshLeaseRequest>,
+    ) -> Result<Response<RefreshLeaseResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let lease = self
+            .db
+            .refresh_lease(
+                &input.namespace,
+                &input.key,
+                &input.fencing_token,
+                input.ttl_ms,
+                &input.request_id,
+                &actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        Ok(Response::new(RefreshLeaseResponse {
+            lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
+    async fn release_lease(
+        &self,
+        req: Request<ReleaseLeaseRequest>,
+    ) -> Result<Response<ReleaseLeaseResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let lease = self
+            .db
+            .release_lease(
+                &input.namespace,
+                &input.key,
+                &input.fencing_token,
+                &input.request_id,
+                &actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        Ok(Response::new(ReleaseLeaseResponse {
+            lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
+    async fn takeover_expired_lease(
+        &self,
+        req: Request<TakeoverExpiredLeaseRequest>,
+    ) -> Result<Response<TakeoverExpiredLeaseResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let lease = self
+            .db
+            .takeover_expired_lease(
+                &input.namespace,
+                &input.key,
+                &input.owner,
+                &input.expected_fencing_token,
+                input.expected_expires_at_ms,
+                input.ttl_ms,
+                &input.request_id,
+                &actor,
+                now_millis(),
+            )
+            .map_err(map_lease_error)?;
+        Ok(Response::new(TakeoverExpiredLeaseResponse {
+            lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
     async fn create_handoff(
         &self,
         req: Request<CreateHandoffRequest>,
