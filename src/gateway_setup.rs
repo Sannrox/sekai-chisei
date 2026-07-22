@@ -816,6 +816,7 @@ async fn ensure_gateway_objects(
     ] {
         let _ = sekai
             .create_link(gateway_request(CreateLinkRequest {
+                fail_if_exists: false,
                 link: Some(Link {
                     id,
                     from_id: from_id.to_string(),
