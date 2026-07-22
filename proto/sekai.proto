@@ -831,6 +831,31 @@ message RevokeCredentialRequest { string principal = 1; }
 message RevokeCredentialResponse { CredentialRecord credential = 1; }
 message ListCredentialsRequest {}
 message ListCredentialsResponse { repeated CredentialRecord credentials = 1; }
+
+enum TenantLifecycleState {
+  TENANT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  TENANT_LIFECYCLE_STATE_ACTIVE = 1;
+  TENANT_LIFECYCLE_STATE_SUSPENDED = 2;
+  TENANT_LIFECYCLE_STATE_CLOSURE_PENDING = 3;
+}
+message TenantRecord {
+  string contract_version = 1;
+  string id = 2;
+  TenantLifecycleState state = 3;
+  int64 created_at_ms = 4;
+  int64 updated_at_ms = 5;
+}
+message CreateTenantRequest { string idempotency_key = 1; }
+message CreateTenantResponse { TenantRecord tenant = 1; }
+message GetTenantRequest { string tenant_id = 1; }
+message GetTenantResponse { TenantRecord tenant = 1; }
+message SuspendTenantRequest { string tenant_id = 1; string idempotency_key = 2; }
+message SuspendTenantResponse { TenantRecord tenant = 1; }
+message ReactivateTenantRequest { string tenant_id = 1; string idempotency_key = 2; }
+message ReactivateTenantResponse { TenantRecord tenant = 1; }
+message RequestTenantClosureRequest { string tenant_id = 1; string idempotency_key = 2; }
+message RequestTenantClosureResponse { TenantRecord tenant = 1; }
+
 message GetProvenanceReportRequest { string work_unit_id = 1; }
 message GetProvenanceReportResponse { string report = 1; }
 
@@ -1136,6 +1161,11 @@ service SekaiService {
   rpc RotateCredential(RotateCredentialRequest) returns (RotateCredentialResponse);
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  rpc GetTenant(GetTenantRequest) returns (GetTenantResponse);
+  rpc SuspendTenant(SuspendTenantRequest) returns (SuspendTenantResponse);
+  rpc ReactivateTenant(ReactivateTenantRequest) returns (ReactivateTenantResponse);
+  rpc RequestTenantClosure(RequestTenantClosureRequest) returns (RequestTenantClosureResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
   rpc RegisterEvidenceProducer(RegisterEvidenceProducerRequest) returns (RegisterEvidenceProducerResponse);
   rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);
