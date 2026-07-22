@@ -402,7 +402,7 @@ fn create_skill_temp(parent: &Path) -> Result<(PathBuf, File), Error> {
 
 fn open_existing_skill(target: &Path) -> Result<(File, String), Error> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true);
+    options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
