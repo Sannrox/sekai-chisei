@@ -856,6 +856,22 @@ message ReactivateTenantResponse { TenantRecord tenant = 1; }
 message RequestTenantClosureRequest { string tenant_id = 1; string idempotency_key = 2; }
 message RequestTenantClosureResponse { TenantRecord tenant = 1; }
 
+message NamespaceOwnership {
+  string contract_version = 1;
+  string namespace = 2;
+  string tenant_id = 3;
+  string migrated_from_namespace = 4;
+  int64 created_at_ms = 5;
+}
+message CreateTenantNamespaceRequest {
+  string namespace = 1;
+  string tenant_id = 2;
+  string migrated_from_namespace = 3;
+}
+message CreateTenantNamespaceResponse { NamespaceOwnership ownership = 1; }
+message GetNamespaceOwnershipRequest { string namespace = 1; }
+message GetNamespaceOwnershipResponse { NamespaceOwnership ownership = 1; }
+
 message GetProvenanceReportRequest { string work_unit_id = 1; }
 message GetProvenanceReportResponse { string report = 1; }
 
@@ -1166,6 +1182,8 @@ service SekaiService {
   rpc SuspendTenant(SuspendTenantRequest) returns (SuspendTenantResponse);
   rpc ReactivateTenant(ReactivateTenantRequest) returns (ReactivateTenantResponse);
   rpc RequestTenantClosure(RequestTenantClosureRequest) returns (RequestTenantClosureResponse);
+  rpc CreateTenantNamespace(CreateTenantNamespaceRequest) returns (CreateTenantNamespaceResponse);
+  rpc GetNamespaceOwnership(GetNamespaceOwnershipRequest) returns (GetNamespaceOwnershipResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
   rpc RegisterEvidenceProducer(RegisterEvidenceProducerRequest) returns (RegisterEvidenceProducerResponse);
   rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);

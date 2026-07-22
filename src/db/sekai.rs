@@ -143,6 +143,7 @@ impl SekaiDb {
         self.migrate_audit()?;
         self.migrate_ledger()?;
         self.migrate_tenants()?;
+        self.migrate_namespace_ownership()?;
         self.migrate_retention()?;
         self.migrate_attestations()?;
         self.migrate_task_observations()?;
@@ -946,6 +947,26 @@ impl SekaiDb {
             params![external_id],
             row_to_object,
         ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn find_by_external_id_for_tenant(
+        &self,
+        external_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<Object>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT object.id,object.kind,object.name,object.namespace,object.external_id,
+                    object.properties,object.created,object.updated
+             FROM sekai_objects object
+             JOIN sekai_namespace_ownership ownership ON ownership.namespace=object.namespace
+             WHERE object.external_id=?1 AND ownership.tenant_id=?2
+             ORDER BY object.id LIMIT 1",
+            params![external_id, tenant_id],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
     }
 
     pub fn find_by_property(
