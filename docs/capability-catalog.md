@@ -48,6 +48,42 @@ namespace membership, object ACLs, policy, budgets, approval, object state, and
 current schema. A previously visible action can therefore be denied or held
 for approval later.
 
+## Governed invocation binding
+
+The v1 receipt-attributed binding covers typed object-query entries and
+governed-action entries. Invoke those entries through the canonical RPC named
+by `input_type` and send `x-sekai-capability` with the discovered capability
+name. Action calls also send `x-sekai-namespace`; query calls use the namespace
+in their existing filter. An optional `x-sekai-operation-id` supplies caller
+correlation and is atomically reserved before an effectful action. The server
+generates one when omitted and returns the effective identifier on successful
+response metadata. Callers that need to correlate a refused or failed RPC must
+supply the header, because generic gRPC error propagation does not guarantee
+generated response metadata. Traverse, context retrieval, and Kioku candidate
+entries continue to use their canonical governed RPCs but do not yet
+participate in this receipt-attribution metadata contract.
+
+The binding is deliberately not a generic execution endpoint. Before entering
+the normal query or action implementation, the server rebuilds the catalog for
+the authenticated authorization context and verifies that the named entry is
+still visible and matches the requested object kind or action type. A revoked
+credential, removed grant, changed action policy, or unavailable capability is
+therefore enforced even when the caller cached an older catalog.
+
+Attributed invocations write a canonical `operation.receipt/v1` record with
+intent, live policy, native routing, budget-check, and outcome events. Receipt
+and audit evidence contain principal identifiers and opaque approval or permit
+references, never bearer tokens, token hashes, provider secrets, or request
+authorization metadata.
+
+Runtime authentication continues to use scoped principal credentials. Tokens
+are returned only when issued, stored as hashes, resolved to the runtime
+principal by the transport interceptor, and revocable through the existing
+credential administration RPCs. Host-executed effects use the narrower signed
+permit and delegation-chain contracts documented in
+`external-action-execution.md`; catalog discovery does not mint or extend
+either form of authority.
+
 ## Related capability surfaces
 
 `GET /v1/chisei/capabilities` describes effective provider protocol features
