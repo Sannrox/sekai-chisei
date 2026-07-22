@@ -2132,6 +2132,7 @@ impl ChiseiServiceImpl {
                     final_route_bias,
                     safe_only,
                     &safe_providers,
+                    None,
                 )
                 .await
                 .unwrap_or_else(|_| resolved_model.clone())
@@ -2789,6 +2790,7 @@ impl ChiseiServiceImpl {
                 },
                 safe_only,
                 safe_providers,
+                None,
                 !route_override.is_empty(),
             )
             .await
@@ -3124,6 +3126,7 @@ impl ChiseiServiceImpl {
         route_bias: Option<&str>,
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
+        requirements: Option<&crate::provider_profile::CapabilityRequirements>,
     ) -> Result<String, String> {
         self.resolve_live_model_with_override(
             model,
@@ -3131,11 +3134,13 @@ impl ChiseiServiceImpl {
             route_bias,
             safe_only,
             safe_providers,
+            requirements,
             false,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_live_model_with_override(
         &self,
         model: &str,
@@ -3143,6 +3148,7 @@ impl ChiseiServiceImpl {
         route_bias: Option<&str>,
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
+        requirements: Option<&crate::provider_profile::CapabilityRequirements>,
         exact_override: bool,
     ) -> Result<String, String> {
         validate_explicit_requested_model(model)?;
@@ -3177,6 +3183,7 @@ impl ChiseiServiceImpl {
             ollama_models: &discovered_ollama,
             available_models: &available_models,
             authoritative_providers: &availability.authoritative_providers,
+            requirements,
             safe_only,
             safe_providers,
         };
@@ -5161,6 +5168,20 @@ impl ChiseiService for ChiseiServiceImpl {
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let r = req.into_inner();
+        let capability_requirements = if r.capability_requirements_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice::<crate::provider_profile::CapabilityRequirements>(
+                    &r.capability_requirements_json,
+                )
+                .map_err(|error| {
+                    Status::invalid_argument(format!(
+                        "invalid capability requirements: {error}"
+                    ))
+                })?,
+            )
+        };
         let scopes = policy_scopes(&r);
         let (policy_scope, effective_policy) = self
             .policy
@@ -5251,7 +5272,10 @@ impl ChiseiService for ChiseiServiceImpl {
         let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
         // Resolve the capable-tier model first; this is the baseline the request
         // would get with no cost tiering.
-        let capable_model = if r.preferred_model == "auto" && effective_policy.is_none() {
+        let capable_model = if r.preferred_model == "auto"
+            && effective_policy.is_none()
+            && capability_requirements.is_none()
+        {
             let resolved = crate::provider_resolution::resolve_model(&model)
                 .map_err(Status::failed_precondition)?;
             if resolved.provider != runtime {
@@ -5277,11 +5301,14 @@ impl ChiseiService for ChiseiServiceImpl {
                 None,
                 safe_only,
                 &safe_providers,
+                capability_requirements.as_ref(),
                 !route_override.is_empty(),
             )
             .await
             .map_err(|err| {
-                if safe_only {
+                if err.starts_with("capability_unsupported:") {
+                    Status::failed_precondition(err)
+                } else if safe_only {
                     Status::permission_denied(format!(
                         "{}: {err}",
                         crate::chisei::privacy::gate_reason(data_class, task_class, "unsafe")
@@ -5341,6 +5368,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 Some("cheap"),
                 safe_only,
                 &safe_providers,
+                capability_requirements.as_ref(),
             )
             .await
             .ok()
@@ -5365,6 +5393,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 Some("cheap"),
                 safe_only,
                 &safe_providers,
+                capability_requirements.as_ref(),
             )
             .await
             .ok()
@@ -5451,6 +5480,7 @@ impl ChiseiService for ChiseiServiceImpl {
                             None,
                             safe_only,
                             &safe_providers,
+                            capability_requirements.as_ref(),
                         )
                         .await
                     && proposed == allocation.model
@@ -5476,6 +5506,7 @@ impl ChiseiService for ChiseiServiceImpl {
                             None,
                             safe_only,
                             &safe_providers,
+                            capability_requirements.as_ref(),
                         )
                         .await
                     && selected == selection.model
@@ -8960,6 +8991,7 @@ mod tests {
                 None,
                 false,
                 &std::collections::HashSet::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -10102,6 +10134,7 @@ mod tests {
             expected_calls: 1,
             budget_route_bias: String::new(),
             route_override: String::new(),
+            capability_requirements_json: Vec::new(),
         }
     }
 
@@ -13196,6 +13229,7 @@ mod tests {
                 expected_calls: 1,
                 budget_route_bias: String::new(),
                 route_override: String::new(),
+                capability_requirements_json: Vec::new(),
             }))
             .await
             .expect_err("sensitive private preflight should deny unsafe provider");
