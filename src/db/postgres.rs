@@ -23,6 +23,56 @@ const NAMESPACE_OWNERSHIP_SCHEMA: &str = include_str!("postgres/0006_namespace_o
 const TENANT_MEMBERSHIP_SCHEMA: &str = include_str!("postgres/0007_tenant_memberships.sql");
 const TENANT_CREDENTIAL_SCHEMA: &str = include_str!("postgres/0008_tenant_credentials.sql");
 
+#[derive(Clone, Copy)]
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "control_plane",
+        sql: CONTROL_PLANE_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        name: "sample_leases",
+        sql: SAMPLE_LEASE_SCHEMA,
+    },
+    Migration {
+        version: 3,
+        name: "unique_grants",
+        sql: UNIQUE_GRANT_SCHEMA,
+    },
+    Migration {
+        version: 4,
+        name: "portfolio_prompt_variants",
+        sql: PORTFOLIO_PROMPT_VARIANT_SCHEMA,
+    },
+    Migration {
+        version: 5,
+        name: "tenants",
+        sql: TENANT_SCHEMA,
+    },
+    Migration {
+        version: 6,
+        name: "namespace_ownership",
+        sql: NAMESPACE_OWNERSHIP_SCHEMA,
+    },
+    Migration {
+        version: 7,
+        name: "tenant_memberships",
+        sql: TENANT_MEMBERSHIP_SCHEMA,
+    },
+    Migration {
+        version: 8,
+        name: "tenant_credentials",
+        sql: TENANT_CREDENTIAL_SCHEMA,
+    },
+];
+
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
 /// Shared PostgreSQL connection pool used by the HA storage backend.
@@ -248,6 +298,10 @@ impl PostgresDb {
     }
 
     fn migrate(&self) -> Result<(), String> {
+        self.migrate_with(MIGRATIONS)
+    }
+
+    fn migrate_with(&self, migrations: &[Migration]) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -264,151 +318,65 @@ impl PostgresDb {
                 );",
             )
             .map_err(|error| format!("initialize PostgreSQL migrations: {error}"))?;
-        let applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&1_i64],
+        let rows = transaction
+            .query(
+                "SELECT version, name FROM sekai_schema_migrations ORDER BY version",
+                &[],
             )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !applied {
-            transaction
-                .batch_execute(CONTROL_PLANE_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL control-plane schema: {error}"))?;
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?;
+        if rows.len() > migrations.len() {
+            let version: i64 = rows[migrations.len()].get(0);
+            return Err(format!(
+                "PostgreSQL schema version {version} is newer than supported version {}; upgrade sekai-chisei before startup",
+                migrations.last().map_or(0, |migration| migration.version)
+            ));
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let version: i64 = row.get(0);
+            let name: String = row.get(1);
+            let expected = &migrations[index];
+            if version != expected.version || name != expected.name {
+                return Err(format!(
+                    "incompatible PostgreSQL migration history at position {}: found version {version} ({name}), expected version {} ({}); restore a compatible schema before startup",
+                    index + 1,
+                    expected.version,
+                    expected.name
+                ));
+            }
+        }
+        for migration in &migrations[rows.len()..] {
+            tracing::info!(
+                version = migration.version,
+                name = migration.name,
+                "applying PostgreSQL migration"
+            );
+            transaction.batch_execute(migration.sql).map_err(|error| {
+                format!(
+                    "apply PostgreSQL migration {} ({}): {error}",
+                    migration.version, migration.name
+                )
+            })?;
             transaction
                 .execute(
                     "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&1_i64, &"control_plane", &chrono::Utc::now().timestamp_millis()],
+                    &[&migration.version, &migration.name, &chrono::Utc::now().timestamp_millis()],
                 )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let sample_leases_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&2_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !sample_leases_applied {
-            transaction
-                .batch_execute(SAMPLE_LEASE_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL sample leases: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&2_i64, &"sample_leases", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let unique_grants_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&3_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !unique_grants_applied {
-            transaction
-                .batch_execute(UNIQUE_GRANT_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL unique grants: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&3_i64, &"unique_grants", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let portfolio_prompt_variants_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&4_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !portfolio_prompt_variants_applied {
-            transaction
-                .batch_execute(PORTFOLIO_PROMPT_VARIANT_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL portfolio prompt variants: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&4_i64, &"portfolio_prompt_variants", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let tenants_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&5_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !tenants_applied {
-            transaction
-                .batch_execute(TENANT_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL tenant schema: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&5_i64, &"tenants", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let namespace_ownership_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&6_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !namespace_ownership_applied {
-            transaction
-                .batch_execute(NAMESPACE_OWNERSHIP_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL namespace ownership: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&6_i64, &"namespace_ownership", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let tenant_memberships_applied = transaction
-            .query_opt(
-                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
-                &[&7_i64],
-            )
-            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
-            .is_some();
-        if !tenant_memberships_applied {
-            transaction
-                .batch_execute(TENANT_MEMBERSHIP_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL tenant memberships: {error}"))?;
-            transaction
-                .execute(
-                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                    &[&7_i64, &"tenant_memberships", &chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
-        }
-        let tenant_credentials_applied = transaction
-            .query_opt(
-                "SELECT 1 FROM sekai_schema_migrations WHERE version = $1",
-                &[&8_i64],
-            )
-            .map_err(|error| format!("check PostgreSQL tenant credential migration: {error}"))?
-            .is_some();
-        if !tenant_credentials_applied {
-            transaction
-                .batch_execute(TENANT_CREDENTIAL_SCHEMA)
-                .map_err(|error| format!("apply PostgreSQL tenant credentials: {error}"))?;
-            transaction.execute(
-                "INSERT INTO sekai_schema_migrations (version,name,applied_at) VALUES ($1,$2,$3)",
-                &[&8_i64, &"tenant_credentials", &chrono::Utc::now().timestamp_millis()],
-            ).map_err(|error| format!("record PostgreSQL tenant credential migration: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "record PostgreSQL migration {} ({}): {error}",
+                        migration.version, migration.name
+                    )
+                })?;
         }
         transaction
             .commit()
-            .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
+            .map_err(|error| format!("commit PostgreSQL migrations: {error}"))?;
+        tracing::info!(
+            schema_version = migrations.last().map_or(0, |migration| migration.version),
+            newly_applied = migrations.len() - rows.len(),
+            "PostgreSQL migrations complete"
+        );
+        Ok(())
     }
 }
 
@@ -434,6 +402,44 @@ fn secure_config(database_url: &str) -> Result<PostgresConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    const TEST_DATABASE_URL_ENV: &str = "SEKAI_TEST_POSTGRES_URL";
+    static POSTGRES_MIGRATION_TEST: Mutex<()> = Mutex::new(());
+
+    fn test_database() -> PostgresDb {
+        let database_url = std::env::var(TEST_DATABASE_URL_ENV).unwrap_or_else(|_| {
+            panic!("{TEST_DATABASE_URL_ENV} must point to an isolated PostgreSQL test database")
+        });
+        if let Ok(ca_certificate_path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_test_ca(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        }
+    }
+
+    fn reset_database(db: &PostgresDb) {
+        db.connection()
+            .unwrap()
+            .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+            .unwrap();
+    }
+
+    fn migration_rows(db: &PostgresDb) -> Vec<(i64, String)> {
+        db.connection()
+            .unwrap()
+            .query(
+                "SELECT version, name FROM sekai_schema_migrations ORDER BY version",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
 
     #[test]
     fn rejects_invalid_configuration_before_connecting() {
@@ -502,5 +508,179 @@ mod tests {
             PORTFOLIO_PROMPT_VARIANT_SCHEMA
                 .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")
         );
+    }
+
+    #[test]
+    fn migration_manifest_is_contiguous_and_named() {
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(migration.version, index as i64 + 1);
+            assert!(!migration.name.is_empty());
+            assert!(!migration.sql.trim().is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn fresh_database_applies_every_migration_once() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+
+        let expected: Vec<_> = MIGRATIONS
+            .iter()
+            .map(|migration| (migration.version, migration.name.to_owned()))
+            .collect();
+        assert_eq!(migration_rows(&db), expected);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn upgrades_every_supported_prior_version_without_reset() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+
+        for prior_version in 0..MIGRATIONS.len() {
+            reset_database(&db);
+            db.migrate_with(&MIGRATIONS[..prior_version]).unwrap();
+            let marker = format!("upgrade-marker-{prior_version}");
+            db.connection()
+                .unwrap()
+                .execute(
+                    "CREATE TABLE migration_upgrade_marker (value TEXT NOT NULL)",
+                    &[],
+                )
+                .unwrap();
+            db.connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO migration_upgrade_marker (value) VALUES ($1)",
+                    &[&marker],
+                )
+                .unwrap();
+
+            db.migrate().unwrap();
+
+            let preserved: String = db
+                .connection()
+                .unwrap()
+                .query_one("SELECT value FROM migration_upgrade_marker", &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(preserved, marker);
+            assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn concurrent_migrators_serialize_and_converge() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        let database_url = std::env::var(TEST_DATABASE_URL_ENV).unwrap();
+        let ca_certificate = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT")
+            .ok()
+            .map(|path| std::fs::read(path).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let database_url = database_url.clone();
+            let ca_certificate = ca_certificate.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                match ca_certificate {
+                    Some(certificate) => {
+                        PostgresDb::connect_with_test_ca(&database_url, 2, &certificate)
+                    }
+                    None => PostgresDb::connect(&database_url, 2),
+                }
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn failed_migration_rolls_back_schema_and_version() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        db.migrate().unwrap();
+        let mut migrations = MIGRATIONS.to_vec();
+        migrations.push(Migration {
+            version: 9,
+            name: "deliberate_failure_fixture",
+            sql: "CREATE TABLE migration_must_roll_back (id BIGINT); SELECT missing_function();",
+        });
+
+        let error = db.migrate_with(&migrations).unwrap_err();
+
+        assert!(error.contains("migration 9 (deliberate_failure_fixture)"));
+        assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+        let table: Option<String> = db
+            .connection()
+            .unwrap()
+            .query_one(
+                "SELECT to_regclass('public.migration_must_roll_back')::text",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(table.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn rejects_future_and_incompatible_migration_history() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        db.migrate().unwrap();
+        db.connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                &[&9_i64, &"future", &0_i64],
+            )
+            .unwrap();
+        let error = db.migrate().unwrap_err();
+        assert!(error.contains("newer than supported version 8"), "{error}");
+
+        reset_database(&db);
+        db.migrate_with(&MIGRATIONS[..1]).unwrap();
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE sekai_schema_migrations SET name = 'operator_modified' WHERE version = 1",
+                &[],
+            )
+            .unwrap();
+        let error = db.migrate().unwrap_err();
+        assert!(
+            error.contains("incompatible PostgreSQL migration history"),
+            "{error}"
+        );
+        assert!(error.contains("restore a compatible schema"), "{error}");
+
+        reset_database(&db);
+        db.migrate().unwrap();
     }
 }
