@@ -159,9 +159,14 @@ entries commit atomically and use durable idempotency keys.
 
 Only an active tenant may admit new governed work. Suspension and
 `closure_pending` preserve existing records; neither state performs physical
-deletion. Tenant-to-namespace ownership and request tenant context are added by
-the subsequent tenant-owned namespace contract, so explicit local operation
-continues without a synthetic tenant.
+deletion. In authenticated non-local operation, every namespace is bound once
+through `namespace-ownership.v1`, and namespace-scoped requests carry
+`x-sekai-tenant-id`. The service checks that context before object data access;
+missing or mismatched context fails closed, and writes additionally require an
+active tenant. Ownership cannot be changed in place. `CreateTenantNamespace`
+can instead create a new boundary with `migrated_from_namespace` provenance so
+data migration remains explicit. The local interceptor bypasses tenant lookup
+and never creates a synthetic tenant.
 
 ## Trust boundaries
 
