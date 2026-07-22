@@ -109,6 +109,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
             expected_calls: 1,
             budget_route_bias: String::new(),
             route_override: String::new(),
+            capability_requirements_json: Vec::new(),
         })
         .await
         .expect("resolve policy")

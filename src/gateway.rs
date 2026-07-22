@@ -2605,6 +2605,7 @@ async fn proxy_gateway_inner_scoped(
             &request_id,
             work_unit_id.as_deref(),
             &failure_posture,
+            capability_surface,
         )
         .await
         {
@@ -3385,6 +3386,18 @@ fn is_transient_governance_status(status: &tonic::Status) -> bool {
 }
 
 fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
+    if status.code() == tonic::Code::FailedPrecondition
+        && status.message().starts_with("capability_unsupported:")
+    {
+        return GatewayRejection::json(
+            StatusCode::BAD_REQUEST,
+            "capability_unsupported",
+            status
+                .message()
+                .trim_start_matches("capability_unsupported:")
+                .trim(),
+        );
+    }
     let (http_status, error_type) = match status.code() {
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
             (StatusCode::FORBIDDEN, "governance_denied")
@@ -4085,6 +4098,7 @@ fn policy_cache_key(
     requested_model: &str,
     task_class: &str,
     budget: &BudgetPreflight,
+    capability_requirements: &str,
 ) -> String {
     governance_cache_key(&[
         "policy-v1",
@@ -4095,6 +4109,7 @@ fn policy_cache_key(
         requested_model,
         task_class,
         budget.route_bias.as_deref().unwrap_or_default(),
+        capability_requirements,
     ])
 }
 
@@ -4414,6 +4429,7 @@ async fn resolve_policy_preflight(
     request_id: &str,
     work_unit_id: Option<&str>,
     failure_posture: &GovernanceFailurePosture,
+    capability_surface: Option<CapabilityRequestSurface>,
 ) -> Result<PolicyPreflight, GatewayRejection> {
     let Some(requested_model) = requested_model else {
         if route_override.is_some() {
@@ -4480,7 +4496,42 @@ async fn resolve_policy_preflight(
     let cache_model = route_override
         .map(|model| format!("route-override:{model}"))
         .unwrap_or_else(|| requested_model.to_string());
-    let cache_key = policy_cache_key(identity, provider, &cache_model, task_class, budget);
+    let capability_requirements = capability_surface
+        .map(|surface| match surface {
+            CapabilityRequestSurface::Responses => {
+                CapabilityRequirements::from_responses_body(body)
+            }
+            CapabilityRequestSurface::OpenAiChat => {
+                CapabilityRequirements::from_openai_chat_body(body)
+            }
+            CapabilityRequestSurface::AnthropicMessages => {
+                CapabilityRequirements::from_anthropic_messages_body(body)
+            }
+        })
+        .transpose()
+        .map_err(|reason| {
+            GatewayRejection::json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("cannot derive request capabilities: {reason}"),
+            )
+        })?;
+    let capability_requirements_json = capability_requirements
+        .as_ref()
+        .map(|requirements| {
+            serde_json::to_vec(requirements).expect("capability requirements are serializable")
+        })
+        .unwrap_or_default();
+    let capability_cache_key = String::from_utf8(capability_requirements_json.clone())
+        .expect("serialized capability requirements are UTF-8 JSON");
+    let cache_key = policy_cache_key(
+        identity,
+        provider,
+        &cache_model,
+        task_class,
+        budget,
+        &capability_cache_key,
+    );
     let Some(target) = &config.chisei_grpc_target else {
         if route_override.is_some() {
             return Err(GatewayRejection::json(
@@ -4531,6 +4582,7 @@ async fn resolve_policy_preflight(
                 expected_calls: 1,
                 budget_route_bias: budget.route_bias.clone().unwrap_or_default(),
                 route_override: route_override.unwrap_or_default().to_string(),
+                capability_requirements_json,
             });
             match client.resolve_policy(req).await {
                 Ok(resp) => {
@@ -14798,6 +14850,21 @@ mod tests {
         assert!(error.to_string().contains("circuit is open"));
     }
 
+    #[test]
+    fn capability_routing_failure_preserves_gateway_error_type() {
+        let rejection = governance_status_rejection(&tonic::Status::failed_precondition(
+            "capability_unsupported: no available candidate can preserve required capabilities",
+        ));
+
+        assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.error_type, "capability_unsupported");
+        assert!(
+            rejection
+                .reason
+                .contains("no available candidate can preserve required capabilities")
+        );
+    }
+
     #[tokio::test]
     async fn stalled_control_plane_rpc_is_bounded_and_opens_circuit() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -16135,6 +16202,7 @@ mod tests {
                         expected_calls: 1,
                         budget_route_bias: String::new(),
                         route_override: String::new(),
+                        capability_requirements_json: Vec::new(),
                     }))
                     .await
                     .map(|_| true)
