@@ -157,6 +157,14 @@ schemas and adapters.
 
 ### Tenant lifecycle
 
+Service credentials may be explicitly bound to one tenant. Authentication
+loads that durable binding and replaces caller-supplied tenant metadata before
+authorization. Unbound compatibility credentials do not infer tenancy from the
+principal string. Tenant credential administration rechecks durable owner or
+admin membership for every operation, and credential mutations commit their
+audit decision in the same SQLite transaction as the secret-hash lifecycle
+change.
+
 The versioned `tenant.v1` record is an administrative identity above, and
 separate from, namespaces, principals, projects, and providers. Platform
 administrators can create, inspect, suspend, reactivate, or request closure of
