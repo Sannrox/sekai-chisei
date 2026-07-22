@@ -442,7 +442,8 @@ assert "claude-code" in report, report
 assert "est_cost_usd" in report, report
 # Cache reporting: the Anthropic call reported 40 cache-read tokens priced at
 # a discounted rate (3 -> 0.3 usd/1M), saving 40 * 2.7 usd/1M = $0.000108.
-assert "cache_reads" in report, report
+for column in ("cold_write", "warm_read", "misses", "hit_rate", "cached_share"):
+    assert column in report, report
 assert "cache_saved_usd" in report, report
 assert "0.000108" in report, report
 
