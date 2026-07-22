@@ -17,6 +17,8 @@ in order.
 
 - [Gateway and clients](gateway.md) — use Codex, Claude Code, OpenAI-compatible,
   or Anthropic-compatible clients.
+- [Available models](available-models.md) — enumerate the governed routable
+  model set through CLI, gRPC, or HTTP.
 - [Responses harness profile](responses-harness-profile.md) — implement the
   supported request, streaming, and error contract.
 - [`proto/`](../proto/) — inspect the native gRPC APIs.
