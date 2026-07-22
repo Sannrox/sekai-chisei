@@ -306,8 +306,7 @@ impl SekaiDb {
             tenant_id,
             subject_id,
             "membership.create",
-            "",
-            role.as_str(),
+            ("", role.as_str()),
             now_ms,
         )?;
         let membership =
@@ -357,8 +356,7 @@ impl SekaiDb {
             tenant_id,
             subject_id,
             "membership.role_change",
-            before.role.as_str(),
-            role.as_str(),
+            (before.role.as_str(), role.as_str()),
             now_ms,
         )?;
         let membership =
@@ -399,8 +397,7 @@ impl SekaiDb {
             tenant_id,
             subject_id,
             "membership.revoke",
-            before.role.as_str(),
-            "revoked",
+            (before.role.as_str(), "revoked"),
             now_ms,
         )?;
         let membership =
@@ -828,10 +825,10 @@ fn insert_membership_audit(
     tenant_id: &str,
     subject_id: &str,
     action: &str,
-    from: &str,
-    to: &str,
+    transition: (&str, &str),
     now_ms: i64,
 ) -> Result<(), TenantError> {
+    let (from, to) = transition;
     crate::sekai::ledger::insert_chained_decision(
         conn,
         &Decision {
