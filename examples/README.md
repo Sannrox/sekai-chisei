@@ -1,21 +1,21 @@
 # Examples
 
-## Bugyo reference capability host
+## Reference capability host
 
-`bugyo_reference_host` is the reference consumer for the agent-facing
+`capability_reference_host` is a host-neutral reference consumer for the agent-facing
 capability catalog. It discovers a governed action from the live namespace
 catalog, binds the projected public contract, invokes it, presents or resolves
 an approval, and retrieves the causal operation report. The host contains no
 compiled list of Chisei actions.
 
 ```bash
-BUGYO_NAMESPACE=default \
-BUGYO_CAPABILITY=sekai.actions.set_property \
-BUGYO_INPUT='{"id":"object-1","key":"status","value":"reviewed"}' \
-SEKAI_INSECURE=1 cargo run --example bugyo_reference_host
+CAPABILITY_NAMESPACE=default \
+CAPABILITY_NAME=sekai.actions.set_property \
+CAPABILITY_INPUT='{"id":"object-1","key":"status","value":"reviewed"}' \
+SEKAI_INSECURE=1 cargo run --example capability_reference_host
 ```
 
-Set `BUGYO_APPROVAL=approve` or `deny` to demonstrate operator handling when
+Set `CAPABILITY_APPROVAL=approve` or `deny` to demonstrate operator handling when
 policy holds the discovered action. Production deployments use
 `SEKAI_AUTH_TOKEN` and a scoped `SEKAI_PRINCIPAL`; insecure mode is local-only.
 

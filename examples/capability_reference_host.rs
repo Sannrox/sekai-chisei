@@ -1,4 +1,4 @@
-//! Reference Bugyo-hosted consumer of the public capability contracts.
+//! Host-neutral reference consumer of the public capability contracts.
 //!
 //! The host discovers its action at runtime, invokes the canonical Sekai RPC,
 //! handles an optional approval, and retrieves the operation receipt. It owns
@@ -57,7 +57,7 @@ fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error + Send +
 fn action_params(input: &serde_json::Value) -> Result<HashMap<String, String>, String> {
     input
         .as_object()
-        .ok_or_else(|| "BUGYO_INPUT must be a JSON object".to_string())?
+        .ok_or_else(|| "CAPABILITY_INPUT must be a JSON object".to_string())?
         .iter()
         .map(|(key, value)| {
             let value = match value {
@@ -92,12 +92,13 @@ async fn retrieve_report(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let namespace = required_env("BUGYO_NAMESPACE")?;
-    let capability_name = required_env("BUGYO_CAPABILITY")?;
-    let input: serde_json::Value = serde_json::from_str(&required_env("BUGYO_INPUT")?)?;
-    let principal = std::env::var("SEKAI_PRINCIPAL").unwrap_or_else(|_| "bugyo:reference".into());
-    let operation_id = std::env::var("BUGYO_OPERATION_ID")
-        .unwrap_or_else(|_| format!("bugyo-{}", uuid::Uuid::new_v4().simple()));
+    let namespace = required_env("CAPABILITY_NAMESPACE")?;
+    let capability_name = required_env("CAPABILITY_NAME")?;
+    let input: serde_json::Value = serde_json::from_str(&required_env("CAPABILITY_INPUT")?)?;
+    let principal =
+        std::env::var("SEKAI_PRINCIPAL").unwrap_or_else(|_| "capability:reference".into());
+    let operation_id = std::env::var("CAPABILITY_OPERATION_ID")
+        .unwrap_or_else(|_| format!("capability-{}", uuid::Uuid::new_v4().simple()));
     let endpoint = std::env::var("SEKAI_SOCKET").unwrap_or_else(|_| {
         let port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "50051".into());
         format!("http://127.0.0.1:{port}")
@@ -168,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(status) => eprintln!("invocation: {} ({})", status.message(), status.code()),
     }
     if let Some(approval_id) = approval_id {
-        match std::env::var("BUGYO_APPROVAL").as_deref() {
+        match std::env::var("CAPABILITY_APPROVAL").as_deref() {
             Ok("approve") => {
                 sekai
                     .approve_action(ApproveActionRequest { approval_id })
@@ -182,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     })
                     .await?;
             }
-            _ => eprintln!("approval pending; set BUGYO_APPROVAL=approve or deny"),
+            _ => eprintln!("approval pending; set CAPABILITY_APPROVAL=approve or deny"),
         }
     }
 
