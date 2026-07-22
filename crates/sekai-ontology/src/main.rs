@@ -1,17 +1,19 @@
 use sekai_ontology::{
-    Error, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology, TraversalDirection,
-    ValidationIssue,
+    EMBEDDED_SKILL, Error, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology,
+    TraversalDirection, ValidationIssue,
 };
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const EXIT_USAGE_OR_INPUT: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
 const EXIT_DATABASE: u8 = 4;
 const EXIT_VALIDATION: u8 = 5;
+const EXIT_ALREADY_CURRENT: u8 = 10;
+const EXIT_SKILL_DRIFT: u8 = 11;
 
 #[derive(Serialize)]
 struct Envelope<T> {
@@ -33,11 +35,14 @@ struct Arguments {
     operands: Vec<String>,
     query_options: QueryOptions,
     query_options_set: bool,
+    skill_path: Option<PathBuf>,
+    force: bool,
+    uninstall: bool,
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error}");
             if let Error::Validation(issues) = &error {
@@ -55,11 +60,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Error> {
+fn run() -> Result<ExitCode, Error> {
     let arguments = parse_arguments(env::args().skip(1))?;
     if arguments.command != "query" && arguments.query_options_set {
         return Err(Error::Input(
             "--direction, --relation, and --depth are only valid with query".into(),
+        ));
+    }
+    if arguments.command != "skill"
+        && (arguments.skill_path.is_some() || arguments.force || arguments.uninstall)
+    {
+        return Err(Error::Input(
+            "--path, --force, and --uninstall are only valid with skill".into(),
         ));
     }
     match arguments.command.as_str() {
@@ -170,6 +182,9 @@ fn run() -> Result<(), Error> {
                 }
             }
         }
+        "entity" => run_entity(&arguments)?,
+        "relation" => run_relation(&arguments)?,
+        "skill" => return run_skill(&arguments),
         "help" => print_help(),
         command => {
             return Err(Error::Input(format!(
@@ -178,7 +193,188 @@ fn run() -> Result<(), Error> {
             )));
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_entity(arguments: &Arguments) -> Result<(), Error> {
+    match arguments.operands.as_slice() {
+        [verb] if verb == "list" => {
+            let document = SqliteOntology::open_read_only(&arguments.database)?.export()?;
+            if arguments.json {
+                print_json("entity.list", document.classes)?;
+            } else {
+                for class in document.classes {
+                    println!("{}", class.name);
+                }
+            }
+        }
+        [verb, name] if verb == "show" => {
+            let ontology = SqliteOntology::open_read_only(&arguments.database)?;
+            let explanation = ontology.explain(name)?;
+            if arguments.json {
+                print_json("entity.show", explanation)?;
+            } else {
+                println!("{}", explanation.class.name);
+            }
+        }
+        _ => {
+            return Err(Error::Input(
+                "usage: sekai [--db <path>] entity <list|show <name>>".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn run_relation(arguments: &Arguments) -> Result<(), Error> {
+    expect_operands(arguments, 1, "relation list")?;
+    if arguments.operands[0] != "list" {
+        return Err(Error::Input(
+            "usage: sekai [--db <path>] relation list".into(),
+        ));
+    }
+    let relations = SqliteOntology::open_read_only(&arguments.database)?
+        .export()?
+        .relations;
+    if arguments.json {
+        print_json("relation.list", relations)?;
+    } else {
+        for relation in relations {
+            println!(
+                "{}: {} -> {}",
+                relation.name, relation.domain, relation.range
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_skill(arguments: &Arguments) -> Result<ExitCode, Error> {
+    if arguments.force && arguments.uninstall {
+        return Err(Error::Input(
+            "--force and --uninstall cannot be used together".into(),
+        ));
+    }
+    let verb = arguments.operands.first().map(String::as_str).unwrap_or("");
+    let directory = arguments
+        .skill_path
+        .clone()
+        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
+        .or_else(default_skill_path);
+    match verb {
+        "path" => {
+            expect_operands(arguments, 1, "skill path [--path <dir>]")?;
+            if arguments.force || arguments.uninstall {
+                return Err(Error::Input(
+                    "--force and --uninstall are only valid with skill install".into(),
+                ));
+            }
+            println!("{}", directory.ok_or_else(|| Error::Input("cannot resolve a user skill directory; pass --path or set SEKAI_SKILL_PATH".into()))?.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        "install" => {
+            expect_operands(
+                arguments,
+                1,
+                "skill install [--path <dir>] [--force|--uninstall]",
+            )?;
+            let target = directory.ok_or_else(|| Error::Input("cannot resolve a user skill directory; pass --path or set SEKAI_SKILL_PATH".into()))?.join("SKILL.md");
+            if arguments.uninstall {
+                return uninstall_skill(&target);
+            }
+            install_skill(&target, arguments.force)
+        }
+        _ => Err(Error::Input(
+            "usage: sekai skill <path|install> [--path <dir>] [--force|--uninstall]".into(),
+        )),
+    }
+}
+
+fn default_skill_path() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".agents/skills/sekai-ontology"))
+}
+
+fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
+    if target_is_symlink(target)? {
+        eprintln!("refusing to follow skill symlink at {}", target.display());
+        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+    }
+    if target.exists() {
+        let current = fs::read_to_string(target).map_err(|error| {
+            Error::Input(format!("cannot read '{}': {error}", target.display()))
+        })?;
+        if current == EMBEDDED_SKILL {
+            eprintln!("skill already current at {}", target.display());
+            return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
+        }
+        if !is_sekai_skill(&current) {
+            eprintln!(
+                "refusing to overwrite non-Sekai file at {}",
+                target.display()
+            );
+            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        }
+        if !force {
+            eprintln!(
+                "refusing to overwrite modified or unrecognized skill at {}; rerun with --force",
+                target.display()
+            );
+            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        }
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Input("skill target has no parent directory".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| Error::Input(format!("cannot create '{}': {error}", parent.display())))?;
+    fs::write(target, EMBEDDED_SKILL)
+        .map_err(|error| Error::Input(format!("cannot write '{}': {error}", target.display())))?;
+    println!("installed {}", target.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
+    if target_is_symlink(target)? {
+        eprintln!("refusing to follow skill symlink at {}", target.display());
+        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+    }
+    if !target.exists() {
+        eprintln!("skill is not installed at {}", target.display());
+        return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
+    }
+    let current = fs::read_to_string(target)
+        .map_err(|error| Error::Input(format!("cannot read '{}': {error}", target.display())))?;
+    if current != EMBEDDED_SKILL {
+        eprintln!(
+            "refusing to remove modified or unrecognized skill at {}",
+            target.display()
+        );
+        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+    }
+    fs::remove_file(target)
+        .map_err(|error| Error::Input(format!("cannot remove '{}': {error}", target.display())))?;
+    println!("removed {}", target.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn is_sekai_skill(content: &str) -> bool {
+    content
+        .lines()
+        .take(8)
+        .any(|line| line.trim() == "name: sekai-ontology")
+}
+
+fn target_is_symlink(target: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Input(format!(
+            "cannot inspect '{}': {error}",
+            target.display()
+        ))),
+    }
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments, Error> {
@@ -189,6 +385,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut direction_set = false;
     let mut relation_set = false;
     let mut depth_set = false;
+    let mut skill_path = None;
+    let mut force = false;
+    let mut uninstall = false;
     let mut arguments = arguments.peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -199,6 +398,14 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                 database = Some(PathBuf::from(path));
             }
             "--json" => json = true,
+            "--path" => {
+                skill_path =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        Error::Input("--path requires a directory".into())
+                    })?))
+            }
+            "--force" => force = true,
+            "--uninstall" => uninstall = true,
             "--direction" => {
                 if direction_set {
                     return Err(Error::Input(
@@ -260,6 +467,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         operands: positional.into_iter().skip(1).collect(),
         query_options,
         query_options_set: direction_set || relation_set || depth_set,
+        skill_path,
+        force,
+        uninstall,
     })
 }
 
@@ -284,7 +494,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n\nQuery defaults to --direction both --depth 1. SEKAI_DB selects the database when --db is omitted."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nQuery defaults to --direction both --depth 1. SEKAI_DB selects the database when --db is omitted. SEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {
