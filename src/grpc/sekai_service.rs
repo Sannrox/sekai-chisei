@@ -8955,6 +8955,95 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    async fn create_tenant_membership(
+        &self,
+        req: Request<CreateTenantMembershipRequest>,
+    ) -> Result<Response<CreateTenantMembershipResponse>, Status> {
+        let (actor, platform_admin, tenant_id) = membership_authority(&req)?;
+        let inner = req.into_inner();
+        let requested_tenant = require_tenant_id(&inner.tenant_id)?;
+        enforce_membership_tenant_scope(tenant_id.as_deref(), &requested_tenant)?;
+        let subject_id = require_subject_id(&inner.subject_id)?;
+        let role = membership_role(inner.role)?;
+        let membership = self
+            .db
+            .create_tenant_membership(
+                &requested_tenant,
+                &subject_id,
+                role,
+                &actor,
+                platform_admin,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(tenant_status)?;
+        Ok(Response::new(CreateTenantMembershipResponse {
+            membership: Some(to_proto_membership(membership)),
+        }))
+    }
+
+    async fn change_tenant_membership_role(
+        &self,
+        req: Request<ChangeTenantMembershipRoleRequest>,
+    ) -> Result<Response<ChangeTenantMembershipRoleResponse>, Status> {
+        let (actor, platform_admin, tenant_id) = membership_authority(&req)?;
+        let inner = req.into_inner();
+        let requested_tenant = require_tenant_id(&inner.tenant_id)?;
+        enforce_membership_tenant_scope(tenant_id.as_deref(), &requested_tenant)?;
+        let membership = self
+            .db
+            .change_tenant_membership_role(
+                &requested_tenant,
+                &require_subject_id(&inner.subject_id)?,
+                membership_role(inner.role)?,
+                &actor,
+                platform_admin,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(tenant_status)?;
+        Ok(Response::new(ChangeTenantMembershipRoleResponse {
+            membership: Some(to_proto_membership(membership)),
+        }))
+    }
+
+    async fn list_tenant_memberships(
+        &self,
+        req: Request<ListTenantMembershipsRequest>,
+    ) -> Result<Response<ListTenantMembershipsResponse>, Status> {
+        let (actor, platform_admin, tenant_id) = membership_authority(&req)?;
+        let requested_tenant = require_tenant_id(&req.get_ref().tenant_id)?;
+        enforce_membership_tenant_scope(tenant_id.as_deref(), &requested_tenant)?;
+        let memberships = self
+            .db
+            .list_tenant_memberships(&requested_tenant, &actor, platform_admin)
+            .map_err(tenant_status)?;
+        Ok(Response::new(ListTenantMembershipsResponse {
+            memberships: memberships.into_iter().map(to_proto_membership).collect(),
+        }))
+    }
+
+    async fn revoke_tenant_membership(
+        &self,
+        req: Request<RevokeTenantMembershipRequest>,
+    ) -> Result<Response<RevokeTenantMembershipResponse>, Status> {
+        let (actor, platform_admin, tenant_id) = membership_authority(&req)?;
+        let inner = req.into_inner();
+        let requested_tenant = require_tenant_id(&inner.tenant_id)?;
+        enforce_membership_tenant_scope(tenant_id.as_deref(), &requested_tenant)?;
+        let membership = self
+            .db
+            .revoke_tenant_membership(
+                &requested_tenant,
+                &require_subject_id(&inner.subject_id)?,
+                &actor,
+                platform_admin,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(tenant_status)?;
+        Ok(Response::new(RevokeTenantMembershipResponse {
+            membership: Some(to_proto_membership(membership)),
+        }))
+    }
+
     async fn rotate_credential(
         &self,
         req: Request<RotateCredentialRequest>,
@@ -9443,6 +9532,12 @@ fn tenant_status(error: crate::sekai::tenant::TenantError) -> Status {
     use crate::sekai::tenant::TenantError;
     match error {
         TenantError::NotFound => Status::not_found("tenant not found"),
+        TenantError::PermissionDenied => {
+            Status::permission_denied("tenant membership authority required")
+        }
+        TenantError::LastOwner => {
+            Status::failed_precondition("the last active tenant owner cannot be removed or demoted")
+        }
         TenantError::Conflict(message) => Status::already_exists(message),
         TenantError::InvalidTransition { from, action } => Status::failed_precondition(format!(
             "cannot {action} tenant in {} state",
@@ -9480,6 +9575,86 @@ fn to_proto_namespace_ownership(
         tenant_id: ownership.tenant_id,
         migrated_from_namespace: ownership.migrated_from_namespace,
         created_at_ms: ownership.created_at_ms,
+    }
+}
+
+fn membership_authority(
+    req: &Request<impl std::any::Any>,
+) -> Result<(String, bool, Option<String>), Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    let actor = principals
+        .into_iter()
+        .next()
+        .ok_or_else(|| Status::unauthenticated("authenticated principal required"))?;
+    let platform_admin = matches!(actor.as_str(), "root" | "local");
+    let tenant_id = request_tenant_context(req)?;
+    if platform_admin {
+        return Ok((actor, true, tenant_id));
+    }
+    let tenant = tenant_id
+        .as_deref()
+        .ok_or_else(|| Status::permission_denied("tenant context required"))?;
+    let subject = actor
+        .strip_prefix(&format!("{tenant}."))
+        .ok_or_else(|| Status::permission_denied("tenant principal mismatch"))?;
+    Ok((require_subject_id(subject)?, false, tenant_id))
+}
+
+fn enforce_membership_tenant_scope(
+    tenant_context: Option<&str>,
+    tenant_id: &str,
+) -> Result<(), Status> {
+    if tenant_context.is_some_and(|context| context != tenant_id) {
+        Err(Status::permission_denied("tenant context mismatch"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_subject_id(value: &str) -> Result<String, Status> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 200
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+    {
+        return Err(Status::invalid_argument(
+            "subject_id must match [a-zA-Z0-9._-]+ and be at most 200 characters",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn membership_role(value: i32) -> Result<crate::sekai::tenant::TenantRole, Status> {
+    match TenantMembershipRole::try_from(value).ok() {
+        Some(TenantMembershipRole::Owner) => Ok(crate::sekai::tenant::TenantRole::Owner),
+        Some(TenantMembershipRole::Admin) => Ok(crate::sekai::tenant::TenantRole::Admin),
+        Some(TenantMembershipRole::Member) => Ok(crate::sekai::tenant::TenantRole::Member),
+        Some(TenantMembershipRole::BillingViewer) => {
+            Ok(crate::sekai::tenant::TenantRole::BillingViewer)
+        }
+        _ => Err(Status::invalid_argument("tenant membership role required")),
+    }
+}
+
+fn to_proto_membership(membership: crate::sekai::tenant::TenantMembership) -> TenantMembership {
+    let role = match membership.role {
+        crate::sekai::tenant::TenantRole::Owner => TenantMembershipRole::Owner,
+        crate::sekai::tenant::TenantRole::Admin => TenantMembershipRole::Admin,
+        crate::sekai::tenant::TenantRole::Member => TenantMembershipRole::Member,
+        crate::sekai::tenant::TenantRole::BillingViewer => TenantMembershipRole::BillingViewer,
+    };
+    TenantMembership {
+        contract_version: membership.contract_version,
+        tenant_id: membership.tenant_id,
+        subject_id: membership.subject_id,
+        role: role as i32,
+        active: membership.active,
+        created_at_ms: membership.created_at_ms,
+        updated_at_ms: membership.updated_at_ms,
+        revoked_at_ms: membership.revoked_at_ms,
     }
 }
 
@@ -18490,6 +18665,100 @@ mod tests {
         .await
         .unwrap();
         assert!(svc.db.get_tenant("local").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tenant_membership_rpcs_filter_scope_and_recheck_live_roles() {
+        let svc = service();
+        let tenant_a = svc.db.create_tenant("root", "membership-a", 1).unwrap();
+        let tenant_b = svc.db.create_tenant("root", "membership-b", 2).unwrap();
+        let owner = "owner".to_string();
+        let owner_principal = format!("{}.owner", tenant_a.id);
+
+        svc.create_tenant_membership(with_tenant_context(
+            CreateTenantMembershipRequest {
+                tenant_id: tenant_a.id.clone(),
+                subject_id: owner.clone(),
+                role: TenantMembershipRole::Owner as i32,
+            },
+            "root",
+            &tenant_a.id,
+        ))
+        .await
+        .unwrap();
+
+        let visible = svc
+            .list_tenant_memberships(with_tenant_context(
+                ListTenantMembershipsRequest {
+                    tenant_id: tenant_a.id.clone(),
+                },
+                &owner_principal,
+                &tenant_a.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(visible.memberships.len(), 1);
+
+        let cross_tenant = svc
+            .list_tenant_memberships(with_tenant_context(
+                ListTenantMembershipsRequest {
+                    tenant_id: tenant_b.id.clone(),
+                },
+                &owner_principal,
+                &tenant_a.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(cross_tenant.code(), tonic::Code::PermissionDenied);
+
+        let last_owner = svc
+            .revoke_tenant_membership(with_tenant_context(
+                RevokeTenantMembershipRequest {
+                    tenant_id: tenant_a.id.clone(),
+                    subject_id: owner.clone(),
+                },
+                &owner_principal,
+                &tenant_a.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(last_owner.code(), tonic::Code::FailedPrecondition);
+
+        let second_owner = "owner-2".to_string();
+        svc.create_tenant_membership(with_tenant_context(
+            CreateTenantMembershipRequest {
+                tenant_id: tenant_a.id.clone(),
+                subject_id: second_owner,
+                role: TenantMembershipRole::Owner as i32,
+            },
+            &owner_principal,
+            &tenant_a.id,
+        ))
+        .await
+        .unwrap();
+        svc.revoke_tenant_membership(with_tenant_context(
+            RevokeTenantMembershipRequest {
+                tenant_id: tenant_a.id.clone(),
+                subject_id: owner.clone(),
+            },
+            &owner_principal,
+            &tenant_a.id,
+        ))
+        .await
+        .unwrap();
+
+        let revoked = svc
+            .list_tenant_memberships(with_tenant_context(
+                ListTenantMembershipsRequest {
+                    tenant_id: tenant_a.id.clone(),
+                },
+                &owner_principal,
+                &tenant_a.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
