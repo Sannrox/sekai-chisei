@@ -453,6 +453,8 @@ async fn collect_graph(
         }
     }
 
+    links
+        .retain(|_, link| objects.contains_key(&link.from_id) && objects.contains_key(&link.to_id));
     Ok((
         objects.into_values().collect(),
         links.into_values().collect(),
