@@ -169,6 +169,21 @@ history. They cannot undo an effect that already started. The control plane
 does not claim exactly-once external effects: redemption proves consumed
 authorization, not execution or outcome.
 
+Policy may additionally name action classes eligible for short
+`offline_bounded` leases and actors eligible to delegate. Offline permits carry
+signed time/invocation caps and explicitly state that disconnected operation
+cannot provide global single-use or immediate revocation. Destructive action
+classes remain online-only. Delegation is disabled by default and transfers,
+rather than copies, unused parent authority into one narrower child. The signed
+child preserves the initiating actor and complete parent chain; every live
+link, depth bound, and non-expansion rule is rechecked before use. Offline
+leases are not delegable because their local consumption is not globally
+observable. On reconnection, the executor records each offline invocation
+through the redemption endpoint before submitting evidence. This creates the
+durable execution binding needed by evidence admission and detects duplicate or
+over-cap reports without pretending the control plane authorized the action
+immediately before execution.
+
 Permit signing requires `CHISEI_PERMIT_SIGNING_KEY`, a 32-byte Ed25519 seed
 encoded as 64 lowercase hexadecimal characters. `CHISEI_PERMIT_ISSUER` and
 `CHISEI_PERMIT_KEY_ID` identify the trusted key. Production deployments should
