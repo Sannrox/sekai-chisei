@@ -38,6 +38,12 @@ built-in actions write audit rows in the same transaction as the object change.
 Creates and deletes use lifecycle summaries; updates record changed scalar and
 property fields.
 
+Reusable coordination leases use a dedicated namespace-scoped API. Every
+acquisition receives a monotonically increasing generation and unique fencing
+token; stale generations cannot refresh, release, or take over current state.
+See [Generation-fenced leases](leases.md) for the client and downstream-executor
+contract.
+
 ### Chisei: governed decisions
 
 Chisei resolves how an operation may proceed. It owns policy, context
