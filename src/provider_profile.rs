@@ -1819,7 +1819,7 @@ fn meta_profile() -> ProviderProfile {
     profile
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CapabilityRequirements {
     pub responses: bool,
     pub streaming: bool,
