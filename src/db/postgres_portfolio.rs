@@ -290,12 +290,20 @@ mod tests {
     use crate::db::portfolio_route_test_cases::assert_route_contract;
 
     const TEST_DATABASE_URL_ENV: &str = "SEKAI_TEST_POSTGRES_URL";
+    const TEST_CA_CERT_ENV: &str = "SEKAI_TEST_POSTGRES_CA_CERT";
 
     fn test_database() -> PostgresDb {
         let database_url = std::env::var(TEST_DATABASE_URL_ENV).unwrap_or_else(|_| {
             panic!("{TEST_DATABASE_URL_ENV} must point to an isolated PostgreSQL test database")
         });
-        PostgresDb::connect(&database_url, 4).unwrap()
+        if let Ok(ca_certificate_path) = std::env::var(TEST_CA_CERT_ENV) {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_test_ca(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        }
     }
 
     #[test]
@@ -304,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SEKAI_TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database; set SEKAI_TEST_POSTGRES_CA_CERT for a private CA"]
     fn damped_route_matches_shared_contract() {
         let db = test_database();
         let run_id = uuid::Uuid::new_v4().simple().to_string();
@@ -320,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SEKAI_TEST_POSTGRES_URL pointing to an isolated PostgreSQL database"]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database; set SEKAI_TEST_POSTGRES_CA_CERT for a private CA"]
     fn advisory_lock_serializes_updates_for_the_same_route() {
         let db = Arc::new(test_database());
         let namespace = format!("route-lock-{}", uuid::Uuid::new_v4().simple());
