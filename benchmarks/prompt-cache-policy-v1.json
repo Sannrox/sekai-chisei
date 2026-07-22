@@ -1,0 +1,20 @@
+{
+  "version": "prompt-cache-policy-benchmark/v1",
+  "workload": "sanitized_stable_prefix_100k_tokens",
+  "measurement_contract": {
+    "cold_latency_ms": "provider_round_trip_including_cache_write",
+    "warm_latency_ms": "provider_round_trip_including_cache_lookup",
+    "upstream_generation_latency_ms": "reported_separately_when_available",
+    "effective_rate_limit_use": "provider_reported_or_null"
+  },
+  "results": [
+    {"scenario":"uncached","cold_latency_ms":null,"warm_latency_ms":null,"upstream_generation_latency_ms":null,"cost_usd_micros":300000,"hit_rate":0.0,"write_premium_usd_micros":0,"realized_savings_usd_micros":0,"effective_rate_limit_use":null},
+    {"scenario":"cold_5m","cold_latency_ms":null,"warm_latency_ms":null,"upstream_generation_latency_ms":null,"cost_usd_micros":375000,"hit_rate":0.0,"write_premium_usd_micros":75000,"realized_savings_usd_micros":0,"effective_rate_limit_use":null},
+    {"scenario":"warm_5m","cold_latency_ms":null,"warm_latency_ms":null,"upstream_generation_latency_ms":null,"cost_usd_micros":30000,"hit_rate":1.0,"write_premium_usd_micros":0,"realized_savings_usd_micros":270000,"effective_rate_limit_use":null},
+    {"scenario":"expired_fallback","cold_latency_ms":null,"warm_latency_ms":null,"upstream_generation_latency_ms":null,"cost_usd_micros":375000,"hit_rate":0.0,"write_premium_usd_micros":75000,"realized_savings_usd_micros":0,"effective_rate_limit_use":null}
+  ],
+  "notes": [
+    "Dollar values are deterministic calculations from the checked-in Anthropic profile, not live measurements.",
+    "Latency and rate-limit fields remain null until a controlled provider run supplies them; normal CI performs no wall-clock wait."
+  ]
+}

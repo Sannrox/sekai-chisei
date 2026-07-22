@@ -73,6 +73,21 @@ history ineligible. Provider adapters canonicalize cache-relevant JSON and
 return cache-read and cache-creation usage, but Chisei never stores prompt
 content or upstream cache representations.
 
+The versioned `chisei.prompt-cache-policy/v1` decision runs only after normal
+privacy and egress governance. It uses bounded provider support, stable-prefix
+size, accounting availability, reuse, and price-ratio inputs. Outcomes use a
+fixed vocabulary (`enabled`, `bypassed`, `unavailable`, or `invalid`) with
+bounded reasons; prompt text, cache keys, and content-derived identity never
+enter decision metadata. Unavailable caching may fall back only to the already
+selected provider, model, and privacy mode, and invalid controls or a budget
+that requires cache savings fail explicitly.
+
+Operational reports derive cold writes, warm reads, misses, hit rate, effective
+cached share, and realized savings from namespace-authorized canonical
+`llm_calls` rows. Missing provider accounting stays distinct from a cache miss.
+The control plane does not expose upstream cache enumeration, retrieval, or
+eviction operations.
+
 Compatible gateway traffic remains caller-owned. Existing client breakpoints
 are forwarded without Chisei adding, moving, or removing cache controls; any
 future managed gateway caching requires its own explicit policy contract.
