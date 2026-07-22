@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde::Serialize;
 
 use crate::grpc::client::connect_sekai;
@@ -293,7 +295,8 @@ pub async fn run_export(config: ReplayExportConfig) -> Result<(), BoxError> {
             .terminal
             .as_ref()
             .map(fs::read_to_string)
-            .transpose()?,
+            .transpose()?
+            .map(|terminal| sanitize_terminal(&terminal)),
     };
 
     let encoded = serde_json::to_vec_pretty(&bundle)?;
@@ -354,6 +357,39 @@ fn sanitize_field_value(field: &str, value: String) -> String {
         return "[redacted sensitive value]".into();
     }
     value
+}
+
+fn sanitize_terminal(value: &str) -> String {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        vec![
+            (
+                Regex::new(r"(?i)(authorization:\s*bearer\s+)\S+").unwrap(),
+                "${1}[REDACTED]",
+            ),
+            (
+                Regex::new(
+                    r"(?i)([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=)[^\s]+",
+                )
+                .unwrap(),
+                "${1}[REDACTED]",
+            ),
+            (
+                Regex::new(r#"(?i)("(?:api[_-]?key|token|secret|password|credential)"\s*:\s*")[^"]+"#)
+                    .unwrap(),
+                "${1}[REDACTED]",
+            ),
+            (
+                Regex::new(r#"/(?:Users|home|private/tmp)/[^\s"']+"#).unwrap(),
+                "[REDACTED_PATH]",
+            ),
+        ]
+    });
+    patterns
+        .iter()
+        .fold(value.to_string(), |text, (pattern, replacement)| {
+            pattern.replace_all(&text, *replacement).into_owned()
+        })
 }
 
 async fn collect_graph(
@@ -472,5 +508,11 @@ mod tests {
             "[redacted sensitive value]"
         );
         assert_eq!(sanitize_field_value("status", "failed".into()), "failed");
+        let terminal = sanitize_terminal(
+            "authorization: Bearer abc\nOPENAI_API_KEY=sk-secret\n/home/alice/project\n",
+        );
+        assert!(!terminal.contains("abc"));
+        assert!(!terminal.contains("sk-secret"));
+        assert!(!terminal.contains("alice"));
     }
 }
