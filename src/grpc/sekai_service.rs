@@ -5762,9 +5762,9 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?;
         // Record the effect against the work unit's blast-radius counters.
         if !work_unit.is_empty() && blast_caps.is_some() && (op_mutations > 0 || op_deletes > 0) {
-            let _ = self
-                .db
-                .add_blast_radius(&work_unit, op_mutations, op_deletes);
+            self.db
+                .add_blast_radius(&work_unit, op_mutations, op_deletes)
+                .map_err(Status::internal)?;
         }
         // Record action-class budget usage (one unit per executed action).
         if let Some(budget) = &self.budget {
@@ -16962,10 +16962,16 @@ mod tests {
     async fn blast_radius_object_not_writable_via_update_object() {
         let svc = service();
         svc.db.add_blast_radius("wu-1", 1, 0).unwrap();
+        let counter_id = svc
+            .db
+            .find_by_external_id("action_blast_radius:wu-1")
+            .unwrap()
+            .unwrap()
+            .id;
         let err = svc
             .update_object(with_principal(UpdateObjectRequest {
                 object: Some(Object {
-                    id: "blast-radius-wu-1".into(),
+                    id: counter_id,
                     kind: "widget".into(),
                     name: "tamper".into(),
                     namespace: String::new(),
