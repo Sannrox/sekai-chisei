@@ -20,6 +20,7 @@ pub mod llm;
 pub mod memory_cli;
 pub mod obs;
 pub mod onboarding;
+pub mod ontology_inspect;
 pub mod operation_report;
 pub mod operation_statistics;
 pub mod perf_regression;
