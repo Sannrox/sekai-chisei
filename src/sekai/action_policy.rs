@@ -10,6 +10,7 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::action::RiskClass;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub const ACTION_POLICY_KIND: &str = "action_policy";
@@ -336,12 +337,9 @@ impl SekaiDb {
             self.update_object(&object)?;
             Ok((new_mutations, new_deletes))
         } else {
-            let sanitized: String = work_unit
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect();
+            let work_unit_digest = format!("{:x}", Sha256::digest(work_unit.as_bytes()));
             self.create_object(&Object {
-                id: format!("blast-radius-{sanitized}"),
+                id: format!("blast-radius-{work_unit_digest}"),
                 kind: BLAST_RADIUS_KIND.to_string(),
                 name: work_unit.to_string(),
                 namespace: String::new(),
@@ -507,5 +505,14 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].scope, "agent:codex-app");
         assert_eq!(all[1].scope, "sekai-chisei");
+    }
+
+    #[test]
+    fn blast_radius_ids_do_not_collide_for_distinct_work_units() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.add_blast_radius("a/b", 1, 0).unwrap();
+        db.add_blast_radius("a-b", 2, 1).unwrap();
+        assert_eq!(db.get_blast_radius("a/b").unwrap(), (1, 0));
+        assert_eq!(db.get_blast_radius("a-b").unwrap(), (2, 1));
     }
 }
