@@ -146,6 +146,10 @@ pub fn render_report(report: &OperationReport) -> String {
     for error in &report.structural_errors {
         out.push_str(&format!("structural_error: {error}\n"));
     }
+    out.push_str("causal_operation:\n");
+    for (stage, value) in causal_operation_view(report) {
+        out.push_str(&format!("  {stage}: {}\n", text_value(&value)));
+    }
     out.push_str("evidence:\n");
     for (surface, events) in &report.sections {
         out.push_str(&format!("  {surface}:\n"));
@@ -168,6 +172,72 @@ pub fn render_report(report: &OperationReport) -> String {
         }
     }
     out
+}
+
+/// Project the agent-facing causal path without claiming that an absent event
+/// occurred. Values come only from the authorized receipt projection.
+pub fn causal_operation_view(report: &OperationReport) -> Vec<(&'static str, String)> {
+    let attribute = |surface: &str, key: &str| {
+        report
+            .sections
+            .get(surface)
+            .and_then(|events| events.iter().find_map(|event| event.attributes.get(key)))
+            .cloned()
+    };
+    let has_surface = |surface: &str| report.sections.get(surface).is_some_and(|v| !v.is_empty());
+    let outcome = attribute("outcome", "outcome").unwrap_or_else(|| "not_reported".into());
+    let approval = attribute("approval", "decision")
+        .or_else(|| {
+            (outcome == "approval_required").then(|| {
+                let id = attribute("outcome", "approval_id").unwrap_or_else(|| "unknown".into());
+                format!("required:{id}")
+            })
+        })
+        .unwrap_or_else(|| "not_required_or_not_reported".into());
+    vec![
+        (
+            "discovered_catalog",
+            attribute("intent", "reported_catalog_version")
+                .unwrap_or_else(|| "not_reported".into()),
+        ),
+        (
+            "selected_capability",
+            attribute("intent", "capability").unwrap_or_else(|| "not_reported".into()),
+        ),
+        ("requested_operation", report.operation_id.clone()),
+        (
+            "policy_decision",
+            attribute("policy", "decision").unwrap_or_else(|| "not_reached".into()),
+        ),
+        ("approval_or_permit", approval),
+        (
+            "invocation",
+            if has_surface("attempt") || has_surface("action") {
+                "executed".into()
+            } else if outcome == "succeeded" {
+                "completed_by_native_rpc".into()
+            } else {
+                "not_executed".into()
+            },
+        ),
+        (
+            "action_or_evidence",
+            if has_surface("action") || has_surface("artifact") {
+                "recorded".into()
+            } else {
+                "not_reported".into()
+            },
+        ),
+        (
+            "verification",
+            if has_surface("verification") {
+                "recorded".into()
+            } else {
+                "not_reported".into()
+            },
+        ),
+        ("outcome", outcome),
+    ]
 }
 
 fn claim(state: &ClaimState) -> &'static str {
@@ -241,6 +311,82 @@ mod tests {
         assert!(rendered.contains("evidence_complete: false"));
         assert!(rendered.contains("integrity: not_verified"));
         assert!(rendered.contains("policy_compliance: failed"));
+        assert!(rendered.contains("causal_operation:"));
+        assert!(rendered.contains("outcome: \"not_reported\""));
+    }
+
+    #[test]
+    fn causal_view_distinguishes_success_from_denial() {
+        use crate::operation_report::ReportEvent;
+        let event = |kind: &str, attributes: &[(&str, &str)]| ReportEvent {
+            event_id: kind.into(),
+            parent_event_id: None,
+            timestamp_ms: 1,
+            kind: kind.into(),
+            actor: "bugyo:test".into(),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+            references: vec![],
+        };
+        let mut report = OperationReport {
+            version: OPERATION_REPORT_VERSION.into(),
+            source_receipt_version: "operation.receipt/v1".into(),
+            operation_id: "op-success".into(),
+            parent_operation_id: None,
+            namespace: "team".into(),
+            operation_class: "catalog_invocation".into(),
+            initiating_actor: "bugyo:test".into(),
+            schema_version: "1.0".into(),
+            policy_version: "live_invocation_check".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(2),
+            duration_ms: Some(1),
+            governance: Default::default(),
+            claims: AssuranceClaims {
+                evidence_complete: true,
+                integrity: ClaimState::NotVerified,
+                policy_compliance: ClaimState::NotVerified,
+            },
+            external_evidence_versions: vec![],
+            sections: BTreeMap::from([
+                (
+                    "intent".into(),
+                    vec![event(
+                        "intent_recorded",
+                        &[
+                            ("reported_catalog_version", "sha256:catalog"),
+                            ("capability", "sekai.actions.set_property"),
+                        ],
+                    )],
+                ),
+                (
+                    "policy".into(),
+                    vec![event("policy_decided", &[("decision", "allow")])],
+                ),
+                (
+                    "outcome".into(),
+                    vec![event("outcome_recorded", &[("outcome", "succeeded")])],
+                ),
+            ]),
+            missing_surfaces: vec![],
+            uncovered_surfaces: vec![],
+            structural_errors: vec![],
+        };
+        let success = causal_operation_view(&report);
+        assert!(success.contains(&("discovered_catalog", "sha256:catalog".into())));
+        assert!(success.contains(&("invocation", "completed_by_native_rpc".into())));
+        report.operation_id = "op-denied".into();
+        report.sections.get_mut("policy").unwrap()[0]
+            .attributes
+            .insert("decision".into(), "deny".into());
+        report.sections.get_mut("outcome").unwrap()[0]
+            .attributes
+            .insert("outcome".into(), "denied".into());
+        let denied = causal_operation_view(&report);
+        assert!(denied.contains(&("policy_decision", "deny".into())));
+        assert!(denied.contains(&("invocation", "not_executed".into())));
     }
 
     #[test]
