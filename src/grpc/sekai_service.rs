@@ -2,13 +2,17 @@
 
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
 use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
+use crate::chisei::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    ReceiptSurface, UncoveredSurface,
+};
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::sekai::SekaiDb;
 use crate::domain;
@@ -47,7 +51,281 @@ pub struct SekaiServiceImpl {
     gateway_schema_principals: Vec<String>,
 }
 
+struct CatalogReceiptGuard<'a> {
+    service: &'a SekaiServiceImpl,
+    operation_id: String,
+    namespace: String,
+    actor: String,
+    capability_name: String,
+    policy_decision: Option<String>,
+    budget_decision: Option<String>,
+    finalized: bool,
+}
+
+impl CatalogReceiptGuard<'_> {
+    fn mark_policy_decided(&mut self, decision: &str) {
+        self.policy_decision = Some(decision.to_string());
+    }
+
+    fn mark_budget_decided(&mut self, decision: &str) {
+        self.budget_decision = Some(decision.to_string());
+    }
+
+    fn finalize(&mut self, decision: &str, outcome: &str) -> Result<(), Status> {
+        self.service.record_catalog_invocation_receipt(
+            &self.operation_id,
+            &self.namespace,
+            &self.actor,
+            &self.capability_name,
+            decision,
+            outcome,
+            false,
+        )?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for CatalogReceiptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let budget_outcome = self
+                .budget_decision
+                .as_deref()
+                .map(|decision| format!("invocation_failed_after_budget:{decision}"));
+            let (decision, outcome) = if let Some(outcome) = budget_outcome.as_deref() {
+                (self.policy_decision.as_deref().unwrap_or("allow"), outcome)
+            } else {
+                self.policy_decision
+                    .as_deref()
+                    .map(|decision| (decision, "invocation_failed_after_policy"))
+                    .unwrap_or(("refuse", "invocation_failed"))
+            };
+            let _ = self.service.record_catalog_invocation_receipt(
+                &self.operation_id,
+                &self.namespace,
+                &self.actor,
+                &self.capability_name,
+                decision,
+                outcome,
+                false,
+            );
+        }
+    }
+}
+
 impl SekaiServiceImpl {
+    #[allow(clippy::too_many_arguments)]
+    fn record_catalog_invocation_receipt(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        actor: &str,
+        capability_name: &str,
+        decision: &str,
+        outcome: &str,
+        insert_only: bool,
+    ) -> Result<(), Status> {
+        let now = now_millis();
+        let started_at_ms = if insert_only {
+            now
+        } else {
+            self.db
+                .get_operation_receipt(operation_id)
+                .map_err(Status::internal)?
+                .map(|receipt| receipt.started_at_ms)
+                .unwrap_or(now)
+        };
+        let event = |suffix: &str, parent: Option<&str>, kind: ReceiptEventKind, attributes| {
+            OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.into(),
+                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
+                timestamp_ms: now,
+                surface: kind.surface(),
+                kind,
+                actor: actor.into(),
+                references: Vec::new(),
+                attributes,
+            }
+        };
+        let attributes =
+            |key: &str, value: &str| BTreeMap::from([(key.to_string(), value.to_string())]);
+        let outcome_attributes = || {
+            if let Some(approval_id) = outcome.strip_prefix("approval_required:") {
+                BTreeMap::from([
+                    ("outcome".into(), "approval_required".into()),
+                    ("approval_id".into(), approval_id.into()),
+                ])
+            } else {
+                attributes("outcome", outcome)
+            }
+        };
+        let mut intent = event(
+            "intent",
+            None,
+            ReceiptEventKind::IntentRecorded,
+            attributes("capability", capability_name),
+        );
+        intent.timestamp_ms = started_at_ms;
+        let (completed_at_ms, events, uncovered_surfaces) = if insert_only && decision == "pending"
+        {
+            (None, vec![intent], Vec::new())
+        } else if decision == "refuse" {
+            (
+                Some(now),
+                vec![
+                    intent,
+                    event(
+                        "outcome",
+                        Some("intent"),
+                        ReceiptEventKind::OutcomeRecorded,
+                        outcome_attributes(),
+                    ),
+                ],
+                [
+                    ReceiptSurface::Policy,
+                    ReceiptSurface::Routing,
+                    ReceiptSurface::Budget,
+                ]
+                .into_iter()
+                .map(|surface| UncoveredSurface {
+                    surface,
+                    reason: "invocation failed before this decision point".into(),
+                })
+                .collect(),
+            )
+        } else if let Some(budget_decision) =
+            outcome.strip_prefix("invocation_failed_after_budget:")
+        {
+            (
+                Some(now),
+                vec![
+                    intent,
+                    event(
+                        "policy",
+                        Some("intent"),
+                        ReceiptEventKind::PolicyDecided,
+                        attributes("decision", decision),
+                    ),
+                    event(
+                        "routing",
+                        Some("policy"),
+                        ReceiptEventKind::RouteSelected,
+                        attributes("route", "native"),
+                    ),
+                    event(
+                        "budget",
+                        Some("routing"),
+                        ReceiptEventKind::BudgetDecided,
+                        attributes("decision", budget_decision),
+                    ),
+                    event(
+                        "outcome",
+                        Some("budget"),
+                        ReceiptEventKind::OutcomeRecorded,
+                        attributes("outcome", "invocation_failed_after_budget"),
+                    ),
+                ],
+                Vec::new(),
+            )
+        } else if outcome == "invocation_failed_after_policy" {
+            (
+                Some(now),
+                vec![
+                    intent,
+                    event(
+                        "policy",
+                        Some("intent"),
+                        ReceiptEventKind::PolicyDecided,
+                        attributes("decision", decision),
+                    ),
+                    event(
+                        "routing",
+                        Some("policy"),
+                        ReceiptEventKind::RouteSelected,
+                        attributes("route", "native"),
+                    ),
+                    event(
+                        "outcome",
+                        Some("routing"),
+                        ReceiptEventKind::OutcomeRecorded,
+                        outcome_attributes(),
+                    ),
+                ],
+                vec![UncoveredSurface {
+                    surface: ReceiptSurface::Budget,
+                    reason: "invocation failed before budget decision".into(),
+                }],
+            )
+        } else {
+            let budget_decision = match outcome.split_once(':').map_or(outcome, |value| value.0) {
+                "dry_run" => "not_applicable_dry_run",
+                "approval_required" => "deferred_pending_approval",
+                "denied" | "capability_unavailable" => "not_applicable_policy_denied",
+                _ => "checked_at_invocation",
+            };
+            (
+                Some(now),
+                vec![
+                    intent,
+                    event(
+                        "policy",
+                        Some("intent"),
+                        ReceiptEventKind::PolicyDecided,
+                        attributes("decision", decision),
+                    ),
+                    event(
+                        "routing",
+                        Some("policy"),
+                        ReceiptEventKind::RouteSelected,
+                        attributes("route", "native"),
+                    ),
+                    event(
+                        "budget",
+                        Some("routing"),
+                        ReceiptEventKind::BudgetDecided,
+                        attributes("decision", budget_decision),
+                    ),
+                    event(
+                        "outcome",
+                        Some("budget"),
+                        ReceiptEventKind::OutcomeRecorded,
+                        outcome_attributes(),
+                    ),
+                ],
+                Vec::new(),
+            )
+        };
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.into(),
+            parent_operation_id: None,
+            namespace: namespace.into(),
+            operation_class: "catalog_invocation".into(),
+            initiating_actor: actor.into(),
+            schema_version: capability::CONTRACT_VERSION.into(),
+            policy_version: "live_invocation_check".into(),
+            started_at_ms,
+            completed_at_ms,
+            events,
+            uncovered_surfaces,
+            reporter_grants: Vec::new(),
+        };
+        if insert_only {
+            return self.db.insert_operation_receipt(&receipt).map_err(|error| {
+                if error.contains("UNIQUE constraint failed") {
+                    Status::already_exists("operation receipt already exists")
+                } else {
+                    Status::internal(error)
+                }
+            });
+        } else {
+            self.db.put_operation_receipt(&receipt)
+        }
+        .map_err(Status::internal)
+    }
+
     pub fn new(db: Arc<SekaiDb>) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
@@ -3893,7 +4171,64 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let invoked_capability = req
+            .metadata()
+            .get("x-sekai-capability")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let requested_operation_id = req
+            .metadata()
+            .get("x-sekai-operation-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        let operation_id = invoked_capability.as_ref().map(|_| {
+            requested_operation_id
+                .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()))
+        });
+        let mut receipt_guard = None;
+        if let Some(capability_name) = &invoked_capability {
+            let namespace = filter.namespace.as_deref().ok_or_else(|| {
+                Status::invalid_argument("catalog invocation requires a namespace filter")
+            })?;
+            let kind = filter.kind.as_deref().ok_or_else(|| {
+                Status::invalid_argument("catalog object query requires a kind filter")
+            })?;
+            let operation_id = operation_id.as_ref().unwrap();
+            let actor = principals.first().cloned().unwrap_or_default();
+            self.record_catalog_invocation_receipt(
+                operation_id,
+                namespace,
+                &actor,
+                capability_name,
+                "pending",
+                "invocation_started",
+                true,
+            )?;
+            receipt_guard = Some(CatalogReceiptGuard {
+                service: self,
+                operation_id: operation_id.clone(),
+                namespace: namespace.to_string(),
+                actor,
+                capability_name: capability_name.clone(),
+                policy_decision: None,
+                budget_decision: None,
+                finalized: false,
+            });
+            let expected = format!("sekai.objects.query.{kind}");
+            if capability_name != &expected
+                || !self
+                    .discoverable_capabilities(namespace, &principals)?
+                    .iter()
+                    .any(|entry| entry.name == *capability_name)
+            {
+                return Err(Status::failed_precondition("capability unavailable"));
+            }
+        }
         if is_managed_team_principal(&self.db, &principals)? {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("team principals must filter by namespace")
@@ -3945,10 +4280,25 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(Status::internal)?;
         let objects = self.resolve_computed_for_responses(objects, &principals)?;
-        Ok(Response::new(ListObjectsResponse {
+        let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
-        }))
+        });
+        if let (Some(_), Some(operation_id)) =
+            (invoked_capability.as_deref(), operation_id.as_deref())
+        {
+            receipt_guard
+                .as_mut()
+                .unwrap()
+                .finalize("allow", "succeeded")?;
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
     }
     async fn find_by_external_id(
         &self,
@@ -5373,11 +5723,99 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ExecuteActionResponse>, Status> {
         let principals = caller_principals(&req);
         let work_unit = work_unit_from_metadata(&req);
+        let invoked_capability = req
+            .metadata()
+            .get("x-sekai-capability")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let operation_id = invoked_capability.as_ref().map(|_| {
+            req.metadata()
+                .get("x-sekai-operation-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()))
+        });
+        let catalog_namespace = req
+            .metadata()
+            .get("x-sekai-namespace")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let inner = req.into_inner();
         let dry_run = inner.dry_run;
         let r = inner
             .request
             .ok_or(Status::invalid_argument("request required"))?;
+        let invocation_namespace = catalog_namespace.as_deref().unwrap_or_else(|| {
+            r.params
+                .get("namespace")
+                .map(String::as_str)
+                .unwrap_or_default()
+        });
+        if let Some(capability_name) = &invoked_capability {
+            if invocation_namespace.is_empty() {
+                return Err(Status::invalid_argument(
+                    "catalog action invocation requires namespace",
+                ));
+            }
+            let entry = self
+                .discoverable_capabilities(invocation_namespace, &principals)?
+                .into_iter()
+                .find(|entry| {
+                    entry.name == *capability_name
+                        && entry.action_type.as_ref().is_some_and(|action| {
+                            action.name == r.action
+                                && (r.action != "create_object"
+                                    || r.params.get("kind") == Some(&action.target_kind))
+                        })
+                });
+            if entry.is_none() {
+                if let Some(operation_id) = operation_id.as_deref() {
+                    let actor = principals.first().map(String::as_str).unwrap_or_default();
+                    self.record_catalog_invocation_receipt(
+                        operation_id,
+                        invocation_namespace,
+                        actor,
+                        capability_name,
+                        "refuse",
+                        "capability_unavailable",
+                        true,
+                    )?;
+                }
+                return Err(Status::failed_precondition("capability unavailable"));
+            }
+        }
+        let mut receipt_guard = if let Some((capability_name, operation_id)) =
+            invoked_capability.as_ref().zip(operation_id.as_ref())
+        {
+            let actor = principals.first().cloned().unwrap_or_default();
+            self.record_catalog_invocation_receipt(
+                operation_id,
+                invocation_namespace,
+                &actor,
+                capability_name,
+                "pending",
+                "invocation_started",
+                true,
+            )?;
+            Some(CatalogReceiptGuard {
+                service: self,
+                operation_id: operation_id.clone(),
+                namespace: invocation_namespace.to_string(),
+                actor,
+                capability_name: capability_name.clone(),
+                policy_decision: None,
+                budget_decision: None,
+                finalized: false,
+            })
+        } else {
+            None
+        };
         let actions = self
             .actions
             .read()
@@ -5393,6 +5831,24 @@ impl SekaiService for SekaiServiceImpl {
                     Status::invalid_argument(err)
                 }
             })?;
+        if invoked_capability.is_some() {
+            for target_id in &target_ids {
+                if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)?
+                    && target.namespace != invocation_namespace
+                {
+                    return Err(Status::failed_precondition(
+                        "capability namespace does not match action target",
+                    ));
+                }
+            }
+            if let Some(namespace) = r.params.get("namespace")
+                && namespace != invocation_namespace
+            {
+                return Err(Status::failed_precondition(
+                    "capability namespace does not match action target",
+                ));
+            }
+        }
         if actions.creates_namespace(&r.action, &r.params) {
             return Err(Status::permission_denied(
                 "namespace objects must be managed through EnsureTeamNamespace",
@@ -5431,6 +5887,9 @@ impl SekaiService for SekaiServiceImpl {
             Some(policy) => (policy.decide(&r.action, action_risk), policy.scope.clone()),
             None => (ActionDecision::Allow, String::new()),
         };
+        if let Some(guard) = receipt_guard.as_mut() {
+            guard.mark_policy_decided(decision.as_str());
+        }
         let attested_policy = if policy_namespace == ERASED_NAMESPACE {
             None
         } else {
@@ -5483,7 +5942,7 @@ impl SekaiService for SekaiServiceImpl {
                     attested.as_ref(),
                 )
                 .map_err(Status::internal)?;
-            return Ok(Response::new(ExecuteActionResponse {
+            let mut response = Response::new(ExecuteActionResponse {
                 result: Some(ActionResult {
                     action: r.action,
                     message: format!("dry run: {} planned op(s)", planned_ops.len()),
@@ -5492,7 +5951,33 @@ impl SekaiService for SekaiServiceImpl {
                     decision: decision.as_str().into(),
                     approval_id: String::new(),
                 }),
-            }));
+            });
+            if let (Some(_), Some(operation_id)) =
+                (invoked_capability.as_deref(), operation_id.as_deref())
+            {
+                if let Err(error) = receipt_guard
+                    .as_mut()
+                    .unwrap()
+                    .finalize(decision.as_str(), "dry_run")
+                {
+                    let mut status =
+                        Status::internal(format!("catalog receipt finalization failed: {error}"));
+                    status.metadata_mut().insert(
+                        "x-sekai-operation-id",
+                        operation_id
+                            .parse()
+                            .map_err(|_| Status::internal("invalid operation id"))?,
+                    );
+                    return Err(status);
+                }
+                response.metadata_mut().insert(
+                    "x-sekai-operation-id",
+                    operation_id
+                        .parse()
+                        .map_err(|_| Status::internal("invalid operation id"))?,
+                );
+            }
+            return Ok(response);
         }
 
         if decision == ActionDecision::RequireApproval {
@@ -5548,19 +6033,52 @@ impl SekaiService for SekaiServiceImpl {
                     attested.as_ref(),
                 )
                 .map_err(Status::internal)?;
-            return Ok(Response::new(ExecuteActionResponse {
+            let mut response = Response::new(ExecuteActionResponse {
                 result: Some(ActionResult {
                     action: r.action,
                     message: format!("action held for approval: {}", approval.id),
                     dry_run: false,
                     planned_ops: Vec::new(),
                     decision: decision.as_str().into(),
-                    approval_id: approval.id,
+                    approval_id: approval.id.clone(),
                 }),
-            }));
+            });
+            if let (Some(_), Some(operation_id)) =
+                (invoked_capability.as_deref(), operation_id.as_deref())
+            {
+                let approval_outcome = format!("approval_required:{}", approval.id);
+                if let Err(error) = receipt_guard
+                    .as_mut()
+                    .unwrap()
+                    .finalize(decision.as_str(), &approval_outcome)
+                {
+                    let mut status =
+                        Status::internal(format!("catalog receipt finalization failed: {error}"));
+                    status.metadata_mut().insert(
+                        "x-sekai-operation-id",
+                        operation_id
+                            .parse()
+                            .map_err(|_| Status::internal("invalid operation id"))?,
+                    );
+                    return Err(status);
+                }
+                response.metadata_mut().insert(
+                    "x-sekai-operation-id",
+                    operation_id
+                        .parse()
+                        .map_err(|_| Status::internal("invalid operation id"))?,
+                );
+            }
+            return Ok(response);
         }
 
         if decision == ActionDecision::Deny {
+            if invoked_capability.is_some() {
+                receipt_guard
+                    .as_mut()
+                    .unwrap()
+                    .finalize(decision.as_str(), "denied")?;
+            }
             let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("policy_scope".into(), policy_scope.clone());
@@ -5658,6 +6176,9 @@ impl SekaiService for SekaiServiceImpl {
         if let Some(budget) = &self.budget
             && let Err(err) = budget.check(&budget_subject, 1)
         {
+            if let Some(guard) = receipt_guard.as_mut() {
+                guard.mark_budget_decided("budget_exceeded");
+            }
             let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
             evidence.insert("risk_class".into(), action_risk.as_str().into());
             evidence.insert("budget_subject".into(), budget_subject.clone());
@@ -5680,6 +6201,13 @@ impl SekaiService for SekaiServiceImpl {
                 "action budget exhausted for {}",
                 budget_subject
             )));
+        }
+        if let Some(guard) = receipt_guard.as_mut() {
+            guard.mark_budget_decided(if self.budget.is_some() {
+                "allow"
+            } else {
+                "not_configured"
+            });
         }
         for kind in schema_kinds {
             self.require_schema_kind_loaded(&kind)?;
@@ -5745,7 +6273,7 @@ impl SekaiService for SekaiServiceImpl {
                 &audit::Decision {
                     id: decision_id,
                     timestamp: now_millis(),
-                    actor,
+                    actor: actor.clone(),
                     action: r.action.clone(),
                     reason: "execute_action".into(),
                     evidence,
@@ -5770,7 +6298,7 @@ impl SekaiService for SekaiServiceImpl {
         if let Some(budget) = &self.budget {
             budget.record(&budget_subject, 1);
         }
-        Ok(Response::new(ExecuteActionResponse {
+        let mut response = Response::new(ExecuteActionResponse {
             result: Some(ActionResult {
                 action: r.action,
                 message: msg,
@@ -5779,7 +6307,33 @@ impl SekaiService for SekaiServiceImpl {
                 decision: decision.as_str().into(),
                 approval_id: String::new(),
             }),
-        }))
+        });
+        if let (Some(_), Some(operation_id)) =
+            (invoked_capability.as_deref(), operation_id.as_deref())
+        {
+            if let Err(error) = receipt_guard
+                .as_mut()
+                .unwrap()
+                .finalize(decision.as_str(), "succeeded")
+            {
+                let mut status =
+                    Status::internal(format!("catalog receipt finalization failed: {error}"));
+                status.metadata_mut().insert(
+                    "x-sekai-operation-id",
+                    operation_id
+                        .parse()
+                        .map_err(|_| Status::internal("invalid operation id"))?,
+                );
+                return Err(status);
+            }
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
     }
     async fn set_action_policy(
         &self,
@@ -17998,6 +18552,211 @@ mod tests {
         assert_eq!(
             unsupported.message(),
             "unsupported capability catalog contract version"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_invocation_rechecks_live_policy_and_records_receipts() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_action_type(with_named_principal(
+            CreateActionTypeRequest {
+                action_type: Some(assign_color_action()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(widget_object(
+                    "widget-1",
+                    HashMap::from([
+                        ("name".into(), "one".into()),
+                        ("color".into(), "red".into()),
+                    ]),
+                )),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+
+        let mut read = with_named_principal(
+            ListObjectsRequest {
+                filter: Some(ListFilter {
+                    namespace: "acme".into(),
+                    kind: "widget".into(),
+                    ..Default::default()
+                }),
+            },
+            "local",
+        );
+        read.metadata_mut().insert(
+            "x-sekai-capability",
+            "sekai.objects.query.widget".parse().unwrap(),
+        );
+        read.metadata_mut()
+            .insert("x-sekai-operation-id", "catalog-read-1".parse().unwrap());
+        let read_response = svc.list_objects(read).await.unwrap();
+        assert_eq!(
+            read_response
+                .metadata()
+                .get("x-sekai-operation-id")
+                .unwrap(),
+            "catalog-read-1"
+        );
+        let read_receipt = svc
+            .db
+            .get_operation_receipt("catalog-read-1")
+            .unwrap()
+            .unwrap();
+        assert!(read_receipt.completeness().complete);
+        assert_eq!(read_receipt.operation_class, "catalog_invocation");
+
+        let mut collision = with_named_principal(
+            ListObjectsRequest {
+                filter: Some(ListFilter {
+                    namespace: "acme".into(),
+                    kind: "widget".into(),
+                    ..Default::default()
+                }),
+            },
+            "intruder",
+        );
+        collision.metadata_mut().insert(
+            "x-sekai-capability",
+            "sekai.objects.query.widget".parse().unwrap(),
+        );
+        collision
+            .metadata_mut()
+            .insert("x-sekai-operation-id", "catalog-read-1".parse().unwrap());
+        assert_eq!(
+            svc.list_objects(collision).await.unwrap_err().code(),
+            tonic::Code::AlreadyExists
+        );
+        assert_eq!(
+            svc.db
+                .get_operation_receipt("catalog-read-1")
+                .unwrap()
+                .unwrap()
+                .initiating_actor,
+            "local"
+        );
+
+        let discovered = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            discovered
+                .capabilities
+                .iter()
+                .any(|entry| entry.name == "sekai.actions.assign_color")
+        );
+        let mut invalid = with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "assign_color".into(),
+                    params: HashMap::from([("id".into(), "widget-1".into())]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            },
+            "local",
+        );
+        invalid.metadata_mut().insert(
+            "x-sekai-capability",
+            "sekai.actions.assign_color".parse().unwrap(),
+        );
+        invalid
+            .metadata_mut()
+            .insert("x-sekai-namespace", "acme".parse().unwrap());
+        invalid.metadata_mut().insert(
+            "x-sekai-operation-id",
+            "catalog-write-invalid-1".parse().unwrap(),
+        );
+        assert_eq!(
+            svc.execute_action(invalid).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        let invalid_receipt = svc
+            .db
+            .get_operation_receipt("catalog-write-invalid-1")
+            .unwrap()
+            .unwrap();
+        assert!(!invalid_receipt.completeness().complete);
+        assert!(
+            serde_json::to_string(&invalid_receipt)
+                .unwrap()
+                .contains("invocation_failed")
+        );
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "acme".into(),
+                default_decision: ActionDecision::Deny,
+                action_overrides: HashMap::new(),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let mut write = with_named_principal(
+            ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "assign_color".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-1".into()),
+                        ("color".into(), "blue".into()),
+                    ]),
+                    actor: String::new(),
+                }),
+                dry_run: false,
+            },
+            "local",
+        );
+        write.metadata_mut().insert(
+            "x-sekai-capability",
+            "sekai.actions.assign_color".parse().unwrap(),
+        );
+        write
+            .metadata_mut()
+            .insert("x-sekai-namespace", "acme".parse().unwrap());
+        write.metadata_mut().insert(
+            "x-sekai-operation-id",
+            "catalog-write-denied-1".parse().unwrap(),
+        );
+        let denied = svc.execute_action(write).await.unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+        let denied_receipt = svc
+            .db
+            .get_operation_receipt("catalog-write-denied-1")
+            .unwrap()
+            .unwrap();
+        assert!(!denied_receipt.completeness().complete);
+        assert!(
+            serde_json::to_string(&denied_receipt)
+                .unwrap()
+                .contains("capability_unavailable")
+        );
+        assert_eq!(
+            svc.db.get_object("widget-1").unwrap().unwrap().properties["color"],
+            "red"
         );
     }
 
