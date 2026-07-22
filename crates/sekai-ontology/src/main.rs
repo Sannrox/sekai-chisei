@@ -446,6 +446,30 @@ fn claim_skill_target(target: &Path) -> Result<PathBuf, Error> {
 }
 
 fn restore_claim(target: &Path, claimed: &Path) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(claimed).map_err(|error| {
+        Error::Input(format!(
+            "cannot inspect recovery file '{}': {error}",
+            claimed.display()
+        ))
+    })?;
+    if metadata.file_type().is_dir() {
+        fs::create_dir(target).map_err(|error| {
+            Error::Input(format!(
+                "cannot reserve '{}' for restoration: {error}; original preserved at '{}'",
+                target.display(),
+                claimed.display()
+            ))
+        })?;
+        if let Err(error) = fs::rename(claimed, target) {
+            let _ = fs::remove_dir(target);
+            return Err(Error::Input(format!(
+                "cannot restore '{}': {error}; original preserved at '{}'",
+                target.display(),
+                claimed.display()
+            )));
+        }
+        return Ok(());
+    }
     fs::hard_link(claimed, target).map_err(|error| {
         Error::Input(format!(
             "cannot restore '{}': {error}; original preserved at '{}'",
