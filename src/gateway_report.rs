@@ -129,10 +129,17 @@ pub struct GatewayReportRow {
     pub operations: i64,
     pub successful_outcomes: i64,
     pub input_tokens: i64,
+    pub uncached_input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub cost_usd_micros: i64,
     pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub cache_warm_reads: i64,
+    pub cache_cold_writes: i64,
+    pub cache_misses: i64,
+    pub cache_accounted_calls: i64,
+    pub cache_unaccounted_attempts: i64,
     pub cache_savings_usd_micros: i64,
     pub refusals: i64,
     pub terminal_failures: i64,
@@ -184,6 +191,7 @@ pub async fn run_report(
                     "cache_creation_input_tokens".to_string(),
                     "cache_creation_5m_input_tokens".to_string(),
                     "cache_creation_1h_input_tokens".to_string(),
+                    "cache_requested".to_string(),
                     "pricing_snapshot_version".to_string(),
                     "cache_savings_usd_micros".to_string(),
                     "cache_savings_usd".to_string(),
@@ -305,10 +313,33 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
             summary.successful_outcomes += 1;
         }
         summary.input_tokens += parse_i64(row.values.get("input_tokens"));
+        let cache_reads = parse_i64(row.values.get("cache_read_input_tokens"));
+        summary.uncached_input_tokens += row
+            .values
+            .get("uncached_input_tokens")
+            .map(|value| parse_i64(Some(value)))
+            .unwrap_or_else(|| legacy_uncached_input(&row, cache_reads));
         summary.output_tokens += parse_i64(row.values.get("output_tokens"));
         summary.total_tokens += parse_i64(row.values.get("total_tokens"));
         summary.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
         summary.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
+        let cache_writes = parse_i64(row.values.get("cache_creation_input_tokens"));
+        summary.cache_creation_input_tokens += cache_writes;
+        summary.cache_warm_reads += i64::from(cache_reads > 0);
+        summary.cache_cold_writes += i64::from(cache_writes > 0);
+        let cache_requested = row
+            .values
+            .get("cache_requested")
+            .is_some_and(|value| value == "true");
+        let accounting_reported = row.values.contains_key("cache_read_input_tokens")
+            || row.values.contains_key("cache_creation_input_tokens");
+        let cache_accounted =
+            cache_reads > 0 || cache_writes > 0 || (cache_requested && accounting_reported);
+        summary.cache_accounted_calls += i64::from(cache_accounted);
+        summary.cache_misses += i64::from(
+            cache_requested && accounting_reported && cache_reads == 0 && cache_writes == 0,
+        );
+        summary.cache_unaccounted_attempts += i64::from(cache_requested && !accounting_reported);
         summary.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
         if row
             .values
@@ -510,13 +541,34 @@ fn row_is_successful(row: &Row) -> bool {
     status_success && terminal_success && !refused
 }
 
+fn cache_hit_rate(row: &GatewayReportRow) -> i64 {
+    let observed = row.cache_accounted_calls;
+    if observed == 0 {
+        0
+    } else {
+        (row.cache_warm_reads.saturating_mul(100) / observed).clamp(0, 100)
+    }
+}
+
+fn effective_cached_share(row: &GatewayReportRow) -> i64 {
+    let eligible_input = row
+        .uncached_input_tokens
+        .saturating_add(row.cache_read_input_tokens)
+        .saturating_add(row.cache_creation_input_tokens);
+    if eligible_input == 0 {
+        0
+    } else {
+        (row.cache_read_input_tokens.saturating_mul(100) / eligible_input).clamp(0, 100)
+    }
+}
+
 fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
     if group_by == ReportGroupBy::WorkUnit {
         print_work_unit_report(rows);
         return;
     }
     println!(
-        "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+        "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>10} {:>10} {:>9} {:>10} {:>10} {:>14}",
         group_by.label(),
         "calls",
         "operations",
@@ -528,13 +580,17 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
         "output_tokens",
         "total_tokens",
         "est_cost_usd",
-        "cache_reads",
+        "cold_write",
+        "warm_read",
+        "misses",
+        "hit_rate",
+        "cached_share",
         "cache_saved_usd"
     );
     println!("{}", "-".repeat(126));
     for row in rows {
         println!(
-            "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+            "{:<24} {:>8} {:>10} {:>9} {:>9} {:>8} {:>9} {:>14} {:>14} {:>14} {:>14} {:>10} {:>10} {:>9} {:>9}% {:>9}% {:>14}",
             truncate(&row.group, 24),
             row.calls,
             row.operations,
@@ -546,7 +602,11 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
             row.output_tokens,
             row.total_tokens,
             format_usd_micros(row.cost_usd_micros),
-            row.cache_read_input_tokens,
+            row.cache_cold_writes,
+            row.cache_warm_reads,
+            row.cache_misses,
+            cache_hit_rate(row),
+            effective_cached_share(row),
             format_usd_micros(row.cache_savings_usd_micros)
         );
     }
@@ -554,17 +614,21 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
 
 fn print_work_unit_report(rows: &[GatewayReportRow]) {
     println!(
-        "{:<24} {:>7} {:>9} {:>9} {:>12} {:>11} {:>9}  models",
-        "work_unit", "calls", "refusals", "failures", "cost_usd", "cache_read", "budget"
+        "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>8} {:>8} {:>9}  models",
+        "work_unit",
+        "calls",
+        "refusals",
+        "failures",
+        "cost_usd",
+        "cold",
+        "warm",
+        "misses",
+        "hit_rate",
+        "cached",
+        "budget"
     );
-    println!("{}", "-".repeat(112));
+    println!("{}", "-".repeat(144));
     for row in rows {
-        let billed_input = row.input_tokens.saturating_add(row.cache_read_input_tokens);
-        let cache_pct = if billed_input > 0 {
-            (row.cache_read_input_tokens.saturating_mul(100) / billed_input).clamp(0, 100)
-        } else {
-            0
-        };
         let budget = if row.budget_limit > 0 {
             format!(
                 "{}%",
@@ -580,13 +644,17 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "{:<24} {:>7} {:>9} {:>9} {:>12} {:>10}% {:>9}  {}",
+            "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>7}% {:>7}% {:>9}  {}",
             truncate(&row.group, 24),
             row.calls,
             row.refusals,
             row.terminal_failures,
             format_usd_micros(row.cost_usd_micros),
-            cache_pct,
+            row.cache_cold_writes,
+            row.cache_warm_reads,
+            row.cache_misses,
+            cache_hit_rate(row),
+            effective_cached_share(row),
             budget,
             models
         );
@@ -609,10 +677,33 @@ pub fn render_dashboard(rows: &[Row], since_ms: i64) -> String {
                 total.successful_outcomes += 1;
             }
             total.input_tokens += parse_i64(row.values.get("input_tokens"));
+            let cache_reads = parse_i64(row.values.get("cache_read_input_tokens"));
+            total.uncached_input_tokens += row
+                .values
+                .get("uncached_input_tokens")
+                .map(|value| parse_i64(Some(value)))
+                .unwrap_or_else(|| legacy_uncached_input(row, cache_reads));
             total.output_tokens += parse_i64(row.values.get("output_tokens"));
             total.total_tokens += parse_i64(row.values.get("total_tokens"));
             total.cost_usd_micros += parse_i64(row.values.get("cost_usd_micros"));
             total.cache_read_input_tokens += parse_i64(row.values.get("cache_read_input_tokens"));
+            let cache_writes = parse_i64(row.values.get("cache_creation_input_tokens"));
+            total.cache_creation_input_tokens += cache_writes;
+            total.cache_warm_reads += i64::from(cache_reads > 0);
+            total.cache_cold_writes += i64::from(cache_writes > 0);
+            let cache_requested = row
+                .values
+                .get("cache_requested")
+                .is_some_and(|value| value == "true");
+            let accounting_reported = row.values.contains_key("cache_read_input_tokens")
+                || row.values.contains_key("cache_creation_input_tokens");
+            let cache_accounted =
+                cache_reads > 0 || cache_writes > 0 || (cache_requested && accounting_reported);
+            total.cache_accounted_calls += i64::from(cache_accounted);
+            total.cache_misses += i64::from(
+                cache_requested && accounting_reported && cache_reads == 0 && cache_writes == 0,
+            );
+            total.cache_unaccounted_attempts += i64::from(cache_requested && !accounting_reported);
             total.cache_savings_usd_micros += parse_i64(row.values.get("cache_savings_usd_micros"));
             if row
                 .values
@@ -701,6 +792,18 @@ fn render_metric_cards(total: &GatewayReportRow) -> String {
             format!("${}", format_usd_micros(total.cost_usd_micros)),
         ),
         ("Cache reads", total.cache_read_input_tokens.to_string()),
+        ("Cold writes", total.cache_cold_writes.to_string()),
+        ("Warm reads", total.cache_warm_reads.to_string()),
+        ("Cache misses", total.cache_misses.to_string()),
+        (
+            "Unaccounted cache attempts",
+            total.cache_unaccounted_attempts.to_string(),
+        ),
+        ("Cache hit rate", format!("{}%", cache_hit_rate(total))),
+        (
+            "Effective cached share",
+            format!("{}%", effective_cached_share(total)),
+        ),
         (
             "Cache savings",
             format!("${}", format_usd_micros(total.cache_savings_usd_micros)),
@@ -729,7 +832,7 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
                 0
             };
             format!(
-                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{operations}</td><td>{successes}</td><td>{failures}</td><td>{profiles}</td><td>{capability_snapshots}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cache_reads}</td><td>${cache_saved}</td></tr>"#,
+                r#"<tr><td>{group}<span class="bar" style="width:{width}%"></span></td><td>{calls}</td><td>{operations}</td><td>{successes}</td><td>{failures}</td><td>{profiles}</td><td>{capability_snapshots}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>${cost}</td><td>{cold_writes}</td><td>{warm_reads}</td><td>{misses}</td><td>{hit_rate}%</td><td>{cached_share}%</td><td>${cache_saved}</td></tr>"#,
                 group = html_escape(&row.group),
                 width = width,
                 calls = row.calls,
@@ -742,7 +845,11 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
                 output = row.output_tokens,
                 total = row.total_tokens,
                 cost = format_usd_micros(row.cost_usd_micros),
-                cache_reads = row.cache_read_input_tokens,
+                cold_writes = row.cache_cold_writes,
+                warm_reads = row.cache_warm_reads,
+                misses = row.cache_misses,
+                hit_rate = cache_hit_rate(row),
+                cached_share = effective_cached_share(row),
                 cache_saved = format_usd_micros(row.cache_savings_usd_micros)
             )
         })
@@ -752,7 +859,7 @@ fn render_section(title: &str, first_column: &str, rows: &[GatewayReportRow]) ->
         r#"<section>
 <h2>{title}</h2>
 <table>
-<thead><tr><th>{first_column}</th><th>calls</th><th>operations</th><th>successful outcomes</th><th>terminal failures</th><th>profiles</th><th>capability snapshots</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cache reads</th><th>cache savings</th></tr></thead>
+<thead><tr><th>{first_column}</th><th>calls</th><th>operations</th><th>successful outcomes</th><th>terminal failures</th><th>profiles</th><th>capability snapshots</th><th>input tokens</th><th>output tokens</th><th>total tokens</th><th>est. cost</th><th>cold writes</th><th>warm reads</th><th>misses</th><th>hit rate</th><th>cached share</th><th>cache savings</th></tr></thead>
 <tbody>
 {body}
 </tbody>
@@ -777,6 +884,20 @@ fn parse_i64(value: Option<&String>) -> i64 {
     value
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
+}
+
+fn legacy_uncached_input(row: &Row, cache_reads: i64) -> i64 {
+    let input = parse_i64(row.values.get("input_tokens"));
+    let provider = row.values.get("provider").map(String::as_str);
+    let separate_anthropic_shape = provider == Some("anthropic")
+        || row.values.contains_key("cache_creation_input_tokens")
+        || row.values.contains_key("cache_creation_5m_input_tokens")
+        || row.values.contains_key("cache_creation_1h_input_tokens");
+    if separate_anthropic_shape {
+        input
+    } else {
+        input.saturating_sub(cache_reads)
+    }
 }
 
 fn format_usd_micros(value: i64) -> String {
@@ -923,6 +1044,7 @@ mod tests {
                     calls: 2,
                     operations: 2,
                     input_tokens: 17,
+                    uncached_input_tokens: 17,
                     output_tokens: 7,
                     total_tokens: 24,
                     cost_usd_micros: 31,
@@ -933,6 +1055,7 @@ mod tests {
                     calls: 1,
                     operations: 1,
                     input_tokens: 5,
+                    uncached_input_tokens: 5,
                     output_tokens: 2,
                     total_tokens: 7,
                     cost_usd_micros: 21,
@@ -958,19 +1081,23 @@ mod tests {
             row([
                 ("agent", "claude-code"),
                 ("input_tokens", "10"),
+                ("uncached_input_tokens", "10"),
                 ("output_tokens", "5"),
                 ("total_tokens", "15"),
                 ("cost_usd_micros", "40"),
                 ("cache_read_input_tokens", "100"),
+                ("cache_creation_input_tokens", "0"),
                 ("cache_savings_usd_micros", "270"),
             ]),
             row([
                 ("agent", "claude-code"),
                 ("input_tokens", "8"),
+                ("uncached_input_tokens", "8"),
                 ("output_tokens", "2"),
                 ("total_tokens", "10"),
                 ("cost_usd_micros", "20"),
                 ("cache_read_input_tokens", "50"),
+                ("cache_creation_input_tokens", "0"),
                 ("cache_savings_usd_micros", "130"),
             ]),
             // A row without cache tokens contributes zero to the cache columns.
@@ -984,9 +1111,65 @@ mod tests {
         ];
         let report = summarize_rows(rows, ReportGroupBy::Agent);
         assert_eq!(report.len(), 1);
+        assert_eq!(report[0].cache_warm_reads, 2);
+        assert_eq!(report[0].cache_cold_writes, 0);
+        assert_eq!(report[0].cache_misses, 0);
+        assert_eq!(report[0].cache_accounted_calls, 2);
+        assert_eq!(cache_hit_rate(&report[0]), 100);
+        assert_eq!(effective_cached_share(&report[0]), 87);
         assert_eq!(report[0].calls, 3);
         assert_eq!(report[0].cache_read_input_tokens, 150);
         assert_eq!(report[0].cache_savings_usd_micros, 400);
+    }
+
+    #[test]
+    fn zero_accounting_is_a_miss_only_for_an_explicit_cache_attempt() {
+        let report = summarize_rows(
+            vec![
+                row([
+                    ("agent", "attempted"),
+                    ("cache_requested", "true"),
+                    ("cache_read_input_tokens", "0"),
+                    ("cache_creation_input_tokens", "0"),
+                ]),
+                row([
+                    ("agent", "ordinary"),
+                    ("cache_read_input_tokens", "0"),
+                    ("cache_creation_input_tokens", "0"),
+                ]),
+                row([("agent", "unaccounted"), ("cache_requested", "true")]),
+            ],
+            ReportGroupBy::Agent,
+        );
+        let attempted = report.iter().find(|row| row.group == "attempted").unwrap();
+        let ordinary = report.iter().find(|row| row.group == "ordinary").unwrap();
+        let unaccounted = report
+            .iter()
+            .find(|row| row.group == "unaccounted")
+            .unwrap();
+        assert_eq!(attempted.cache_misses, 1);
+        assert_eq!(attempted.cache_accounted_calls, 1);
+        assert_eq!(ordinary.cache_misses, 0);
+        assert_eq!(ordinary.cache_accounted_calls, 0);
+        assert_eq!(unaccounted.cache_misses, 0);
+        assert_eq!(unaccounted.cache_accounted_calls, 0);
+        assert_eq!(unaccounted.cache_unaccounted_attempts, 1);
+    }
+
+    #[test]
+    fn legacy_uncached_input_respects_provider_usage_shapes() {
+        let anthropic = row([
+            ("provider", "anthropic"),
+            ("input_tokens", "10"),
+            ("cache_read_input_tokens", "100"),
+        ]);
+        let openai = row([
+            ("provider", "openai"),
+            ("input_tokens", "100"),
+            ("cache_read_input_tokens", "80"),
+        ]);
+        assert_eq!(legacy_uncached_input(&anthropic, 100), 10);
+        assert_eq!(legacy_uncached_input(&openai, 80), 20);
     }
 
     #[test]
@@ -1024,6 +1207,7 @@ mod tests {
                     calls: 2,
                     operations: 2,
                     input_tokens: 18,
+                    uncached_input_tokens: 18,
                     output_tokens: 8,
                     total_tokens: 26,
                     cost_usd_micros: 37,
@@ -1034,6 +1218,7 @@ mod tests {
                     calls: 1,
                     operations: 1,
                     input_tokens: 7,
+                    uncached_input_tokens: 7,
                     output_tokens: 3,
                     total_tokens: 10,
                     cost_usd_micros: 15,
@@ -1150,6 +1335,7 @@ mod tests {
                     calls: 2,
                     operations: 2,
                     input_tokens: 16,
+                    uncached_input_tokens: 16,
                     output_tokens: 3,
                     total_tokens: 19,
                     cost_usd_micros: 13,
@@ -1160,6 +1346,7 @@ mod tests {
                     calls: 1,
                     operations: 1,
                     input_tokens: 5,
+                    uncached_input_tokens: 5,
                     output_tokens: 2,
                     total_tokens: 7,
                     cost_usd_micros: 14,
@@ -1183,6 +1370,7 @@ mod tests {
                     ("total_tokens", "15"),
                     ("cost_usd_micros", "25"),
                     ("cache_read_input_tokens", "100"),
+                    ("cache_creation_input_tokens", "25"),
                     ("cache_savings_usd_micros", "270"),
                 ]),
                 row([
@@ -1212,8 +1400,18 @@ mod tests {
         assert!(!html.contains("danger<&>"));
         // Cache reporting is surfaced.
         assert!(html.contains("Cache reads"));
+        assert!(html.contains("Cold writes"));
+        assert!(html.contains("Warm reads"));
+        assert!(html.contains("Cache misses"));
+        assert!(html.contains("Unaccounted cache attempts"));
+        assert!(html.contains("Cache hit rate"));
+        assert!(html.contains("Effective cached share"));
         assert!(html.contains("Cache savings"));
-        assert!(html.contains("cache reads"));
+        assert!(html.contains("cold writes"));
+        assert!(html.contains("warm reads"));
+        // A partially cached call counts once in the denominator, so its
+        // call-level hit rate is 100%, not 50%.
+        assert!(html.contains("100%"));
         // Total cache savings across rows: $0.000270.
         assert!(html.contains("$0.000270"));
     }
