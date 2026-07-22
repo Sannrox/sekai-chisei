@@ -41,7 +41,13 @@ pub(super) fn assert_route_contract(
 fn selection(model: &str, previous_model: &str, shifted: bool, reason: &str) -> RouteSelection {
     RouteSelection {
         model: model.into(),
+        prompt_variant: crate::chisei::portfolio::LEGACY_PROMPT_VARIANT.into(),
         previous_model: previous_model.into(),
+        previous_prompt_variant: if previous_model.is_empty() {
+            String::new()
+        } else {
+            crate::chisei::portfolio::LEGACY_PROMPT_VARIANT.into()
+        },
         shifted,
         reason: reason.into(),
     }

@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use crate::db::sekai::SekaiDb;
 
+pub const LEGACY_PROMPT_VARIANT: &str = "legacy@1";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrontierPoint {
     pub model: String,
+    pub prompt_variant: String,
     pub quality_score: f64,
     pub cost_usd_micros: i64,
     pub sample_count: i64,
@@ -16,6 +19,7 @@ pub struct Observation {
     pub namespace: String,
     pub task_class: String,
     pub model: String,
+    pub prompt_variant: String,
     pub quality_score: f64,
     pub cost_usd_micros: i64,
     pub sample_count: i64,
@@ -66,6 +70,7 @@ pub struct TaskDemand {
 pub struct Allocation {
     pub task_class: String,
     pub model: String,
+    pub prompt_variant: String,
     pub quality_score: f64,
     pub cost_per_call_usd_micros: i64,
     pub expected_calls: i64,
@@ -81,7 +86,9 @@ pub struct AllocationPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteSelection {
     pub model: String,
+    pub prompt_variant: String,
     pub previous_model: String,
+    pub previous_prompt_variant: String,
     pub shifted: bool,
     pub reason: String,
 }
@@ -99,6 +106,7 @@ impl PortfolioStore {
         let namespace = observation.namespace.trim();
         let task_class = normalize_task_class(&observation.task_class);
         let model = observation.model.trim();
+        let prompt_variant = normalize_prompt_variant(&observation.prompt_variant);
         if namespace.is_empty() {
             return Err("portfolio observation namespace required".into());
         }
@@ -120,6 +128,7 @@ impl PortfolioStore {
             namespace: namespace.to_string(),
             task_class,
             model: model.to_string(),
+            prompt_variant,
             ..observation.clone()
         };
         self.db.portfolio_record_observation(&normalized)
@@ -143,7 +152,7 @@ impl PortfolioStore {
             .iter()
             .filter(|point| {
                 !points.iter().any(|other| {
-                    other.model != point.model
+                    (other.model != point.model || other.prompt_variant != point.prompt_variant)
                         && other.cost_usd_micros <= point.cost_usd_micros
                         && other.quality_score >= point.quality_score
                         && (other.cost_usd_micros < point.cost_usd_micros
@@ -250,6 +259,7 @@ impl PortfolioStore {
             .map(|(demand, _, _, point)| Allocation {
                 task_class: normalize_task_class(&demand.task_class),
                 model: point.model,
+                prompt_variant: point.prompt_variant,
                 quality_score: point.quality_score,
                 cost_per_call_usd_micros: point.cost_usd_micros,
                 expected_calls: demand.expected_calls,
@@ -271,6 +281,7 @@ impl PortfolioStore {
         namespace: &str,
         task_class: &str,
         proposed_model: &str,
+        proposed_prompt_variant: &str,
         now_ms: i64,
         force: bool,
     ) -> Result<RouteSelection, String> {
@@ -281,6 +292,7 @@ impl PortfolioStore {
             namespace.trim(),
             &normalize_task_class(task_class),
             proposed_model.trim(),
+            &normalize_prompt_variant(proposed_prompt_variant),
             now_ms,
             force,
         )
@@ -394,6 +406,15 @@ pub fn normalize_task_class(task_class: &str) -> String {
     }
 }
 
+pub fn normalize_prompt_variant(prompt_variant: &str) -> String {
+    let normalized = prompt_variant.trim();
+    if normalized.is_empty() {
+        LEGACY_PROMPT_VARIANT.into()
+    } else {
+        normalized.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +446,48 @@ mod tests {
         assert_eq!(point.cost_usd_micros, 17);
         assert_eq!(point.sample_count, 4);
         assert_eq!(point.updated_at, 20);
+    }
+
+    #[test]
+    fn prompt_variants_remain_distinct_and_participate_in_dominance() {
+        let store = store();
+        for (variant, quality, cost) in [("concise@1", 90.0, 10), ("verbose@1", 70.0, 12)] {
+            let mut observation = observation("acme", "primary", "model-a", quality, cost, 3, 1);
+            observation.prompt_variant = variant.into();
+            store.record(&observation).unwrap();
+        }
+
+        let points = store.points("acme", "primary").unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].prompt_variant, "concise@1");
+        assert_eq!(points[0].quality_score, 90.0);
+        assert_eq!(points[1].prompt_variant, "verbose@1");
+        assert_eq!(
+            store.frontier("acme", "primary").unwrap(),
+            vec![points[0].clone()]
+        );
+    }
+
+    #[test]
+    fn allocation_returns_variant_qualified_selection() {
+        let store = store();
+        for (variant, quality, cost) in [("cheap@1", 85.0, 10), ("strong@2", 95.0, 30)] {
+            let mut observation = observation("acme", "primary", "model-a", quality, cost, 5, 1);
+            observation.prompt_variant = variant.into();
+            store.record(&observation).unwrap();
+        }
+        let plan = store
+            .allocate(
+                &objective(ObjectiveMode::MinimizeCost, 100),
+                &[TaskDemand {
+                    task_class: "primary".into(),
+                    expected_calls: 1,
+                    quality_bar: Some(90.0),
+                }],
+            )
+            .unwrap();
+        assert_eq!(plan.allocations[0].model, "model-a");
+        assert_eq!(plan.allocations[0].prompt_variant, "strong@2");
     }
 
     #[test]
@@ -515,6 +578,7 @@ mod tests {
             namespace: namespace.into(),
             task_class: task_class.into(),
             model: model.into(),
+            prompt_variant: LEGACY_PROMPT_VARIANT.into(),
             quality_score,
             cost_usd_micros,
             sample_count,
@@ -695,19 +759,33 @@ mod tests {
     fn route_changes_require_cooldown_and_repeated_confirmation() {
         let store = store();
         let initial = store
-            .damped_route("acme", "primary", "small", 0, false)
+            .damped_route("acme", "primary", "small", LEGACY_PROMPT_VARIANT, 0, false)
             .unwrap();
         assert!(initial.shifted);
 
         for now in [1, 2] {
             let held = store
-                .damped_route("acme", "primary", "large", now, false)
+                .damped_route(
+                    "acme",
+                    "primary",
+                    "large",
+                    LEGACY_PROMPT_VARIANT,
+                    now,
+                    false,
+                )
                 .unwrap();
             assert_eq!(held.model, "small");
             assert!(!held.shifted);
         }
         let shifted = store
-            .damped_route("acme", "primary", "large", 15 * 60 * 1000, false)
+            .damped_route(
+                "acme",
+                "primary",
+                "large",
+                LEGACY_PROMPT_VARIANT,
+                15 * 60 * 1000,
+                false,
+            )
             .unwrap();
         assert_eq!(shifted.model, "large");
         assert!(shifted.shifted);
@@ -717,13 +795,42 @@ mod tests {
     fn forced_regression_route_bypasses_damping() {
         let store = store();
         store
-            .damped_route("acme", "primary", "small", 0, false)
+            .damped_route("acme", "primary", "small", LEGACY_PROMPT_VARIANT, 0, false)
             .unwrap();
         let reverted = store
-            .damped_route("acme", "primary", "capable", 1, true)
+            .damped_route("acme", "primary", "capable", LEGACY_PROMPT_VARIANT, 1, true)
             .unwrap();
         assert_eq!(reverted.model, "capable");
         assert_eq!(reverted.previous_model, "small");
         assert!(reverted.shifted);
+    }
+
+    #[test]
+    fn variant_only_route_change_uses_existing_damping() {
+        let store = store();
+        store
+            .damped_route("acme", "primary", "model-a", "prompt@1", 0, false)
+            .unwrap();
+        for now in [15 * 60 * 1000, 15 * 60 * 1000 + 1] {
+            let held = store
+                .damped_route("acme", "primary", "model-a", "prompt@2", now, false)
+                .unwrap();
+            assert_eq!(held.prompt_variant, "prompt@1");
+            assert!(!held.shifted);
+        }
+        let shifted = store
+            .damped_route(
+                "acme",
+                "primary",
+                "model-a",
+                "prompt@2",
+                15 * 60 * 1000 + 2,
+                false,
+            )
+            .unwrap();
+        assert!(shifted.shifted);
+        assert_eq!(shifted.model, "model-a");
+        assert_eq!(shifted.prompt_variant, "prompt@2");
+        assert_eq!(shifted.previous_prompt_variant, "prompt@1");
     }
 }
