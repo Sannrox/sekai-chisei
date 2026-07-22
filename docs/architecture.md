@@ -120,6 +120,20 @@ There is no separate first-class application scope. Repositories, incidents,
 tickets, deployments, contracts, and other domain concepts belong in typed
 schemas and adapters.
 
+### Tenant lifecycle
+
+The versioned `tenant.v1` record is an administrative identity above, and
+separate from, namespaces, principals, projects, and providers. Platform
+administrators can create, inspect, suspend, reactivate, or request closure of
+a tenant through authenticated Sekai RPCs. Lifecycle mutations and their audit
+entries commit atomically and use durable idempotency keys.
+
+Only an active tenant may admit new governed work. Suspension and
+`closure_pending` preserve existing records; neither state performs physical
+deletion. Tenant-to-namespace ownership and request tenant context are added by
+the subsequent tenant-owned namespace contract, so explicit local operation
+continues without a synthetic tenant.
+
 ## Trust boundaries
 
 - Namespace and object access control apply when data is read or mutated.
