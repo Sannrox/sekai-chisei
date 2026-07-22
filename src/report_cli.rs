@@ -323,7 +323,7 @@ mod tests {
             parent_event_id: None,
             timestamp_ms: 1,
             kind: kind.into(),
-            actor: "bugyo:test".into(),
+            actor: "host:test".into(),
             attributes: attributes
                 .iter()
                 .map(|(key, value)| ((*key).into(), (*value).into()))
@@ -337,7 +337,7 @@ mod tests {
             parent_operation_id: None,
             namespace: "team".into(),
             operation_class: "catalog_invocation".into(),
-            initiating_actor: "bugyo:test".into(),
+            initiating_actor: "host:test".into(),
             schema_version: "1.0".into(),
             policy_version: "live_invocation_check".into(),
             started_at_ms: 1,
