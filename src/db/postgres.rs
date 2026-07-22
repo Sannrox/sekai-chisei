@@ -19,6 +19,7 @@ const UNIQUE_GRANT_SCHEMA: &str = include_str!("postgres/0003_unique_grants.sql"
 const PORTFOLIO_PROMPT_VARIANT_SCHEMA: &str =
     include_str!("postgres/0004_portfolio_prompt_variants.sql");
 const TENANT_SCHEMA: &str = include_str!("postgres/0005_tenants.sql");
+const NAMESPACE_OWNERSHIP_SCHEMA: &str = include_str!("postgres/0006_namespace_ownership.sql");
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
@@ -351,6 +352,24 @@ impl PostgresDb {
                 )
                 .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
         }
+        let namespace_ownership_applied = transaction
+            .query_opt(
+                "SELECT version FROM sekai_schema_migrations WHERE version = $1",
+                &[&6_i64],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?
+            .is_some();
+        if !namespace_ownership_applied {
+            transaction
+                .batch_execute(NAMESPACE_OWNERSHIP_SCHEMA)
+                .map_err(|error| format!("apply PostgreSQL namespace ownership: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                    &[&6_i64, &"namespace_ownership", &chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|error| format!("record PostgreSQL migration: {error}"))?;
+        }
         transaction
             .commit()
             .map_err(|error| format!("commit PostgreSQL migrations: {error}"))
@@ -432,6 +451,12 @@ mod tests {
         assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));
         assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenants"));
         assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenant_requests"));
+        assert!(
+            NAMESPACE_OWNERSHIP_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_namespace_ownership")
+        );
+        assert!(NAMESPACE_OWNERSHIP_SCHEMA.contains("trg_tenant_object_write"));
+        assert!(NAMESPACE_OWNERSHIP_SCHEMA.contains("trg_tenant_link_write"));
         assert!(
             PORTFOLIO_PROMPT_VARIANT_SCHEMA
                 .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")

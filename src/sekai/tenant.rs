@@ -5,6 +5,16 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const TENANT_CONTRACT_VERSION: &str = "tenant.v1";
+pub const NAMESPACE_OWNERSHIP_CONTRACT_VERSION: &str = "namespace-ownership.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceOwnership {
+    pub contract_version: String,
+    pub namespace: String,
+    pub tenant_id: String,
+    pub migrated_from_namespace: String,
+    pub created_at_ms: i64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TenantState {
@@ -56,6 +66,61 @@ pub enum TenantError {
 }
 
 impl SekaiDb {
+    pub(crate) fn migrate_namespace_ownership(&self) -> Result<(), String> {
+        self.conn()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS sekai_namespace_ownership (
+                    namespace TEXT PRIMARY KEY,
+                    contract_version TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    migrated_from_namespace TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES sekai_tenants(id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_sekai_namespace_ownership_tenant
+                    ON sekai_namespace_ownership(tenant_id);
+                 CREATE TRIGGER IF NOT EXISTS trg_tenant_object_insert
+                 BEFORE INSERT ON sekai_objects
+                 WHEN EXISTS (
+                    SELECT 1 FROM sekai_namespace_ownership ownership
+                    JOIN sekai_tenants tenant ON tenant.id=ownership.tenant_id
+                    WHERE ownership.namespace=NEW.namespace AND tenant.state!='active'
+                 ) BEGIN SELECT RAISE(ABORT, 'tenant cannot admit namespace writes'); END;
+                 CREATE TRIGGER IF NOT EXISTS trg_tenant_object_update
+                 BEFORE UPDATE ON sekai_objects
+                 WHEN EXISTS (
+                    SELECT 1 FROM sekai_namespace_ownership ownership
+                    JOIN sekai_tenants tenant ON tenant.id=ownership.tenant_id
+                    WHERE ownership.namespace IN (OLD.namespace,NEW.namespace)
+                      AND tenant.state!='active'
+                 ) BEGIN SELECT RAISE(ABORT, 'tenant cannot admit namespace writes'); END;
+                 CREATE TRIGGER IF NOT EXISTS trg_tenant_object_delete
+                 BEFORE DELETE ON sekai_objects
+                 WHEN EXISTS (
+                    SELECT 1 FROM sekai_namespace_ownership ownership
+                    JOIN sekai_tenants tenant ON tenant.id=ownership.tenant_id
+                    WHERE ownership.namespace=OLD.namespace AND tenant.state!='active'
+                 ) BEGIN SELECT RAISE(ABORT, 'tenant cannot admit namespace writes'); END;
+                 CREATE TRIGGER IF NOT EXISTS trg_tenant_link_insert
+                 BEFORE INSERT ON sekai_links
+                 WHEN EXISTS (
+                    SELECT 1 FROM sekai_objects object
+                    JOIN sekai_namespace_ownership ownership ON ownership.namespace=object.namespace
+                    JOIN sekai_tenants tenant ON tenant.id=ownership.tenant_id
+                    WHERE object.id IN (NEW.from_id,NEW.to_id) AND tenant.state!='active'
+                 ) BEGIN SELECT RAISE(ABORT, 'tenant cannot admit namespace writes'); END;
+                 CREATE TRIGGER IF NOT EXISTS trg_tenant_link_delete
+                 BEFORE DELETE ON sekai_links
+                 WHEN EXISTS (
+                    SELECT 1 FROM sekai_objects object
+                    JOIN sekai_namespace_ownership ownership ON ownership.namespace=object.namespace
+                    JOIN sekai_tenants tenant ON tenant.id=ownership.tenant_id
+                    WHERE object.id IN (OLD.from_id,OLD.to_id) AND tenant.state!='active'
+                 ) BEGIN SELECT RAISE(ABORT, 'tenant cannot admit namespace writes'); END;",
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn migrate_tenants(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(
@@ -213,6 +278,202 @@ impl SekaiDb {
             state => Err(TenantError::AdmissionBlocked(state)),
         }
     }
+
+    pub fn namespace_ownership(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<NamespaceOwnership>, TenantError> {
+        self.conn()
+            .query_row(
+                "SELECT contract_version,namespace,tenant_id,migrated_from_namespace,created_at_ms
+                 FROM sekai_namespace_ownership WHERE namespace=?1",
+                params![namespace],
+                |row| {
+                    Ok(NamespaceOwnership {
+                        contract_version: row.get(0)?,
+                        namespace: row.get(1)?,
+                        tenant_id: row.get(2)?,
+                        migrated_from_namespace: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage)
+    }
+
+    pub fn bind_namespace_to_tenant(
+        &self,
+        namespace: &str,
+        tenant_id: &str,
+        migrated_from_namespace: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<NamespaceOwnership, TenantError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let tenant = tenant_by_id(&tx, tenant_id)?.ok_or(TenantError::NotFound)?;
+        if tenant.state != TenantState::Active {
+            return Err(TenantError::AdmissionBlocked(tenant.state));
+        }
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT contract_version,namespace,tenant_id,migrated_from_namespace,created_at_ms
+                 FROM sekai_namespace_ownership WHERE namespace=?1",
+                params![namespace],
+                |row| {
+                    Ok(NamespaceOwnership {
+                        contract_version: row.get(0)?,
+                        namespace: row.get(1)?,
+                        tenant_id: row.get(2)?,
+                        migrated_from_namespace: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage)?
+        {
+            if existing.tenant_id == tenant_id
+                && existing.migrated_from_namespace == migrated_from_namespace
+            {
+                tx.commit().map_err(storage)?;
+                return Ok(existing);
+            }
+            insert_namespace_ownership_audit(
+                &tx,
+                actor,
+                namespace,
+                &existing.tenant_id,
+                tenant_id,
+                "rejected",
+                now_ms,
+            )?;
+            tx.commit().map_err(storage)?;
+            return Err(TenantError::Conflict(
+                "namespace ownership is immutable; create a new namespace and migrate data".into(),
+            ));
+        }
+        if migrated_from_namespace == namespace {
+            return Err(TenantError::Conflict(
+                "a namespace cannot migrate from itself".into(),
+            ));
+        }
+        if !migrated_from_namespace.is_empty() {
+            let source_exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sekai_namespace_ownership WHERE namespace=?1)",
+                    params![migrated_from_namespace],
+                    |row| row.get(0),
+                )
+                .map_err(storage)?;
+            if !source_exists {
+                return Err(TenantError::NotFound);
+            }
+        }
+        let external_id = format!("namespace:{namespace}");
+        let boundaries = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id,kind FROM sekai_objects WHERE external_id=?1 ORDER BY id LIMIT 2",
+                )
+                .map_err(storage)?;
+            statement
+                .query_map(params![external_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?
+        };
+        if boundaries.len() > 1 || boundaries.iter().any(|(_, kind)| kind != "namespace") {
+            return Err(TenantError::Conflict(
+                "canonical namespace identity is not uniquely held by a namespace boundary".into(),
+            ));
+        }
+        let properties = serde_json::to_string(&HashMap::from([
+            ("tenant_owned".to_string(), "true".to_string()),
+            ("runtime_boundary".to_string(), namespace.to_string()),
+        ]))
+        .map_err(storage)?;
+        if let Some((boundary_id, _)) = boundaries.first() {
+            tx.execute(
+                "UPDATE sekai_objects
+                 SET namespace=?1, properties=json_set(properties,'$.tenant_owned','true'), updated=?2
+                 WHERE id=?3",
+                params![namespace, now_ms, boundary_id],
+            )
+            .map_err(storage)?;
+        } else {
+            tx.execute(
+                "INSERT INTO sekai_objects (id,kind,name,namespace,external_id,properties,created,updated)
+                 VALUES (?1,'namespace',?2,?2,?1,?3,?4,?4)",
+                params![external_id, namespace, properties, now_ms],
+            )
+            .map_err(storage)?;
+        }
+        tx.execute(
+            "INSERT INTO sekai_namespace_ownership
+             (namespace,contract_version,tenant_id,migrated_from_namespace,created_at_ms)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                namespace,
+                NAMESPACE_OWNERSHIP_CONTRACT_VERSION,
+                tenant_id,
+                migrated_from_namespace,
+                now_ms
+            ],
+        )
+        .map_err(storage)?;
+        insert_namespace_ownership_audit(&tx, actor, namespace, "", tenant_id, "applied", now_ms)?;
+        tx.commit().map_err(storage)?;
+        Ok(NamespaceOwnership {
+            contract_version: NAMESPACE_OWNERSHIP_CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            tenant_id: tenant_id.into(),
+            migrated_from_namespace: migrated_from_namespace.into(),
+            created_at_ms: now_ms,
+        })
+    }
+}
+
+fn insert_namespace_ownership_audit(
+    conn: &rusqlite::Connection,
+    actor: &str,
+    namespace: &str,
+    from_tenant: &str,
+    to_tenant: &str,
+    outcome: &str,
+    now_ms: i64,
+) -> Result<(), TenantError> {
+    crate::sekai::ledger::insert_chained_decision(
+        conn,
+        &Decision {
+            id: Uuid::new_v4().to_string(),
+            timestamp: now_ms,
+            actor: actor.into(),
+            action: "namespace.tenant_ownership".into(),
+            reason: if outcome == "applied" {
+                "namespace tenant ownership created".into()
+            } else {
+                "cross-tenant ownership change rejected".into()
+            },
+            evidence: HashMap::from([
+                (
+                    "contract_version".into(),
+                    NAMESPACE_OWNERSHIP_CONTRACT_VERSION.into(),
+                ),
+                ("from_tenant".into(), from_tenant.into()),
+                ("to_tenant".into(), to_tenant.into()),
+                ("data_class".into(), "internal".into()),
+            ]),
+            target_id: format!("namespace:{namespace}"),
+            outcome: outcome.into(),
+        },
+    )
+    .map_err(TenantError::Storage)
 }
 
 fn tenant_by_id(
@@ -418,5 +679,98 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn namespace_ownership_is_unique_immutable_and_supports_new_namespace_migration() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let first = db.create_tenant("root", "tenant-a", 1).unwrap();
+        let second = db.create_tenant("root", "tenant-b", 2).unwrap();
+        db.create_object(&crate::domain::Object {
+            id: "namespace:legacy".into(),
+            kind: "namespace".into(),
+            name: "legacy".into(),
+            namespace: "legacy".into(),
+            external_id: "namespace:legacy".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        db.bind_namespace_to_tenant("legacy", &first.id, "", "root", 2)
+            .unwrap();
+        assert_eq!(
+            db.namespace_ownership("legacy").unwrap().unwrap().tenant_id,
+            first.id.clone()
+        );
+
+        let owned = db
+            .bind_namespace_to_tenant("alpha", &first.id, "", "root", 3)
+            .unwrap();
+        assert_eq!(owned, db.namespace_ownership("alpha").unwrap().unwrap());
+        assert_eq!(
+            db.bind_namespace_to_tenant("alpha", &first.id, "", "root", 4)
+                .unwrap(),
+            owned
+        );
+        assert!(matches!(
+            db.bind_namespace_to_tenant("alpha", &second.id, "", "root", 5),
+            Err(TenantError::Conflict(_))
+        ));
+
+        let migrated = db
+            .bind_namespace_to_tenant("alpha-v2", &second.id, "alpha", "root", 6)
+            .unwrap();
+        assert_eq!(migrated.migrated_from_namespace, "alpha");
+        assert_eq!(
+            db.find_namespace_boundary("alpha-v2")
+                .unwrap()
+                .unwrap()
+                .properties
+                .get("tenant_owned")
+                .map(String::as_str),
+            Some("true")
+        );
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("namespace.tenant_ownership".into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 4);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.outcome == "rejected")
+        );
+
+        db.suspend_tenant(&first.id, "root", "suspend-owned", 7)
+            .unwrap();
+        assert!(
+            db.create_object(&crate::domain::Object {
+                id: "blocked-write".into(),
+                kind: "note".into(),
+                name: "blocked".into(),
+                namespace: "alpha".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 8,
+                updated: 8,
+            })
+            .unwrap_err()
+            .contains("tenant cannot admit namespace writes")
+        );
+        db.create_object(&crate::domain::Object {
+            id: "local-write".into(),
+            kind: "note".into(),
+            name: "local".into(),
+            namespace: "unowned-local".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 8,
+            updated: 8,
+        })
+        .unwrap();
     }
 }

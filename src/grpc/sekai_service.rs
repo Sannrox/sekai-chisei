@@ -555,6 +555,7 @@ impl SekaiServiceImpl {
         actor: &str,
         principals: &[String],
     ) -> Result<String, Status> {
+        let tenant_context = super::tenant_id_from_principal(actor);
         let actions = self
             .actions
             .read()
@@ -577,13 +578,21 @@ impl SekaiServiceImpl {
         }
         for target_id in &target_ids {
             if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                enforce_namespace_tenant_context(
+                    &self.db,
+                    tenant_context.as_deref(),
+                    &target.namespace,
+                    true,
+                )?;
                 check_team_namespace(&self.db, principals, &target.namespace, true)?;
             }
             check_write(&self.security, target_id, principals)?;
         }
         if let Some(namespace) = params.get("namespace") {
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_deref(), namespace, true)?;
             check_team_namespace(&self.db, principals, namespace, true)?;
-        } else if action_name == "create_object" && is_managed_team_principal(&self.db, principals)?
+        } else if action_name == "create_object"
+            && (tenant_context.is_some() || is_managed_team_principal(&self.db, principals)?)
         {
             return Err(Status::permission_denied(
                 "team object creation requires a canonical namespace",
@@ -684,6 +693,7 @@ impl SekaiServiceImpl {
         &self,
         mut object: domain::Object,
         principals: &[String],
+        tenant_context: Option<&str>,
     ) -> Result<domain::Object, Status> {
         let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let schema = self
@@ -694,6 +704,13 @@ impl SekaiServiceImpl {
         compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
             !is_reserved_governance_kind(&candidate.kind)
                 && check_team_namespace(&self.db, principals, &candidate.namespace, false).is_ok()
+                && enforce_namespace_tenant_context(
+                    &self.db,
+                    tenant_context,
+                    &candidate.namespace,
+                    false,
+                )
+                .is_ok()
                 && self.security.can_access(&candidate.id, &refs)
         })
         .map_err(Status::internal)?;
@@ -709,10 +726,11 @@ impl SekaiServiceImpl {
         &self,
         objects: Vec<domain::Object>,
         principals: &[String],
+        tenant_context: Option<&str>,
     ) -> Result<Vec<domain::Object>, Status> {
         objects
             .into_iter()
-            .map(|object| self.resolve_computed_for_response(object, principals))
+            .map(|object| self.resolve_computed_for_response(object, principals, tenant_context))
             .collect()
     }
 
@@ -3924,6 +3942,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateObjectRequest>,
     ) -> Result<Response<CreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let obj = req
             .into_inner()
             .object
@@ -3947,6 +3966,12 @@ impl SekaiService for SekaiServiceImpl {
                 "namespace objects must be managed through EnsureTeamNamespace",
             ));
         }
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &obj.namespace,
+            true,
+        )?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
         let domain_obj = from_proto_obj(&obj);
@@ -3974,7 +3999,8 @@ impl SekaiService for SekaiServiceImpl {
         self.db
             .create_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?;
-        let domain_obj = self.resolve_computed_for_response(domain_obj, &principals)?;
+        let domain_obj =
+            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_deref())?;
         Ok(Response::new(CreateObjectResponse {
             object: Some(to_proto_obj(&domain_obj)),
         }))
@@ -3984,18 +4010,27 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let id = req.into_inner().id;
         let obj = self
             .db
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &obj.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &id, &principals)?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
-        let obj = self.resolve_computed_for_response(obj, &principals)?;
+        let obj =
+            self.resolve_computed_for_response(obj, &principals, tenant_context.as_deref())?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -4005,6 +4040,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<UpdateObjectRequest>,
     ) -> Result<Response<UpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let obj = req
             .into_inner()
             .object
@@ -4031,6 +4067,18 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&obj.id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &existing.namespace,
+            true,
+        )?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &obj.namespace,
+            true,
+        )?;
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
@@ -4122,7 +4170,8 @@ impl SekaiService for SekaiServiceImpl {
             .update_object_with_audit(&domain_obj, actor)
             .map_err(map_graph_mutation_error)?
             .ok_or(Status::not_found("not found"))?;
-        let domain_obj = self.resolve_computed_for_response(domain_obj, &principals)?;
+        let domain_obj =
+            self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_deref())?;
         Ok(Response::new(UpdateObjectResponse {
             object: Some(to_proto_obj(&domain_obj)),
         }))
@@ -4132,10 +4181,17 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let id = req.into_inner().id;
         let Some(existing) = self.db.get_object(&id).map_err(Status::internal)? else {
             return Ok(Response::new(DeleteObjectResponse {}));
         };
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &existing.namespace,
+            true,
+        )?;
         if existing.kind == "namespace" {
             require_credential_admin(&principals)?;
             if existing
@@ -4171,6 +4227,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let invoked_capability = req
             .metadata()
             .get("x-sekai-capability")
@@ -4186,6 +4243,17 @@ impl SekaiService for SekaiServiceImpl {
             .filter(|value| !value.is_empty())
             .map(str::to_string);
         let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        if tenant_context.is_some() {
+            let namespace = filter.namespace.as_deref().ok_or_else(|| {
+                Status::permission_denied("tenant context requires an explicit namespace filter")
+            })?;
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                namespace,
+                false,
+            )?;
+        }
         let operation_id = invoked_capability.as_ref().map(|_| {
             requested_operation_id
                 .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()))
@@ -4279,7 +4347,8 @@ impl SekaiService for SekaiServiceImpl {
                 RESERVED_GOVERNANCE_KINDS,
             )
             .map_err(Status::internal)?;
-        let objects = self.resolve_computed_for_responses(objects, &principals)?;
+        let objects =
+            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_deref())?;
         let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -4305,18 +4374,30 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<FindByExternalIdRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let external_id = req.into_inner().external_id;
-        let obj = self
-            .db
-            .find_by_external_id(&external_id)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("not found"))?;
+        let obj = match tenant_context.as_deref() {
+            Some(tenant_id) => self
+                .db
+                .find_by_external_id_for_tenant(&external_id, tenant_id),
+            None => self.db.find_by_external_id(&external_id),
+        }
+        .map_err(Status::internal)?
+        .ok_or(Status::not_found("not found"))?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
         }
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &obj.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &obj.id, &principals)?;
-        let obj = self.resolve_computed_for_response(obj, &principals)?;
+        let obj =
+            self.resolve_computed_for_response(obj, &principals, tenant_context.as_deref())?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -4326,6 +4407,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<FindByPropertyRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
             return Ok(Response::new(ListObjectsResponse {
@@ -4350,10 +4432,20 @@ impl SekaiService for SekaiServiceImpl {
             .into_iter()
             .filter(|object| {
                 check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                    && enforce_namespace_tenant_context(
+                        &self.db,
+                        tenant_context.as_deref(),
+                        &object.namespace,
+                        false,
+                    )
+                    .is_ok()
             })
             .collect::<Vec<_>>();
-        let filtered = self
-            .resolve_computed_for_responses(filtered.into_iter().cloned().collect(), &principals)?;
+        let filtered = self.resolve_computed_for_responses(
+            filtered.into_iter().cloned().collect(),
+            &principals,
+            tenant_context.as_deref(),
+        )?;
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(to_proto_obj).collect(),
             total: filtered.len() as i32,
@@ -4453,6 +4545,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ResolveObjectSetRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         let set = self
@@ -4480,6 +4573,17 @@ impl SekaiService for SekaiServiceImpl {
             })?;
             check_team_namespace(&self.db, &principals, namespace, false)?;
         }
+        if tenant_context.is_some() {
+            let namespace = filter.namespace.as_deref().ok_or_else(|| {
+                Status::permission_denied("tenant context requires a namespace-scoped object set")
+            })?;
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                namespace,
+                false,
+            )?;
+        }
         {
             let schema = self
                 .schema
@@ -4496,7 +4600,8 @@ impl SekaiService for SekaiServiceImpl {
                 RESERVED_GOVERNANCE_KINDS,
             )
             .map_err(Status::internal)?;
-        let objects = self.resolve_computed_for_responses(objects, &principals)?;
+        let objects =
+            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_deref())?;
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -4507,6 +4612,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
         let l = req
             .into_inner()
@@ -4519,6 +4625,12 @@ impl SekaiService for SekaiServiceImpl {
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                &object.namespace,
+                true,
+            )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
             endpoints.push(object);
@@ -4547,6 +4659,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
         let id = req.into_inner().id;
         let Some(link) = self.db.get_link(&id).map_err(Status::internal)? else {
@@ -4558,6 +4671,12 @@ impl SekaiService for SekaiServiceImpl {
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
+            enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                &object.namespace,
+                true,
+            )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
         }
@@ -4569,6 +4688,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetLinksRequest>,
     ) -> Result<Response<GetLinksResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
         let root = self
@@ -4576,6 +4696,13 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &root.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
@@ -4598,6 +4725,13 @@ impl SekaiService for SekaiServiceImpl {
                         .is_some_and(|object| {
                             check_team_namespace(&self.db, &principals, &object.namespace, false)
                                 .is_ok()
+                                && enforce_namespace_tenant_context(
+                                    &self.db,
+                                    tenant_context.as_deref(),
+                                    &object.namespace,
+                                    false,
+                                )
+                                .is_ok()
                                 && check_read(&self.security, object_id, &principals).is_ok()
                         })
                 })
@@ -4612,12 +4746,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetLinkedObjectsRequest>,
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let r = req.into_inner();
         let root = self
             .db
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_deref(),
+            &root.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
         let dir = if r.direction == "incoming" {
@@ -4633,10 +4775,18 @@ impl SekaiService for SekaiServiceImpl {
             .into_iter()
             .filter(|object| {
                 check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                    && enforce_namespace_tenant_context(
+                        &self.db,
+                        tenant_context.as_deref(),
+                        &object.namespace,
+                        false,
+                    )
+                    .is_ok()
                     && check_read(&self.security, &object.id, &principals).is_ok()
             })
             .collect();
-        let objs = self.resolve_computed_for_responses(objs, &principals)?;
+        let objs =
+            self.resolve_computed_for_responses(objs, &principals, tenant_context.as_deref())?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
         }))
@@ -4646,6 +4796,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let q = req
             .into_inner()
             .query
@@ -4686,6 +4837,13 @@ impl SekaiService for SekaiServiceImpl {
         drop(schema);
         res.objects.retain(|object| {
             check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                && enforce_namespace_tenant_context(
+                    &self.db,
+                    tenant_context.as_deref(),
+                    &object.namespace,
+                    false,
+                )
+                .is_ok()
                 && check_read(&self.security, &object.id, &principals).is_ok()
         });
         let visible_ids = res
@@ -4696,7 +4854,11 @@ impl SekaiService for SekaiServiceImpl {
         res.links.retain(|link| {
             visible_ids.contains(link.from_id.as_str()) && visible_ids.contains(link.to_id.as_str())
         });
-        res.objects = self.resolve_computed_for_responses(res.objects, &principals)?;
+        res.objects = self.resolve_computed_for_responses(
+            res.objects,
+            &principals,
+            tenant_context.as_deref(),
+        )?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -4887,7 +5049,7 @@ impl SekaiService for SekaiServiceImpl {
         }
         for candidate in &mut result.candidates {
             candidate.object =
-                self.resolve_computed_for_response(candidate.object.clone(), &principals)?;
+                self.resolve_computed_for_response(candidate.object.clone(), &principals, None)?;
         }
 
         Ok(Response::new(RetrieveContextResponse {
@@ -5722,6 +5884,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ExecuteActionRequest>,
     ) -> Result<Response<ExecuteActionResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         let work_unit = work_unit_from_metadata(&req);
         let invoked_capability = req
             .metadata()
@@ -5856,13 +6019,22 @@ impl SekaiService for SekaiServiceImpl {
         }
         for target_id in &target_ids {
             if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                enforce_namespace_tenant_context(
+                    &self.db,
+                    tenant_context.as_deref(),
+                    &target.namespace,
+                    true,
+                )?;
                 check_team_namespace(&self.db, &principals, &target.namespace, true)?;
             }
             check_write(&self.security, target_id, &principals)?;
         }
         if let Some(namespace) = r.params.get("namespace") {
+            enforce_namespace_tenant_context(&self.db, tenant_context.as_deref(), namespace, true)?;
             check_team_namespace(&self.db, &principals, namespace, true)?;
-        } else if r.action == "create_object" && is_managed_team_principal(&self.db, &principals)? {
+        } else if r.action == "create_object"
+            && (tenant_context.is_some() || is_managed_team_principal(&self.db, &principals)?)
+        {
             return Err(Status::permission_denied(
                 "team object creation requires a canonical namespace",
             ));
@@ -6745,6 +6917,7 @@ impl SekaiService for SekaiServiceImpl {
                 .map(|node| node.object.clone())
                 .collect(),
             &principals,
+            None,
         )?;
         let nodes = visible_nodes
             .iter()
@@ -7659,7 +7832,7 @@ impl SekaiService for SekaiServiceImpl {
                 && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
         })
         .map_err(Status::invalid_argument)?;
-        let objects = self.resolve_computed_for_responses(result.objects, &principals)?;
+        let objects = self.resolve_computed_for_responses(result.objects, &principals, None)?;
         Ok(Response::new(ExecuteFunctionResponse {
             result: Some(FunctionResult {
                 objects: objects.iter().map(to_proto_obj).collect(),
@@ -8152,6 +8325,7 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectChangesRequest>,
     ) -> Result<Response<ListObjectChangesResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         check_object_namespace_access(&self.db, &principals, &inner.object_id, false)?;
@@ -8160,6 +8334,19 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_object(&inner.object_id)
             .map_err(Status::internal)?;
+        match object.as_ref() {
+            Some(object) => enforce_namespace_tenant_context(
+                &self.db,
+                tenant_context.as_deref(),
+                &object.namespace,
+                false,
+            )
+            .map_err(|_| Status::not_found("not found"))?,
+            None if tenant_context.is_some() => {
+                return Err(Status::not_found("not found"));
+            }
+            None => {}
+        }
         let object_kind = match object.as_ref() {
             Some(object) => Some(object.kind.clone()),
             None => self
@@ -8569,6 +8756,57 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(tenant_status)?;
         Ok(Response::new(RequestTenantClosureResponse {
             tenant: Some(to_proto_tenant(tenant)),
+        }))
+    }
+
+    async fn create_tenant_namespace(
+        &self,
+        req: Request<CreateTenantNamespaceRequest>,
+    ) -> Result<Response<CreateTenantNamespaceResponse>, Status> {
+        let actor = tenant_admin_actor(&req)?;
+        let context = request_tenant_context(&req)?.ok_or_else(|| {
+            Status::failed_precondition("tenant-owned namespaces are disabled in local mode")
+        })?;
+        let inner = req.into_inner();
+        let namespace = validate_credential_principal(&inner.namespace)?;
+        let tenant_id = require_tenant_id(&inner.tenant_id)?;
+        if context != tenant_id {
+            return Err(Status::permission_denied("tenant context mismatch"));
+        }
+        let migrated_from = if inner.migrated_from_namespace.trim().is_empty() {
+            String::new()
+        } else {
+            validate_credential_principal(&inner.migrated_from_namespace)?
+        };
+        let ownership = self
+            .db
+            .bind_namespace_to_tenant(
+                &namespace,
+                &tenant_id,
+                &migrated_from,
+                &actor,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(tenant_status)?;
+        Ok(Response::new(CreateTenantNamespaceResponse {
+            ownership: Some(to_proto_namespace_ownership(ownership)),
+        }))
+    }
+
+    async fn get_namespace_ownership(
+        &self,
+        req: Request<GetNamespaceOwnershipRequest>,
+    ) -> Result<Response<GetNamespaceOwnershipResponse>, Status> {
+        let context = request_tenant_context(&req)?;
+        let namespace = validate_credential_principal(&req.get_ref().namespace)?;
+        enforce_namespace_tenant_context(&self.db, context.as_deref(), &namespace, false)?;
+        let ownership = self
+            .db
+            .namespace_ownership(&namespace)
+            .map_err(tenant_status)?
+            .ok_or_else(|| Status::not_found("namespace ownership not found"))?;
+        Ok(Response::new(GetNamespaceOwnershipResponse {
+            ownership: Some(to_proto_namespace_ownership(ownership)),
         }))
     }
 
@@ -9013,6 +9251,49 @@ fn require_tenant_request_key(value: &str) -> Result<String, Status> {
     Ok(value.to_string())
 }
 
+fn request_tenant_context(req: &Request<impl std::any::Any>) -> Result<Option<String>, Status> {
+    let auth_source = req
+        .metadata()
+        .get("x-sekai-auth-source")
+        .and_then(|value| value.to_str().ok());
+    // Direct in-process callers predate transport metadata and retain local
+    // semantics. Production interceptors always set the authentication source.
+    if auth_source.is_none() || auth_source == Some("local") {
+        return Ok(None);
+    }
+    let tenant_id = req
+        .metadata()
+        .get("x-sekai-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("tenant context required"))?;
+    require_tenant_id(tenant_id).map(Some)
+}
+
+fn enforce_namespace_tenant_context(
+    db: &SekaiDb,
+    tenant_context: Option<&str>,
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let Some(tenant_id) = tenant_context else {
+        return Ok(());
+    };
+    let ownership = db
+        .namespace_ownership(namespace)
+        .map_err(tenant_status)?
+        .ok_or_else(|| Status::permission_denied("namespace tenant ownership required"))?;
+    if ownership.tenant_id != tenant_id {
+        return Err(Status::permission_denied(
+            "namespace tenant context mismatch",
+        ));
+    }
+    if write {
+        db.require_tenant_admission(tenant_id)
+            .map_err(tenant_status)?;
+    }
+    Ok(())
+}
+
 fn tenant_status(error: crate::sekai::tenant::TenantError) -> Status {
     use crate::sekai::tenant::TenantError;
     match error {
@@ -9042,6 +9323,18 @@ fn to_proto_tenant(record: crate::sekai::tenant::TenantRecord) -> TenantRecord {
         state: state as i32,
         created_at_ms: record.created_at_ms,
         updated_at_ms: record.updated_at_ms,
+    }
+}
+
+fn to_proto_namespace_ownership(
+    ownership: crate::sekai::tenant::NamespaceOwnership,
+) -> NamespaceOwnership {
+    NamespaceOwnership {
+        contract_version: ownership.contract_version,
+        namespace: ownership.namespace,
+        tenant_id: ownership.tenant_id,
+        migrated_from_namespace: ownership.migrated_from_namespace,
+        created_at_ms: ownership.created_at_ms,
     }
 }
 
@@ -9307,6 +9600,17 @@ mod tests {
         let mut req = Request::new(payload);
         req.metadata_mut()
             .insert("x-principal", MetadataValue::try_from(principal).unwrap());
+        req
+    }
+
+    fn with_tenant_context<T>(payload: T, principal: &str, tenant_id: &str) -> Request<T> {
+        let mut req = with_named_principal(payload, principal);
+        req.metadata_mut()
+            .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+        req.metadata_mut().insert(
+            "x-sekai-tenant-id",
+            MetadataValue::try_from(tenant_id).unwrap(),
+        );
         req
     }
 
@@ -17953,6 +18257,94 @@ mod tests {
             .state(),
             TenantLifecycleState::Suspended
         );
+    }
+
+    #[tokio::test]
+    async fn tenant_context_fails_closed_while_local_mode_skips_tenant_state() {
+        let svc = service();
+        let tenant_a = svc
+            .db
+            .create_tenant("root", "namespace-tenant-a", 1)
+            .unwrap();
+        let tenant_b = svc
+            .db
+            .create_tenant("root", "namespace-tenant-b", 2)
+            .unwrap();
+        svc.create_tenant_namespace(with_tenant_context(
+            CreateTenantNamespaceRequest {
+                namespace: "alpha".into(),
+                tenant_id: tenant_a.id.clone(),
+                migrated_from_namespace: String::new(),
+            },
+            "root",
+            &tenant_a.id,
+        ))
+        .await
+        .unwrap();
+
+        let object = Object {
+            id: "tenant-object".into(),
+            kind: "note".into(),
+            name: "tenant object".into(),
+            namespace: "alpha".into(),
+            ..Default::default()
+        };
+        svc.create_object(with_tenant_context(
+            CreateObjectRequest {
+                object: Some(object.clone()),
+            },
+            "root",
+            &tenant_a.id,
+        ))
+        .await
+        .unwrap();
+
+        let missing = svc
+            .get_object({
+                let mut req = with_named_principal(
+                    GetObjectRequest {
+                        id: object.id.clone(),
+                    },
+                    "root",
+                );
+                req.metadata_mut()
+                    .insert("x-sekai-auth-source", MetadataValue::from_static("token"));
+                req
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::PermissionDenied);
+
+        let mismatched = svc
+            .get_object(with_tenant_context(
+                GetObjectRequest {
+                    id: object.id.clone(),
+                },
+                "root",
+                &tenant_b.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatched.code(), tonic::Code::NotFound);
+        let absent = svc
+            .get_object(with_tenant_context(
+                GetObjectRequest {
+                    id: "does-not-exist".into(),
+                },
+                "root",
+                &tenant_b.id,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(absent.code(), mismatched.code());
+
+        svc.get_object(with_named_principal(
+            GetObjectRequest { id: object.id },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert!(svc.db.get_tenant("local").unwrap().is_none());
     }
 
     #[tokio::test]
