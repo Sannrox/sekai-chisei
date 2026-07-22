@@ -254,6 +254,12 @@ impl SdkInvocation {
         insert_metadata(&mut request, "x-sekai-namespace", &self.namespace)?;
         insert_metadata(&mut request, "x-sekai-capability", &self.capability)?;
         insert_metadata(&mut request, "x-sekai-operation-id", &self.operation_id)?;
+        insert_metadata(&mut request, "x-chisei-work-unit", &self.operation_id)?;
+        insert_metadata(
+            &mut request,
+            "x-sekai-catalog-version",
+            &self.catalog_version,
+        )?;
         Ok(request)
     }
 
@@ -553,6 +559,8 @@ mod tests {
             "x-sekai-namespace",
             "x-sekai-capability",
             "x-sekai-operation-id",
+            "x-chisei-work-unit",
+            "x-sekai-catalog-version",
         ]
         .into_iter()
         .map(|key| {

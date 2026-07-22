@@ -41,7 +41,9 @@
     "x-principal": "agent-a",
     "x-sekai-namespace": "team-a",
     "x-sekai-capability": "sekai.actions.write",
-    "x-sekai-operation-id": "operation-1"
+    "x-sekai-operation-id": "operation-1",
+    "x-chisei-work-unit": "operation-1",
+    "x-sekai-catalog-version": "sha256:catalog"
   },
   "expected_error": {
     "code": "permission_denied",
