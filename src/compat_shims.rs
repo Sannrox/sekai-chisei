@@ -7,7 +7,8 @@
 //!
 //! The register is checked in rather than derived, because the interesting
 //! fields — owner and deadline — do not exist anywhere in the source. What is
-//! derived is the *completeness* check: a test scans `src/` for
+//! derived is the *completeness* check: a test scans the control-plane and
+//! provider crate sources for
 //! `#[deprecated]` items and fails when one is missing here, so a shim cannot
 //! be added without also being given a deadline.
 
@@ -111,7 +112,10 @@ mod tests {
     /// Names of items carrying `#[deprecated]` anywhere under `src/`.
     fn deprecated_items() -> BTreeSet<String> {
         let mut names = BTreeSet::new();
-        for path in rust_sources("src") {
+        for path in rust_sources("src")
+            .into_iter()
+            .chain(rust_sources("crates/sekai-provider/src"))
+        {
             let Ok(source) = std::fs::read_to_string(&path) else {
                 continue;
             };
