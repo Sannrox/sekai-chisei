@@ -89,7 +89,7 @@ impl ActionPolicy {
 
     /// Serialize to a Sekai object property map (mirrors namespace policy
     /// storage: human-readable, CSV-style values).
-    pub fn to_properties(&self) -> HashMap<String, String> {
+    pub(crate) fn to_properties(&self) -> HashMap<String, String> {
         let mut properties = HashMap::new();
         properties.insert("scope".to_string(), self.scope.clone());
         properties.insert(
