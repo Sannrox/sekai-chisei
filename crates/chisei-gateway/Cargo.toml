@@ -5,10 +5,40 @@ edition = "2024"
 license = "AGPL-3.0-only"
 description = "Governed OpenAI- and Anthropic-compatible egress gateway."
 
+[features]
+default = []
+secret-command = []
+
 [dependencies]
+async-stream = "0.3"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httpdate = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+pin-project-lite = "0.2"
+prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-sekai-chisei = { version = "0.1.0", path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sekai-provider = { version = "0.1.0", path = "../sekai-provider" }
 sekai-proto = { version = "0.1.0", path = "../sekai-proto" }
+sha2 = "0.10"
+subtle = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+sekai-chisei = { version = "0.1.0", path = "../..", features = ["gateway-test-support"] }
+tempfile = "3"

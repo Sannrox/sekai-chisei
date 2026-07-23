@@ -506,6 +506,17 @@ impl SekaiDb {
         Ok((used, max_amount, period_type))
     }
 
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    pub fn gateway_test_budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String> {
+        self.budget_usage(scope_id, metric, now_ms)
+    }
+
     /// Worst pressure level among scopes whose id starts with `namespace`
     /// (matches the pre-hierarchy prefix-scan semantics of
     /// `BudgetTracker::namespace_pressure`, now backed by SQL `LIKE`).

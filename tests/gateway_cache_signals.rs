@@ -42,8 +42,8 @@ async fn key_cache_miss_is_recorded_on_an_unknown_key() {
         // recorded before the connection is attempted.
         std::env::set_var("CHISEI_GRPC_URL", "http://127.0.0.1:1");
     }
-    let config = sekai_chisei::gateway::GatewayConfig::from_env().expect("gateway config");
-    let app = sekai_chisei::gateway::app(config);
+    let config = chisei_gateway::gateway::GatewayConfig::from_env().expect("gateway config");
+    let app = chisei_gateway::gateway::app(config);
 
     // An authenticated route with a key that was never cached forces exactly
     // one lookup against an empty cache.

@@ -1,9 +1,9 @@
-use sekai_chisei::gateway::{GatewayConfig, serve};
-use sekai_chisei::gateway_report::{GatewayReportConfig, report_usage, run_report};
+use chisei_gateway::gateway::{GatewayConfig, serve};
+use chisei_gateway::gateway_report::{GatewayReportConfig, report_usage, run_report};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    sekai_chisei::obs::logging::init();
+    chisei_gateway::obs::logging::init();
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("report") {
         args.remove(0);

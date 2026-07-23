@@ -183,7 +183,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 | [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
 | [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
 | [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
-| [`src/llm/`](src/llm/) | Provider-specific adapters |
+| [`crates/sekai-provider/`](crates/sekai-provider/) | Provider registry, adapters, pricing, and shared receipt contracts |
+| [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
 | [`adapters/`](adapters/) | External evidence reference adapters |
 | [`examples/`](examples/) | Runnable integration examples |
 | [`tests/`](tests/) | Integration tests and deterministic fixtures |
