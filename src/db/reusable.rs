@@ -15,6 +15,9 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.handoffs",
     "sekai.leases",
     "sekai.ontology-definitions",
+    "sekai.retention",
+    "sekai.scoped-content",
+    "sekai.reconciliation",
 ];
 
 pub fn postgres_reusable_capabilities() -> BackendCapabilities {
