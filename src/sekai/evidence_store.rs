@@ -1007,7 +1007,7 @@ const fn default_max_retained_submissions() -> u64 {
     DEFAULT_MAX_RETAINED_EVIDENCE_SUBMISSIONS
 }
 
-fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), String> {
+pub(crate) fn validate_capability(capability: &EvidenceProducerCapability) -> Result<(), String> {
     if capability.producer_identity.trim().is_empty() {
         return Err("producer identity is required".to_string());
     }
@@ -1051,7 +1051,7 @@ fn load_capability(
     .transpose()
 }
 
-fn authorize<'a>(
+pub(crate) fn authorize<'a>(
     capability: &EvidenceProducerCapability,
     envelope: &EvidenceEnvelope,
     now_ms: i64,
@@ -1165,7 +1165,7 @@ fn schema_is_accepted(tx: &Transaction<'_>, envelope: &EvidenceEnvelope) -> Resu
     Ok(false)
 }
 
-fn submission_is_admitted(submission: &EvidenceSubmissionRecord) -> bool {
+pub(crate) fn submission_is_admitted(submission: &EvidenceSubmissionRecord) -> bool {
     submission.lifecycle_state.is_admitted()
         && (submission.lifecycle_state != EvidenceLifecycleState::Quarantined
             || submission
@@ -1405,7 +1405,7 @@ fn row_to_submission(row: &rusqlite::Row<'_>) -> Result<EvidenceSubmissionRecord
     })
 }
 
-fn intent_str(intent: EvidenceIntent) -> &'static str {
+pub(crate) fn intent_str(intent: EvidenceIntent) -> &'static str {
     match intent {
         EvidenceIntent::Upsert => "upsert",
         EvidenceIntent::Retract => "retract",
@@ -1413,7 +1413,7 @@ fn intent_str(intent: EvidenceIntent) -> &'static str {
     }
 }
 
-fn parse_intent(value: &str) -> Option<EvidenceIntent> {
+pub(crate) fn parse_intent(value: &str) -> Option<EvidenceIntent> {
     Some(match value {
         "upsert" => EvidenceIntent::Upsert,
         "retract" => EvidenceIntent::Retract,
@@ -1422,7 +1422,7 @@ fn parse_intent(value: &str) -> Option<EvidenceIntent> {
     })
 }
 
-fn parse_classification(value: &str) -> Option<EvidenceClassification> {
+pub(crate) fn parse_classification(value: &str) -> Option<EvidenceClassification> {
     Some(match value {
         "public" => EvidenceClassification::Public,
         "internal" => EvidenceClassification::Internal,

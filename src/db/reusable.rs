@@ -7,9 +7,12 @@ use crate::runtime_backend::{
 
 pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.action-definitions",
+    "sekai.attestations",
     "sekai.credentials",
     "sekai.coordination",
     "sekai.datasets",
+    "sekai.evidence",
+    "sekai.handoffs",
     "sekai.leases",
     "sekai.ontology-definitions",
 ];
