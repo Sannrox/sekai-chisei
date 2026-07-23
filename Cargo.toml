@@ -23,6 +23,7 @@ resolver = "2"
 [features]
 default = []
 secret-command = []
+gateway-test-support = []
 
 [dependencies]
 # gRPC
@@ -81,6 +82,7 @@ sekai-provider = { version = "0.1.0", path = "crates/sekai-provider" }
 sekai-proto = { version = "0.1.0", path = "crates/sekai-proto" }
 
 [dev-dependencies]
+chisei-gateway = { version = "0.1.0", path = "crates/chisei-gateway" }
 tempfile = "3"
 
 [[bench]]

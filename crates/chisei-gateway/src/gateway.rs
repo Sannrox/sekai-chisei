@@ -119,54 +119,7 @@ const RECOVERY_REPLAY_YIELD_INTERVAL: usize = 32;
 const SCHEMA_RECONCILIATION_RETRY_MS: u64 = 60_000;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
-pub(crate) const LLM_CALLS_COLUMNS: &[&str] = &[
-    "request_id",
-    "receipt_id",
-    "operation_id",
-    "parent_operation_id",
-    "turn_id",
-    "attempt",
-    "cycle_id",
-    "traceparent",
-    "timestamp_ms",
-    "agent",
-    "project",
-    "user_id",
-    "key_id",
-    "provider",
-    "model",
-    "resolved_model",
-    "profile_version",
-    "capability_snapshot_version",
-    "work_unit_id",
-    "route_bias",
-    "policy_scope",
-    "policy_version",
-    "pipeline_sampled",
-    "sample_reason",
-    "sample_rate",
-    "status",
-    "terminal_outcome",
-    "error_type",
-    "refusal_reason",
-    "request_bytes",
-    "latency_ms",
-    "input_tokens",
-    "uncached_input_tokens",
-    "output_tokens",
-    "total_tokens",
-    "provider_total_tokens",
-    "cost_usd_micros",
-    "cost_usd",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "cache_creation_5m_input_tokens",
-    "cache_creation_1h_input_tokens",
-    "cache_requested",
-    "pricing_snapshot_version",
-    "cache_savings_usd_micros",
-    "cache_savings_usd",
-];
+pub(crate) use sekai_provider::gateway_contract::LLM_CALLS_COLUMNS;
 
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -13594,15 +13547,14 @@ mod tests {
         );
 
         receipt_db
-            .conn()
-            .execute_batch(
+            .gateway_test_execute_batch(
                 "DROP INDEX idx_chisei_operation_receipts_lookup;
                  UPDATE chisei_operation_receipts
                  SET caller_scope=NULL, request_id='chisei:scope-a:legacy', updated_at=999
                  WHERE operation_id='other-scope-operation';",
             )
             .unwrap();
-        receipt_db.migrate_chisei().unwrap();
+        receipt_db.gateway_test_migrate_chisei().unwrap();
         assert_eq!(
             receipt_db
                 .find_operation_receipt_by_lookup_request_id(
@@ -15687,9 +15639,10 @@ mod tests {
 
     #[test]
     fn prompt_cache_baseline_covers_required_scenarios() {
-        let baseline: serde_json::Value =
-            serde_json::from_str(include_str!("../benchmarks/prompt-cache-baseline-v1.json"))
-                .unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../benchmarks/prompt-cache-baseline-v1.json"
+        ))
+        .unwrap();
         assert_eq!(baseline["version"], "prompt-cache-baseline/v1");
         let names = baseline["scenarios"]
             .as_array()
