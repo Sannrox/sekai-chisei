@@ -12,7 +12,12 @@ keywords = ["agents", "governance", "llm", "grpc", "local-first"]
 categories = ["development-tools", "web-programming"]
 
 [workspace]
-members = ["crates/sekai-ontology"]
+members = [
+    "crates/chisei-gateway",
+    "crates/sekai-ontology",
+    "crates/sekai-proto",
+    "crates/sekai-provider",
+]
 resolver = "2"
 
 [features]
@@ -72,13 +77,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+sekai-provider = { version = "0.1.0", path = "crates/sekai-provider" }
+sekai-proto = { version = "0.1.0", path = "crates/sekai-proto" }
 
 [dev-dependencies]
 tempfile = "3"
-
-[build-dependencies]
-tonic-prost-build = "0.14"
-protoc-bin-vendored = "3"
 
 [[bench]]
 name = "control_plane"

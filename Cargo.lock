@@ -211,6 +211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "chisei-gateway"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "sekai-chisei",
+ "sekai-proto",
+ "sekai-provider",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2159,7 +2171,6 @@ dependencies = [
  "postgres-native-tls",
  "prost",
  "prost-types",
- "protoc-bin-vendored",
  "r2d2",
  "r2d2_postgres",
  "r2d2_sqlite",
@@ -2167,6 +2178,8 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "same-file",
+ "sekai-proto",
+ "sekai-provider",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2177,7 +2190,6 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -2193,6 +2205,37 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "sekai-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "sekai-provider"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

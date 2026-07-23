@@ -247,7 +247,7 @@ PY
 cd "$ROOT"
 
 if [ "${CHISEI_GATEWAY_SMOKE_SKIP_BUILD:-0}" != "1" ]; then
-  cargo build --locked --bins
+  cargo build --locked --workspace --bins
 fi
 
 BIN_DIR="${CHISEI_GATEWAY_SMOKE_BIN_DIR:-$ROOT/target/debug}"
@@ -266,6 +266,7 @@ SOCKET="$TMPDIR/sekai.sock"
 DB_PATH="$TMPDIR/sekai.db"
 SEKAI_INSECURE=1 \
 GRPC_PORT=0 \
+OPS_PORT="" \
 SEKAI_SOCKET="$SOCKET" \
 DB_PATH="$DB_PATH" \
 OPENAI_API_KEY="control-plane-openai-smoke-key" \

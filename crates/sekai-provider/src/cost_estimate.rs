@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::gateway::{ModelPricing, parse_pricing_table};
+use crate::pricing::{ModelPricing, parse_pricing_table};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostEstimateConfig {
@@ -19,7 +19,7 @@ pub struct CostEstimate {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct CacheCreationUsage {
+pub struct CacheCreationUsage {
     pub total_tokens: i64,
     pub five_minute_tokens: Option<i64>,
     pub one_hour_tokens: Option<i64>,
@@ -135,7 +135,7 @@ fn projected_cost(input: i64, output: i64, pricing: &ModelPricing) -> Result<i64
 ///
 /// Anthropic reports cache reads separately from uncached input, while OpenAI
 /// compatible providers report cached input as a subset of prompt tokens.
-pub(crate) fn cost_usd_micros(
+pub fn cost_usd_micros(
     model: &str,
     pricing: &ModelPricing,
     input_tokens: i64,
@@ -156,7 +156,7 @@ pub(crate) fn cost_usd_micros(
     )
 }
 
-pub(crate) fn cost_usd_micros_with_cache_classes(
+pub fn cost_usd_micros_with_cache_classes(
     model: &str,
     pricing: &ModelPricing,
     input_tokens: i64,

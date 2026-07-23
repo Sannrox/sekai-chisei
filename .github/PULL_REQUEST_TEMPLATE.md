@@ -11,8 +11,8 @@
 ## Validation
 
 - [ ] `cargo fmt --check`
-- [ ] `cargo test --locked`
-- [ ] `cargo clippy --all-targets -- -D warnings`
+- [ ] `cargo test --workspace --locked`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] Additional focused or smoke tests are listed below
 
 <!-- List additional commands and results. -->

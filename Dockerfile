@@ -6,7 +6,7 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bins && \
+    cargo build --release --workspace --bins && \
     mkdir -p /out && \
     cp target/release/sekai-chisei \
        target/release/chisei-gateway \
