@@ -2,7 +2,7 @@ use crate::db::sekai::SekaiDb;
 use rusqlite::params;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: String,
     pub col_type: String,
@@ -31,7 +31,7 @@ pub fn llm_call_column_classification(name: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dataset {
     pub id: String,
     pub name: String,
@@ -40,14 +40,14 @@ pub struct Dataset {
     pub created: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowFilter {
     pub column: String,
     pub op: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RowQuery {
     pub filters: Vec<RowFilter>,
     pub columns: Vec<String>,
@@ -55,7 +55,7 @@ pub struct RowQuery {
     pub offset: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualTable {
     pub id: String,
     pub name: String,

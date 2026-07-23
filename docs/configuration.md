@@ -33,12 +33,13 @@ explicit operator decision.
 Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend and its
-supported reusable surfaces. PostgreSQL exposes the reusable `sekai.graph`,
-`sekai.authorization`, and `sekai.audit` storage contract for enterprise
-composition and conformance testing. The community server still requires the
-complete SQLite capability set and refuses PostgreSQL runtime selection because
-coordination, Chisei, and gateway surfaces are not implemented there. Backend
-selection does not enable tenant, OIDC, OAuth, or identity endpoints.
+supported reusable surfaces. PostgreSQL exposes partial contracts for the graph,
+datasets, ontology and action definitions, generation-fenced leases, and
+tenant-free principal credentials for composition and conformance testing. The
+community server still requires the complete SQLite capability set and refuses
+PostgreSQL runtime selection because work admission, evidence, retention,
+Chisei, and gateway surfaces are incomplete. Backend selection does not enable
+tenant, OIDC, OAuth, or identity endpoints.
 
 ## Providers and outbound calls
 
