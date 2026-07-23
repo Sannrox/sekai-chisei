@@ -23,6 +23,7 @@ const TENANT_MEMBERSHIP_SCHEMA: &str = include_str!("postgres/0007_tenant_member
 const TENANT_CREDENTIAL_SCHEMA: &str = include_str!("postgres/0008_tenant_credentials.sql");
 const GRAPH_PARITY_SCHEMA: &str = include_str!("postgres/0009_graph_parity.sql");
 const SEKAI_PARITY_SCHEMA: &str = include_str!("postgres/0010_sekai_parity.sql");
+const COORDINATION_PARITY_SCHEMA: &str = include_str!("postgres/0011_coordination_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -81,6 +82,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "sekai_parity",
         sql: SEKAI_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 11,
+        name: "coordination_parity",
+        sql: COORDINATION_PARITY_SCHEMA,
     },
 ];
 
