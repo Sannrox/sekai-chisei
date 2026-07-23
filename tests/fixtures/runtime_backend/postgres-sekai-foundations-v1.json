@@ -5,6 +5,7 @@
     "sekai.action-definitions",
     "sekai.audit",
     "sekai.authorization",
+    "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",
     "sekai.graph",
