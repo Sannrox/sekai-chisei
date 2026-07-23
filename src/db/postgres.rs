@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-#[cfg(test)]
 use native_tls::Certificate;
 use native_tls::TlsConnector;
 use postgres::{Config as PostgresConfig, config::SslMode};
@@ -23,6 +22,7 @@ const NAMESPACE_OWNERSHIP_SCHEMA: &str = include_str!("postgres/0006_namespace_o
 const TENANT_MEMBERSHIP_SCHEMA: &str = include_str!("postgres/0007_tenant_memberships.sql");
 const TENANT_CREDENTIAL_SCHEMA: &str = include_str!("postgres/0008_tenant_credentials.sql");
 const GRAPH_PARITY_SCHEMA: &str = include_str!("postgres/0009_graph_parity.sql");
+const SEKAI_PARITY_SCHEMA: &str = include_str!("postgres/0010_sekai_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -77,6 +77,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "graph_parity",
         sql: GRAPH_PARITY_SCHEMA,
     },
+    Migration {
+        version: 10,
+        name: "sekai_parity",
+        sql: SEKAI_PARITY_SCHEMA,
+    },
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -109,8 +114,11 @@ impl PostgresDb {
         Self::connect_with_tls(database_url, max_connections, tls)
     }
 
-    #[cfg(test)]
-    pub(crate) fn connect_with_test_ca(
+    /// Connect with an explicitly supplied PEM CA certificate.
+    ///
+    /// This keeps certificate trust explicit for isolated conformance
+    /// environments without permitting plaintext or disabled verification.
+    pub fn connect_with_ca_certificate(
         database_url: &str,
         max_connections: u32,
         ca_certificate_pem: &[u8],
@@ -170,7 +178,7 @@ impl PostgresDb {
             .query_opt(
                 "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id
                  FROM sekai_principal_credentials
-                 WHERE token_hash = $1 AND status = 'active'
+                 WHERE token_hash = $1 AND tenant_id = '' AND status = 'active'
                  ORDER BY created DESC LIMIT 1",
                 &[&token_hash],
             )
@@ -284,7 +292,8 @@ impl PostgresDb {
             .query(
                 "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id
                  FROM sekai_principal_credentials
-                 WHERE ($1::text IS NULL OR principal = $1)
+                 WHERE tenant_id = ''
+                   AND ($1::text IS NULL OR principal = $1)
                    AND ($2::text IS NULL OR status = $2)
                  ORDER BY created, id",
                 &[&principal, &status],
@@ -421,7 +430,7 @@ mod tests {
             let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
                 panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
             });
-            PostgresDb::connect_with_test_ca(&database_url, 4, &ca_certificate).unwrap()
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
         } else {
             PostgresDb::connect(&database_url, 4).unwrap()
         }
@@ -606,7 +615,7 @@ mod tests {
                 barrier.wait();
                 match ca_certificate {
                     Some(certificate) => {
-                        PostgresDb::connect_with_test_ca(&database_url, 2, &certificate)
+                        PostgresDb::connect_with_ca_certificate(&database_url, 2, &certificate)
                     }
                     None => PostgresDb::connect(&database_url, 2),
                 }
@@ -621,6 +630,37 @@ mod tests {
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn reusable_credentials_exclude_tenant_rows() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        db.migrate().unwrap();
+        db.connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO sekai_principal_credentials
+                    (id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id)
+                 VALUES ('tenant-credential','shared-principal','tenant-hash','active',1,1,0,'tenant-a')",
+                &[],
+            )
+            .unwrap();
+
+        assert!(
+            db.get_principal_credential("tenant-hash")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_credentials(Some("shared-principal"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     fn failed_migration_rolls_back_schema_and_version() {
         let _guard = POSTGRES_MIGRATION_TEST
             .lock()
@@ -629,15 +669,18 @@ mod tests {
         reset_database(&db);
         db.migrate().unwrap();
         let mut migrations = MIGRATIONS.to_vec();
+        let failing_version = MIGRATIONS.len() as i64 + 1;
         migrations.push(Migration {
-            version: 9,
+            version: failing_version,
             name: "deliberate_failure_fixture",
             sql: "CREATE TABLE migration_must_roll_back (id BIGINT); SELECT missing_function();",
         });
 
         let error = db.migrate_with(&migrations).unwrap_err();
 
-        assert!(error.contains("migration 9 (deliberate_failure_fixture)"));
+        assert!(error.contains(&format!(
+            "migration {failing_version} (deliberate_failure_fixture)"
+        )));
         assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
         let table: Option<String> = db
             .connection()
@@ -660,15 +703,22 @@ mod tests {
         let db = test_database();
         reset_database(&db);
         db.migrate().unwrap();
+        let future_version = MIGRATIONS.len() as i64 + 1;
         db.connection()
             .unwrap()
             .execute(
                 "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
-                &[&9_i64, &"future", &0_i64],
+                &[&future_version, &"future", &0_i64],
             )
             .unwrap();
         let error = db.migrate().unwrap_err();
-        assert!(error.contains("newer than supported version 8"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "newer than supported version {}",
+                MIGRATIONS.len()
+            )),
+            "{error}"
+        );
 
         reset_database(&db);
         db.migrate_with(&MIGRATIONS[..1]).unwrap();
