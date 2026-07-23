@@ -55,7 +55,10 @@ enrichment, budgets, egress decisions, approval requirements, model/runtime
 routing, evaluation gates, outcome attribution, and learning rules.
 
 The LLM provider adapters execute calls but do not own these decisions.
-Provider-specific behavior stays behind `src/llm/` abstractions.
+Provider-specific behavior stays behind the `sekai-provider` crate. The
+`chisei-gateway` crate depends only on `sekai-proto` and `sekai-provider` among
+workspace packages; governed decisions and durable mutations cross the gRPC
+contract instead of reaching into control-plane implementation modules.
 
 Provider registry persistence and lifecycle records are owned by
 `provider_profile`; `provider_resolution` is the single orchestration boundary

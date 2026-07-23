@@ -410,6 +410,12 @@ impl SekaiDb {
         Ok(())
     }
 
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    pub fn gateway_test_migrate_chisei(&self) -> Result<(), String> {
+        self.migrate_chisei()
+    }
+
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         let conn = self.conn();
         upsert_operation_receipt(&conn, receipt)

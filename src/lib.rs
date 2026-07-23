@@ -10,7 +10,6 @@ pub mod db;
 pub mod domain;
 pub mod enterprise;
 pub mod enterprise_conformance;
-pub mod gateway;
 pub use sekai_provider::gateway_keys;
 pub mod gateway_report;
 pub mod gateway_setup;
