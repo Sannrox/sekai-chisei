@@ -27,6 +27,8 @@ const COORDINATION_PARITY_SCHEMA: &str = include_str!("postgres/0011_coordinatio
 const EVIDENCE_PARITY_SCHEMA: &str = include_str!("postgres/0012_evidence_parity.sql");
 const RETENTION_DEDUPLICATION_PARITY_SCHEMA: &str =
     include_str!("postgres/0013_retention_deduplication_parity.sql");
+const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
+    include_str!("postgres/0014_action_governance_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -100,6 +102,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "retention_deduplication_parity",
         sql: RETENTION_DEDUPLICATION_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 14,
+        name: "action_governance_parity",
+        sql: ACTION_GOVERNANCE_PARITY_SCHEMA,
     },
 ];
 
@@ -542,6 +549,20 @@ mod tests {
             PORTFOLIO_PROMPT_VARIANT_SCHEMA
                 .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")
         );
+        for table in [
+            "sekai_action_policies",
+            "sekai_action_approvals",
+            "sekai_action_blast_radius",
+            "sekai_action_governance_audit",
+        ] {
+            assert!(
+                ACTION_GOVERNANCE_PARITY_SCHEMA
+                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+            );
+        }
+        for excluded in ["tenant", "oauth", "oidc"] {
+            assert!(!ACTION_GOVERNANCE_PARITY_SCHEMA.contains(excluded));
+        }
     }
 
     #[test]
