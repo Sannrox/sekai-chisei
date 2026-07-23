@@ -258,20 +258,23 @@ downstream outcome separate.
 ## Persistence
 
 SQLite is the server's current storage backend and runs in WAL mode for file
-databases. PostgreSQL implements the backend-neutral, non-tenant core graph
-contract: object and link operations, object sets, schemas and interfaces,
-object grants and access checks, lineage, and transactionally coupled
-object-change audit. The shared conformance suite exercises the same contract
-against SQLite and PostgreSQL. PostgreSQL migrations preserve stable graph
-query and audit ordering. Contract updates carry the `updated` value read by
-the caller as an explicit compare-and-swap token, preventing stale writers from
-silently overwriting a committed revision.
+databases. PostgreSQL implements backend-neutral, non-tenant contracts for the
+core graph plus reusable datasets and virtual tables, ontology definitions,
+action definitions, generation-fenced leases, and principal credentials.
+Shared conformance suites exercise the same contracts against SQLite and
+PostgreSQL. PostgreSQL migrations preserve stable graph query and audit
+ordering. Contract updates carry the `updated` value read by the caller as an
+explicit compare-and-swap token, preventing stale writers from silently
+overwriting a committed revision. Lease mutations serialize by namespace and
+key, preserve request idempotency, advance fencing generations monotonically,
+and record their audit row in the same transaction.
 
 PostgreSQL is not yet a drop-in replacement for the server's complete SQLite
-path. It advertises only `sekai.graph`, `sekai.authorization`, and
-`sekai.audit`; coordination, ontology reasoning, evidence, retention, and
-Chisei persistence remain excluded. Object-kind changes therefore fail closed
-on PostgreSQL until ontology constraint validation is available there. The
+path. Its partial capability manifest distinguishes graph, datasets, ontology
+definitions, action definitions, leases, and credentials; work admission,
+ontology reasoning, evidence, retention, and Chisei persistence remain
+excluded. Object-kind changes therefore fail closed on PostgreSQL until
+ontology constraint validation is available there. The
 graph, policy state, receipts, evidence, and audit history are
 durable; provider streams and secrets are not treated as durable credentials.
 
