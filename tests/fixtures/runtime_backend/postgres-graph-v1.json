@@ -1,0 +1,9 @@
+{
+  "contract_version": "sekai.runtime-backend/v1",
+  "backend": "postgres",
+  "reusable_surfaces": [
+    "sekai.audit",
+    "sekai.authorization",
+    "sekai.graph"
+  ]
+}
