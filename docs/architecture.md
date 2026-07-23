@@ -38,6 +38,15 @@ built-in actions write audit rows in the same transaction as the object change.
 Creates and deletes use lifecycle summaries; updates record changed scalar and
 property fields.
 
+Reusable PostgreSQL persistence also covers retention policies, scope-bound
+immutable content, legal and operational holds, transactional garbage
+collection, integrity-checked lifecycle archives, and reversible object
+reconciliation. PostgreSQL collectors serialize per namespace so concurrent
+release, hold, reconciliation, and collection attempts cannot double-delete a
+payload or lose a retaining obligation. These reusable surfaces do not activate
+PostgreSQL as the community runtime backend and do not add tenant or identity
+capabilities.
+
 Reusable coordination leases use a dedicated namespace-scoped API. Every
 acquisition receives a monotonically increasing generation and unique fencing
 token; stale generations cannot refresh, release, or take over current state.
