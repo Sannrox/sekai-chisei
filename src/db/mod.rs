@@ -1,4 +1,5 @@
 pub mod action;
+pub mod action_governance;
 pub mod attestation;
 pub mod chisei;
 pub mod chisei_budget;
@@ -16,6 +17,7 @@ pub mod ontology;
 mod portfolio_route_test_cases;
 pub mod postgres;
 mod postgres_action;
+mod postgres_action_governance;
 mod postgres_attestation;
 mod postgres_audit;
 mod postgres_authorization;
