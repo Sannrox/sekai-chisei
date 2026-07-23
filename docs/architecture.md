@@ -260,7 +260,8 @@ downstream outcome separate.
 SQLite is the server's current storage backend and runs in WAL mode for file
 databases. PostgreSQL implements backend-neutral, non-tenant contracts for the
 core graph plus reusable datasets and virtual tables, ontology definitions,
-action definitions, generation-fenced leases, and principal credentials.
+action definitions, generation-fenced leases, principal credentials, external
+evidence admission and graph projection, policy attestations, and handoffs.
 Shared conformance suites exercise the same contracts against SQLite and
 PostgreSQL. PostgreSQL migrations preserve stable graph query and audit
 ordering. Contract updates carry the `updated` value read by the caller as an
@@ -271,9 +272,12 @@ and record their audit row in the same transaction.
 
 PostgreSQL is not yet a drop-in replacement for the server's complete SQLite
 path. Its partial capability manifest distinguishes graph, datasets, ontology
-definitions, action definitions, leases, and credentials; work admission,
-ontology reasoning, evidence, retention, and Chisei persistence remain
-excluded. Object-kind changes therefore fail closed on PostgreSQL until
+definitions, action definitions, leases, credentials, coordination, evidence,
+attestations, and handoffs. Ontology reasoning, retention, and Chisei
+persistence remain excluded. Evidence support is reusable Sekai persistence,
+not runtime activation: identity, payload, lifecycle, projection, integrity,
+and audit records share their required transactions. Object-kind changes
+therefore fail closed on PostgreSQL until
 ontology constraint validation is available there. The
 graph, policy state, receipts, evidence, and audit history are
 durable; provider streams and secrets are not treated as durable credentials.

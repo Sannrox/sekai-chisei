@@ -3,12 +3,15 @@
   "backend": "postgres",
   "reusable_surfaces": [
     "sekai.action-definitions",
+    "sekai.attestations",
     "sekai.audit",
     "sekai.authorization",
     "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",
+    "sekai.evidence",
     "sekai.graph",
+    "sekai.handoffs",
     "sekai.leases",
     "sekai.ontology-definitions"
   ]
