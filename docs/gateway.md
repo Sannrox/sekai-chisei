@@ -178,7 +178,7 @@ cache after rotation or revocation:
 
 ```bash
 CHISEI_GATEWAY_ADMIN_TOKEN='<random-32-byte-minimum-token>' \
-cargo run --bin chisei-gateway -- refresh
+cargo run -p chisei-gateway --bin chisei-gateway -- refresh
 ```
 
 `GATEWAY_KEYS=key=agent:project` remains an explicit environment allowlist for
@@ -219,14 +219,14 @@ Inspect recent normalized usage:
 
 ```bash
 SEKAI_SOCKET=./data/sekai.sock \
-cargo run --bin chisei-gateway -- report --by agent --since 24h
+cargo run -p chisei-gateway --bin chisei-gateway -- report --by agent --since 24h
 ```
 
 Export a standalone report:
 
 ```bash
 SEKAI_SOCKET=./data/sekai.sock \
-cargo run --bin chisei-gateway -- report --since 24h --html dashboard.html
+cargo run -p chisei-gateway --bin chisei-gateway -- report --since 24h --html dashboard.html
 ```
 
 Run the deterministic local gateway smoke test without real provider

@@ -17,7 +17,7 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HttpTimeouts {
+pub struct HttpTimeouts {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub pool_idle_timeout: Duration,
@@ -25,7 +25,7 @@ pub(crate) struct HttpTimeouts {
 }
 
 impl HttpTimeouts {
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         Self {
             connect_timeout: duration_env(
                 "LLM_HTTP_CONNECT_TIMEOUT_SECS",
@@ -43,13 +43,13 @@ impl HttpTimeouts {
         }
     }
 
-    pub(crate) fn client(self) -> reqwest::Client {
+    pub fn client(self) -> reqwest::Client {
         self.client_builder()
             .build()
             .expect("valid reqwest timeout configuration")
     }
 
-    pub(crate) fn gateway_client(self) -> reqwest::Client {
+    pub fn gateway_client(self) -> reqwest::Client {
         self.client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -194,7 +194,7 @@ pub enum ProviderError {
 const PRECONDITION_ERROR_PREFIX: &str = "chisei-provider-error:precondition:";
 const UNAVAILABLE_ERROR_PREFIX: &str = "chisei-provider-error:unavailable:";
 
-pub(crate) fn encode_provider_error(error: ProviderError) -> String {
+pub fn encode_provider_error(error: ProviderError) -> String {
     match error {
         ProviderError::Precondition(message) => format!("{PRECONDITION_ERROR_PREFIX}{message}"),
         ProviderError::Unavailable(message) => format!("{UNAVAILABLE_ERROR_PREFIX}{message}"),
@@ -202,7 +202,7 @@ pub(crate) fn encode_provider_error(error: ProviderError) -> String {
     }
 }
 
-pub(crate) fn decode_provider_error(error: String) -> ProviderError {
+pub fn decode_provider_error(error: String) -> ProviderError {
     if let Some(message) = error.strip_prefix(PRECONDITION_ERROR_PREFIX) {
         ProviderError::Precondition(message.to_string())
     } else if let Some(message) = error.strip_prefix(UNAVAILABLE_ERROR_PREFIX) {
