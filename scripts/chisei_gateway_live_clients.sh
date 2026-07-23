@@ -235,7 +235,7 @@ launch_codex_app() {
   CHISEI_CODEX_API_KEY="$CODEX_KEY" \
     "${cmd[@]}"
   echo "After one model call, verify usage with:"
-  echo "  SEKAI_SOCKET=./data/sekai.sock cargo run --bin chisei-gateway -- report --by agent --since 10m"
+  echo "  SEKAI_SOCKET=./data/sekai.sock cargo run -p chisei-gateway --bin chisei-gateway -- report --by agent --since 10m"
 }
 
 codex_smoke() {
@@ -285,7 +285,7 @@ codex_live_smoke() {
   require_command cargo
   local report_file
   report_file="$(mktemp)"
-  if ! cargo run --quiet --bin chisei-gateway -- report --by agent --since "$REPORT_SINCE" --limit 100 >"$report_file"; then
+  if ! cargo run --quiet -p chisei-gateway --bin chisei-gateway -- report --by agent --since "$REPORT_SINCE" --limit 100 >"$report_file"; then
     cat "$report_file" >&2 || true
     rm -f "$report_file"
     echo "codex-live-smoke failed: could not read gateway report" >&2

@@ -16,7 +16,7 @@ pub mod gunshi_feedback;
 pub mod gunshi_optimization;
 pub mod gunshi_policy;
 pub mod kioku;
-pub mod model_availability;
+pub use sekai_provider::model_availability;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;

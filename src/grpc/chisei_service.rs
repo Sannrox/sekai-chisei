@@ -1287,10 +1287,10 @@ fn record_completed_operation_on(
 fn native_execution_cost(
     plan: &ExecutionPlan,
     response: &PlannedChatResponse,
-    pricing: &HashMap<String, crate::gateway::ModelPricing>,
+    pricing: &HashMap<String, crate::pricing::ModelPricing>,
 ) -> Option<i64> {
     let (priced_model, rates) =
-        crate::gateway::lookup_pricing_entry(pricing, &plan.resolved_model)?;
+        crate::pricing::lookup_pricing_entry(pricing, &plan.resolved_model)?;
     crate::cost_estimate::cost_usd_micros(
         priced_model,
         rates,
@@ -8571,7 +8571,7 @@ mod tests {
             output_tokens: 10,
             ..Default::default()
         };
-        let pricing = crate::gateway::parse_pricing_table("gpt-5.5=3:15").unwrap();
+        let pricing = crate::pricing::parse_pricing_table("gpt-5.5=3:15").unwrap();
         assert_eq!(native_execution_cost(&plan, &response, &pricing), Some(450));
     }
 
