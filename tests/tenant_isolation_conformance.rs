@@ -239,7 +239,7 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     fn quoted_strings(source: &str) -> impl Iterator<Item = &str> {
         source.split('"').skip(1).step_by(2)
     }
-    let gateway = include_str!("../src/gateway.rs");
+    let gateway = include_str!("../crates/chisei-gateway/src/gateway.rs");
     let configuration_sources = [
         include_str!("../src/config.rs"),
         gateway,
@@ -257,7 +257,7 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
         .collect::<Vec<_>>();
     let manifest = CommunitySurfaceManifest {
         grpc_methods: &method_refs,
-        gateway_routes: sekai_chisei::gateway::COMMUNITY_GATEWAY_ROUTES,
+        gateway_routes: chisei_gateway::gateway::COMMUNITY_GATEWAY_ROUTES,
         configuration_keys: &configuration_keys,
         accepted_authority_metadata: sekai_chisei::grpc::COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS,
     };

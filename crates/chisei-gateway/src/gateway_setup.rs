@@ -1246,14 +1246,14 @@ mod tests {
         assert_eq!(resolved.model, "gpt-5.5");
 
         let request_budget_project = db
-            .budget_usage(
+            .gateway_test_budget_usage(
                 "project:sekai-chisei",
                 "requests",
                 chrono::Utc::now().timestamp_millis(),
             )
             .unwrap();
         let request_budget_agent = db
-            .budget_usage(
+            .gateway_test_budget_usage(
                 "project:sekai-chisei/agent:codex-app",
                 "requests",
                 chrono::Utc::now().timestamp_millis(),

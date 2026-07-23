@@ -134,6 +134,14 @@ impl SekaiDb {
         }
     }
 
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
+    pub fn gateway_test_execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.conn()
+            .execute_batch(sql)
+            .map_err(|error| error.to_string())
+    }
+
     /// Sample pool utilization at acquisition time.
     ///
     /// Sampling here rather than on a timer keeps the gauge tied to real demand
