@@ -330,7 +330,7 @@ mod tests {
             let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
                 panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
             });
-            PostgresDb::connect_with_test_ca(&database_url, 4, &ca_certificate).unwrap()
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
         } else {
             PostgresDb::connect(&database_url, 4).unwrap()
         }
