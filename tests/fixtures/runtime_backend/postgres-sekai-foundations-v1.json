@@ -13,6 +13,9 @@
     "sekai.graph",
     "sekai.handoffs",
     "sekai.leases",
-    "sekai.ontology-definitions"
+    "sekai.ontology-definitions",
+    "sekai.reconciliation",
+    "sekai.retention",
+    "sekai.scoped-content"
   ]
 }

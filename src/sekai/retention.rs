@@ -332,7 +332,7 @@ fn contains_typed_subject(text: &str, kind: &str, subject: &str) -> bool {
     })
 }
 
-fn contains_subject_reference(text: &str, kind: &str, subject: &str) -> bool {
+pub(crate) fn contains_subject_reference(text: &str, kind: &str, subject: &str) -> bool {
     text != subject
         && (contains_typed_subject(text, kind, subject)
             || if subject.chars().any(|character| !character.is_alphabetic()) {
@@ -905,6 +905,157 @@ impl SekaiDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         verify_decisions_in_transaction(&tx)?;
+        let content_predicate = match request.subject_kind.as_str() {
+            "work_unit" => "operation_id=?1 OR causal_identity=?1",
+            "agent" | "user" => "actor=?1",
+            _ => unreachable!(),
+        };
+        let content_references = {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT reference_id,blob_id,retention_hold,legal_hold,archived,
+                     receipt_required,attestation_required,retention_until_ms
+                     FROM sekai_content_references WHERE {content_predicate}"
+                ))
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([&request.subject], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if content_references.iter().any(
+            |(_, _, retention_hold, legal_hold, archived, receipt, attestation, until)| {
+                *retention_hold
+                    || *legal_hold
+                    || *archived
+                    || *receipt
+                    || *attestation
+                    || until.is_some_and(|value| value > request.timestamp)
+            },
+        ) {
+            return Err("subject erasure is blocked by a retaining obligation".into());
+        }
+        let subject_reference_ids = content_references
+            .iter()
+            .map(|(reference_id, ..)| reference_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let subject_blob_ids = content_references
+            .iter()
+            .map(|(_, blob_id, ..)| blob_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for blob_id in &subject_blob_ids {
+            let shared = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT reference_id,released_at_ms,retention_hold,legal_hold,archived,
+                                receipt_required,attestation_required,retention_until_ms
+                         FROM sekai_content_references WHERE blob_id=?1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                statement
+                    .query_map([blob_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, bool>(5)?,
+                            row.get::<_, bool>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .any(
+                        |(
+                            reference_id,
+                            released,
+                            retention,
+                            legal,
+                            archived,
+                            receipt,
+                            attestation,
+                            until,
+                        )| {
+                            !subject_reference_ids.contains(&reference_id)
+                                && (released.is_none()
+                                    || retention
+                                    || legal
+                                    || archived
+                                    || receipt
+                                    || attestation
+                                    || until.is_some_and(|value| value > request.timestamp))
+                        },
+                    )
+            };
+            if shared {
+                return Err(
+                    "subject erasure is blocked by another readable content reference".into(),
+                );
+            }
+        }
+        let mut subject_blob_ids = std::collections::BTreeSet::new();
+        for (reference_id, blob_id, ..) in &content_references {
+            subject_blob_ids.insert(blob_id.clone());
+            tx.execute(
+                "UPDATE sekai_content_references SET
+                 actor=?1,operation_id=?1,causal_identity=?1,
+                 released_at_ms=COALESCE(released_at_ms,?2),release_reason='subject erasure'
+                 WHERE reference_id=?3",
+                params![subject_hash, request.timestamp, reference_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE sekai_content_events
+                 SET actor=?1,reason='subject erasure tombstone'
+                 WHERE reference_id=?2",
+                params![subject_hash, reference_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_content_events
+                 (id,event_kind,blob_id,reference_id,actor,reason,created_at_ms)
+                 VALUES (?1,'subject_erased',?2,?3,?4,?5,?6)",
+                params![
+                    format!("content-event-{}", uuid::Uuid::new_v4().simple()),
+                    blob_id,
+                    reference_id,
+                    "privacy.erasure",
+                    "subject erasure completed",
+                    request.timestamp,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        for blob_id in subject_blob_ids {
+            let _payload_erased = tx
+                .execute(
+                    "UPDATE sekai_content_blobs SET content=NULL,erased_at_ms=?1
+                     WHERE id=?2 AND content IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM sekai_content_references r
+                       WHERE r.blob_id=sekai_content_blobs.id AND (
+                         r.released_at_ms IS NULL OR r.retention_hold=1 OR r.legal_hold=1
+                         OR r.archived=1 OR r.receipt_required=1 OR r.attestation_required=1
+                         OR COALESCE(r.retention_until_ms,0)>?1))",
+                    params![request.timestamp, blob_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let known_subject_object_ids =
             find_subject_object_ids(&tx, &request.subject_kind, &request.subject)?;
         let subject_object_ids = find_subject_related_object_ids(

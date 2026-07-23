@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const DIGEST_DOMAIN: &[u8] = b"sekai-scoped-content/v1";
-const MAX_IDEMPOTENCY_ALIASES: i64 = 16;
+pub(crate) const MAX_IDEMPOTENCY_ALIASES: i64 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentScope {
@@ -96,7 +96,7 @@ pub enum ReconciliationAction {
 }
 
 impl ReconciliationAction {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Merge => "merge",
             Self::Alias => "alias",
@@ -106,7 +106,7 @@ impl ReconciliationAction {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "merge" => Ok(Self::Merge),
             "alias" => Ok(Self::Alias),
@@ -1025,7 +1025,7 @@ pub fn scoped_content_digest(scope: &ContentScope, content: &[u8]) -> Result<Str
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn validate_scope(scope: &ContentScope) -> Result<(), String> {
+pub(crate) fn validate_scope(scope: &ContentScope) -> Result<(), String> {
     for (name, value) in [
         ("namespace", scope.namespace.as_str()),
         ("classification", scope.classification.as_str()),
@@ -1037,7 +1037,7 @@ fn validate_scope(scope: &ContentScope) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_reference_request(request: &ContentReferenceRequest) -> Result<(), String> {
+pub(crate) fn validate_reference_request(request: &ContentReferenceRequest) -> Result<(), String> {
     for (name, value) in [
         ("reference_id", request.reference_id.as_str()),
         ("actor", request.actor.as_str()),
@@ -1183,7 +1183,9 @@ fn reference_semantic_digest(reference: &ContentReference) -> Result<String, Str
     }))
 }
 
-fn validate_reconciliation_request(request: &ReconciliationRequest) -> Result<(), String> {
+pub(crate) fn validate_reconciliation_request(
+    request: &ReconciliationRequest,
+) -> Result<(), String> {
     for (name, value) in [
         ("namespace", request.namespace.as_str()),
         ("kind", request.kind.as_str()),
@@ -1315,7 +1317,9 @@ fn normalized_subjects(subjects: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn reconciliation_request_digest(request: &ReconciliationRequest) -> Result<String, String> {
+pub(crate) fn reconciliation_request_digest(
+    request: &ReconciliationRequest,
+) -> Result<String, String> {
     let mut canonical = request.clone();
     canonical.idempotency_key.clear();
     canonical.candidates.sort_by(|left, right| {
