@@ -8,6 +8,7 @@
 
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
+use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
 
 pub const ACTION_APPROVAL_KIND: &str = "action_approval";
@@ -120,7 +121,7 @@ impl ActionApproval {
             .collect()
     }
 
-    fn to_properties(&self) -> Result<HashMap<String, String>, String> {
+    pub(crate) fn to_properties(&self) -> Result<HashMap<String, String>, String> {
         let params_json = serde_json::to_string(&self.params).map_err(|e| e.to_string())?;
         Ok(HashMap::from([
             ("status".to_string(), self.status.as_str().to_string()),
@@ -136,7 +137,7 @@ impl ActionApproval {
         ]))
     }
 
-    fn from_object(object: &Object) -> Self {
+    pub(crate) fn from_object(object: &Object) -> Self {
         let params = object
             .properties
             .get("params_json")
@@ -188,7 +189,7 @@ impl SekaiDb {
             created: approval.created,
             updated: approval.updated,
         };
-        self.create_object(&object)
+        self.create_object_with_audit(&object, &approval.actor)
     }
 
     pub fn get_action_approval(&self, id: &str) -> Result<Option<ActionApproval>, String> {
@@ -199,12 +200,56 @@ impl SekaiDb {
     }
 
     pub fn update_action_approval(&self, approval: &ActionApproval) -> Result<(), String> {
-        let mut object = self
-            .get_object(&approval.id)?
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let mut object = tx
+            .query_row(
+                "SELECT id,kind,name,namespace,external_id,properties,created,updated
+                 FROM sekai_objects WHERE id=?1",
+                params![approval.id],
+                crate::db::sekai::row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "approval not found".to_string())?;
+        let current = ActionApproval::from_object(&object);
+        if current == *approval {
+            return Ok(());
+        }
+        if current.status != ApprovalStatus::Pending {
+            return Err("approval is already terminal".to_string());
+        }
+        if approval.updated < current.updated {
+            return Err("approval update is stale".to_string());
+        }
+        let before = object.clone();
         object.properties = approval.to_properties()?;
         object.updated = approval.updated;
-        self.update_object(&object)
+        let properties =
+            serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE sekai_objects SET properties=?2,updated=?3
+                 WHERE id=?1 AND updated=?4",
+                params![object.id, properties, object.updated, before.updated],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("approval update is stale or already terminal".to_string());
+        }
+        let actor = if approval.decided_by.is_empty() {
+            &approval.actor
+        } else {
+            &approval.decided_by
+        };
+        let changes = crate::sekai::audit::object_diff_changes(
+            actor,
+            Some(&before),
+            Some(&object),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        crate::sekai::audit::insert_object_changes(&tx, &changes)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// List approvals, optionally filtered by status, most recent first.
