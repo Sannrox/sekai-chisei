@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 
 use crate::db::postgres::PostgresDb;
-use crate::domain::{Direction, Link, Object, is_valid_property_key};
+use crate::domain::{
+    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
+};
+use crate::sekai::lineage::{LineageEdge, LineageNode, LineageResult};
+use postgres::IsolationLevel;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
 const LINK_COLUMNS: &str = "id, from_id, to_id, relation, created";
@@ -129,6 +133,170 @@ impl PostgresDb {
             .transpose()
     }
 
+    pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        self.list_objects_query(filter, None).map(|result| result.0)
+    }
+
+    pub fn list_objects_with_total_for_principals(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_query(filter, Some(principals))
+    }
+
+    fn list_objects_query(
+        &self,
+        filter: &ListFilter,
+        principals: Option<&[&str]>,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut where_parts = Vec::new();
+        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
+        if let Some(kind) = &filter.kind {
+            let parameter = push_text_param(&mut params, kind.clone());
+            where_parts.push(format!("o.kind = {parameter}"));
+        }
+        if let Some(name) = &filter.name {
+            let parameter = push_text_param(&mut params, name.clone());
+            where_parts.push(format!("o.name = {parameter}"));
+        }
+        if let Some(namespace) = &filter.namespace {
+            let parameter = push_text_param(&mut params, namespace.clone());
+            where_parts.push(format!("o.namespace = {parameter}"));
+        }
+        for property_filter in &filter.property_filters {
+            where_parts.push(postgres_property_filter(property_filter, &mut params)?);
+        }
+        for interface in &filter.interface_filter {
+            let parameter = push_text_param(&mut params, interface.clone());
+            where_parts.push(format!(
+                "EXISTS (
+                    SELECT 1 FROM sekai_object_types t
+                    WHERE t.kind = o.kind
+                      AND t.implements_json::jsonb ? {parameter}
+                )"
+            ));
+        }
+        if let Some(principals) = principals {
+            let privileged = principals
+                .iter()
+                .any(|principal| matches!(*principal, "root" | "local"));
+            let effective = principals
+                .iter()
+                .filter(|principal| !principal.is_empty() && **principal != "anonymous")
+                .map(|principal| (*principal).to_string())
+                .collect::<Vec<_>>();
+            params.push(Box::new(effective));
+            let parameter = format!("${}", params.len());
+            where_parts.push(format!(
+                "(NOT EXISTS (
+                    SELECT 1 FROM sekai_grants g WHERE g.object_id = o.id
+                 ) OR EXISTS (
+                    SELECT 1 FROM sekai_grants g
+                    WHERE g.object_id = o.id AND g.principal = ANY({parameter})
+                 ))"
+            ));
+            if !privileged {
+                where_parts.push(format!(
+                    "(NOT EXISTS (
+                        SELECT 1 FROM sekai_objects boundary
+                        WHERE boundary.kind = 'namespace'
+                          AND boundary.external_id = 'namespace:' || o.namespace
+                          AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                    ) OR EXISTS (
+                        SELECT 1 FROM sekai_objects boundary
+                        JOIN sekai_grants namespace_grant
+                          ON namespace_grant.object_id = boundary.id
+                        WHERE boundary.kind = 'namespace'
+                          AND boundary.external_id = 'namespace:' || o.namespace
+                          AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                          AND namespace_grant.principal = ANY({parameter})
+                    ))"
+                ));
+            }
+        }
+        let where_sql = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+        let refs = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| error.to_string())?;
+        let total: i64 = transaction
+            .query_one(
+                &format!("SELECT COUNT(*) FROM sekai_objects o{where_sql}"),
+                &refs,
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+
+        let direction = if filter.descending { "DESC" } else { "ASC" };
+        let order_expression = match filter.order_by.as_str() {
+            "" => "o.id ASC".to_string(),
+            "created" => format!("o.created {direction}, o.id ASC"),
+            "updated" => format!("o.updated {direction}, o.id ASC"),
+            "name" => format!("o.name {direction}, o.id ASC"),
+            property if property.starts_with("property:") => {
+                let key = property.trim_start_matches("property:");
+                if !is_valid_property_key(key) {
+                    return Err("invalid property order key".into());
+                }
+                params.push(Box::new(key.to_string()));
+                let value = format!("o.properties::jsonb ->> ${}", params.len());
+                let numeric = postgres_numeric_predicate(&value);
+                format!(
+                    "CASE WHEN {value} IS NULL THEN 1 ELSE 0 END,
+                     CASE WHEN {numeric} THEN 0 ELSE 1 END,
+                     CASE WHEN {numeric}
+                          THEN BTRIM({value})::double precision END {direction},
+                     CASE WHEN {numeric} THEN '' ELSE {value} END {direction},
+                     o.id ASC"
+                )
+            }
+            _ => return Err("invalid order_by field".into()),
+        };
+        let limit = if filter.limit == i32::MAX {
+            i32::MAX
+        } else if filter.limit <= 0 {
+            MAX_LIST_LIMIT
+        } else {
+            filter.limit.min(MAX_LIST_LIMIT)
+        };
+        params.push(Box::new(limit));
+        let limit_parameter = format!("${}", params.len());
+        params.push(Box::new(filter.offset.max(0)));
+        let offset_parameter = format!("${}", params.len());
+        let refs = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        let rows = transaction
+            .query(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o{where_sql}
+                     ORDER BY {order_expression}
+                     LIMIT {limit_parameter} OFFSET {offset_parameter}"
+                ),
+                &refs,
+            )
+            .map_err(|error| error.to_string())?;
+        let objects = rows
+            .into_iter()
+            .map(row_to_object)
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok((objects, total.min(i32::MAX as i64) as i32))
+    }
+
     pub fn find_by_property(
         &self,
         kind: &str,
@@ -245,6 +413,62 @@ impl PostgresDb {
         Ok(objects)
     }
 
+    pub fn get_lineage(&self, object_id: &str, max_nodes: usize) -> Result<LineageResult, String> {
+        use std::collections::{HashSet, VecDeque};
+        let max = if max_nodes == 0 {
+            200
+        } else {
+            max_nodes.min(500)
+        };
+        let start = self.get_object(object_id)?.ok_or("object not found")?;
+        let mut result = LineageResult::default();
+        let mut visited = HashSet::from([start.id.clone()]);
+        let mut queue = VecDeque::from([start.clone()]);
+        result.nodes.push(LineageNode {
+            role: lineage_role(&start.kind),
+            ephemeral: false,
+            object: start,
+        });
+        while let Some(object) = queue.pop_front() {
+            if result.nodes.len() >= max {
+                result.truncated = true;
+                break;
+            }
+            for direction in [Direction::Outgoing, Direction::Incoming] {
+                for link in self.get_links(&object.id, "", &direction)? {
+                    if !is_lineage_relation(&link.relation) {
+                        continue;
+                    }
+                    let target = match direction {
+                        Direction::Outgoing => &link.to_id,
+                        Direction::Incoming => &link.from_id,
+                    };
+                    if !visited.insert(target.clone()) {
+                        continue;
+                    }
+                    if let Some(object) = self.get_object(target)? {
+                        result.edges.push(LineageEdge {
+                            from: link.from_id,
+                            to: link.to_id,
+                            relation: link.relation,
+                        });
+                        result.nodes.push(LineageNode {
+                            role: lineage_role(&object.kind),
+                            ephemeral: false,
+                            object: object.clone(),
+                        });
+                        queue.push_back(object);
+                    }
+                    if result.nodes.len() >= max {
+                        result.truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     fn get_links_query(
         &self,
         object_id: &str,
@@ -289,6 +513,129 @@ impl PostgresDb {
             .map(row_to_object)
             .collect()
     }
+}
+
+fn push_text_param(
+    params: &mut Vec<Box<dyn postgres::types::ToSql + Sync>>,
+    value: String,
+) -> String {
+    params.push(Box::new(value));
+    format!("${}", params.len())
+}
+
+fn postgres_property_filter(
+    filter: &PropertyFilter,
+    params: &mut Vec<Box<dyn postgres::types::ToSql + Sync>>,
+) -> Result<String, String> {
+    if !is_valid_property_key(&filter.key) {
+        return Err("invalid property key".into());
+    }
+    match filter.op.to_ascii_lowercase().as_str() {
+        "eq" => {
+            let (property, value) = push_property_comparison(filter, params);
+            Ok(format!("{property} = {value}"))
+        }
+        "ne" | "neq" => {
+            let (property, value) = push_property_comparison(filter, params);
+            Ok(format!("{property} IS NOT NULL AND {property} <> {value}"))
+        }
+        "contains" | "prefix" => {
+            params.push(Box::new(filter.key.clone()));
+            let property = format!("o.properties::jsonb ->> ${}", params.len());
+            let suffix = if filter.op.eq_ignore_ascii_case("contains") {
+                "%"
+            } else {
+                ""
+            };
+            params.push(Box::new(format!(
+                "{suffix}{}{percent}",
+                escape_like_pattern(&filter.value),
+                percent = "%"
+            )));
+            Ok(format!("{property} ILIKE ${} ESCAPE '\\'", params.len()))
+        }
+        "in" => {
+            let values = filter
+                .value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                return Ok("FALSE".into());
+            }
+            params.push(Box::new(filter.key.clone()));
+            let property = format!("o.properties::jsonb ->> ${}", params.len());
+            params.push(Box::new(values));
+            Ok(format!("{property} = ANY(${})", params.len()))
+        }
+        "gt" | "gte" | "lt" | "lte" => {
+            let (property, value) = push_property_comparison(filter, params);
+            let compare = match filter.op.to_ascii_lowercase().as_str() {
+                "gt" => ">",
+                "gte" => ">=",
+                "lt" => "<",
+                "lte" => "<=",
+                _ => unreachable!(),
+            };
+            let property_numeric = postgres_numeric_predicate(&property);
+            let value_numeric = postgres_numeric_predicate(&value);
+            Ok(format!(
+                "CASE WHEN {property_numeric} AND {value_numeric}
+                    THEN BTRIM({property})::double precision {compare}
+                         BTRIM({value})::double precision
+                    ELSE {property} {compare} {value}
+                 END"
+            ))
+        }
+        _ => Err("unsupported property filter operator".into()),
+    }
+}
+
+fn push_property_comparison(
+    filter: &PropertyFilter,
+    params: &mut Vec<Box<dyn postgres::types::ToSql + Sync>>,
+) -> (String, String) {
+    params.push(Box::new(filter.key.clone()));
+    let property = format!("o.properties::jsonb ->> ${}", params.len());
+    params.push(Box::new(filter.value.clone()));
+    let value = format!("${}", params.len());
+    (property, value)
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn postgres_numeric_predicate(expression: &str) -> String {
+    format!("sekai_is_numeric_text({expression})")
+}
+
+fn lineage_role(kind: &str) -> String {
+    match kind {
+        "namespace" => "namespace",
+        "commit" => "commit",
+        "pull_request" => "pr",
+        _ => "other",
+    }
+    .into()
+}
+
+fn is_lineage_relation(relation: &str) -> bool {
+    matches!(
+        relation,
+        "contains"
+            | "produces"
+            | "targets"
+            | "executed"
+            | "depends_on"
+            | "evidence_for"
+            | "derived_from"
+    )
 }
 
 fn row_to_object(row: postgres::Row) -> Result<Object, String> {
