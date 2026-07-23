@@ -51,7 +51,7 @@ jobs:
           test "$average_ms" -lt 250
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   fmt:
     name: Rustfmt
@@ -74,8 +74,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets --locked
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   docker:
     name: Docker
@@ -103,7 +103,7 @@ jobs:
             changed_files="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
           fi
 
-          if grep -Eq '^(Dockerfile|Cargo\.lock|Cargo\.toml|proto/|src/)' <<<"$changed_files"; then
+          if grep -Eq '^(Dockerfile|Cargo\.lock|Cargo\.toml|crates/|proto/|src/)' <<<"$changed_files"; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
@@ -132,7 +132,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build smoke binaries
-        run: cargo build --locked --bins
+        run: cargo build --locked --workspace --bins
 
       - name: Run gateway smoke
         env:

@@ -243,7 +243,7 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     let configuration_sources = [
         include_str!("../src/config.rs"),
         gateway,
-        include_str!("../src/bin/chisei-gateway.rs"),
+        include_str!("../crates/chisei-gateway/src/main.rs"),
     ];
     let configuration_keys = configuration_sources
         .iter()

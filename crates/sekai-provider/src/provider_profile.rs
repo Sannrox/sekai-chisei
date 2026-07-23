@@ -1481,18 +1481,16 @@ pub struct CapabilityMatrix {
     pub lifecycle_overrides: Vec<RegistryLifecycleOverride>,
     pub profiles: Vec<ProviderProfile>,
     #[serde(default)]
-    pub available_models: Vec<crate::chisei::model_availability::AvailableModel>,
+    pub available_models: Vec<crate::model_availability::AvailableModel>,
 }
 
 impl CapabilityMatrix {
     pub fn built_in() -> Self {
-        Self::with_model_availability(
-            crate::chisei::model_availability::model_availability_snapshot(),
-        )
+        Self::with_model_availability(crate::model_availability::model_availability_snapshot())
     }
 
     pub fn with_model_availability(
-        availability: crate::chisei::model_availability::ModelAvailabilitySnapshot,
+        availability: crate::model_availability::ModelAvailabilitySnapshot,
     ) -> Self {
         let registry = provider_registry_snapshot();
         let profiles = registry

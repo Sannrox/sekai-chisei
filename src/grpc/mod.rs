@@ -4,15 +4,8 @@ mod llm_service;
 pub mod sekai_service;
 
 pub mod pb {
-    pub mod sekai {
-        tonic::include_proto!("sekai");
-    }
-    pub mod chisei {
-        tonic::include_proto!("chisei");
-    }
-    pub(super) mod llm {
-        tonic::include_proto!("llm");
-    }
+    pub(super) use sekai_proto::llm;
+    pub use sekai_proto::{chisei, sekai};
 }
 
 use std::path::Path;

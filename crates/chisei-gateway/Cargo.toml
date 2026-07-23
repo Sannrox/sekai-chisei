@@ -1,0 +1,14 @@
+[package]
+name = "chisei-gateway"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Governed OpenAI- and Anthropic-compatible egress gateway."
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sekai-chisei = { version = "0.1.0", path = "../.." }
+sekai-provider = { version = "0.1.0", path = "../sekai-provider" }
+sekai-proto = { version = "0.1.0", path = "../sekai-proto" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
