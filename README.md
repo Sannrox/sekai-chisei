@@ -106,6 +106,40 @@ location, and an inspection command:
 cargo run --bin sekaictl -- receipt <operation_id>
 ```
 
+### Local ontology tool
+
+The `sekai` CLI is a standalone tool for portable ontology databases. It does
+not require the control-plane server or network access.
+
+Install it:
+
+```bash
+cargo install --path crates/sekai-ontology
+```
+
+The database is resolved in this order (first match wins):
+
+1. `--db <path>` (explicit flag)
+2. `SEKAI_DB` environment variable
+3. User-level default (if the file exists):
+   - macOS: `~/Library/Application Support/sekai/knowledge.db`
+   - Linux: `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
+4. `knowledge.db` in the current directory
+
+Create and use an ontology:
+
+```bash
+sekai init                          # creates knowledge.db (see resolution order)
+sekai import definitions.json       # import classes and relations
+sekai validate                      # check structural integrity
+sekai --json explain SomeClass      # definition, closure, provenance
+sekai --json query SomeClass --direction outbound --depth 2
+```
+
+Do not use the control-plane database (`data/sekai.db`) as a portable ontology
+database. See the [sekai-ontology crate](crates/sekai-ontology/) for library
+usage.
+
 ## What is implemented
 
 - SQLite-backed typed-object graph with schemas, links, datasets, and virtual
