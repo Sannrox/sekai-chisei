@@ -636,3 +636,226 @@ fn exit_codes_distinguish_failures() {
         "classes.Broken.superclasses[0]"
     );
 }
+
+#[test]
+fn database_resolution_prefers_sekai_db_env_over_user_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let env_db = directory.path().join("from_env.db");
+    let fake_home = directory.path().join("home");
+
+    // Create the user-level default with an empty ontology
+    #[cfg(target_os = "macos")]
+    let user_db = fake_home.join("Library/Application Support/sekai/knowledge.db");
+    #[cfg(not(target_os = "macos"))]
+    let user_db = fake_home.join(".local/share/sekai/knowledge.db");
+
+    fs::create_dir_all(user_db.parent().unwrap()).unwrap();
+    assert!(
+        sekai(&["--db", user_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+
+    // Initialize env db and import fixture (gives it classes)
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(
+        sekai(&["--db", env_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    assert!(
+        sekai(&["--db", env_db.to_str().unwrap(), "import", fixture])
+            .status
+            .success()
+    );
+
+    // With SEKAI_DB set and a user-level default existing, SEKAI_DB should win
+    let work_dir = directory.path().join("work");
+    fs::create_dir(&work_dir).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    cmd.args(["--json", "entity", "list"])
+        .env("SEKAI_DB", env_db.to_str().unwrap())
+        .env("HOME", fake_home.to_str().unwrap())
+        .current_dir(&work_dir);
+
+    #[cfg(not(target_os = "macos"))]
+    cmd.env_remove("XDG_DATA_HOME");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // The env db has classes from the fixture; user-level default is empty
+    assert!(!json["data"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn database_resolution_falls_back_to_cwd_knowledge_db() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd_db = directory.path().join("knowledge.db");
+
+    // Initialize CWD knowledge.db
+    assert!(
+        sekai(&["--db", cwd_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+
+    // Without SEKAI_DB or --db, should use knowledge.db in CWD
+    // Point HOME at an empty dir so user-level default cannot interfere
+    let empty_home = directory.path().join("empty_home");
+    fs::create_dir(&empty_home).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    cmd.args(["--json", "validate"])
+        .env_remove("SEKAI_DB")
+        .env("HOME", empty_home.to_str().unwrap())
+        .current_dir(directory.path());
+
+    #[cfg(not(target_os = "macos"))]
+    cmd.env_remove("XDG_DATA_HOME");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["valid"], true);
+}
+
+#[test]
+fn database_resolution_uses_user_default_when_file_exists() {
+    // This test simulates the user-level default by setting HOME to a temp dir
+    // and creating the expected platform path.
+    let directory = tempfile::tempdir().unwrap();
+    let fake_home = directory.path().join("home");
+
+    #[cfg(target_os = "macos")]
+    let user_db = fake_home.join("Library/Application Support/sekai/knowledge.db");
+    #[cfg(not(target_os = "macos"))]
+    let user_db = fake_home.join(".local/share/sekai/knowledge.db");
+
+    fs::create_dir_all(user_db.parent().unwrap()).unwrap();
+
+    // Initialize the user-level database and import fixture
+    assert!(
+        sekai(&["--db", user_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(
+        sekai(&["--db", user_db.to_str().unwrap(), "import", fixture])
+            .status
+            .success()
+    );
+
+    // Run from a directory that does NOT have knowledge.db, with HOME pointing
+    // to our fake home and SEKAI_DB unset.
+    let work_dir = directory.path().join("work");
+    fs::create_dir(&work_dir).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    cmd.args(["--json", "entity", "list"])
+        .env("HOME", fake_home.to_str().unwrap())
+        .env_remove("SEKAI_DB")
+        .current_dir(&work_dir);
+
+    // On non-macOS, also clear XDG_DATA_HOME so the fallback uses HOME
+    #[cfg(not(target_os = "macos"))]
+    cmd.env_remove("XDG_DATA_HOME");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!json["data"].as_array().unwrap().is_empty());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn database_resolution_respects_xdg_data_home() {
+    let directory = tempfile::tempdir().unwrap();
+    let xdg_dir = directory.path().join("custom_xdg");
+    let user_db = xdg_dir.join("sekai/knowledge.db");
+
+    fs::create_dir_all(user_db.parent().unwrap()).unwrap();
+
+    // Initialize and populate
+    assert!(
+        sekai(&["--db", user_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(
+        sekai(&["--db", user_db.to_str().unwrap(), "import", fixture])
+            .status
+            .success()
+    );
+
+    // Run with XDG_DATA_HOME set to our custom location
+    let work_dir = directory.path().join("work");
+    fs::create_dir(&work_dir).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sekai"))
+        .args(["--json", "entity", "list"])
+        .env("XDG_DATA_HOME", xdg_dir.to_str().unwrap())
+        .env_remove("SEKAI_DB")
+        .current_dir(&work_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!json["data"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn database_resolution_skips_user_default_when_file_missing() {
+    // When user-level default does not exist, should fall back to CWD knowledge.db
+    let directory = tempfile::tempdir().unwrap();
+    let fake_home = directory.path().join("empty_home");
+    fs::create_dir(&fake_home).unwrap();
+
+    let work_dir = directory.path().join("work");
+    fs::create_dir(&work_dir).unwrap();
+
+    // Create a CWD knowledge.db
+    let cwd_db = work_dir.join("knowledge.db");
+    assert!(
+        sekai(&["--db", cwd_db.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    cmd.args(["--json", "validate"])
+        .env("HOME", fake_home.to_str().unwrap())
+        .env_remove("SEKAI_DB")
+        .current_dir(&work_dir);
+
+    #[cfg(not(target_os = "macos"))]
+    cmd.env_remove("XDG_DATA_HOME");
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["valid"], true);
+}
