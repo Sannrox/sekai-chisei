@@ -616,6 +616,38 @@ fn target_is_symlink(target: &Path) -> Result<bool, Error> {
     }
 }
 
+/// Resolve the default database path when neither `--db` nor `SEKAI_DB` is set.
+///
+/// Returns the user-level default if the file already exists:
+/// - macOS: `~/Library/Application Support/sekai/knowledge.db`
+/// - Other (Linux, etc.): `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
+///
+/// Falls back to `knowledge.db` in the current working directory.
+fn resolve_default_database() -> PathBuf {
+    if let Some(path) = user_default_database()
+        && path.exists()
+    {
+        return path;
+    }
+    PathBuf::from("knowledge.db")
+}
+
+/// Compute the platform-specific user-level database path without checking existence.
+fn user_default_database() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/sekai/knowledge.db"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+        base.map(|b| b.join("sekai/knowledge.db"))
+    }
+}
+
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments, Error> {
     let mut database = env::var_os("SEKAI_DB").map(PathBuf::from);
     let mut json = false;
@@ -700,7 +732,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     }
     let command = positional.first().cloned().unwrap_or_else(|| "help".into());
     Ok(Arguments {
-        database: database.unwrap_or_else(|| PathBuf::from("knowledge.db")),
+        database: database.unwrap_or_else(resolve_default_database),
         json,
         command,
         operands: positional.into_iter().skip(1).collect(),
@@ -733,7 +765,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nQuery defaults to --direction both --depth 1. SEKAI_DB selects the database when --db is omitted. SEKAI_SKILL_PATH selects the skill directory."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  4. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. SEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {
