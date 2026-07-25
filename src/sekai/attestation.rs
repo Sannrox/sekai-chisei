@@ -9,6 +9,8 @@
 //! the fact is detectable, and the decision can be re-derived at any time by
 //! replaying the pinned snapshot against the recorded inputs.
 
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
@@ -385,7 +387,7 @@ mod tests {
         })
     }
 
-    fn record_linked_decision(db: &SekaiDb, attestation: &PolicyAttestation) {
+    fn record_linked_decision(db: &RuntimeDb, attestation: &PolicyAttestation) {
         db.record_decision(&Decision {
             id: attestation.decision_id.clone(),
             timestamp: 1_000,
@@ -407,7 +409,7 @@ mod tests {
 
     #[test]
     fn attestation_round_trip_and_verify() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let attestation = attest("dec-1");
         db.insert_attestation(&attestation).unwrap();
         record_linked_decision(&db, &attestation);
@@ -425,7 +427,7 @@ mod tests {
 
     #[test]
     fn tampered_snapshot_fails_hash_and_replay() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let attestation = attest("dec-1");
         db.insert_attestation(&attestation).unwrap();
         record_linked_decision(&db, &attestation);
@@ -448,7 +450,7 @@ mod tests {
 
     #[test]
     fn tampered_recorded_decision_fails_replay() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let attestation = attest("dec-1");
         db.insert_attestation(&attestation).unwrap();
         record_linked_decision(&db, &attestation);
@@ -468,7 +470,7 @@ mod tests {
 
     #[test]
     fn missing_decision_link_is_reported() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let attestation = attest("dec-missing");
         db.insert_attestation(&attestation).unwrap();
         let report = db.verify_attestation(&attestation.id).unwrap();
@@ -480,7 +482,7 @@ mod tests {
 
     #[test]
     fn missing_attestation_is_reported() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let report = db.verify_attestation("nope").unwrap();
         assert!(!report.ok);
         assert!(!report.found);
@@ -488,7 +490,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_decision_and_scope() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let a1 = attest("dec-1");
         let a2 = attest("dec-2");
         db.insert_attestation(&a1).unwrap();
@@ -512,7 +514,7 @@ mod tests {
 
     #[test]
     fn purge_removes_attestations_with_their_decisions() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let old = attest("dec-old");
         let new = attest("dec-new");
         db.record_decision_with_attestation(

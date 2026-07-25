@@ -11,5 +11,6 @@
     "chisei.policy",
     "chisei.portfolio",
     "gateway.governance"
-  ]
+  ],
+  "migration_version": null
 }

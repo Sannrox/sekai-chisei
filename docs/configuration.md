@@ -9,9 +9,11 @@ template.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection. `postgres` is recognized for composition/conformance, but the community server still rejects runtime selection until Chisei and gateway surfaces reach parity. |
+| `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
 | `DB_PATH` | `./data/sekai.db` | SQLite database path |
-| `DATABASE_URL` | unset | PostgreSQL connection URL; valid only with `SEKAI_DB_BACKEND=postgres` |
+| `DATABASE_URL` | unset | PostgreSQL connection URL; required when `SEKAI_DB_BACKEND=postgres` |
+| `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | PostgreSQL pool size |
+| `SEKAI_POSTGRES_CA_CERT` | unset | Optional PEM CA certificate path for TLS trust |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
 | `SEKAI_BIND` | inferred | TCP bind address; see [transport modes](operations.md#transport-modes) |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path; set empty to disable |
@@ -32,15 +34,14 @@ explicit operator decision.
 
 Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public
-`sekai.runtime-backend/v1` capability contract identifies the backend and its
-supported reusable surfaces. PostgreSQL implements the complete reusable Sekai
-surface set (graph, authorization, audit, coordination, evidence, retention,
-leases, guarded mutations, capability packages, team namespaces, and related
-definitions) with shared SQLite/PostgreSQL conformance and a fail-closed RPC
-inventory. The community server still requires the full community capability
-set—including Chisei and gateway surfaces—and therefore refuses PostgreSQL
-runtime selection until those remaining surfaces reach parity. Backend
-selection does not enable tenant, OIDC, OAuth, or identity endpoints.
+`sekai.runtime-backend/v1` capability contract identifies the backend, its
+supported reusable surfaces, and (for PostgreSQL) the applied migration version.
+PostgreSQL implements the complete reusable community surface set—Sekai, Chisei,
+gateway governance, and operations health—with shared SQLite/PostgreSQL
+conformance. Selecting `SEKAI_DB_BACKEND=postgres` starts the public control
+plane against PostgreSQL when `DATABASE_URL` is set and migrations/capabilities
+validate. Backend selection does not enable tenant, OIDC, OAuth, or identity
+endpoints.
 
 ## Providers and outbound calls
 

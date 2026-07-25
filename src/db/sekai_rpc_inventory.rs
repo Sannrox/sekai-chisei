@@ -290,6 +290,7 @@ pub fn postgres_complete_sekai_capabilities() -> Result<BackendCapabilities, Str
         contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
         backend: BackendIdentity::Postgres,
         reusable_surfaces: surfaces,
+        migration_version: None,
     };
     // Complete Sekai still must include every implemented foundation surface.
     let required = postgres_reusable_capabilities().reusable_surfaces;

@@ -21,5 +21,6 @@
     "sekai.retention",
     "sekai.scoped-content",
     "sekai.team-namespaces"
-  ]
+  ],
+  "migration_version": null
 }

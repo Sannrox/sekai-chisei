@@ -1,3 +1,4 @@
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
@@ -73,7 +74,7 @@ fn looks_like_secret(value: &str) -> bool {
 }
 
 pub fn record_object_diff(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     before: Option<&Object>,
     after: Option<&Object>,
@@ -1057,8 +1058,8 @@ pub(crate) fn insert_object_changes(
 mod tests {
     use super::*;
 
-    fn setup() -> SekaiDb {
-        SekaiDb::new(":memory:").unwrap()
+    fn setup() -> RuntimeDb {
+        RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()))
     }
 
     fn object(
@@ -1455,7 +1456,7 @@ mod tests {
 
     #[test]
     fn record_object_diff_returns_insert_errors() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
             let conn = db.conn();
             conn.execute("DROP TABLE sekai_object_changes", []).unwrap();

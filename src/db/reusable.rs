@@ -36,6 +36,7 @@ pub fn postgres_reusable_capabilities() -> BackendCapabilities {
         contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
         backend: BackendIdentity::Postgres,
         reusable_surfaces,
+        migration_version: None,
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Link, Object};
 use crate::sekai::schema::{PropertyType, SchemaRegistry};
@@ -6,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 type ExecuteFn = Box<
-    dyn Fn(&SekaiDb, &SchemaRegistry, &HashMap<String, String>, &str) -> Result<String, String>
+    dyn Fn(&RuntimeDb, &SchemaRegistry, &HashMap<String, String>, &str) -> Result<String, String>
         + Send
         + Sync,
 >;
 type TargetIdsFn =
-    Box<dyn Fn(&SekaiDb, &HashMap<String, String>) -> Result<Vec<String>, String> + Send + Sync>;
+    Box<dyn Fn(&RuntimeDb, &HashMap<String, String>) -> Result<Vec<String>, String> + Send + Sync>;
 
 pub struct ActionDef {
     pub name: String,
@@ -311,7 +312,7 @@ impl ActionExecutor {
 
     pub fn execute(
         &self,
-        db: &SekaiDb,
+        db: &RuntimeDb,
         schema: &SchemaRegistry,
         action: &str,
         params: &HashMap<String, String>,
@@ -330,7 +331,7 @@ impl ActionExecutor {
 
     pub fn target_ids(
         &self,
-        db: &SekaiDb,
+        db: &RuntimeDb,
         action: &str,
         params: &HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
@@ -348,7 +349,7 @@ impl ActionExecutor {
 
     pub fn schema_kinds(
         &self,
-        db: &SekaiDb,
+        db: &RuntimeDb,
         action: &str,
         params: &HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
@@ -1156,7 +1157,7 @@ mod tests {
 
     #[test]
     fn test_create_object_action() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let exec = ActionExecutor::new();
         let params = HashMap::from([
             ("id".into(), "o1".into()),
@@ -1181,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_set_property_action() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "o1".into(),
             kind: "namespace".into(),
@@ -1213,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_missing_param() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let exec = ActionExecutor::new();
         let params = HashMap::from([("id".into(), "o1".into())]);
         let schema = SchemaRegistry::new();

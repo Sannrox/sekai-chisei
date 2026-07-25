@@ -3,6 +3,8 @@ use crate::chisei::gunshi::{
     compare_advisory, score_advisory_comparisons,
 };
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
 use serde::{Deserialize, Serialize};
@@ -28,7 +30,7 @@ pub struct GunshiFeedbackRecord {
 }
 
 pub fn record_issued_recommendations(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     issuance_id: &str,
     request_digest: &str,
@@ -112,7 +114,7 @@ pub fn record_issued_recommendations(
 }
 
 pub fn record_feedback(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     issuance_id: &str,
     plan: &AllocationPlan,
@@ -207,7 +209,7 @@ fn feedback_decisions_equivalent(existing: &Decision, requested: &Decision) -> b
 }
 
 fn require_issued_plan(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     issuance_id: &str,
     plan: &AllocationPlan,
 ) -> Result<Decision, String> {
@@ -324,7 +326,7 @@ fn receipted_metric(
     Ok((total, found))
 }
 
-pub fn advisory_scorecard(db: &SekaiDb, namespace: &str) -> Result<AdvisoryScorecard, String> {
+pub fn advisory_scorecard(db: &RuntimeDb, namespace: &str) -> Result<AdvisoryScorecard, String> {
     required("scorecard namespace", namespace)?;
     let choices = feedback_decisions(db, CHOICE_ACTION, namespace)?;
     let outcomes = feedback_decisions(db, OUTCOME_ACTION, namespace)?
@@ -358,7 +360,7 @@ pub fn advisory_scorecard(db: &SekaiDb, namespace: &str) -> Result<AdvisoryScore
 }
 
 fn feedback_decisions(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     action: &str,
     namespace: &str,
 ) -> Result<Vec<Decision>, String> {
@@ -532,7 +534,7 @@ mod tests {
         );
     }
 
-    fn persist_receipt(db: &SekaiDb, plan: &AllocationPlan) {
+    fn persist_receipt(db: &RuntimeDb, plan: &AllocationPlan) {
         use crate::chisei::receipt::{
             OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
         };
@@ -586,7 +588,7 @@ mod tests {
 
     #[test]
     fn choices_and_outcomes_are_idempotent_and_scoreable() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let plan = plan();
         let choice = choice(&plan);
         record_issued_recommendations(
@@ -691,7 +693,7 @@ mod tests {
 
     #[test]
     fn conflicting_feedback_and_predecision_outcomes_are_rejected() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let plan = plan();
         let choice = choice(&plan);
         record_issued_recommendations(

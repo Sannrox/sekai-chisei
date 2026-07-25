@@ -2,6 +2,16 @@
   "contract_version": "sekai.runtime-backend/v1",
   "backend": "postgres",
   "reusable_surfaces": [
+    "chisei.approvals",
+    "chisei.budget",
+    "chisei.evaluation",
+    "chisei.execution",
+    "chisei.learning",
+    "chisei.observations",
+    "chisei.policy",
+    "chisei.portfolio",
+    "gateway.governance",
+    "operations.health",
     "sekai.action-definitions",
     "sekai.attestations",
     "sekai.audit",
@@ -22,5 +32,5 @@
     "sekai.scoped-content",
     "sekai.team-namespaces"
   ],
-  "migration_version": null
+  "migration_version": 17
 }
