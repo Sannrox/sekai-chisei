@@ -533,7 +533,7 @@ fn validate(
     Ok(())
 }
 
-fn object_state_matches(left: &Object, right: &Object) -> bool {
+pub(crate) fn object_state_matches(left: &Object, right: &Object) -> bool {
     left.id == right.id
         && left.kind == right.kind
         && left.name == right.name
@@ -544,7 +544,7 @@ fn object_state_matches(left: &Object, right: &Object) -> bool {
         && left.updated == right.updated
 }
 
-fn guarded_mutation_digest(
+pub(crate) fn guarded_mutation_digest(
     operation: &str,
     target_id: &str,
     token: &str,
@@ -556,7 +556,7 @@ fn guarded_mutation_digest(
     )
 }
 
-fn canonical_object_input(object: &Object) -> Result<String, LeaseError> {
+pub(crate) fn canonical_object_input(object: &Object) -> Result<String, LeaseError> {
     let properties = object.properties.iter().collect::<BTreeMap<_, _>>();
     serde_json::to_string(&(
         &object.id,
@@ -570,7 +570,7 @@ fn canonical_object_input(object: &Object) -> Result<String, LeaseError> {
     ))
     .map_err(storage)
 }
-fn validate_text(value: &str, name: &str) -> Result<(), LeaseError> {
+pub(crate) fn validate_text(value: &str, name: &str) -> Result<(), LeaseError> {
     if value.trim().is_empty() || value.len() > 512 || value.contains('\0') {
         return Err(LeaseError::Invalid(format!("{name} is invalid")));
     }
