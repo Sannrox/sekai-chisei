@@ -281,13 +281,18 @@ pub fn parse_service_rpcs<'a>(proto: &'a str, service: &str) -> Result<BTreeSet<
     Ok(rpcs)
 }
 
-/// PostgreSQL capabilities for proven Chisei execution/budget surfaces only.
+/// PostgreSQL capabilities for the complete reusable Chisei surface set.
 ///
-/// Community runtime selection still requires every COMMUNITY_REQUIRED_SURFACES
-/// entry; this helper intentionally stays partial until remaining inventory
-/// surfaces pass shared harnesses.
-pub fn postgres_partial_chisei_capabilities() -> Result<BackendCapabilities, String> {
+/// Community runtime selection still requires Sekai, gateway, and operations
+/// surfaces beyond this set; see #238 for community PostgreSQL activation.
+pub fn postgres_complete_chisei_capabilities() -> Result<BackendCapabilities, String> {
     let inventory = ChiseiRpcInventory::load()?;
+    if !inventory.remaining_surfaces.is_empty() {
+        return Err(format!(
+            "chisei inventory still has remaining surfaces: {:?}",
+            inventory.remaining_surfaces
+        ));
+    }
     let mut surfaces = inventory.complete_chisei_surfaces.clone();
     surfaces.sort();
     surfaces.dedup();
@@ -296,6 +301,11 @@ pub fn postgres_partial_chisei_capabilities() -> Result<BackendCapabilities, Str
         backend: BackendIdentity::Postgres,
         reusable_surfaces: surfaces,
     })
+}
+
+/// Alias retained for callers written against the partial-progress helper.
+pub fn postgres_partial_chisei_capabilities() -> Result<BackendCapabilities, String> {
+    postgres_complete_chisei_capabilities()
 }
 
 #[cfg(test)]
@@ -322,23 +332,41 @@ mod tests {
         );
         assert!(
             inventory
-                .remaining_surfaces
+                .complete_chisei_surfaces
                 .iter()
                 .any(|surface| surface == "chisei.learning")
         );
+        assert!(inventory.remaining_surfaces.is_empty());
     }
 
     #[test]
-    fn partial_capabilities_do_not_claim_community_complete() {
-        let partial = postgres_partial_chisei_capabilities().unwrap();
-        assert_eq!(partial.backend, BackendIdentity::Postgres);
+    fn complete_chisei_capabilities_do_not_claim_community_complete() {
+        let complete = postgres_complete_chisei_capabilities().unwrap();
+        assert_eq!(complete.backend, BackendIdentity::Postgres);
         assert!(
-            partial
+            complete
                 .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
-                .is_err()
+                .is_err(),
+            "community still needs Sekai and operations surfaces (#238)"
         );
+        for surface in [
+            "chisei.budget",
+            "chisei.execution",
+            "chisei.policy",
+            "chisei.learning",
+            "chisei.approvals",
+            "gateway.governance",
+        ] {
+            assert!(
+                complete
+                    .reusable_surfaces
+                    .iter()
+                    .any(|item| item == surface),
+                "missing {surface}"
+            );
+        }
         assert!(
-            partial
+            complete
                 .reusable_surfaces
                 .iter()
                 .all(|surface| !surface.to_ascii_lowercase().contains("tenant"))
