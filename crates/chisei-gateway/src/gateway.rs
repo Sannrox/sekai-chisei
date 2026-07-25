@@ -14467,10 +14467,13 @@ mod tests {
 
     #[tokio::test]
     async fn durable_resilience_audit_does_not_wait_for_central_replication() {
+        // Hang the control-plane accept path so a blocking remote audit would
+        // never complete. Durable spool success must still return without
+        // waiting on that hang (fire-and-forget remote fan-out).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = routing_config();
         config.chisei_grpc_target = Some(format!("http://{}", listener.local_addr().unwrap()));
-        tokio::spawn(async move {
+        let hang = tokio::spawn(async move {
             let (_socket, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
         });
@@ -14488,7 +14491,6 @@ mod tests {
             tier: "low-risk".into(),
         };
 
-        let started = Instant::now();
         assert!(
             record_resilience_decision(
                 &config,
@@ -14499,9 +14501,19 @@ mod tests {
                 "fail_open",
                 HashMap::new(),
             )
-            .await
+            .await,
+            "spool-backed resilience audit must succeed without remote completion"
         );
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // Behavioral non-blocking contract: local durable evidence exists and
+        // the hang task is still outstanding (remote fan-out did not need to
+        // finish). Avoid wall-clock budgets that flake under CI load.
+        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 1);
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let event: LocalGatewayAuditEvent = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(event.action, "gateway.no_preflight");
+        assert_eq!(event.outcome, "fail_open");
+        assert!(!hang.is_finished());
+        hang.abort();
         tokio::fs::remove_file(path).await.unwrap();
     }
 
