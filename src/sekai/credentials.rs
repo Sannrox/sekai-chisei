@@ -10,7 +10,13 @@ use crate::db::sekai::PrincipalCredential;
 use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 
-const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = 5000;
+/// Maximum age of a process-local credential cache snapshot before a same-epoch
+/// reload is forced. Revocation/rotation bumps the activity epoch and reloads
+/// immediately. Authentication rechecks durable rows on every request and never
+/// admits a rotated or revoked token from a stale cache alone.
+pub const CREDENTIAL_CACHE_MAX_STALE_MS: i64 = 5_000;
+
+const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = CREDENTIAL_CACHE_MAX_STALE_MS;
 
 fn in_progress_epoch(activity_epoch: i64) -> i64 {
     -(activity_epoch + 1)
@@ -30,6 +36,11 @@ impl PrincipalCredentialStore {
             last_reload_ms: AtomicI64::new(0),
             last_data_version: AtomicI64::new(0),
         }
+    }
+
+    /// Documented maximum cache age for same-epoch snapshots (milliseconds).
+    pub fn max_stale_ms() -> i64 {
+        CREDENTIAL_CACHE_MAX_STALE_MS
     }
 
     pub fn load(&self, credentials: &[PrincipalCredential]) {
