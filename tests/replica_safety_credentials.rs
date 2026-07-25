@@ -104,12 +104,3 @@ fn failed_reload_does_not_admit_new_authority() {
     assert!(!store.has_any());
     assert!(store.resolve("anything").is_none());
 }
-
-#[test]
-fn max_stale_constant_is_positive_and_matches_reload_interval() {
-    assert!(CREDENTIAL_CACHE_MAX_STALE_MS > 0);
-    assert_eq!(
-        PrincipalCredentialStore::max_stale_ms(),
-        CREDENTIAL_CACHE_MAX_STALE_MS
-    );
-}

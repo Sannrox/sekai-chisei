@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(budget.class, ReplicaAuthorityClass::SharedStoreRequired);
         let creds = inventory.surface("sekai.credentials").unwrap();
         assert_eq!(creds.class, ReplicaAuthorityClass::CacheAllowed);
-        assert_eq!(creds.max_stale_ms, Some(30_000));
+        assert_eq!(creds.max_stale_ms, Some(5_000));
     }
 
     #[test]
