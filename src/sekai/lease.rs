@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -685,7 +687,7 @@ mod tests {
     }
     #[test]
     fn release_reacquire_and_stale_generation_are_fenced() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
             .acquire_lease("n", "deploy", "a", 100, "a1", "a", 10)
             .unwrap();
@@ -707,7 +709,7 @@ mod tests {
     }
     #[test]
     fn expiry_boundary_takeover_and_retry_are_deterministic() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
             .acquire_lease("n", "k", "a", 10, "one", "a", 100)
             .unwrap();
@@ -772,7 +774,9 @@ mod tests {
     #[test]
     fn concurrent_acquire_has_exactly_one_winner() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let db = Arc::new(SekaiDb::new(file.path().to_str().unwrap()).unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(file.path().to_str().unwrap()).unwrap(),
+        )));
         let barrier = Arc::new(Barrier::new(2));
         let handles = ["a", "b"].map(|owner| {
             let db = Arc::clone(&db);
@@ -796,7 +800,9 @@ mod tests {
     #[test]
     fn concurrent_takeover_has_exactly_one_winner() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let db = Arc::new(SekaiDb::new(file.path().to_str().unwrap()).unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(file.path().to_str().unwrap()).unwrap(),
+        )));
         let first = db
             .acquire_lease("n", "k", "a", 10, "first", "a", 10)
             .unwrap();
@@ -823,7 +829,7 @@ mod tests {
 
     #[test]
     fn guarded_mutations_fence_stale_released_and_expired_generations() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
             .acquire_lease("n", "k", "a", 10, "lease-1", "a", 10)
             .unwrap();
@@ -894,7 +900,7 @@ mod tests {
 
     #[test]
     fn guarded_delete_retry_is_idempotent_and_audits_generation_without_token() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let lease = db
             .acquire_lease("n", "k", "a", 100, "lease", "a", 10)
             .unwrap();
@@ -965,7 +971,9 @@ mod tests {
     #[test]
     fn guarded_update_racing_takeover_has_one_serializable_order() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let db = Arc::new(SekaiDb::new(file.path().to_str().unwrap()).unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(file.path().to_str().unwrap()).unwrap(),
+        )));
         let first = db
             .acquire_lease("n", "k", "a", 10, "lease-1", "a", 10)
             .unwrap();
@@ -1015,7 +1023,7 @@ mod tests {
 
     #[test]
     fn guarded_update_binds_authorized_snapshot_and_replays_after_later_delete() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let lease = db
             .acquire_lease("n", "k", "a", 100, "lease", "a", 10)
             .unwrap();

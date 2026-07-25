@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,11 +87,11 @@ fn now_ms() -> i64 {
 /// `project:p/agent:a/work_unit:w`, whose ancestors (`global`, `project:p`,
 /// `project:p/agent:a`) are all checked and deducted together atomically.
 pub struct BudgetTracker {
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
 }
 
 impl BudgetTracker {
-    pub fn new(db: Arc<SekaiDb>) -> Self {
+    pub fn new(db: Arc<RuntimeDb>) -> Self {
         Self { db }
     }
 
@@ -309,7 +311,9 @@ mod tests {
     use super::*;
 
     fn tracker() -> BudgetTracker {
-        BudgetTracker::new(Arc::new(SekaiDb::new(":memory:").unwrap()))
+        BudgetTracker::new(Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        ))))
     }
 
     #[test]

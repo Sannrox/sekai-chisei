@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
 use crate::sekai::ontology::OntologyRegistry;
@@ -224,7 +226,7 @@ impl CandidateState {
 }
 
 pub fn retrieve<F, G>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     query: &RetrievalQuery,
     can_read: F,
     is_forbidden: G,
@@ -237,7 +239,7 @@ where
 }
 
 pub fn retrieve_with_ontology<F, G>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     query: &RetrievalQuery,
     ontology: Option<&OntologyRegistry>,
     can_read: F,
@@ -251,7 +253,7 @@ where
 }
 
 pub fn retrieve_with_ontology_started<F, G>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     query: &RetrievalQuery,
     ontology: Option<&OntologyRegistry>,
     started: Instant,
@@ -904,7 +906,7 @@ fn transitive_endpoints(path: &[Link], direction: RetrievalDirection) -> Option<
 }
 
 fn load_bounded_adjacency(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     object_id: &str,
     direction: RetrievalDirection,
     relations: &BTreeSet<String>,
@@ -943,7 +945,7 @@ fn load_bounded_adjacency(
 }
 
 fn append_bounded_links(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     object_id: &str,
     relation: &str,
     direction: &Direction,
@@ -999,7 +1001,7 @@ fn to_u32(value: usize) -> u32 {
 }
 
 fn load_object(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     id: &str,
     cache: &mut HashMap<String, Option<Object>>,
 ) -> Result<Option<Object>, RetrievalError> {
@@ -1052,8 +1054,8 @@ mod tests {
         }
     }
 
-    fn graph() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
+    fn graph() -> RuntimeDb {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (id, kind) in [
             ("root", "service"),
             ("a", "component"),
@@ -1246,7 +1248,7 @@ mod tests {
 
     #[test]
     fn transitive_derivation_cites_asserted_links_and_obeys_bounds() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for id in ["a", "b", "c"] {
             db.create_object(&object(id, "component")).unwrap();
         }
@@ -1365,7 +1367,7 @@ mod tests {
 
     #[test]
     fn denied_intermediate_cannot_contribute_to_derivation_or_metadata() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for id in ["a", "hidden", "c"] {
             db.create_object(&object(id, "component")).unwrap();
         }
@@ -1394,7 +1396,7 @@ mod tests {
 
     #[test]
     fn source_row_accounting_deduplicates_asserted_facts() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for id in ["a", "b"] {
             db.create_object(&object(id, "component")).unwrap();
         }
@@ -1455,7 +1457,7 @@ mod tests {
 
     #[test]
     fn transitive_explanations_follow_direction_and_reject_mixed_paths() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for id in ["a", "b", "c", "x"] {
             db.create_object(&object(id, "component")).unwrap();
         }
@@ -1758,7 +1760,7 @@ mod tests {
 
     #[test]
     fn wide_adjacency_is_scanned_and_returned_with_hard_caps() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&object("root", "service")).unwrap();
         for index in 0..300 {
             let id = format!("node-{index:03}");
@@ -1793,7 +1795,7 @@ mod tests {
 
     #[test]
     fn traversal_depth_is_absolutely_capped_at_three() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for id in ["d0", "d1", "d2", "d3", "d4"] {
             db.create_object(&object(id, "node")).unwrap();
         }

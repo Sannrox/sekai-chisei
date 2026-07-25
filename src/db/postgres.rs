@@ -215,6 +215,18 @@ impl PostgresDb {
         (state.connections, state.idle_connections)
     }
 
+    /// Highest applied forward migration version for capability advertisement.
+    pub fn latest_migration_version(&self) -> Result<i64, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT COALESCE(MAX(version), 0) FROM sekai_schema_migrations",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0))
+            .ok_or_else(|| "sekai_schema_migrations is unavailable".to_string())
+    }
+
     pub fn get_principal_credential(
         &self,
         token_hash: &str,

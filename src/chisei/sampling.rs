@@ -17,6 +17,8 @@
 
 use super::budget::PressureLevel;
 use super::pipeline::{PipelineRequest, Step, StepDecision, complexity_class};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -80,7 +82,7 @@ impl Step for SamplingStep {
         "sampling"
     }
 
-    fn run(&self, req: &mut PipelineRequest, _db: &SekaiDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, _db: &RuntimeDb) -> StepDecision {
         let decision = self.decide(req);
         let value = serde_json::json!({
             "sampled": decision.sampled,
@@ -206,7 +208,10 @@ mod tests {
     #[test]
     fn decode_round_trips_the_step_value() {
         let step = SamplingStep::new(1.0, 0.7);
-        let mut decision = step.run(&mut req("w"), &SekaiDb::new(":memory:").unwrap());
+        let mut decision = step.run(
+            &mut req("w"),
+            &RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap())),
+        );
         decision.step = "sampling".into();
         let decoded = decode_sampling(std::slice::from_ref(&decision)).unwrap();
         assert!(decoded.sampled);

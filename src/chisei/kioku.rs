@@ -1,6 +1,8 @@
 //! Governed institutional memory derived from verifiable operation outcomes.
 
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::security::Role;
@@ -1829,7 +1831,7 @@ mod tests {
 
     #[test]
     fn candidate_listing_is_namespace_scoped_and_operation_filtered() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = candidate();
         db.insert_kioku_memory(&first, &[candidate_evidence(&first)])
             .unwrap();
@@ -1853,7 +1855,7 @@ mod tests {
 
     #[test]
     fn disabling_active_memory_is_audited_and_removes_it_from_retrieval() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut memory = candidate();
         memory.confidence_bps = 10_000;
         db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
@@ -1974,7 +1976,7 @@ mod tests {
         }
     }
 
-    fn persist_outcome_receipt(db: &SekaiDb, operation_id: &str, request_id: &str, passed: bool) {
+    fn persist_outcome_receipt(db: &RuntimeDb, operation_id: &str, request_id: &str, passed: bool) {
         let mut receipt = verified_outcome(operation_id, passed).receipt;
         receipt
             .events
@@ -1988,7 +1990,7 @@ mod tests {
 
     #[test]
     fn receipt_and_holdout_assignments_are_atomic() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut memory = candidate();
         memory.confidence_bps = 10_000;
         db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
@@ -2026,7 +2028,7 @@ mod tests {
     }
 
     fn active_memory(
-        db: &SekaiDb,
+        db: &RuntimeDb,
         id: &str,
         operation_id: &str,
         affinity_object_ids: Vec<String>,
@@ -2061,7 +2063,7 @@ mod tests {
 
     #[test]
     fn persists_versioned_memory_with_traceable_evidence() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let memory = candidate();
         let link = KiokuEvidenceLink {
             memory_id: memory.id.clone(),
@@ -2085,14 +2087,14 @@ mod tests {
 
     #[test]
     fn rejects_untraceable_memory() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let error = db.insert_kioku_memory(&candidate(), &[]).unwrap_err();
         assert!(error.contains("evidence link"));
     }
 
     #[test]
     fn rejects_direct_active_memory_insertion() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut memory = candidate();
         memory.state = MemoryLifecycleState::Active;
         memory.reviewed_at_ms = Some(110);
@@ -2114,7 +2116,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_confidence_and_contradictions_only() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut memory = candidate();
         memory.confidence_bps = 10_001;
         assert!(
@@ -2146,7 +2148,7 @@ mod tests {
 
     #[test]
     fn derives_candidate_from_verified_binary_outcomes() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let memory = db
             .produce_kioku_candidate(CandidateDerivation {
                 id: "derived-1".into(),
@@ -2254,7 +2256,7 @@ mod tests {
 
     #[test]
     fn validates_and_promotes_candidate_with_human_audit() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.produce_kioku_candidate(CandidateDerivation {
             id: "reviewed-1".into(),
             kind: MemoryKind::Recommendation,
@@ -2306,7 +2308,7 @@ mod tests {
 
     #[test]
     fn retrieves_active_memories_by_scope_affinity_and_classification() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for object in [
             Object {
                 id: "namespace-payments".into(),
@@ -2433,7 +2435,7 @@ mod tests {
 
     #[test]
     fn invalidated_assignment_cannot_record_an_outcome() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         active_memory(
             &db,
             "invalidated",
@@ -2480,7 +2482,7 @@ mod tests {
 
     #[test]
     fn outcome_metric_matching_ignores_receipt_whitespace() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         active_memory(
             &db,
             "trimmed-metric",
@@ -2541,7 +2543,7 @@ mod tests {
 
     #[test]
     fn retires_regressing_memory_from_held_out_outcomes() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         active_memory(
             &db,
             "regressing",
@@ -2622,7 +2624,7 @@ mod tests {
 
     #[test]
     fn holdout_assignments_are_scoped_to_operation_receipts() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         active_memory(
             &db,
             "scoped-holdout",
@@ -2657,7 +2659,7 @@ mod tests {
 
     #[test]
     fn supersedes_atomically_and_sweeps_expiry_and_retention() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         active_memory(
             &db,
             "old",

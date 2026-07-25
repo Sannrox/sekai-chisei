@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::grpc::TokenAuthInterceptor;
 use sekai_chisei::obs::signals;
@@ -15,7 +16,9 @@ use tonic::Request;
 use tonic::service::Interceptor;
 
 fn interceptor() -> TokenAuthInterceptor {
-    let db = Arc::new(SekaiDb::new(":memory:").expect("open in-memory database"));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").expect("open in-memory database"),
+    )));
     let store = Arc::new(PrincipalCredentialStore::new());
     TokenAuthInterceptor::new(store, db, None)
 }

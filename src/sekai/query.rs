@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
 use crate::sekai::schema::SchemaRegistry;
@@ -24,7 +26,7 @@ pub struct GraphResult {
 }
 
 pub fn traverse(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     q: &GraphQuery,
     schema: Option<&SchemaRegistry>,
 ) -> Result<GraphResult, String> {
@@ -126,8 +128,8 @@ mod tests {
         InterfaceDef, ObjectType, PropertyDef, PropertyType, SchemaRegistry,
     };
 
-    fn setup() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
+    fn setup() -> RuntimeDb {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         // namespace -> comp1, comp2; comp1 -> file1
         db.create_object(&Object {
             id: "r1".into(),

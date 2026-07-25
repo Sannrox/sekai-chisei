@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::sekai::attestation::{
     AttestationVerification, EVIDENCE_ATTESTATION_HASH, EVIDENCE_ATTESTATION_ID,
@@ -239,7 +241,7 @@ fn is_enforced_refusal(decision: &Decision) -> bool {
         || decision.reason.contains("exceeded")
 }
 
-pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceReport, String> {
+pub fn assemble_report(db: &RuntimeDb, work_unit_id: &str) -> Result<ProvenanceReport, String> {
     if work_unit_id.trim().is_empty() {
         return Err("work unit id must not be empty".into());
     }
@@ -272,7 +274,7 @@ pub fn assemble_report(db: &SekaiDb, work_unit_id: &str) -> Result<ProvenanceRep
     })
 }
 
-fn assemble_assurance(db: &SekaiDb, decisions: &[Decision]) -> Result<AssuranceSummary, String> {
+fn assemble_assurance(db: &RuntimeDb, decisions: &[Decision]) -> Result<AssuranceSummary, String> {
     let ledger = db.verify_ledger()?;
     let mut attestations = Vec::new();
     for decision in decisions {
@@ -483,7 +485,7 @@ mod tests {
 
     #[test]
     fn assembles_calls_and_request_linked_decisions() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: "llm_calls".into(),
             name: "LLM calls".into(),
@@ -532,7 +534,7 @@ mod tests {
 
     #[test]
     fn includes_work_unit_budget_warnings() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: "llm_calls".into(),
             name: "LLM calls".into(),
@@ -573,7 +575,7 @@ mod tests {
 
     #[test]
     fn evidence_matching_is_exact_for_free_form_work_unit_ids() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: "llm_calls".into(),
             name: "LLM calls".into(),
@@ -693,7 +695,7 @@ mod tests {
 
     #[test]
     fn request_target_decisions_surface_egress_counts() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: "llm_calls".into(),
             name: "LLM calls".into(),
@@ -761,7 +763,7 @@ mod tests {
             ActionAttestationInput, EVIDENCE_ATTESTATION_HASH, build_action_attestation,
         };
 
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: "llm_calls".into(),
             name: "LLM calls".into(),
