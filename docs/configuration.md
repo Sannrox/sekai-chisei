@@ -9,7 +9,7 @@ template.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection. `postgres` is recognized but rejected until the complete reusable surface is implemented. |
+| `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection. `postgres` is recognized for composition/conformance, but the community server still rejects runtime selection until Chisei and gateway surfaces reach parity. |
 | `DB_PATH` | `./data/sekai.db` | SQLite database path |
 | `DATABASE_URL` | unset | PostgreSQL connection URL; valid only with `SEKAI_DB_BACKEND=postgres` |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
@@ -33,13 +33,14 @@ explicit operator decision.
 Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend and its
-supported reusable surfaces. PostgreSQL exposes partial contracts for the graph,
-datasets, ontology and action definitions, generation-fenced leases, and
-tenant-free principal credentials for composition and conformance testing. The
-community server still requires the complete SQLite capability set and refuses
-PostgreSQL runtime selection because work admission, evidence, retention,
-Chisei, and gateway surfaces are incomplete. Backend selection does not enable
-tenant, OIDC, OAuth, or identity endpoints.
+supported reusable surfaces. PostgreSQL implements the complete reusable Sekai
+surface set (graph, authorization, audit, coordination, evidence, retention,
+leases, guarded mutations, capability packages, team namespaces, and related
+definitions) with shared SQLite/PostgreSQL conformance and a fail-closed RPC
+inventory. The community server still requires the full community capability
+set—including Chisei and gateway surfaces—and therefore refuses PostgreSQL
+runtime selection until those remaining surfaces reach parity. Backend
+selection does not enable tenant, OIDC, OAuth, or identity endpoints.
 
 ## Providers and outbound calls
 

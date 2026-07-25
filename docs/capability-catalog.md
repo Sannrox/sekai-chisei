@@ -152,5 +152,7 @@ so neither installation nor removal mutates another namespace. The manually
 authored versions under `examples/capability-packages/` are the single proving
 package; they are not a registry or distribution mechanism.
 
-This contract is SQLite-only. It does not claim PostgreSQL parity, automatic
-authoring, remote distribution, or executable plugin installation.
+Lifecycle persistence is covered by shared SQLite/PostgreSQL conformance for
+the reusable Sekai surface. This catalog still does not claim automatic
+authoring, remote distribution, or executable plugin installation, and it does
+not activate community PostgreSQL runtime selection by itself.
