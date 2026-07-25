@@ -46,6 +46,8 @@ mod db {
     }
 
     #[cfg(test)]
+    pub use sekai_chisei::db::runtime_db;
+    #[cfg(test)]
     pub use sekai_chisei::db::sekai;
 }
 
