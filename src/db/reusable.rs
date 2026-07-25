@@ -13,6 +13,7 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.coordination",
     "sekai.datasets",
     "sekai.evidence",
+    "sekai.function-definitions",
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
