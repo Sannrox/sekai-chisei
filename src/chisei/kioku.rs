@@ -475,7 +475,7 @@ impl KiokuMemory {
 }
 
 impl KiokuEvidenceLink {
-    fn validate(&self, memory: &KiokuMemory) -> Result<(), String> {
+    pub(crate) fn validate(&self, memory: &KiokuMemory) -> Result<(), String> {
         if self.memory_id != memory.id || self.memory_version != memory.version {
             return Err("evidence link memory version does not match memory".into());
         }
