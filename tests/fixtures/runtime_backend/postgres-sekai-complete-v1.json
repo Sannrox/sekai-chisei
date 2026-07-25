@@ -1,0 +1,25 @@
+{
+  "contract_version": "sekai.runtime-backend/v1",
+  "backend": "postgres",
+  "reusable_surfaces": [
+    "sekai.action-definitions",
+    "sekai.attestations",
+    "sekai.audit",
+    "sekai.authorization",
+    "sekai.capability-packages",
+    "sekai.coordination",
+    "sekai.credentials",
+    "sekai.datasets",
+    "sekai.evidence",
+    "sekai.function-definitions",
+    "sekai.graph",
+    "sekai.guarded-mutations",
+    "sekai.handoffs",
+    "sekai.leases",
+    "sekai.ontology-definitions",
+    "sekai.reconciliation",
+    "sekai.retention",
+    "sekai.scoped-content",
+    "sekai.team-namespaces"
+  ]
+}
