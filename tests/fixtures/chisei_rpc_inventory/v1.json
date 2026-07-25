@@ -13,7 +13,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -24,7 +27,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -35,7 +41,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -46,7 +55,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -57,7 +69,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -68,7 +83,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -79,7 +97,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -90,7 +111,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -101,7 +125,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -112,7 +139,10 @@
         "chisei.approvals"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": []
     },
@@ -159,8 +189,8 @@
         "chisei.portfolio"
       ],
       "evidence": [
-        "src/db/postgres_portfolio.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs"
       ],
       "durable_dependencies": []
     },
@@ -171,8 +201,8 @@
         "chisei.portfolio"
       ],
       "evidence": [
-        "src/db/postgres_portfolio.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs"
       ],
       "durable_dependencies": []
     },
@@ -183,8 +213,8 @@
         "chisei.portfolio"
       ],
       "evidence": [
-        "src/db/postgres_portfolio.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs"
       ],
       "durable_dependencies": []
     },
@@ -195,8 +225,8 @@
         "chisei.portfolio"
       ],
       "evidence": [
-        "src/db/postgres_portfolio.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs"
       ],
       "durable_dependencies": []
     },
@@ -207,8 +237,8 @@
         "chisei.policy"
       ],
       "evidence": [
-        "tests/graph_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": []
     },
@@ -217,8 +247,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "tests/graph_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -229,8 +259,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "tests/graph_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -241,7 +271,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -254,8 +285,8 @@
         "chisei.policy"
       ],
       "evidence": [
-        "tests/graph_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": []
     },
@@ -264,7 +295,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy"
@@ -275,7 +307,12 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.execution",
@@ -288,7 +325,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [
         "chisei.execution"
@@ -301,8 +339,8 @@
         "chisei.observations"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -313,8 +351,8 @@
         "gateway.governance"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_gateway_audit_backend_conformance.rs",
+        "tests/chisei_execution_backend_conformance.rs"
       ],
       "durable_dependencies": []
     },
@@ -323,8 +361,12 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
         "tests/chisei_execution_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -340,7 +382,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": []
     },
@@ -352,7 +394,7 @@
       ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": []
     },
@@ -363,7 +405,8 @@
         "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": []
     },
@@ -374,7 +417,8 @@
         "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": []
     },
@@ -385,7 +429,8 @@
         "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": []
     },
@@ -395,7 +440,7 @@
       "surfaces": [],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
-        "docs/postgres-chisei-parity.md"
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [
         "chisei.execution"
@@ -408,7 +453,8 @@
         "chisei.learning"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": []
     },
@@ -419,7 +465,8 @@
         "chisei.learning"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": []
     },
@@ -428,7 +475,10 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": [
         "chisei.learning",
@@ -442,7 +492,8 @@
         "chisei.learning"
       ],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": []
     },
@@ -451,7 +502,10 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": [
         "chisei.learning",
@@ -466,7 +520,9 @@
         "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_gateway_audit_backend_conformance.rs"
       ],
       "durable_dependencies": []
     },
@@ -478,7 +534,9 @@
         "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_gateway_audit_backend_conformance.rs"
       ],
       "durable_dependencies": []
     },
@@ -487,7 +545,10 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -501,8 +562,8 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -511,8 +572,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -523,8 +584,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -537,8 +598,8 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -547,8 +608,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -559,8 +620,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -573,8 +634,8 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -583,8 +644,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -595,8 +656,8 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -607,8 +668,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -619,8 +680,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -631,8 +692,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -643,8 +704,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -657,8 +718,8 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -669,8 +730,8 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": []
     },
@@ -679,8 +740,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -691,8 +752,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -703,8 +764,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -715,8 +776,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -727,8 +788,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -739,8 +800,8 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "src/db/postgres_eval.rs",
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -751,7 +812,12 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -764,7 +830,12 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -777,7 +848,12 @@
       "kind": "computed",
       "surfaces": [],
       "evidence": [
-        "docs/postgres-chisei-parity.md"
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
       ],
       "durable_dependencies": [
         "chisei.policy",
@@ -787,40 +863,67 @@
     }
   ],
   "complete_chisei_surfaces": [
-    "chisei.budget",
-    "chisei.execution"
-  ],
-  "remaining_surfaces": [
     "chisei.approvals",
+    "chisei.budget",
     "chisei.evaluation",
+    "chisei.execution",
     "chisei.learning",
     "chisei.observations",
     "chisei.policy",
     "chisei.portfolio",
     "gateway.governance"
   ],
+  "remaining_surfaces": [],
   "prerequisite_issues": [
     236
   ],
   "evidence_harnesses": [
-    "tests/chisei_execution_backend_conformance.rs",
-    "tests/chisei_budget_backend_conformance.rs",
-    "src/db/postgres_eval.rs",
-    "src/db/postgres_portfolio.rs",
-    "tests/graph_backend_conformance.rs",
     "docs/postgres-chisei-parity.md",
-    "tests/chisei_postgres_inventory_conformance.rs",
     "src/db/postgres_budget.rs",
-    "src/db/postgres_chisei_receipts.rs"
+    "src/db/postgres_chisei_receipts.rs",
+    "src/db/postgres_eval.rs",
+    "src/db/postgres_external_action.rs",
+    "src/db/postgres_external_permit.rs",
+    "src/db/postgres_kioku.rs",
+    "src/db/postgres_portfolio.rs",
+    "tests/chisei_budget_backend_conformance.rs",
+    "tests/chisei_eval_backend_conformance.rs",
+    "tests/chisei_execution_backend_conformance.rs",
+    "tests/chisei_external_action_backend_conformance.rs",
+    "tests/chisei_external_permit_backend_conformance.rs",
+    "tests/chisei_gateway_audit_backend_conformance.rs",
+    "tests/chisei_kioku_backend_conformance.rs",
+    "tests/chisei_policy_backend_conformance.rs",
+    "tests/chisei_portfolio_backend_conformance.rs",
+    "tests/chisei_postgres_inventory_conformance.rs",
+    "tests/graph_backend_conformance.rs"
   ],
   "internal_surfaces": [
+    {
+      "surface": "chisei.approvals",
+      "evidence": [
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
+      ],
+      "note": "dual-backend harness proven"
+    },
     {
       "surface": "chisei.budget",
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
         "src/db/postgres_budget.rs"
       ],
-      "note": "limits, usage, chain reservation, idempotent events, attributions"
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "chisei.evaluation",
+      "evidence": [
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
+      ],
+      "note": "dual-backend harness proven"
     },
     {
       "surface": "chisei.execution",
@@ -828,7 +931,47 @@
         "tests/chisei_execution_backend_conformance.rs",
         "src/db/postgres_chisei_receipts.rs"
       ],
-      "note": "operation receipts, reporter grants, gateway request aliases"
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "chisei.learning",
+      "evidence": [
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
+      ],
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "chisei.observations",
+      "evidence": [
+        "tests/chisei_eval_backend_conformance.rs",
+        "src/db/postgres_eval.rs"
+      ],
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "chisei.policy",
+      "evidence": [
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs"
+      ],
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "chisei.portfolio",
+      "evidence": [
+        "tests/chisei_portfolio_backend_conformance.rs",
+        "src/db/postgres_portfolio.rs"
+      ],
+      "note": "dual-backend harness proven"
+    },
+    {
+      "surface": "gateway.governance",
+      "evidence": [
+        "tests/chisei_gateway_audit_backend_conformance.rs",
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "note": "dual-backend harness proven"
     }
   ]
 }
