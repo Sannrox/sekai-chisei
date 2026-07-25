@@ -65,11 +65,28 @@ two `PostgresDb` pools against one `SEKAI_TEST_POSTGRES_URL` when available
 | #306 | Leases, admission, recovery after replica loss (`tests/replica_safety_leases.rs`) |
 | #307 | Credential/authority cache stale bounds (`tests/replica_safety_credentials.rs`) |
 | #308 | Eval/portfolio off process-local authority (`tests/replica_safety_eval.rs`) |
-| #309 | Parent closeout evidence suite |
+| #309 | Parent closeout evidence suite (`tests/replica_safety_closeout.rs`) |
+
+## Closeout evidence
+
+Run the full replica-safety suite:
+
+```bash
+cargo test --test replica_safety_harness
+cargo test --test replica_safety_budget
+cargo test --test replica_safety_leases
+cargo test --test replica_safety_credentials
+cargo test --test replica_safety_eval
+cargo test --test replica_safety_closeout
+```
+
+`replica_safety_closeout` re-checks inventory completeness and a single
+two-replica smoke covering budget, lease, admission, credentials, recovery, and
+eval sharing.
 
 ## Operator posture
 
 For multi-replica production, select a shared backend (`SEKAI_DB_BACKEND=postgres`
 and `DATABASE_URL`; see [configuration.md](configuration.md)). Do not run
 multiple writers against independent SQLite files and expect shared budgets or
-leases to converge.
+leases to converge. Process memory must not decide durable authorization.
