@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
@@ -1518,8 +1520,8 @@ fn row_to_run_event(row: &rusqlite::Row) -> rusqlite::Result<RunEvent> {
 mod tests {
     use super::*;
 
-    fn db() -> SekaiDb {
-        SekaiDb::new(":memory:").unwrap()
+    fn db() -> RuntimeDb {
+        RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()))
     }
 
     fn root_scope() -> ContentionScope {

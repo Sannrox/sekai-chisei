@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, REL_CONTAINS};
 
@@ -11,7 +13,7 @@ pub struct EscalationResult {
 }
 
 pub fn check_escalation(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     threshold: Option<i32>,
 ) -> Option<EscalationResult> {
@@ -53,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_escalation_triggers() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),
@@ -92,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_no_escalation_below_threshold() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),

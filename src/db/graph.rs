@@ -23,6 +23,7 @@ pub fn postgres_graph_capabilities() -> crate::runtime_backend::BackendCapabilit
             .iter()
             .map(|surface| (*surface).to_string())
             .collect(),
+        migration_version: None,
     }
 }
 

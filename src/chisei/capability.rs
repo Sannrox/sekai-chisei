@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
 use crate::sekai::audit::{Decision, insert_object_changes, object_diff_changes};
@@ -447,7 +449,7 @@ pub fn author_capability_proposals(
 
 /// Record a human approval or rejection of the exact proposal contents.
 pub fn review_capability_proposal(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     proposal: &mut CapabilityProposal,
     reviewer: &str,
     approved: bool,
@@ -506,7 +508,7 @@ pub fn review_capability_proposal(
 /// human-reviewed digest. Failed evals are terminally recorded as `gate_failed`; infrastructure or
 /// caller errors leave the approved proposal untouched so a valid run can be supplied later.
 pub fn gate_capability_proposal(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     eval: &EvalStore,
     proposal: &mut CapabilityProposal,
     run_id: &str,
@@ -621,7 +623,7 @@ pub fn gate_capability_proposal(
 /// audit, and decision audit share one SQLite transaction. This guarantees at most one active
 /// version per `(namespace, task_class)` even under concurrent callers.
 pub fn register_capability(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     proposal: &CapabilityProposal,
     authorization: &CapabilityLaunchAuthorization,
     actor: &str,
@@ -642,7 +644,10 @@ pub fn register_capability(
         ));
     }
 
-    let mut conn = db.conn();
+    let mut conn = db
+        .require_sqlite_arc()
+        .map_err(CapabilityRegistryError::Storage)?
+        .conn();
     let tx = conn.transaction().map_err(registry_storage)?;
     let mut existing = {
         let mut statement = tx
@@ -784,7 +789,7 @@ pub fn register_capability(
 
 /// Revoke an active capability version without deleting its graph or audit history.
 pub fn revoke_capability(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     capability_id: &str,
     actor: &str,
     reason: &str,
@@ -796,7 +801,10 @@ pub fn revoke_capability(
             "revocation actor and reason are required".to_string(),
         ));
     }
-    let mut conn = db.conn();
+    let mut conn = db
+        .require_sqlite_arc()
+        .map_err(CapabilityRegistryError::Storage)?
+        .conn();
     let tx = conn.transaction().map_err(registry_storage)?;
     let before = tx
         .query_row(
@@ -845,7 +853,7 @@ pub fn revoke_capability(
 }
 
 pub fn list_capability_versions(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     task_class: &str,
 ) -> Result<Vec<CapabilityVersion>, CapabilityRegistryError> {
@@ -869,7 +877,7 @@ pub fn list_capability_versions(
 }
 
 pub fn get_active_capability(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     task_class: &str,
 ) -> Result<Option<CapabilityVersion>, CapabilityRegistryError> {
@@ -1056,7 +1064,7 @@ fn proposal_digest(proposal: &CapabilityProposal) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn record_capability_decision(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     proposal: &CapabilityProposal,
     actor: &str,
     action: &str,
@@ -1166,14 +1174,14 @@ mod tests {
     }
 
     fn authorized_proposal(
-        db: &SekaiDb,
+        db: &RuntimeDb,
         now: i64,
     ) -> (CapabilityProposal, CapabilityLaunchAuthorization) {
         authorize_proposal(db, proposal_at(now), now)
     }
 
     fn authorize_proposal(
-        db: &SekaiDb,
+        db: &RuntimeDb,
         mut proposal: CapabilityProposal,
         now: i64,
     ) -> (CapabilityProposal, CapabilityLaunchAuthorization) {
@@ -1367,7 +1375,7 @@ mod tests {
 
     #[test]
     fn review_requires_an_independent_reviewer_and_is_audited() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut proposal = proposal();
 
         assert!(matches!(
@@ -1406,7 +1414,7 @@ mod tests {
 
     #[test]
     fn gate_rejects_a_proposal_changed_after_approval() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let eval = EvalStore::new();
         let mut proposal = proposal();
         review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
@@ -1429,7 +1437,7 @@ mod tests {
 
     #[test]
     fn gate_rejects_rationale_changed_after_approval() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let eval = EvalStore::new();
         let mut proposal = proposal();
         review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
@@ -1452,7 +1460,7 @@ mod tests {
 
     #[test]
     fn gate_rejects_a_run_from_another_proposal() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let eval = EvalStore::new();
         let mut proposal = proposal();
         review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
@@ -1480,7 +1488,7 @@ mod tests {
 
     #[test]
     fn passing_own_suite_authorizes_launch_and_is_audited() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let eval = EvalStore::new();
         let mut proposal = proposal();
         review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
@@ -1518,7 +1526,7 @@ mod tests {
 
     #[test]
     fn incomplete_or_failing_suite_is_terminally_gate_failed() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let eval = EvalStore::new();
         let mut proposal = proposal();
         review_capability_proposal(&db, &mut proposal, "reviewer", true, "approved", 50).unwrap();
@@ -1543,7 +1551,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_forged_launch_authorization() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let (proposal, mut authorization) = authorized_proposal(&db, 100);
         authorization.proposal_digest = "forged".to_string();
 
@@ -1560,7 +1568,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_a_forged_authorization_timestamp() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let (proposal, mut authorization) = authorized_proposal(&db, 100);
         authorization.authorized += 1;
 
@@ -1577,7 +1585,7 @@ mod tests {
 
     #[test]
     fn registry_versions_atomically_and_links_lineage() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let (proposal_v1, authorization_v1) = authorized_proposal(&db, 100);
         let version_1 =
             register_capability(&db, &proposal_v1, &authorization_v1, "human:registrar", 200)
@@ -1611,7 +1619,7 @@ mod tests {
 
     #[test]
     fn registry_retry_with_same_authorization_is_idempotent() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let (proposal, authorization) = authorized_proposal(&db, 100);
         let first =
             register_capability(&db, &proposal, &authorization, "human:registrar", 200).unwrap();
@@ -1636,7 +1644,7 @@ mod tests {
 
     #[test]
     fn registry_versions_canonical_namespace_and_task_class_keys() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut raw_proposal = proposal_at(100);
         raw_proposal.namespace = " acme ".to_string();
         raw_proposal.task_class = "Code   Review".to_string();
@@ -1663,7 +1671,7 @@ mod tests {
 
     #[test]
     fn revocation_preserves_version_and_removes_it_from_active_lookup() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let (proposal, authorization) = authorized_proposal(&db, 100);
         let registered =
             register_capability(&db, &proposal, &authorization, "human:registrar", 200).unwrap();

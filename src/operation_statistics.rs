@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
 const RECEIPT_PAGE_SIZE: i64 = 128;
@@ -59,7 +61,7 @@ enum OutcomeClass {
 }
 
 pub fn query_operation_statistics(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespaces: &[String],
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
@@ -184,7 +186,7 @@ pub fn query_operation_statistics(
 }
 
 fn list_receipts_in_window(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespaces: &[String],
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
@@ -247,7 +249,7 @@ fn list_receipts_in_window(
 }
 
 fn active_admissions_in_window(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespaces: &[String],
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
@@ -493,7 +495,7 @@ mod tests {
 
     #[test]
     fn reconciles_attempts_cost_outcomes_and_learning_without_content() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first_id = "attempt-1";
         let mut first_context = event(first_id, 3, 130, ReceiptEventKind::ContextGoverned, &[]);
         first_context.references = vec![GovernedReference {
@@ -641,7 +643,7 @@ mod tests {
 
     #[test]
     fn paginates_receipts_and_applies_inclusive_exclusive_event_bounds() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for index in 0..129 {
             let operation_id = format!("op-{index:03}");
             let timestamp = 1_000 + index;
@@ -683,7 +685,7 @@ mod tests {
 
     #[test]
     fn waiting_time_sums_repeated_cycles_and_excludes_resolved_pre_window_waits() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let operation_id = "waiting";
         db.put_operation_receipt(&receipt(
             operation_id,
@@ -744,7 +746,7 @@ mod tests {
 
     #[test]
     fn classifies_terminal_parked_unverified_and_unknown_operations() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (operation_id, kind, status) in [
             (
                 "dispatch-failure",
@@ -804,7 +806,7 @@ mod tests {
 
     #[test]
     fn learning_admissions_include_only_current_active_memories_in_window() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (id, state, promoted_at) in [
             ("active", "active", 100),
             ("rejected", "rejected", 110),

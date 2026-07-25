@@ -300,6 +300,7 @@ pub fn postgres_complete_chisei_capabilities() -> Result<BackendCapabilities, St
         contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
         backend: BackendIdentity::Postgres,
         reusable_surfaces: surfaces,
+        migration_version: None,
     })
 }
 

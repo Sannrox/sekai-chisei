@@ -1,5 +1,7 @@
 //! Atomic projection of admitted evidence into governed Sekai graph state.
 
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{KIND_EXTERNAL_EVIDENCE, REL_DERIVED_FROM, REL_EVIDENCE_FOR};
 use crate::sekai::audit::{Decision, ObjectChange, insert_object_changes};
@@ -647,12 +649,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
 
-    fn setup() -> SekaiDb {
+    fn setup() -> RuntimeDb {
         setup_at(":memory:")
     }
 
-    fn setup_at(path: &str) -> SekaiDb {
-        let db = SekaiDb::new(path).unwrap();
+    fn setup_at(path: &str) -> RuntimeDb {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(path).unwrap()));
         db.create_object(&Object {
             id: "service-1".into(),
             kind: "service".into(),
@@ -742,7 +744,7 @@ mod tests {
         }
     }
 
-    fn admit(db: &SekaiDb, evidence: &EvidenceEnvelope) -> String {
+    fn admit(db: &RuntimeDb, evidence: &EvidenceEnvelope) -> String {
         db.submit_evidence(evidence, "producer:checks", 200)
             .unwrap()
             .submission

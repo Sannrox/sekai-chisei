@@ -11,5 +11,6 @@
     "sekai.authorization",
     "sekai.coordination",
     "sekai.graph"
-  ]
+  ],
+  "migration_version": null
 }

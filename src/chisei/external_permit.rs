@@ -1,6 +1,8 @@
 //! Signed, short-lived authority for host-executed external actions.
 
 use crate::chisei::external_action::{AuthorizationRecord, PERMIT_VERSION, REDEMPTION_VERSION};
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{OptionalExtension, TransactionBehavior};
@@ -1224,7 +1226,7 @@ mod tests {
         }
     }
 
-    fn persist_authorization(db: &SekaiDb, record: &AuthorizationRecord) {
+    fn persist_authorization(db: &RuntimeDb, record: &AuthorizationRecord) {
         assert!(matches!(
             db.claim_external_action_authorization(
                 &record.request,
@@ -1341,7 +1343,9 @@ mod tests {
         let record = authorization(10_000, 1);
         let (permit, key) = signed(&record);
         {
-            let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+            let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+                SekaiDb::new(path.to_str().unwrap()).unwrap(),
+            ));
             persist_authorization(&db, &record);
             db.put_permit(&permit, "issue-1", "agent:test").unwrap();
             let first = db
@@ -1366,7 +1370,9 @@ mod tests {
                 .unwrap();
             assert_eq!(first, retry);
         }
-        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ));
         db.revoke_permit(
             &permit.revocation_handle,
             "revoked after lost response",
@@ -1403,7 +1409,9 @@ mod tests {
         let path = dir.path().join("replica.db");
         let record = authorization(10_000, 1);
         let (permit, key) = signed(&record);
-        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ));
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         drop(db);
@@ -1415,7 +1423,9 @@ mod tests {
             let permit = permit.clone();
             let key = key.clone();
             joins.push(std::thread::spawn(move || {
-                let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+                let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+                    SekaiDb::new(path.to_str().unwrap()).unwrap(),
+                ));
                 barrier.wait();
                 db.redeem_permit(
                     &permit,
@@ -1439,7 +1449,7 @@ mod tests {
     fn toctou_revocation_and_kill_switch_stop_future_redemption() {
         let record = authorization(10_000, 3);
         let (permit, key) = signed(&record);
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         let mut changed = context(&permit);
@@ -1550,7 +1560,7 @@ mod tests {
             .verify_host_context(&context(&permit), 3_999)
             .unwrap();
 
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         persist_authorization(&db, &record);
         db.put_permit(&permit, "offline-issue", "agent:test")
             .unwrap();
@@ -1660,7 +1670,7 @@ mod tests {
     fn delegation_is_narrow_policy_named_and_parent_chain_is_live() {
         let record = authorization(10_000, 3);
         let (root, key) = signed(&record);
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         persist_authorization(&db, &record);
         db.set_external_permit_policy(&permit_policy(), 2_500)
             .unwrap();

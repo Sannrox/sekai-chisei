@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use crate::chisei::budget::BudgetTracker;
 use crate::config::{Config, GrpcTcpMode};
-use crate::db::sekai::{PrincipalCredential, SekaiDb};
+use crate::db::runtime_db::RuntimeDb;
+use crate::db::sekai::PrincipalCredential;
+#[cfg(test)]
+use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::runtime_backend::RuntimeBackend;
@@ -41,14 +44,14 @@ pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     legacy_root_token: Option<String>,
 }
 
 impl TokenAuthInterceptor {
     pub fn new(
         store: Arc<PrincipalCredentialStore>,
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         legacy_root_token: Option<String>,
     ) -> Self {
         Self {
@@ -356,7 +359,9 @@ pub async fn run(
         .capabilities()
         .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
         .map_err(std::io::Error::other)?;
-    let db = backend.database();
+    let runtime_db = backend.database();
+    // Dual-backend handle: SQLite and PostgreSQL community stores.
+    let db = runtime_db.clone();
     let provider_registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     if let Some(ops_port) = config.ops_port {
@@ -436,7 +441,10 @@ pub async fn run(
     .await
 }
 
-fn ensure_local_gateway_credential(socket_path: &str, db: &SekaiDb) -> Result<(), std::io::Error> {
+fn ensure_local_gateway_credential(
+    socket_path: &str,
+    db: &RuntimeDb,
+) -> Result<(), std::io::Error> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -481,7 +489,7 @@ async fn run_tcp<H>(
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
     tcp_mode: &GrpcTcpMode,
     credential_store: Arc<PrincipalCredentialStore>,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     health_service: H,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -618,7 +626,7 @@ where
 
 fn build_services(
     config: &Config,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
 ) -> (
     Arc<sekai_service::SekaiServiceImpl>,
     Arc<chisei_service::ChiseiServiceImpl>,
@@ -656,7 +664,7 @@ fn build_services(
     (sekai_svc, chisei_svc)
 }
 
-fn spawn_execution_evidence_reconciler(db: Arc<SekaiDb>) {
+fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
@@ -681,7 +689,7 @@ fn spawn_execution_evidence_reconciler(db: Arc<SekaiDb>) {
 
 fn spawn_health_reporter(
     health_reporter: HealthReporter,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     provider_registry_state_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
@@ -722,8 +730,10 @@ mod tests {
     use super::*;
     use tonic::service::Interceptor;
 
-    fn in_memory_db() -> Arc<SekaiDb> {
-        Arc::new(SekaiDb::new(":memory:").unwrap())
+    fn in_memory_db() -> Arc<RuntimeDb> {
+        Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )))
     }
 
     fn base_config() -> Config {
@@ -816,7 +826,7 @@ mod tests {
             }
         }
 
-        let db = Arc::new(
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
             SekaiDb::new_with_enterprise_extension(
                 ":memory:",
                 Some(Arc::new(BoundedExtension {
@@ -825,7 +835,7 @@ mod tests {
                 })),
             )
             .unwrap(),
-        );
+        )));
         let mut interceptor =
             TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
         let mut request = Request::new(());
@@ -841,7 +851,7 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
 
-        let db = Arc::new(
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
             SekaiDb::new_with_enterprise_extension(
                 ":memory:",
                 Some(Arc::new(BoundedExtension {
@@ -850,7 +860,7 @@ mod tests {
                 })),
             )
             .unwrap(),
-        );
+        )));
         let mut interceptor =
             TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
         let mut request = Request::new(());

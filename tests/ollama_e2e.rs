@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sekai_chisei::config::Config;
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
 use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
@@ -83,7 +84,9 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         permit_key_id: "permit-key-1".into(),
     };
     let model = e2e_model();
-    let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").expect("create db"),
+    )));
 
     let server = tokio::spawn(async move {
         Server::builder()
@@ -200,7 +203,9 @@ async fn delegation_chain_keeps_private_context_local() {
         permit_key_id: "permit-key-1".into(),
     };
     let local_model = e2e_model();
-    let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").expect("create db"),
+    )));
     db.create_object(&Object {
         id: "policy-alpha".into(),
         kind: "policy".into(),

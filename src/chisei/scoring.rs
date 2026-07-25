@@ -28,6 +28,8 @@ use tracing::{error, info, warn};
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::eval::{self, EvalStore};
 use crate::config::Config;
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::llm;
 use crate::sekai::audit::DecisionFilter;
@@ -192,7 +194,7 @@ A truncated or refused output should score low.";
 /// The background scoring job. Holds shared handles to the same DB and in-memory [`EvalStore`]
 /// the gRPC service uses, so emitted runs are visible to live regression checks immediately.
 pub struct ScoringJob {
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     eval: Arc<EvalStore>,
     judge: Arc<dyn Judge>,
     interval: Duration,
@@ -203,7 +205,7 @@ pub struct ScoringJob {
 
 impl ScoringJob {
     pub fn new(
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         eval: Arc<EvalStore>,
         config: Config,
         budget: Arc<BudgetTracker>,
@@ -225,7 +227,7 @@ impl ScoringJob {
 
     /// Test/alternate constructor with an injected judge.
     pub fn with_judge(
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         eval: Arc<EvalStore>,
         judge: Arc<dyn Judge>,
         batch_size: i32,
@@ -936,7 +938,7 @@ fn task_class_breakdown_json(group: &[&SampleObservation], results: &[eval::Case
     serde_json::to_string(&counts).unwrap_or_default()
 }
 
-fn scored_decisions(db: &SekaiDb, namespace: &str) -> Vec<crate::sekai::audit::Decision> {
+fn scored_decisions(db: &RuntimeDb, namespace: &str) -> Vec<crate::sekai::audit::Decision> {
     db.list_decisions(&DecisionFilter {
         actor: Some("chisei.scoring".to_string()),
         action: Some("scored".to_string()),
@@ -948,7 +950,7 @@ fn scored_decisions(db: &SekaiDb, namespace: &str) -> Vec<crate::sekai::audit::D
     .unwrap_or_default()
 }
 
-fn task_class_deltas(db: &SekaiDb, namespace: &str, current_json: &str) -> BTreeMap<String, f64> {
+fn task_class_deltas(db: &RuntimeDb, namespace: &str, current_json: &str) -> BTreeMap<String, f64> {
     let Ok(current) = serde_json::from_str::<BTreeMap<String, ClassCount>>(current_json) else {
         return BTreeMap::new();
     };
@@ -979,7 +981,7 @@ fn task_class_signal_target(namespace: &str, task_class: &str) -> String {
 }
 
 pub fn task_class_regression_signal(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     task_class: &str,
 ) -> Option<TaskClassRegressionSignal> {
@@ -1012,7 +1014,7 @@ pub fn task_class_regression_signal(
 }
 
 pub fn task_class_or_namespace_regressed(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     eval: &EvalStore,
     namespace: &str,
     task_class: &str,
@@ -1140,21 +1142,29 @@ mod tests {
         }
     }
 
-    fn setup() -> (Arc<SekaiDb>, Arc<EvalStore>) {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    fn setup() -> (Arc<RuntimeDb>, Arc<EvalStore>) {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         (db.clone(), Arc::new(EvalStore::with_db(db)))
     }
 
-    fn observe(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64) {
+    fn observe(db: &RuntimeDb, request_id: &str, namespace: &str, ts: i64) {
         observe_with_output(db, request_id, namespace, ts, "here is the thing");
     }
 
-    fn observe_with_output(db: &SekaiDb, request_id: &str, namespace: &str, ts: i64, output: &str) {
+    fn observe_with_output(
+        db: &RuntimeDb,
+        request_id: &str,
+        namespace: &str,
+        ts: i64,
+        output: &str,
+    ) {
         observe_with_task_class(db, request_id, namespace, "", ts, output);
     }
 
     fn observe_with_task_class(
-        db: &SekaiDb,
+        db: &RuntimeDb,
         request_id: &str,
         namespace: &str,
         task_class: &str,
@@ -1180,7 +1190,7 @@ mod tests {
     }
 
     /// Seed `count` observations for a namespace with distinct ids/timestamps from `base`.
-    fn observe_batch(db: &SekaiDb, namespace: &str, base: &str, count: usize, ts_base: i64) {
+    fn observe_batch(db: &RuntimeDb, namespace: &str, base: &str, count: usize, ts_base: i64) {
         for i in 0..count {
             observe(db, &format!("{base}-{i}"), namespace, ts_base + i as i64);
         }
@@ -1188,7 +1198,7 @@ mod tests {
 
     /// Seed `count` observations for a namespace + task_class with distinct ids/timestamps.
     fn observe_batch_with_task_class(
-        db: &SekaiDb,
+        db: &RuntimeDb,
         namespace: &str,
         task_class: &str,
         base: &str,

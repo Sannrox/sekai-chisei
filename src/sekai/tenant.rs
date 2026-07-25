@@ -1,3 +1,4 @@
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -980,7 +981,7 @@ mod tests {
 
     #[test]
     fn lifecycle_is_idempotent_audited_and_blocks_admission() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let created = db.create_tenant("root", "create-1", 10).unwrap();
         assert_eq!(created, db.create_tenant("root", "create-1", 11).unwrap());
         assert!(db.require_tenant_admission(&created.id).is_ok());
@@ -1033,7 +1034,9 @@ mod tests {
     #[test]
     fn concurrent_create_retries_return_one_tenant() {
         let path = std::env::temp_dir().join(format!("sekai-tenant-{}.db", Uuid::new_v4()));
-        let db = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
         let barrier = Arc::new(Barrier::new(3));
         let handles = (0..2)
             .map(|_| {
@@ -1069,7 +1072,7 @@ mod tests {
 
     #[test]
     fn memberships_are_tenant_scoped_live_authorized_and_preserve_the_last_owner() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db.create_tenant("root", "members-a", 1).unwrap();
         let second = db.create_tenant("root", "members-b", 2).unwrap();
         let owner = "external:owner";
@@ -1172,7 +1175,7 @@ mod tests {
 
     #[test]
     fn namespace_ownership_is_unique_immutable_and_supports_new_namespace_migration() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db.create_tenant("root", "tenant-a", 1).unwrap();
         let second = db.create_tenant("root", "tenant-b", 2).unwrap();
         db.create_object(&crate::domain::Object {

@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_MODEL, REL_CONTAINS, REL_TOUCHES};
 
@@ -7,7 +9,7 @@ pub struct AffinityResult {
     pub low_success: bool,
 }
 
-fn namespace_object(db: &SekaiDb, namespace: &str) -> Option<crate::domain::Object> {
+fn namespace_object(db: &RuntimeDb, namespace: &str) -> Option<crate::domain::Object> {
     if namespace.is_empty() {
         return None;
     }
@@ -17,7 +19,7 @@ fn namespace_object(db: &SekaiDb, namespace: &str) -> Option<crate::domain::Obje
         .flatten()
 }
 
-pub fn get_affinity(db: &SekaiDb, namespace: &str) -> AffinityResult {
+pub fn get_affinity(db: &RuntimeDb, namespace: &str) -> AffinityResult {
     let best_model = model_for_namespace(db, namespace);
     let low_success = low_success_namespace(db, namespace);
     AffinityResult {
@@ -27,7 +29,7 @@ pub fn get_affinity(db: &SekaiDb, namespace: &str) -> AffinityResult {
     }
 }
 
-fn model_for_namespace(db: &SekaiDb, namespace: &str) -> String {
+fn model_for_namespace(db: &RuntimeDb, namespace: &str) -> String {
     let Some(namespace_obj) = namespace_object(db, namespace) else {
         return String::new();
     };
@@ -74,7 +76,7 @@ fn model_for_namespace(db: &SekaiDb, namespace: &str) -> String {
     best
 }
 
-fn low_success_namespace(db: &SekaiDb, namespace: &str) -> bool {
+fn low_success_namespace(db: &RuntimeDb, namespace: &str) -> bool {
     let Some(namespace_obj) = namespace_object(db, namespace) else {
         return false;
     };
@@ -107,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_low_success_namespace() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),
