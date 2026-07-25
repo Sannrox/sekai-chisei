@@ -33,7 +33,9 @@
       "notes": "Authoritative suites/runs/iterations for multi-replica promotion; process-local EvalStore is non-authoritative only.",
       "evidence": [
         "src/chisei/eval.rs",
-        "src/db/chisei_eval_backend.rs"
+        "src/db/chisei_eval_backend.rs",
+        "src/grpc/chisei_service.rs",
+        "tests/replica_safety_eval.rs"
       ]
     },
     {
@@ -41,7 +43,9 @@
       "class": "shared_store_required",
       "notes": "Portfolio objectives and observations used for routing authority.",
       "evidence": [
-        "src/db/chisei_portfolio.rs"
+        "src/db/chisei_portfolio.rs",
+        "src/chisei/portfolio.rs",
+        "tests/replica_safety_eval.rs"
       ]
     },
     {
