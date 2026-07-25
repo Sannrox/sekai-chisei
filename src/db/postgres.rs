@@ -29,6 +29,8 @@ const RETENTION_DEDUPLICATION_PARITY_SCHEMA: &str =
     include_str!("postgres/0013_retention_deduplication_parity.sql");
 const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
     include_str!("postgres/0014_action_governance_parity.sql");
+const CAPABILITY_PACKAGE_PARITY_SCHEMA: &str =
+    include_str!("postgres/0015_capability_package_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -107,6 +109,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         name: "action_governance_parity",
         sql: ACTION_GOVERNANCE_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 15,
+        name: "capability_package_parity",
+        sql: CAPABILITY_PACKAGE_PARITY_SCHEMA,
     },
 ];
 
@@ -562,6 +569,19 @@ mod tests {
         }
         for excluded in ["tenant", "oauth", "oidc"] {
             assert!(!ACTION_GOVERNANCE_PARITY_SCHEMA.contains(excluded));
+        }
+        for table in [
+            "sekai_capability_package_versions",
+            "sekai_capability_package_installations",
+            "sekai_capability_package_events",
+        ] {
+            assert!(
+                CAPABILITY_PACKAGE_PARITY_SCHEMA
+                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+            );
+        }
+        for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
+            assert!(!CAPABILITY_PACKAGE_PARITY_SCHEMA.contains(excluded));
         }
     }
 
