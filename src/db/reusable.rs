@@ -21,6 +21,7 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.retention",
     "sekai.scoped-content",
     "sekai.reconciliation",
+    "sekai.team-namespaces",
 ];
 
 pub fn postgres_reusable_capabilities() -> BackendCapabilities {
