@@ -66,10 +66,12 @@
     {
       "id": "sekai.credentials",
       "class": "cache_allowed",
-      "max_stale_ms": 30000,
-      "notes": "PrincipalCredentialStore may cache; reload must bound stale authority and fail closed on reload error.",
+      "max_stale_ms": 5000,
+      "notes": "PrincipalCredentialStore may cache with CREDENTIAL_CACHE_MAX_STALE_MS; epoch changes reload immediately. Request-path auth rechecks durable rows and never widens authority from cache alone.",
       "evidence": [
-        "src/sekai/credentials.rs"
+        "src/sekai/credentials.rs",
+        "src/grpc/mod.rs",
+        "tests/replica_safety_credentials.rs"
       ]
     },
     {
