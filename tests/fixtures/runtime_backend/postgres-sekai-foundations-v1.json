@@ -12,6 +12,7 @@
     "sekai.datasets",
     "sekai.evidence",
     "sekai.graph",
+    "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
     "sekai.ontology-definitions",
