@@ -15397,6 +15397,7 @@ mod tests {
     }
 
     use crate::config::Config;
+    use crate::db::runtime_db::RuntimeDb;
     use crate::db::sekai::SekaiDb;
     use crate::grpc::chisei_service::ChiseiServiceImpl;
     use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -15846,7 +15847,7 @@ mod tests {
 
     /// Usage recording for streamed responses happens in a background task
     /// after the last chunk is delivered, so poll instead of asserting once.
-    async fn wait_for_llm_calls(db: &SekaiDb, count: usize) -> Vec<HashMap<String, String>> {
+    async fn wait_for_llm_calls(db: &RuntimeDb, count: usize) -> Vec<HashMap<String, String>> {
         for _ in 0..100 {
             let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
             if rows.len() >= count {
@@ -16004,12 +16005,14 @@ mod tests {
         }
     }
 
-    async fn spawn_control_plane() -> (String, Arc<SekaiDb>) {
+    async fn spawn_control_plane() -> (String, Arc<RuntimeDb>) {
         spawn_control_plane_with_config(test_config()).await
     }
 
-    async fn spawn_control_plane_with_config(config: Config) -> (String, Arc<SekaiDb>) {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    async fn spawn_control_plane_with_config(config: Config) -> (String, Arc<RuntimeDb>) {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         for (agent, project, secret) in [
             ("codex-app", "default", "sk-chisei-codex-app"),
             ("claude-code", "default", "sk-chisei-claude-code"),
@@ -16041,8 +16044,8 @@ mod tests {
 
     async fn spawn_control_plane_from_db(
         config: Config,
-        db: Arc<SekaiDb>,
-    ) -> (String, Arc<SekaiDb>) {
+        db: Arc<RuntimeDb>,
+    ) -> (String, Arc<RuntimeDb>) {
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -19350,7 +19353,9 @@ mod tests {
             "application/json",
         )
         .await;
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         db.create_object(&crate::domain::Object {
             id: "private-ticker".to_string(),
             kind: "ticker".to_string(),
