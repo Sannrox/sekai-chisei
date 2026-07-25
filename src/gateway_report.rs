@@ -5,6 +5,7 @@ use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use tonic::Request as GrpcRequest;
 
+use crate::db::runtime_db::RuntimeDb;
 use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::CheckBudgetRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -217,11 +218,7 @@ pub async fn run_report(
     Ok(())
 }
 
-pub fn egress_rows(
-    db: &crate::db::sekai::SekaiDb,
-    after: i64,
-    limit: i32,
-) -> Result<Vec<Row>, String> {
+pub fn egress_rows(db: &RuntimeDb, after: i64, limit: i32) -> Result<Vec<Row>, String> {
     let rows = db.query_rows(
         "llm_calls",
         &crate::sekai::dataset::RowQuery {

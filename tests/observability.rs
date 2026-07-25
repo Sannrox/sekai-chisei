@@ -10,6 +10,7 @@ use axum::body::{Body, Bytes, to_bytes};
 use futures_util::future::poll_fn;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::{Body as HttpBody, Frame};
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::obs::grpc_layer::MetricsLayer;
 use tokio::time::sleep;
@@ -65,7 +66,9 @@ impl HttpBody for TestBody {
 
 #[tokio::test]
 async fn ops_routes_report_health_readiness_and_metrics() {
-    let db = Arc::new(SekaiDb::new(":memory:").expect("create db"));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").expect("create db"),
+    )));
     let directory =
         std::env::temp_dir().join(format!("sekai-ops-registry-{}", uuid::Uuid::new_v4()));
     let registry_path = directory.join("provider-registry.json");

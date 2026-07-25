@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use metrics::gauge;
@@ -16,7 +18,7 @@ pub struct CapacityMetrics {
     pub utilization: i32,
 }
 
-pub fn record_snapshot(db: &SekaiDb, metrics: &CapacityMetrics) -> Result<(), String> {
+pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), String> {
     // Queue depth is emitted through the labeled operability signal so the
     // family carries one consistent label set. Emitting it here unlabeled as
     // well would render two series under one family with different dimensions,
@@ -55,7 +57,7 @@ pub fn record_snapshot(db: &SekaiDb, metrics: &CapacityMetrics) -> Result<(), St
     db.create_object(&obj)
 }
 
-pub fn latest_snapshots(db: &SekaiDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
+pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
     let objs = db.list_all_objects(&crate::domain::ListFilter {
         kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
         ..Default::default()
@@ -107,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_capacity_snapshot() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         record_snapshot(
             &db,
             &CapacityMetrics {

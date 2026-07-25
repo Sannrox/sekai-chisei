@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, REL_CONTAINS};
 
@@ -11,7 +13,7 @@ pub struct ProposedTask {
     pub priority: i32,
 }
 
-pub fn scan(db: &SekaiDb) -> Vec<ProposedTask> {
+pub fn scan(db: &RuntimeDb) -> Vec<ProposedTask> {
     let namespaces = db
         .list_all_objects(&crate::domain::ListFilter {
             kind: Some("namespace".into()),
@@ -63,7 +65,7 @@ mod tests {
 
     #[test]
     fn test_sentinel_detects_degraded() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),
@@ -127,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_sentinel_ignores_low_volume() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),

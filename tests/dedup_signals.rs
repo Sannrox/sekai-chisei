@@ -5,6 +5,7 @@
 //! deleted. Each `tests/*.rs` runs in its own process.
 
 use sekai_chisei::chisei::budget::BudgetTracker;
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::obs::signals;
 use std::sync::Arc;
@@ -24,7 +25,9 @@ fn dedup_count(rendered: &str, event: &str) -> u64 {
 fn replays_and_conflicts_are_counted_separately() {
     sekai_chisei::obs::metrics::handle();
 
-    let db = Arc::new(SekaiDb::new(":memory:").expect("open in-memory database"));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").expect("open in-memory database"),
+    )));
     let budget = BudgetTracker::new(db);
 
     let before = sekai_chisei::obs::metrics::handle().render();

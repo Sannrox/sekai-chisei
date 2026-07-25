@@ -30,6 +30,8 @@ use crate::chisei::receipt::{
 };
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{ListFilter, Object};
 use crate::sekai::action::RiskClass;
@@ -49,7 +51,7 @@ pub struct ChiseiServiceImpl {
     evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     config: Config,
     provider_registry_state_path: Option<PathBuf>,
 }
@@ -69,7 +71,7 @@ const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
 const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
 
 fn record_reported_memory_outcomes(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     receipt: &OperationReceipt,
     actor: &str,
     now_ms: i64,
@@ -457,7 +459,7 @@ fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
 }
 
 fn authorize_statistics_namespaces(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     namespaces: &[String],
 ) -> Result<(), Status> {
@@ -790,7 +792,7 @@ fn external_audit_evidence(record: &external::AuthorizationRecord) -> HashMap<St
 }
 
 fn ensure_external_action_audit(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     record: &external::AuthorizationRecord,
 ) -> Result<(), Status> {
     let lifecycle = if record.approval_status.is_empty() {
@@ -819,7 +821,7 @@ fn external_budget_scope(request: &external::ExternalActionRequest) -> String {
 }
 
 fn release_external_reservations(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     budget: &BudgetTracker,
     record: &mut external::AuthorizationRecord,
 ) -> Result<(), Status> {
@@ -847,7 +849,7 @@ fn release_external_reservations(
 }
 
 fn persist_released_external_flags(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     reserved: &external::AuthorizationRecord,
     released: &external::AuthorizationRecord,
 ) -> Result<(), Status> {
@@ -860,7 +862,7 @@ fn persist_released_external_flags(
 }
 
 fn reclaim_expired_external_action_reservations(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     budget: &BudgetTracker,
     now_ms: i64,
 ) -> Result<(), Status> {
@@ -892,7 +894,7 @@ fn reclaim_expired_external_action_reservations(
     Ok(())
 }
 
-fn require_namespace_access(db: &SekaiDb, actor: &str, namespace: &str) -> Result<(), Status> {
+fn require_namespace_access(db: &RuntimeDb, actor: &str, namespace: &str) -> Result<(), Status> {
     let namespace = canonical_namespace(namespace)?;
     if matches!(actor, "root" | "local") {
         return Ok(());
@@ -914,7 +916,7 @@ fn require_namespace_access(db: &SekaiDb, actor: &str, namespace: &str) -> Resul
 }
 
 fn require_namespace_write_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
@@ -945,7 +947,7 @@ fn require_namespace_write_access(
 }
 
 fn require_external_project_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     actor: &str,
     namespace: &str,
     project: &str,
@@ -982,7 +984,7 @@ fn require_external_project_access(
 }
 
 fn require_team_namespace_access<T>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     _config: &Config,
     request: &Request<T>,
     namespace: &str,
@@ -1008,7 +1010,7 @@ fn require_team_namespace_access<T>(
 }
 
 fn require_execution_namespace_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     _config: &Config,
     actor: &str,
     namespace: &str,
@@ -1045,7 +1047,7 @@ fn strongest_pressure(
 }
 
 fn execution_context_actor(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     _config: &Config,
     actor: &str,
     delegated: Option<&str>,
@@ -1184,7 +1186,7 @@ fn receipt_event(
 }
 
 fn record_completed_operation_on(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     plan: &ExecutionPlan,
     actor: &str,
     response: &PlannedChatResponse,
@@ -1302,7 +1304,7 @@ fn native_execution_cost(
 }
 
 fn record_failed_operation_on(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     plan: &ExecutionPlan,
     actor: &str,
     completion_reason: &str,
@@ -1399,7 +1401,7 @@ struct EvidenceClassGate {
 }
 
 struct FinishStreamedExecution<'a> {
-    db: &'a SekaiDb,
+    db: &'a RuntimeDb,
     evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     request_id: &'a str,
     namespace: &'a str,
@@ -1424,7 +1426,7 @@ struct EvolveTaskRecord<'a> {
 }
 
 fn record_evolve_task_on(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     task: EvolveTaskRecord<'_>,
 ) -> Result<(), String> {
@@ -1516,7 +1518,11 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
     Ok(())
 }
 
-fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> Result<(), String> {
+fn persist_namespace_policy(
+    db: &RuntimeDb,
+    namespace: &str,
+    policy: &Policy,
+) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
     let external_id = format!("policy:{namespace}");
     let mut properties = policy_properties(policy);
@@ -1543,7 +1549,7 @@ fn persist_namespace_policy(db: &SekaiDb, namespace: &str, policy: &Policy) -> R
 }
 
 fn persist_namespace_worker_policy(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     contention_scope_id: &str,
 ) -> Result<(), String> {
@@ -1572,7 +1578,7 @@ fn persist_namespace_worker_policy(
 }
 
 impl ChiseiServiceImpl {
-    pub fn new(db: Arc<SekaiDb>, config: Config) -> Self {
+    pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -1879,7 +1885,7 @@ impl ChiseiServiceImpl {
         });
     }
 
-    pub fn with_budget(db: Arc<SekaiDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
+    pub fn with_budget(db: Arc<RuntimeDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -3361,7 +3367,7 @@ fn budget_subject(
 }
 
 fn active_continuation_allocation(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     work_unit_id: &str,
     budget_identities: &[&str],
     now_ms: i64,
@@ -3578,7 +3584,7 @@ fn prune_excess_plans(plans: &mut HashMap<String, ExecutionPlan>, protected_plan
     }
 }
 
-fn load_namespace_policies(db: &SekaiDb, resolver: &PolicyResolver) {
+fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver) {
     for kind in ["policy", "namespace_policy"] {
         let Ok(objects) = db.list_all_objects(&ListFilter {
             kind: Some(kind.into()),
@@ -6714,7 +6720,7 @@ impl ChiseiService for ChiseiServiceImpl {
                         cache_creation_input_tokens,
                     };
                     let execution = FinishStreamedExecution {
-                        db: &db,
+                        db: db.as_ref(),
                         evolve_history: &evolve_history,
                         request_id: &request_id,
                         namespace: &namespace_hint,
@@ -6731,7 +6737,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     let _ = finish_streamed_execution(&execution);
                     let completed_at_ms = chrono::Utc::now().timestamp_millis();
                     if let Err(error) = record_completed_operation_on(
-                        &db,
+                        db.as_ref(),
                         &receipt_plan,
                         &actor,
                         &response,
@@ -6775,7 +6781,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     cache_creation_input_tokens,
                 };
                 let execution = FinishStreamedExecution {
-                    db: &db,
+                    db: db.as_ref(),
                     evolve_history: &evolve_history,
                     request_id: &request_id,
                     namespace: &namespace_hint,
@@ -8908,7 +8914,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_rejects_unknown_explicit_provider_without_policy() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db, config(":memory:"));
         let request = resolve_policy_request("unscoped", "bogus", "bogus/model");
 
@@ -8981,7 +8989,9 @@ mod tests {
 
     #[tokio::test]
     async fn live_model_resolution_rejects_unknown_explicit_provider() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db, config(":memory:"));
 
         let error = svc
@@ -9001,7 +9011,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_normalizes_loaded_legacy_native_runtime() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db, config(":memory:"));
         svc.policy.set_namespace_policy(
             "private",
@@ -9040,7 +9052,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         // Treat openai as available without a key so routing can resolve.
         cfg.gateway_provided_providers = vec!["openai".into()];
@@ -9087,7 +9101,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(db, cfg);
@@ -9174,7 +9190,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(db, cfg);
@@ -9231,7 +9249,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_respects_a_promoted_capable_override() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(db, cfg);
@@ -9301,7 +9321,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_records_no_bias_when_no_cheaper_model_exists() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(db, cfg);
@@ -9332,7 +9354,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_policy_records_no_bias_for_equal_cost_models() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let mut cfg = config(":memory:");
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(db, cfg);
@@ -9426,7 +9450,9 @@ mod tests {
     }
 
     fn memory_service() -> ChiseiServiceImpl {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         ChiseiServiceImpl::new(db, config(":memory:"))
     }
 
@@ -9994,7 +10020,7 @@ mod tests {
     }
 
     fn file_service(path: &str) -> ChiseiServiceImpl {
-        let db = Arc::new(SekaiDb::new(path).unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
         ChiseiServiceImpl::new(db, config(path))
     }
 
@@ -11512,7 +11538,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_gateway_audit_writes_decision_log() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
         let response = svc
             .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
@@ -11572,7 +11600,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_gateway_audit_strips_reserved_attestation_evidence_keys() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
         let event = svc
             .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
@@ -11606,7 +11636,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_gateway_audit_clamps_future_timestamp() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let svc = ChiseiServiceImpl::new(db, config(":memory:"));
         let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
         let event = svc
@@ -13091,7 +13123,7 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         {
-            let db = SekaiDb::new(&path).unwrap();
+            let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap()));
             db.create_object(&Object {
                 id: "policy-alpha".into(),
                 kind: "policy".into(),

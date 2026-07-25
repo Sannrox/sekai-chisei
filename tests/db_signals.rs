@@ -6,6 +6,7 @@
 //! observed before this file was split out. Cargo gives each integration test
 //! its own process, so nothing here emits a signal except the code under test.
 
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::obs::signals;
 
@@ -26,7 +27,9 @@ fn connection_acquisition_emits_wait_and_pool_saturation() {
 
     // Constructing the database runs migrations, each acquiring a pooled
     // connection through the instrumented chokepoint.
-    let db = SekaiDb::new(":memory:").expect("open in-memory database");
+    let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").expect("open in-memory database"),
+    ));
     drop(db);
 
     let after = scrape();

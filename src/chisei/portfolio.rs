@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
 pub const LEGACY_PROMPT_VARIANT: &str = "legacy@1";
@@ -94,11 +96,11 @@ pub struct RouteSelection {
 }
 
 pub struct PortfolioStore {
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
 }
 
 impl PortfolioStore {
-    pub fn new(db: Arc<SekaiDb>) -> Self {
+    pub fn new(db: Arc<RuntimeDb>) -> Self {
         Self { db }
     }
 
@@ -420,7 +422,9 @@ mod tests {
     use super::*;
 
     fn store() -> PortfolioStore {
-        PortfolioStore::new(Arc::new(SekaiDb::new(":memory:").unwrap()))
+        PortfolioStore::new(Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        ))))
     }
 
     #[test]

@@ -1,10 +1,12 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, Object};
 use crate::sekai::function;
 use crate::sekai::schema::{PropertyType, SchemaRegistry};
 use std::collections::HashMap;
 
-type ComputeFn = Box<dyn Fn(&Object, &SekaiDb) -> Option<String> + Send + Sync>;
+type ComputeFn = Box<dyn Fn(&Object, &RuntimeDb) -> Option<String> + Send + Sync>;
 
 pub struct ComputeRegistry {
     funcs: HashMap<String, ComputeFn>, // "kind:property" -> fn
@@ -27,7 +29,7 @@ impl ComputeRegistry {
         self.funcs.insert(format!("{}:{}", kind, property), f);
     }
 
-    pub fn resolve(&self, obj: &mut Object, db: &SekaiDb) {
+    pub fn resolve(&self, obj: &mut Object, db: &RuntimeDb) {
         for (key, f) in &self.funcs {
             let (k, prop) = key.split_once(':').unwrap_or((key, ""));
             if k != obj.kind {
@@ -39,7 +41,7 @@ impl ComputeRegistry {
         }
     }
 
-    pub fn resolve_all(&self, objs: &mut [Object], db: &SekaiDb) {
+    pub fn resolve_all(&self, objs: &mut [Object], db: &RuntimeDb) {
         for obj in objs.iter_mut() {
             self.resolve(obj, db);
         }
@@ -88,7 +90,7 @@ pub fn default_compute_registry() -> ComputeRegistry {
 
 pub fn resolve_schema_computed_with_filter<F>(
     obj: &mut Object,
-    db: &SekaiDb,
+    db: &RuntimeDb,
     schema: &SchemaRegistry,
     allow: F,
 ) -> Result<(), String>
@@ -121,7 +123,7 @@ where
 
 fn function_computed_value<F>(
     obj: &Object,
-    db: &SekaiDb,
+    db: &RuntimeDb,
     function_name: &str,
     property_name: &str,
     allow: &F,
@@ -154,7 +156,7 @@ where
 
 fn fallback_computed_value<F>(
     obj: &Object,
-    db: &SekaiDb,
+    db: &RuntimeDb,
     property_name: &str,
     allow: &F,
 ) -> Result<Option<String>, String>
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_compute_component_count() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let mut namespace = Object {
             id: "r1".into(),
             kind: "namespace".into(),
@@ -243,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_compute_health() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let reg = default_compute_registry();
         let mut comp = Object {
             id: "c1".into(),
