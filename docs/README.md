@@ -54,6 +54,9 @@ in order.
   workload baseline and interpret regression budgets.
 - [Architecture decisions](decisions/README.md) — accepted, durable design
   choices and the ADR template.
+- [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
+  tenant-free Sekai surface set, inventory evidence, and remaining runtime
+  activation gates.
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
   enforcement.
 
