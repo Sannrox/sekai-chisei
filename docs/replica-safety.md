@@ -60,8 +60,8 @@ two `PostgresDb` pools against one `SEKAI_TEST_POSTGRES_URL` when available
 
 | Issue | Focus |
 | --- | --- |
-| #304 | Inventory + harness (this document) |
-| #305 | Shared budget under concurrent replicas |
+| #304 | Inventory + harness (this document) — landed |
+| #305 | Shared budget under concurrent replicas (`tests/replica_safety_budget.rs`) |
 | #306 | Leases, admission, recovery after replica loss |
 | #307 | Credential/authority cache stale bounds |
 | #308 | Eval/portfolio off process-local authority |
