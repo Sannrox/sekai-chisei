@@ -1903,10 +1903,6 @@ impl GatewayCorrelation {
     }
 }
 
-fn gateway_attempt_receipt_id(operation_id: &str, request_id: &str, attempt: u32) -> String {
-    gateway_provider_receipt_id(operation_id, request_id, attempt, 1)
-}
-
 /// Receipt identity for a client attempt, optionally qualified by an internal
 /// mid-request provider ordinal so failover dispatches do not collide with the
 /// client-controlled `x-chisei-attempt` namespace.
@@ -2942,9 +2938,70 @@ async fn proxy_gateway_inner_scoped(
         }
     };
 
+    // First-attempt auth and header assembly are fallible (e.g. missing provider
+    // credentials) and must finish before the alias is claimed, or a retry of the
+    // same request id would be rejected as already dispatched.
+    let build_upstream = |prepared: &PreparedUpstreamRequest| -> Result<
+        reqwest::RequestBuilder,
+        Box<Response<Body>>,
+    > {
+            let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+                Ok(method) => method,
+                Err(err) => {
+                    return Err(Box::new(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &format!("unsupported method: {err}"),
+                    )));
+                }
+            };
+            let mut upstream = state
+                .client
+                .request(upstream_method, prepared.url.clone())
+                .body(prepared.body.clone());
+            let upstream_auth_mode = upstream_auth_mode(
+                &state.config,
+                identity_context.upstream_auth,
+                prepared.provider,
+            );
+            let resolved_to_isolated_openai_backend = matches!(
+                prepared.provider,
+                ProviderKind::OpenAi(
+                    OpenAiRuntime::Ollama
+                        | OpenAiRuntime::Native
+                        | OpenAiRuntime::Xai
+                        | OpenAiRuntime::Meta
+                )
+            );
+            if prepared.cross_provider
+                || resolved_to_isolated_openai_backend
+                || upstream_auth_mode == UpstreamAuthMode::GatewayKey
+            {
+                upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
+                    Ok(upstream) => upstream,
+                    Err(response) => return Err(response),
+                };
+            }
+            for (name, value) in headers.iter() {
+                let strip_client_auth = should_strip_isolated_client_credential(
+                    name,
+                    prepared.cross_provider || resolved_to_isolated_openai_backend,
+                );
+                if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
+                    upstream = upstream.header(name, value);
+                }
+            }
+            Ok(upstream)
+        };
+
+    let mut upstream = match build_upstream(&prepared) {
+        Ok(upstream) => upstream,
+        Err(response) => return *response,
+    };
+
     // Reserve the opaque alias only after every fallible pre-dispatch step has
     // completed. Mid-request provider failover reuses the same reserved alias
-    // and advances the attempt ordinal on each receipt.
+    // and advances the provider ordinal on each receipt.
     if let Err(error) = reserve_gateway_request_alias(&state.config, &alias_context).await {
         return alias_reservation_error_response(error);
     }
@@ -3030,78 +3087,6 @@ async fn proxy_gateway_inner_scoped(
     };
 
     loop {
-        let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
-            Ok(method) => method,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &format!("unsupported method: {err}"),
-                );
-            }
-        };
-
-        let mut upstream = state
-            .client
-            .request(upstream_method, prepared.url.clone())
-            .body(prepared.body.clone());
-        let upstream_auth_mode = upstream_auth_mode(
-            &state.config,
-            identity_context.upstream_auth,
-            prepared.provider,
-        );
-        let resolved_to_isolated_openai_backend = matches!(
-            prepared.provider,
-            ProviderKind::OpenAi(
-                OpenAiRuntime::Ollama
-                    | OpenAiRuntime::Native
-                    | OpenAiRuntime::Xai
-                    | OpenAiRuntime::Meta
-            )
-        );
-        // Cross-provider requests were translated to a different provider family, so
-        // the client's credential (e.g. an Anthropic subscription token) must never
-        // be forwarded to the resolved upstream. Apply the resolved provider's own
-        // gateway auth instead (a no-op for Ollama/native) and strip client auth
-        // headers below regardless of the passthrough mode.
-        if prepared.cross_provider
-            || resolved_to_isolated_openai_backend
-            || upstream_auth_mode == UpstreamAuthMode::GatewayKey
-        {
-            upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
-                Ok(upstream) => upstream,
-                Err(response) => {
-                    // After alias claim, surface as a terminal refusal so the
-                    // claimed alias is reconcilable.
-                    let rejection = GatewayRejection::json(
-                        StatusCode::BAD_GATEWAY,
-                        "gateway_config_error",
-                        "could not apply provider authentication for upstream dispatch",
-                    );
-                    record_refusal_with_usage_and_append(
-                        &state.config,
-                        &state.runtime,
-                        &identity,
-                        &usage_context,
-                        &rejection,
-                        None,
-                        false,
-                    )
-                    .await;
-                    return *response;
-                }
-            };
-        }
-        for (name, value) in headers.iter() {
-            let strip_client_auth = should_strip_isolated_client_credential(
-                name,
-                prepared.cross_provider || resolved_to_isolated_openai_backend,
-            );
-            if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
-                upstream = upstream.header(name, value);
-            }
-        }
-
         let send_result = send_upstream_with_resilience(
             &state.runtime,
             prepared.provider,
@@ -3346,7 +3331,18 @@ async fn proxy_gateway_inner_scoped(
                         resolved_profile.map(|profile| profile.governance.metadata_status.clone());
                     usage_context.cache_requested = cache_requested
                         || automatic_cache_attempted(resolved_profile, &prepared.body);
-                    continue;
+                    // Rebuild authenticated request for the failover candidate.
+                    // Auth failure after claim is rare (credentials are gateway-side);
+                    // surface the original failure if the rebuild cannot proceed.
+                    match build_upstream(&prepared) {
+                        Ok(next_upstream) => {
+                            upstream = next_upstream;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Fall through to original send_result.
+                        }
+                    }
                 }
             }
             // No further candidate: surface the original outcome.
@@ -4113,6 +4109,7 @@ fn client_can_dispatch_to_provider(client: ProviderKind, target: ProviderKind) -
 /// upstream failure. Never crosses governance, capability, family (unless allowed), or local-free
 /// boundaries. Also skips candidates the client protocol cannot adapt to, so preparation
 /// failures do not terminate failover early.
+#[allow(clippy::too_many_arguments)]
 async fn select_next_failover_candidate(
     runtime: &GatewayRuntime,
     registry: &ProviderRegistry,
@@ -4161,10 +4158,7 @@ async fn select_next_failover_candidate(
             continue;
         };
         let provider_id = capability_provider_id(provider);
-        if excluded_provider_ids
-            .iter()
-            .any(|excluded| *excluded == provider_id)
-        {
+        if excluded_provider_ids.contains(&provider_id) {
             continue;
         }
         if local_free_only && provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama) {
@@ -4176,12 +4170,11 @@ async fn select_next_failover_candidate(
         if !client_can_dispatch_to_provider(client_provider, provider) {
             continue;
         }
-        if let Some(surface) = surface {
-            if enforce_adapter_capabilities(client_provider, provider, surface, &decision.body)
+        if let Some(surface) = surface
+            && enforce_adapter_capabilities(client_provider, provider, surface, &decision.body)
                 .is_err()
-            {
-                continue;
-            }
+        {
+            continue;
         }
         if circuits
             .get(provider_id)
@@ -12948,8 +12941,8 @@ mod tests {
             correlation.operation_id
         );
         assert_ne!(
-            gateway_attempt_receipt_id("operation-1", "request-1", 1),
-            gateway_attempt_receipt_id("operation-1", "request-2", 1)
+            gateway_provider_receipt_id("operation-1", "request-1", 1, 1),
+            gateway_provider_receipt_id("operation-1", "request-2", 1, 1)
         );
     }
 
@@ -13766,7 +13759,7 @@ mod tests {
         assert_eq!(receipt.version, OPERATION_RECEIPT_VERSION);
         assert_eq!(
             receipt.operation_id,
-            gateway_attempt_receipt_id("gateway-op-1", "gateway-op-1", 2)
+            gateway_provider_receipt_id("gateway-op-1", "gateway-op-1", 2, 1)
         );
         assert_eq!(receipt.parent_operation_id.as_deref(), Some("gateway-op-1"));
         let intent = receipt
@@ -15248,7 +15241,7 @@ mod tests {
         );
         assert_eq!(
             gateway_provider_receipt_id("op-1", "req-1", 1, 1),
-            gateway_attempt_receipt_id("op-1", "req-1", 1)
+            gateway_provider_receipt_id("op-1", "req-1", 1, 1)
         );
     }
 
