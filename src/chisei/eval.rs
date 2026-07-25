@@ -142,6 +142,9 @@ impl Default for EvalStore {
 }
 
 impl EvalStore {
+    /// Process-local, non-authoritative store for single-process batches and unit
+    /// tests. **Not** multi-replica authority — use [`Self::with_db`] for any
+    /// shared control-plane eval evidence (see `docs/replica-safety.md`).
     pub fn new() -> Self {
         Self {
             db: None,
@@ -152,6 +155,7 @@ impl EvalStore {
         }
     }
 
+    /// Database-backed eval store shared across replicas via `RuntimeDb`.
     pub fn with_db(db: Arc<RuntimeDb>) -> Self {
         Self {
             db: Some(db),
@@ -160,6 +164,11 @@ impl EvalStore {
             iterations: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(sequence_seed()),
         }
+    }
+
+    /// True when this store reads and writes shared durable state.
+    pub fn is_shared(&self) -> bool {
+        self.db.is_some()
     }
 
     /// A process-wide monotonically increasing counter, used to guarantee unique run/iteration
