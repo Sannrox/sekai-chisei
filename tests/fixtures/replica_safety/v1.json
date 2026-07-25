@@ -50,7 +50,8 @@
       "notes": "Single-winner acquisition and reclaim after owner loss.",
       "evidence": [
         "src/db/lease.rs",
-        "tests/reusable_sekai_backend_conformance.rs"
+        "tests/reusable_sekai_backend_conformance.rs",
+        "tests/replica_safety_leases.rs"
       ]
     },
     {
@@ -58,7 +59,8 @@
       "class": "shared_store_required",
       "notes": "Work admission and lifecycle transitions.",
       "evidence": [
-        "src/db/coordination.rs"
+        "src/db/coordination.rs",
+        "tests/replica_safety_leases.rs"
       ]
     },
     {
