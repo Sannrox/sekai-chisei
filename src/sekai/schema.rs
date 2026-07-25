@@ -392,6 +392,20 @@ pub fn is_valid_property_classification(value: &str) -> bool {
     )
 }
 
+/// Returns true when `kind` is a code-owned builtin schema type.
+pub fn is_builtin_schema_kind(kind: &str) -> bool {
+    SchemaRegistry::new()
+        .get(kind)
+        .is_some_and(|object_type| object_type.is_builtin)
+}
+
+/// Returns true when `name` is a code-owned builtin interface.
+pub fn is_builtin_interface_name(name: &str) -> bool {
+    SchemaRegistry::new()
+        .get_interface(name)
+        .is_some_and(|interface| interface.is_builtin)
+}
+
 fn builtin_object_types() -> Vec<ObjectType> {
     let mut types = [
         (
@@ -946,13 +960,31 @@ impl SekaiDb {
     }
 
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
-        let conn = self.conn();
-        let deleted = conn
+        if kind.trim().is_empty() {
+            return Err("kind required".into());
+        }
+        if is_builtin_schema_kind(kind) {
+            return Err("cannot delete builtin schema type".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let object_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_objects WHERE kind = ?1",
+                params![kind],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if object_count > 0 {
+            return Err("cannot delete schema type while objects of that kind exist".into());
+        }
+        let deleted = tx
             .execute(
                 "DELETE FROM sekai_object_types WHERE kind = ?1",
                 params![kind],
             )
             .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(deleted > 0)
     }
 
@@ -1035,13 +1067,35 @@ impl SekaiDb {
     }
 
     pub fn delete_interface(&self, name: &str) -> Result<bool, String> {
-        let conn = self.conn();
-        let deleted = conn
+        if name.trim().is_empty() {
+            return Err("interface name required".into());
+        }
+        if is_builtin_interface_name(name) {
+            return Err("cannot delete builtin interface".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let mut stmt = tx
+            .prepare("SELECT implements_json FROM sekai_object_types")
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let implements_json: String = row.get(0).map_err(|error| error.to_string())?;
+            let implements: Vec<String> =
+                serde_json::from_str(&implements_json).map_err(|error| error.to_string())?;
+            if implements.iter().any(|interface| interface == name) {
+                return Err("cannot delete interface while schema types implement it".into());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        let deleted = tx
             .execute(
                 "DELETE FROM sekai_interfaces WHERE name = ?1",
                 params![name],
             )
             .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(deleted > 0)
     }
 
