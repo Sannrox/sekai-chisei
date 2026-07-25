@@ -1,6 +1,7 @@
 pub mod action;
 pub mod action_governance;
 pub mod attestation;
+pub mod capability_package;
 pub mod chisei;
 pub mod chisei_budget;
 pub mod chisei_portfolio;
@@ -22,6 +23,7 @@ mod postgres_attestation;
 mod postgres_audit;
 mod postgres_authorization;
 mod postgres_budget;
+mod postgres_capability_package;
 mod postgres_coordination;
 mod postgres_dataset;
 mod postgres_deduplication;
