@@ -35,6 +35,10 @@ An executor refuses the action when any requirement is unsupported. Shared tests
 exercise both filesystem-style (`atomic_rename`) and HTTP-style
 (`conditional_request`) executors.
 
+The versioned, CI-runnable certification profile is
+[host-executor-permit-conformance.md](host-executor-permit-conformance.md)
+(`sekai.host-executor-permit-conformance/v1`).
+
 ## Offline leases
 
 Offline permits are disabled until an administrator stores an

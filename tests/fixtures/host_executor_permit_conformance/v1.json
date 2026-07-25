@@ -1,0 +1,86 @@
+{
+  "version": "sekai.host-executor-permit-conformance/v1",
+  "parent_issue": 296,
+  "description": "Deterministic, provider-free host-executor permit conformance profile. A harness is certifiable only when every required case passes; deliberate negatives must fail the broken mock.",
+  "required_cases": [
+    {
+      "id": "verify_ok_with_capabilities",
+      "class": "positive",
+      "summary": "Valid permit + matching host capabilities is accepted."
+    },
+    {
+      "id": "verify_rejects_missing_capability",
+      "class": "negative",
+      "summary": "Host missing a required enforcement capability is refused."
+    },
+    {
+      "id": "verify_rejects_bad_signature",
+      "class": "negative",
+      "summary": "Tampered signature is refused."
+    },
+    {
+      "id": "verify_rejects_outside_validity_window",
+      "class": "negative",
+      "summary": "Verification outside not_before/expires is refused."
+    },
+    {
+      "id": "verify_rejects_executor_mismatch",
+      "class": "negative",
+      "summary": "Host context executor must match the signed permit."
+    },
+    {
+      "id": "verify_rejects_harness_mismatch",
+      "class": "negative",
+      "summary": "Requesting harness must match the signed permit."
+    },
+    {
+      "id": "verify_rejects_arguments_digest_mismatch",
+      "class": "negative",
+      "summary": "Canonical arguments digest must match the signed permit."
+    },
+    {
+      "id": "verify_rejects_target_mismatch",
+      "class": "negative",
+      "summary": "Target selectors must match the signed permit."
+    },
+    {
+      "id": "verify_rejects_precondition_mismatch",
+      "class": "negative",
+      "summary": "Observed preconditions must match immutable preconditions."
+    },
+    {
+      "id": "verify_rejects_untrusted_issuer",
+      "class": "negative",
+      "summary": "Untrusted issuer is refused."
+    },
+    {
+      "id": "verify_rejects_untrusted_key_id",
+      "class": "negative",
+      "summary": "Untrusted key id is refused (issuer may still match)."
+    },
+    {
+      "id": "redeem_is_idempotent",
+      "class": "positive",
+      "summary": "Same idempotency key returns the same redemption without double consume (one-invocation permit)."
+    },
+    {
+      "id": "redeem_after_revoke_fails",
+      "class": "negative",
+      "summary": "Revoked permit cannot be redeemed."
+    },
+    {
+      "id": "execution_evidence_shape",
+      "class": "positive",
+      "summary": "Host execution evidence validates schema and terminal rules."
+    },
+    {
+      "id": "broken_harness_must_fail_each_negative",
+      "class": "meta",
+      "summary": "A deliberately broken mock fails every negative case (proves the suite is not vacuous)."
+    }
+  ],
+  "reference_executors": [
+    "executor:filesystem/atomic_rename",
+    "executor:http/conditional_request"
+  ]
+}
