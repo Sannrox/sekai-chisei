@@ -37,6 +37,41 @@ pub struct DecisionFilter {
     pub offset: i32,
 }
 
+fn validate_decision(decision: &Decision) -> Result<(), String> {
+    if decision.id.trim().is_empty() {
+        return Err("decision id required".into());
+    }
+    let evidence = serde_json::to_string(&decision.evidence).map_err(|error| error.to_string())?;
+    let parsed: HashMap<String, String> = serde_json::from_str(&evidence)
+        .map_err(|error| format!("decision evidence must be a string map: {error}"))?;
+    for (key, value) in &parsed {
+        if looks_like_secret(value) {
+            return Err(format!(
+                "decision evidence must not store secret material in field {key}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "bearer ",
+        "akia",
+        "asia",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
+}
+
 pub fn record_object_diff(
     db: &SekaiDb,
     actor: &str,
@@ -460,6 +495,7 @@ impl SekaiDb {
     }
 
     pub fn record_decision(&self, d: &Decision) -> Result<(), String> {
+        validate_decision(d)?;
         let conn = self.conn();
         crate::sekai::ledger::insert_chained_decision(&conn, d)
     }
@@ -467,6 +503,9 @@ impl SekaiDb {
     pub fn record_decisions(&self, decisions: &[Decision]) -> Result<(), String> {
         if decisions.is_empty() {
             return Ok(());
+        }
+        for decision in decisions {
+            validate_decision(decision)?;
         }
         let mut conn = self.conn();
         let transaction = conn
@@ -492,6 +531,9 @@ impl SekaiDb {
         if decisions.is_empty() {
             return Ok(());
         }
+        for decision in decisions {
+            validate_decision(decision)?;
+        }
         let mut conn = self.conn();
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -510,7 +552,13 @@ impl SekaiDb {
                             actor: row.get(2)?,
                             action: row.get(3)?,
                             reason: row.get(4)?,
-                            evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+                            evidence: serde_json::from_str(&evidence).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    5,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                             target_id: row.get(6)?,
                             outcome: row.get(7)?,
                         })
@@ -538,14 +586,22 @@ impl SekaiDb {
             "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome FROM sekai_decisions WHERE id = ?1",
             params![id],
             |row| {
+                let decision_id: String = row.get(0)?;
                 let ev_str: String = row.get(5)?;
+                let evidence = serde_json::from_str(&ev_str).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
                 Ok(Decision {
-                    id: row.get(0)?,
+                    id: decision_id,
                     timestamp: row.get(1)?,
                     actor: row.get(2)?,
                     action: row.get(3)?,
                     reason: row.get(4)?,
-                    evidence: serde_json::from_str(&ev_str).unwrap_or_default(),
+                    evidence,
                     target_id: row.get(6)?,
                     outcome: row.get(7)?,
                 })
@@ -597,13 +653,16 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let ev_str: String = row.get(5).map_err(|e| e.to_string())?;
+            let id: String = row.get(0).map_err(|e| e.to_string())?;
+            let evidence = serde_json::from_str(&ev_str)
+                .map_err(|error| format!("corrupt decision evidence for {id}: {error}"))?;
             results.push(Decision {
-                id: row.get(0).map_err(|e| e.to_string())?,
+                id,
                 timestamp: row.get(1).map_err(|e| e.to_string())?,
                 actor: row.get(2).map_err(|e| e.to_string())?,
                 action: row.get(3).map_err(|e| e.to_string())?,
                 reason: row.get(4).map_err(|e| e.to_string())?,
-                evidence: serde_json::from_str(&ev_str).unwrap_or_default(),
+                evidence,
                 target_id: row.get(6).map_err(|e| e.to_string())?,
                 outcome: row.get(7).map_err(|e| e.to_string())?,
             });
