@@ -267,18 +267,22 @@ pub enum FallbackTrigger {
     GovernanceUnavailable,
     /// Control plane responded but degraded the route.
     BudgetDegraded,
+    /// Preferred upstream provider is unhealthy; a policy-authorized fallback was used.
+    ProviderUnhealthy,
 }
 
 impl FallbackTrigger {
     pub const ALL: &'static [FallbackTrigger] = &[
         FallbackTrigger::GovernanceUnavailable,
         FallbackTrigger::BudgetDegraded,
+        FallbackTrigger::ProviderUnhealthy,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             FallbackTrigger::GovernanceUnavailable => "governance_unavailable",
             FallbackTrigger::BudgetDegraded => "budget_degraded",
+            FallbackTrigger::ProviderUnhealthy => "provider_unhealthy",
         }
     }
 }
@@ -346,7 +350,7 @@ mod tests {
         assert_eq!(Cache::ALL.len(), 2);
         assert_eq!(CacheOutcome::ALL.len(), 3);
         assert_eq!(LagSurface::ALL.len(), 3);
-        assert_eq!(FallbackTrigger::ALL.len(), 2);
+        assert_eq!(FallbackTrigger::ALL.len(), 3);
         assert_eq!(DeduplicationEvent::ALL.len(), 2);
     }
 }

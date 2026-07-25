@@ -525,6 +525,20 @@ impl CircuitBreakerState {
         self.open_until.is_some_and(|until| Instant::now() < until)
     }
 
+    /// Drop an expired cooldown and publish the observed open state.
+    ///
+    /// The Prometheus gauge is last-observed: it is updated whenever traffic or
+    /// status handling inspects the circuit, including after a time-based
+    /// cooldown has already expired.
+    fn observe(&mut self, provider: &str) -> bool {
+        if self.open_until.is_some_and(|until| Instant::now() >= until) {
+            self.open_until = None;
+        }
+        let open = self.is_open();
+        crate::obs::signals::set_provider_circuit_open(provider, open);
+        open
+    }
+
     fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.open_until = None;
@@ -539,6 +553,10 @@ impl CircuitBreakerState {
         if self.consecutive_failures >= config.circuit_failure_threshold {
             self.open_until = Some(Instant::now() + config.circuit_cooldown);
         }
+    }
+
+    fn publish_metrics(&self, provider: &str) {
+        crate::obs::signals::set_provider_circuit_open(provider, self.is_open());
     }
 
     fn record_http_signal(
@@ -1113,21 +1131,21 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
             .timestamp_millis()
             .saturating_sub(last_degraded_at_ms as i64)
             <= state.runtime.governance_cache_ttl.as_millis() as i64;
-    let provider_health = state
-        .runtime
-        .upstream_circuits
-        .read()
-        .await
-        .iter()
-        .map(|(provider, circuit)| {
-            serde_json::json!({
-                "provider": provider,
-                "health": circuit.health,
-                "circuit_open": circuit.is_open(),
-                "consecutive_failures": circuit.consecutive_failures,
+    let provider_health = {
+        let mut circuits = state.runtime.upstream_circuits.write().await;
+        circuits
+            .iter_mut()
+            .map(|(provider, circuit)| {
+                let open = circuit.observe(provider);
+                serde_json::json!({
+                    "provider": provider,
+                    "health": circuit.health,
+                    "circuit_open": open,
+                    "consecutive_failures": circuit.consecutive_failures,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    };
     let provider_circuit_open = provider_health
         .iter()
         .any(|provider| provider["circuit_open"] == true);
@@ -2686,6 +2704,10 @@ async fn proxy_gateway_inner_scoped(
             }
         };
         if resolved.resolved_model != originally_resolved_model {
+            crate::obs::signals::record_fallback(
+                crate::obs::labels::Subsystem::Gateway,
+                crate::obs::labels::FallbackTrigger::ProviderUnhealthy,
+            );
             record_gateway_decision(
                 &state.config,
                 &identity,
@@ -7723,21 +7745,17 @@ async fn send_upstream_with_resilience(
     contact_guard: &ProviderContactGuard,
 ) -> Result<(reqwest::Response, String), UpstreamSendError> {
     let circuit_key = capability_provider_id(provider).to_string();
-    if runtime
-        .upstream_circuits
-        .read()
-        .await
-        .get(&circuit_key)
-        .is_some_and(CircuitBreakerState::is_open)
     {
-        let health = runtime
-            .upstream_circuits
-            .read()
-            .await
-            .get(&circuit_key)
-            .map(|circuit| circuit.health)
-            .unwrap_or(ProviderHealth::Unavailable);
-        return Err(UpstreamSendError::CircuitOpen { health });
+        let mut circuits = runtime.upstream_circuits.write().await;
+        if let Some(circuit) = circuits.get_mut(&circuit_key) {
+            if circuit.observe(&circuit_key) {
+                return Err(UpstreamSendError::CircuitOpen {
+                    health: circuit.health,
+                });
+            }
+        } else {
+            crate::obs::signals::set_provider_circuit_open(&circuit_key, false);
+        }
     }
 
     let mut request = request;
@@ -7760,13 +7778,12 @@ async fn send_upstream_with_resilience(
             Ok(response) => {
                 let signal = provider_health_from_response(&response);
                 let retry_after = retry_after_duration(response.headers());
-                runtime
-                    .upstream_circuits
-                    .write()
-                    .await
-                    .entry(circuit_key)
-                    .or_default()
-                    .record_http_signal(signal, retry_after, &runtime.resilience);
+                {
+                    let mut circuits = runtime.upstream_circuits.write().await;
+                    let circuit = circuits.entry(circuit_key.clone()).or_default();
+                    circuit.record_http_signal(signal, retry_after, &runtime.resilience);
+                    circuit.publish_metrics(&circuit_key);
+                }
                 return Ok((response, contact_snapshot_version));
             }
             Err(error)
@@ -7780,13 +7797,12 @@ async fn send_upstream_with_resilience(
                     .await;
             }
             Err(error) => {
-                runtime
-                    .upstream_circuits
-                    .write()
-                    .await
-                    .entry(circuit_key)
-                    .or_default()
-                    .record_failure(error.to_string(), &runtime.resilience);
+                {
+                    let mut circuits = runtime.upstream_circuits.write().await;
+                    let circuit = circuits.entry(circuit_key.clone()).or_default();
+                    circuit.record_failure(error.to_string(), &runtime.resilience);
+                    circuit.publish_metrics(&circuit_key);
+                }
                 return Err(UpstreamSendError::Request {
                     error,
                     snapshot_version: contact_snapshot_version,
@@ -14613,6 +14629,64 @@ mod tests {
             HeaderValue::from_static("interactive"),
         );
         assert!(!canary_admission_allowed(&context, &headers));
+    }
+
+    #[test]
+    fn provider_circuit_opens_after_threshold_and_recovers_on_success() {
+        let resilience = ResilienceConfig {
+            circuit_failure_threshold: 2,
+            circuit_cooldown: Duration::from_secs(60),
+            ..ResilienceConfig::default()
+        };
+        let mut circuit = CircuitBreakerState::default();
+        circuit.record_failure("upstream-1".into(), &resilience);
+        assert!(!circuit.is_open());
+        circuit.record_failure("upstream-2".into(), &resilience);
+        assert!(circuit.is_open());
+        circuit.publish_metrics("openai");
+        circuit.record_success();
+        assert!(!circuit.is_open());
+        circuit.publish_metrics("openai");
+    }
+
+    #[tokio::test]
+    async fn after_threshold_failures_routing_selects_authorized_fallback() {
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+                circuit_failure_threshold: 2,
+                circuit_cooldown: Duration::from_secs(60),
+                ..ResilienceConfig::default()
+            });
+        {
+            let mut circuits = runtime.upstream_circuits.write().await;
+            let circuit = circuits.entry("openai".into()).or_default();
+            circuit.record_failure("fail-1".into(), &runtime.resilience);
+            circuit.record_failure("fail-2".into(), &runtime.resilience);
+            circuit.publish_metrics("openai");
+            assert!(circuit.is_open());
+        }
+        let decision = PolicyPreflight {
+            body: br#"{"model":"openai/gpt-5.5","input":"hello"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["ollama/llama3.2".into()],
+            data_class: None,
+        };
+        let selected = select_healthy_policy_fallback(
+            &runtime,
+            &ProviderRegistry::built_in(),
+            decision,
+            Some(CapabilityRequestSurface::Responses),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.resolved_model.as_deref(), Some("ollama/llama3.2"));
+        assert_eq!(selected.route_bias.as_deref(), Some("health_fallback"));
     }
 
     #[tokio::test]
