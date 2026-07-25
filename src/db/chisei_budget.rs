@@ -576,6 +576,118 @@ impl SekaiDb {
     }
 }
 
+/// Backend-neutral budget persistence used by dual-backend conformance.
+pub trait ChiseiBudgetBackend: Send + Sync {
+    fn budget_set_limit(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String>;
+    fn budget_check_and_reserve_chain(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String>;
+    fn budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String>;
+    fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
+}
+
+macro_rules! forward_budget {
+    ($target:ty) => {
+        fn budget_set_limit(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            max_amount: i64,
+            period_type: &str,
+        ) -> Result<(), String> {
+            <$target>::budget_set_limit(self, scope_id, metric, max_amount, period_type)
+        }
+        fn budget_check_and_reserve_chain(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            amount: i64,
+            now_ms: i64,
+        ) -> Result<(), String> {
+            <$target>::budget_check_and_reserve_chain(self, scope_id, metric, amount, now_ms)
+        }
+        fn budget_check_and_reserve_chain_idempotent(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            amount: i64,
+            now_ms: i64,
+            idempotency_key: &str,
+        ) -> Result<(), String> {
+            <$target>::budget_check_and_reserve_chain_idempotent(
+                self,
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                idempotency_key,
+            )
+        }
+        fn budget_usage(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            now_ms: i64,
+        ) -> Result<(i64, i64, String), String> {
+            <$target>::budget_usage(self, scope_id, metric, now_ms)
+        }
+        fn budget_record_idempotent(
+            &self,
+            scope_id: &str,
+            metric: &str,
+            amount: i64,
+            idempotency_key: &str,
+            now_ms: i64,
+        ) -> Result<bool, String> {
+            <$target>::budget_record_idempotent(
+                self,
+                scope_id,
+                metric,
+                amount,
+                idempotency_key,
+                now_ms,
+            )
+        }
+    };
+}
+
+impl ChiseiBudgetBackend for SekaiDb {
+    forward_budget!(SekaiDb);
+}
+impl ChiseiBudgetBackend for crate::db::postgres::PostgresDb {
+    forward_budget!(crate::db::postgres::PostgresDb);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
