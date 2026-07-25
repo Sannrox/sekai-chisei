@@ -128,5 +128,9 @@
     "tenant quotas",
     "managed HA packaging",
     "exactly-once external effects"
+  ],
+  "closeout_evidence": [
+    "tests/replica_safety_closeout.rs",
+    "docs/replica-safety.md"
   ]
 }
