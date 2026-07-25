@@ -15,45 +15,11 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
-            .map_err(|error| error.to_string())?;
         if let Some(value) = attestation {
             insert_attestation(&mut tx, value)?;
         }
-        let head = tx
-            .query_opt(
-                "SELECT seq,entry_hash FROM sekai_decisions
-                 WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1 FOR UPDATE",
-                &[],
-            )
-            .map_err(|error| error.to_string())?;
-        let (head_seq, head_hash) = head
-            .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
-            .unwrap_or((0, String::new()));
-        let sequence = head_seq + 1;
-        let evidence =
-            serde_json::to_string(&decision.evidence).map_err(|error| error.to_string())?;
-        let entry_hash =
-            crate::sekai::ledger::entry_hash(sequence, &head_hash, decision, &evidence);
-        tx.execute(
-            "INSERT INTO sekai_decisions
-             (id,timestamp,actor,action,reason,evidence,target_id,outcome,seq,prev_hash,entry_hash)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-            &[
-                &decision.id,
-                &decision.timestamp,
-                &decision.actor,
-                &decision.action,
-                &decision.reason,
-                &evidence,
-                &decision.target_id,
-                &decision.outcome,
-                &sequence,
-                &head_hash,
-                &entry_hash,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        // Decision + optional attestation commit in one transaction.
+        crate::db::postgres_decision::insert_chained_decision(&mut tx, decision)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
