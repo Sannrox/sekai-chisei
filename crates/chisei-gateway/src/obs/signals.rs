@@ -25,6 +25,8 @@ pub const QUEUE_DEPTH: &str = "sekai_queue_depth";
 pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
 pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
 pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
+/// 1 when a named upstream provider circuit is open, else 0.
+pub const PROVIDER_CIRCUIT_OPEN: &str = "sekai_provider_circuit_open";
 pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
 pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
 
@@ -55,6 +57,10 @@ pub fn describe_all() {
         "Delay between producing a record and its durable visibility"
     );
     describe_counter!(FALLBACK_TOTAL, "Requests that left their preferred path");
+    describe_gauge!(
+        PROVIDER_CIRCUIT_OPEN,
+        "1 when a named upstream provider circuit is open"
+    );
     describe_counter!(REJECTED_WORK_TOTAL, "Work refused, by coarse reason");
     describe_counter!(
         DEDUPLICATION_TOTAL,
@@ -126,6 +132,18 @@ pub fn record_fallback(subsystem: Subsystem, trigger: FallbackTrigger) {
     .increment(1);
 }
 
+/// Publish whether a bounded provider circuit is currently open.
+///
+/// `provider` must be a short runtime id (openai, anthropic, ollama, …), not a
+/// free-form model name, to keep Prometheus cardinality bounded.
+pub fn set_provider_circuit_open(provider: &str, open: bool) {
+    gauge!(
+        PROVIDER_CIRCUIT_OPEN,
+        "provider" => provider.to_string(),
+    )
+    .set(if open { 1.0 } else { 0.0 });
+}
+
 /// Record refused work.
 pub fn record_rejected_work(subsystem: Subsystem, reason: RejectionReason) {
     counter!(
@@ -164,6 +182,7 @@ mod tests {
             CACHE_EVENTS,
             DURABILITY_LAG,
             FALLBACK_TOTAL,
+            PROVIDER_CIRCUIT_OPEN,
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
         ] {
