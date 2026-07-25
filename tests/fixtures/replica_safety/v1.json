@@ -1,0 +1,123 @@
+{
+  "version": "sekai.replica-safety/v1",
+  "parent_issue": 117,
+  "description": "Authoritative control-plane surfaces for multi-replica deployment. Process memory may cache only when class is cache_allowed and a max_stale_ms is set.",
+  "classes": {
+    "shared_store_required": "Durable authority lives only in the shared SQLite/PostgreSQL store. Replicas must not decide from process-local state.",
+    "cache_allowed": "Process-local cache is permitted with max_stale_ms. After the bound, reloads must refuse revoked/widened authority.",
+    "process_local_ok": "Ephemeral, non-authoritative helper state only. Unsafe as multi-replica authority."
+  },
+  "surfaces": [
+    {
+      "id": "chisei.budget",
+      "class": "shared_store_required",
+      "notes": "Reserve, adjust, and idempotent record must be atomic in the shared store.",
+      "evidence": [
+        "src/db/chisei_budget.rs",
+        "src/db/replica_safety.rs",
+        "tests/replica_safety_harness.rs"
+      ]
+    },
+    {
+      "id": "chisei.receipts",
+      "class": "shared_store_required",
+      "notes": "Operation receipts and gateway aliases are durable authority.",
+      "evidence": [
+        "src/db/chisei_receipt.rs"
+      ]
+    },
+    {
+      "id": "chisei.evaluation",
+      "class": "shared_store_required",
+      "notes": "Authoritative suites/runs/iterations for multi-replica promotion; process-local EvalStore is non-authoritative only.",
+      "evidence": [
+        "src/chisei/eval.rs",
+        "src/db/chisei_eval_backend.rs"
+      ]
+    },
+    {
+      "id": "chisei.portfolio",
+      "class": "shared_store_required",
+      "notes": "Portfolio objectives and observations used for routing authority.",
+      "evidence": [
+        "src/db/chisei_portfolio.rs"
+      ]
+    },
+    {
+      "id": "sekai.leases",
+      "class": "shared_store_required",
+      "notes": "Single-winner acquisition and reclaim after owner loss.",
+      "evidence": [
+        "src/db/lease.rs",
+        "tests/reusable_sekai_backend_conformance.rs"
+      ]
+    },
+    {
+      "id": "sekai.coordination",
+      "class": "shared_store_required",
+      "notes": "Work admission and lifecycle transitions.",
+      "evidence": [
+        "src/db/coordination.rs"
+      ]
+    },
+    {
+      "id": "sekai.credentials",
+      "class": "cache_allowed",
+      "max_stale_ms": 30000,
+      "notes": "PrincipalCredentialStore may cache; reload must bound stale authority and fail closed on reload error.",
+      "evidence": [
+        "src/sekai/credentials.rs"
+      ]
+    },
+    {
+      "id": "sekai.authorization",
+      "class": "shared_store_required",
+      "notes": "Grants and ACL checks resolve against durable store (with optional bounded cache later).",
+      "evidence": [
+        "src/db/graph.rs"
+      ]
+    },
+    {
+      "id": "sekai.audit",
+      "class": "shared_store_required",
+      "notes": "Decisions and object changes are append-only durable evidence.",
+      "evidence": [
+        "src/sekai/audit.rs"
+      ]
+    },
+    {
+      "id": "gateway.governance",
+      "class": "cache_allowed",
+      "max_stale_ms": 300000,
+      "notes": "Gateway may cache last-known governance with TTL; fail-open requires durable local audit spool.",
+      "evidence": [
+        "crates/chisei-gateway/src/gateway.rs"
+      ]
+    },
+    {
+      "id": "chisei.eval.batch_scratch",
+      "class": "process_local_ok",
+      "notes": "In-memory EvalStore batches for single-process experiments only; not multi-replica authority.",
+      "evidence": [
+        "src/chisei/eval.rs"
+      ]
+    }
+  ],
+  "required_authoritative_surfaces": [
+    "chisei.budget",
+    "chisei.receipts",
+    "chisei.evaluation",
+    "chisei.portfolio",
+    "sekai.leases",
+    "sekai.coordination",
+    "sekai.credentials",
+    "sekai.authorization",
+    "sekai.audit"
+  ],
+  "non_goals": [
+    "multi-region topology",
+    "tenant quotas",
+    "managed HA packaging",
+    "exactly-once external effects"
+  ]
+}

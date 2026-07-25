@@ -56,6 +56,7 @@ mod postgres_portfolio;
 mod postgres_retention;
 mod postgres_schema;
 mod postgres_team_namespace;
+pub mod replica_safety;
 pub mod retention;
 pub mod reusable;
 pub mod runtime_db;

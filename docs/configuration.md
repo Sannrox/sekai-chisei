@@ -43,6 +43,11 @@ plane against PostgreSQL when `DATABASE_URL` is set and migrations/capabilities
 validate. Backend selection does not enable tenant, OIDC, OAuth, or identity
 endpoints.
 
+For multi-replica control planes, use a shared backend so budgets, leases, and
+credentials converge. Process memory must not decide durable authority; see
+[replica-safety.md](replica-safety.md) for the surface inventory and two-replica
+test harness.
+
 ## Providers and outbound calls
 
 | Variable | Default | Purpose |
