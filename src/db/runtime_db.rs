@@ -3072,6 +3072,8 @@ impl RuntimeDb {
     }
 
     /// Test helper used by gateway setup fixtures.
+    #[cfg(feature = "gateway-test-support")]
+    #[doc(hidden)]
     pub fn gateway_test_budget_usage(
         &self,
         scope_id: &str,
