@@ -15,7 +15,8 @@
       "evidence": [
         "src/db/chisei_budget.rs",
         "src/db/replica_safety.rs",
-        "tests/replica_safety_harness.rs"
+        "tests/replica_safety_harness.rs",
+        "tests/replica_safety_budget.rs"
       ]
     },
     {
