@@ -19,6 +19,7 @@
     "sekai.ontology-definitions",
     "sekai.reconciliation",
     "sekai.retention",
-    "sekai.scoped-content"
+    "sekai.scoped-content",
+    "sekai.team-namespaces"
   ]
 }
