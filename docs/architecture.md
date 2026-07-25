@@ -52,10 +52,10 @@ acquisition receives a monotonically increasing generation and unique fencing
 token; stale generations cannot refresh, release, or take over current state.
 Lease-guarded create, update, and delete RPCs validate the active generation and
 commit the graph mutation, object audit, and idempotency record in the same
-SQLite transaction. Guarded mutations are unavailable on partial storage
-interfaces that cannot provide this cross-table transaction.
-See [Generation-fenced leases](leases.md) for the client and downstream-executor
-contract.
+backend transaction. Shared SQLite/PostgreSQL conformance covers this
+cross-table contract; partial storage interfaces that cannot provide it fail
+closed. See [Generation-fenced leases](leases.md) for the client and
+downstream-executor contract.
 
 ### Chisei: governed decisions
 
@@ -269,38 +269,47 @@ downstream outcome separate.
 
 ## Persistence
 
-SQLite is the server's current storage backend and runs in WAL mode for file
-databases. PostgreSQL implements backend-neutral, non-tenant contracts for the
-core graph plus reusable datasets and virtual tables, ontology definitions,
-action definitions, generation-fenced leases, principal credentials, external
-evidence admission and graph projection, policy attestations, and handoffs.
-Shared conformance suites exercise the same contracts against SQLite and
-PostgreSQL. PostgreSQL migrations preserve stable graph query and audit
-ordering. Contract updates carry the `updated` value read by the caller as an
-explicit compare-and-swap token, preventing stale writers from silently
-overwriting a committed revision. Lease mutations serialize by namespace and
-key, preserve request idempotency, advance fencing generations monotonically,
-and record their audit row in the same transaction.
+SQLite is the server's default storage backend and runs in WAL mode for file
+databases. PostgreSQL implements the complete reusable, non-tenant Sekai
+persistence surface with backend-neutral contracts and shared
+SQLite/PostgreSQL conformance: core graph and authorization, object-change and
+decision audit, datasets and virtual tables, ontology and action definitions,
+function definitions, generation-fenced leases and guarded object mutations,
+capability-package lifecycle, team-namespace bootstrap, principal credentials,
+coordination and work admission, external evidence admission and projection,
+policy attestations, handoffs, retention, scoped content, and reconciliation.
 
-PostgreSQL is not yet a drop-in replacement for the server's complete SQLite
-path. Its partial capability manifest distinguishes graph, datasets, ontology
-definitions, action definitions, leases, credentials, coordination, evidence,
-attestations, and handoffs. Ontology reasoning, retention, and Chisei
-persistence remain excluded. Evidence support is reusable Sekai persistence,
-not runtime activation: identity, payload, lifecycle, projection, integrity,
-and audit records share their required transactions. Object-kind changes
-therefore fail closed on PostgreSQL until
-ontology constraint validation is available there. The
-graph, policy state, receipts, evidence, and audit history are
-durable; provider streams and secrets are not treated as durable credentials.
+A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
+RPC to shared backend evidence or an explicit computed/query implementation
+with named durable dependencies. PostgreSQL may advertise the complete reusable
+Sekai surface set only when that inventory validates. The inventory fails closed
+when an RPC is added without classification or when tenant, OIDC, or OAuth
+surfaces appear.
+
+PostgreSQL migrations preserve stable graph query and audit ordering. Contract
+updates carry the `updated` value read by the caller as an explicit
+compare-and-swap token, preventing stale writers from silently overwriting a
+committed revision. Lease mutations serialize by namespace and key, preserve
+request idempotency, advance fencing generations monotonically, and record
+their audit row in the same transaction. Evidence identity, payload, lifecycle,
+projection, integrity, and audit records share their required transactions.
+
+PostgreSQL is still not a drop-in replacement for the community process's
+complete SQLite runtime. Chisei governed-decision persistence, gateway
+governance, and operations composition remain outside the complete reusable
+Sekai advertisement, so public runtime selection of PostgreSQL continues to
+fail closed until those surfaces have equivalent parity. Object-kind changes
+that require ontology constraint validation still fail closed on PostgreSQL
+where that validation path is unavailable. Provider streams and secrets are not
+treated as durable credentials. This contract does not activate tenant
+persistence or identity endpoints.
 
 Runtime composition uses the versioned `sekai.runtime-backend/v1` contract.
 Its public metadata names the backend and the reusable Sekai, Chisei, gateway,
 and operations surfaces it supports. Startup validates the complete community
 requirement before binding listeners. SQLite advertises that complete set;
-PostgreSQL selection fails early until later parity work can truthfully
-advertise it. This contract does not activate tenant persistence or identity
-endpoints.
+PostgreSQL selection fails early until later Chisei and gateway parity can
+truthfully complete it.
 
 External evidence submissions are retained source records. Graph objects,
 links, and evidence observations are rebuildable projections. Conflicting
@@ -339,8 +348,9 @@ Resolved manifests are receiver projections: unavailable reference identities
 and versions are removed, so their digest identifies the creator's immutable
 manifest but cannot be recomputed from a redacted projection.
 Creation and revocation are idempotent and recorded with the manifest in the
-SQLite handoff audit tables. This contract is not implemented by the selected
-PostgreSQL persistence interfaces.
+handoff audit tables. Shared SQLite/PostgreSQL conformance covers the reusable
+handoff contract; community runtime selection of PostgreSQL remains gated by
+broader Chisei and gateway parity, not by handoff storage.
 
 ### Identity, content, and reconciliation
 
@@ -368,8 +378,9 @@ and reversal decisions are idempotent and audited; they never delete the source
 objects or their lineage. Semantic similarity is not a reconciliation action
 and cannot silently merge evidence.
 
-These storage and reconciliation contracts belong to the complete SQLite
-runtime. They do not expand the selected PostgreSQL persistence interfaces or
+These storage and reconciliation contracts are part of the complete reusable
+Sekai surface set implemented for both SQLite and PostgreSQL. They do not
+activate community PostgreSQL runtime selection by themselves, and they do not
 change the public protobuf contract.
 
 Ontology relations opt into graph enforcement by setting `mapped_relation`.
