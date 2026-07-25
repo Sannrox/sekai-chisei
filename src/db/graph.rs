@@ -71,8 +71,10 @@ pub trait GraphBackend: Send + Sync {
     fn upsert_object_type(&self, object_type: &ObjectType) -> Result<(), String>;
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, String>;
     fn list_object_types(&self) -> Result<Vec<ObjectType>, String>;
+    fn delete_object_type(&self, kind: &str) -> Result<bool, String>;
     fn upsert_interface(&self, interface: &InterfaceDef) -> Result<(), String>;
     fn list_interfaces(&self) -> Result<Vec<InterfaceDef>, String>;
+    fn delete_interface(&self, name: &str) -> Result<bool, String>;
 
     fn create_grant(&self, grant: &Grant) -> Result<(), String>;
     fn delete_grant(&self, id: &str) -> Result<Option<Grant>, String>;
@@ -160,11 +162,17 @@ impl GraphBackend for SekaiDb {
     fn list_object_types(&self) -> Result<Vec<ObjectType>, String> {
         self.list_object_types()
     }
+    fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
+        self.delete_object_type(kind)
+    }
     fn upsert_interface(&self, interface: &InterfaceDef) -> Result<(), String> {
         self.upsert_interface(interface)
     }
     fn list_interfaces(&self) -> Result<Vec<InterfaceDef>, String> {
         self.list_interfaces()
+    }
+    fn delete_interface(&self, name: &str) -> Result<bool, String> {
+        self.delete_interface(name)
     }
     fn create_grant(&self, grant: &Grant) -> Result<(), String> {
         self.create_grant(grant)
@@ -390,11 +398,17 @@ impl GraphBackend for PostgresDb {
     fn list_object_types(&self) -> Result<Vec<ObjectType>, String> {
         self.list_object_types()
     }
+    fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
+        self.delete_object_type(kind)
+    }
     fn upsert_interface(&self, interface: &InterfaceDef) -> Result<(), String> {
         self.upsert_interface(interface)
     }
     fn list_interfaces(&self) -> Result<Vec<InterfaceDef>, String> {
         self.list_interfaces()
+    }
+    fn delete_interface(&self, name: &str) -> Result<bool, String> {
+        self.delete_interface(name)
     }
     fn create_grant(&self, grant: &Grant) -> Result<(), String> {
         self.create_grant(grant)
