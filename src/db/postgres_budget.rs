@@ -32,6 +32,34 @@ impl PostgresDb {
         amount: i64,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.budget_check_and_reserve_chain_inner(scope_id, metric, amount, now_ms, None)
+    }
+
+    pub fn budget_check_and_reserve_chain_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: &str,
+    ) -> Result<(), String> {
+        self.budget_check_and_reserve_chain_inner(
+            scope_id,
+            metric,
+            amount,
+            now_ms,
+            Some(idempotency_key),
+        )
+    }
+
+    fn budget_check_and_reserve_chain_inner(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+    ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
         let mut connection = self.connection()?;
         let mut transaction = connection
@@ -49,6 +77,38 @@ impl PostgresDb {
                     &[&key],
                 )
                 .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
+        }
+
+        if let Some(idempotency_key) = idempotency_key {
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO chisei_budget_usage_events
+                        (idempotency_key, scope_id, metric, amount, created_at)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT DO NOTHING",
+                    &[&idempotency_key, &scope_id, &metric, &amount, &now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 0 {
+                let stored = transaction
+                    .query_one(
+                        "SELECT scope_id, metric, amount FROM chisei_budget_usage_events
+                         WHERE idempotency_key = $1",
+                        &[&idempotency_key],
+                    )
+                    .map_err(|error| error.to_string())?;
+                let stored = (
+                    stored.get::<_, String>(0),
+                    stored.get::<_, String>(1),
+                    stored.get::<_, i64>(2),
+                );
+                if stored != (scope_id.to_string(), metric.to_string(), amount) {
+                    return Err(
+                        "idempotency key was already used for different budget reservation".into(),
+                    );
+                }
+                return transaction.commit().map_err(|error| error.to_string());
+            }
         }
 
         for scope in &chain {
@@ -98,6 +158,18 @@ impl PostgresDb {
                      ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
                         amount_used = chisei_budget_usage.amount_used + excluded.amount_used",
                     &[&scope, &metric, &period_start, &amount],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO chisei_budget_attributions
+                        (source_scope_id, applied_scope_id, metric, period_start, amount_used)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
+                     DO UPDATE SET
+                        amount_used = chisei_budget_attributions.amount_used
+                            + EXCLUDED.amount_used",
+                    &[&scope_id, &scope, &metric, &period_start, &amount],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -185,8 +257,123 @@ impl PostgresDb {
                     &[&scope, &metric, &period_start, &delta],
                 )
                 .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO chisei_budget_attributions
+                        (source_scope_id, applied_scope_id, metric, period_start, amount_used)
+                     VALUES ($1, $2, $3, $4, GREATEST($5, 0))
+                     ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
+                     DO UPDATE SET
+                        amount_used = GREATEST(
+                            chisei_budget_attributions.amount_used + $5, 0
+                        )",
+                    &[&scope_id, &scope, &metric, &period_start, &delta],
+                )
+                .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Applies a usage delta once for a stable caller-generated key.
+    pub fn budget_record_idempotent(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        if idempotency_key.is_empty() {
+            self.budget_adjust_chain(scope_id, metric, amount, now_ms)?;
+            return Ok(true);
+        }
+        let chain = scope_chain(scope_id);
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for scope in &chain {
+            let key = budget_lock_key(metric, scope);
+            transaction
+                .query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    &[&key],
+                )
+                .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
+        }
+        let inserted = transaction
+            .execute(
+                "INSERT INTO chisei_budget_usage_events
+                    (idempotency_key, scope_id, metric, amount, created_at)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT DO NOTHING",
+                &[&idempotency_key, &scope_id, &metric, &amount, &now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if inserted == 0 {
+            let stored = transaction
+                .query_one(
+                    "SELECT scope_id, metric, amount FROM chisei_budget_usage_events
+                     WHERE idempotency_key = $1",
+                    &[&idempotency_key],
+                )
+                .map_err(|error| error.to_string())?;
+            let stored = (
+                stored.get::<_, String>(0),
+                stored.get::<_, String>(1),
+                stored.get::<_, i64>(2),
+            );
+            if stored != (scope_id.to_string(), metric.to_string(), amount) {
+                crate::obs::signals::record_deduplication(
+                    crate::obs::labels::Subsystem::Chisei,
+                    crate::obs::labels::DeduplicationEvent::IdempotencyConflict,
+                );
+                return Err("idempotency key was already used for different budget usage".into());
+            }
+            transaction.commit().map_err(|error| error.to_string())?;
+            crate::obs::signals::record_deduplication(
+                crate::obs::labels::Subsystem::Chisei,
+                crate::obs::labels::DeduplicationEvent::IdempotentReplay,
+            );
+            return Ok(false);
+        }
+        for scope in &chain {
+            let period_type = transaction
+                .query_opt(
+                    "SELECT period_type FROM chisei_budget_limits
+                     WHERE scope_id = $1 AND metric = $2",
+                    &[&scope, &metric],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| row.get::<_, String>(0))
+                .unwrap_or_else(|| "daily".to_string());
+            let period_start = period_start_ms(&period_type, now_ms);
+            transaction
+                .execute(
+                    "INSERT INTO chisei_budget_usage
+                        (scope_id, metric, period_start, amount_used)
+                     VALUES ($1, $2, $3, GREATEST($4, 0))
+                     ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                        amount_used = GREATEST(chisei_budget_usage.amount_used + $4, 0)",
+                    &[&scope, &metric, &period_start, &amount],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO chisei_budget_attributions
+                        (source_scope_id, applied_scope_id, metric, period_start, amount_used)
+                     VALUES ($1, $2, $3, $4, GREATEST($5, 0))
+                     ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
+                     DO UPDATE SET
+                        amount_used = GREATEST(
+                            chisei_budget_attributions.amount_used + $5, 0
+                        )",
+                    &[&scope_id, &scope, &metric, &period_start, &amount],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub fn budget_usage(
