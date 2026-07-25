@@ -31,6 +31,7 @@ const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
     include_str!("postgres/0014_action_governance_parity.sql");
 const CAPABILITY_PACKAGE_PARITY_SCHEMA: &str =
     include_str!("postgres/0015_capability_package_parity.sql");
+const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_namespace_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -114,6 +115,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "capability_package_parity",
         sql: CAPABILITY_PACKAGE_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 16,
+        name: "team_namespace_parity",
+        sql: TEAM_NAMESPACE_PARITY_SCHEMA,
     },
 ];
 
@@ -582,6 +588,13 @@ mod tests {
         }
         for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
             assert!(!CAPABILITY_PACKAGE_PARITY_SCHEMA.contains(excluded));
+        }
+        assert!(
+            TEAM_NAMESPACE_PARITY_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_team_principals")
+        );
+        for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
+            assert!(!TEAM_NAMESPACE_PARITY_SCHEMA.contains(excluded));
         }
     }
 

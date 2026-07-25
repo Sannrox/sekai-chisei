@@ -239,7 +239,9 @@ impl SekaiDb {
         member_role: Role,
         actor: &str,
     ) -> Result<(Object, Vec<Grant>), String> {
+        crate::db::team_namespace::validate_team_namespace_bootstrap(namespace, principal)?;
         let namespace = namespace.trim();
+        let principal = principal.trim();
         let external_id = format!("namespace:{namespace}");
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
