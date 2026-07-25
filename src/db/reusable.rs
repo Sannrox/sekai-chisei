@@ -62,4 +62,19 @@ mod tests {
                 .all(|surface| !surface.contains("tenant"))
         );
     }
+
+    #[test]
+    fn complete_sekai_fixture_covers_foundation_surfaces() {
+        let complete = crate::db::sekai_rpc_inventory::postgres_complete_sekai_capabilities()
+            .expect("complete sekai inventory");
+        let foundations = postgres_reusable_capabilities();
+        for surface in &foundations.reusable_surfaces {
+            assert!(
+                complete
+                    .reusable_surfaces
+                    .iter()
+                    .any(|item| item == surface)
+            );
+        }
+    }
 }

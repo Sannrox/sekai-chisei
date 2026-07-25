@@ -48,4 +48,5 @@ mod postgres_team_namespace;
 pub mod retention;
 pub mod reusable;
 pub mod sekai;
+pub mod sekai_rpc_inventory;
 pub mod team_namespace;
