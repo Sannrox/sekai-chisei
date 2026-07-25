@@ -3070,4 +3070,20 @@ impl RuntimeDb {
             }
         }
     }
+
+    /// Test helper used by gateway setup fixtures.
+    pub fn gateway_test_budget_usage(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64, String), String> {
+        match self {
+            Self::Sqlite(db) => db.gateway_test_budget_usage(scope_id, metric, now_ms),
+            Self::Postgres(_) => Err(
+                "gateway_test_budget_usage is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
 }
