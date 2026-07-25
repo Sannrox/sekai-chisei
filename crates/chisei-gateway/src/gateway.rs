@@ -1904,15 +1904,34 @@ impl GatewayCorrelation {
 }
 
 fn gateway_attempt_receipt_id(operation_id: &str, request_id: &str, attempt: u32) -> String {
+    gateway_provider_receipt_id(operation_id, request_id, attempt, 1)
+}
+
+/// Receipt identity for a client attempt, optionally qualified by an internal
+/// mid-request provider ordinal so failover dispatches do not collide with the
+/// client-controlled `x-chisei-attempt` namespace.
+fn gateway_provider_receipt_id(
+    operation_id: &str,
+    request_id: &str,
+    attempt: u32,
+    provider_ordinal: u32,
+) -> String {
     let mut digest = Sha256::new();
     digest.update((operation_id.len() as u64).to_be_bytes());
     digest.update(operation_id.as_bytes());
     digest.update((request_id.len() as u64).to_be_bytes());
     digest.update(request_id.as_bytes());
-    format!(
-        "{operation_id}:__attempt__:{:x}:{attempt}",
-        digest.finalize()
-    )
+    if provider_ordinal <= 1 {
+        format!(
+            "{operation_id}:__attempt__:{:x}:{attempt}",
+            digest.finalize()
+        )
+    } else {
+        format!(
+            "{operation_id}:__attempt__:{:x}:{attempt}:p{provider_ordinal}",
+            digest.finalize()
+        )
+    }
 }
 
 fn gateway_correlation_scope(identity: &GatewayIdentity) -> String {
@@ -2413,6 +2432,7 @@ async fn proxy_gateway_inner_scoped(
         parent_operation_id: correlation.parent_operation_id.clone(),
         turn_id: correlation.turn_id.clone(),
         attempt: correlation.attempt,
+        provider_ordinal: 1,
         cycle_id: correlation.cycle_id.clone(),
         traceparent: correlation.traceparent.clone(),
         responses_profile,
@@ -2549,7 +2569,7 @@ async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
-    let (resolved, mut egress, budget) = if state.config.no_preflight {
+    let (mut resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
             resolved_model: requested_registry_model
@@ -2685,6 +2705,7 @@ async fn proxy_gateway_inner_scoped(
             &registry_snapshot,
             resolved,
             capability_surface,
+            client_provider,
             state.config.allow_cross_provider,
             budget.provisional_local_free,
         )
@@ -2879,90 +2900,51 @@ async fn proxy_gateway_inner_scoped(
             }
         }
     }
-    let contact_guard = ProviderContactGuard {
-        provider: resolved.resolved_provider,
-        resolved_model: resolved_registry_model.map(str::to_string),
-        requirements: contact_requirements,
-    };
-    let resolved_registry_metadata = resolved
-        .resolved_model
-        .as_deref()
-        .and_then(|model| registry_snapshot.resolve_model(model).ok());
-    let resolved_profile = resolved_registry_metadata
+    let local_free_only = budget
         .as_ref()
-        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
-    let prepared = match prepare_upstream_request(
-        &state.config,
-        &identity,
-        &uri,
-        client_provider,
-        resolved.resolved_provider,
-        egress.body,
-        resolved_registry_metadata.as_ref(),
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
-    let automatic_cache_requested = automatic_cache_attempted(resolved_profile, &prepared.body);
+        .is_some_and(|budget| budget.provisional_local_free);
+    // Governed egress + Responses normalization applied once; mid-request
+    // failover only rewrites the model field onto this baseline.
+    let egress_baseline = egress.body;
 
-    let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
-        Ok(method) => method,
-        Err(err) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("unsupported method: {err}"),
-            );
-        }
-    };
-
-    let mut upstream = state
-        .client
-        .request(upstream_method, prepared.url)
-        .body(prepared.body);
-    let upstream_auth_mode = upstream_auth_mode(
-        &state.config,
-        identity_context.upstream_auth,
-        prepared.provider,
-    );
-    let resolved_to_isolated_openai_backend = matches!(
-        prepared.provider,
-        ProviderKind::OpenAi(
-            OpenAiRuntime::Ollama
-                | OpenAiRuntime::Native
-                | OpenAiRuntime::Xai
-                | OpenAiRuntime::Meta
+    // First-attempt preparation is fallible and must complete before the alias
+    // is reserved/claimed so preparation failures do not strand dispatch.
+    let mut prepared = {
+        let resolved_registry_metadata = resolved
+            .resolved_model
+            .as_deref()
+            .and_then(|model| registry_snapshot.resolve_model(model).ok());
+        match prepare_upstream_request(
+            &state.config,
+            &identity,
+            &uri,
+            client_provider,
+            resolved.resolved_provider,
+            egress_baseline.clone(),
+            resolved_registry_metadata.as_ref(),
         )
-    );
-    // Cross-provider requests were translated to a different provider family, so
-    // the client's credential (e.g. an Anthropic subscription token) must never
-    // be forwarded to the resolved upstream. Apply the resolved provider's own
-    // gateway auth instead (a no-op for Ollama/native) and strip client auth
-    // headers below regardless of the passthrough mode.
-    if prepared.cross_provider
-        || resolved_to_isolated_openai_backend
-        || upstream_auth_mode == UpstreamAuthMode::GatewayKey
-    {
-        upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
-            Ok(upstream) => upstream,
-            Err(response) => return *response,
-        };
-    }
-    for (name, value) in headers.iter() {
-        let strip_client_auth = should_strip_isolated_client_credential(
-            name,
-            prepared.cross_provider || resolved_to_isolated_openai_backend,
-        );
-        if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
-            upstream = upstream.header(name, value);
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
         }
-    }
+    };
+    let mut contact_guard = {
+        let resolved_registry_model = resolved.resolved_model.as_deref().or_else(|| {
+            requested_registry_model
+                .as_ref()
+                .map(|model| model.canonical_model.as_str())
+        });
+        ProviderContactGuard {
+            provider: resolved.resolved_provider,
+            resolved_model: resolved_registry_model.map(str::to_string),
+            requirements: contact_requirements.clone(),
+        }
+    };
 
     // Reserve the opaque alias only after every fallible pre-dispatch step has
-    // completed. Earlier refusals persist their own terminal receipt; reserving
-    // before that point could strand an alias without a reconcilable outcome.
+    // completed. Mid-request provider failover reuses the same reserved alias
+    // and advances the attempt ordinal on each receipt.
     if let Err(error) = reserve_gateway_request_alias(&state.config, &alias_context).await {
         return alias_reservation_error_response(error);
     }
@@ -2973,182 +2955,518 @@ async fn proxy_gateway_inner_scoped(
         return alias_reservation_error_response(error);
     }
 
-    let pricing_snapshot_version = effective_pricing_snapshot_version(
-        &state.config,
-        resolved_profile,
-        resolved.resolved_model.as_deref(),
-        requested_model.as_deref(),
-    );
-    let mut usage_context = UsageContext {
-        request_id,
-        lookup_request_id: correlation.lookup_request_id,
-        caller_scope: correlation.caller_scope,
-        operation_id: correlation.operation_id,
-        parent_operation_id: correlation.parent_operation_id,
-        turn_id: correlation.turn_id,
-        attempt: correlation.attempt,
-        cycle_id: correlation.cycle_id,
-        traceparent: correlation.traceparent,
-        responses_profile,
-        responses_terminal_required: responses_create,
-        provider: prepared.provider,
-        requested_model,
-        resolved_model: resolved.resolved_model,
-        route_override,
-        requested_alias: requested_registry_model
+    let mut tried_provider_ids: Vec<String> =
+        vec![capability_provider_id(resolved.resolved_provider).into()];
+    let mut provider_attempt: u32 = 1;
+    let mut usage_context = {
+        let resolved_registry_metadata = resolved
+            .resolved_model
+            .as_deref()
+            .and_then(|model| registry_snapshot.resolve_model(model).ok());
+        let resolved_profile = resolved_registry_metadata
             .as_ref()
-            .and_then(|resolved| resolved.requested_alias.clone()),
-        profile_version: resolved_profile.map(|profile| profile.profile_version.clone()),
-        capability_snapshot_version: Some(registry_snapshot_version),
-        pricing_snapshot_version,
-        governance_metadata_status: resolved_profile
-            .map(|profile| profile.governance.metadata_status.clone()),
-        work_unit_id,
-        pipeline_spec,
-        request_bytes,
-        started_ms,
-        route_bias: resolved.route_bias,
-        policy_scope: resolved.policy_scope,
-        policy_version: resolved.policy_version,
-        task_class,
-        data_class: effective_data_class(
-            &failure_posture.data_class,
-            resolved.data_class.as_deref(),
-        ),
-        request_hash,
-        budget_subject: budget
-            .as_ref()
-            .and_then(|budget| budget.budget_subject.clone()),
-        budget_status: budget
-            .as_ref()
-            .map(|budget| {
-                if budget.provisional_local_free {
-                    "local_free"
-                } else {
-                    "allowed"
-                }
-            })
-            .unwrap_or("not_evaluated")
-            .into(),
-        egress_applied: !state.config.no_preflight,
-        cache_requested: cache_requested || automatic_cache_requested,
+            .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
+        let automatic_cache_requested = automatic_cache_attempted(resolved_profile, &prepared.body);
+        UsageContext {
+            request_id,
+            lookup_request_id: correlation.lookup_request_id,
+            caller_scope: correlation.caller_scope,
+            operation_id: correlation.operation_id,
+            parent_operation_id: correlation.parent_operation_id,
+            turn_id: correlation.turn_id,
+            attempt: correlation.attempt,
+            provider_ordinal: 1,
+            cycle_id: correlation.cycle_id,
+            traceparent: correlation.traceparent,
+            responses_profile,
+            responses_terminal_required: responses_create,
+            provider: prepared.provider,
+            requested_model: requested_model.clone(),
+            resolved_model: resolved.resolved_model.clone(),
+            route_override: route_override.clone(),
+            requested_alias: requested_registry_model
+                .as_ref()
+                .and_then(|resolved| resolved.requested_alias.clone()),
+            profile_version: resolved_profile.map(|profile| profile.profile_version.clone()),
+            capability_snapshot_version: Some(registry_snapshot_version.clone()),
+            pricing_snapshot_version: effective_pricing_snapshot_version(
+                &state.config,
+                resolved_profile,
+                resolved.resolved_model.as_deref(),
+                requested_model.as_deref(),
+            ),
+            governance_metadata_status: resolved_profile
+                .map(|profile| profile.governance.metadata_status.clone()),
+            work_unit_id,
+            pipeline_spec,
+            request_bytes,
+            started_ms,
+            route_bias: resolved.route_bias.clone(),
+            policy_scope: resolved.policy_scope.clone(),
+            policy_version: resolved.policy_version.clone(),
+            task_class,
+            data_class: effective_data_class(
+                &failure_posture.data_class,
+                resolved.data_class.as_deref(),
+            ),
+            request_hash,
+            budget_subject: budget
+                .as_ref()
+                .and_then(|budget| budget.budget_subject.clone()),
+            budget_status: budget
+                .as_ref()
+                .map(|budget| {
+                    if budget.provisional_local_free {
+                        "local_free"
+                    } else {
+                        "allowed"
+                    }
+                })
+                .unwrap_or("not_evaluated")
+                .into(),
+            egress_applied: !state.config.no_preflight,
+            cache_requested: cache_requested || automatic_cache_requested,
+        }
     };
-    match send_upstream_with_resilience(&state.runtime, prepared.provider, upstream, &contact_guard)
-        .await
-    {
-        Ok((resp, contact_snapshot_version)) => {
-            usage_context.capability_snapshot_version = Some(contact_snapshot_version);
-            response_from_upstream(
-                resp,
-                &state.config,
-                &state.runtime,
-                &identity,
-                usage_context,
-                prepared.response_adapter,
-                prepared.client_response_model,
+
+    loop {
+        let upstream_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+            Ok(method) => method,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("unsupported method: {err}"),
+                );
+            }
+        };
+
+        let mut upstream = state
+            .client
+            .request(upstream_method, prepared.url.clone())
+            .body(prepared.body.clone());
+        let upstream_auth_mode = upstream_auth_mode(
+            &state.config,
+            identity_context.upstream_auth,
+            prepared.provider,
+        );
+        let resolved_to_isolated_openai_backend = matches!(
+            prepared.provider,
+            ProviderKind::OpenAi(
+                OpenAiRuntime::Ollama
+                    | OpenAiRuntime::Native
+                    | OpenAiRuntime::Xai
+                    | OpenAiRuntime::Meta
             )
-            .await
-        }
-        Err(UpstreamSendError::Governance {
-            rejection,
-            snapshot_version,
-            model_attempted,
-        }) => {
-            usage_context.capability_snapshot_version = Some(snapshot_version);
-            let action = match rejection.error_type.as_str() {
-                "capability_unsupported" => "gateway.capability_denied",
-                "provider_registry_unavailable" => "gateway.provider_registry_unavailable",
-                _ => "gateway.lifecycle_denied",
+        );
+        // Cross-provider requests were translated to a different provider family, so
+        // the client's credential (e.g. an Anthropic subscription token) must never
+        // be forwarded to the resolved upstream. Apply the resolved provider's own
+        // gateway auth instead (a no-op for Ollama/native) and strip client auth
+        // headers below regardless of the passthrough mode.
+        if prepared.cross_provider
+            || resolved_to_isolated_openai_backend
+            || upstream_auth_mode == UpstreamAuthMode::GatewayKey
+        {
+            upstream = match apply_provider_auth(upstream, &state.config, prepared.provider) {
+                Ok(upstream) => upstream,
+                Err(response) => {
+                    // After alias claim, surface as a terminal refusal so the
+                    // claimed alias is reconcilable.
+                    let rejection = GatewayRejection::json(
+                        StatusCode::BAD_GATEWAY,
+                        "gateway_config_error",
+                        "could not apply provider authentication for upstream dispatch",
+                    );
+                    record_refusal_with_usage_and_append(
+                        &state.config,
+                        &state.runtime,
+                        &identity,
+                        &usage_context,
+                        &rejection,
+                        None,
+                        false,
+                    )
+                    .await;
+                    return *response;
+                }
             };
-            record_gateway_decision(
-                &state.config,
-                &identity,
-                action,
-                &rejection.reason,
-                "denied",
-                HashMap::from([("request_id".into(), usage_context.request_id.clone())]),
-            )
-            .await;
-            record_refusal_with_usage_and_append(
-                &state.config,
-                &state.runtime,
-                &identity,
-                &usage_context,
-                &rejection,
-                None,
-                model_attempted,
-            )
-            .await;
-            rejection.response()
         }
-        Err(UpstreamSendError::CircuitOpen { health }) => {
-            let error_type = match health {
-                ProviderHealth::RateLimited => "upstream_rate_limited",
-                ProviderHealth::QuotaExhausted => "upstream_quota_exhausted",
-                _ => "upstream_unavailable",
-            };
-            let rejection = GatewayRejection {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                error_type: error_type.into(),
-                reason: format!(
-                    "{} upstream is temporarily in {:?} health state",
-                    prepared.provider.runtime_name(),
-                    health
-                ),
-                rejected_route: None,
-                retry_safety: Some("safe"),
-            };
-            record_refusal_with_usage_and_append(
-                &state.config,
-                &state.runtime,
-                &identity,
-                &usage_context,
-                &rejection,
-                None,
-                false,
-            )
-            .await;
-            json_error_with_retry_safety(
-                rejection.status,
-                &rejection.error_type,
-                &rejection.reason,
-                "safe",
-            )
+        for (name, value) in headers.iter() {
+            let strip_client_auth = should_strip_isolated_client_credential(
+                name,
+                prepared.cross_provider || resolved_to_isolated_openai_backend,
+            );
+            if should_forward_request_header(name, upstream_auth_mode) && !strip_client_auth {
+                upstream = upstream.header(name, value);
+            }
         }
-        Err(UpstreamSendError::Request {
-            error: err,
-            snapshot_version,
-        }) => {
-            usage_context.capability_snapshot_version = Some(snapshot_version);
-            let retry_safety = if err.is_connect() {
-                "safe"
+
+        let send_result = send_upstream_with_resilience(
+            &state.runtime,
+            prepared.provider,
+            upstream,
+            &contact_guard,
+        )
+        .await;
+
+        // Mid-request failover only when the first provider never received work:
+        // open circuit (pre-send) or connect failure. HTTP error statuses and
+        // ambiguous transport losses are not replayed to another provider.
+        let failover_rejection = match &send_result {
+            Err(UpstreamSendError::CircuitOpen { health }) => {
+                let error_type = match health {
+                    ProviderHealth::RateLimited => "upstream_rate_limited",
+                    ProviderHealth::QuotaExhausted => "upstream_quota_exhausted",
+                    _ => "upstream_unavailable",
+                };
+                let mut rejection = GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    format!(
+                        "{} upstream is temporarily in {:?} health state",
+                        prepared.provider.runtime_name(),
+                        health
+                    ),
+                )
+                .with_retry_safety("safe");
+                if let Some(model) = resolved.resolved_model.clone() {
+                    rejection = rejection.with_rejected_route(prepared.provider, model);
+                }
+                Some(rejection)
+            }
+            Err(UpstreamSendError::Request { error: err, .. }) if err.is_connect() => {
+                let mut rejection = GatewayRejection::json(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    safe_upstream_error_reason(prepared.provider, "request", err),
+                )
+                .with_retry_safety("safe");
+                if let Some(model) = resolved.resolved_model.clone() {
+                    rejection = rejection.with_rejected_route(prepared.provider, model);
+                }
+                Some(rejection)
+            }
+            _ => None,
+        };
+
+        if let Some(rejection) = failover_rejection {
+            let excluded: Vec<&str> = tried_provider_ids.iter().map(String::as_str).collect();
+            let next_ordinal = usage_context.provider_ordinal.checked_add(1);
+            let next = if provider_attempt < MAX_MID_REQUEST_PROVIDER_ATTEMPTS
+                && next_ordinal.is_some()
+                && !resolved.fallback_models.is_empty()
+            {
+                select_next_failover_candidate(
+                    &state.runtime,
+                    &registry_snapshot,
+                    &resolved,
+                    capability_surface,
+                    client_provider,
+                    state.config.allow_cross_provider,
+                    local_free_only,
+                    &excluded,
+                )
+                .await
+                .unwrap_or(None)
             } else {
-                "ambiguous"
+                None
             };
-            let rejection = GatewayRejection {
-                status: StatusCode::BAD_GATEWAY,
-                error_type: "upstream_error".into(),
-                reason: safe_upstream_error_reason(prepared.provider, "request", &err),
-                rejected_route: None,
-                retry_safety: Some(retry_safety),
-            };
-            record_refusal_with_usage_and_append(
-                &state.config,
-                &state.runtime,
-                &identity,
-                &usage_context,
-                &rejection,
-                None,
-                true,
-            )
-            .await;
-            json_error_with_retry_safety(
-                rejection.status,
-                &rejection.error_type,
-                &rejection.reason,
-                retry_safety,
-            )
+            if let (Some(next_decision), Some(next_ordinal)) = (next, next_ordinal) {
+                if let Err(UpstreamSendError::Request {
+                    snapshot_version, ..
+                }) = &send_result
+                {
+                    usage_context.capability_snapshot_version = Some(snapshot_version.clone());
+                }
+                let failed_route = resolved.resolved_model.clone().unwrap_or_default();
+                let model_attempted =
+                    !matches!(&send_result, Err(UpstreamSendError::CircuitOpen { .. }));
+                // Prepare a usable failover candidate first. Only then persist the
+                // failed-attempt receipt and failover decision — otherwise a chain
+                // of unusable candidates would double-record the original failure.
+                resolved = next_decision;
+                tried_provider_ids.push(capability_provider_id(resolved.resolved_provider).into());
+
+                // Re-prepare after claim. Skip operationally unusable candidates
+                // (missing endpoint, rewrite failure) and keep searching so a
+                // later configured fallback still runs.
+                let mut prepared_failover = false;
+                while !prepared_failover {
+                    let resolved_registry_metadata = resolved
+                        .resolved_model
+                        .as_deref()
+                        .and_then(|model| registry_snapshot.resolve_model(model).ok());
+                    let attempt_body = match resolved.resolved_model.as_deref() {
+                        Some(model) => match rewrite_request_model(&egress_baseline, model) {
+                            Ok(body) => body,
+                            Err(_) => {
+                                let excluded: Vec<&str> =
+                                    tried_provider_ids.iter().map(String::as_str).collect();
+                                match select_next_failover_candidate(
+                                    &state.runtime,
+                                    &registry_snapshot,
+                                    &resolved,
+                                    capability_surface,
+                                    client_provider,
+                                    state.config.allow_cross_provider,
+                                    local_free_only,
+                                    &excluded,
+                                )
+                                .await
+                                .unwrap_or(None)
+                                {
+                                    Some(more) => {
+                                        resolved = more;
+                                        tried_provider_ids.push(
+                                            capability_provider_id(resolved.resolved_provider)
+                                                .into(),
+                                        );
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        },
+                        None => egress_baseline.clone(),
+                    };
+                    match prepare_upstream_request(
+                        &state.config,
+                        &identity,
+                        &uri,
+                        client_provider,
+                        resolved.resolved_provider,
+                        attempt_body,
+                        resolved_registry_metadata.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(next_prepared) => {
+                            prepared = next_prepared;
+                            prepared_failover = true;
+                        }
+                        Err(_) => {
+                            let excluded: Vec<&str> =
+                                tried_provider_ids.iter().map(String::as_str).collect();
+                            match select_next_failover_candidate(
+                                &state.runtime,
+                                &registry_snapshot,
+                                &resolved,
+                                capability_surface,
+                                client_provider,
+                                state.config.allow_cross_provider,
+                                local_free_only,
+                                &excluded,
+                            )
+                            .await
+                            .unwrap_or(None)
+                            {
+                                Some(more) => {
+                                    resolved = more;
+                                    tried_provider_ids.push(
+                                        capability_provider_id(resolved.resolved_provider).into(),
+                                    );
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                if !prepared_failover {
+                    // Fall through to surface the original send_result failure once.
+                } else {
+                    record_refusal_with_usage_and_append(
+                        &state.config,
+                        &state.runtime,
+                        &identity,
+                        &usage_context,
+                        &rejection,
+                        None,
+                        model_attempted,
+                    )
+                    .await;
+                    crate::obs::signals::record_fallback(
+                        crate::obs::labels::Subsystem::Gateway,
+                        crate::obs::labels::FallbackTrigger::ProviderUnhealthy,
+                    );
+                    record_gateway_decision(
+                        &state.config,
+                        &identity,
+                        "gateway.mid_request_failover",
+                        "policy-authorized equivalent fallback selected after live upstream failure",
+                        "routed",
+                        HashMap::from([
+                            ("failed_route".into(), failed_route),
+                            (
+                                "fallback_route".into(),
+                                resolved.resolved_model.clone().unwrap_or_default(),
+                            ),
+                            ("attempt".into(), usage_context.attempt.to_string()),
+                            (
+                                "provider_ordinal".into(),
+                                usage_context.provider_ordinal.to_string(),
+                            ),
+                        ]),
+                    )
+                    .await;
+                    usage_context.provider_ordinal = next_ordinal;
+                    provider_attempt = provider_attempt.saturating_add(1);
+                    let resolved_registry_model =
+                        resolved.resolved_model.as_deref().or_else(|| {
+                            requested_registry_model
+                                .as_ref()
+                                .map(|model| model.canonical_model.as_str())
+                        });
+                    contact_guard = ProviderContactGuard {
+                        provider: resolved.resolved_provider,
+                        resolved_model: resolved_registry_model.map(str::to_string),
+                        requirements: contact_requirements.clone(),
+                    };
+                    let resolved_registry_metadata = resolved
+                        .resolved_model
+                        .as_deref()
+                        .and_then(|model| registry_snapshot.resolve_model(model).ok());
+                    let resolved_profile = resolved_registry_metadata
+                        .as_ref()
+                        .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
+                    usage_context.provider = prepared.provider;
+                    usage_context.resolved_model = resolved.resolved_model.clone();
+                    usage_context.route_bias = resolved.route_bias.clone();
+                    usage_context.policy_scope = resolved.policy_scope.clone();
+                    usage_context.policy_version = resolved.policy_version.clone();
+                    usage_context.profile_version =
+                        resolved_profile.map(|profile| profile.profile_version.clone());
+                    usage_context.pricing_snapshot_version = effective_pricing_snapshot_version(
+                        &state.config,
+                        resolved_profile,
+                        resolved.resolved_model.as_deref(),
+                        requested_model.as_deref(),
+                    );
+                    usage_context.governance_metadata_status =
+                        resolved_profile.map(|profile| profile.governance.metadata_status.clone());
+                    usage_context.cache_requested = cache_requested
+                        || automatic_cache_attempted(resolved_profile, &prepared.body);
+                    continue;
+                }
+            }
+            // No further candidate: surface the original outcome.
         }
+
+        return match send_result {
+            Ok((resp, contact_snapshot_version)) => {
+                usage_context.capability_snapshot_version = Some(contact_snapshot_version);
+                response_from_upstream(
+                    resp,
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    usage_context,
+                    prepared.response_adapter,
+                    prepared.client_response_model,
+                )
+                .await
+            }
+            Err(UpstreamSendError::Governance {
+                rejection,
+                snapshot_version,
+                model_attempted,
+            }) => {
+                usage_context.capability_snapshot_version = Some(snapshot_version);
+                let action = match rejection.error_type.as_str() {
+                    "capability_unsupported" => "gateway.capability_denied",
+                    "provider_registry_unavailable" => "gateway.provider_registry_unavailable",
+                    _ => "gateway.lifecycle_denied",
+                };
+                record_gateway_decision(
+                    &state.config,
+                    &identity,
+                    action,
+                    &rejection.reason,
+                    "denied",
+                    HashMap::from([("request_id".into(), usage_context.request_id.clone())]),
+                )
+                .await;
+                record_refusal_with_usage_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &usage_context,
+                    &rejection,
+                    None,
+                    model_attempted,
+                )
+                .await;
+                rejection.response()
+            }
+            Err(UpstreamSendError::CircuitOpen { health }) => {
+                let error_type = match health {
+                    ProviderHealth::RateLimited => "upstream_rate_limited",
+                    ProviderHealth::QuotaExhausted => "upstream_quota_exhausted",
+                    _ => "upstream_unavailable",
+                };
+                let rejection = GatewayRejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    error_type: error_type.into(),
+                    reason: format!(
+                        "{} upstream is temporarily in {:?} health state",
+                        prepared.provider.runtime_name(),
+                        health
+                    ),
+                    rejected_route: None,
+                    retry_safety: Some("safe"),
+                };
+                record_refusal_with_usage_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &usage_context,
+                    &rejection,
+                    None,
+                    false,
+                )
+                .await;
+                json_error_with_retry_safety(
+                    rejection.status,
+                    &rejection.error_type,
+                    &rejection.reason,
+                    "safe",
+                )
+            }
+            Err(UpstreamSendError::Request {
+                error: err,
+                snapshot_version,
+            }) => {
+                usage_context.capability_snapshot_version = Some(snapshot_version);
+                let retry_safety = if err.is_connect() {
+                    "safe"
+                } else {
+                    "ambiguous"
+                };
+                let rejection = GatewayRejection {
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: "upstream_error".into(),
+                    reason: safe_upstream_error_reason(prepared.provider, "request", &err),
+                    rejected_route: None,
+                    retry_safety: Some(retry_safety),
+                };
+                record_refusal_with_usage_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &usage_context,
+                    &rejection,
+                    None,
+                    true,
+                )
+                .await;
+                json_error_with_retry_safety(
+                    rejection.status,
+                    &rejection.error_type,
+                    &rejection.reason,
+                    retry_safety,
+                )
+            }
+        };
     }
 }
 
@@ -3223,6 +3541,10 @@ struct UsageContext {
     parent_operation_id: Option<String>,
     turn_id: Option<String>,
     attempt: u32,
+    /// Internal mid-request provider ordinal (1-based). Distinct from the
+    /// client-controlled attempt so failover receipts never collide with a
+    /// later client retry at attempt+1.
+    provider_ordinal: u32,
     cycle_id: Option<String>,
     traceparent: Option<String>,
     responses_profile: bool,
@@ -3274,6 +3596,7 @@ fn early_refusal_context(
         parent_operation_id: correlation.parent_operation_id.clone(),
         turn_id: correlation.turn_id.clone(),
         attempt: correlation.attempt,
+        provider_ordinal: 1,
         cycle_id: correlation.cycle_id.clone(),
         traceparent: correlation.traceparent.clone(),
         responses_profile,
@@ -3728,11 +4051,15 @@ struct PolicyPreflight {
     data_class: Option<String>,
 }
 
+/// Maximum distinct upstream providers tried for one client call (primary + failover).
+const MAX_MID_REQUEST_PROVIDER_ATTEMPTS: u32 = 3;
+
 async fn select_healthy_policy_fallback(
     runtime: &GatewayRuntime,
     registry: &ProviderRegistry,
-    mut decision: PolicyPreflight,
+    decision: PolicyPreflight,
     surface: Option<CapabilityRequestSurface>,
+    client_provider: ProviderKind,
     allow_cross_provider: bool,
     local_free_only: bool,
 ) -> Result<PolicyPreflight, GatewayRejection> {
@@ -3744,6 +4071,59 @@ async fn select_healthy_policy_fallback(
     if !selected_unhealthy {
         return Ok(decision);
     }
+    drop(circuits);
+    match select_next_failover_candidate(
+        runtime,
+        registry,
+        &decision,
+        surface,
+        client_provider,
+        allow_cross_provider,
+        local_free_only,
+        &[],
+    )
+    .await
+    {
+        Ok(Some(next)) => Ok(next),
+        Ok(None) => Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            format!(
+                "provider {selected_key:?} is unhealthy and no policy-authorized capability and governance equivalent fallback is eligible"
+            ),
+        )
+        .with_retry_safety("safe")),
+        Err(rejection) => Err(rejection),
+    }
+}
+
+/// Whether the client protocol can be prepared for the candidate provider.
+///
+/// Same-family is always adaptable. The only implemented cross-family adapter is
+/// Anthropic Messages → OpenAI-compatible chat.
+fn client_can_dispatch_to_provider(client: ProviderKind, target: ProviderKind) -> bool {
+    client == target
+        || client.same_family(target)
+        || (client == ProviderKind::Anthropic && target.is_openai())
+}
+
+/// Pick the next policy-authorized fallback, skipping open circuits and already-tried providers.
+///
+/// Used both for preflight health fallback and same-request mid-request failover after a live
+/// upstream failure. Never crosses governance, capability, family (unless allowed), or local-free
+/// boundaries. Also skips candidates the client protocol cannot adapt to, so preparation
+/// failures do not terminate failover early.
+async fn select_next_failover_candidate(
+    runtime: &GatewayRuntime,
+    registry: &ProviderRegistry,
+    decision: &PolicyPreflight,
+    surface: Option<CapabilityRequestSurface>,
+    client_provider: ProviderKind,
+    allow_cross_provider: bool,
+    local_free_only: bool,
+    excluded_provider_ids: &[&str],
+) -> Result<Option<PolicyPreflight>, GatewayRejection> {
+    let selected_key = capability_provider_id(decision.resolved_provider);
     let selected_profile = registry.effective_profile(selected_key).ok_or_else(|| {
         GatewayRejection::json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3772,6 +4152,7 @@ async fn select_healthy_policy_fallback(
                 format!("cannot derive fallback requirements: {reason}"),
             )
         })?;
+    let circuits = runtime.upstream_circuits.read().await;
     for candidate in &decision.fallback_models {
         let Ok(resolved) = registry.resolve_model(candidate) else {
             continue;
@@ -3779,14 +4160,31 @@ async fn select_healthy_policy_fallback(
         let Some(provider) = ProviderKind::from_runtime(&resolved.provider) else {
             continue;
         };
+        let provider_id = capability_provider_id(provider);
+        if excluded_provider_ids
+            .iter()
+            .any(|excluded| *excluded == provider_id)
+        {
+            continue;
+        }
         if local_free_only && provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama) {
             continue;
         }
         if !decision.resolved_provider.same_family(provider) && !allow_cross_provider {
             continue;
         }
+        if !client_can_dispatch_to_provider(client_provider, provider) {
+            continue;
+        }
+        if let Some(surface) = surface {
+            if enforce_adapter_capabilities(client_provider, provider, surface, &decision.body)
+                .is_err()
+            {
+                continue;
+            }
+        }
         if circuits
-            .get(capability_provider_id(provider))
+            .get(provider_id)
             .is_some_and(CircuitBreakerState::is_open)
         {
             continue;
@@ -3801,7 +4199,8 @@ async fn select_healthy_policy_fallback(
         {
             continue;
         }
-        decision.body =
+        let mut next = decision.clone();
+        next.body =
             rewrite_request_model(&decision.body, &resolved.canonical_model).map_err(|error| {
                 GatewayRejection::json(
                     StatusCode::BAD_REQUEST,
@@ -3809,19 +4208,12 @@ async fn select_healthy_policy_fallback(
                     format!("could not rewrite fallback model: {error}"),
                 )
             })?;
-        decision.resolved_model = Some(resolved.canonical_model);
-        decision.resolved_provider = provider;
-        decision.route_bias = Some("health_fallback".into());
-        return Ok(decision);
+        next.resolved_model = Some(resolved.canonical_model);
+        next.resolved_provider = provider;
+        next.route_bias = Some("health_fallback".into());
+        return Ok(Some(next));
     }
-    Err(GatewayRejection::json(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "upstream_unavailable",
-        format!(
-            "provider {selected_key:?} is unhealthy and no policy-authorized capability and governance equivalent fallback is eligible"
-        ),
-    )
-    .with_retry_safety("safe"))
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -8587,10 +8979,11 @@ async fn record_usage_and_append(
             values.insert("request_id".to_string(), context.request_id.clone());
             values.insert(
                 "receipt_id".to_string(),
-                gateway_attempt_receipt_id(
+                gateway_provider_receipt_id(
                     &context.operation_id,
                     &context.request_id,
                     context.attempt,
+                    context.provider_ordinal,
                 ),
             );
             insert_correlation_values(&mut values, context);
@@ -8773,7 +9166,12 @@ fn gateway_recovery_llm_values(
         ("request_id".into(), context.request_id.clone()),
         (
             "receipt_id".into(),
-            gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt),
+            gateway_provider_receipt_id(
+                &context.operation_id,
+                &context.request_id,
+                context.attempt,
+                context.provider_ordinal,
+            ),
         ),
         (
             "timestamp_ms".into(),
@@ -8960,7 +9358,12 @@ async fn record_refusal_with_usage_and_append(
     values.insert("request_id".to_string(), context.request_id.clone());
     values.insert(
         "receipt_id".to_string(),
-        gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt),
+        gateway_provider_receipt_id(
+            &context.operation_id,
+            &context.request_id,
+            context.attempt,
+            context.provider_ordinal,
+        ),
     );
     insert_correlation_values(&mut values, context);
     values.insert(
@@ -9118,8 +9521,12 @@ fn build_gateway_operation_receipt(
         .map(|failure| failure.model_attempted)
         .unwrap_or(true);
     let rejection = rejection.map(|failure| failure.rejection);
-    let operation_id =
-        gateway_attempt_receipt_id(&context.operation_id, &context.request_id, context.attempt);
+    let operation_id = gateway_provider_receipt_id(
+        &context.operation_id,
+        &context.request_id,
+        context.attempt,
+        context.provider_ordinal,
+    );
     let completed_at_ms = Utc::now().timestamp_millis();
     let actor = identity.agent.as_str();
     let policy_version = context
@@ -13297,6 +13704,7 @@ mod tests {
             parent_operation_id: Some("parent-op".into()),
             turn_id: Some("turn-1".into()),
             attempt: 2,
+            provider_ordinal: 1,
             cycle_id: Some("cycle-1".into()),
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             responses_profile: true,
@@ -13639,6 +14047,7 @@ mod tests {
             parent_operation_id: None,
             turn_id: None,
             attempt: 1,
+            provider_ordinal: 1,
             cycle_id: None,
             traceparent: None,
             responses_profile: true,
@@ -14680,6 +15089,7 @@ mod tests {
             &ProviderRegistry::built_in(),
             decision,
             Some(CapabilityRequestSurface::Responses),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             false,
             false,
         )
@@ -14716,6 +15126,7 @@ mod tests {
             &ProviderRegistry::built_in(),
             decision,
             Some(CapabilityRequestSurface::Responses),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             false,
             false,
         )
@@ -14752,6 +15163,7 @@ mod tests {
             &ProviderRegistry::built_in(),
             decision,
             Some(CapabilityRequestSurface::Responses),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
             false,
             false,
         )
@@ -14789,12 +15201,111 @@ mod tests {
                 &ProviderRegistry::built_in(),
                 decision,
                 Some(CapabilityRequestSurface::Responses),
+                ProviderKind::OpenAi(OpenAiRuntime::Ollama),
                 false,
                 true,
             )
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn mid_request_failover_selects_next_candidate_after_live_failure() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        // Primary is still closed-circuit-healthy; mid-request failover must not
+        // require the breaker to already be open.
+        let decision = PolicyPreflight {
+            body: br#"{"model":"openai/gpt-5.5","input":"hello"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["ollama/llama3.2".into()],
+            data_class: None,
+        };
+        let next = select_next_failover_candidate(
+            &runtime,
+            &ProviderRegistry::built_in(),
+            &decision,
+            Some(CapabilityRequestSurface::Responses),
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            false,
+            false,
+            &["openai"],
+        )
+        .await
+        .unwrap()
+        .expect("fallback candidate");
+        assert_eq!(next.resolved_model.as_deref(), Some("ollama/llama3.2"));
+        assert_eq!(next.route_bias.as_deref(), Some("health_fallback"));
+        // Mid-request provider receipts are distinct via provider ordinal without
+        // consuming the client-controlled attempt namespace.
+        assert_ne!(
+            gateway_provider_receipt_id("op-1", "req-1", 1, 1),
+            gateway_provider_receipt_id("op-1", "req-1", 1, 2)
+        );
+        assert_eq!(
+            gateway_provider_receipt_id("op-1", "req-1", 1, 1),
+            gateway_attempt_receipt_id("op-1", "req-1", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_request_failover_skips_already_tried_and_fails_closed_on_unsafe() {
+        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+        runtime.upstream_circuits.write().await.insert(
+            "ollama".into(),
+            CircuitBreakerState {
+                consecutive_failures: 1,
+                open_until: Some(Instant::now() + Duration::from_secs(60)),
+                last_failure: Some("unavailable".into()),
+                health: ProviderHealth::Unavailable,
+            },
+        );
+        let decision = PolicyPreflight {
+            body: br#"{"model":"openai/gpt-5.5","input":"hello"}"#.to_vec(),
+            resolved_model: Some("openai/gpt-5.5".into()),
+            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            route_bias: None,
+            policy_scope: Some("project:default".into()),
+            policy_version: Some("v1".into()),
+            fallback_models: vec!["ollama/llama3.2".into()],
+            data_class: None,
+        };
+        // Exclude openai (failed live) and ollama is circuit-open → no candidate.
+        assert!(
+            select_next_failover_candidate(
+                &runtime,
+                &ProviderRegistry::built_in(),
+                &decision,
+                Some(CapabilityRequestSurface::Responses),
+                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+                false,
+                false,
+                &["openai"],
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn client_dispatch_adapter_allows_anthropic_to_openai_only() {
+        assert!(client_can_dispatch_to_provider(
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::OpenAi(OpenAiRuntime::Ollama),
+        ));
+        assert!(client_can_dispatch_to_provider(
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+        ));
+        assert!(!client_can_dispatch_to_provider(
+            ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+            ProviderKind::Anthropic,
+        ));
     }
 
     #[tokio::test]
