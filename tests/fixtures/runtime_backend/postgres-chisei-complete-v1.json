@@ -1,0 +1,15 @@
+{
+  "contract_version": "sekai.runtime-backend/v1",
+  "backend": "postgres",
+  "reusable_surfaces": [
+    "chisei.approvals",
+    "chisei.budget",
+    "chisei.evaluation",
+    "chisei.execution",
+    "chisei.learning",
+    "chisei.observations",
+    "chisei.policy",
+    "chisei.portfolio",
+    "gateway.governance"
+  ]
+}

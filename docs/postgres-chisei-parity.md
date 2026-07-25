@@ -1,42 +1,58 @@
 # Chisei PostgreSQL parity
 
-This note tracks PostgreSQL parity for Chisei governed decisions and execution
-(#237). It does not activate community PostgreSQL runtime selection (#238).
+This note closes the Chisei governed-decision and execution PostgreSQL parity
+track (#237). It does not activate community PostgreSQL runtime selection
+(#238).
 
-## Outcome so far
+## Outcome
+
+Every reusable Chisei decision and execution surface has PostgreSQL persistence
+with shared SQLite/PostgreSQL conformance evidence, or is an explicit
+computed/query path with named durable dependencies.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| `chisei.budget` | Proven (limits, chain reservation, idempotent events, attributions) | `tests/chisei_budget_backend_conformance.rs`, `src/db/postgres_budget.rs` |
-| `chisei.execution` | Proven (receipts, reporter grants, gateway aliases) | `tests/chisei_execution_backend_conformance.rs`, `src/db/postgres_chisei_receipts.rs` |
-| `chisei.evaluation` / evolve / samples | Schema + methods present; dual harness incomplete | `src/db/postgres_eval.rs` |
-| `chisei.portfolio` | Schema + methods present; dual harness incomplete | `src/db/postgres_portfolio.rs` |
-| `chisei.policy` / egress | Durable via graph objects when present; dual harness incomplete | graph conformance + service loaders |
-| `chisei.approvals` / external action | Schema migrated; method parity remaining | migration `0017_chisei_execution_parity.sql` |
-| `chisei.learning` (kioku / gunshi) | Schema migrated; method parity remaining | migration `0017_chisei_execution_parity.sql` |
-| `gateway.governance` | Alias reserve/claim proven; full gateway audit path remaining | receipt harness |
+| `chisei.budget` | Proven | `tests/chisei_budget_backend_conformance.rs` |
+| `chisei.execution` | Proven | `tests/chisei_execution_backend_conformance.rs` |
+| `chisei.evaluation` / samples | Proven | `tests/chisei_eval_backend_conformance.rs` |
+| `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
+| `chisei.policy` | Proven (graph objects) | `tests/chisei_policy_backend_conformance.rs` |
+| `chisei.approvals` | Proven | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs` |
+| `chisei.learning` | Proven | `tests/chisei_kioku_backend_conformance.rs` |
+| `chisei.observations` | Proven | eval sample harness |
+| `gateway.governance` | Proven | receipt aliases + gateway audit harness |
 
 ## Inventory
 
-`tests/fixtures/chisei_rpc_inventory/v1.json` maps every `ChiseiService` and
-`LlmService` RPC to persistence kind, surfaces, and evidence. Validation lives
-in `src/db/chisei_rpc_inventory.rs`.
+| Artifact | Role |
+| --- | --- |
+| `tests/fixtures/chisei_rpc_inventory/v1.json` | Fail-closed map of every Chisei/LLM RPC |
+| `tests/fixtures/runtime_backend/postgres-chisei-complete-v1.json` | Complete Chisei capability advertisement |
+| `src/db/chisei_rpc_inventory.rs` | Inventory validation and capability helper |
+| `tests/chisei_*_backend_conformance.rs` | Shared SQLite/PostgreSQL harnesses |
 
-`complete_chisei_surfaces` lists only surfaces with shared SQLite/PostgreSQL
-harness evidence. Remaining surfaces stay fail-closed for community runtime
-selection.
+`complete_chisei_surfaces` lists only surfaces with dual-backend evidence.
+`remaining_surfaces` is empty after closeout.
 
-## Remaining work for #237 closeout
+## Delivery slices
 
-1. Dual-backend conformance for evaluation, portfolio, sample observations.
-2. PostgreSQL methods + harness for external-action authorization and permits.
-3. PostgreSQL methods + harness for kioku learning lifecycle.
-4. Policy/egress/gateway audit parity evidence beyond graph storage.
-5. Advertise complete Chisei surfaces only after every inventory fixture passes.
-6. Keep secrets and provider stream content outside durable storage.
+| Slice | Outcome |
+| --- | --- |
+| Receipts / gateway aliases / budget events | Foundation PR |
+| Eval / portfolio / policy / gateway audit harnesses | Dual harnesses for existing methods |
+| External-action authorization and permits | PostgreSQL methods + harnesses |
+| Kioku learning lifecycle | PostgreSQL methods + harnesses |
+| Inventory complete capability | This closeout |
+
+## Still outside this track
+
+- Community PostgreSQL runtime activation (`SEKAI_DB_BACKEND=postgres`) — #238
+- Tenant state, OIDC, and OAuth
+- Full permit redemption crypto paths that stay host-local
 
 ## Operator posture
 
-SQLite remains the default community backend. PostgreSQL may run isolated
-conformance and partial composition. Public `SEKAI_DB_BACKEND=postgres`
-selection still fails closed until every community-required surface is proven.
+SQLite remains the default community backend. PostgreSQL may be used for
+composition and isolated conformance. Public community runtime selection of
+PostgreSQL still fails closed until every community-required surface—including
+Sekai foundations and operations health—can be advertised truthfully (#238).
