@@ -1,3 +1,4 @@
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Object};
 use rusqlite::{OptionalExtension, params};
@@ -89,7 +90,7 @@ pub fn validate_function(f: &Function) -> Result<(), String> {
 }
 
 pub fn execute(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     f: &Function,
     params: &HashMap<String, String>,
 ) -> Result<FunctionResult, String> {
@@ -97,7 +98,7 @@ pub fn execute(
 }
 
 pub fn execute_with_filter<F>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     f: &Function,
     params: &HashMap<String, String>,
     allow: F,
@@ -109,7 +110,7 @@ where
 }
 
 pub fn execute_for_object_with_filter<F>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     f: &Function,
     source: &Object,
     params: &HashMap<String, String>,
@@ -122,7 +123,7 @@ where
 }
 
 fn execute_with_source_and_filter<F>(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     f: &Function,
     params: &HashMap<String, String>,
     source: Option<&Object>,
@@ -432,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_execute_count_components() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "r1".into(),
             kind: "namespace".into(),
@@ -519,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_execute_with_param() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "c1".into(),
             kind: KIND_COMPONENT.into(),
@@ -590,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_function_persistence() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let f = Function {
             name: "sum_tasks".into(),
             description: "sum task totals".into(),

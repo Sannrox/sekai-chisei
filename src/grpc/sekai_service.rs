@@ -14,6 +14,8 @@ use crate::chisei::receipt::{
     ReceiptSurface, UncoveredSurface,
 };
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain;
 use crate::gateway_keys::hash_gateway_key;
@@ -42,7 +44,7 @@ use uuid::Uuid;
 const REDACTED_VALUE: &str = "[redacted]";
 
 pub struct SekaiServiceImpl {
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     actions: Arc<RwLock<ActionExecutor>>,
     security: Arc<SecurityChecker>,
     schema: Arc<RwLock<SchemaRegistry>>,
@@ -413,12 +415,12 @@ impl SekaiServiceImpl {
             .map_err(Status::internal)
     }
 
-    pub fn new(db: Arc<SekaiDb>) -> Self {
+    pub fn new(db: Arc<RuntimeDb>) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
 
     pub fn new_with_gateway_schema_principals(
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         gateway_schema_principals: Vec<String>,
     ) -> Self {
         let security = Arc::new(SecurityChecker::new());
@@ -475,7 +477,7 @@ impl SekaiServiceImpl {
     /// Construct sharing a chisei budget tracker so governed actions can be
     /// metered against action-class budgets (Plan 9, Phase C).
     pub fn with_budget(
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         budget: Arc<crate::chisei::budget::BudgetTracker>,
     ) -> Self {
         let mut svc = Self::new(db);
@@ -484,7 +486,7 @@ impl SekaiServiceImpl {
     }
 
     pub fn with_budget_and_gateway_schema_principals(
-        db: Arc<SekaiDb>,
+        db: Arc<RuntimeDb>,
         budget: Arc<crate::chisei::budget::BudgetTracker>,
         gateway_schema_principals: Vec<String>,
     ) -> Self {
@@ -1617,7 +1619,7 @@ fn to_proto_evidence_submission(
 }
 
 fn evidence_submission_result(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     admission: EvidenceAdmission,
     projection: Option<EvidenceProjectionOutcome>,
 ) -> Result<EvidenceSubmissionResult, Status> {
@@ -1701,7 +1703,7 @@ fn redact_action_outcome(
 }
 
 fn schema_restricted_action_property(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     schema: &schema::SchemaRegistry,
     params: &std::collections::HashMap<String, String>,
 ) -> Option<bool> {
@@ -1754,7 +1756,7 @@ fn check_write(
 }
 
 fn validate_object_kind_change_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     principals: &[String],
     existing: &domain::Object,
@@ -1811,7 +1813,7 @@ fn validate_object_kind_change_access(
 }
 
 fn check_object_admin(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     object: &domain::Object,
     principals: &[String],
@@ -1837,7 +1839,7 @@ fn check_object_admin(
 }
 
 fn check_object_namespace_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     principals: &[String],
     object_id: &str,
     write: bool,
@@ -1858,7 +1860,7 @@ fn check_object_namespace_access(
 }
 
 fn team_namespace_memberships(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     principals: &[String],
 ) -> Result<Vec<(String, security::Role)>, Status> {
     if principals
@@ -1877,7 +1879,7 @@ fn team_namespace_memberships(
     Ok(memberships)
 }
 
-fn is_managed_team_principal(db: &SekaiDb, principals: &[String]) -> Result<bool, Status> {
+fn is_managed_team_principal(db: &RuntimeDb, principals: &[String]) -> Result<bool, Status> {
     if principals
         .iter()
         .any(|principal| matches!(principal.as_str(), "root" | "local"))
@@ -1893,7 +1895,7 @@ fn is_managed_team_principal(db: &SekaiDb, principals: &[String]) -> Result<bool
 }
 
 fn check_team_namespace(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     principals: &[String],
     namespace: &str,
     write: bool,
@@ -1939,7 +1941,7 @@ fn check_team_namespace(
 }
 
 fn check_dataset_access(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     principals: &[String],
     dataset: &dataset::Dataset,
@@ -2056,7 +2058,7 @@ fn check_scope_write(
 }
 
 fn check_work_unit_read(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
@@ -2072,7 +2074,7 @@ fn check_work_unit_read(
 }
 
 fn check_work_unit_write(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
@@ -2460,7 +2462,7 @@ fn queried_order_property(order_by: &str) -> Option<String> {
 }
 
 fn preserve_redacted_restricted_properties(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     schema: &schema::SchemaRegistry,
     security: &SecurityChecker,
     principals: &[String],
@@ -2839,7 +2841,7 @@ fn map_graph_mutation_error(error: String) -> Status {
 }
 
 fn check_ontology_grant_target(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     security: &SecurityChecker,
     object_id: &str,
     principals: &[String],
@@ -3005,7 +3007,7 @@ fn ensure_action_schema_kinds_allowed(kinds: &[String]) -> Result<(), Status> {
 /// namespace of an existing target object, falling back to a `namespace` param
 /// (used by `create_object` before the object exists).
 fn action_policy_namespace(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     target_ids: &[String],
     params: &std::collections::HashMap<String, String>,
 ) -> String {
@@ -3252,7 +3254,7 @@ fn validate_action_type_against_schema(
 }
 
 fn validate_computed_property_functions(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     object_type: &schema::ObjectType,
 ) -> Result<(), Status> {
     for property in &object_type.properties {
@@ -3811,7 +3813,7 @@ fn aggregate_reconcile_summary(
 }
 
 fn reconcile_owned_scope(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     now_ms: i64,
     scope_id: String,
     dry_run: bool,
@@ -7856,7 +7858,9 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
-        let res = crate::sekai::lineage::get_lineage(&self.db, &r.object_id, r.max_nodes as usize)
+        let res = self
+            .db
+            .get_lineage(&r.object_id, r.max_nodes as usize)
             .map_err(Status::internal)?;
         let visible_nodes = res
             .nodes
@@ -10280,7 +10284,7 @@ fn require_credential_admin(principals: &[String]) -> Result<(), Status> {
 }
 
 fn credential_admin_actor(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     req: &Request<impl std::any::Any>,
     requested_tenant: &str,
 ) -> Result<(String, bool), Status> {
@@ -10334,7 +10338,7 @@ fn require_tenant_request_key(value: &str) -> Result<String, Status> {
 type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
 fn request_tenant_context(
-    _db: &SekaiDb,
+    _db: &RuntimeDb,
     req: &Request<impl std::any::Any>,
 ) -> Result<Option<RequestEnterpriseContext>, Status> {
     if let Some(context) = req
@@ -10347,7 +10351,7 @@ fn request_tenant_context(
 }
 
 fn enforce_namespace_tenant_context(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     tenant_context: Option<&RequestEnterpriseContext>,
     namespace: &str,
     write: bool,
@@ -10786,7 +10790,9 @@ mod tests {
     use tonic::metadata::MetadataValue;
 
     fn service() -> SekaiServiceImpl {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         SekaiServiceImpl::new(db)
     }
 
@@ -10862,11 +10868,13 @@ mod tests {
 
     #[test]
     fn injected_enterprise_extension_derives_context_and_authorizes_namespace() {
-        let db = SekaiDb::new_with_enterprise_extension(
-            ":memory:",
-            Some(Arc::new(TestEnterpriseExtension)),
-        )
-        .unwrap();
+        let db = RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        ));
         let mut request = Request::new(());
         request
             .extensions_mut()
@@ -10913,11 +10921,13 @@ mod tests {
 
     #[test]
     fn community_request_is_authorized_by_installed_enterprise_extension() {
-        let db = SekaiDb::new_with_enterprise_extension(
-            ":memory:",
-            Some(Arc::new(TestEnterpriseExtension)),
-        )
-        .unwrap();
+        let db = RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        ));
         let mut request = Request::new(());
         request
             .extensions_mut()
@@ -15287,7 +15297,9 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         {
             let conn = db.conn();
             conn.execute(
@@ -15363,7 +15375,9 @@ mod tests {
 
     #[tokio::test]
     async fn user_defined_action_blocks_when_target_schema_failed_to_load() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         db.migrate_schema_types().unwrap();
         {
             let conn = db.conn();
@@ -15440,7 +15454,9 @@ mod tests {
 
     #[tokio::test]
     async fn schema_table_read_failure_blocks_object_writes() {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         {
             let conn = db.conn();
             conn.execute("DROP TABLE sekai_object_types", []).unwrap();
@@ -19049,7 +19065,9 @@ mod tests {
     #[tokio::test]
     async fn action_class_budget_denies_when_exhausted() {
         use crate::chisei::budget::{BudgetTracker, PeriodType};
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
         let budget = Arc::new(BudgetTracker::new(db.clone()));
         // Allow 1 write action, then deny.
         budget

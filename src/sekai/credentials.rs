@@ -4,7 +4,10 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
-use crate::db::sekai::{PrincipalCredential, SekaiDb};
+use crate::db::runtime_db::RuntimeDb;
+use crate::db::sekai::PrincipalCredential;
+#[cfg(test)]
+use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 
 const CREDENTIAL_RELOAD_INTERVAL_MS: i64 = 5000;
@@ -54,7 +57,7 @@ impl PrincipalCredentialStore {
         self.resolve_hashed(&hash_gateway_key(token))
     }
 
-    pub fn maybe_reload(&self, db: &SekaiDb) -> bool {
+    pub fn maybe_reload(&self, db: &RuntimeDb) -> bool {
         let activity_epoch = match db.principal_credentials_activity_epoch() {
             Ok(activity_epoch) => activity_epoch,
             Err(_) => return false,
@@ -131,8 +134,8 @@ impl Default for PrincipalCredentialStore {
 mod tests {
     use super::*;
 
-    fn test_db() -> SekaiDb {
-        SekaiDb::new(":memory:").unwrap()
+    fn test_db() -> RuntimeDb {
+        RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()))
     }
 
     fn fixed_time(i: i64) -> i64 {

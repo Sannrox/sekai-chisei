@@ -1,8 +1,7 @@
 # Chisei PostgreSQL parity
 
 This note closes the Chisei governed-decision and execution PostgreSQL parity
-track (#237). It does not activate community PostgreSQL runtime selection
-(#238).
+track (#237). Community PostgreSQL runtime selection is activated by #238.
 
 ## Outcome
 
@@ -46,13 +45,11 @@ computed/query path with named durable dependencies.
 
 ## Still outside this track
 
-- Community PostgreSQL runtime activation (`SEKAI_DB_BACKEND=postgres`) — #238
 - Tenant state, OIDC, and OAuth
 - Full permit redemption crypto paths that stay host-local
 
 ## Operator posture
 
-SQLite remains the default community backend. PostgreSQL may be used for
-composition and isolated conformance. Public community runtime selection of
-PostgreSQL still fails closed until every community-required surface—including
-Sekai foundations and operations health—can be advertised truthfully (#238).
+SQLite remains the default community backend. Select PostgreSQL with
+`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for the complete reusable public
+control plane (see [configuration.md](configuration.md) and #238).

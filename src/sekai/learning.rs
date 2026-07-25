@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{KIND_LEARNING, Link, Object, REL_TOUCHES};
 use crate::sekai::schema::SchemaRegistry;
@@ -183,7 +185,7 @@ fn governed_learning_namespace(target: &Object) -> Result<String, String> {
 }
 
 pub(crate) fn record_learning_target_ids(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     params: &HashMap<String, String>,
 ) -> Result<Vec<String>, String> {
     let input = RecordLearningInput::from_params(params)?;
@@ -195,7 +197,7 @@ pub(crate) fn record_learning_target_ids(
 }
 
 pub(crate) fn record_learning(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     schema: &SchemaRegistry,
     params: &HashMap<String, String>,
     actor: &str,
@@ -447,7 +449,7 @@ mod tests {
 
     #[test]
     fn record_learning_action_is_governed_as_two_sensitive_writes() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
         let executor = ActionExecutor::new();
         let params = record_params();
@@ -498,7 +500,7 @@ mod tests {
 
     #[test]
     fn record_learning_atomically_creates_object_link_acl_and_audit() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
         let executor = ActionExecutor::new();
         let params = record_params();
@@ -541,7 +543,7 @@ mod tests {
 
     #[test]
     fn record_learning_copies_acl_and_exact_retry_is_idempotent() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
         for (id, principal, role) in [
             ("grant-alice", "alice", Role::Editor),
@@ -596,7 +598,7 @@ mod tests {
 
     #[test]
     fn record_learning_rejects_untrusted_properties_and_collisions() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
         let executor = ActionExecutor::new();
         let schema = SchemaRegistry::new();
@@ -634,7 +636,7 @@ mod tests {
 
     #[test]
     fn record_learning_rolls_back_when_link_id_collides() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
         db.create_link(&Link {
             id: "learning-request-42->target-1".into(),
@@ -657,7 +659,7 @@ mod tests {
 
     #[test]
     fn record_learning_rejects_a_forged_partial_retry() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let target = target("target-1");
         db.create_object(&target).unwrap();
         let input = RecordLearningInput::from_params(&record_params()).unwrap();
@@ -719,7 +721,7 @@ mod tests {
                 .contains("control characters")
         );
 
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "unscoped".into(),
             kind: "component".into(),

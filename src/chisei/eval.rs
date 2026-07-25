@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +121,7 @@ pub struct ContextExpansionGate {
 }
 
 pub struct EvalStore {
-    db: Option<Arc<SekaiDb>>,
+    db: Option<Arc<RuntimeDb>>,
     suites: Mutex<HashMap<String, Suite>>,
     runs: Mutex<HashMap<String, Run>>,
     iterations: Mutex<HashMap<String, Iteration>>,
@@ -150,7 +152,7 @@ impl EvalStore {
         }
     }
 
-    pub fn with_db(db: Arc<SekaiDb>) -> Self {
+    pub fn with_db(db: Arc<RuntimeDb>) -> Self {
         Self {
             db: Some(db),
             suites: Mutex::new(HashMap::new()),
@@ -759,8 +761,12 @@ mod tests {
     #[test]
     fn database_backed_store_observes_writes_from_another_replica() {
         let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
-        let writer = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
-        let reader = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let writer = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        let reader = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
         let store = EvalStore::with_db(reader);
         let suite = Suite {
             id: "shared-suite".into(),
@@ -791,8 +797,12 @@ mod tests {
     #[test]
     fn database_eval_evidence_is_append_only_across_connections() {
         let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
-        let first = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
-        let second = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let first = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        let second = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
         let mut promotion = Suite {
             id: "promotion-suite".into(),
             name: "a".into(),

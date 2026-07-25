@@ -1,4 +1,4 @@
-use crate::db::sekai::SekaiDb;
+use crate::db::runtime_db::RuntimeDb;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -11,11 +11,11 @@ use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct OpsState {
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
 }
 
-pub fn router(db: Arc<SekaiDb>, provider_registry_state_path: PathBuf) -> Router {
+pub fn router(db: Arc<RuntimeDb>, provider_registry_state_path: PathBuf) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
@@ -29,7 +29,7 @@ pub fn router(db: Arc<SekaiDb>, provider_registry_state_path: PathBuf) -> Router
 pub async fn bind_and_spawn(
     bind: &str,
     port: u16,
-    db: Arc<SekaiDb>,
+    db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::obs::metrics::handle();

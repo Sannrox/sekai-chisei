@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Object, REL_RELATION_SOURCE, REL_RELATION_TARGET, Relation};
 use rusqlite::{OptionalExtension, params};
@@ -35,7 +37,7 @@ pub struct RelationshipObjectSpec {
 }
 
 pub fn create_relationship_object(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     spec: RelationshipObjectSpec,
 ) -> Result<Object, String> {
     if spec.source_id.trim().is_empty() {
@@ -157,7 +159,7 @@ pub fn create_relationship_object(
 }
 
 pub fn relationship_objects_for_endpoint(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     endpoint_id: &str,
     role: EndpointRole,
     relation: Option<&str>,
@@ -188,7 +190,7 @@ pub fn relationship_objects_for_endpoint(
 }
 
 pub fn relationship_endpoints(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     relationship_id: &str,
 ) -> Result<(String, String), String> {
     let source = relationship_endpoint(db, relationship_id, REL_RELATION_SOURCE)?
@@ -199,7 +201,7 @@ pub fn relationship_endpoints(
 }
 
 fn collect_endpoint_relationships(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     endpoint_id: &str,
     endpoint_relation: &str,
     relation: Option<&str>,
@@ -228,7 +230,7 @@ fn collect_endpoint_relationships(
 }
 
 fn relationship_endpoint(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     relationship_id: &str,
     endpoint_relation: &str,
 ) -> Result<Option<String>, String> {
@@ -287,7 +289,7 @@ mod tests {
 
     #[test]
     fn relationship_object_helpers_create_and_query_metadata_object() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&object("source", "component")).unwrap();
         db.create_object(&object("target", "model")).unwrap();
 
@@ -351,7 +353,7 @@ mod tests {
 
     #[test]
     fn relationship_objects_do_not_change_existing_bare_link_queries() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&object("source", "component")).unwrap();
         db.create_object(&object("target", "model")).unwrap();
         db.create_link(&Link {
@@ -393,7 +395,7 @@ mod tests {
 
     #[test]
     fn relationship_object_creation_rejects_derived_endpoint_link_collisions() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&object("source", "component")).unwrap();
         db.create_object(&object("target", "model")).unwrap();
         db.create_link(&Link {

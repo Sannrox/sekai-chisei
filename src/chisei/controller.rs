@@ -16,6 +16,8 @@ use crate::chisei::promotion::{
     Candidate, CandidateStore, KIND_ROUTING_BIAS, RoutingBiasPayload, STATUS_GATE_PASSED,
     STATUS_PROMOTED, STATUS_ROLLED_BACK,
 };
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
 /// Live, governed routing-bias overrides keyed by (namespace, task_class), consulted by
@@ -103,7 +105,7 @@ impl ActivePromotions {
 pub fn promote_candidate(
     store: &CandidateStore,
     active: &ActivePromotions,
-    db: &SekaiDb,
+    db: &RuntimeDb,
     candidate_id: &str,
 ) -> Option<()> {
     let promoted = store.transition(candidate_id, STATUS_GATE_PASSED, STATUS_PROMOTED)?;
@@ -152,7 +154,7 @@ pub fn check_rollbacks(
     store: &CandidateStore,
     active: &ActivePromotions,
     eval: &EvalStore,
-    db: &SekaiDb,
+    db: &RuntimeDb,
 ) -> usize {
     let mut rolled_back = 0;
     for candidate in store.list_by_status(STATUS_PROMOTED) {
@@ -190,7 +192,7 @@ pub fn check_rollbacks(
     rolled_back
 }
 
-fn record(db: &SekaiDb, outcome: &str, candidate: &Candidate, reason: &str) {
+fn record(db: &RuntimeDb, outcome: &str, candidate: &Candidate, reason: &str) {
     let mut evidence = HashMap::new();
     evidence.insert("kind".to_string(), candidate.kind.clone());
     evidence.insert("namespace".to_string(), candidate.namespace.clone());
@@ -214,9 +216,11 @@ mod tests {
     use crate::chisei::eval::{CaseResult, Run};
     use std::sync::Arc;
 
-    fn setup() -> (Arc<SekaiDb>, EvalStore, CandidateStore, ActivePromotions) {
+    fn setup() -> (Arc<RuntimeDb>, EvalStore, CandidateStore, ActivePromotions) {
         (
-            Arc::new(SekaiDb::new(":memory:").unwrap()),
+            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+                SekaiDb::new(":memory:").unwrap(),
+            ))),
             EvalStore::new(),
             CandidateStore::new(),
             ActivePromotions::new(),

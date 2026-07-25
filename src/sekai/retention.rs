@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -3214,7 +3216,9 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let hot_path = directory.join("hot.db");
         let archive_path = directory.join("archive.db");
-        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
+        ));
         std::fs::hard_link(&hot_path, &archive_path).unwrap();
 
         let error = db
@@ -3231,7 +3235,9 @@ mod tests {
             std::env::temp_dir().join(format!("sekai-sidecar-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let hot_path = directory.join("hot.db");
-        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
+        ));
 
         for suffix in ["-wal", "-shm", "-journal"] {
             let sidecar = PathBuf::from(format!("{}{suffix}", hot_path.display()));
@@ -3255,7 +3261,9 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let hot_path = directory.join("hot.db");
         let archive_path = directory.join("archive.db");
-        let db = SekaiDb::new(hot_path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
+        ));
         let sidecar = PathBuf::from(format!("{}-journal", hot_path.display()));
         symlink(&sidecar, &archive_path).unwrap();
 
@@ -3332,7 +3340,7 @@ mod tests {
 
     #[test]
     fn installs_bounded_defaults_and_validates_overrides() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let policies = db.list_retention_policies().unwrap();
         assert_eq!(policies.len(), 3);
         assert!(
@@ -3347,7 +3355,7 @@ mod tests {
 
     #[test]
     fn prunes_scoped_usage_and_preserves_other_namespaces() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -3391,7 +3399,7 @@ mod tests {
 
     #[test]
     fn specific_policy_can_retain_rows_longer_than_default() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -3453,7 +3461,7 @@ mod tests {
 
     #[test]
     fn scoped_audit_policy_expires_classified_prefix() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (id, data_class) in [("sensitive", "sensitive"), ("public", "public")] {
             db.record_decision(&Decision {
                 id: id.into(),
@@ -3488,9 +3496,9 @@ mod tests {
 
     #[test]
     fn class_scoped_task_policy_preserves_other_classes() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, data_class) in [("remove", "sensitive"), ("keep", "public")] {
                 conn.execute(
                     "INSERT INTO sekai_task_observations
@@ -3521,9 +3529,9 @@ mod tests {
 
     #[test]
     fn class_scoped_task_retention_only_folds_contiguous_prefix() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, data_class, status, timestamp) in [
                 ("sensitive-first", "sensitive", "failed", 1),
                 ("public-success", "public", "done", 2),
@@ -3571,9 +3579,9 @@ mod tests {
 
     #[test]
     fn class_scoped_task_archive_redacts_expired_non_prefix_payloads() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, data_class, status, timestamp) in [
                 ("sensitive-first", "sensitive", "failed", 1),
                 ("public-success", "public", "done", 2),
@@ -3631,8 +3639,10 @@ mod tests {
 
     #[test]
     fn caller_context_cannot_forge_a_retention_tombstone() {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.conn()
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO sekai_task_observations
                  (request_id,namespace,data_class,component_id,model,status,timestamp,context_json)
@@ -3661,7 +3671,7 @@ mod tests {
 
     #[test]
     fn audit_retention_records_a_verifiable_anchor() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_decision(&Decision {
             id: "old".into(),
             timestamp: 1,
@@ -3690,7 +3700,7 @@ mod tests {
 
     #[test]
     fn audit_retention_refuses_to_anchor_tampered_history() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_decision(&Decision {
             id: "old".into(),
             timestamp: 1,
@@ -3710,7 +3720,9 @@ mod tests {
             updated: 1,
         })
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "UPDATE sekai_decisions SET outcome='tampered' WHERE id='old'",
                 [],
@@ -3724,9 +3736,9 @@ mod tests {
 
     #[test]
     fn task_observation_retention_converts_millisecond_clock_to_seconds() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, timestamp) in [("old", 1), ("fresh", 100_000)] {
                 conn.execute(
                     "INSERT INTO sekai_task_observations
@@ -3761,9 +3773,9 @@ mod tests {
 
     #[test]
     fn task_observation_retention_preserves_lifetime_statistics() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, status, timestamp) in [
                 ("old-success", "done", 1),
                 ("old-failure", "failed", 2),
@@ -3799,7 +3811,7 @@ mod tests {
     fn audit_retention_removes_related_object_changes() {
         use crate::sekai::audit::ObjectChange;
 
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_object_change(&ObjectChange {
             id: "old-change".into(),
             object_id: "target".into(),
@@ -3828,7 +3840,7 @@ mod tests {
     fn archives_aged_records_before_removing_them_from_the_hot_store() {
         use crate::sekai::audit::ObjectChange;
 
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for dataset in [AUDIT_DATASET, LLM_CALLS_DATASET, TASK_OBSERVATIONS_DATASET] {
             db.set_retention_policy(&RetentionPolicy {
                 dataset: dataset.into(),
@@ -3879,7 +3891,7 @@ mod tests {
         )
         .unwrap();
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, timestamp) in [("old-observation", 1), ("fresh-observation", 200_000)]
             {
                 conn.execute(
@@ -3940,7 +3952,7 @@ mod tests {
     #[test]
     fn archive_verification_detects_payload_tampering() {
         let path = archive_path();
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -3969,7 +3981,7 @@ mod tests {
     #[test]
     fn archive_verification_detects_removed_batch_manifest() {
         let path = archive_path();
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -4002,7 +4014,7 @@ mod tests {
     #[test]
     fn archive_verification_rejects_total_content_loss() {
         let path = archive_path();
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -4035,7 +4047,7 @@ mod tests {
 
     #[test]
     fn refuses_to_archive_tampered_audit_history() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_decision(&Decision {
             id: "tampered".into(),
             timestamp: 1,
@@ -4047,7 +4059,9 @@ mod tests {
             outcome: "ok".into(),
         })
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "UPDATE sekai_decisions SET outcome='forged' WHERE id='tampered'",
                 [],
@@ -4073,7 +4087,7 @@ mod tests {
     fn archive_conflicts_leave_hot_records_untouched() {
         let path = archive_path();
         for (index, model) in ["first", "changed"].into_iter().enumerate() {
-            let db = SekaiDb::new(":memory:").unwrap();
+            let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
             db.create_dataset(&Dataset {
                 id: LLM_CALLS_DATASET.into(),
                 name: "calls".into(),
@@ -4120,7 +4134,7 @@ mod tests {
 
     #[test]
     fn archives_non_audit_records_after_ledger_anchor_advances() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_decision(&Decision {
             id: "purged".into(),
             timestamp: 1,
@@ -4191,7 +4205,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_removes_saved_filters_and_budget_events() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&crate::domain::Object {
             id: "agent-object".into(),
             kind: "agent".into(),
@@ -4203,7 +4217,9 @@ mod tests {
             updated: 1,
         })
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO chisei_budget_usage_events
                  (idempotency_key,scope_id,metric,amount,created_at)
@@ -4217,7 +4233,9 @@ mod tests {
             "keep-object,agent-object",
         )])
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO sekai_virtual_tables
                  (id,name,dataset_id,filters,columns,created)
@@ -4226,7 +4244,9 @@ mod tests {
             )
             .unwrap();
         let filters = serde_json::to_string(&vec![("agent", "eq", "erase-agent")]).unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO sekai_virtual_tables
                  (id,name,dataset_id,filters,columns,created)
@@ -4236,7 +4256,9 @@ mod tests {
             .unwrap();
         let unrelated_filters =
             serde_json::to_string(&vec![("status", "eq", "agent-object")]).unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO sekai_virtual_tables
                  (id,name,dataset_id,filters,columns,created)
@@ -4272,7 +4294,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_spans_stores_and_preserves_verifiable_tombstones() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (id, external_id) in [
             ("agent-object", "agent:erase-agent"),
             ("keep-object", "agent:keep-agent"),
@@ -4300,7 +4322,9 @@ mod tests {
             updated: 1,
         })
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "INSERT INTO sekai_grants (id,object_id,principal,role,created)
                  VALUES ('subject-object-grant','agent-object','agent:other','reader',1)",
@@ -4452,7 +4476,7 @@ mod tests {
         )
         .unwrap();
         {
-            let conn = db.conn();
+            let conn = db.as_sqlite().expect("sqlite").conn();
             for (request_id, context) in [
                 (
                     "erase-observation",
@@ -4527,7 +4551,9 @@ mod tests {
             .unwrap();
         db.budget_adjust_chain("project:p/agent:keep-agent", "tokens", 10, budget_time)
             .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute_batch(
                 "INSERT INTO chisei_budget_usage
                    (scope_id,metric,period_start,amount_used)
@@ -4846,7 +4872,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].evidence["subject_hash"], result.subject_hash);
 
-        let conn = db.conn();
+        let conn = db.as_sqlite().expect("sqlite").conn();
         let usage: String = conn
             .query_row(
                 "SELECT COALESCE(GROUP_CONCAT(data), '') FROM sekai_dataset_rows WHERE dataset_id='llm_calls'",
@@ -4880,7 +4906,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_refuses_to_launder_invalid_ledger() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.record_decision(&Decision {
             id: "tampered".into(),
             timestamp: 1,
@@ -4892,7 +4918,9 @@ mod tests {
             outcome: "ok".into(),
         })
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute(
                 "UPDATE sekai_decisions SET seq=NULL WHERE id='tampered'",
                 [],
@@ -4914,7 +4942,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_does_not_match_identifier_prefixes() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         for (id, agent) in [("exact", "agent1"), ("prefix", "agent10")] {
             db.record_decision(&Decision {
                 id: id.into(),
@@ -4992,8 +5020,10 @@ mod tests {
 
     #[test]
     fn work_unit_erasure_removes_coordination_state() {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.conn()
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute_batch(
                 "INSERT INTO sekai_work_units
                    (id,kind,actor,status,scope_id,created_at)
@@ -5027,7 +5057,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.work_units_deleted, 1);
-        let conn = db.conn();
+        let conn = db.as_sqlite().expect("sqlite").conn();
         for table in [
             "sekai_work_units",
             "sekai_reservations",
@@ -5052,8 +5082,8 @@ mod tests {
 
     #[test]
     fn user_erasure_removes_grants_and_credentials() {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.conn()
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.as_sqlite().expect("sqlite").conn()
             .execute_batch(
                 "INSERT INTO sekai_grants (id,object_id,principal,role,created)
                  VALUES ('grant','object','user:alice','reader',1);
@@ -5110,7 +5140,7 @@ mod tests {
         assert_eq!(result.audit_tombstoned, 1);
         assert!(store.maybe_reload(&db));
         assert!(store.resolve("secret").is_none());
-        let conn = db.conn();
+        let conn = db.as_sqlite().expect("sqlite").conn();
         let grants: i64 = conn
             .query_row("SELECT COUNT(*) FROM sekai_grants", [], |row| row.get(0))
             .unwrap();
@@ -5140,7 +5170,7 @@ mod tests {
 
     #[test]
     fn common_literal_subjects_require_attributable_value_context() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -5157,7 +5187,9 @@ mod tests {
             ],
         )
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute_batch(
                 "INSERT INTO sekai_task_observations
                  (request_id,namespace,component_id,model,status,timestamp,context_json)
@@ -5200,7 +5232,7 @@ mod tests {
 
     #[test]
     fn generic_subject_ids_do_not_match_unrelated_schema_keys() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
             name: "calls".into(),
@@ -5217,7 +5249,9 @@ mod tests {
             ],
         )
         .unwrap();
-        db.conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute_batch(
                 "INSERT INTO sekai_task_observations
                  (request_id,namespace,component_id,model,status,timestamp,context_json)
@@ -5269,8 +5303,8 @@ mod tests {
 
     #[test]
     fn agent_erasure_removes_agent_principal_state() {
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.conn()
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.as_sqlite().expect("sqlite").conn()
             .execute_batch(
                 "INSERT INTO sekai_grants (id,object_id,principal,role,created)
                  VALUES ('grant','object','project:default/agent:bot','writer',1);

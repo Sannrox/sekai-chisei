@@ -1,3 +1,5 @@
+use crate::db::runtime_db::RuntimeDb;
+#[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, REL_DEPENDS_ON};
 
@@ -10,7 +12,7 @@ pub struct PropagationTask {
 
 /// When a shared-library namespace is updated, find downstream namespaces that depend on it.
 pub fn on_namespace_task_done(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     namespace: &str,
     version: &str,
 ) -> Vec<PropagationTask> {
@@ -44,7 +46,7 @@ mod tests {
 
     #[test]
     fn test_propagation() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&Object {
             id: "lib".into(),
             kind: "namespace".into(),

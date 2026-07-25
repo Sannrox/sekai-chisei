@@ -1,3 +1,4 @@
+use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_MODEL, Object, REL_CONTAINS};
 use rusqlite::{OptionalExtension, params};
@@ -25,7 +26,7 @@ pub struct TaskObservationStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TaskObservationBaseline {
+pub struct TaskObservationBaseline {
     task_total: i32,
     task_succeeded: i32,
     consecutive_failures: i32,
@@ -167,7 +168,7 @@ impl SekaiDb {
             .map_err(|e| e.to_string())
     }
 
-    fn insert_task_observation_baseline(
+    pub(crate) fn insert_task_observation_baseline(
         &self,
         component_id: &str,
         namespace: &str,
@@ -192,7 +193,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    fn get_task_observation_baseline(
+    pub(crate) fn get_task_observation_baseline(
         &self,
         component_id: &str,
     ) -> Result<Option<TaskObservationBaseline>, String> {
@@ -233,7 +234,7 @@ fn row_to_task_observation(row: &rusqlite::Row) -> Result<TaskObservation, rusql
 }
 
 pub fn task_observation_stats(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     component_id: &str,
 ) -> Result<TaskObservationStats, String> {
     let observations = db.list_task_observations_for_component(component_id)?;
@@ -274,23 +275,23 @@ pub fn task_observation_stats(
     })
 }
 
-pub fn task_total(db: &SekaiDb, component_id: &str) -> Result<i32, String> {
+pub fn task_total(db: &RuntimeDb, component_id: &str) -> Result<i32, String> {
     Ok(task_observation_stats(db, component_id)?.task_total)
 }
 
-pub fn task_succeeded(db: &SekaiDb, component_id: &str) -> Result<i32, String> {
+pub fn task_succeeded(db: &RuntimeDb, component_id: &str) -> Result<i32, String> {
     Ok(task_observation_stats(db, component_id)?.task_succeeded)
 }
 
-pub fn success_rate(db: &SekaiDb, component_id: &str) -> Result<i32, String> {
+pub fn success_rate(db: &RuntimeDb, component_id: &str) -> Result<i32, String> {
     Ok(task_observation_stats(db, component_id)?.success_rate)
 }
 
-pub fn consecutive_failures(db: &SekaiDb, component_id: &str) -> Result<i32, String> {
+pub fn consecutive_failures(db: &RuntimeDb, component_id: &str) -> Result<i32, String> {
     Ok(task_observation_stats(db, component_id)?.consecutive_failures)
 }
 
-pub fn on_task_completed(db: &SekaiDb, event: &TaskCompletion) {
+pub fn on_task_completed(db: &RuntimeDb, event: &TaskCompletion) {
     let now = chrono::Utc::now().timestamp();
     let request_id = if event.request_id.trim().is_empty() {
         format!("generated:{}", uuid::Uuid::new_v4())
@@ -371,7 +372,7 @@ pub fn on_task_completed(db: &SekaiDb, event: &TaskCompletion) {
 }
 
 fn preserve_legacy_task_observation_baseline_if_needed(
-    db: &SekaiDb,
+    db: &RuntimeDb,
     comp: &Object,
     namespace: &str,
     timestamp: i64,
@@ -425,8 +426,8 @@ mod tests {
     use super::*;
     use crate::domain::Link;
 
-    fn setup() -> SekaiDb {
-        let db = SekaiDb::new(":memory:").unwrap();
+    fn setup() -> RuntimeDb {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let now = 0i64;
         db.create_object(&Object {
             id: "r1".into(),
@@ -700,7 +701,9 @@ mod tests {
             .unwrap();
         }
 
-        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ));
         let authenticated: bool = db
             .conn()
             .query_row(

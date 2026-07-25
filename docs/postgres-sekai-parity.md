@@ -1,7 +1,7 @@
 # Reusable Sekai PostgreSQL parity
 
-This note closes the parent reusable-Sekai PostgreSQL parity track. It does not
-activate the community process against PostgreSQL.
+This note closes the parent reusable-Sekai PostgreSQL parity track. Community
+PostgreSQL runtime selection is activated by #238.
 
 ## Outcome
 
@@ -35,12 +35,11 @@ Evidence is checked in as:
 
 - Chisei governed-decision and execution persistence (#237) — closed; see
   `docs/postgres-chisei-parity.md`
-- Community PostgreSQL runtime activation (#238)
+- Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
 - Tenant state, tenant RPCs, OIDC, and OAuth
 
 ## Operator posture
 
-SQLite remains the default community backend. PostgreSQL may be used for
-composition and isolated conformance. Public runtime selection of PostgreSQL
-still fails closed until the remaining Chisei and gateway surfaces can be
-advertised truthfully.
+SQLite remains the default community backend. Select PostgreSQL with
+`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for the complete reusable public
+control plane (see [configuration.md](configuration.md) and #238).

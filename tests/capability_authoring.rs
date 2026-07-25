@@ -7,6 +7,7 @@ use sekai_chisei::chisei::capability::{
 };
 use sekai_chisei::chisei::eval::{CaseResult, EvalStore, Run};
 use sekai_chisei::chisei::evolve::TaskRecord;
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 
 fn observation(
@@ -58,7 +59,9 @@ fn passing_run(proposal: &sekai_chisei::chisei::capability::CapabilityProposal) 
 
 #[test]
 fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
-    let db = SekaiDb::new(":memory:").expect("open in-memory database");
+    let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").expect("open in-memory database"),
+    ));
     let observations = vec![
         observation("task-1", "done", &["comment", "invented"], 1),
         observation("task-2", "done", &["comment"], 2),

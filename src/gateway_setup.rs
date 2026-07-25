@@ -974,6 +974,7 @@ pub fn key_usage() -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::db::runtime_db::RuntimeDb;
     use crate::db::sekai::SekaiDb;
     use crate::grpc::chisei_service::ChiseiServiceImpl;
     use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -1074,8 +1075,10 @@ mod tests {
         }
     }
 
-    async fn spawn_control_plane() -> (String, Arc<SekaiDb>) {
-        let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+    async fn spawn_control_plane() -> (String, Arc<RuntimeDb>) {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
 
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), test_config());
