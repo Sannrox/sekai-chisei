@@ -33,7 +33,9 @@ Evidence is checked in as:
 
 ## Still outside this parent
 
-- Chisei governed-decision and execution persistence (#237)
+- Chisei governed-decision and execution persistence (#237) — see
+  `docs/postgres-chisei-parity.md` for in-progress receipt/budget parity and
+  remaining learning/approval/gateway surfaces
 - Community PostgreSQL runtime activation (#238)
 - Tenant state, tenant RPCs, OIDC, and OAuth
 

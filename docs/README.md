@@ -57,6 +57,9 @@ in order.
 - [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
   tenant-free Sekai surface set, inventory evidence, and remaining runtime
   activation gates.
+- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — in-progress Chisei
+  decision/execution inventory, proven budget/receipt surfaces, and remaining
+  learning/approval/gateway work.
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
   enforcement.
 

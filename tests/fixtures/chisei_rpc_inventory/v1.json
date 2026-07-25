@@ -1,0 +1,834 @@
+{
+  "version": "chisei.rpc-inventory/v1",
+  "service": "ChiseiService+LlmService",
+  "proto": [
+    "proto/chisei.proto",
+    "proto/llm.proto"
+  ],
+  "entries": [
+    {
+      "rpc": "AuthorizeExternalAction",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ResolveExternalActionApproval",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "CancelExternalActionAuthorization",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "IssueExternalActionPermit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "VerifyExternalActionPermit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RedeemExternalActionPermit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RevokeExternalActionPermit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetExternalActionKillSwitch",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetExternalPermitPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "DelegateExternalActionPermit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "CheckBudget",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.budget"
+      ],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RecordUsage",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.budget"
+      ],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetBudgetLimit",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.budget"
+      ],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RecordPortfolioObservation",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.portfolio"
+      ],
+      "evidence": [
+        "src/db/postgres_portfolio.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetPortfolioFrontier",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.portfolio"
+      ],
+      "evidence": [
+        "src/db/postgres_portfolio.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetPortfolioObjective",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.portfolio"
+      ],
+      "evidence": [
+        "src/db/postgres_portfolio.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "AllocatePortfolio",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.portfolio"
+      ],
+      "evidence": [
+        "src/db/postgres_portfolio.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetNamespacePolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/graph_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ResolvePolicy",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "tests/graph_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ]
+    },
+    {
+      "rpc": "GetEffectivePolicySummary",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/graph_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ]
+    },
+    {
+      "rpc": "ListAvailableModels",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ]
+    },
+    {
+      "rpc": "SetNamespaceWorkerPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/graph_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "CheckEgress",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ]
+    },
+    {
+      "rpc": "RunPipeline",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.execution",
+        "chisei.policy",
+        "chisei.budget"
+      ]
+    },
+    {
+      "rpc": "ListPipelineRuns",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "RecordSampleObservation",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.observations"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RecordGatewayAudit",
+      "kind": "persistent",
+      "surfaces": [
+        "gateway.governance"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "PlanExecution",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget",
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "ExecutePlan",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ExecutePlanStream",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ReportOperationEvent",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "AuthorizeOperationReporter",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetOperationReceipt",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "QueryOperationStatistics",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "ListKiokuCandidates",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ReviewKiokuMemory",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "IssueGunshiRecommendations",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.learning",
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "RecordGunshiFeedback",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetGunshiScorecard",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.learning",
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "ReserveGatewayRequestAlias",
+      "kind": "persistent",
+      "surfaces": [
+        "gateway.governance",
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ClaimGatewayRequestAliasDispatch",
+      "kind": "persistent",
+      "surfaces": [
+        "gateway.governance",
+        "chisei.execution"
+      ],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetAffinity",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.portfolio"
+      ]
+    },
+    {
+      "rpc": "CreateEvalSuite",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ListEvalSuites",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "GetEvalSuite",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "CreateEvalRun",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetEvalRun",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "ListEvalRuns",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "TrackEvalIteration",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetLatestEvalIteration",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "ListEvalIterations",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "CompareRuns",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "GetEvidenceContextGate",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvalVariance",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvalModelCompare",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolveSuggest",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "EvolveEnhance",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "EvolveRecommend",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolveReport",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolvePatterns",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolveVariance",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolveAbResults",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "EvolveTemplates",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/db/postgres_eval.rs",
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ]
+    },
+    {
+      "rpc": "Chat",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget",
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "ChatStream",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget",
+        "chisei.execution"
+      ]
+    },
+    {
+      "rpc": "ResolveProvider",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "docs/postgres-chisei-parity.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget",
+        "chisei.execution"
+      ]
+    }
+  ],
+  "complete_chisei_surfaces": [
+    "chisei.budget",
+    "chisei.execution"
+  ],
+  "remaining_surfaces": [
+    "chisei.approvals",
+    "chisei.evaluation",
+    "chisei.learning",
+    "chisei.observations",
+    "chisei.policy",
+    "chisei.portfolio",
+    "gateway.governance"
+  ],
+  "prerequisite_issues": [
+    236
+  ],
+  "evidence_harnesses": [
+    "tests/chisei_execution_backend_conformance.rs",
+    "tests/chisei_budget_backend_conformance.rs",
+    "src/db/postgres_eval.rs",
+    "src/db/postgres_portfolio.rs",
+    "tests/graph_backend_conformance.rs",
+    "docs/postgres-chisei-parity.md",
+    "tests/chisei_postgres_inventory_conformance.rs",
+    "src/db/postgres_budget.rs",
+    "src/db/postgres_chisei_receipts.rs"
+  ],
+  "internal_surfaces": [
+    {
+      "surface": "chisei.budget",
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs"
+      ],
+      "note": "limits, usage, chain reservation, idempotent events, attributions"
+    },
+    {
+      "surface": "chisei.execution",
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
+      ],
+      "note": "operation receipts, reporter grants, gateway request aliases"
+    }
+  ]
+}
