@@ -194,7 +194,9 @@ fn profile_fixture_is_complete_and_on_disk() {
     }
     for (id, class) in expected {
         assert!(
-            actual.iter().any(|(a_id, a_class)| a_id == id && a_class == class),
+            actual
+                .iter()
+                .any(|(a_id, a_class)| a_id == id && a_class == class),
             "missing expected case {id}/{class}"
         );
     }
@@ -517,7 +519,10 @@ fn redeem_is_idempotent_across_retries() {
             3_001,
         )
         .unwrap();
-    assert_eq!(first, retry, "same idempotency key must return the same redemption");
+    assert_eq!(
+        first, retry,
+        "same idempotency key must return the same redemption"
+    );
     // Distinct key after the only slot is consumed must fail — proves the retry
     // did not leave an extra unconsumed slot, and also that the first redeem
     // did consume the single invocation.
