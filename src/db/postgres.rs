@@ -32,6 +32,8 @@ const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
 const CAPABILITY_PACKAGE_PARITY_SCHEMA: &str =
     include_str!("postgres/0015_capability_package_parity.sql");
 const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_namespace_parity.sql");
+const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
+    include_str!("postgres/0017_chisei_execution_parity.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -120,6 +122,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 16,
         name: "team_namespace_parity",
         sql: TEAM_NAMESPACE_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 17,
+        name: "chisei_execution_parity",
+        sql: CHISEI_EXECUTION_PARITY_SCHEMA,
     },
 ];
 
@@ -596,6 +603,26 @@ mod tests {
         for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
             assert!(!TEAM_NAMESPACE_PARITY_SCHEMA.contains(excluded));
         }
+        for table in [
+            "chisei_operation_receipts",
+            "chisei_gateway_request_aliases",
+            "chisei_budget_usage_events",
+            "chisei_budget_attributions",
+            "chisei_kioku_memories",
+            "chisei_external_action_authorizations",
+            "chisei_external_action_permits",
+        ] {
+            assert!(
+                CHISEI_EXECUTION_PARITY_SCHEMA
+                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL table {table}"
+            );
+        }
+        for excluded in ["tenant", "oauth", "oidc"] {
+            assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains(excluded));
+        }
+        assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("AUTOINCREMENT"));
+        assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("INSERT OR"));
     }
 
     #[test]
