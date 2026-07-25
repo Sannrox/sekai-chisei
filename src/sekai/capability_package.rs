@@ -135,7 +135,7 @@ fn valid_version(value: &str) -> bool {
     parse_package_version(value).is_some()
 }
 
-fn parse_package_version(value: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_package_version(value: &str) -> Option<(u64, u64, u64)> {
     let mut parts = value.split('.');
     let version = (
         parts.next()?.parse().ok()?,
@@ -626,9 +626,20 @@ impl SekaiDb {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     }
+
+    pub fn list_capability_package_decisions(
+        &self,
+        namespace: &str,
+        package_name: &str,
+    ) -> Result<Vec<Decision>, String> {
+        self.list_decisions(&crate::sekai::audit::DecisionFilter {
+            target_id: Some(format!("capability-package:{namespace}:{package_name}")),
+            ..crate::sekai::audit::DecisionFilter::default()
+        })
+    }
 }
 
-fn run_eval_suites(manifest: &CapabilityPackageManifest) -> Result<usize, String> {
+pub(crate) fn run_eval_suites(manifest: &CapabilityPackageManifest) -> Result<usize, String> {
     let mut checks_run = 0;
     for suite in manifest
         .components
@@ -666,7 +677,11 @@ fn run_eval_suites(manifest: &CapabilityPackageManifest) -> Result<usize, String
     Ok(checks_run)
 }
 
-fn validate_context(namespace: &str, actor: &str, request_id: &str) -> Result<(), String> {
+pub(crate) fn validate_context(
+    namespace: &str,
+    actor: &str,
+    request_id: &str,
+) -> Result<(), String> {
     if namespace.trim().is_empty() || actor.trim().is_empty() || request_id.trim().is_empty() {
         return Err("namespace, actor, and request_id are required".into());
     }
@@ -775,7 +790,7 @@ fn replay(
     }
 }
 
-fn request_digest(
+pub(crate) fn request_digest(
     action: &str,
     namespace: &str,
     manifest: &CapabilityPackageManifest,
@@ -788,7 +803,7 @@ fn request_digest(
     ))
 }
 
-fn simple_request_digest(action: &str, namespace: &str, package_name: &str) -> String {
+pub(crate) fn simple_request_digest(action: &str, namespace: &str, package_name: &str) -> String {
     format!(
         "sha256:{:x}",
         Sha256::digest(format!("{action}\0{namespace}\0{package_name}"))
