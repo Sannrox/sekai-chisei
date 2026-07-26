@@ -92,6 +92,24 @@ impl PolicyResolver {
         }
     }
 
+    /// Receipt attributes for a residency decision.
+    pub fn residency_receipt_attributes(
+        &self,
+        decision: &ResidencyDecision,
+    ) -> std::collections::BTreeMap<String, String> {
+        // Attribute projection is pure over the decision; use a default policy
+        // shell for the helper on ResidencyPolicy.
+        ResidencyPolicy {
+            policy_id: decision.policy_id.clone(),
+            version: decision.policy_version.clone(),
+            allowed_regions: Default::default(),
+            provider_regions: Default::default(),
+            model_regions: Default::default(),
+            allowed_data_classes: Default::default(),
+        }
+        .receipt_attributes(decision)
+    }
+
     pub fn effective_policy(&self, namespace: &str) -> Option<Policy> {
         self.namespace_policies
             .lock()
