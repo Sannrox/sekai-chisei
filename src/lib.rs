@@ -1,5 +1,6 @@
 pub mod action_cli;
 pub mod attest_cli;
+pub mod capability_codegen;
 pub mod capability_projection;
 pub mod chisei;
 pub mod compat_shims;
