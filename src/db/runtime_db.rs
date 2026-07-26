@@ -2676,6 +2676,54 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_peer_trust_root(
+        &self,
+        root: &crate::sekai::peer_import::PeerTrustRoot,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_peer_trust_root(root),
+            Self::Postgres(_) => {
+                Err("put_peer_trust_root is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
+    pub fn list_peer_trust_roots(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::peer_import::PeerTrustRoot>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_peer_trust_roots(namespace),
+            Self::Postgres(_) => Err(
+                "list_peer_trust_roots is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn put_peer_import(
+        &self,
+        record: &crate::sekai::peer_import::PeerImportRecord,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_peer_import(record),
+            Self::Postgres(_) => {
+                Err("put_peer_import is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
+    pub fn get_peer_import(
+        &self,
+        import_id: &str,
+    ) -> Result<Option<crate::sekai::peer_import::PeerImportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_peer_import(import_id),
+            Self::Postgres(_) => {
+                Err("get_peer_import is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),
