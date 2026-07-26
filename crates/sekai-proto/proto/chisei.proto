@@ -526,6 +526,53 @@ message ResolvePolicyRequest {
 }
 message ResolvePolicyResponse { PolicyResolution resolution = 1; }
 
+// Historical policy dry-run against stored operation receipts (#282).
+// Candidate policy is supplied in the request and is never activated.
+message DryRunNamespacePolicyRequest {
+  string namespace = 1;
+  int64 start_timestamp_ms = 2;
+  int64 end_timestamp_ms = 3;
+  repeated string allowed_runtimes = 4;
+  repeated string allowed_models = 5;
+  string default_runtime = 6;
+  string default_model = 7;
+  string data_class = 8;
+  string request_id = 9;
+}
+message DryRunNamespacePolicyCounts {
+  uint32 evaluated = 1;
+  uint32 unchanged = 2;
+  uint32 re_routed = 3;
+  uint32 would_deny = 4;
+  uint32 would_allow = 5;
+  uint32 insufficient_history = 6;
+}
+message DryRunNamespacePolicySample {
+  string delta_class = 1;
+  repeated string operation_ids = 2;
+}
+message DryRunNamespacePolicyResult {
+  string operation_id = 1;
+  string delta_class = 2;
+  string historical_outcome = 3;
+  string candidate_outcome = 4;
+  string historical_runtime = 5;
+  string historical_model = 6;
+  string candidate_runtime = 7;
+  string candidate_model = 8;
+  string detail = 9;
+}
+message DryRunNamespacePolicyResponse {
+  string namespace = 1;
+  int64 start_timestamp_ms = 2;
+  int64 end_timestamp_ms = 3;
+  string candidate_policy_version = 4;
+  DryRunNamespacePolicyCounts counts = 5;
+  repeated DryRunNamespacePolicySample samples = 6;
+  // Bounded per-receipt results (capped server-side).
+  repeated DryRunNamespacePolicyResult results = 7;
+}
+
 message GetEffectivePolicySummaryRequest { string namespace = 1; }
 message ListAvailableModelsRequest {
   string namespace = 1;
@@ -1158,6 +1205,8 @@ service ChiseiService {
   // Model Policy
   rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
   rpc ResolvePolicy(ResolvePolicyRequest) returns (ResolvePolicyResponse);
+  // Read-only historical dry-run of a candidate policy over stored receipts.
+  rpc DryRunNamespacePolicy(DryRunNamespacePolicyRequest) returns (DryRunNamespacePolicyResponse);
   // Read-only, operator-safe live projection of effective namespace policy.
   rpc GetEffectivePolicySummary(GetEffectivePolicySummaryRequest) returns (GetEffectivePolicySummaryResponse);
   // Compact namespace-authorized projection of the governed routing availability map.
