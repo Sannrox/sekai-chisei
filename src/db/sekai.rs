@@ -1305,10 +1305,25 @@ impl SekaiDb {
             &l.to_id,
             &l.relation,
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
-            params![l.id, l.from_id, l.to_id, l.relation, l.created],
-        ).map_err(|e| e.to_string())?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|e| e.to_string())?
+            == 1;
+        if inserted {
+            // Namespace for relation history follows the from-object when present.
+            let namespace = link_namespace_tx(&transaction, &l.from_id)?;
+            crate::sekai::temporal::retain_link_history_in_tx(
+                &transaction,
+                None,
+                Some(l),
+                &namespace,
+                "system",
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+        }
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -1328,14 +1343,55 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?
             == 1;
+        if inserted {
+            let namespace = link_namespace_tx(&transaction, &l.from_id)?;
+            crate::sekai::temporal::retain_link_history_in_tx(
+                &transaction,
+                None,
+                Some(l),
+                &namespace,
+                "system",
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+        }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(inserted)
     }
 
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Link {
+                        id: row.get(0)?,
+                        from_id: row.get(1)?,
+                        to_id: row.get(2)?,
+                        relation: row.get(3)?,
+                        created: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
             .map_err(|e| e.to_string())?;
+        transaction
+            .execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        if let Some(link) = existing {
+            let namespace = link_namespace_tx(&transaction, &link.from_id)?;
+            crate::sekai::temporal::retain_link_history_in_tx(
+                &transaction,
+                Some(&link),
+                None,
+                &namespace,
+                "system",
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1858,6 +1914,19 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
         relation: row.get(3)?,
         created: row.get(4)?,
     })
+}
+
+/// Resolve the namespace used for relation history. Prefers the from-object
+/// namespace; falls back to empty (global) when the object is absent.
+fn link_namespace_tx(tx: &rusqlite::Transaction<'_>, from_id: &str) -> Result<String, String> {
+    tx.query_row(
+        "SELECT namespace FROM sekai_objects WHERE id = ?1",
+        params![from_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+    .map(|ns| ns.unwrap_or_default())
 }
 
 #[cfg(test)]
