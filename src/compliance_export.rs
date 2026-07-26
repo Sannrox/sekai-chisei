@@ -460,6 +460,10 @@ fn redact_event(event: &mut OperationReceiptEvent) {
 fn redact_decision_record(decision: &mut ComplianceDecisionRecord) {
     let keys: Vec<String> = decision.evidence.keys().cloned().collect();
     for key in keys {
+        // Keep structural attribution fields so offline verify still works.
+        if key == "namespace" || key == "project" {
+            continue;
+        }
         if let Some(value) = decision.evidence.get_mut(&key)
             && looks_sensitive(&key, value)
         {
