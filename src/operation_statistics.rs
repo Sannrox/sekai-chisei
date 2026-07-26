@@ -42,12 +42,26 @@ pub struct LearningCounts {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutcomeAttributedSpend {
+    /// Priced model spend attributed to each logical-operation outcome class.
+    pub by_outcome: BTreeMap<String, i64>,
+    /// Priced model spend attributed to (capability, outcome) pairs.
+    /// Capability is the receipt `operation_class` when present, else `"unknown"`.
+    pub by_capability_outcome: BTreeMap<(String, String), i64>,
+    /// Mean priced spend for verified logical operations (0 when none verified).
+    pub cost_per_verified_usd_micros: i64,
+    /// Mean priced spend for failed logical operations (0 when none failed).
+    pub cost_per_failed_usd_micros: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OperationStatistics {
     pub totals: StatisticsTotals,
     pub daily_spend: BTreeMap<String, i64>,
     pub namespace_model_spend: BTreeMap<(String, String), i64>,
     pub outcomes: OutcomeCounts,
     pub learning: LearningCounts,
+    pub outcome_spend: OutcomeAttributedSpend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +72,19 @@ enum OutcomeClass {
     Rejected,
     Unverified,
     Unknown,
+}
+
+impl OutcomeClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            OutcomeClass::Verified => "verified",
+            OutcomeClass::Failed => "failed",
+            OutcomeClass::Parked => "parked",
+            OutcomeClass::Rejected => "rejected",
+            OutcomeClass::Unverified => "unverified",
+            OutcomeClass::Unknown => "unknown",
+        }
+    }
 }
 
 pub fn query_operation_statistics(
@@ -77,11 +104,19 @@ pub fn query_operation_statistics(
         HashMap::new();
     let mut logical_waiting: HashMap<(String, String), (i64, String, bool, i64)> = HashMap::new();
     let mut logical_operations = HashSet::new();
+    // Sum priced model spend per logical operation (all attempts in-window), then
+    // attribute that total to the winning outcome class for the logical op.
+    // Capability spend is tracked per (logical, capability) so multi-attempt
+    // receipts with different operation_class values are not collapsed to the
+    // first receipt's capability.
+    let mut logical_priced_spend: HashMap<(String, String), i64> = HashMap::new();
+    let mut logical_capability_spend: HashMap<(String, String, String), i64> = HashMap::new();
 
     for receipt in &receipts {
         let logical_id = logical_operation_id(receipt);
         let logical_key = (receipt.namespace.clone(), logical_id);
         logical_operations.insert(logical_key.clone());
+        let capability = receipt_capability(receipt);
         let route_model = receipt
             .events
             .iter()
@@ -109,6 +144,15 @@ pub fn query_operation_statistics(
                         statistics.totals.priced_model_calls += 1;
                         statistics.totals.total_cost_usd_micros =
                             statistics.totals.total_cost_usd_micros.saturating_add(cost);
+                        let spend = logical_priced_spend.entry(logical_key.clone()).or_default();
+                        *spend = spend.saturating_add(cost);
+                        let cap_key = (
+                            logical_key.0.clone(),
+                            logical_key.1.clone(),
+                            capability.clone(),
+                        );
+                        let cap_spend = logical_capability_spend.entry(cap_key).or_default();
+                        *cap_spend = cap_spend.saturating_add(cost);
                         if let Some(day) = utc_day(event.timestamp_ms) {
                             let total = statistics.daily_spend.entry(day).or_default();
                             *total = total.saturating_add(cost);
@@ -163,7 +207,11 @@ pub fn query_operation_statistics(
         }
     }
     statistics.totals.logical_operations = logical_operations.len() as i64;
-    for (_, _, outcome) in logical_outcomes.into_values() {
+    let mut verified_spend = 0_i64;
+    let mut failed_spend = 0_i64;
+    let mut resolved_logical_keys = HashSet::new();
+    for (logical_key, (_, _, outcome)) in &logical_outcomes {
+        resolved_logical_keys.insert(logical_key.clone());
         match outcome {
             OutcomeClass::Verified => statistics.outcomes.verified += 1,
             OutcomeClass::Failed => statistics.outcomes.failed += 1,
@@ -172,6 +220,53 @@ pub fn query_operation_statistics(
             OutcomeClass::Unverified => statistics.outcomes.unverified += 1,
             OutcomeClass::Unknown => statistics.outcomes.unknown += 1,
         }
+        let spend = logical_priced_spend.get(logical_key).copied().unwrap_or(0);
+        let outcome_label = outcome.as_str();
+        let bucket = statistics
+            .outcome_spend
+            .by_outcome
+            .entry(outcome_label.into())
+            .or_default();
+        *bucket = bucket.saturating_add(spend);
+        match outcome {
+            OutcomeClass::Verified => verified_spend = verified_spend.saturating_add(spend),
+            OutcomeClass::Failed => failed_spend = failed_spend.saturating_add(spend),
+            _ => {}
+        }
+    }
+    for ((namespace, logical_id, capability), spend) in logical_capability_spend {
+        let logical_key = (namespace, logical_id);
+        let outcome_label = logical_outcomes
+            .get(&logical_key)
+            .map(|(_, _, outcome)| outcome.as_str())
+            .unwrap_or(OutcomeClass::Unknown.as_str());
+        let cap_bucket = statistics
+            .outcome_spend
+            .by_capability_outcome
+            .entry((capability, outcome_label.into()))
+            .or_default();
+        *cap_bucket = cap_bucket.saturating_add(spend);
+    }
+    // Logical ops with priced spend but no outcome classification still must not
+    // vanish — attribute the total to the explicit `unknown` bucket once.
+    for (logical_key, spend) in logical_priced_spend {
+        if resolved_logical_keys.contains(&logical_key) {
+            continue;
+        }
+        let bucket = statistics
+            .outcome_spend
+            .by_outcome
+            .entry(OutcomeClass::Unknown.as_str().into())
+            .or_default();
+        *bucket = bucket.saturating_add(spend);
+    }
+    if statistics.outcomes.verified > 0 {
+        statistics.outcome_spend.cost_per_verified_usd_micros =
+            verified_spend / statistics.outcomes.verified;
+    }
+    if statistics.outcomes.failed > 0 {
+        statistics.outcome_spend.cost_per_failed_usd_micros =
+            failed_spend / statistics.outcomes.failed;
     }
     for (_, _, waiting, waiting_ms) in logical_waiting.into_values() {
         if waiting {
@@ -183,6 +278,15 @@ pub fn query_operation_statistics(
     statistics.learning.learnings_admitted =
         active_admissions_in_window(db, namespaces, start_timestamp_ms, end_timestamp_ms)?;
     Ok(statistics)
+}
+
+fn receipt_capability(receipt: &OperationReceipt) -> String {
+    let class = receipt.operation_class.trim();
+    if class.is_empty() {
+        "unknown".into()
+    } else {
+        class.to_string()
+    }
 }
 
 fn list_receipts_in_window(
@@ -638,7 +742,170 @@ mod tests {
         assert_eq!(statistics.outcomes.failed, 0);
         assert_eq!(statistics.learning.enrichments_served, 1);
         assert_eq!(statistics.learning.escalations_answered, 1);
+        // logical-1 attempts cost 100+250=350 and the winning outcome is verified.
+        assert_eq!(
+            statistics.outcome_spend.by_outcome.get("verified"),
+            Some(&350)
+        );
+        // Rejected beta call was unpriced, so no spend under rejected.
+        assert_eq!(
+            statistics
+                .outcome_spend
+                .by_outcome
+                .get("rejected")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(statistics.outcome_spend.cost_per_verified_usd_micros, 350);
+        assert_eq!(statistics.outcome_spend.cost_per_failed_usd_micros, 0);
+        assert_eq!(
+            statistics
+                .outcome_spend
+                .by_capability_outcome
+                .get(&("test".into(), "verified".into())),
+            Some(&350)
+        );
         assert!(!format!("{statistics:?}").contains("secret-memory-body"));
+    }
+
+    #[test]
+    fn attributes_priced_spend_to_outcome_classes_and_capabilities() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let mut success = receipt(
+            "success-1",
+            "alpha",
+            100,
+            Some(150),
+            vec![
+                event(
+                    "success-1",
+                    0,
+                    100,
+                    ReceiptEventKind::IntentRecorded,
+                    &[("logical_operation_id", "op-success")],
+                ),
+                event(
+                    "success-1",
+                    1,
+                    120,
+                    ReceiptEventKind::ModelCalled,
+                    &[("model", "m1"), ("cost_usd_micros", "200")],
+                ),
+                event(
+                    "success-1",
+                    2,
+                    140,
+                    ReceiptEventKind::VerificationRecorded,
+                    &[("verdict", "passed")],
+                ),
+                event(
+                    "success-1",
+                    3,
+                    150,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("status", "completed")],
+                ),
+            ],
+        );
+        success.operation_class = "capability.write".into();
+        db.put_operation_receipt(&success).unwrap();
+
+        let mut failed = receipt(
+            "failed-1",
+            "alpha",
+            200,
+            Some(240),
+            vec![
+                event(
+                    "failed-1",
+                    0,
+                    200,
+                    ReceiptEventKind::IntentRecorded,
+                    &[("logical_operation_id", "op-failed")],
+                ),
+                event(
+                    "failed-1",
+                    1,
+                    210,
+                    ReceiptEventKind::ModelCalled,
+                    &[("model", "m1"), ("cost_usd_micros", "50")],
+                ),
+                event(
+                    "failed-1",
+                    2,
+                    220,
+                    ReceiptEventKind::ModelCalled,
+                    &[("model", "m1"), ("cost_usd_micros", "50")],
+                ),
+                event(
+                    "failed-1",
+                    3,
+                    240,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("status", "failed")],
+                ),
+            ],
+        );
+        failed.operation_class = "capability.write".into();
+        db.put_operation_receipt(&failed).unwrap();
+
+        // Incomplete receipt with cost but no outcome → explicit unknown bucket.
+        let mut dangling = receipt(
+            "dangling-1",
+            "alpha",
+            300,
+            None,
+            vec![event(
+                "dangling-1",
+                0,
+                310,
+                ReceiptEventKind::ModelCalled,
+                &[("model", "m2"), ("cost_usd_micros", "75")],
+            )],
+        );
+        dangling.operation_class = "capability.read".into();
+        db.put_operation_receipt(&dangling).unwrap();
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 0, 1_000).unwrap();
+        assert_eq!(statistics.outcomes.verified, 1);
+        assert_eq!(statistics.outcomes.failed, 1);
+        assert_eq!(statistics.outcomes.unknown, 1);
+        assert_eq!(
+            statistics.outcome_spend.by_outcome.get("verified"),
+            Some(&200)
+        );
+        assert_eq!(
+            statistics.outcome_spend.by_outcome.get("failed"),
+            Some(&100)
+        );
+        assert_eq!(
+            statistics.outcome_spend.by_outcome.get("unknown"),
+            Some(&75)
+        );
+        assert_eq!(statistics.outcome_spend.cost_per_verified_usd_micros, 200);
+        assert_eq!(statistics.outcome_spend.cost_per_failed_usd_micros, 100);
+        assert_eq!(
+            statistics
+                .outcome_spend
+                .by_capability_outcome
+                .get(&("capability.write".into(), "verified".into())),
+            Some(&200)
+        );
+        assert_eq!(
+            statistics
+                .outcome_spend
+                .by_capability_outcome
+                .get(&("capability.write".into(), "failed".into())),
+            Some(&100)
+        );
+        assert_eq!(
+            statistics
+                .outcome_spend
+                .by_capability_outcome
+                .get(&("capability.read".into(), "unknown".into())),
+            Some(&75)
+        );
     }
 
     #[test]

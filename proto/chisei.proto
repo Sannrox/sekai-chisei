@@ -786,6 +786,15 @@ message QueryOperationStatisticsResponse {
   repeated OperationStatisticValue spend_caps = 4;
   OperationOutcomeCounts outcomes = 5;
   OperationLearningCounts learning = 6;
+  // Priced model spend attributed to logical-operation outcome classes
+  // (labels.outcome = verified|failed|parked|rejected|unverified|unknown).
+  repeated OperationStatisticValue outcome_spend = 7;
+  // Priced model spend attributed to capability × outcome
+  // (labels.capability + labels.outcome).
+  repeated OperationStatisticValue capability_outcome_spend = 8;
+  // Mean priced spend for verified / failed logical operations (0 when empty).
+  int64 cost_per_verified_usd_micros = 9;
+  int64 cost_per_failed_usd_micros = 10;
 }
 
 message GetAffinityRequest {
