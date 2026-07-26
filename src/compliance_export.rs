@@ -475,13 +475,29 @@ fn looks_sensitive(key: &str, value: &str) -> bool {
         || lower.contains("body")
         || lower.contains("content")
         || lower.contains("payload")
+        || lower.contains("credential")
+        || lower.contains("bearer")
     {
         return true;
     }
-    value.len() > 512
-        || value.contains("sk-")
-        || value.contains("ghp_")
-        || value.contains("BEGIN PRIVATE KEY")
+    if value.len() > 512 || value.to_ascii_uppercase().contains("BEGIN PRIVATE KEY") {
+        return true;
+    }
+    let value_lower = value.to_ascii_lowercase();
+    [
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "bearer ",
+        "akia",
+        "asia",
+    ]
+    .iter()
+    .any(|prefix| value_lower.contains(prefix))
+        || (value_lower.starts_with("eyj") && value_lower.matches('.').count() == 2)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
