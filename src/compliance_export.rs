@@ -477,18 +477,29 @@ pub fn export_compliance_from_db(
     exported_at_ms: i64,
 ) -> Result<ComplianceExportBundle, String> {
     validate_request(request)?;
-    let receipts = db.list_operation_receipts_in_window(
+    // Fetch limit+1 so silent truncation is impossible.
+    let mut receipts = db.list_operation_receipts_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
-        MAX_COMPLIANCE_RECEIPTS,
+        MAX_COMPLIANCE_RECEIPTS.saturating_add(1),
     )?;
-    let decisions = db.list_compliance_decisions_in_window(
+    if receipts.len() > MAX_COMPLIANCE_RECEIPTS {
+        return Err(format!(
+            "compliance export receipt limit exceeded ({MAX_COMPLIANCE_RECEIPTS}); narrow the time window"
+        ));
+    }
+    let mut decisions = db.list_compliance_decisions_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
-        MAX_COMPLIANCE_DECISIONS,
+        MAX_COMPLIANCE_DECISIONS.saturating_add(1),
     )?;
+    if decisions.len() > MAX_COMPLIANCE_DECISIONS {
+        return Err(format!(
+            "compliance export decision limit exceeded ({MAX_COMPLIANCE_DECISIONS}); narrow the time window"
+        ));
+    }
     build_compliance_export(request, receipts, decisions, exported_at_ms)
 }
 
