@@ -526,6 +526,93 @@
       ]
     },
     {
+      "rpc": "InstallGunshiAllocationBaseline",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "PromoteGunshiAllocationPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/chisei/gunshi_policy.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "RollbackGunshiAllocationPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetGunshiAutoOptIn",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "SetGunshiAllocationKillSwitch",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetGunshiAllocationStatus",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.learning"
+      ]
+    },
+    {
+      "rpc": "AuthorizeGunshiAutoDispatch",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/chisei/gunshi_dispatch.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.learning",
+        "chisei.execution"
+      ]
+    },
+    {
       "rpc": "ReserveGatewayRequestAlias",
       "kind": "persistent",
       "surfaces": [

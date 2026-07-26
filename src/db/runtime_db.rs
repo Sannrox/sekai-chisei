@@ -1852,6 +1852,39 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_gunshi_allocation_state(namespace),
+            Self::Postgres(_) => Err(
+                "get_gunshi_allocation_state is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn put_gunshi_allocation_state_cas(
+        &self,
+        namespace: &str,
+        revision_id: &str,
+        changed_at_ms: i64,
+        state_json: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.put_gunshi_allocation_state_cas(
+                namespace,
+                revision_id,
+                changed_at_ms,
+                state_json,
+                expected_revision,
+            ),
+            Self::Postgres(_) => Err(
+                "put_gunshi_allocation_state_cas is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn put_external_action_authorization(
         &self,
         record: &AuthorizationRecord,

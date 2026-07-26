@@ -7301,6 +7301,195 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn install_gunshi_allocation_baseline(
+        &self,
+        req: Request<InstallGunshiAllocationBaselineRequest>,
+    ) -> Result<Response<InstallGunshiAllocationBaselineResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let snapshot: crate::chisei::gunshi_policy::AllocationPolicySnapshot =
+            serde_json::from_str(&input.snapshot_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid allocation snapshot: {error}"))
+            })?;
+        let gate: crate::chisei::gunshi_policy::PolicyEvaluationGate =
+            serde_json::from_str(&input.gate_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid evaluation gate: {error}"))
+            })?;
+        let status = crate::chisei::gunshi_auto::install_baseline(
+            &self.db,
+            &actor,
+            &input.namespace,
+            snapshot,
+            gate,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(InstallGunshiAllocationBaselineResponse {
+            status_json: serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn promote_gunshi_allocation_policy(
+        &self,
+        req: Request<PromoteGunshiAllocationPolicyRequest>,
+    ) -> Result<Response<PromoteGunshiAllocationPolicyResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let candidate: crate::chisei::gunshi_policy::AllocationPolicySnapshot =
+            serde_json::from_str(&input.candidate_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid candidate snapshot: {error}"))
+            })?;
+        let baseline: crate::chisei::gunshi_policy::PolicyEvaluation =
+            serde_json::from_str(&input.baseline_evaluation_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid baseline evaluation: {error}"))
+            })?;
+        let candidate_evaluation: crate::chisei::gunshi_policy::PolicyEvaluation =
+            serde_json::from_str(&input.candidate_evaluation_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid candidate evaluation: {error}"))
+            })?;
+        let status = crate::chisei::gunshi_auto::promote(
+            &self.db,
+            crate::chisei::gunshi_auto::PromoteRequest {
+                actor,
+                namespace: input.namespace,
+                candidate,
+                baseline,
+                candidate_evaluation,
+                expected_revision: input.expected_revision,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(PromoteGunshiAllocationPolicyResponse {
+            status_json: serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn rollback_gunshi_allocation_policy(
+        &self,
+        req: Request<RollbackGunshiAllocationPolicyRequest>,
+    ) -> Result<Response<RollbackGunshiAllocationPolicyResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let status = crate::chisei::gunshi_auto::rollback(
+            &self.db,
+            &actor,
+            &input.namespace,
+            &input.expected_revision,
+            &input.reason,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(RollbackGunshiAllocationPolicyResponse {
+            status_json: serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn set_gunshi_auto_opt_in(
+        &self,
+        req: Request<SetGunshiAutoOptInRequest>,
+    ) -> Result<Response<SetGunshiAutoOptInResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let status = crate::chisei::gunshi_auto::set_auto_opt_in(
+            &self.db,
+            &actor,
+            &input.namespace,
+            input.opt_in,
+            &input.expected_revision,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(SetGunshiAutoOptInResponse {
+            status_json: serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn set_gunshi_allocation_kill_switch(
+        &self,
+        req: Request<SetGunshiAllocationKillSwitchRequest>,
+    ) -> Result<Response<SetGunshiAllocationKillSwitchResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let status = crate::chisei::gunshi_auto::set_kill_switch(
+            &self.db,
+            &actor,
+            &input.namespace,
+            input.enabled,
+            &input.reason,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(SetGunshiAllocationKillSwitchResponse {
+            status_json: serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn get_gunshi_allocation_status(
+        &self,
+        req: Request<GetGunshiAllocationStatusRequest>,
+    ) -> Result<Response<GetGunshiAllocationStatusResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let namespace = req.get_ref().namespace.clone();
+        require_namespace_access(&self.db, &actor, &namespace)?;
+        let status = crate::chisei::gunshi_auto::get_status(&self.db, &namespace)
+            .map_err(Status::internal)?;
+        let status_json = match status {
+            Some(status) => serde_json::to_string(&status)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            None => "{}".into(),
+        };
+        Ok(Response::new(GetGunshiAllocationStatusResponse {
+            status_json,
+        }))
+    }
+
+    async fn authorize_gunshi_auto_dispatch(
+        &self,
+        req: Request<AuthorizeGunshiAutoDispatchRequest>,
+    ) -> Result<Response<AuthorizeGunshiAutoDispatchResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_access(&self.db, &actor, &input.namespace)?;
+        let plan: crate::chisei::gunshi::AllocationPlan = serde_json::from_str(&input.plan_json)
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid allocation plan: {error}"))
+            })?;
+        let operation: crate::chisei::gunshi::PendingOperation =
+            serde_json::from_str(&input.operation_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid pending operation: {error}"))
+            })?;
+        let capacity: crate::chisei::gunshi::CapacityEnvelope =
+            serde_json::from_str(&input.capacity_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid capacity envelope: {error}"))
+            })?;
+        let (authorization, attributes) =
+            crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
+                &self.db,
+                &input.namespace,
+                &plan,
+                &operation,
+                &capacity,
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(AuthorizeGunshiAutoDispatchResponse {
+            authorization_json: serde_json::to_string(&authorization)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            receipt_attributes_json: serde_json::to_string(&attributes)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
     async fn review_kioku_memory(
         &self,
         req: Request<ReviewKiokuMemoryRequest>,
