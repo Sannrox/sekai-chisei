@@ -101,23 +101,25 @@ pub fn snapshot_from_receipt(receipt: &OperationReceipt) -> HistoricalRouteSnaps
     let historical_runtime = route
         .and_then(|event| attr(event, &["runtime", "provider", "resolved_runtime"]))
         .unwrap_or_default();
+    // Prefer original request fields when present. Older receipts that only
+    // store the resolved route cannot recover the pre-policy request, so
+    // leave preferences empty and classify as insufficient history below.
     let preferred_model = route
         .and_then(|event| attr(event, &["preferred_model", "requested_model"]))
-        .unwrap_or_else(|| historical_model.clone());
+        .unwrap_or_default();
     let preferred_runtime = route
         .and_then(|event| attr(event, &["preferred_runtime", "requested_runtime"]))
-        .unwrap_or_else(|| historical_runtime.clone());
+        .unwrap_or_default();
 
     let historical_outcome = policy
-        .and_then(|event| attr(event, &["outcome", "decision", "result"]))
-        .map(|value| classify_historical_outcome(&value))
-        .unwrap_or_else(|| {
-            if historical_model.is_empty() && historical_runtime.is_empty() {
-                HistoricalOutcomeClass::Unknown
-            } else {
-                HistoricalOutcomeClass::Allowed
+        .and_then(|event| {
+            if let Some(executable) = attr(event, &["executable"]) {
+                return Some(classify_executable(&executable));
             }
-        });
+            attr(event, &["outcome", "decision", "result"])
+                .map(|value| classify_historical_outcome(&value))
+        })
+        .unwrap_or(HistoricalOutcomeClass::Unknown);
 
     HistoricalRouteSnapshot {
         operation_id: receipt.operation_id.clone(),
@@ -137,6 +139,19 @@ pub fn evaluate_snapshot_against_policy(
     snapshot: &HistoricalRouteSnapshot,
     candidate: &Policy,
 ) -> DryRunReceiptResult {
+    if snapshot.preferred_model.trim().is_empty() && snapshot.preferred_runtime.trim().is_empty() {
+        return DryRunReceiptResult {
+            operation_id: snapshot.operation_id.clone(),
+            delta: DryRunDeltaClass::InsufficientHistory,
+            historical_outcome: snapshot.historical_outcome,
+            candidate_outcome: None,
+            historical_runtime: snapshot.historical_runtime.clone(),
+            historical_model: snapshot.historical_model.clone(),
+            candidate_runtime: String::new(),
+            candidate_model: String::new(),
+            detail: "receipt lacks preferred_runtime/preferred_model for accurate dry-run".into(),
+        };
+    }
     let resolver = PolicyResolver::new();
     match resolver.apply_policy(
         candidate,
@@ -295,10 +310,20 @@ fn receipt_in_window(
 fn classify_historical_outcome(value: &str) -> HistoricalOutcomeClass {
     let lower = value.trim().to_ascii_lowercase();
     match lower.as_str() {
-        "allow" | "allowed" | "succeeded" | "success" | "ok" => HistoricalOutcomeClass::Allowed,
-        "deny" | "denied" | "reject" | "rejected" | "failed" | "fail" => {
+        "allow" | "allowed" | "succeeded" | "success" | "ok" | "true" => {
+            HistoricalOutcomeClass::Allowed
+        }
+        "deny" | "denied" | "reject" | "rejected" | "failed" | "fail" | "false" => {
             HistoricalOutcomeClass::Denied
         }
+        _ => HistoricalOutcomeClass::Unknown,
+    }
+}
+
+fn classify_executable(value: &str) -> HistoricalOutcomeClass {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => HistoricalOutcomeClass::Allowed,
+        "false" | "0" | "no" => HistoricalOutcomeClass::Denied,
         _ => HistoricalOutcomeClass::Unknown,
     }
 }
@@ -354,7 +379,14 @@ mod tests {
                     surface: ReceiptSurface::Policy,
                     actor: "chisei".into(),
                     references: Vec::new(),
-                    attributes: BTreeMap::from([("outcome".into(), outcome.into())]),
+                    attributes: BTreeMap::from([(
+                        "executable".into(),
+                        if outcome == "deny" {
+                            "false".into()
+                        } else {
+                            "true".into()
+                        },
+                    )]),
                 },
                 OperationReceiptEvent {
                     event_id: format!("{id}-route"),
@@ -367,7 +399,7 @@ mod tests {
                     references: Vec::new(),
                     attributes: BTreeMap::from([
                         ("runtime".into(), historical_runtime.into()),
-                        ("resolved_model".into(), historical_model.into()),
+                        ("model".into(), historical_model.into()),
                         ("preferred_runtime".into(), historical_runtime.into()),
                         ("preferred_model".into(), historical_model.into()),
                     ]),
@@ -390,7 +422,7 @@ mod tests {
 
     #[test]
     fn dry_run_produces_stable_delta_counts() {
-        let receipts = vec![
+        let receipts = [
             receipt("op-same", "openai", "gpt-5.5", "allow"),
             receipt("op-deny", "openai", "gpt-5.5", "allow"),
             receipt("op-allow-again", "openai", "gpt-5.5", "deny"),
