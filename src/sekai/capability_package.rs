@@ -800,18 +800,18 @@ impl SekaiDb {
         }))
     }
 
-    fn enforce_package_trust_tx(
+    /// Evaluate package trust inside an open transaction.
+    ///
+    /// Returns the decision even when denied so callers can record audit
+    /// evidence after rolling back the mutation transaction.
+    fn evaluate_package_trust_tx(
         tx: &Transaction<'_>,
         namespace: &str,
         manifest: &CapabilityPackageManifest,
     ) -> Result<PackageTrustDecision, String> {
         let policy = Self::load_package_trust_policy_tx(tx, namespace)?;
         let signers = Self::load_package_trust_signers_tx(tx, namespace)?;
-        let decision = evaluate_package_trust(&policy.required_trust_level, &signers, manifest)?;
-        if !decision.allowed {
-            return Err(format!("package trust denied: {}", decision.reason));
-        }
-        Ok(decision)
+        evaluate_package_trust(&policy.required_trust_level, &signers, manifest)
     }
 
     /// Record a denied trust decision without installing the package.
@@ -867,37 +867,16 @@ impl SekaiDb {
             return existing
                 .ok_or_else(|| "idempotent install no longer has an active installation".into());
         }
-        let trust = match Self::enforce_package_trust_tx(&tx, namespace, manifest) {
-            Ok(decision) => decision,
-            Err(error) => {
-                drop(tx);
-                drop(conn);
-                let decision = PackageTrustDecision {
-                    allowed: false,
-                    required_trust_level: self
-                        .get_capability_package_trust_policy(namespace)
-                        .map(|policy| policy.required_trust_level)
-                        .unwrap_or_else(|_| PACKAGE_TRUST_UNSIGNED_ALLOWED.into()),
-                    signature_present: manifest.signature.is_some(),
-                    signature_valid: false,
-                    signer_identity: manifest
-                        .signature
-                        .as_ref()
-                        .map(|signature| signature.signer_identity.clone())
-                        .unwrap_or_default(),
-                    key_id: manifest
-                        .signature
-                        .as_ref()
-                        .map(|signature| signature.key_id.clone())
-                        .unwrap_or_default(),
-                    reason: error.clone(),
-                };
-                let _ = self.record_package_trust_denial(
-                    namespace, manifest, actor, request_id, &decision, now_ms,
-                );
-                return Err(error);
-            }
-        };
+        let trust = Self::evaluate_package_trust_tx(&tx, namespace, manifest)?;
+        if !trust.allowed {
+            let error = format!("package trust denied: {}", trust.reason);
+            drop(tx);
+            drop(conn);
+            let _ = self.record_package_trust_denial(
+                namespace, manifest, actor, request_id, &trust, now_ms,
+            );
+            return Err(error);
+        }
         let trust_evidence = package_trust_evidence(&trust);
         if load_installation(&tx, namespace, &manifest.name)?.is_some() {
             return Err("package already installed in namespace".into());
@@ -944,7 +923,16 @@ impl SekaiDb {
             return existing
                 .ok_or_else(|| "idempotent upgrade no longer has an active installation".into());
         }
-        let trust = Self::enforce_package_trust_tx(&tx, namespace, manifest)?;
+        let trust = Self::evaluate_package_trust_tx(&tx, namespace, manifest)?;
+        if !trust.allowed {
+            let error = format!("package trust denied: {}", trust.reason);
+            drop(tx);
+            drop(conn);
+            let _ = self.record_package_trust_denial(
+                namespace, manifest, actor, request_id, &trust, now_ms,
+            );
+            return Err(error);
+        }
         let trust_evidence = package_trust_evidence(&trust);
         let current = load_installation(&tx, namespace, &manifest.name)?
             .ok_or_else(|| "package is not installed in namespace".to_string())?;
@@ -1500,6 +1488,43 @@ mod package_trust_tests {
                 .unwrap_err()
                 .contains("not trusted")
         );
+
+        let denials = db
+            .list_capability_package_events("ns", "signed-pkg")
+            .unwrap();
+        assert!(
+            denials
+                .iter()
+                .any(|event| event.action == "trust_denied"),
+            "unsigned install must record trust_denied"
+        );
+    }
+
+    #[test]
+    fn upgrade_trust_denial_is_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let base = sample_manifest("upgrade-pkg", "1.0.0");
+        db.install_capability_package("ns", &base, "operator", "base", 1)
+            .unwrap();
+        db.set_capability_package_trust_policy("ns", PACKAGE_TRUST_SIGNED, "admin", "policy-u", 2)
+            .unwrap();
+        let unsigned_upgrade = sample_manifest("upgrade-pkg", "1.1.0");
+        assert!(
+            db.upgrade_capability_package("ns", &unsigned_upgrade, "operator", "up-deny", 3)
+                .unwrap_err()
+                .contains("signed package required")
+        );
+        let events = db
+            .list_capability_package_events("ns", "upgrade-pkg")
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "trust_denied"),
+            "rejected upgrade must record trust_denied"
+        );
+        let still = db.get_capability_package("ns", "upgrade-pkg").unwrap().unwrap();
+        assert_eq!(still.current_version, "1.0.0");
     }
 
     #[test]
