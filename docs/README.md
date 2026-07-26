@@ -55,6 +55,7 @@ in order.
 - [Architecture decisions](decisions/README.md) — accepted, durable design
   choices and the ADR template.
 - [Gunshi auto-allocation envelope](research/279-gunshi-auto-allocation-envelope.md)
+- [Gunshi eval-gated promotion and bounded auto-dispatch](gunshi-auto-allocation.md)
   — research recommendation for bounded automatic dispatch (#279 → #280).
 - [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
   tenant-free Sekai surface set, inventory evidence, and remaining runtime

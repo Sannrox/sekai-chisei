@@ -958,6 +958,53 @@ message IssueGunshiRecommendationsResponse {
 message GetGunshiScorecardRequest { string namespace = 1; }
 message GetGunshiScorecardResponse { string scorecard_json = 1; }
 
+// Eval-gated Gunshi allocation policy control (#280). Payloads are versioned
+// JSON contracts (gunshi.allocation-control/v1 and gunshi_policy types).
+message InstallGunshiAllocationBaselineRequest {
+  string namespace = 1;
+  string snapshot_json = 2;
+  string gate_json = 3;
+}
+message InstallGunshiAllocationBaselineResponse { string status_json = 1; }
+message PromoteGunshiAllocationPolicyRequest {
+  string namespace = 1;
+  string candidate_json = 2;
+  string baseline_evaluation_json = 3;
+  string candidate_evaluation_json = 4;
+  string expected_revision = 5;
+}
+message PromoteGunshiAllocationPolicyResponse { string status_json = 1; }
+message RollbackGunshiAllocationPolicyRequest {
+  string namespace = 1;
+  string expected_revision = 2;
+  string reason = 3;
+}
+message RollbackGunshiAllocationPolicyResponse { string status_json = 1; }
+message SetGunshiAutoOptInRequest {
+  string namespace = 1;
+  bool opt_in = 2;
+  string expected_revision = 3;
+}
+message SetGunshiAutoOptInResponse { string status_json = 1; }
+message SetGunshiAllocationKillSwitchRequest {
+  string namespace = 1;
+  bool enabled = 2;
+  string reason = 3;
+}
+message SetGunshiAllocationKillSwitchResponse { string status_json = 1; }
+message GetGunshiAllocationStatusRequest { string namespace = 1; }
+message GetGunshiAllocationStatusResponse { string status_json = 1; }
+message AuthorizeGunshiAutoDispatchRequest {
+  string namespace = 1;
+  string plan_json = 2;
+  string operation_json = 3;
+  string capacity_json = 4;
+}
+message AuthorizeGunshiAutoDispatchResponse {
+  string authorization_json = 1;
+  string receipt_attributes_json = 2;
+}
+
 // --- Host-executed external-action authorization ---
 // These contracts describe bounded authority and causal evidence. Chisei does
 // not execute host actions, and v1 authorization decisions do not issue a
@@ -1234,6 +1281,13 @@ service ChiseiService {
   rpc IssueGunshiRecommendations(IssueGunshiRecommendationsRequest) returns (IssueGunshiRecommendationsResponse);
   rpc RecordGunshiFeedback(RecordGunshiFeedbackRequest) returns (RecordGunshiFeedbackResponse);
   rpc GetGunshiScorecard(GetGunshiScorecardRequest) returns (GetGunshiScorecardResponse);
+  rpc InstallGunshiAllocationBaseline(InstallGunshiAllocationBaselineRequest) returns (InstallGunshiAllocationBaselineResponse);
+  rpc PromoteGunshiAllocationPolicy(PromoteGunshiAllocationPolicyRequest) returns (PromoteGunshiAllocationPolicyResponse);
+  rpc RollbackGunshiAllocationPolicy(RollbackGunshiAllocationPolicyRequest) returns (RollbackGunshiAllocationPolicyResponse);
+  rpc SetGunshiAutoOptIn(SetGunshiAutoOptInRequest) returns (SetGunshiAutoOptInResponse);
+  rpc SetGunshiAllocationKillSwitch(SetGunshiAllocationKillSwitchRequest) returns (SetGunshiAllocationKillSwitchResponse);
+  rpc GetGunshiAllocationStatus(GetGunshiAllocationStatusRequest) returns (GetGunshiAllocationStatusResponse);
+  rpc AuthorizeGunshiAutoDispatch(AuthorizeGunshiAutoDispatchRequest) returns (AuthorizeGunshiAutoDispatchResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
   rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 
