@@ -100,8 +100,9 @@ Single decision object:
 1. **This freeze** (done) — option A locked.
 2. **Proto + control-plane decide handler** (landed) — `DecideGatewayExecution`
    RPC + pure compose helpers; deterministic unit tests for admit/deny composition.
-3. **Gateway dual-path** behind an explicit env flag
-   (`CHISEI_GATEWAY_FAT_DECIDE=1`), default off until parity proven.
+3. **Gateway dual-path** (landed, default off) — `CHISEI_GATEWAY_FAT_DECIDE=1`
+   enables a fail-closed pre-deny call to `DecideGatewayExecution` before the
+   legacy multi-RPC preflight. Admit falls through to legacy until parity flip.
 4. **Flip default** after smoke + regression evidence; remove dual-path.
 5. **Optional cache** (Option C) only after step 4.
 
