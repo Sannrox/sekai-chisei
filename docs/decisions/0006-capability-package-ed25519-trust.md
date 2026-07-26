@@ -38,7 +38,8 @@ acceptable.
 - Operators manage signing keys offline and register verifying keys via
   `PutCapabilityPackageSigner`.
 - PostgreSQL package trust policy admin is not complete in the community
-  runtime; SQLite is the reference path.
+  runtime; SQLite is the reference path. Trust admin RPCs fail closed on
+  community PostgreSQL rather than returning soft defaults that look configured.
 
 ## Validation
 

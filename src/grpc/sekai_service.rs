@@ -6128,7 +6128,7 @@ impl SekaiService for SekaiServiceImpl {
         let policy = self
             .db
             .get_capability_package_trust_policy(&inner.namespace)
-            .map_err(Status::internal)?;
+            .map_err(Status::failed_precondition)?;
         Ok(Response::new(GetCapabilityPackageTrustPolicyResponse {
             policy: Some(CapabilityPackageTrustPolicy {
                 namespace: policy.namespace,
@@ -6186,7 +6186,7 @@ impl SekaiService for SekaiServiceImpl {
         let signers = self
             .db
             .list_capability_package_signers(&inner.namespace)
-            .map_err(Status::internal)?;
+            .map_err(Status::failed_precondition)?;
         Ok(Response::new(ListCapabilityPackageSignersResponse {
             signers: signers
                 .into_iter()
