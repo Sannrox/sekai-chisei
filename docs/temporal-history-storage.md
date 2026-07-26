@@ -34,6 +34,17 @@ Domain and persistence entry points live in `src/sekai/temporal.rs`. Tables:
 - Disabling a policy stops new enablement flags; retained versions remain until
   #228 retention/collection work applies policy.
 
+## Atomic graph mutations (#226)
+
+When a temporal policy is enabled for an object type, property, or relation,
+object create/update/delete and link create/delete append or close history
+versions in the **same SQLite transaction** as the current-state write and
+object-change audit. Failure rolls all three back together.
+
+Discovery: `SekaiDb::discover_temporal_surfaces(namespace)` lists registered
+surfaces and whether history is currently retained (`history_retained`).
+Surfaces without a policy are non-retained by default.
+
 Directional storage cost can be re-checked with:
 
 ```bash
