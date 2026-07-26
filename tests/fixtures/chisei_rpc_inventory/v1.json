@@ -613,6 +613,19 @@
       ]
     },
     {
+      "rpc": "PromoteGunshiFeedbackToEval",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning",
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_feedback_eval.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
       "rpc": "ReserveGatewayRequestAlias",
       "kind": "persistent",
       "surfaces": [

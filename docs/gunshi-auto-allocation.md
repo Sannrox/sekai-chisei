@@ -56,7 +56,15 @@ sekaictl gunshi kill-switch --namespace <ns> --reason <text>
 sekaictl gunshi rollback --namespace <ns> --expected-revision <id> --reason <text>
 sekaictl gunshi allocation-status --namespace <ns>
 sekaictl gunshi authorize-auto --namespace <ns> --plan <json> --operation <json> --capacity <json>
+sekaictl gunshi promote-feedback --namespace <ns> --suite-id feedback-<ns>:<class> --issuance-id <id> --allocation-id <id>
 ```
+
+## Feedback → eval suites (#300)
+
+Authorized operator choices can be promoted into append-only suites whose ids
+start with `feedback-`. Case ids are deterministic from
+`(issuance_id, allocation_id)` so promotion is idempotent. Operator rationale is
+redacted in the stored case spec; promotion is audited.
 
 ## Persistence
 
