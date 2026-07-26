@@ -100,14 +100,15 @@ Single decision object:
 1. **This freeze** (done) — option A locked.
 2. **Proto + control-plane decide handler** (landed) — `DecideGatewayExecution`
    RPC + pure compose helpers; deterministic unit tests for admit/deny composition.
-3. **Gateway dual-path** (landed, default off) — `CHISEI_GATEWAY_FAT_DECIDE=1`
-   enables fail-closed `DecideGatewayExecution`. **Deny** refuses upstream;
-   **admit** replaces CheckBudget + ResolvePolicy with the PDP response
-   (context egress and health fallback still run at the edge). Soft-unavailable
-   falls through to legacy multi-RPC preflight.
-4. **Flip default** after smoke + regression evidence with fat-decide on;
-   then remove the legacy multi-RPC path for budget/policy preflight.
-5. **Optional cache** (Option C) only after step 4.
+3. **Gateway dual-path** (landed) — fail-closed `DecideGatewayExecution`.
+   **Deny** refuses upstream; **admit** replaces CheckBudget + ResolvePolicy
+   with the PDP response (context egress and health fallback still run at the
+   edge). Soft-unavailable falls through to legacy multi-RPC preflight.
+4. **Default on** (landed) — fat-decide is enabled unless
+   `CHISEI_GATEWAY_FAT_DECIDE=0` (or `false`/`off`/`no`). Gateway smoke and the
+   normal suite exercise the default path. Legacy multi-RPC remains as opt-out
+   until a later cleanup removes it.
+5. **Optional cache** (Option C) only after production soak of default-on.
 
 ## Explicit non-goals of the first slice
 
