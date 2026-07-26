@@ -2574,12 +2574,14 @@ async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
-    // Issue #163 dual-path: optional fat-decide pre-deny gate. When admitted,
-    // legacy multi-RPC preflight still runs until full parity flip.
-    if state.config.fat_decide
+    // Issue #163 dual-path: when fat-decide admits, replace CheckBudget +
+    // ResolvePolicy with the PDP response. Soft-unavailable falls through to
+    // legacy multi-RPC preflight. Deny never contacts upstream.
+    let fat_decide_admit = if state.config.fat_decide
         && !state.config.no_preflight
         && state.config.chisei_grpc_target.is_some()
-        && let Err(rejection) = fat_decide_preflight(
+    {
+        match fat_decide_preflight(
             &state.config,
             &state.runtime,
             &identity,
@@ -2591,17 +2593,23 @@ async fn proxy_gateway_inner_scoped(
             &failure_posture,
         )
         .await
-    {
-        record_refusal_and_append(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &preflight_context,
-            &rejection,
-        )
-        .await;
-        return rejection.response();
-    }
+        {
+            Ok(admit) => admit,
+            Err(rejection) => {
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
+                return rejection.response();
+            }
+        }
+    } else {
+        None
+    };
     let (mut resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
@@ -2619,6 +2627,39 @@ async fn proxy_gateway_inner_scoped(
             body: resolved.body.clone(),
         };
         (resolved, egress, None)
+    } else if let Some(admit) = fat_decide_admit {
+        match apply_fat_decide_admit(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &mut preflight_context,
+            &registry_snapshot,
+            admit,
+            body.to_vec(),
+            requested_provider,
+            client_provider,
+            capability_surface,
+            context_request.as_ref(),
+            requested_model.as_deref(),
+            &request_id,
+            work_unit_id.as_deref(),
+            &failure_posture,
+        )
+        .await
+        {
+            Ok(triple) => triple,
+            Err(rejection) => {
+                record_refusal_and_append(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &preflight_context,
+                    &rejection,
+                )
+                .await;
+                return rejection.response();
+            }
+        }
     } else {
         let budget = match check_budget_preflight(
             &state.config,
@@ -3776,10 +3817,127 @@ fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
     GatewayRejection::json(http_status, error_type, status.to_string())
 }
 
-/// Optional fat-decide pre-deny gate (Issue #163 dual-path).
+/// Admit payload from `DecideGatewayExecution` used to replace legacy
+/// CheckBudget + ResolvePolicy preflight (Issue #163 dual-path).
+#[derive(Debug, Clone)]
+struct FatDecideAdmit {
+    resolved_model: String,
+    resolved_runtime: String,
+    policy_version: String,
+    budget_scope: String,
+    /// Reserved for usage/receipt correlation once post-call accounting binds it.
+    #[allow(dead_code)]
+    budget_grant_id: String,
+    route_bias: Option<String>,
+    provisional_local_free: bool,
+}
+
+/// Build policy/budget preflight from a fat-decide admit (Issue #163).
+#[allow(clippy::too_many_arguments)]
+async fn apply_fat_decide_admit(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    preflight_context: &mut UsageContext,
+    registry_snapshot: &ProviderRegistry,
+    admit: FatDecideAdmit,
+    body: Vec<u8>,
+    requested_provider: ProviderKind,
+    client_provider: ProviderKind,
+    capability_surface: Option<CapabilityRequestSurface>,
+    context_request: Option<&GatewayContextRequest>,
+    requested_model: Option<&str>,
+    request_id: &str,
+    work_unit_id: Option<&str>,
+    failure_posture: &GovernanceFailurePosture,
+) -> Result<
+    (
+        PolicyPreflight,
+        ContextEgressPreflight,
+        Option<BudgetPreflight>,
+    ),
+    GatewayRejection,
+> {
+    let budget = BudgetPreflight {
+        provisional_local_free: admit.provisional_local_free,
+        route_bias: admit.route_bias.clone(),
+        budget_subject: Some(admit.budget_scope.clone()),
+    };
+    preflight_context.budget_subject = budget.budget_subject.clone();
+    preflight_context.budget_status = if budget.provisional_local_free {
+        "local_free"
+    } else {
+        "allowed"
+    }
+    .into();
+    let resolved_provider = ProviderKind::from_runtime(&admit.resolved_runtime)
+        .or_else(|| ProviderKind::from_model(&admit.resolved_model).ok())
+        .unwrap_or(requested_provider);
+    let resolved = PolicyPreflight {
+        body,
+        resolved_model: Some(admit.resolved_model.clone()).filter(|m| !m.is_empty()),
+        resolved_provider,
+        route_bias: admit.route_bias.clone(),
+        policy_scope: Some(admit.budget_scope.clone()),
+        policy_version: Some(admit.policy_version.clone()).filter(|v| !v.is_empty()),
+        fallback_models: Vec::new(),
+        data_class: None,
+    };
+    if admit.provisional_local_free
+        && resolved.resolved_provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama)
+    {
+        return Err(GatewayRejection::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "budget_exceeded",
+            "budget exceeded and local-free routing could not be verified",
+        ));
+    }
+    let originally_resolved_model = resolved.resolved_model.clone();
+    let resolved = select_healthy_policy_fallback(
+        runtime,
+        registry_snapshot,
+        resolved,
+        capability_surface,
+        client_provider,
+        config.allow_cross_provider,
+        budget.provisional_local_free,
+    )
+    .await?;
+    if resolved.resolved_model != originally_resolved_model {
+        crate::obs::signals::record_fallback(
+            crate::obs::labels::Subsystem::Gateway,
+            crate::obs::labels::FallbackTrigger::ProviderUnhealthy,
+        );
+    }
+    preflight_context.provider = resolved.resolved_provider;
+    preflight_context.resolved_model = resolved.resolved_model.clone();
+    preflight_context.route_bias = resolved.route_bias.clone();
+    preflight_context.policy_scope = resolved.policy_scope.clone();
+    preflight_context.policy_version = resolved.policy_version.clone();
+    preflight_context.egress_applied = true;
+    let egress = apply_context_egress(
+        config,
+        runtime,
+        identity,
+        client_provider,
+        resolved.resolved_provider,
+        &resolved.body,
+        context_request,
+        requested_model,
+        resolved.resolved_model.as_deref(),
+        request_id,
+        work_unit_id,
+        failure_posture,
+    )
+    .await?;
+    Ok((resolved, egress, Some(budget)))
+}
+
+/// Fat-decide dual-path (Issue #163).
 ///
-/// When admitted, the caller continues with the legacy multi-RPC preflight.
-/// When denied, the edge must not contact upstream.
+/// - `Ok(Some(admit))` — PDP admitted; skip legacy budget/policy RPCs.
+/// - `Ok(None)` — soft-unavailable; fall through to legacy multi-RPC preflight.
+/// - `Err` — deny or fail-closed; do not contact upstream.
 #[allow(clippy::too_many_arguments)]
 async fn fat_decide_preflight(
     config: &GatewayConfig,
@@ -3791,9 +3949,9 @@ async fn fat_decide_preflight(
     task_class: &str,
     request_id: &str,
     failure_posture: &GovernanceFailurePosture,
-) -> Result<(), GatewayRejection> {
+) -> Result<Option<FatDecideAdmit>, GatewayRejection> {
     let Some(target) = &config.chisei_grpc_target else {
-        return Ok(());
+        return Ok(None);
     };
     let namespace = if identity.project.trim().is_empty() {
         config.default_project.clone()
@@ -3832,7 +3990,17 @@ async fn fat_decide_preflight(
                     record_control_plane_success(runtime).await;
                     let decision = response.into_inner();
                     if decision.admitted {
-                        Ok(())
+                        let route_bias = decision.route_bias.trim();
+                        Ok(Some(FatDecideAdmit {
+                            resolved_model: decision.resolved_model,
+                            resolved_runtime: decision.resolved_runtime,
+                            policy_version: decision.policy_version,
+                            budget_scope: decision.budget_scope,
+                            budget_grant_id: decision.budget_grant_id,
+                            route_bias: (!route_bias.is_empty()).then(|| route_bias.to_string()),
+                            provisional_local_free: decision.degradation_level == "local_free"
+                                || route_bias == "local_free",
+                        }))
                     } else {
                         let error_type = if decision.deny_reason.is_empty() {
                             "governance_denied"
@@ -3855,9 +4023,8 @@ async fn fat_decide_preflight(
                     if failure_posture.fail_closed || !is_transient_governance_status(&err) {
                         Err(governance_status_rejection(&err))
                     } else {
-                        // Soft path: log and allow legacy preflight to decide.
                         warn!(error = %err, "fat-decide unavailable; falling through to legacy preflight");
-                        Ok(())
+                        Ok(None)
                     }
                 }
             }
@@ -3871,7 +4038,7 @@ async fn fat_decide_preflight(
                 ))
             } else {
                 warn!(error = %err, "fat-decide connect failed; falling through to legacy preflight");
-                Ok(())
+                Ok(None)
             }
         }
     }
