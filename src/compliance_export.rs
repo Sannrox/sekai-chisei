@@ -473,27 +473,9 @@ fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
         || decision.evidence.get("project").map(String::as_str) == Some(namespace)
 }
 
-/// Attribute/evidence keys retained under redaction. Everything else is scrubbed.
-fn redaction_allowlist(key: &str) -> bool {
-    matches!(
-        key,
-        "namespace"
-            | "project"
-            | "route"
-            | "model"
-            | "provider"
-            | "decision"
-            | "outcome"
-            | "policy_version"
-            | "schema_version"
-            | "operation_class"
-            | "request_id"
-            | "status"
-    )
-}
-
 fn redact_receipt(receipt: &mut OperationReceipt) {
-    // Allowlist redaction: free-form principals and text are not retained.
+    // Aggressive structural redaction: keep identifiers/versions/timestamps and
+    // event kinds only. No free-form attribute or principal values survive.
     receipt.initiating_actor = "[redacted]".into();
     for grant in &mut receipt.reporter_grants {
         grant.principal = "[redacted]".into();
@@ -508,38 +490,31 @@ fn redact_receipt(receipt: &mut OperationReceipt) {
 
 fn redact_event(event: &mut OperationReceiptEvent) {
     event.actor = "[redacted]".into();
+    event.attributes.clear();
     for reference in &mut event.references {
         reference.reference = "[redacted]".into();
-        if reference.content_hash.is_some() {
-            reference.content_hash = Some("[redacted]".into());
-        }
-    }
-    let keys: Vec<String> = event.attributes.keys().cloned().collect();
-    for key in keys {
-        if !redaction_allowlist(&key)
-            && let Some(value) = event.attributes.get_mut(&key)
-        {
-            *value = "[redacted]".into();
-        }
+        reference.content_hash = None;
+        reference.disclosed_fields.clear();
     }
 }
 
 fn redact_decision_record(decision: &mut ComplianceDecisionRecord) {
     decision.reason = "[redacted]".into();
     decision.actor = "[redacted]".into();
-    // Keep target_id structural prefix but drop free-form tails when sensitive.
-    if !decision.target_id.starts_with("operation:")
-        && !decision.target_id.starts_with("compliance-export:")
-    {
-        decision.target_id = "[redacted]".into();
+    decision.target_id = match decision.target_id.split_once(':') {
+        Some(("operation", id)) if !id.is_empty() => format!("operation:{id}"),
+        Some(("compliance-export", id)) if !id.is_empty() => format!("compliance-export:{id}"),
+        _ => "[redacted]".into(),
+    };
+    // Retain only exact namespace attribution keys; drop all other evidence.
+    let namespace = decision.evidence.get("namespace").cloned();
+    let project = decision.evidence.get("project").cloned();
+    decision.evidence.clear();
+    if let Some(namespace) = namespace {
+        decision.evidence.insert("namespace".into(), namespace);
     }
-    let keys: Vec<String> = decision.evidence.keys().cloned().collect();
-    for key in keys {
-        if !redaction_allowlist(&key)
-            && let Some(value) = decision.evidence.get_mut(&key)
-        {
-            *value = "[redacted]".into();
-        }
+    if let Some(project) = project {
+        decision.evidence.insert("project".into(), project);
     }
 }
 
