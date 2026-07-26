@@ -11,6 +11,7 @@ pub mod external_permit;
 pub mod federation;
 pub mod gate;
 pub mod gunshi;
+pub mod gunshi_auto;
 pub mod gunshi_dispatch;
 pub mod gunshi_feedback;
 pub mod gunshi_optimization;
