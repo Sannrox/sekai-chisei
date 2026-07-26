@@ -141,8 +141,9 @@ pub struct GatewayConfig {
     pub pricing: HashMap<String, ModelPricing>,
     pub run_pipeline: bool,
     pub allow_cross_provider: bool,
-    /// When true, call `DecideGatewayExecution` as a fail-closed pre-deny gate
-    /// before the legacy multi-RPC preflight (Issue #163 dual-path). Default off.
+    /// When true, use `DecideGatewayExecution` for budget/policy preflight
+    /// (Issue #163 dual-path). Defaults on; set `CHISEI_GATEWAY_FAT_DECIDE=0`
+    /// to force the legacy multi-RPC preflight.
     pub fat_decide: bool,
 }
 
@@ -195,10 +196,7 @@ impl GatewayConfig {
                 .as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
-        let fat_decide = matches!(
-            std::env::var("CHISEI_GATEWAY_FAT_DECIDE").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-        );
+        let fat_decide = fat_decide_enabled_from_env();
         let xai_configured =
             std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
         let meta_configured = std::env::var("META_MODEL_API_KEY")
@@ -3815,6 +3813,17 @@ fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
         _ => (StatusCode::SERVICE_UNAVAILABLE, "governance_unavailable"),
     };
     GatewayRejection::json(http_status, error_type, status.to_string())
+}
+
+/// Default-on fat-decide switch. Explicit opt-out: `0`, `false`, `no`, `off`.
+fn fat_decide_enabled_from_env() -> bool {
+    match std::env::var("CHISEI_GATEWAY_FAT_DECIDE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
 }
 
 /// Admit payload from `DecideGatewayExecution` used to replace legacy
@@ -14522,6 +14531,42 @@ mod tests {
             run_pipeline: false,
             allow_cross_provider: false,
             fat_decide: false,
+        }
+    }
+
+    #[test]
+    fn fat_decide_defaults_on_and_supports_explicit_opt_out() {
+        // Isolate from the process environment for this assertion.
+        let key = "CHISEI_GATEWAY_FAT_DECIDE";
+        let previous = std::env::var(key).ok();
+        // SAFETY: test-only env mutation, restored below.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(fat_decide_enabled_from_env());
+        for disable in ["0", "false", "FALSE", "no", "off", " Off "] {
+            unsafe {
+                std::env::set_var(key, disable);
+            }
+            assert!(
+                !fat_decide_enabled_from_env(),
+                "expected disable for {disable:?}"
+            );
+        }
+        for enable in ["1", "true", "yes", "on", "anything"] {
+            unsafe {
+                std::env::set_var(key, enable);
+            }
+            assert!(
+                fat_decide_enabled_from_env(),
+                "expected enable for {enable:?}"
+            );
+        }
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 
