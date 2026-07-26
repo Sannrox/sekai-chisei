@@ -137,6 +137,18 @@ pub struct TemporalPolicy {
     pub enabled_at_revision: Option<i64>,
 }
 
+/// Fields accepted when creating or updating a temporal policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalPolicyWrite {
+    pub namespace: String,
+    pub surface_kind: TemporalSurfaceKind,
+    pub surface_name: String,
+    pub enabled: bool,
+    pub preserve_conflicts: bool,
+    pub retention_days: Option<i32>,
+    pub classification_behavior: String,
+}
+
 /// One retained assertion version. Historical payloads are append-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalAssertionVersion {
@@ -351,37 +363,36 @@ impl SekaiDb {
     /// next revision and never invents earlier history.
     pub fn upsert_temporal_policy(
         &self,
-        namespace: &str,
-        surface_kind: TemporalSurfaceKind,
-        surface_name: &str,
-        enabled: bool,
-        preserve_conflicts: bool,
-        retention_days: Option<i32>,
-        classification_behavior: &str,
+        write: &TemporalPolicyWrite,
     ) -> Result<TemporalPolicy, String> {
-        if !namespace.is_empty() {
-            validate_text(namespace, "namespace")?;
+        if !write.namespace.is_empty() {
+            validate_text(&write.namespace, "namespace")?;
         }
-        validate_policy_surface(surface_kind, surface_name)?;
-        if let Some(days) = retention_days
+        validate_policy_surface(write.surface_kind, &write.surface_name)?;
+        if let Some(days) = write.retention_days
             && days <= 0
         {
             return Err("retention_days must be positive when set".into());
         }
-        let behavior = if classification_behavior.is_empty() {
-            "inherit"
+        let behavior = if write.classification_behavior.is_empty() {
+            "inherit".to_string()
         } else {
-            validate_text(classification_behavior, "classification_behavior")?;
-            classification_behavior
+            validate_text(&write.classification_behavior, "classification_behavior")?;
+            write.classification_behavior.clone()
         };
         let now = now_ms();
         let conn = self.conn();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-        let existing = read_policy_tx(&tx, namespace, surface_kind, surface_name)?;
+        let existing = read_policy_tx(
+            &tx,
+            &write.namespace,
+            write.surface_kind,
+            &write.surface_name,
+        )?;
         let (policy_version, created_at, enabled_at_revision) = if let Some(prev) = existing {
             let next_version = prev.policy_version + 1;
-            let enabled_rev = if enabled {
+            let enabled_rev = if write.enabled {
                 Some(match prev.enabled_at_revision {
                     Some(r) if prev.enabled => r,
                     _ => allocate_revision_tx(&tx, now)?.0,
@@ -391,7 +402,7 @@ impl SekaiDb {
             };
             (next_version, prev.created_at_ms, enabled_rev)
         } else {
-            let enabled_rev = if enabled {
+            let enabled_rev = if write.enabled {
                 Some(allocate_revision_tx(&tx, now)?.0)
             } else {
                 None
@@ -400,14 +411,14 @@ impl SekaiDb {
         };
 
         let policy = TemporalPolicy {
-            namespace: namespace.to_string(),
-            surface_kind,
-            surface_name: surface_name.to_string(),
-            enabled,
+            namespace: write.namespace.clone(),
+            surface_kind: write.surface_kind,
+            surface_name: write.surface_name.clone(),
+            enabled: write.enabled,
             policy_version,
-            preserve_conflicts,
-            retention_days,
-            classification_behavior: behavior.to_string(),
+            preserve_conflicts: write.preserve_conflicts,
+            retention_days: write.retention_days,
+            classification_behavior: behavior,
             created_at_ms: created_at,
             updated_at_ms: now,
             enabled_at_revision,
@@ -1019,6 +1030,25 @@ mod tests {
         }
     }
 
+    fn policy_write(
+        namespace: &str,
+        kind: TemporalSurfaceKind,
+        name: &str,
+        enabled: bool,
+        preserve_conflicts: bool,
+        retention_days: Option<i32>,
+    ) -> TemporalPolicyWrite {
+        TemporalPolicyWrite {
+            namespace: namespace.into(),
+            surface_kind: kind,
+            surface_name: name.into(),
+            enabled,
+            preserve_conflicts,
+            retention_days,
+            classification_behavior: "inherit".into(),
+        }
+    }
+
     #[test]
     fn fresh_db_has_empty_temporal_structures_and_revision_counter() {
         let db = memory_db();
@@ -1035,15 +1065,14 @@ mod tests {
         let path_str = path.to_str().unwrap();
         {
             let db = SekaiDb::new(path_str).unwrap();
-            db.upsert_temporal_policy(
+            db.upsert_temporal_policy(&policy_write(
                 "ns",
                 TemporalSurfaceKind::Relation,
                 "works_for",
                 true,
                 true,
                 Some(90),
-                "inherit",
-            )
+            ))
             .unwrap();
             let v1 = db
                 .append_temporal_assertion(&sample_append("a1", "ada"))
@@ -1165,15 +1194,14 @@ mod tests {
         };
         db.create_object_with_audit(&object, "alice").unwrap();
         let policy = db
-            .upsert_temporal_policy(
+            .upsert_temporal_policy(&policy_write(
                 "ns",
                 TemporalSurfaceKind::ObjectType,
                 "person",
                 true,
                 false,
                 None,
-                "inherit",
-            )
+            ))
             .unwrap();
         assert!(policy.enabled_at_revision.is_some());
         assert_eq!(
@@ -1191,15 +1219,14 @@ mod tests {
     #[test]
     fn backfill_is_bounded_idempotent_and_marks_unknown_validity() {
         let db = memory_db();
-        db.upsert_temporal_policy(
+        db.upsert_temporal_policy(&policy_write(
             "ns",
             TemporalSurfaceKind::Relation,
             "works_for",
             true,
             false,
             None,
-            "inherit",
-        )
+        ))
         .unwrap();
 
         let empty = TemporalBackfillRequest {
@@ -1249,28 +1276,26 @@ mod tests {
     #[test]
     fn disable_stops_new_policy_enablement_flag_but_retains_versions() {
         let db = memory_db();
-        db.upsert_temporal_policy(
+        db.upsert_temporal_policy(&policy_write(
             "ns",
             TemporalSurfaceKind::Relation,
             "works_for",
             true,
             false,
             None,
-            "inherit",
-        )
+        ))
         .unwrap();
         db.append_temporal_assertion(&sample_append("a1", "ada"))
             .unwrap();
         let disabled = db
-            .upsert_temporal_policy(
+            .upsert_temporal_policy(&policy_write(
                 "ns",
                 TemporalSurfaceKind::Relation,
                 "works_for",
                 false,
                 false,
                 None,
-                "inherit",
-            )
+            ))
             .unwrap();
         assert!(!disabled.enabled);
         assert_eq!(
@@ -1313,15 +1338,14 @@ mod tests {
         }
         {
             let db = SekaiDb::new(path_selective.to_str().unwrap()).unwrap();
-            db.upsert_temporal_policy(
+            db.upsert_temporal_policy(&policy_write(
                 "default",
                 TemporalSurfaceKind::Property,
                 "item.value",
                 true,
                 false,
                 None,
-                "inherit",
-            )
+            ))
             .unwrap();
             for i in 0..n {
                 let object = Object {
