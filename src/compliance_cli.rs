@@ -2,7 +2,8 @@
 
 use crate::compliance_export::{
     ComplianceExportBundle, ComplianceExportRequest, RedactionMode, compliance_bundle_bytes,
-    export_compliance_from_db, sign_compliance_export, verify_compliance_export,
+    export_compliance_from_db, record_compliance_export_success, sign_compliance_export,
+    verify_compliance_export,
 };
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
@@ -61,7 +62,8 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         actor: config.actor,
         request_id: config.request_id,
     };
-    let mut bundle = export_compliance_from_db(&db, &request, Utc::now().timestamp_millis())?;
+    let exported_at = Utc::now().timestamp_millis();
+    let mut bundle = export_compliance_from_db(&db, &request, exported_at)?;
     if let (Some(key_path), Some(identity), Some(key_id)) =
         (&config.signing_key, &config.identity, &config.key_id)
     {
@@ -75,6 +77,8 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         )?;
     }
     std::fs::write(&config.output, compliance_bundle_bytes(&bundle)?)?;
+    // Audit only after the durable write succeeds.
+    record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())?;
     println!(
         "exported {} receipts={} decisions={} digest={}",
         config.output.display(),

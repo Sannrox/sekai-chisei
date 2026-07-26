@@ -276,12 +276,17 @@ pub fn verify_compliance_export(
             false
         }
         (Some(signature), None) => {
-            // Structural signature presence check only.
-            if signature.signature_hex.trim().is_empty() {
-                errors.push("signature present but empty".into());
-                false
-            } else {
-                true
+            // Without an explicit trusted key, still cryptographically verify
+            // against the embedded public key so signature_ok is not a free pass.
+            // Callers that need identity trust must pass --trusted-key.
+            match verify_signature(bundle, signature, &signature.public_key_hex) {
+                Ok(()) => true,
+                Err(error) => {
+                    errors.push(format!(
+                        "signature present but failed embedded-key verification: {error}"
+                    ));
+                    false
+                }
             }
         }
         (Some(signature), Some(public_key_hex)) => {
@@ -390,14 +395,9 @@ fn receipt_overlaps_window(
 }
 
 fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
-    if decision.evidence.get("namespace").map(String::as_str) == Some(namespace) {
-        return true;
-    }
-    decision.target_id.contains(namespace)
-        || decision
-            .evidence
-            .values()
-            .any(|value| value == namespace || value.contains(&format!(":{namespace}:")))
+    // Exact structured attribution only — never substring-match target ids
+    // (exporting "team-a" must not pick up "team-alpha").
+    decision.evidence.get("namespace").map(String::as_str) == Some(namespace)
 }
 
 fn redact_receipt(receipt: &mut OperationReceipt) {
@@ -466,7 +466,11 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Load receipts/decisions from the runtime store and build an audited export.
+/// Load receipts/decisions from the runtime store and build an export bundle.
+///
+/// Does **not** write audit success — callers must invoke
+/// [`record_compliance_export_success`] only after the bundle is signed and
+/// written to durable storage.
 pub fn export_compliance_from_db(
     db: &crate::db::runtime_db::RuntimeDb,
     request: &ComplianceExportRequest,
@@ -479,17 +483,23 @@ pub fn export_compliance_from_db(
         request.end_timestamp_ms,
         MAX_COMPLIANCE_RECEIPTS,
     )?;
-    // Decisions are filtered again in build_compliance_export by namespace/window.
-    let decisions = db.list_decisions(&crate::sekai::audit::DecisionFilter {
-        actor: None,
-        action: None,
-        target_id: None,
-        after: request.start_timestamp_ms.saturating_sub(1),
-        limit: MAX_COMPLIANCE_DECISIONS as i32,
-        offset: 0,
-    })?;
-    let bundle = build_compliance_export(request, receipts, decisions, exported_at_ms)?;
-    let evidence = export_audit_evidence(request, &bundle);
+    let decisions = db.list_compliance_decisions_in_window(
+        &request.namespace,
+        request.start_timestamp_ms,
+        request.end_timestamp_ms,
+        MAX_COMPLIANCE_DECISIONS,
+    )?;
+    build_compliance_export(request, receipts, decisions, exported_at_ms)
+}
+
+/// Record a successful compliance export after the bundle is durable.
+pub fn record_compliance_export_success(
+    db: &crate::db::runtime_db::RuntimeDb,
+    request: &ComplianceExportRequest,
+    bundle: &ComplianceExportBundle,
+    recorded_at_ms: i64,
+) -> Result<(), String> {
+    let evidence = export_audit_evidence(request, bundle);
     let decision = Decision {
         id: format!(
             "compliance-export:{:x}",
@@ -498,7 +508,7 @@ pub fn export_compliance_from_db(
                 request.namespace, request.actor, request.request_id
             ))
         ),
-        timestamp: exported_at_ms,
+        timestamp: recorded_at_ms,
         actor: request.actor.clone(),
         action: "compliance.export".into(),
         reason: "authorized offline compliance export".into(),
@@ -506,8 +516,7 @@ pub fn export_compliance_from_db(
         target_id: format!("compliance-export:{}", request.namespace),
         outcome: "succeeded".into(),
     };
-    db.record_decision(&decision)?;
-    Ok(bundle)
+    db.record_decision(&decision)
 }
 
 /// Hash used for export audit request digests.
@@ -754,6 +763,7 @@ mod tests {
         let bundle = export_compliance_from_db(&db, &request, 1_000).unwrap();
         assert_eq!(bundle.manifest.receipt_count, 1);
         assert!(verify_compliance_export(&bundle, None).ok);
+        record_compliance_export_success(&db, &request, &bundle, 1_001).unwrap();
 
         let audits = db
             .list_decisions(&crate::sekai::audit::DecisionFilter {
@@ -767,5 +777,24 @@ mod tests {
             .unwrap();
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].outcome, "succeeded");
+    }
+
+    #[test]
+    fn namespace_filter_does_not_substring_match() {
+        let mut other = sample_decision("d-other", 160);
+        other
+            .evidence
+            .insert("namespace".into(), "team-alpha".into());
+        other.target_id = "operation:team-alpha:1".into();
+        let request = ComplianceExportRequest {
+            namespace: "team-a".into(),
+            start_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+            redaction: RedactionMode::Full,
+            actor: "auditor".into(),
+            request_id: "export-ns".into(),
+        };
+        let bundle = build_compliance_export(&request, vec![], vec![other], 1_000).unwrap();
+        assert_eq!(bundle.manifest.decision_count, 0);
     }
 }
