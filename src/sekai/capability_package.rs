@@ -853,34 +853,44 @@ impl SekaiDb {
     }
 
     /// Record a denied trust decision without installing the package.
+    ///
+    /// Uses the original install/upgrade `request_digest` so retries stay inside
+    /// the existing `(namespace, actor, request_id)` idempotency keyspace and
+    /// replay the same denial instead of looking like a conflicting request.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_package_trust_denial(
         &self,
         namespace: &str,
         manifest: &CapabilityPackageManifest,
         actor: &str,
         request_id: &str,
+        operation_request_digest: &str,
         decision: &PackageTrustDecision,
         now_ms: i64,
     ) -> Result<(), String> {
         self.migrate_capability_packages()?;
         let evidence = package_trust_evidence(decision);
-        let request_digest = request_digest("trust_deny", namespace, manifest, request_id)?;
+        let denial_error = format!("package trust denied: {}", decision.reason);
+        let result_json =
+            serde_json::to_string(&serde_json::json!({"error": denial_error}))
+                .map_err(|error| error.to_string())?;
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         // Best-effort: ignore unique conflicts on retry of the same denial.
         let _ = tx.execute(
             "INSERT OR IGNORE INTO sekai_capability_package_events
              (namespace,package_name,package_version,action,actor,request_id,request_digest,manifest_digest,evidence,result_json,recorded_at_ms)
-             VALUES(?1,?2,?3,'trust_denied',?4,?5,?6,?7,?8,'null',?9)",
+             VALUES(?1,?2,?3,'trust_denied',?4,?5,?6,?7,?8,?9,?10)",
             params![
                 namespace,
                 manifest.name,
                 manifest.version,
                 actor,
                 request_id,
-                request_digest,
+                operation_request_digest,
                 manifest.digest().unwrap_or_default(),
                 evidence,
+                result_json,
                 now_ms
             ],
         );
@@ -911,7 +921,13 @@ impl SekaiDb {
             drop(tx);
             drop(conn);
             let _ = self.record_package_trust_denial(
-                namespace, manifest, actor, request_id, &trust, now_ms,
+                namespace,
+                manifest,
+                actor,
+                request_id,
+                &request_digest,
+                &trust,
+                now_ms,
             );
             return Err(error);
         }
@@ -967,7 +983,13 @@ impl SekaiDb {
             drop(tx);
             drop(conn);
             let _ = self.record_package_trust_denial(
-                namespace, manifest, actor, request_id, &trust, now_ms,
+                namespace,
+                manifest,
+                actor,
+                request_id,
+                &request_digest,
+                &trust,
+                now_ms,
             );
             return Err(error);
         }
@@ -1410,16 +1432,36 @@ fn replay(
     request_id: &str,
     expected_digest: &str,
 ) -> Result<Option<Option<PackageInstallation>>, String> {
-    let prior: Option<(String, String)> = tx.query_row("SELECT request_digest,result_json FROM sekai_capability_package_events WHERE namespace=?1 AND actor=?2 AND request_id=?3", params![namespace, actor, request_id], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|error| error.to_string())?;
+    let prior: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT request_digest,result_json,action FROM sekai_capability_package_events
+             WHERE namespace=?1 AND actor=?2 AND request_id=?3",
+            params![namespace, actor, request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
     match prior {
         None => Ok(None),
-        Some((digest, _)) if digest != expected_digest => {
+        Some((digest, _, _)) if digest != expected_digest => {
             Err("request_id was already used for different package input".into())
         }
-        Some((_, result_json)) => Ok(Some(
+        Some((_, result_json, action)) if action == "trust_denied" => {
+            Err(parse_trust_denial_error(&result_json))
+        }
+        Some((_, result_json, _)) => Ok(Some(
             serde_json::from_str(&result_json).map_err(|error| error.to_string())?,
         )),
     }
+}
+
+fn parse_trust_denial_error(result_json: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result_json)
+        && let Some(error) = value.get("error").and_then(|item| item.as_str())
+    {
+        return error.to_string();
+    }
+    "package trust denied (idempotent replay of prior denial)".into()
 }
 
 pub(crate) fn request_digest(
@@ -1535,6 +1577,29 @@ mod package_trust_tests {
                 .iter()
                 .any(|event| event.action == "trust_denied"),
             "unsigned install must record trust_denied"
+        );
+    }
+
+    #[test]
+    fn denied_install_replays_same_request_id() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_capability_package_trust_policy("ns", PACKAGE_TRUST_SIGNED, "admin", "policy-r", 1)
+            .unwrap();
+        let manifest = sample_manifest("replay-pkg", "1.0.0");
+        let first = db
+            .install_capability_package("ns", &manifest, "operator", "same-req", 2)
+            .unwrap_err();
+        assert!(first.contains("signed package required"));
+        let second = db
+            .install_capability_package("ns", &manifest, "operator", "same-req", 3)
+            .unwrap_err();
+        assert!(
+            second.contains("signed package required"),
+            "identical denial must replay, not conflict on request_id: {second}"
+        );
+        assert!(
+            !second.contains("already used for different package input"),
+            "denial must keep the original operation digest: {second}"
         );
     }
 
