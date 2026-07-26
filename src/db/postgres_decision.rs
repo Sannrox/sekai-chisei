@@ -114,7 +114,8 @@ impl PostgresDb {
         end_timestamp_ms: i64,
         limit: usize,
     ) -> Result<Vec<Decision>, String> {
-        let limit = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
+        // Callers may pass max+1 to detect overflow; allow that sentinel.
+        let limit = i64::try_from(limit.min(10_001)).unwrap_or(10_001);
         self.connection()?
             .query(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome

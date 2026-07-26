@@ -90,20 +90,38 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         )?;
     }
 
-    // Stage the file, audit, then publish so a failed audit cannot leave an
-    // unaudited compliance artifact at the final path.
-    let staged = config.output.with_extension("compliance-export.partial");
-    std::fs::write(&staged, compliance_bundle_bytes(&bundle)?)?;
-    if let Err(error) =
-        record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())
+    // Unique create-new staging file (no symlink follow), publish, then audit.
+    let parent = config
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged = parent.join(format!(
+        ".compliance-export-{}-{}.partial",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
     {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(&compliance_bundle_bytes(&bundle)?)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = std::fs::rename(&staged, &config.output) {
         let _ = std::fs::remove_file(&staged);
         return Err(error.into());
     }
-    std::fs::rename(&staged, &config.output).map_err(|error| {
-        let _ = std::fs::remove_file(&staged);
-        error
-    })?;
+    if let Err(error) =
+        record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())
+    {
+        // Best-effort compensation: remove the published file if audit fails so
+        // we do not leave an unaudited compliance artifact.
+        let _ = std::fs::remove_file(&config.output);
+        return Err(error.into());
+    }
     println!(
         "exported {} receipts={} decisions={} digest={}",
         config.output.display(),
