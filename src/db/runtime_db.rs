@@ -1266,8 +1266,86 @@ impl RuntimeDb {
                 db.install_capability_package(namespace, manifest, actor, request_id, now_ms)
             }
             Self::Postgres(db) => {
+                // Trust policy enforcement is SQLite-complete; Postgres remains
+                // on the grandfather unsigned path until package-trust parity.
                 db.install_capability_package(namespace, manifest, actor, request_id, now_ms)
             }
+        }
+    }
+
+    pub fn set_capability_package_trust_policy(
+        &self,
+        namespace: &str,
+        required_trust_level: &str,
+        actor: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::capability_package::PackageTrustPolicy, String> {
+        match self {
+            Self::Sqlite(db) => db.set_capability_package_trust_policy(
+                namespace,
+                required_trust_level,
+                actor,
+                request_id,
+                now_ms,
+            ),
+            Self::Postgres(_) => Err(
+                "capability package trust policy is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_capability_package_trust_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::sekai::capability_package::PackageTrustPolicy, String> {
+        match self {
+            Self::Sqlite(db) => db.get_capability_package_trust_policy(namespace),
+            Self::Postgres(_) => Ok(crate::sekai::capability_package::PackageTrustPolicy {
+                namespace: namespace.into(),
+                required_trust_level:
+                    crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED.into(),
+                updated_by: "system".into(),
+                updated_at_ms: 0,
+            }),
+        }
+    }
+
+    pub fn put_capability_package_signer(
+        &self,
+        namespace: &str,
+        identity: &str,
+        key_id: &str,
+        public_key_b64: &str,
+        actor: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::capability_package::PackageSigner, String> {
+        match self {
+            Self::Sqlite(db) => db.put_capability_package_signer(
+                namespace,
+                identity,
+                key_id,
+                public_key_b64,
+                actor,
+                request_id,
+                now_ms,
+            ),
+            Self::Postgres(_) => Err(
+                "capability package signers are unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_capability_package_signers(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::capability_package::PackageSigner>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_capability_package_signers(namespace),
+            Self::Postgres(_) => Ok(Vec::new()),
         }
     }
 

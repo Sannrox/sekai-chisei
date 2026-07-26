@@ -3928,11 +3928,20 @@ fn from_proto_package_manifest(
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
+    let signature = manifest
+        .signature
+        .map(|signature| package_domain::PackageSignature {
+            algorithm: signature.algorithm,
+            signer_identity: signature.signer_identity,
+            key_id: signature.key_id,
+            signature_b64: signature.signature_b64,
+        });
     let manifest = package_domain::CapabilityPackageManifest {
         manifest_version: manifest.manifest_version,
         name: manifest.name,
         version: manifest.version,
         components,
+        signature,
     };
     manifest.validate().map_err(Status::invalid_argument)?;
     Ok(manifest)
@@ -3955,6 +3964,15 @@ fn to_proto_package_manifest(
                     .expect("JSON values always serialize"),
             })
             .collect(),
+        signature: manifest
+            .signature
+            .as_ref()
+            .map(|signature| CapabilityPackageSignature {
+                algorithm: signature.algorithm.clone(),
+                signer_identity: signature.signer_identity.clone(),
+                key_id: signature.key_id.clone(),
+                signature_b64: signature.signature_b64.clone(),
+            }),
     }
 }
 
@@ -6064,6 +6082,113 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(InstallCapabilityPackageResponse {
             installation: Some(to_proto_package_installation(&installation)),
+        }))
+    }
+
+    async fn set_capability_package_trust_policy(
+        &self,
+        req: Request<SetCapabilityPackageTrustPolicyRequest>,
+    ) -> Result<Response<SetCapabilityPackageTrustPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let policy = self
+            .db
+            .set_capability_package_trust_policy(
+                &inner.namespace,
+                &inner.required_trust_level,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(SetCapabilityPackageTrustPolicyResponse {
+            policy: Some(CapabilityPackageTrustPolicy {
+                namespace: policy.namespace,
+                required_trust_level: policy.required_trust_level,
+                updated_by: policy.updated_by,
+                updated_at_ms: policy.updated_at_ms,
+            }),
+        }))
+    }
+
+    async fn get_capability_package_trust_policy(
+        &self,
+        req: Request<GetCapabilityPackageTrustPolicyRequest>,
+    ) -> Result<Response<GetCapabilityPackageTrustPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        let policy = self
+            .db
+            .get_capability_package_trust_policy(&inner.namespace)
+            .map_err(Status::internal)?;
+        Ok(Response::new(GetCapabilityPackageTrustPolicyResponse {
+            policy: Some(CapabilityPackageTrustPolicy {
+                namespace: policy.namespace,
+                required_trust_level: policy.required_trust_level,
+                updated_by: policy.updated_by,
+                updated_at_ms: policy.updated_at_ms,
+            }),
+        }))
+    }
+
+    async fn put_capability_package_signer(
+        &self,
+        req: Request<PutCapabilityPackageSignerRequest>,
+    ) -> Result<Response<PutCapabilityPackageSignerResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let signer = self
+            .db
+            .put_capability_package_signer(
+                &inner.namespace,
+                &inner.identity,
+                &inner.key_id,
+                &inner.public_key_b64,
+                &actor,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(PutCapabilityPackageSignerResponse {
+            signer: Some(CapabilityPackageSigner {
+                namespace: signer.namespace,
+                identity: signer.identity,
+                key_id: signer.key_id,
+                public_key_b64: signer.public_key_b64,
+                created_by: signer.created_by,
+                created_at_ms: signer.created_at_ms,
+            }),
+        }))
+    }
+
+    async fn list_capability_package_signers(
+        &self,
+        req: Request<ListCapabilityPackageSignersRequest>,
+    ) -> Result<Response<ListCapabilityPackageSignersResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        let signers = self
+            .db
+            .list_capability_package_signers(&inner.namespace)
+            .map_err(Status::internal)?;
+        Ok(Response::new(ListCapabilityPackageSignersResponse {
+            signers: signers
+                .into_iter()
+                .map(|signer| CapabilityPackageSigner {
+                    namespace: signer.namespace,
+                    identity: signer.identity,
+                    key_id: signer.key_id,
+                    public_key_b64: signer.public_key_b64,
+                    created_by: signer.created_by,
+                    created_at_ms: signer.created_at_ms,
+                })
+                .collect(),
         }))
     }
 
