@@ -1733,6 +1733,37 @@ fn is_sensitive_name(value: &str) -> bool {
         || lower.contains("credential")
 }
 
+fn temporal_assertion_to_proto(
+    a: crate::sekai::temporal::TemporalAssertionVersion,
+) -> TemporalAssertion {
+    TemporalAssertion {
+        assertion_id: a.assertion_id,
+        version: a.version,
+        namespace: a.namespace,
+        subject_id: a.subject_id,
+        predicate: a.predicate,
+        object_ref: a.object_ref,
+        payload_json: a.payload_json,
+        valid_from: Some(TemporalBound {
+            kind: a.valid_from.kind.as_str().into(),
+            ms: a.valid_from.ms.unwrap_or(0),
+        }),
+        valid_to: Some(TemporalBound {
+            kind: a.valid_to.kind.as_str().into(),
+            ms: a.valid_to.ms.unwrap_or(0),
+        }),
+        recorded_from_revision: a.recorded_from_revision,
+        recorded_to_revision: a.recorded_to_revision.unwrap_or(0),
+        recorded_at_ms: a.recorded_at_ms,
+        source_observed_at_ms: a.source_observed_at_ms.unwrap_or(0),
+        source_id: a.source_id,
+        actor: a.actor,
+        evidence_ref: a.evidence_ref,
+        lineage_ref: a.lineage_ref,
+        is_backfill: a.is_backfill,
+    }
+}
+
 fn check_read(
     security: &SecurityChecker,
     object_id: &str,
@@ -10244,6 +10275,190 @@ impl SekaiService for SekaiServiceImpl {
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
+    }
+
+    async fn discover_temporal_surfaces(
+        &self,
+        req: Request<DiscoverTemporalSurfacesRequest>,
+    ) -> Result<Response<DiscoverTemporalSurfacesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = req.into_inner().namespace;
+        let db = self
+            .db
+            .require_sqlite_arc()
+            .map_err(Status::failed_precondition)?;
+        let surfaces = db
+            .discover_temporal_surfaces(&namespace)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(|s| TemporalSurfaceDiscovery {
+                namespace: s.namespace,
+                surface_kind: s.surface_kind.as_str().into(),
+                surface_name: s.surface_name,
+                history_retained: s.history_retained,
+                policy_version: s.policy_version,
+                preserve_conflicts: s.preserve_conflicts,
+            })
+            .collect();
+        Ok(Response::new(DiscoverTemporalSurfacesResponse { surfaces }))
+    }
+
+    async fn query_temporal_as_of(
+        &self,
+        req: Request<QueryTemporalAsOfRequest>,
+    ) -> Result<Response<QueryTemporalAsOfResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        if inner.subject_id.is_empty() {
+            return Err(Status::invalid_argument("subject_id required"));
+        }
+        // Authorization: current object ACL when the subject still exists.
+        // Non-disclosure for denied subjects (same as GetObject).
+        if let Some(object) = self
+            .db
+            .get_object(&inner.subject_id)
+            .map_err(Status::internal)?
+        {
+            check_read(&self.security, &object.id, &principals)?;
+            check_object_namespace_access(&self.db, &principals, &object.id, false)?;
+        } else {
+            // Orphan history: require an explicit ACL grant on the subject id
+            // so counts/existence do not leak across principals without access.
+            let refs: Vec<&str> = principals.iter().map(String::as_str).collect();
+            if !self.security.can_access(&inner.subject_id, &refs) {
+                return Ok(Response::new(QueryTemporalAsOfResponse {
+                    assertions: vec![],
+                    selected_revision: 0,
+                    next_page_token: String::new(),
+                    outcome: "not_retained".into(),
+                }));
+            }
+        }
+
+        let unknown_bounds =
+            crate::sekai::temporal::UnknownBoundsPolicy::parse(&inner.unknown_bounds_policy)
+                .map_err(Status::invalid_argument)?;
+        let valid_at_ms = match inner.valid_at_kind.as_str() {
+            "" => None,
+            "known" => Some(inner.valid_at_ms),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "valid_at_kind must be empty or known, got {other}"
+                )));
+            }
+        };
+        let page_token = if inner.page_token.is_empty() {
+            None
+        } else {
+            let parts: Vec<&str> = inner.page_token.split('\0').collect();
+            if parts.len() != 2 {
+                return Err(Status::invalid_argument(
+                    "page_token must be assertion_id\\0version",
+                ));
+            }
+            let version: i64 = parts[1]
+                .parse()
+                .map_err(|_| Status::invalid_argument("page_token version is not an integer"))?;
+            Some((parts[0].to_string(), version))
+        };
+        let db = self
+            .db
+            .require_sqlite_arc()
+            .map_err(Status::failed_precondition)?;
+        let result = db
+            .query_temporal_as_of(&crate::sekai::temporal::TemporalAsOfQuery {
+                namespace: inner.namespace,
+                subject_id: inner.subject_id,
+                predicate: inner.predicate,
+                recorded_revision: inner.recorded_revision,
+                valid_at_ms,
+                unknown_bounds,
+                limit: i64::from(inner.limit),
+                page_token,
+            })
+            .map_err(|e| {
+                if e.contains("must be") || e.contains("future") || e.contains("limit") {
+                    Status::invalid_argument(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+        let next_page_token = result
+            .next_page_token
+            .map(|(id, ver)| format!("{id}\0{ver}"))
+            .unwrap_or_default();
+        Ok(Response::new(QueryTemporalAsOfResponse {
+            assertions: result
+                .assertions
+                .into_iter()
+                .map(temporal_assertion_to_proto)
+                .collect(),
+            selected_revision: result.selected_revision,
+            next_page_token,
+            outcome: result.outcome,
+        }))
+    }
+
+    async fn diff_temporal_history(
+        &self,
+        req: Request<DiffTemporalHistoryRequest>,
+    ) -> Result<Response<DiffTemporalHistoryResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        if inner.subject_id.is_empty() {
+            return Err(Status::invalid_argument("subject_id required"));
+        }
+        if let Some(object) = self
+            .db
+            .get_object(&inner.subject_id)
+            .map_err(Status::internal)?
+        {
+            check_read(&self.security, &object.id, &principals)?;
+            check_object_namespace_access(&self.db, &principals, &object.id, false)?;
+        } else {
+            let refs: Vec<&str> = principals.iter().map(String::as_str).collect();
+            if !self.security.can_access(&inner.subject_id, &refs) {
+                return Ok(Response::new(DiffTemporalHistoryResponse {
+                    opened: vec![],
+                    closed: vec![],
+                }));
+            }
+        }
+        let db = self
+            .db
+            .require_sqlite_arc()
+            .map_err(Status::failed_precondition)?;
+        let result = db
+            .diff_temporal_history(
+                &inner.namespace,
+                &inner.subject_id,
+                &inner.predicate,
+                inner.from_revision,
+                inner.to_revision,
+                i64::from(inner.limit),
+            )
+            .map_err(|e| {
+                if e.contains("must be") || e.contains("limit") {
+                    Status::invalid_argument(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+        Ok(Response::new(DiffTemporalHistoryResponse {
+            opened: result
+                .opened
+                .into_iter()
+                .map(temporal_assertion_to_proto)
+                .collect(),
+            closed: result
+                .closed
+                .into_iter()
+                .map(temporal_assertion_to_proto)
+                .collect(),
+        }))
     }
 
     async fn verify_audit_ledger(

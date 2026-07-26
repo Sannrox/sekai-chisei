@@ -635,6 +635,73 @@ message ListDecisionsRequest { string actor = 1; string action = 2; int64 after 
 message ListDecisionsResponse { repeated Decision decisions = 1; }
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
 message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+
+// Selective bitemporal history (#225–#227). SQLite-first; not a PostgreSQL parity claim.
+message TemporalBound {
+  string kind = 1; // known | unbounded | unknown
+  int64 ms = 2;    // set only when kind = known
+}
+message TemporalAssertion {
+  string assertion_id = 1;
+  int64 version = 2;
+  string namespace = 3;
+  string subject_id = 4;
+  string predicate = 5;
+  string object_ref = 6;
+  string payload_json = 7;
+  TemporalBound valid_from = 8;
+  TemporalBound valid_to = 9;
+  int64 recorded_from_revision = 10;
+  int64 recorded_to_revision = 11; // 0 means open
+  int64 recorded_at_ms = 12;
+  int64 source_observed_at_ms = 13;
+  string source_id = 14;
+  string actor = 15;
+  string evidence_ref = 16;
+  string lineage_ref = 17;
+  bool is_backfill = 18;
+}
+message TemporalSurfaceDiscovery {
+  string namespace = 1;
+  string surface_kind = 2; // object_type | property | relation
+  string surface_name = 3;
+  bool history_retained = 4;
+  int64 policy_version = 5;
+  bool preserve_conflicts = 6;
+}
+message DiscoverTemporalSurfacesRequest { string namespace = 1; }
+message DiscoverTemporalSurfacesResponse {
+  repeated TemporalSurfaceDiscovery surfaces = 1;
+}
+message QueryTemporalAsOfRequest {
+  string namespace = 1;
+  string subject_id = 2;
+  string predicate = 3; // empty = all predicates for subject
+  int64 recorded_revision = 4; // 0 = latest committed
+  int64 valid_at_ms = 5; // used when valid_at_kind = known
+  string valid_at_kind = 6; // known | (empty = no domain-time filter)
+  string unknown_bounds_policy = 7; // exclude (default) | include
+  int32 limit = 8;
+  string page_token = 9; // "assertion_id\\0version"
+}
+message QueryTemporalAsOfResponse {
+  repeated TemporalAssertion assertions = 1;
+  int64 selected_revision = 2;
+  string next_page_token = 3;
+  string outcome = 4; // ok | empty | not_retained
+}
+message DiffTemporalHistoryRequest {
+  string namespace = 1;
+  string subject_id = 2;
+  string predicate = 3;
+  int64 from_revision = 4;
+  int64 to_revision = 5;
+  int32 limit = 6;
+}
+message DiffTemporalHistoryResponse {
+  repeated TemporalAssertion opened = 1;
+  repeated TemporalAssertion closed = 2;
+}
 message PolicyAttestation {
   string id = 1;
   string decision_id = 2;       // the audit decision this attestation authorizes
@@ -1373,6 +1440,9 @@ service SekaiService {
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
+  rpc DiscoverTemporalSurfaces(DiscoverTemporalSurfacesRequest) returns (DiscoverTemporalSurfacesResponse);
+  rpc QueryTemporalAsOf(QueryTemporalAsOfRequest) returns (QueryTemporalAsOfResponse);
+  rpc DiffTemporalHistory(DiffTemporalHistoryRequest) returns (DiffTemporalHistoryResponse);
   rpc VerifyAuditLedger(VerifyAuditLedgerRequest) returns (VerifyAuditLedgerResponse);
   rpc GetAttestation(GetAttestationRequest) returns (GetAttestationResponse);
   rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);

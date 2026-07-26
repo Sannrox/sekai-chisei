@@ -835,6 +835,267 @@ impl SekaiDb {
             })
             .collect())
     }
+
+    /// Bounded as-of query over retained assertion versions.
+    ///
+    /// Does not consult audit as a substitute for history. Surfaces without
+    /// any retained rows return `outcome = empty` (not fabricated from audit).
+    pub fn query_temporal_as_of(
+        &self,
+        query: &TemporalAsOfQuery,
+    ) -> Result<TemporalAsOfResult, String> {
+        if !query.namespace.is_empty() {
+            validate_text(&query.namespace, "namespace")?;
+        }
+        validate_text(&query.subject_id, "subject_id")?;
+        if !query.predicate.is_empty() {
+            validate_text(&query.predicate, "predicate")?;
+        }
+        let limit = if query.limit <= 0 {
+            100
+        } else if query.limit > 1_000 {
+            return Err("limit must be between 1 and 1000".into());
+        } else {
+            query.limit
+        };
+
+        let next = self.peek_next_commit_revision()?;
+        let latest = next.saturating_sub(1);
+        let selected = if query.recorded_revision <= 0 {
+            latest
+        } else if query.recorded_revision >= next {
+            return Err("recorded_revision is in the future (not yet committed)".into());
+        } else {
+            query.recorded_revision
+        };
+
+        let conn = self.conn();
+        let mut sql = String::from(
+            "SELECT assertion_id, version, namespace, subject_id, predicate, object_ref,
+                    payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
+                    recorded_from_revision, recorded_to_revision, recorded_at_ms,
+                    source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
+                    is_backfill
+             FROM sekai_temporal_assertions
+             WHERE namespace = ?1 AND subject_id = ?2
+               AND recorded_from_revision <= ?3
+               AND (recorded_to_revision IS NULL OR recorded_to_revision > ?3)",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(query.namespace.clone()),
+            Box::new(query.subject_id.clone()),
+            Box::new(selected),
+        ];
+        let mut idx = 4;
+        if !query.predicate.is_empty() {
+            sql.push_str(&format!(" AND predicate = ?{idx}"));
+            params_vec.push(Box::new(query.predicate.clone()));
+            idx += 1;
+        }
+        if let Some((aid, ver)) = &query.page_token {
+            sql.push_str(&format!(
+                " AND (assertion_id > ?{idx} OR (assertion_id = ?{idx} AND version > ?{}))",
+                idx + 1
+            ));
+            params_vec.push(Box::new(aid.clone()));
+            params_vec.push(Box::new(*ver));
+            idx += 2;
+        }
+        let _ = idx;
+        sql.push_str(" ORDER BY assertion_id ASC, version ASC");
+        // Fetch limit+1 to detect a next page; apply valid-time filter in Rust
+        // so unknown-bound policy stays explicit.
+        sql.push_str(&format!(" LIMIT {}", limit + 1));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), row_to_assertion)
+            .map_err(|e| e.to_string())?;
+        let mut matched = Vec::new();
+        for row in rows {
+            let version = row.map_err(|e| e.to_string())?;
+            if valid_time_matches(
+                &version.valid_from,
+                &version.valid_to,
+                query.valid_at_ms,
+                query.unknown_bounds,
+            ) {
+                matched.push(version);
+            }
+        }
+
+        let mut next_page = None;
+        if matched.len() as i64 > limit {
+            let last = matched[limit as usize - 1].clone();
+            next_page = Some((last.assertion_id.clone(), last.version));
+            matched.truncate(limit as usize);
+        }
+
+        let outcome = if matched.is_empty() {
+            // Distinguish never-enabled vs empty at this snapshot without
+            // inventing audit-derived history.
+            let any_history: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_temporal_assertions
+                     WHERE namespace = ?1 AND subject_id = ?2",
+                    params![query.namespace, query.subject_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if any_history == 0 {
+                "not_retained".into()
+            } else {
+                "empty".into()
+            }
+        } else {
+            "ok".into()
+        };
+
+        Ok(TemporalAsOfResult {
+            assertions: matched,
+            selected_revision: selected,
+            next_page_token: next_page,
+            outcome,
+        })
+    }
+
+    /// Bounded diff of versions that opened or closed between two revisions.
+    /// Temporal order alone is not causality; results are attributed versions only.
+    pub fn diff_temporal_history(
+        &self,
+        namespace: &str,
+        subject_id: &str,
+        predicate: &str,
+        from_revision: i64,
+        to_revision: i64,
+        limit: i64,
+    ) -> Result<TemporalDiffResult, String> {
+        if !namespace.is_empty() {
+            validate_text(namespace, "namespace")?;
+        }
+        validate_text(subject_id, "subject_id")?;
+        if from_revision < 0 || to_revision < 0 || from_revision >= to_revision {
+            return Err("from_revision must be >= 0 and strictly less than to_revision".into());
+        }
+        let limit = if limit <= 0 {
+            100
+        } else if limit > 1_000 {
+            return Err("limit must be between 1 and 1000".into());
+        } else {
+            limit
+        };
+        let conn = self.conn();
+        let mut opened_sql = String::from(
+            "SELECT assertion_id, version, namespace, subject_id, predicate, object_ref,
+                    payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
+                    recorded_from_revision, recorded_to_revision, recorded_at_ms,
+                    source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
+                    is_backfill
+             FROM sekai_temporal_assertions
+             WHERE namespace = ?1 AND subject_id = ?2
+               AND recorded_from_revision > ?3 AND recorded_from_revision <= ?4",
+        );
+        let mut closed_sql = String::from(
+            "SELECT assertion_id, version, namespace, subject_id, predicate, object_ref,
+                    payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
+                    recorded_from_revision, recorded_to_revision, recorded_at_ms,
+                    source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
+                    is_backfill
+             FROM sekai_temporal_assertions
+             WHERE namespace = ?1 AND subject_id = ?2
+               AND recorded_to_revision IS NOT NULL
+               AND recorded_to_revision > ?3 AND recorded_to_revision <= ?4",
+        );
+        if !predicate.is_empty() {
+            validate_text(predicate, "predicate")?;
+            opened_sql.push_str(" AND predicate = ?5");
+            closed_sql.push_str(" AND predicate = ?5");
+        }
+        opened_sql.push_str(&format!(
+            " ORDER BY recorded_from_revision ASC, assertion_id ASC LIMIT {limit}"
+        ));
+        closed_sql.push_str(&format!(
+            " ORDER BY recorded_to_revision ASC, assertion_id ASC LIMIT {limit}"
+        ));
+
+        let opened = if predicate.is_empty() {
+            let mut stmt = conn.prepare(&opened_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![namespace, subject_id, from_revision, to_revision],
+                    row_to_assertion,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut stmt = conn.prepare(&opened_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![namespace, subject_id, from_revision, to_revision, predicate],
+                    row_to_assertion,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let closed = if predicate.is_empty() {
+            let mut stmt = conn.prepare(&closed_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![namespace, subject_id, from_revision, to_revision],
+                    row_to_assertion,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut stmt = conn.prepare(&closed_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![namespace, subject_id, from_revision, to_revision, predicate],
+                    row_to_assertion,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        Ok(TemporalDiffResult { opened, closed })
+    }
+}
+
+fn valid_time_matches(
+    from: &TemporalBound,
+    to: &TemporalBound,
+    valid_at_ms: Option<i64>,
+    unknown_policy: UnknownBoundsPolicy,
+) -> bool {
+    let Some(at) = valid_at_ms else {
+        // No domain-time selector: exclude unknown when policy is Exclude.
+        if unknown_policy == UnknownBoundsPolicy::Exclude
+            && (from.kind == TemporalBoundKind::Unknown || to.kind == TemporalBoundKind::Unknown)
+        {
+            return false;
+        }
+        return true;
+    };
+    // Unknown bounds never contain a concrete domain time under Exclude.
+    if from.kind == TemporalBoundKind::Unknown || to.kind == TemporalBoundKind::Unknown {
+        return unknown_policy == UnknownBoundsPolicy::Include;
+    }
+    let from_ok = match from.kind {
+        TemporalBoundKind::Unbounded => true,
+        TemporalBoundKind::Known => from.ms.is_some_and(|ms| ms <= at),
+        TemporalBoundKind::Unknown => false,
+    };
+    let to_ok = match to.kind {
+        TemporalBoundKind::Unbounded => true,
+        TemporalBoundKind::Known => to.ms.is_some_and(|ms| at < ms),
+        TemporalBoundKind::Unknown => false,
+    };
+    from_ok && to_ok
 }
 
 /// Discovery row distinguishing retained vs non-retained schema surfaces.
@@ -846,6 +1107,60 @@ pub struct TemporalSurfaceDiscovery {
     pub history_retained: bool,
     pub policy_version: i64,
     pub preserve_conflicts: bool,
+}
+
+/// How as-of queries treat `unknown` valid bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownBoundsPolicy {
+    /// Default: never match indeterminate valid bounds.
+    Exclude,
+    /// Return matches that carry unknown bounds (still attributed).
+    Include,
+}
+
+impl UnknownBoundsPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "" | "exclude" => Ok(Self::Exclude),
+            "include" => Ok(Self::Include),
+            other => Err(format!(
+                "unknown_bounds_policy must be exclude|include, got {other}"
+            )),
+        }
+    }
+}
+
+/// Selector for a bitemporal as-of query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalAsOfQuery {
+    pub namespace: String,
+    pub subject_id: String,
+    /// Empty predicate matches all predicates for the subject.
+    pub predicate: String,
+    /// 0 means “latest committed revision” (next_revision - 1, or 0 if none).
+    pub recorded_revision: i64,
+    /// When set, requires known/unbounded validity to contain this domain time.
+    pub valid_at_ms: Option<i64>,
+    pub unknown_bounds: UnknownBoundsPolicy,
+    pub limit: i64,
+    /// Opaque page token: last `(assertion_id, version)` exclusive start.
+    pub page_token: Option<(String, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalAsOfResult {
+    pub assertions: Vec<TemporalAssertionVersion>,
+    pub selected_revision: i64,
+    pub next_page_token: Option<(String, i64)>,
+    /// `ok`, `not_enabled`, `empty`.
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalDiffResult {
+    pub opened: Vec<TemporalAssertionVersion>,
+    pub closed: Vec<TemporalAssertionVersion>,
 }
 
 /// Within an existing graph mutation transaction, retain history for temporal
@@ -1638,6 +1953,89 @@ mod tests {
             !db.is_temporal_enabled("ns", TemporalSurfaceKind::Relation, "works_for")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn as_of_and_diff_queries_respect_revision_and_unknown_bounds() {
+        let db = memory_db();
+        db.upsert_temporal_policy(&policy_write(
+            "ns",
+            TemporalSurfaceKind::ObjectType,
+            "person",
+            true,
+            false,
+            None,
+        ))
+        .unwrap();
+        let mut person = Object {
+            id: "ada".into(),
+            kind: "person".into(),
+            name: "Ada".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&person, "alice").unwrap();
+        let rev1 = db.peek_next_commit_revision().unwrap() - 1;
+        person.name = "Ada L".into();
+        person.updated = 2;
+        db.update_object_with_audit(&person, "alice").unwrap();
+        let rev2 = db.peek_next_commit_revision().unwrap() - 1;
+
+        let at_r1 = db
+            .query_temporal_as_of(&TemporalAsOfQuery {
+                namespace: "ns".into(),
+                subject_id: "ada".into(),
+                predicate: "person".into(),
+                recorded_revision: rev1,
+                valid_at_ms: None,
+                unknown_bounds: UnknownBoundsPolicy::Exclude,
+                limit: 10,
+                page_token: None,
+            })
+            .unwrap();
+        assert_eq!(at_r1.outcome, "ok");
+        assert_eq!(at_r1.assertions.len(), 1);
+        assert_eq!(at_r1.assertions[0].version, 1);
+
+        let at_r2 = db
+            .query_temporal_as_of(&TemporalAsOfQuery {
+                namespace: "ns".into(),
+                subject_id: "ada".into(),
+                predicate: "person".into(),
+                recorded_revision: rev2,
+                valid_at_ms: None,
+                unknown_bounds: UnknownBoundsPolicy::Exclude,
+                limit: 10,
+                page_token: None,
+            })
+            .unwrap();
+        assert_eq!(at_r2.assertions.len(), 1);
+        assert_eq!(at_r2.assertions[0].version, 2);
+
+        let diff = db
+            .diff_temporal_history("ns", "ada", "person", rev1, rev2, 10)
+            .unwrap();
+        assert_eq!(diff.opened.len(), 1);
+        assert_eq!(diff.closed.len(), 1);
+
+        // Non-retained subject is not synthesized from audit.
+        let missing = db
+            .query_temporal_as_of(&TemporalAsOfQuery {
+                namespace: "ns".into(),
+                subject_id: "nobody".into(),
+                predicate: String::new(),
+                recorded_revision: 0,
+                valid_at_ms: None,
+                unknown_bounds: UnknownBoundsPolicy::Exclude,
+                limit: 10,
+                page_token: None,
+            })
+            .unwrap();
+        assert_eq!(missing.outcome, "not_retained");
+        assert!(missing.assertions.is_empty());
     }
 
     #[test]
