@@ -495,6 +495,9 @@ fn redact_receipt(receipt: &mut OperationReceipt) {
     for grant in &mut receipt.reporter_grants {
         grant.principal = "[redacted]".into();
     }
+    for surface in &mut receipt.uncovered_surfaces {
+        surface.reason = "[redacted]".into();
+    }
     for event in &mut receipt.events {
         redact_event(event);
     }
