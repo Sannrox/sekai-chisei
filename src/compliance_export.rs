@@ -450,12 +450,33 @@ fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
 }
 
 fn redact_receipt(receipt: &mut OperationReceipt) {
+    if looks_sensitive("initiating_actor", &receipt.initiating_actor) {
+        receipt.initiating_actor = "[redacted]".into();
+    }
+    for grant in &mut receipt.reporter_grants {
+        if looks_sensitive("principal", &grant.principal) {
+            grant.principal = "[redacted]".into();
+        }
+    }
     for event in &mut receipt.events {
         redact_event(event);
     }
 }
 
 fn redact_event(event: &mut OperationReceiptEvent) {
+    if looks_sensitive("actor", &event.actor) {
+        event.actor = "[redacted]".into();
+    }
+    for reference in &mut event.references {
+        if looks_sensitive("reference", &reference.reference) {
+            reference.reference = "[redacted]".into();
+        }
+        if let Some(hash) = &mut reference.content_hash
+            && looks_sensitive("content_hash", hash)
+        {
+            *hash = "[redacted]".into();
+        }
+    }
     let keys: Vec<String> = event.attributes.keys().cloned().collect();
     for key in keys {
         if let Some(value) = event.attributes.get_mut(&key)
