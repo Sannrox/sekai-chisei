@@ -14,6 +14,7 @@ pub mod gunshi;
 pub mod gunshi_auto;
 pub mod gunshi_dispatch;
 pub mod gunshi_feedback;
+pub mod gunshi_feedback_eval;
 pub mod gunshi_optimization;
 pub mod gunshi_policy;
 pub mod kioku;

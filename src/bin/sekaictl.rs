@@ -205,6 +205,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 Ok(())
             }
+            Some("promote-feedback") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let suite_id = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--suite-id")
+                    .map_err(std::io::Error::other)?;
+                let issuance_id =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--issuance-id")
+                        .map_err(std::io::Error::other)?;
+                let allocation_id =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--allocation-id")
+                        .map_err(std::io::Error::other)?;
+                let result = sekai_chisei::gunshi_cli::promote_feedback(
+                    namespace,
+                    suite_id,
+                    issuance_id,
+                    allocation_id,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
         },
         "team" => match args.get(1).map(String::as_str) {

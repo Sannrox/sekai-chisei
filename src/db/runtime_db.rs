@@ -2898,6 +2898,16 @@ impl RuntimeDb {
         }
     }
 
+    pub fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.append_feedback_eval_suite(suite),
+            Self::Postgres(_) => Err(
+                "append_feedback_eval_suite is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn record_decisions_idempotently_by(
         &self,
         decisions: &[Decision],
