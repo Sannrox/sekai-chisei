@@ -154,9 +154,26 @@ pub fn build_compliance_export(
         .filter(|decision| {
             decision.timestamp >= request.start_timestamp_ms
                 && decision.timestamp < request.end_timestamp_ms
-                && decision_touches_namespace(decision, &request.namespace)
         })
-        .map(ComplianceDecisionRecord::from)
+        .map(|decision| {
+            let mut record = ComplianceDecisionRecord::from(decision);
+            // Callers may select by durable lifecycle namespace column when
+            // evidence.namespace/project is absent; preserve attribution for
+            // offline verify without substring-matching target ids.
+            if !decision_touches_namespace(decision, &request.namespace)
+                && !record.evidence.contains_key("namespace")
+                && !record.evidence.contains_key("project")
+            {
+                record
+                    .evidence
+                    .insert("namespace".into(), request.namespace.clone());
+            } else if !decision_touches_namespace(decision, &request.namespace) {
+                // Explicit evidence attribution for another namespace: drop.
+                record.id.clear();
+            }
+            record
+        })
+        .filter(|record| !record.id.is_empty())
         .collect();
     decision_records.sort_by(|left, right| {
         left.timestamp
