@@ -34,6 +34,7 @@ use crate::sekai::evidence_store::{
     EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
 };
 use crate::sekai::handoff as handoff_domain;
+use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
@@ -806,6 +807,7 @@ impl SekaiServiceImpl {
                 )
                 .is_ok()
                 && self.security.can_access(&candidate.id, &refs)
+                && object_passes_marking(&self.db, candidate, principals).unwrap_or(false)
         })
         .map_err(Status::internal)?;
         Ok(redact_restricted_properties(
@@ -1741,6 +1743,190 @@ fn check_read(
         return Err(Status::permission_denied("access denied"));
     }
     Ok(())
+}
+
+fn resolve_principal_authority(
+    db: &RuntimeDb,
+    principals: &[String],
+) -> Result<markings::PrincipalAuthority, Status> {
+    let primary = principals.first().map(String::as_str).unwrap_or_default();
+    if let Some(trusted) = markings::trusted_service_authority(primary) {
+        return Ok(trusted);
+    }
+    let external_id = markings::principal_profile_external_id(primary);
+    // Prefer an explicit kind-matched sealed profile over any colliding
+    // external_id on ordinary objects (external IDs are indexed, not unique).
+    let candidates = db
+        .find_all_by_external_id(&external_id)
+        .map_err(Status::internal)?;
+    let mut trusted = Vec::new();
+    for object in &candidates {
+        if object.kind != markings::PRINCIPAL_PROFILE_KIND {
+            continue;
+        }
+        if object
+            .properties
+            .get(markings::PRINCIPAL_PROFILE_SEALED_PROPERTY)
+            .is_none_or(|value| value != "true")
+        {
+            continue;
+        }
+        let grants = db.list_grants(&object.id).map_err(Status::internal)?;
+        if grants
+            .iter()
+            .any(|grant| matches!(grant.role, security::Role::Admin))
+        {
+            trusted.push(object);
+        }
+    }
+    if trusted.len() > 1 {
+        return Err(Status::failed_precondition(
+            "multiple trusted principal profiles found; resolve duplicates before marking checks",
+        ));
+    }
+    markings::principal_authority_from_profile(primary, trusted.first().copied())
+        .map_err(Status::internal)
+}
+
+fn object_passes_marking(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+) -> Result<bool, Status> {
+    let marking = markings::object_classification(object).map_err(Status::invalid_argument)?;
+    if marking.is_none() {
+        return Ok(true);
+    }
+    let authority = resolve_principal_authority(db, principals)?;
+    let result = markings::evaluate_marking_access("visibility", marking, &authority);
+    Ok(result.decision != markings::MarkingDecision::Deny)
+}
+
+/// ACL-visible list with marking filter, exact marking-visible totals, and
+/// offset/limit applied over the filtered set.
+fn list_objects_with_marking<F>(
+    db: &RuntimeDb,
+    filter: &domain::ListFilter,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    resolve: F,
+) -> Result<(Vec<domain::Object>, i32), Status>
+where
+    F: FnOnce(
+        Vec<domain::Object>,
+        &[String],
+        Option<&RequestEnterpriseContext>,
+    ) -> Result<Vec<domain::Object>, Status>,
+{
+    let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    let requested_limit = if filter.limit <= 0 {
+        domain::DEFAULT_LIST_LIMIT as usize
+    } else {
+        (filter.limit as usize).min(domain::MAX_LIST_LIMIT as usize)
+    };
+    let requested_offset = filter.offset.max(0) as usize;
+    let mut scan_offset = 0i32;
+    let mut visible_index = 0usize;
+    let mut collected = Vec::new();
+    let mut visible_total = 0i32;
+    loop {
+        let mut scan_filter = filter.clone();
+        scan_filter.offset = scan_offset;
+        scan_filter.limit = domain::MAX_LIST_LIMIT;
+        let (page, principal_total) = db
+            .list_objects_with_total_for_principals(
+                &scan_filter,
+                &principal_refs,
+                RESERVED_GOVERNANCE_KINDS,
+            )
+            .map_err(Status::internal)?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len() as i32;
+        for object in page {
+            if !object_passes_marking(db, &object, principals).unwrap_or(false) {
+                continue;
+            }
+            if visible_index >= requested_offset && collected.len() < requested_limit {
+                collected.push(object);
+            }
+            visible_index = visible_index.saturating_add(1);
+            visible_total = visible_total.saturating_add(1);
+        }
+        scan_offset = scan_offset.saturating_add(page_len);
+        if scan_offset >= principal_total {
+            break;
+        }
+    }
+    let objects = resolve(collected, principals, tenant_context)?;
+    Ok((objects, visible_total))
+}
+
+fn validate_principal_profile_object(obj: &Object) -> Result<(), Status> {
+    if obj.kind != markings::PRINCIPAL_PROFILE_KIND {
+        return Ok(());
+    }
+    let expected = markings::principal_profile_external_id(&obj.name);
+    if obj.external_id != expected {
+        return Err(Status::invalid_argument(format!(
+            "principal_profile external_id must be {expected}"
+        )));
+    }
+    if let Some(ceiling) = obj
+        .properties
+        .get(markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY)
+    {
+        markings::parse_optional_classification(ceiling).map_err(Status::invalid_argument)?;
+    }
+    if let Some(purposes) = obj
+        .properties
+        .get(markings::PRINCIPAL_ALLOWED_PURPOSES_PROPERTY)
+    {
+        let domain = from_proto_obj(obj);
+        markings::principal_authority_from_profile(&obj.name, Some(&domain))
+            .map_err(Status::invalid_argument)?;
+        let _ = purposes;
+    }
+    Ok(())
+}
+
+fn enforce_object_marking_access(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    operation_id: &str,
+) -> Result<markings::MarkingCheckResult, Status> {
+    let marking = markings::object_classification(object).map_err(Status::invalid_argument)?;
+    let authority = resolve_principal_authority(db, principals)?;
+    let result = markings::evaluate_marking_access(operation_id, marking, &authority);
+    if result.decision == markings::MarkingDecision::Deny {
+        // Generic denial — do not leak marking details to unauthorized callers.
+        return Err(Status::permission_denied("access denied"));
+    }
+    Ok(result)
+}
+
+fn record_marking_or_purpose_decision(
+    db: &RuntimeDb,
+    actor: &str,
+    action: &str,
+    target_id: &str,
+    decision_id: &str,
+    outcome: &str,
+    evidence: HashMap<String, String>,
+) -> Result<(), Status> {
+    db.record_decision(&audit::Decision {
+        id: decision_id.into(),
+        timestamp: now_millis(),
+        actor: actor.into(),
+        action: action.into(),
+        reason: "classification marking / purpose gate".into(),
+        evidence,
+        target_id: target_id.into(),
+        outcome: outcome.into(),
+    })
+    .map_err(Status::internal)
 }
 
 fn check_write(
@@ -3187,6 +3373,7 @@ fn to_proto_action_type(action_type: &action::ActionTypeDef) -> ActionTypeDef {
         ops: action_type.ops.iter().map(to_proto_action_op).collect(),
         target_kind: action_type.target_kind.clone(),
         created: action_type.created,
+        required_purpose: action_type.required_purpose.clone(),
     }
 }
 
@@ -3221,6 +3408,7 @@ fn from_proto_action_type(action_type: &ActionTypeDef) -> Result<action::ActionT
         ops: action_type.ops.iter().map(from_proto_action_op).collect(),
         target_kind: action_type.target_kind.clone(),
         created: action_type.created,
+        required_purpose: action_type.required_purpose.trim().to_string(),
     })
 }
 
@@ -4395,6 +4583,12 @@ impl SekaiService for SekaiServiceImpl {
             None,
         )?;
         let domain_object = from_proto_obj(&object);
+        if let Some(value) = domain_object
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
+        {
+            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+        }
         if let Some(created) = self
             .db
             .guarded_object_replay(
@@ -4419,21 +4613,31 @@ impl SekaiService for SekaiServiceImpl {
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
-        self.require_schema_kind_loaded(&domain_object.kind)?;
-        let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        schema
-            .validate(&domain_object)
-            .map_err(Status::invalid_argument)?;
-        ensure_restricted_create_properties_allowed(
-            &schema,
-            &self.security,
-            &principals,
-            &domain_object,
-        )?;
-        drop(schema);
+        let mut domain_object = domain_object;
+        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
+            require_credential_admin(&principals)?;
+            validate_principal_profile_object(&object)?;
+            domain_object.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+        } else {
+            self.require_schema_kind_loaded(&domain_object.kind)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            schema
+                .validate(&domain_object)
+                .map_err(Status::invalid_argument)?;
+            ensure_restricted_create_properties_allowed(
+                &schema,
+                &self.security,
+                &principals,
+                &domain_object,
+            )?;
+            drop(schema);
+        }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let created = self
             .db
@@ -4447,6 +4651,24 @@ impl SekaiService for SekaiServiceImpl {
                 now_millis(),
             )
             .map_err(map_lease_error)?;
+        if created.kind == markings::PRINCIPAL_PROFILE_KIND {
+            let grant = security::Grant {
+                id: format!("principal-profile-admin-{}", Uuid::new_v4().simple()),
+                object_id: created.id.clone(),
+                principal: if actor.is_empty() {
+                    "root".into()
+                } else {
+                    actor.into()
+                },
+                role: security::Role::Admin,
+                created: now_millis(),
+            };
+            if let Err(error) = self.db.create_grant(&grant) {
+                let _ = self.db.delete_object(&created.id);
+                return Err(Status::internal(error));
+            }
+            self.security.add_grant(&grant);
+        }
         let created =
             self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GuardedCreateObjectResponse {
@@ -4484,6 +4706,14 @@ impl SekaiService for SekaiServiceImpl {
         {
             require_credential_admin(&principals)?;
         }
+        if object.kind == markings::PRINCIPAL_PROFILE_KIND
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == markings::PRINCIPAL_PROFILE_KIND)
+        {
+            require_credential_admin(&principals)?;
+            validate_principal_profile_object(&object)?;
+        }
         if let Some(existing) = &existing {
             enforce_namespace_tenant_context(
                 &self.db,
@@ -4508,6 +4738,14 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
+        if let Some(existing) = &existing {
+            enforce_object_marking_access(
+                &self.db,
+                existing,
+                &principals,
+                &format!("guarded_update_object:{}", existing.id),
+            )?;
+        }
         enforce_object_bound_lease_precondition(
             &precondition.key,
             &precondition.namespace,
@@ -4515,6 +4753,12 @@ impl SekaiService for SekaiServiceImpl {
             Some(object.namespace.as_str()),
         )?;
         let mut domain_object = from_proto_obj(&object);
+        if let Some(value) = domain_object
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
+        {
+            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+        }
         let request_object = domain_object.clone();
         if let Some(updated) = self
             .db
@@ -4529,6 +4773,12 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(map_lease_error)?
         {
+            enforce_object_marking_access(
+                &self.db,
+                &updated,
+                &principals,
+                &format!("guarded_update_object_replay:{}", updated.id),
+            )?;
             let updated =
                 self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
             return Ok(Response::new(GuardedUpdateObjectResponse {
@@ -4544,24 +4794,31 @@ impl SekaiService for SekaiServiceImpl {
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
-        self.require_schema_kind_loaded(&domain_object.kind)?;
-        let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        if existing.is_some() {
-            preserve_redacted_restricted_properties(
-                &self.db,
-                &schema,
-                &self.security,
-                &principals,
-                &mut domain_object,
-            )?;
+        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
+            domain_object.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+        } else {
+            self.require_schema_kind_loaded(&domain_object.kind)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            if existing.is_some() {
+                preserve_redacted_restricted_properties(
+                    &self.db,
+                    &schema,
+                    &self.security,
+                    &principals,
+                    &mut domain_object,
+                )?;
+            }
+            schema
+                .validate(&domain_object)
+                .map_err(Status::invalid_argument)?;
+            drop(schema);
         }
-        schema
-            .validate(&domain_object)
-            .map_err(Status::invalid_argument)?;
-        drop(schema);
         if let Some(existing) = &existing {
             validate_object_kind_change_access(
                 &self.db,
@@ -4627,6 +4884,15 @@ impl SekaiService for SekaiServiceImpl {
                 true,
             )?;
             check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+            enforce_object_marking_access(
+                &self.db,
+                existing,
+                &principals,
+                &format!("guarded_delete_object:{}", existing.id),
+            )?;
+            if existing.kind == markings::PRINCIPAL_PROFILE_KIND {
+                require_credential_admin(&principals)?;
+            }
             if existing.kind == "namespace" {
                 require_credential_admin(&principals)?;
                 if existing
@@ -4892,40 +5158,88 @@ impl SekaiService for SekaiServiceImpl {
                 "namespace:* external IDs are reserved for namespace boundaries",
             ));
         }
+        if obj
+            .external_id
+            .starts_with(markings::PRINCIPAL_PROFILE_EXTERNAL_ID_PREFIX)
+            && obj.kind != markings::PRINCIPAL_PROFILE_KIND
+        {
+            return Err(Status::invalid_argument(
+                "principal:* external IDs are reserved for principal_profile objects",
+            ));
+        }
         if obj.kind == "namespace" {
             require_credential_admin(&principals)?;
             return Err(Status::failed_precondition(
                 "namespace objects must be managed through EnsureTeamNamespace",
             ));
         }
+        if obj.kind == markings::PRINCIPAL_PROFILE_KIND {
+            require_credential_admin(&principals)?;
+            validate_principal_profile_object(&obj)?;
+        }
         enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, true)?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
-        let domain_obj = from_proto_obj(&obj);
+        let mut domain_obj = from_proto_obj(&obj);
         if is_reserved_governance_kind(&domain_obj.kind) {
             return Err(Status::permission_denied(
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
-        self.require_schema_kind_loaded(&domain_obj.kind)?;
-        let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        schema
-            .validate(&domain_obj)
-            .map_err(Status::invalid_argument)?;
-        ensure_restricted_create_properties_allowed(
-            &schema,
-            &self.security,
-            &principals,
-            &domain_obj,
-        )?;
-        drop(schema);
+        if domain_obj.kind == markings::PRINCIPAL_PROFILE_KIND {
+            domain_obj.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+        }
+        if domain_obj.kind != markings::PRINCIPAL_PROFILE_KIND {
+            self.require_schema_kind_loaded(&domain_obj.kind)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            schema
+                .validate(&domain_obj)
+                .map_err(Status::invalid_argument)?;
+            ensure_restricted_create_properties_allowed(
+                &schema,
+                &self.security,
+                &principals,
+                &domain_obj,
+            )?;
+            drop(schema);
+        }
+        if let Some(value) = domain_obj
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
+        {
+            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+        }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         self.db
             .create_object_with_audit(&domain_obj, actor)
             .map_err(Status::internal)?;
+        if domain_obj.kind == markings::PRINCIPAL_PROFILE_KIND {
+            // Profiles must not remain world-writable; seal with an admin grant.
+            // If sealing fails, remove the object so we do not leave an unusable
+            // world-open identity record.
+            let grant = security::Grant {
+                id: format!("principal-profile-admin-{}", Uuid::new_v4().simple()),
+                object_id: domain_obj.id.clone(),
+                principal: if actor.is_empty() {
+                    "root".into()
+                } else {
+                    actor.into()
+                },
+                role: security::Role::Admin,
+                created: now_millis(),
+            };
+            if let Err(error) = self.db.create_grant(&grant) {
+                let _ = self.db.delete_object(&domain_obj.id);
+                return Err(Status::internal(error));
+            }
+            self.security.add_grant(&grant);
+        }
         let domain_obj =
             self.resolve_computed_for_response(domain_obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(CreateObjectResponse {
@@ -4950,6 +5264,32 @@ impl SekaiService for SekaiServiceImpl {
         check_read(&self.security, &id, &principals)?;
         if is_reserved_governance_kind(&obj.kind) {
             return Err(Status::not_found("not found"));
+        }
+        let marking = enforce_object_marking_access(
+            &self.db,
+            &obj,
+            &principals,
+            &format!("get_object:{}", obj.id),
+        )?;
+        if marking.decision != markings::MarkingDecision::NotApplicable {
+            let actor = principals.first().cloned().unwrap_or_default();
+            let mut evidence = HashMap::new();
+            if let Some(value) = &marking.object_classification {
+                evidence.insert("object_classification".into(), value.clone());
+            }
+            if let Some(value) = &marking.principal_ceiling {
+                evidence.insert("principal_ceiling".into(), value.clone());
+            }
+            evidence.insert("detail".into(), marking.detail.clone());
+            record_marking_or_purpose_decision(
+                &self.db,
+                &actor,
+                "marking.read",
+                &obj.id,
+                &marking.decision_id,
+                "allowed",
+                evidence,
+            )?;
         }
         let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetObjectResponse {
@@ -4998,6 +5338,13 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         check_team_namespace(&self.db, &principals, &obj.namespace, true)?;
         check_write(&self.security, &obj.id, &principals)?;
+        // Clearance required to mutate a marked object (including demoting it).
+        enforce_object_marking_access(
+            &self.db,
+            &existing,
+            &principals,
+            &format!("update_object:{}", existing.id),
+        )?;
         let mut domain_obj = from_proto_obj(&obj);
         if is_reserved_governance_kind(&domain_obj.kind)
             || self
@@ -5010,22 +5357,40 @@ impl SekaiService for SekaiServiceImpl {
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
-        self.require_schema_kind_loaded(&domain_obj.kind)?;
-        let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        preserve_redacted_restricted_properties(
-            &self.db,
-            &schema,
-            &self.security,
-            &principals,
-            &mut domain_obj,
-        )?;
-        schema
-            .validate(&domain_obj)
-            .map_err(Status::invalid_argument)?;
-        drop(schema);
+        if domain_obj.kind == markings::PRINCIPAL_PROFILE_KIND
+            || existing.kind == markings::PRINCIPAL_PROFILE_KIND
+        {
+            require_credential_admin(&principals)?;
+            validate_principal_profile_object(&obj)?;
+            domain_obj.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+        }
+        if domain_obj.kind != markings::PRINCIPAL_PROFILE_KIND {
+            self.require_schema_kind_loaded(&domain_obj.kind)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            preserve_redacted_restricted_properties(
+                &self.db,
+                &schema,
+                &self.security,
+                &principals,
+                &mut domain_obj,
+            )?;
+            schema
+                .validate(&domain_obj)
+                .map_err(Status::invalid_argument)?;
+            drop(schema);
+        }
+        if let Some(value) = domain_obj
+            .properties
+            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
+        {
+            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+        }
         if existing.kind != domain_obj.kind {
             let ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
             let mut linked = self
@@ -5120,8 +5485,17 @@ impl SekaiService for SekaiServiceImpl {
                 ));
             }
         }
+        if existing.kind == markings::PRINCIPAL_PROFILE_KIND {
+            require_credential_admin(&principals)?;
+        }
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         check_write(&self.security, &id, &principals)?;
+        enforce_object_marking_access(
+            &self.db,
+            &existing,
+            &principals,
+            &format!("delete_object:{id}"),
+        )?;
         if self
             .db
             .get_object(&id)
@@ -5256,19 +5630,15 @@ impl SekaiService for SekaiServiceImpl {
         }
         // The API now defaults paging at 100 rows when no limit is provided;
         // DB callers using list_objects(&filter) remain unchanged.
-        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-        // Query visibility in SQL so list pagination and totals honor grants
-        // consistently across callers.
-        let (objects, total) = self
-            .db
-            .list_objects_with_total_for_principals(
-                &filter,
-                &principal_refs,
-                RESERVED_GOVERNANCE_KINDS,
-            )
-            .map_err(Status::internal)?;
-        let objects =
-            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_ref())?;
+        let (objects, total) = list_objects_with_marking(
+            &self.db,
+            &filter,
+            &principals,
+            tenant_context.as_ref(),
+            |objects, principals, tenant_context| {
+                self.resolve_computed_for_responses(objects, principals, tenant_context)
+            },
+        )?;
         let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -5313,6 +5683,7 @@ impl SekaiService for SekaiServiceImpl {
                         && check_team_namespace(&self.db, &principals, &candidate.namespace, false)
                             .is_ok()
                         && check_read(&self.security, &candidate.id, &principals).is_ok()
+                        && object_passes_marking(&self.db, candidate, &principals).unwrap_or(false)
                 })
         } else {
             self.db
@@ -5327,6 +5698,12 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
         check_read(&self.security, &obj.id, &principals)?;
+        enforce_object_marking_access(
+            &self.db,
+            &obj,
+            &principals,
+            &format!("find_by_external_id:{}", obj.id),
+        )?;
         let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
@@ -5369,6 +5746,7 @@ impl SekaiService for SekaiServiceImpl {
                         false,
                     )
                     .is_ok()
+                    && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
             })
             .collect::<Vec<_>>();
         let filtered = self.resolve_computed_for_responses(
@@ -5516,17 +5894,15 @@ impl SekaiService for SekaiServiceImpl {
                 .map_err(|_| Status::internal("schema registry unavailable"))?;
             ensure_list_filter_query_allowed(&schema, &principals, &filter)?;
         }
-        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-        let (objects, total) = self
-            .db
-            .list_objects_with_total_for_principals(
-                &filter,
-                &principal_refs,
-                RESERVED_GOVERNANCE_KINDS,
-            )
-            .map_err(Status::internal)?;
-        let objects =
-            self.resolve_computed_for_responses(objects, &principals, tenant_context.as_ref())?;
+        let (objects, total) = list_objects_with_marking(
+            &self.db,
+            &filter,
+            &principals,
+            tenant_context.as_ref(),
+            |objects, principals, tenant_context| {
+                self.resolve_computed_for_responses(objects, principals, tenant_context)
+            },
+        )?;
         Ok(Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
@@ -5559,6 +5935,12 @@ impl SekaiService for SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
+            enforce_object_marking_access(
+                &self.db,
+                &object,
+                &principals,
+                &format!("create_link:{object_id}"),
+            )?;
             endpoints.push(object);
         }
         if self.db.get_link(&l.id).map_err(Status::internal)?.is_none() {
@@ -5615,6 +5997,12 @@ impl SekaiService for SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
+            enforce_object_marking_access(
+                &self.db,
+                &object,
+                &principals,
+                &format!("delete_link:{object_id}"),
+            )?;
         }
         self.db.delete_link(&id).map_err(Status::internal)?;
         Ok(Response::new(DeleteLinkResponse {}))
@@ -5636,6 +6024,12 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
+        enforce_object_marking_access(
+            &self.db,
+            &root,
+            &principals,
+            &format!("get_links:{}", root.id),
+        )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -5664,6 +6058,8 @@ impl SekaiService for SekaiServiceImpl {
                                 )
                                 .is_ok()
                                 && check_read(&self.security, object_id, &principals).is_ok()
+                                && object_passes_marking(&self.db, &object, &principals)
+                                    .unwrap_or(false)
                         })
                 })
             })
@@ -5688,6 +6084,12 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
+        enforce_object_marking_access(
+            &self.db,
+            &root,
+            &principals,
+            &format!("get_linked_objects:{}", root.id),
+        )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -5709,6 +6111,7 @@ impl SekaiService for SekaiServiceImpl {
                     )
                     .is_ok()
                     && check_read(&self.security, &object.id, &principals).is_ok()
+                    && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
             })
             .collect();
         let objs =
@@ -5771,6 +6174,7 @@ impl SekaiService for SekaiServiceImpl {
                 )
                 .is_ok()
                 && check_read(&self.security, &object.id, &principals).is_ok()
+                && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
         });
         let visible_ids = res
             .objects
@@ -5952,6 +6356,7 @@ impl SekaiService for SekaiServiceImpl {
             |object| {
                 self.security.can_access(&object.id, &principal_refs)
                     && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                    && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
             },
             |object| is_reserved_governance_kind(&object.kind),
         )
@@ -6979,6 +7384,8 @@ impl SekaiService for SekaiServiceImpl {
                     || check_team_namespace(&self.db, &principals, &to.namespace, false).is_err()
                     || check_read(&self.security, &from.id, &principals).is_err()
                     || check_read(&self.security, &to.id, &principals).is_err()
+                    || !object_passes_marking(&self.db, &from, &principals).unwrap_or(false)
+                    || !object_passes_marking(&self.db, &to, &principals).unwrap_or(false)
                 {
                     continue;
                 }
@@ -7258,6 +7665,11 @@ impl SekaiService for SekaiServiceImpl {
         }
         for target_id in &target_ids {
             if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                if target.kind == markings::PRINCIPAL_PROFILE_KIND {
+                    return Err(Status::permission_denied(
+                        "principal_profile objects require credential-admin CRUD paths",
+                    ));
+                }
                 enforce_namespace_tenant_context(
                     &self.db,
                     tenant_context.as_ref(),
@@ -7265,8 +7677,90 @@ impl SekaiService for SekaiServiceImpl {
                     true,
                 )?;
                 check_team_namespace(&self.db, &principals, &target.namespace, true)?;
+                // Marked targets require clearance for action execution too.
+                let _ = enforce_object_marking_access(
+                    &self.db,
+                    &target,
+                    &principals,
+                    &format!("execute_action:{}:{}", r.action, target_id),
+                )?;
             }
             check_write(&self.security, target_id, &principals)?;
+        }
+        // Reject invalid classification writes through set_property / fixed params
+        // and registered action ops that set the classification property.
+        if r.params
+            .get("key")
+            .is_some_and(|key| key == markings::OBJECT_CLASSIFICATION_PROPERTY)
+        {
+            if let Some(value) = r.params.get("value") {
+                markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+            }
+        }
+        if let Some(value) = r.params.get(markings::OBJECT_CLASSIFICATION_PROPERTY) {
+            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
+        }
+        if let Some(action_type) = actions.get_action_type(&r.action) {
+            for op in &action_type.ops {
+                if op.op == "set_property"
+                    && op.property == markings::OBJECT_CLASSIFICATION_PROPERTY
+                {
+                    let value = if op.value_from.is_empty() {
+                        r.params.get("value")
+                    } else {
+                        r.params.get(&op.value_from)
+                    };
+                    if let Some(value) = value {
+                        markings::parse_optional_classification(value)
+                            .map_err(Status::invalid_argument)?;
+                    }
+                }
+            }
+        }
+        // Purpose gate for registered action types with required_purpose.
+        {
+            let required_purpose = actions
+                .get_action_type(&r.action)
+                .map(|action_type| action_type.required_purpose.clone())
+                .unwrap_or_default();
+            if !required_purpose.trim().is_empty() {
+                let authority = resolve_principal_authority(&self.db, &principals)?;
+                let purpose = markings::evaluate_purpose_access(
+                    &format!("execute_action:{}", r.action),
+                    &required_purpose,
+                    &authority,
+                );
+                let actor = principals.first().cloned().unwrap_or_default();
+                let mut evidence = HashMap::from([
+                    ("required_purpose".into(), purpose.required_purpose.clone()),
+                    ("detail".into(), purpose.detail.clone()),
+                ]);
+                if purpose.decision == markings::MarkingDecision::Deny {
+                    evidence.insert("outcome".into(), "denied".into());
+                    let _ = record_marking_or_purpose_decision(
+                        &self.db,
+                        &actor,
+                        "purpose.execute",
+                        target_ids.first().map(String::as_str).unwrap_or(""),
+                        &purpose.decision_id,
+                        "denied",
+                        evidence,
+                    );
+                    return Err(Status::permission_denied("purpose not allow-listed"));
+                }
+                if purpose.decision == markings::MarkingDecision::Allow {
+                    evidence.insert("outcome".into(), "allowed".into());
+                    record_marking_or_purpose_decision(
+                        &self.db,
+                        &actor,
+                        "purpose.execute",
+                        target_ids.first().map(String::as_str).unwrap_or(""),
+                        &purpose.decision_id,
+                        "allowed",
+                        evidence,
+                    )?;
+                }
+            }
         }
         if let Some(namespace) = r.params.get("namespace") {
             enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, true)?;
@@ -7955,8 +8449,72 @@ impl SekaiService for SekaiServiceImpl {
             )));
         }
 
-        // Resume the effect, re-checking write access for the original proposer.
+        // Resume the effect, re-checking write access, markings, and purpose
+        // for the original proposer (authority may have changed while held).
         let proposer = vec![approval.actor.clone()];
+        let actions = self
+            .actions
+            .read()
+            .map_err(|_| Status::internal("action registry unavailable"))?;
+        let resume_targets = actions
+            .target_ids(&self.db, &approval.action, &approval.params)
+            .map_err(Status::invalid_argument)?;
+        for target_id in &resume_targets {
+            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
+                enforce_object_marking_access(
+                    &self.db,
+                    &target,
+                    &proposer,
+                    &format!("approve_action:{}:{}", approval.action, target_id),
+                )?;
+            }
+        }
+        let required_purpose = actions
+            .get_action_type(&approval.action)
+            .map(|action_type| action_type.required_purpose.clone())
+            .unwrap_or_default();
+        if !required_purpose.trim().is_empty() {
+            let authority = resolve_principal_authority(&self.db, &proposer)?;
+            let purpose = markings::evaluate_purpose_access(
+                &format!("approve_action:{}", approval.action),
+                &required_purpose,
+                &authority,
+            );
+            if purpose.decision == markings::MarkingDecision::Deny {
+                let evidence = HashMap::from([
+                    ("required_purpose".into(), purpose.required_purpose.clone()),
+                    ("detail".into(), purpose.detail.clone()),
+                    ("outcome".into(), "denied".into()),
+                ]);
+                let _ = record_marking_or_purpose_decision(
+                    &self.db,
+                    &approval.actor,
+                    "purpose.execute",
+                    approval.target_id.as_str(),
+                    &purpose.decision_id,
+                    "denied",
+                    evidence,
+                );
+                return Err(Status::permission_denied("purpose not allow-listed"));
+            }
+            if purpose.decision == markings::MarkingDecision::Allow {
+                let evidence = HashMap::from([
+                    ("required_purpose".into(), purpose.required_purpose.clone()),
+                    ("detail".into(), purpose.detail.clone()),
+                    ("outcome".into(), "allowed".into()),
+                ]);
+                record_marking_or_purpose_decision(
+                    &self.db,
+                    &approval.actor,
+                    "purpose.execute",
+                    approval.target_id.as_str(),
+                    &purpose.decision_id,
+                    "allowed",
+                    evidence,
+                )?;
+            }
+        }
+        drop(actions);
         let msg = self.run_action_effect(
             &approval.action,
             &approval.params,
@@ -8171,6 +8729,12 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::not_found("not found"))?;
         check_team_namespace(&self.db, &principals, &root.namespace, false)?;
         check_read(&self.security, &root.id, &principals)?;
+        enforce_object_marking_access(
+            &self.db,
+            &root,
+            &principals,
+            &format!("get_lineage:{}", root.id),
+        )?;
         let res = self
             .db
             .get_lineage(&r.object_id, r.max_nodes as usize)
@@ -8181,6 +8745,7 @@ impl SekaiService for SekaiServiceImpl {
             .filter(|node| {
                 check_team_namespace(&self.db, &principals, &node.object.namespace, false).is_ok()
                     && check_read(&self.security, &node.object.id, &principals).is_ok()
+                    && object_passes_marking(&self.db, &node.object, &principals).unwrap_or(false)
             })
             .collect::<Vec<_>>();
         let objects = self.resolve_computed_for_responses(
@@ -9102,6 +9667,7 @@ impl SekaiService for SekaiServiceImpl {
         let result = function::execute_with_filter(&self.db, &function, &inner.params, |object| {
             self.security.can_access(&object.id, &refs)
                 && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
+                && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
         })
         .map_err(Status::invalid_argument)?;
         let objects = self.resolve_computed_for_responses(result.objects, &principals, None)?;
@@ -9614,17 +10180,30 @@ impl SekaiService for SekaiServiceImpl {
             .get_object(&inner.object_id)
             .map_err(Status::internal)?;
         match object.as_ref() {
-            Some(object) => enforce_namespace_tenant_context(
-                &self.db,
-                tenant_context.as_ref(),
-                &object.namespace,
-                false,
-            )
-            .map_err(|_| Status::not_found("not found"))?,
+            Some(object) => {
+                enforce_namespace_tenant_context(
+                    &self.db,
+                    tenant_context.as_ref(),
+                    &object.namespace,
+                    false,
+                )
+                .map_err(|_| Status::not_found("not found"))?;
+                enforce_object_marking_access(
+                    &self.db,
+                    object,
+                    &principals,
+                    &format!("list_object_changes:{}", object.id),
+                )?;
+            }
             None if tenant_context.is_some() => {
                 return Err(Status::not_found("not found"));
             }
-            None => {}
+            // Without a live object we cannot reconstruct access_marking.
+            // Fail closed: only credential admins may inspect orphan history.
+            None => {
+                require_credential_admin(&principals)
+                    .map_err(|_| Status::not_found("not found"))?;
+            }
         }
         let object_kind = match object.as_ref() {
             Some(object) => Some(object.kind.clone()),
@@ -11459,6 +12038,7 @@ mod tests {
             }],
             target_kind: "widget".into(),
             created: 0,
+            required_purpose: String::new(),
         }
     }
 
@@ -11579,6 +12159,249 @@ mod tests {
 
         let obj = svc.db.get_object("obj-1").unwrap().unwrap();
         assert_eq!(obj.properties["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn get_object_denies_marked_artifact_without_clearance() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "artifact-1".into(),
+                kind: "artifact".into(),
+                name: "secret".into(),
+                namespace: "ns".into(),
+                external_id: "artifact:1".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                )]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        // No grants on object => world-readable ACL, but marking fails closed.
+        let err = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "artifact-1".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "artifact-2".into(),
+                kind: "artifact".into(),
+                name: "secret".into(),
+                namespace: "ns".into(),
+                external_id: "artifact:2".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                )]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&domain::Object {
+                id: "principal-alice".into(),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: "alice".into(),
+                namespace: "ns".into(),
+                external_id: markings::principal_profile_external_id("alice"),
+                properties: HashMap::from([
+                    (
+                        markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        "confidential".into(),
+                    ),
+                    (
+                        markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        // Credential-admin seal + Admin grant required for trust.
+        grant_object_role(&svc, "principal-alice", "root", security::Role::Admin);
+        let resp = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "artifact-2".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.object.unwrap().id, "artifact-2");
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("marking.read".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(decisions.iter().any(|d| d.outcome == "allowed"));
+    }
+
+    #[tokio::test]
+    async fn find_by_external_id_hides_marked_artifact_without_clearance() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "artifact-3".into(),
+                kind: "artifact".into(),
+                name: "secret".into(),
+                namespace: "ns".into(),
+                external_id: "artifact:hidden".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "restricted".into(),
+                )]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        let err = svc
+            .find_by_external_id(with_named_principal(
+                FindByExternalIdRequest {
+                    external_id: "artifact:hidden".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn execute_action_denies_when_purpose_not_allow_listed() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        let mut action = assign_color_action();
+        action.required_purpose = "incident-response".into();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(action),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(widget_object(
+                "widget-purpose",
+                HashMap::from([("name".into(), "w".into())]),
+            )),
+        }))
+        .await
+        .unwrap();
+        grant_object_role(&svc, "widget-purpose", "tester", security::Role::Editor);
+
+        let err = svc
+            .execute_action(with_principal(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: "assign_color".into(),
+                    params: HashMap::from([
+                        ("id".into(), "widget-purpose".into()),
+                        ("color".into(), "red".into()),
+                    ]),
+                    actor: "tester".into(),
+                }),
+                dry_run: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("purpose"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_allows_when_purpose_is_allow_listed() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+        let mut action = assign_color_action();
+        action.name = "assign_color_purpose".into();
+        action.required_purpose = "incident-response".into();
+        svc.create_action_type(with_principal(CreateActionTypeRequest {
+            action_type: Some(action),
+        }))
+        .await
+        .unwrap();
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(widget_object(
+                "widget-purpose-ok",
+                HashMap::from([("name".into(), "w".into())]),
+            )),
+        }))
+        .await
+        .unwrap();
+        grant_object_role(&svc, "widget-purpose-ok", "tester", security::Role::Editor);
+        svc.db
+            .create_object(&domain::Object {
+                id: "principal-tester".into(),
+                kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: "tester".into(),
+                namespace: "".into(),
+                external_id: markings::principal_profile_external_id("tester"),
+                properties: HashMap::from([
+                    (
+                        markings::PRINCIPAL_ALLOWED_PURPOSES_PROPERTY.into(),
+                        "incident-response".into(),
+                    ),
+                    (
+                        markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        grant_object_role(&svc, "principal-tester", "root", security::Role::Admin);
+
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "assign_color_purpose".into(),
+                params: HashMap::from([
+                    ("id".into(), "widget-purpose-ok".into()),
+                    ("color".into(), "blue".into()),
+                ]),
+                actor: "tester".into(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+        let obj = svc.db.get_object("widget-purpose-ok").unwrap().unwrap();
+        assert_eq!(obj.properties["color"], "blue");
+        let decisions = svc
+            .db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("purpose.execute".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(decisions.iter().any(|d| d.outcome == "allowed"));
     }
 
     #[tokio::test]
@@ -12471,6 +13294,7 @@ mod tests {
                 }],
                 target_kind: "widget".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
         }))
         .await
@@ -12715,6 +13539,7 @@ mod tests {
                     }],
                     target_kind: "widget".into(),
                     created: 0,
+                    required_purpose: String::new(),
                 }),
             }))
             .await
@@ -12851,6 +13676,7 @@ mod tests {
             ],
             target_kind: "widget".into(),
             created: 0,
+            required_purpose: String::new(),
         };
         svc.create_action_type(with_principal(CreateActionTypeRequest {
             action_type: Some(action_type),
@@ -12928,6 +13754,7 @@ mod tests {
                 }],
                 target_kind: "widget".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
         }))
         .await
@@ -12997,6 +13824,7 @@ mod tests {
                 }],
                 target_kind: "widget".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
         }))
         .await
@@ -13073,6 +13901,7 @@ mod tests {
                 }],
                 target_kind: "widget".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
         }))
         .await
@@ -13144,6 +13973,7 @@ mod tests {
                 ],
                 target_kind: "widget".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
         }))
         .await
@@ -15927,6 +16757,7 @@ mod tests {
             }],
             target_kind: "broken".into(),
             created: 1,
+            required_purpose: String::new(),
         })
         .unwrap();
         let svc = SekaiServiceImpl::new(db.clone());
