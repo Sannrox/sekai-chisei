@@ -58,6 +58,7 @@ in order.
 - [Gunshi eval-gated promotion and bounded auto-dispatch](gunshi-auto-allocation.md)
 - [Operator console information architecture](research/283-operator-console-ia.md)
 - [Lookup vs model call (defer)](research/175-lookup-vs-model-call.md)
+- [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
   — research recommendation for bounded automatic dispatch (#279 → #280).
 - [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
   tenant-free Sekai surface set, inventory evidence, and remaining runtime
