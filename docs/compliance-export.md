@@ -60,10 +60,10 @@ No control-plane database is required for verification.
 | Mode | Behavior |
 | --- | --- |
 | `full` (default) | Keep admitted receipt attributes and decision evidence as stored |
-| `redacted` (`--redact`) | Replace sensitive attribute/evidence values with `[redacted]` while keeping keys and decision metadata |
+| `redacted` (`--redact`) | Allowlist-only free text: keep structural keys (`namespace`, `project`, `route`, `model`, …) and replace other attribute/evidence values plus free-form actors/reasons with `[redacted]` |
 
-Sensitive keys include prompt/token/password/body/content/payload fields and
-values that look like credentials or are very large.
+Redaction is intentionally conservative: fields not on the structural allowlist
+are scrubbed even when they do not look like credentials.
 
 ## Limits
 
