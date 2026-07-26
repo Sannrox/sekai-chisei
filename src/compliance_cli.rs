@@ -138,8 +138,19 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     }
     let _ = std::fs::remove_file(&staged);
     // Make the published directory entry durable before recording success.
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(error) = dir.sync_all() {
+                let _ = std::fs::remove_file(&config.output);
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            // On platforms where the parent cannot be opened as a file, fail
+            // closed rather than claiming durable publication without evidence.
+            let _ = std::fs::remove_file(&config.output);
+            return Err(error.into());
+        }
     }
     if let Err(error) = record_compliance_export_success(
         db.as_ref(),
