@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::chisei::residency::{ResidencyDecision, ResidencyPolicy, ResidencyResolver};
+
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub allowed_runtimes: Vec<String>,
@@ -36,6 +38,7 @@ impl Policy {
 
 pub struct PolicyResolver {
     namespace_policies: Mutex<HashMap<String, Policy>>,
+    residency: ResidencyResolver,
 }
 
 impl Default for PolicyResolver {
@@ -48,11 +51,45 @@ impl PolicyResolver {
     pub fn new() -> Self {
         Self {
             namespace_policies: Mutex::new(HashMap::new()),
+            residency: ResidencyResolver::new(),
         }
     }
 
     pub fn set_namespace_policy(&self, ns: &str, p: Policy) {
         self.namespace_policies.lock().unwrap().insert(ns.into(), p);
+    }
+
+    pub fn set_residency_policy(
+        &self,
+        namespace: &str,
+        policy: ResidencyPolicy,
+    ) -> Result<(), String> {
+        self.residency.set_namespace_policy(namespace, policy)
+    }
+
+    pub fn residency_policy(&self, namespace: &str) -> Option<ResidencyPolicy> {
+        self.residency.get(namespace)
+    }
+
+    /// Fail closed when a residency policy is configured for the namespace.
+    pub fn enforce_residency(
+        &self,
+        namespace: &str,
+        provider: &str,
+        model: &str,
+        data_class: &str,
+    ) -> Result<ResidencyDecision, String> {
+        let decision =
+            self.residency
+                .evaluate_namespace(namespace, provider, model, data_class)?;
+        if decision.allowed {
+            Ok(decision)
+        } else {
+            Err(format!(
+                "residency policy denied route: {}",
+                decision.reasons.join("; ")
+            ))
+        }
     }
 
     pub fn effective_policy(&self, namespace: &str) -> Option<Policy> {
@@ -193,7 +230,31 @@ impl PolicyResolver {
 
         validate_resolved_route(&runtime, &model)?;
 
+        // Residency is enforced by callers that know the operation data class
+        // via `enforce_residency` after route resolution.
+
         Ok((runtime, model))
+    }
+
+    /// Resolve a route and enforce residency for the namespace data class.
+    pub fn resolve_with_residency(
+        &self,
+        namespace: &str,
+        preferred_runtime: &str,
+        preferred_model: &str,
+        data_class: &str,
+    ) -> Result<(String, String, ResidencyDecision), String> {
+        let (runtime, model) = self.resolve(namespace, preferred_runtime, preferred_model)?;
+        let data_class = if data_class.trim().is_empty() {
+            self.effective_policy(namespace)
+                .map(|policy| policy.data_class)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unclassified".into())
+        } else {
+            data_class.to_string()
+        };
+        let decision = self.enforce_residency(namespace, &runtime, &model, &data_class)?;
+        Ok((runtime, model, decision))
     }
 }
 
@@ -455,6 +516,41 @@ mod tests {
         assert!(validate_resolved_route("xai", "xai/grok-4.5").is_ok());
         assert!(is_registry_runtime("meta"));
         assert!(validate_resolved_route("xai", "openai/gpt-5.5").is_err());
+    }
+
+    #[test]
+    fn resolve_with_residency_denies_disallowed_region() {
+        use crate::chisei::residency::ResidencyPolicy;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let resolver = PolicyResolver::new();
+        resolver.set_namespace_policy(
+            "eu-ns",
+            Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+        resolver
+            .set_residency_policy(
+                "eu-ns",
+                ResidencyPolicy {
+                    policy_id: "eu".into(),
+                    version: "1".into(),
+                    allowed_regions: BTreeSet::from(["eu".into()]),
+                    provider_regions: BTreeMap::from([("openai".into(), "us".into())]),
+                    model_regions: BTreeMap::from([("gpt-5.5".into(), "us".into())]),
+                    allowed_data_classes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let err = resolver
+            .resolve_with_residency("eu-ns", "openai", "gpt-5.5", "internal")
+            .unwrap_err();
+        assert!(err.contains("residency"), "{err}");
     }
 
     #[test]
