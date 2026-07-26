@@ -69,7 +69,8 @@ values that look like credentials or are very large.
 
 - At most 5,000 receipts and 10,000 decisions per export
 - Window length at most 366 days
-- SQLite is the reference local path for `sekaictl compliance export`
+- `sekaictl compliance export` uses the configured runtime backend
+  (`SEKAI_DB_BACKEND` / `DB_PATH` or `DATABASE_URL`)
 
 ## Non-goals (this version)
 
