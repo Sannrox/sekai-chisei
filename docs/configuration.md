@@ -17,8 +17,8 @@ template.
 | `GRPC_PORT` | `50051` | TCP gRPC port |
 | `SEKAI_BIND` | inferred | TCP bind address; see [transport modes](operations.md#transport-modes) |
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path; set empty to disable |
-| `OPS_BIND` | `127.0.0.1` | Health and metrics bind address |
-| `OPS_PORT` | `9464` | Health and metrics port; set empty to disable |
+| `OPS_BIND` | `127.0.0.1` | Health, metrics, and operator console bind address |
+| `OPS_PORT` | `9464` | Health, metrics, and console port; set empty to disable |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_AUTH_TOKEN` | unset | Deprecated single-principal bootstrap token |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |

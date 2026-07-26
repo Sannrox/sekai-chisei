@@ -72,7 +72,12 @@ async fn ops_routes_report_health_readiness_and_metrics() {
     let directory =
         std::env::temp_dir().join(format!("sekai-ops-registry-{}", uuid::Uuid::new_v4()));
     let registry_path = directory.join("provider-registry.json");
-    let app = sekai_chisei::obs::ops::router(db, registry_path.clone());
+    let app = sekai_chisei::obs::ops::router(
+        db,
+        registry_path.clone(),
+        std::sync::Arc::new(sekai_chisei::sekai::credentials::PrincipalCredentialStore::new()),
+        None,
+    );
 
     let health = app
         .clone()
