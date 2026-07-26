@@ -526,8 +526,10 @@ impl SekaiDb {
                 "SELECT receipt_json FROM chisei_operation_receipts
                  WHERE namespace=?1
                    AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?3
-                   AND (json_extract(receipt_json, '$.completed_at_ms') IS NULL
-                        OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?2)
+                   AND COALESCE(
+                        CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER),
+                        CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER)
+                      ) >= ?2
                  ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
                  LIMIT ?4",
             )
