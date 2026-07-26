@@ -159,6 +159,22 @@
       "durable_dependencies": []
     },
     {
+      "rpc": "DecideGatewayExecution",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_policy_backend_conformance.rs",
+        "tests/graph_backend_conformance.rs",
+        "src/chisei/gateway_decide.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget"
+      ]
+    },
+    {
       "rpc": "RecordUsage",
       "kind": "persistent",
       "surfaces": [

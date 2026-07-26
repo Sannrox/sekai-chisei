@@ -8,9 +8,10 @@ use sekai_chisei::runtime_backend::COMMUNITY_REQUIRED_SURFACES;
 #[test]
 fn chisei_inventory_covers_every_proto_rpc() {
     let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-    assert_eq!(inventory.entries.len(), 75);
+    assert_eq!(inventory.entries.len(), 76);
     assert!(inventory.entry("GetOperationReceipt").is_some());
     assert!(inventory.entry("ReserveGatewayRequestAlias").is_some());
+    assert!(inventory.entry("DecideGatewayExecution").is_some());
     assert!(inventory.entry("Chat").is_some());
     assert!(inventory.remaining_surfaces.is_empty());
     for surface in [
