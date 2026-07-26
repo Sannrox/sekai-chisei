@@ -10199,11 +10199,9 @@ impl SekaiService for SekaiServiceImpl {
                 return Err(Status::not_found("not found"));
             }
             // Without a live object we cannot reconstruct access_marking.
-            // Fail closed: only credential admins may inspect orphan history.
-            None => {
-                require_credential_admin(&principals)
-                    .map_err(|_| Status::not_found("not found"))?;
-            }
+            // Residual: ACL-only for orphan history until tombstones retain
+            // access_marking (documented residual risk).
+            None => {}
         }
         let object_kind = match object.as_ref() {
             Some(object) => Some(object.kind.clone()),
