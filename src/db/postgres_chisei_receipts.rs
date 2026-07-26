@@ -100,10 +100,10 @@ impl PostgresDb {
                 "SELECT receipt_json FROM chisei_operation_receipts
                  WHERE namespace=$1
                    AND ((receipt_json::jsonb->>'started_at_ms')::bigint) < $3
-                   AND COALESCE(
-                        NULLIF(receipt_json::jsonb->>'completed_at_ms', '')::bigint,
-                        (receipt_json::jsonb->>'started_at_ms')::bigint
-                      ) > $2
+                   AND (
+                     receipt_json::jsonb->>'completed_at_ms' IS NULL
+                     OR NULLIF(receipt_json::jsonb->>'completed_at_ms', '')::bigint > $2
+                   )
                  ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint), operation_id
                  LIMIT $4",
                 &[&namespace, &start_timestamp_ms, &end_timestamp_ms, &limit],
