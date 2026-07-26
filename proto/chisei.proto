@@ -1004,6 +1004,13 @@ message AuthorizeGunshiAutoDispatchResponse {
   string authorization_json = 1;
   string receipt_attributes_json = 2;
 }
+message PromoteGunshiFeedbackToEvalRequest {
+  string namespace = 1;
+  string suite_id = 2;
+  string issuance_id = 3;
+  string allocation_id = 4;
+}
+message PromoteGunshiFeedbackToEvalResponse { string result_json = 1; }
 
 // --- Host-executed external-action authorization ---
 // These contracts describe bounded authority and causal evidence. Chisei does
@@ -1288,6 +1295,7 @@ service ChiseiService {
   rpc SetGunshiAllocationKillSwitch(SetGunshiAllocationKillSwitchRequest) returns (SetGunshiAllocationKillSwitchResponse);
   rpc GetGunshiAllocationStatus(GetGunshiAllocationStatusRequest) returns (GetGunshiAllocationStatusResponse);
   rpc AuthorizeGunshiAutoDispatch(AuthorizeGunshiAutoDispatchRequest) returns (AuthorizeGunshiAutoDispatchResponse);
+  rpc PromoteGunshiFeedbackToEval(PromoteGunshiFeedbackToEvalRequest) returns (PromoteGunshiFeedbackToEvalResponse);
   rpc ReserveGatewayRequestAlias(ReserveGatewayRequestAliasRequest) returns (ReserveGatewayRequestAliasResponse);
   rpc ClaimGatewayRequestAliasDispatch(ClaimGatewayRequestAliasDispatchRequest) returns (ClaimGatewayRequestAliasDispatchResponse);
 

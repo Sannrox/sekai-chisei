@@ -955,6 +955,62 @@ impl SekaiDb {
         }
     }
 
+    /// Create or append-only update a `feedback-` eval suite (idempotent by case id).
+    pub fn append_feedback_eval_suite(&self, suite: &eval::Suite) -> Result<(), String> {
+        if !suite.id.starts_with("feedback-") {
+            return Err("append_feedback_eval_suite requires a feedback- suite id".into());
+        }
+        let cases_json = serde_json::to_string(&suite.cases).map_err(|e| e.to_string())?;
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT cases_json FROM chisei_eval_suites WHERE id = ?1",
+                params![suite.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(existing_json) = existing {
+            let existing_cases: Vec<eval::Case> =
+                serde_json::from_str(&existing_json).map_err(|error| error.to_string())?;
+            // Caller must only add cases; existing case bodies must match.
+            for existing_case in &existing_cases {
+                match suite.cases.iter().find(|case| case.id == existing_case.id) {
+                    Some(case) if case == existing_case => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "feedback case {} already exists with different content",
+                            existing_case.id
+                        ));
+                    }
+                    None => {
+                        return Err("feedback suite update cannot drop existing cases".into());
+                    }
+                }
+            }
+            transaction
+                .execute(
+                    "UPDATE chisei_eval_suites
+                     SET name = ?2, description = ?3, cases_json = ?4
+                     WHERE id = ?1",
+                    params![suite.id, suite.name, suite.description, cases_json],
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO chisei_eval_suites (id, name, description, cases_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![suite.id, suite.name, suite.description, cases_json],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         let conn = self.conn();
         conn.query_row(

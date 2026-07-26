@@ -8,8 +8,9 @@ use crate::grpc::pb::chisei::{
     AuthorizeGunshiAutoDispatchRequest, GetGunshiAllocationStatusRequest,
     GetGunshiScorecardRequest, InstallGunshiAllocationBaselineRequest,
     IssueGunshiRecommendationsRequest, PromoteGunshiAllocationPolicyRequest,
-    RecordGunshiFeedbackRequest, RollbackGunshiAllocationPolicyRequest,
-    SetGunshiAllocationKillSwitchRequest, SetGunshiAutoOptInRequest,
+    PromoteGunshiFeedbackToEvalRequest, RecordGunshiFeedbackRequest,
+    RollbackGunshiAllocationPolicyRequest, SetGunshiAllocationKillSwitchRequest,
+    SetGunshiAutoOptInRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,7 +25,7 @@ pub const RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v1
 pub const ISSUED_RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v2";
 
 pub fn usage() -> &'static str {
-    "sekaictl gunshi recommend <input.json> --output <recommendations.json>\n  sekaictl gunshi issue <input.json> --output <recommendations.json>\n  sekaictl gunshi respond <recommendations.json> <choice.json> --operation <id> [--outcome <outcome.json>]\n  sekaictl gunshi scorecard --namespace <name>\n  sekaictl gunshi allocation-status --namespace <name>\n  sekaictl gunshi install-baseline --namespace <name> --snapshot <snapshot.json> --gate <gate.json>\n  sekaictl gunshi promote --namespace <name> --candidate <candidate.json> --baseline-eval <eval.json> --candidate-eval <eval.json> --expected-revision <id>\n  sekaictl gunshi rollback --namespace <name> --expected-revision <id> --reason <text>\n  sekaictl gunshi auto-opt-in --namespace <name> --expected-revision <id> [--off]\n  sekaictl gunshi kill-switch --namespace <name> --reason <text> [--clear]\n  sekaictl gunshi authorize-auto --namespace <name> --plan <plan.json> --operation <op.json> --capacity <capacity.json>"
+    "sekaictl gunshi recommend <input.json> --output <recommendations.json>\n  sekaictl gunshi issue <input.json> --output <recommendations.json>\n  sekaictl gunshi respond <recommendations.json> <choice.json> --operation <id> [--outcome <outcome.json>]\n  sekaictl gunshi scorecard --namespace <name>\n  sekaictl gunshi allocation-status --namespace <name>\n  sekaictl gunshi install-baseline --namespace <name> --snapshot <snapshot.json> --gate <gate.json>\n  sekaictl gunshi promote --namespace <name> --candidate <candidate.json> --baseline-eval <eval.json> --candidate-eval <eval.json> --expected-revision <id>\n  sekaictl gunshi rollback --namespace <name> --expected-revision <id> --reason <text>\n  sekaictl gunshi auto-opt-in --namespace <name> --expected-revision <id> [--off]\n  sekaictl gunshi kill-switch --namespace <name> --reason <text> [--clear]\n  sekaictl gunshi authorize-auto --namespace <name> --plan <plan.json> --operation <op.json> --capacity <capacity.json>\n  sekaictl gunshi promote-feedback --namespace <name> --suite-id <feedback-...> --issuance-id <id> --allocation-id <id>"
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,6 +355,25 @@ pub async fn authorize_auto(
         "authorization": serde_json::from_str::<serde_json::Value>(&response.authorization_json)?,
         "receipt_attributes": serde_json::from_str::<serde_json::Value>(&response.receipt_attributes_json)?,
     }))
+}
+
+pub async fn promote_feedback(
+    namespace: String,
+    suite_id: String,
+    issuance_id: String,
+    allocation_id: String,
+) -> Result<serde_json::Value, BoxErr> {
+    require_namespace(&namespace)?;
+    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
+        .promote_gunshi_feedback_to_eval(PromoteGunshiFeedbackToEvalRequest {
+            namespace,
+            suite_id,
+            issuance_id,
+            allocation_id,
+        })
+        .await?
+        .into_inner();
+    Ok(serde_json::from_str(&response.result_json)?)
 }
 
 pub fn scorecard_namespace(args: &[String]) -> Result<String, String> {
