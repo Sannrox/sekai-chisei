@@ -271,24 +271,8 @@ pub fn evaluate_package_trust(
         identity == &signature.signer_identity && key_id == &signature.key_id
     });
     let Some((_, _, verifying_key)) = trusted else {
-        // Under unsigned_allowed, signatures are optional. An unregistered
-        // signer cannot be cryptographically checked, so accept the package
-        // (format/algorithm already validated above). Signed policy still
-        // fails closed until the identity/key is registered.
-        if level == PACKAGE_TRUST_UNSIGNED_ALLOWED {
-            return Ok(PackageTrustDecision {
-                allowed: true,
-                required_trust_level: level.into(),
-                signature_present: true,
-                signature_valid: false,
-                signer_identity: signature.signer_identity.clone(),
-                key_id: signature.key_id.clone(),
-                reason: format!(
-                    "signature from unregistered signer {}/{}; allowed under {PACKAGE_TRUST_UNSIGNED_ALLOWED}",
-                    signature.signer_identity, signature.key_id
-                ),
-            });
-        }
+        // A supplied signature must always bind to a registered key, even under
+        // unsigned_allowed (which only makes signatures optional, not free-form).
         return Ok(PackageTrustDecision {
             allowed: false,
             required_trust_level: level.into(),
@@ -1576,19 +1560,20 @@ mod package_trust_tests {
     }
 
     #[test]
-    fn unsigned_allowed_accepts_signature_from_unregistered_signer() {
-        // Grandfather / empty-signer path used by PostgreSQL: signatures are
-        // optional under unsigned_allowed and must not hard-fail install.
+    fn unsigned_allowed_still_rejects_unregistered_signer() {
+        // Signatures are optional under unsigned_allowed, but a supplied
+        // signature must still bind to a registered key (or be omitted).
         let db = SekaiDb::new(":memory:").unwrap();
         let mut manifest = sample_manifest("optional-sig", "1.0.0");
         let signing = SigningKey::from_bytes(&[3u8; 32]);
         manifest
             .sign("issuer:unknown", "key-x", &signing)
             .expect("sign");
-        let installed = db
-            .install_capability_package("ns", &manifest, "operator", "opt-1", 10)
-            .unwrap();
-        assert_eq!(installed.package_name, "optional-sig");
+        assert!(
+            db.install_capability_package("ns", &manifest, "operator", "opt-1", 10)
+                .unwrap_err()
+                .contains("not trusted")
+        );
     }
 
     #[test]
