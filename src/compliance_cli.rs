@@ -129,6 +129,10 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         .into());
     }
     let _ = std::fs::remove_file(&staged);
+    // Make the published directory entry durable before recording success.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     if let Err(error) = record_compliance_export_success(
         db.as_ref(),
         &request,

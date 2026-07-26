@@ -121,7 +121,10 @@ impl PostgresDb {
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
                  FROM sekai_decisions
                  WHERE timestamp >= $1 AND timestamp < $2
-                   AND evidence::jsonb->>'namespace' = $3
+                   AND (
+                     evidence::jsonb->>'namespace' = $3
+                     OR evidence::jsonb->>'project' = $3
+                   )
                  ORDER BY timestamp ASC, COALESCE(seq, 0) ASC, id ASC
                  LIMIT $4",
                 &[&start_timestamp_ms, &end_timestamp_ms, &namespace, &limit],
