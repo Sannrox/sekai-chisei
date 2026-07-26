@@ -27,5 +27,6 @@ pub mod portfolio;
 pub mod privacy;
 pub mod promotion;
 pub use sekai_provider::receipt;
+pub mod residency;
 pub mod sampling;
 pub mod scoring;
