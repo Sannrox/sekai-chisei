@@ -98,6 +98,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", serde_json::to_string_pretty(&scorecard)?);
                 Ok(())
             }
+            Some("allocation-status") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let status = sekai_chisei::gunshi_cli::get_allocation_status(namespace).await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("install-baseline") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let snapshot = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--snapshot")
+                    .map_err(std::io::Error::other)?;
+                let gate = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--gate")
+                    .map_err(std::io::Error::other)?;
+                let status = sekai_chisei::gunshi_cli::install_baseline(
+                    namespace,
+                    snapshot.into(),
+                    gate.into(),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("promote") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let candidate = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--candidate")
+                    .map_err(std::io::Error::other)?;
+                let baseline =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--baseline-eval")
+                        .map_err(std::io::Error::other)?;
+                let candidate_eval =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--candidate-eval")
+                        .map_err(std::io::Error::other)?;
+                let expected =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
+                        .map_err(std::io::Error::other)?;
+                let status = sekai_chisei::gunshi_cli::promote_policy(
+                    namespace,
+                    candidate.into(),
+                    baseline.into(),
+                    candidate_eval.into(),
+                    expected,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("rollback") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let expected =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
+                        .map_err(std::io::Error::other)?;
+                let reason = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--reason")
+                    .map_err(std::io::Error::other)?;
+                let status =
+                    sekai_chisei::gunshi_cli::rollback_policy(namespace, expected, reason).await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("auto-opt-in") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let expected =
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
+                        .map_err(std::io::Error::other)?;
+                let opt_in = !args[2..].iter().any(|arg| arg == "--off");
+                let status =
+                    sekai_chisei::gunshi_cli::set_auto_opt_in(namespace, opt_in, expected).await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("kill-switch") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let clear = args[2..].iter().any(|arg| arg == "--clear");
+                let reason = if clear {
+                    String::new()
+                } else {
+                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--reason")
+                        .map_err(std::io::Error::other)?
+                };
+                let status =
+                    sekai_chisei::gunshi_cli::set_kill_switch(namespace, !clear, reason).await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                Ok(())
+            }
+            Some("authorize-auto") => {
+                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
+                    .map_err(std::io::Error::other)?;
+                let plan = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--plan")
+                    .map_err(std::io::Error::other)?;
+                let operation = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--operation")
+                    .map_err(std::io::Error::other)?;
+                let capacity = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--capacity")
+                    .map_err(std::io::Error::other)?;
+                let result = sekai_chisei::gunshi_cli::authorize_auto(
+                    namespace,
+                    plan.into(),
+                    operation.into(),
+                    capacity.into(),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
         },
         "team" => match args.get(1).map(String::as_str) {
