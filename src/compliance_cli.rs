@@ -120,9 +120,16 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&staged)?;
-        file.write_all(&compliance_bundle_bytes(&bundle)?)?;
-        file.sync_all()?;
+        let write_result = (|| {
+            let mut file = options.open(&staged)?;
+            file.write_all(&compliance_bundle_bytes(&bundle)?)?;
+            file.sync_all()?;
+            Ok::<(), BoxErr>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
     }
     // hard_link fails if the destination already exists (no silent overwrite).
     if let Err(error) = std::fs::hard_link(&staged, &config.output) {
