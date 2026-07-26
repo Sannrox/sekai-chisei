@@ -39,10 +39,11 @@ use crate::grpc::client::{
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     CheckBudgetRequest, CheckBudgetResponse, ClaimGatewayRequestAliasDispatchRequest,
-    CompareRunsRequest, EvalRun, GatewayAuditEvent, GetEvalRunRequest, GetEvalSuiteRequest,
-    GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
-    RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
-    ReserveGatewayRequestAliasRequest, ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
+    CompareRunsRequest, DecideGatewayExecutionRequest, EvalRun, GatewayAuditEvent,
+    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
+    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
+    RecordSampleObservationRequest, RecordUsageRequest, ReserveGatewayRequestAliasRequest,
+    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
@@ -140,6 +141,9 @@ pub struct GatewayConfig {
     pub pricing: HashMap<String, ModelPricing>,
     pub run_pipeline: bool,
     pub allow_cross_provider: bool,
+    /// When true, call `DecideGatewayExecution` as a fail-closed pre-deny gate
+    /// before the legacy multi-RPC preflight (Issue #163 dual-path). Default off.
+    pub fat_decide: bool,
 }
 
 impl GatewayConfig {
@@ -189,6 +193,10 @@ impl GatewayConfig {
             std::env::var("CHISEI_GATEWAY_NO_PREFLIGHT")
                 .or_else(|_| std::env::var("GATEWAY_NO_PREFLIGHT"))
                 .as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        );
+        let fat_decide = matches!(
+            std::env::var("CHISEI_GATEWAY_FAT_DECIDE").as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
         let xai_configured =
@@ -269,6 +277,7 @@ impl GatewayConfig {
             pricing,
             run_pipeline,
             allow_cross_provider,
+            fat_decide,
         })
     }
 }
@@ -2565,6 +2574,34 @@ async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
+    // Issue #163 dual-path: optional fat-decide pre-deny gate. When admitted,
+    // legacy multi-RPC preflight still runs until full parity flip.
+    if state.config.fat_decide
+        && !state.config.no_preflight
+        && state.config.chisei_grpc_target.is_some()
+        && let Err(rejection) = fat_decide_preflight(
+            &state.config,
+            &state.runtime,
+            &identity,
+            requested_model.as_deref().unwrap_or(""),
+            request_bytes,
+            work_unit_id.as_deref().unwrap_or(""),
+            &task_class,
+            &request_id,
+            &failure_posture,
+        )
+        .await
+    {
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
+        return rejection.response();
+    }
     let (mut resolved, mut egress, budget) = if state.config.no_preflight {
         let resolved = PolicyPreflight {
             body: body.to_vec(),
@@ -3737,6 +3774,107 @@ fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
         _ => (StatusCode::SERVICE_UNAVAILABLE, "governance_unavailable"),
     };
     GatewayRejection::json(http_status, error_type, status.to_string())
+}
+
+/// Optional fat-decide pre-deny gate (Issue #163 dual-path).
+///
+/// When admitted, the caller continues with the legacy multi-RPC preflight.
+/// When denied, the edge must not contact upstream.
+#[allow(clippy::too_many_arguments)]
+async fn fat_decide_preflight(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    requested_model: &str,
+    request_bytes: usize,
+    work_unit: &str,
+    task_class: &str,
+    request_id: &str,
+    failure_posture: &GovernanceFailurePosture,
+) -> Result<(), GatewayRejection> {
+    let Some(target) = &config.chisei_grpc_target else {
+        return Ok(());
+    };
+    let namespace = if identity.project.trim().is_empty() {
+        config.default_project.clone()
+    } else {
+        identity.project.clone()
+    };
+    let request = DecideGatewayExecutionRequest {
+        contract_version: "gateway.decide/v1".into(),
+        namespace: namespace.clone(),
+        requested_model: requested_model.to_string(),
+        operation_class: "gateway.http".into(),
+        estimated_cost_usd_micros: 0,
+        correlation_operation_id: if request_id.trim().is_empty() {
+            format!("gateway-{}", Utc::now().timestamp_millis())
+        } else {
+            request_id.to_string()
+        },
+        correlation_attempt: 1,
+        estimated_tokens: estimate_tokens_from_bytes(request_bytes),
+        task_class: task_class.to_string(),
+        preferred_runtime: String::new(),
+        project: namespace,
+        agent: identity.agent.clone(),
+        key_id: identity.key_id.clone(),
+        work_unit: work_unit.to_string(),
+        local_free_available: !config.ollama_base_url.trim().is_empty(),
+    };
+    match connect_governance(runtime, target).await {
+        Ok(channel) => {
+            let mut client = ChiseiServiceClient::new(channel);
+            match client
+                .decide_gateway_execution(GrpcRequest::new(request))
+                .await
+            {
+                Ok(response) => {
+                    record_control_plane_success(runtime).await;
+                    let decision = response.into_inner();
+                    if decision.admitted {
+                        Ok(())
+                    } else {
+                        let error_type = if decision.deny_reason.is_empty() {
+                            "governance_denied"
+                        } else {
+                            decision.deny_reason.as_str()
+                        };
+                        Err(GatewayRejection::json(
+                            StatusCode::FORBIDDEN,
+                            error_type,
+                            if decision.deny_message.is_empty() {
+                                "gateway fat-decide denied".into()
+                            } else {
+                                decision.deny_message
+                            },
+                        ))
+                    }
+                }
+                Err(err) => {
+                    record_control_plane_failure(runtime, &err).await;
+                    if failure_posture.fail_closed || !is_transient_governance_status(&err) {
+                        Err(governance_status_rejection(&err))
+                    } else {
+                        // Soft path: log and allow legacy preflight to decide.
+                        warn!(error = %err, "fat-decide unavailable; falling through to legacy preflight");
+                        Ok(())
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            if failure_posture.fail_closed {
+                Err(GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    format!("fat-decide control plane unavailable: {err}"),
+                ))
+            } else {
+                warn!(error = %err, "fat-decide connect failed; falling through to legacy preflight");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14216,6 +14354,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         }
     }
 
@@ -16480,6 +16619,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         };
         spawn_gateway_with_config(config).await
     }
@@ -16515,6 +16655,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         };
         spawn_gateway_with_runtime(
             config,
@@ -17076,6 +17217,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17169,6 +17311,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17214,6 +17357,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17267,6 +17411,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17308,6 +17453,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17365,6 +17511,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17440,6 +17587,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17545,6 +17693,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17600,6 +17749,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17667,6 +17817,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17760,6 +17911,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17827,6 +17979,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17881,6 +18034,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -17967,6 +18121,7 @@ mod tests {
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18032,6 +18187,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18093,6 +18249,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
+            fat_decide: false,
         })
         .await;
 
@@ -18202,6 +18359,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
+            fat_decide: false,
         })
         .await;
 
@@ -18280,6 +18438,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
+            fat_decide: false,
         })
         .await;
 
@@ -18345,6 +18504,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
+            fat_decide: false,
         })
         .await;
 
@@ -18432,6 +18592,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
+            fat_decide: false,
         })
         .await;
 
@@ -18492,6 +18653,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18562,6 +18724,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18630,6 +18793,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18682,6 +18846,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18741,6 +18906,7 @@ mod tests {
                 pricing: HashMap::new(),
                 run_pipeline: false,
                 allow_cross_provider: false,
+                fat_decide: false,
             },
             GatewayRuntime::new(
                 Duration::from_secs(60 * 60),
@@ -18900,6 +19066,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -18986,6 +19153,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19064,6 +19232,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19136,6 +19305,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19200,6 +19370,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19325,6 +19496,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19415,6 +19587,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19503,6 +19676,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19611,6 +19785,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19724,6 +19899,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19829,6 +20005,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -19999,6 +20176,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20205,6 +20383,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20272,6 +20451,7 @@ mod tests {
             pricing,
             run_pipeline: true,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20444,6 +20624,7 @@ mod tests {
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20507,6 +20688,7 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20561,6 +20743,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20613,6 +20796,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
@@ -20669,6 +20853,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
+            fat_decide: false,
         })
         .await;
 
