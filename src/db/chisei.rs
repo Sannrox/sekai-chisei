@@ -529,7 +529,7 @@ impl SekaiDb {
                    AND COALESCE(
                         CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER),
                         CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER)
-                      ) >= ?2
+                      ) > ?2
                  ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
                  LIMIT ?4",
             )
