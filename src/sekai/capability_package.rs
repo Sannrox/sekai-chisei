@@ -931,9 +931,8 @@ impl SekaiDb {
         self.migrate_capability_packages()?;
         let evidence = package_trust_evidence(decision);
         let denial_error = format!("package trust denied: {}", decision.reason);
-        let result_json =
-            serde_json::to_string(&serde_json::json!({"error": denial_error}))
-                .map_err(|error| error.to_string())?;
+        let result_json = serde_json::to_string(&serde_json::json!({"error": denial_error}))
+            .map_err(|error| error.to_string())?;
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         // Best-effort: ignore unique conflicts on retry of the same denial.
@@ -1704,9 +1703,7 @@ mod package_trust_tests {
             .list_capability_package_events("ns", "signed-pkg")
             .unwrap();
         assert!(
-            denials
-                .iter()
-                .any(|event| event.action == "trust_denied"),
+            denials.iter().any(|event| event.action == "trust_denied"),
             "unsigned install must record trust_denied"
         );
     }
@@ -1755,9 +1752,7 @@ mod package_trust_tests {
             .list_capability_package_events("ns", "malformed-pkg")
             .unwrap();
         assert!(
-            events
-                .iter()
-                .any(|event| event.action == "trust_denied"),
+            events.iter().any(|event| event.action == "trust_denied"),
             "malformed signature must record trust_denied"
         );
     }
@@ -1780,12 +1775,13 @@ mod package_trust_tests {
             .list_capability_package_events("ns", "upgrade-pkg")
             .unwrap();
         assert!(
-            events
-                .iter()
-                .any(|event| event.action == "trust_denied"),
+            events.iter().any(|event| event.action == "trust_denied"),
             "rejected upgrade must record trust_denied"
         );
-        let still = db.get_capability_package("ns", "upgrade-pkg").unwrap().unwrap();
+        let still = db
+            .get_capability_package("ns", "upgrade-pkg")
+            .unwrap()
+            .unwrap();
         assert_eq!(still.current_version, "1.0.0");
     }
 
