@@ -436,6 +436,20 @@ fn record_id(kind: &str, namespace: &str, allocation_id: &str, issuance_id: &str
     format!("gunshi-{kind}-{}", &digest[..32])
 }
 
+/// Load a stored operator-choice feedback record by issuance and allocation.
+pub fn load_choice_feedback(
+    db: &RuntimeDb,
+    namespace: &str,
+    allocation_id: &str,
+    issuance_id: &str,
+) -> Result<GunshiFeedbackRecord, String> {
+    let decision = db
+        .get_decision(&record_id("choice", namespace, allocation_id, issuance_id))?
+        .filter(|decision| decision.action == CHOICE_ACTION)
+        .ok_or_else(|| "no operator choice feedback found for allocation".to_string())?;
+    decode_record(&decision)
+}
+
 fn issuance_record_id(namespaces: &BTreeSet<&str>, issuance_id: &str) -> String {
     let namespace_scope = namespaces.iter().copied().collect::<Vec<_>>().join("\0");
     let digest = format!(

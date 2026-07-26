@@ -7490,6 +7490,38 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn promote_gunshi_feedback_to_eval(
+        &self,
+        req: Request<PromoteGunshiFeedbackToEvalRequest>,
+    ) -> Result<Response<PromoteGunshiFeedbackToEvalResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let input = req.into_inner();
+        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        let result = crate::chisei::gunshi_feedback_eval::promote_feedback_to_eval(
+            &self.db,
+            &actor,
+            &input.suite_id,
+            &input.issuance_id,
+            &input.allocation_id,
+            &input.namespace,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(Status::failed_precondition)?;
+        if let Err(error) = self.eval.put_suite(result.suite.clone())
+            && self.eval.get_suite(&result.suite_id).as_ref() != Some(&result.suite)
+        {
+            tracing::warn!(
+                %error,
+                suite_id = %result.suite_id,
+                "eval store sync after feedback promotion"
+            );
+        }
+        Ok(Response::new(PromoteGunshiFeedbackToEvalResponse {
+            result_json: serde_json::to_string(&result)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
     async fn review_kioku_memory(
         &self,
         req: Request<ReviewKiokuMemoryRequest>,
