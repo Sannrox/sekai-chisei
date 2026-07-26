@@ -48,7 +48,9 @@ impl ResidencyPolicy {
             return Ok(());
         }
         if self.policy_id.trim().is_empty() || self.version.trim().is_empty() {
-            return Err("residency policy id and version are required when constraints are set".into());
+            return Err(
+                "residency policy id and version are required when constraints are set".into(),
+            );
         }
         for region in self
             .allowed_regions
@@ -76,21 +78,16 @@ impl ResidencyPolicy {
     ) -> Result<ResidencyDecision, String> {
         self.validate()?;
         let provider_region = self.provider_regions.get(provider).cloned();
-        let model_region = self
-            .model_regions
-            .get(model)
-            .cloned()
-            .or_else(|| {
-                // Prefix match: ollama/llama → provider region if model unset
-                self.model_regions
-                    .iter()
-                    .find(|(key, _)| model.starts_with(key.as_str()))
-                    .map(|(_, region)| region.clone())
-            });
+        let model_region = self.model_regions.get(model).cloned().or_else(|| {
+            // Prefix match: ollama/llama → provider region if model unset
+            self.model_regions
+                .iter()
+                .find(|(key, _)| model.starts_with(key.as_str()))
+                .map(|(_, region)| region.clone())
+        });
 
         let mut reasons = Vec::new();
-        if !self.allowed_data_classes.is_empty()
-            && !self.allowed_data_classes.contains(data_class)
+        if !self.allowed_data_classes.is_empty() && !self.allowed_data_classes.contains(data_class)
         {
             reasons.push(format!(
                 "data class {data_class:?} is not allowed by residency policy"
@@ -129,9 +126,7 @@ impl ResidencyPolicy {
                     } else if provider_region.is_none() {
                         // already reported
                     } else if !self.model_regions.is_empty() {
-                        reasons.push(format!(
-                            "model {model:?} has no residency region mapping"
-                        ));
+                        reasons.push(format!("model {model:?} has no residency region mapping"));
                     }
                 }
                 None => {}
@@ -174,7 +169,10 @@ impl ResidencyPolicy {
             attrs.insert("residency_model_region".into(), region.clone());
         }
         if !decision.reasons.is_empty() {
-            attrs.insert("residency_denial_reasons".into(), decision.reasons.join("; "));
+            attrs.insert(
+                "residency_denial_reasons".into(),
+                decision.reasons.join("; "),
+            );
         }
         attrs
     }
@@ -190,7 +188,11 @@ impl ResidencyResolver {
         Self::default()
     }
 
-    pub fn set_namespace_policy(&self, namespace: &str, policy: ResidencyPolicy) -> Result<(), String> {
+    pub fn set_namespace_policy(
+        &self,
+        namespace: &str,
+        policy: ResidencyPolicy,
+    ) -> Result<(), String> {
         policy.validate()?;
         self.by_namespace
             .lock()
@@ -215,7 +217,9 @@ impl ResidencyResolver {
         data_class: &str,
     ) -> Result<ResidencyDecision, String> {
         match self.get(namespace) {
-            Some(policy) if !policy.is_unrestricted() => policy.evaluate(provider, model, data_class),
+            Some(policy) if !policy.is_unrestricted() => {
+                policy.evaluate(provider, model, data_class)
+            }
             _ => Ok(ResidencyDecision {
                 allowed: true,
                 policy_id: String::new(),
