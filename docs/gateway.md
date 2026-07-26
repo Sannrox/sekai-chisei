@@ -12,7 +12,10 @@ It exposes:
 
 For each request, the gateway authenticates and attributes the caller,
 preflights policy, budget, and egress decisions, resolves the provider/model,
-streams the response, and records normalized usage and audit evidence.
+streams the response, and records normalized usage and audit evidence. By
+default, budget/policy preflight uses the control-plane
+`DecideGatewayExecution` RPC (Issue #163). Set `CHISEI_GATEWAY_FAT_DECIDE=0`
+to force the legacy multi-RPC CheckBudget + ResolvePolicy path.
 
 ## Guided launch
 
