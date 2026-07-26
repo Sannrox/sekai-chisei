@@ -71,6 +71,9 @@ values that look like credentials or are very large.
 - Window length at most 366 days
 - `sekaictl compliance export` uses the configured runtime backend
   (`SEKAI_DB_BACKEND` / `DB_PATH` or `DATABASE_URL`)
+- Host filesystem/DB credentials are the trust boundary for this CLI, as with
+  other offline `sekaictl` report tools. A future gRPC export will enforce
+  namespace authorization for networked multi-tenant access.
 
 ## Non-goals (this version)
 

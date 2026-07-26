@@ -46,6 +46,10 @@ struct VerifyConfig {
 }
 
 async fn export(config: ExportConfig) -> Result<(), BoxErr> {
+    // Local sekaictl export uses the host database configuration as the trust
+    // boundary, matching receipt/report CLIs. Callers who can open the runtime
+    // store can already read the underlying tables. Networked multi-tenant
+    // export must go through an authorized gRPC surface (follow-up).
     let cfg = Config::from_env();
     let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
     let db = backend.database();
