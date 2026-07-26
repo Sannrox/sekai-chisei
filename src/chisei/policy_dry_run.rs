@@ -95,25 +95,31 @@ pub fn snapshot_from_receipt(receipt: &OperationReceipt) -> HistoricalRouteSnaps
         .iter()
         .find(|event| event.kind == ReceiptEventKind::PolicyDecided);
 
+    let intent = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::IntentRecorded);
+
     let historical_model = route
         .and_then(|event| attr(event, &["resolved_model", "model"]))
         .unwrap_or_default();
     let historical_runtime = route
         .and_then(|event| attr(event, &["runtime", "provider", "resolved_runtime"]))
         .unwrap_or_default();
-    // Prefer original request fields when present. Older receipts that only
-    // store the resolved route cannot recover the pre-policy request, so
-    // leave preferences empty and classify as insufficient history below.
+    // Preference order: RouteSelected preferred_*, Intent preferred_*, then none.
     let preferred_model = route
         .and_then(|event| attr(event, &["preferred_model", "requested_model"]))
+        .or_else(|| intent.and_then(|event| attr(event, &["preferred_model", "requested_model"])))
         .unwrap_or_default();
     let preferred_runtime = route
         .and_then(|event| attr(event, &["preferred_runtime", "requested_runtime"]))
+        .or_else(|| {
+            intent.and_then(|event| attr(event, &["preferred_runtime", "requested_runtime"]))
+        })
         .unwrap_or_default();
 
     // Route-policy dry-run only. A selected route means the namespace route
-    // policy allowed the request; composite `executable=false` (budget, privacy,
-    // eval, etc.) must not be treated as a route-policy denial.
+    // policy allowed the request; composite `executable=false` is ignored.
     let historical_outcome = if !historical_runtime.is_empty() || !historical_model.is_empty() {
         HistoricalOutcomeClass::Allowed
     } else if let Some(value) = policy.and_then(|event| {
@@ -123,14 +129,6 @@ pub fn snapshot_from_receipt(receipt: &OperationReceipt) -> HistoricalRouteSnaps
         )
     }) {
         classify_historical_outcome(&value)
-    } else if policy
-        .and_then(|event| attr(event, &["executable"]))
-        .as_deref()
-        == Some("false")
-    {
-        // No route was selected and the plan was not executable — treat as deny
-        // only when no resolved route evidence exists.
-        HistoricalOutcomeClass::Denied
     } else {
         HistoricalOutcomeClass::Unknown
     };
@@ -334,14 +332,6 @@ fn classify_historical_outcome(value: &str) -> HistoricalOutcomeClass {
     }
 }
 
-fn classify_executable(value: &str) -> HistoricalOutcomeClass {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => HistoricalOutcomeClass::Allowed,
-        "false" | "0" | "no" => HistoricalOutcomeClass::Denied,
-        _ => HistoricalOutcomeClass::Unknown,
-    }
-}
-
 fn attr(event: &crate::chisei::receipt::OperationReceiptEvent, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| event.attributes.get(*key).cloned())
@@ -368,10 +358,62 @@ mod tests {
 
     fn receipt(
         id: &str,
+        preferred_runtime: &str,
+        preferred_model: &str,
         historical_runtime: &str,
         historical_model: &str,
         outcome: &str,
     ) -> OperationReceipt {
+        let mut events = vec![OperationReceiptEvent {
+            event_id: format!("{id}-intent"),
+            operation_id: id.into(),
+            parent_event_id: None,
+            timestamp_ms: 149,
+            kind: ReceiptEventKind::IntentRecorded,
+            surface: ReceiptSurface::Intent,
+            actor: "operator".into(),
+            references: Vec::new(),
+            attributes: BTreeMap::from([
+                ("preferred_runtime".into(), preferred_runtime.into()),
+                ("preferred_model".into(), preferred_model.into()),
+            ]),
+        }];
+        events.push(OperationReceiptEvent {
+            event_id: format!("{id}-policy"),
+            operation_id: id.into(),
+            parent_event_id: Some(format!("{id}-intent")),
+            timestamp_ms: 150,
+            kind: ReceiptEventKind::PolicyDecided,
+            surface: ReceiptSurface::Policy,
+            actor: "chisei".into(),
+            references: Vec::new(),
+            attributes: BTreeMap::from([(
+                "route_policy_decision".into(),
+                if outcome == "deny" {
+                    "deny".into()
+                } else {
+                    "allow".into()
+                },
+            )]),
+        });
+        if outcome != "deny" {
+            events.push(OperationReceiptEvent {
+                event_id: format!("{id}-route"),
+                operation_id: id.into(),
+                parent_event_id: Some(format!("{id}-policy")),
+                timestamp_ms: 151,
+                kind: ReceiptEventKind::RouteSelected,
+                surface: ReceiptSurface::Routing,
+                actor: "chisei".into(),
+                references: Vec::new(),
+                attributes: BTreeMap::from([
+                    ("runtime".into(), historical_runtime.into()),
+                    ("model".into(), historical_model.into()),
+                    ("preferred_runtime".into(), preferred_runtime.into()),
+                    ("preferred_model".into(), preferred_model.into()),
+                ]),
+            });
+        }
         OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id: id.into(),
@@ -383,42 +425,7 @@ mod tests {
             policy_version: "old-policy".into(),
             started_at_ms: 150,
             completed_at_ms: Some(160),
-            events: vec![
-                OperationReceiptEvent {
-                    event_id: format!("{id}-policy"),
-                    operation_id: id.into(),
-                    parent_event_id: None,
-                    timestamp_ms: 150,
-                    kind: ReceiptEventKind::PolicyDecided,
-                    surface: ReceiptSurface::Policy,
-                    actor: "chisei".into(),
-                    references: Vec::new(),
-                    attributes: BTreeMap::from([(
-                        "executable".into(),
-                        if outcome == "deny" {
-                            "false".into()
-                        } else {
-                            "true".into()
-                        },
-                    )]),
-                },
-                OperationReceiptEvent {
-                    event_id: format!("{id}-route"),
-                    operation_id: id.into(),
-                    parent_event_id: Some(format!("{id}-policy")),
-                    timestamp_ms: 151,
-                    kind: ReceiptEventKind::RouteSelected,
-                    surface: ReceiptSurface::Routing,
-                    actor: "chisei".into(),
-                    references: Vec::new(),
-                    attributes: BTreeMap::from([
-                        ("runtime".into(), historical_runtime.into()),
-                        ("model".into(), historical_model.into()),
-                        ("preferred_runtime".into(), historical_runtime.into()),
-                        ("preferred_model".into(), historical_model.into()),
-                    ]),
-                },
-            ],
+            events,
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
         }
@@ -437,11 +444,10 @@ mod tests {
     #[test]
     fn dry_run_produces_stable_delta_counts() {
         let receipts = [
-            receipt("op-same", "openai", "gpt-5.5", "allow"),
-            receipt("op-deny", "openai", "gpt-5.5", "allow"),
-            receipt("op-allow-again", "openai", "gpt-5.5", "deny"),
+            receipt("op-same", "openai", "gpt-5.5", "openai", "gpt-5.5", "allow"),
+            receipt("op-deny", "openai", "gpt-5.5", "openai", "gpt-5.5", "allow"),
+            receipt("op-allow-again", "openai", "gpt-5.5", "", "", "deny"),
         ];
-        // Candidate keeps gpt-5.5, drops nothing for first; for second we force deny by empty models + empty default in a separate call
         let keep = candidate(&["gpt-5.5"], "gpt-5.5");
         let report = dry_run_policy_over_receipts("ns", 100, 200, &keep, &receipts[..1]).unwrap();
         assert_eq!(report.counts.evaluated, 1);
@@ -469,8 +475,9 @@ mod tests {
 
     #[test]
     fn re_route_detected_when_default_model_changes() {
-        let receipts = vec![receipt("op-route", "openai", "gpt-5.5", "allow")];
-        // Preferred model not allowed; falls back to default model.
+        let receipts = [receipt(
+            "op-route", "openai", "gpt-5.5", "openai", "gpt-5.5", "allow",
+        )];
         let candidate = Policy {
             allowed_runtimes: vec!["openai".into()],
             allowed_models: vec!["gpt-4.1-mini".into()],
@@ -485,10 +492,9 @@ mod tests {
 
     #[test]
     fn dry_run_is_side_effect_free() {
-        // Documented guarantee: pure evaluation path does not touch provider
-        // adapters. This test simply asserts the pure API is usable without a
-        // RuntimeDb or network.
-        let receipts = vec![receipt("op-1", "openai", "gpt-5.5", "allow")];
+        let receipts = [receipt(
+            "op-1", "openai", "gpt-5.5", "openai", "gpt-5.5", "allow",
+        )];
         let candidate = candidate(&["gpt-5.5"], "gpt-5.5");
         let report = dry_run_policy_over_receipts("ns", 100, 200, &candidate, &receipts).unwrap();
         assert_eq!(report.counts.evaluated, 1);
