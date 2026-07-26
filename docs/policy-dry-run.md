@@ -15,9 +15,22 @@ how routes and allow/deny outcomes would have changed.
 - **Candidate only**: the supplied policy is never activated.
 - **Namespace authorized**: gRPC requires team-namespace access.
 - **Audited**: each dry-run records a `policy.dry_run` decision with counts and
-  the candidate policy version.
+  the candidate policy version (RPC fails if audit persistence fails).
 - **Bounded**: at most 5,000 receipts; sample operation IDs capped per delta
   class.
+
+## Receipt requirements
+
+Accurate dry-run needs `RouteSelected` attributes:
+
+- `preferred_runtime` / `preferred_model` (original request)
+- `runtime` / `model` (historical resolved route)
+
+and `PolicyDecided.executable` (`true`/`false`) for historical allow/deny.
+
+New planned executions persist those preferred fields. Older receipts without
+preferences are counted as `insufficient_history` rather than inventing a
+request from the resolved route.
 
 ## Delta classes
 
