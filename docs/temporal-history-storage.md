@@ -45,6 +45,21 @@ Discovery: `SekaiDb::discover_temporal_surfaces(namespace)` lists registered
 surfaces and whether history is currently retained (`history_retained`).
 Surfaces without a policy are non-retained by default.
 
+## Historical queries (#227)
+
+Authenticated gRPC (SQLite-first):
+
+| RPC | Role |
+| --- | --- |
+| `DiscoverTemporalSurfaces` | Policy discovery for a namespace |
+| `QueryTemporalAsOf` | Bitemporal as-of read with unknown-bounds policy and page tokens |
+| `DiffTemporalHistory` | Versions opened/closed between two revisions (not causal lineage) |
+
+Defaults: `unknown_bounds_policy=exclude`; `recorded_revision=0` means latest
+committed. Requests for subjects with no retained history return
+`outcome=not_retained` and never synthesize rows from audit. PostgreSQL
+returns `failed_precondition` until a parity slice lands.
+
 Directional storage cost can be re-checked with:
 
 ```bash
