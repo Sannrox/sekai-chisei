@@ -35,6 +35,7 @@ pub mod schema;
 pub mod security;
 pub mod sentinel;
 pub mod skillextract;
+pub mod temporal;
 #[cfg(any())]
 pub mod tenant;
 pub mod tool_bridge;
