@@ -4820,6 +4820,227 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn decide_gateway_execution(
+        &self,
+        req: Request<DecideGatewayExecutionRequest>,
+    ) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
+        use crate::chisei::gateway_decide::{
+            GATEWAY_DECIDE_CONTRACT_VERSION, GatewayDecideDenyReason, GatewayDecideInputs,
+            GatewayDecideOutcome, GatewayDecideRequest, budget_grant_id, compose_gateway_decide,
+        };
+
+        let actor = authenticated_actor(&req);
+        let r = req.into_inner();
+        let namespace = r.namespace.trim();
+        if namespace.is_empty() {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
+                deny_message: "namespace is required".into(),
+                ..Default::default()
+            }));
+        }
+        if let Err(status) = require_namespace_access(&self.db, &actor, namespace) {
+            let reason = if status.code() == tonic::Code::PermissionDenied {
+                GatewayDecideDenyReason::Unauthorized
+            } else {
+                GatewayDecideDenyReason::InvalidRequest
+            };
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: reason.as_str().into(),
+                deny_message: status.message().to_string(),
+                ..Default::default()
+            }));
+        }
+
+        let domain_request = GatewayDecideRequest {
+            contract_version: r.contract_version.clone(),
+            namespace: namespace.into(),
+            principal: actor.clone(),
+            requested_model: r.requested_model.trim().to_string(),
+            operation_class: r.operation_class.trim().to_string(),
+            estimated_cost_usd_micros: r.estimated_cost_usd_micros,
+            correlation_operation_id: r.correlation_operation_id.trim().to_string(),
+            correlation_attempt: r.correlation_attempt,
+        };
+        if let Err(message) = domain_request.validate() {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
+                deny_message: message,
+                ..Default::default()
+            }));
+        }
+
+        let project = if r.project.trim().is_empty() {
+            namespace
+        } else {
+            r.project.trim()
+        };
+        let preferred_runtime = r.preferred_runtime.trim();
+        let preferred_model = r.requested_model.trim();
+        let route = match self
+            .policy
+            .resolve(namespace, preferred_runtime, preferred_model)
+        {
+            Ok((runtime, model)) => {
+                let policy_version = self
+                    .policy
+                    .effective_policy(namespace)
+                    .map(|policy| policy.version())
+                    .unwrap_or_default();
+                // Residency fail-closed when a policy is configured.
+                if let Err(error) = self
+                    .policy
+                    .enforce_residency(namespace, &runtime, &model, "internal")
+                {
+                    Err((GatewayDecideDenyReason::ResidencyDenied, error))
+                } else {
+                    Ok((runtime, model, policy_version))
+                }
+            }
+            Err(error) => {
+                let reason = if error.to_ascii_lowercase().contains("capabilit") {
+                    GatewayDecideDenyReason::CapabilityUnsupported
+                } else {
+                    GatewayDecideDenyReason::PolicyDenied
+                };
+                Err((reason, error))
+            }
+        };
+
+        let budget_subject = budget_subject(
+            "",
+            project,
+            r.agent.trim(),
+            r.key_id.trim(),
+            r.work_unit.trim(),
+            "",
+        )
+        .unwrap_or_else(|_| format!("project:{project}"));
+        let estimated_tokens = r.estimated_tokens.max(0);
+        let metric = crate::db::chisei_budget::METRIC_TOKENS;
+        let within_cap = self
+            .budget
+            .check_with_metric(&budget_subject, estimated_tokens, metric)
+            .is_ok();
+        let route_bias = self
+            .budget
+            .route_bias(
+                &budget_subject,
+                estimated_tokens,
+                metric,
+                r.task_class.trim(),
+            )
+            .as_str()
+            .to_string();
+        let (budget_allowed, degradation_level, budget_warning) = if within_cap {
+            (
+                true,
+                if route_bias == "cheap" {
+                    "cheap_cloud"
+                } else {
+                    "capable"
+                },
+                false,
+            )
+        } else if metric == crate::db::chisei_budget::METRIC_TOKENS
+            && r.local_free_available
+            && crate::chisei::model_routing::is_cheap_eligible_task_class(r.task_class.trim())
+        {
+            (false, "local_free", true)
+        } else {
+            (false, "hard_cap", true)
+        };
+
+        let grant = budget_grant_id(
+            &budget_subject,
+            &domain_request.correlation_operation_id,
+            domain_request.correlation_attempt,
+        );
+        let composed = compose_gateway_decide(GatewayDecideInputs {
+            request: domain_request.clone(),
+            route,
+            budget_allowed,
+            budget_scope: budget_subject.clone(),
+            budget_grant_id: grant.clone(),
+            route_bias: route_bias.clone(),
+            degradation_level: degradation_level.into(),
+            budget_warning,
+        });
+
+        let mut response = DecideGatewayExecutionResponse {
+            contract_version: composed.contract_version.clone(),
+            admitted: composed.allows_upstream(),
+            deny_reason: String::new(),
+            deny_message: String::new(),
+            resolved_runtime: String::new(),
+            resolved_model: String::new(),
+            policy_version: String::new(),
+            budget_scope: budget_subject.clone(),
+            budget_grant_id: grant,
+            route_bias,
+            degradation_level: degradation_level.into(),
+            budget_warning,
+        };
+        match &composed.outcome {
+            GatewayDecideOutcome::Admit(admit) => {
+                response.resolved_runtime = admit.resolved_runtime.clone();
+                response.resolved_model = admit.resolved_model.clone();
+                response.policy_version = admit.policy_version.clone();
+                response.budget_grant_id = admit.budget_grant_id.clone();
+            }
+            GatewayDecideOutcome::Deny(deny) => {
+                response.deny_reason = deny.reason.as_str().into();
+                response.deny_message = deny.message.clone();
+            }
+        }
+
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: format!(
+                "gateway-decide:{}:{}:{}",
+                namespace,
+                domain_request.correlation_operation_id,
+                domain_request.correlation_attempt
+            ),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor,
+            action: "gateway.decide".into(),
+            reason: if response.admitted {
+                "gateway fat-decide admitted".into()
+            } else {
+                response.deny_message.clone()
+            },
+            evidence: std::collections::HashMap::from([
+                ("namespace".into(), namespace.into()),
+                (
+                    "correlation_operation_id".into(),
+                    domain_request.correlation_operation_id.clone(),
+                ),
+                ("admitted".into(), response.admitted.to_string()),
+                ("deny_reason".into(), response.deny_reason.clone()),
+                ("resolved_model".into(), response.resolved_model.clone()),
+                ("budget_scope".into(), response.budget_scope.clone()),
+                (
+                    "contract_version".into(),
+                    GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                ),
+            ]),
+            target_id: domain_request.correlation_operation_id,
+            outcome: if response.admitted {
+                "admitted".into()
+            } else {
+                "denied".into()
+            },
+        });
+
+        Ok(Response::new(response))
+    }
+
     async fn check_budget(
         &self,
         req: Request<CheckBudgetRequest>,
@@ -14450,5 +14671,87 @@ mod tests {
             .expect("planned executions poisoned");
         assert_eq!(plans.len(), MAX_CACHED_EXECUTION_PLANS);
         assert!(plans.contains_key(&inserted.plan_id));
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_admits_and_denies_closed() {
+        use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "team-a",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+
+        let mut admit = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "op-decide-1".into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "local".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: false,
+        });
+        admit
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let admitted = svc
+            .decide_gateway_execution(admit)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(admitted.admitted, "{admitted:?}");
+        assert_eq!(admitted.resolved_model, "gpt-5.5");
+        assert_eq!(admitted.resolved_runtime, "openai");
+        assert!(admitted.deny_reason.is_empty());
+        assert!(!admitted.budget_grant_id.is_empty());
+
+        // Non-bootstrap principal without a grant fails closed (unauthorized).
+        let mut denied = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "op-decide-2".into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "mallory".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: false,
+        });
+        denied
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        let denied = svc
+            .decide_gateway_execution(denied)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "unauthorized");
     }
 }

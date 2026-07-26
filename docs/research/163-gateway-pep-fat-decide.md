@@ -98,8 +98,8 @@ Single decision object:
 ## Implementation sequencing
 
 1. **This freeze** (done) — option A locked.
-2. **Proto + control-plane decide handler** with deterministic unit tests
-   (parity fixtures against today’s in-process decisions).
+2. **Proto + control-plane decide handler** (landed) — `DecideGatewayExecution`
+   RPC + pure compose helpers; deterministic unit tests for admit/deny composition.
 3. **Gateway dual-path** behind an explicit env flag
    (`CHISEI_GATEWAY_FAT_DECIDE=1`), default off until parity proven.
 4. **Flip default** after smoke + regression evidence; remove dual-path.
