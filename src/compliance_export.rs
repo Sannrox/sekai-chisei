@@ -458,6 +458,15 @@ fn redact_event(event: &mut OperationReceiptEvent) {
 }
 
 fn redact_decision_record(decision: &mut ComplianceDecisionRecord) {
+    if looks_sensitive("reason", &decision.reason) {
+        decision.reason = "[redacted]".into();
+    }
+    if looks_sensitive("target_id", &decision.target_id) {
+        decision.target_id = "[redacted]".into();
+    }
+    if looks_sensitive("actor", &decision.actor) {
+        decision.actor = "[redacted]".into();
+    }
     let keys: Vec<String> = decision.evidence.keys().cloned().collect();
     for key in keys {
         // Keep structural attribution fields so offline verify still works.
