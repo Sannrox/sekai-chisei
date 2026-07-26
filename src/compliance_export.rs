@@ -821,10 +821,7 @@ mod tests {
         assert!(!bundle.decisions[0].evidence.contains_key("route"));
         assert_eq!(bundle.decisions[0].reason, "[redacted]");
         assert_eq!(bundle.decisions[0].actor, "[redacted]");
-        assert_eq!(
-            bundle.decisions[0].evidence.get("namespace").unwrap(),
-            "ns"
-        );
+        assert_eq!(bundle.decisions[0].evidence.get("namespace").unwrap(), "ns");
         assert_eq!(bundle.manifest.exported_by, "[redacted]");
         assert!(verify_compliance_export(&bundle, None).ok);
     }
