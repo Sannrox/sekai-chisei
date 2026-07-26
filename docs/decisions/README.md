@@ -27,3 +27,6 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0002: Identify prompt variants by immutable versioned names](0002-versioned-prompt-variant-identity.md)
 - [ADR 0003: Inspect ontology through authenticated static artifacts](0003-authenticated-static-ontology-inspection.md)
 - [ADR 0004: Add selective bitemporal history to the current graph](0004-selective-bitemporal-history.md)
+- [ADR 0005: Object-bound coordination leases](0005-object-bound-coordination-leases.md)
+- [ADR 0006: Capability package ed25519 trust](0006-capability-package-ed25519-trust.md)
+- [ADR 0007: Provisional classification markings and purpose gates](0007-provisional-classification-markings.md)
