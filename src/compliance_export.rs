@@ -280,9 +280,11 @@ pub fn verify_compliance_export(
                 decision.id
             ));
         }
-        if decision.evidence.get("namespace").map(String::as_str)
-            != Some(bundle.manifest.namespace.as_str())
-        {
+        let attributed = decision.evidence.get("namespace").map(String::as_str)
+            == Some(bundle.manifest.namespace.as_str())
+            || decision.evidence.get("project").map(String::as_str)
+                == Some(bundle.manifest.namespace.as_str());
+        if !attributed {
             errors.push(format!(
                 "decision {} is not attributed to manifest namespace",
                 decision.id
@@ -432,8 +434,10 @@ fn receipt_overlaps_window(
 
 fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
     // Exact structured attribution only — never substring-match target ids
-    // (exporting "team-a" must not pick up "team-alpha").
+    // (exporting "team-a" must not pick up "team-alpha"). Lifecycle scope
+    // historically used either evidence.namespace or evidence.project.
     decision.evidence.get("namespace").map(String::as_str) == Some(namespace)
+        || decision.evidence.get("project").map(String::as_str) == Some(namespace)
 }
 
 fn redact_receipt(receipt: &mut OperationReceipt) {
