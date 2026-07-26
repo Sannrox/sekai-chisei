@@ -6,12 +6,10 @@ use crate::compliance_export::{
     verify_compliance_export,
 };
 use crate::config::Config;
-use crate::db::runtime_db::RuntimeDb;
-use crate::db::sekai::SekaiDb;
+use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -49,7 +47,8 @@ struct VerifyConfig {
 
 async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     let cfg = Config::from_env();
-    let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&cfg.db_path)?));
+    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
+    let db = backend.database();
     let request = ComplianceExportRequest {
         namespace: config.namespace,
         start_timestamp_ms: config.from_ms,
@@ -83,7 +82,7 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     }
 
     let exported_at = Utc::now().timestamp_millis();
-    let mut bundle = export_compliance_from_db(&db, &request, exported_at)?;
+    let mut bundle = export_compliance_from_db(db.as_ref(), &request, exported_at)?;
     if let (Some(key_path), Some(identity), Some(key_id)) =
         (&config.signing_key, &config.identity, &config.key_id)
     {
@@ -117,15 +116,27 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         file.write_all(&compliance_bundle_bytes(&bundle)?)?;
         file.sync_all()?;
     }
-    if let Err(error) = std::fs::rename(&staged, &config.output) {
+    // hard_link fails if the destination already exists (no silent overwrite).
+    if let Err(error) = std::fs::hard_link(&staged, &config.output) {
         let _ = std::fs::remove_file(&staged);
-        return Err(error.into());
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to publish {}: {error} (destination must not already exist)",
+                config.output.display()
+            ),
+        )
+        .into());
     }
-    if let Err(error) =
-        record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())
-    {
-        // Best-effort compensation: remove the published file if audit fails so
-        // we do not leave an unaudited compliance artifact.
+    let _ = std::fs::remove_file(&staged);
+    if let Err(error) = record_compliance_export_success(
+        db.as_ref(),
+        &request,
+        &bundle,
+        Utc::now().timestamp_millis(),
+    ) {
+        // Best-effort compensation: remove only the file this invocation
+        // published if audit fails so we do not leave an unaudited artifact.
         let _ = std::fs::remove_file(&config.output);
         return Err(error.into());
     }
