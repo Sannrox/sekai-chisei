@@ -2544,34 +2544,42 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::RouteSelected,
                 "chisei.routing",
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("runtime".into(), plan.resolved_runtime.clone()),
-                        ("model".into(), plan.resolved_model.clone()),
-                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                        (
-                            "preferred_model".into(),
-                            if input.route_override.trim().is_empty() {
-                                input.preferred_model.clone()
-                            } else {
-                                input.route_override.trim().into()
-                            },
-                        ),
-                        (
-                            "route_override".into(),
-                            if input.route_override.trim().is_empty() {
-                                String::new()
-                            } else {
-                                input.route_override.trim().into()
-                            },
-                        ),
-                        (
-                            "bias_bypassed".into(),
-                            (!input.route_override.trim().is_empty()).to_string(),
-                        ),
-                    ]);
-                    attributes
-                },
+                BTreeMap::from([
+                    ("runtime".into(), plan.resolved_runtime.clone()),
+                    ("model".into(), plan.resolved_model.clone()),
+                    // Persist the effective preference used for resolution so
+                    // historical dry-run does not invent or miss preferences.
+                    (
+                        "preferred_runtime".into(),
+                        if input.preferred_runtime.trim().is_empty() {
+                            plan.resolved_runtime.clone()
+                        } else {
+                            input.preferred_runtime.clone()
+                        },
+                    ),
+                    (
+                        "preferred_model".into(),
+                        if !input.route_override.trim().is_empty() {
+                            input.route_override.trim().into()
+                        } else if input.preferred_model.trim().is_empty() {
+                            plan.resolved_model.clone()
+                        } else {
+                            input.preferred_model.clone()
+                        },
+                    ),
+                    (
+                        "route_override".into(),
+                        if input.route_override.trim().is_empty() {
+                            String::new()
+                        } else {
+                            input.route_override.trim().into()
+                        },
+                    ),
+                    (
+                        "bias_bypassed".into(),
+                        (!input.route_override.trim().is_empty()).to_string(),
+                    ),
+                ]),
             ),
             receipt_event(
                 &operation_id,
