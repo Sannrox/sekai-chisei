@@ -434,6 +434,48 @@ message CheckBudgetResponse {
   string degradation_level = 4;
   bool warning = 5;
 }
+
+// Fat gateway decide surface (Issue #163). Single PDP call for the HTTP edge.
+// See docs/research/163-gateway-pep-fat-decide.md.
+message DecideGatewayExecutionRequest {
+  // Must be gateway.decide/v1.
+  string contract_version = 1;
+  string namespace = 2;
+  string requested_model = 3;
+  string operation_class = 4;
+  int64 estimated_cost_usd_micros = 5;
+  string correlation_operation_id = 6;
+  uint32 correlation_attempt = 7;
+  // Token estimate for budget preflight (same unit as CheckBudget).
+  int32 estimated_tokens = 8;
+  string task_class = 9;
+  string preferred_runtime = 10;
+  // Optional budget hierarchy fields (project defaults to namespace).
+  string project = 11;
+  string agent = 12;
+  string key_id = 13;
+  string work_unit = 14;
+  bool local_free_available = 15;
+}
+
+message DecideGatewayExecutionResponse {
+  string contract_version = 1;
+  // When false, deny_reason is set and the edge must not contact upstream.
+  bool admitted = 2;
+  // unauthorized | capability_unsupported | policy_denied | budget_denied |
+  // residency_denied | invalid_request
+  string deny_reason = 3;
+  string deny_message = 4;
+  string resolved_runtime = 5;
+  string resolved_model = 6;
+  string policy_version = 7;
+  string budget_scope = 8;
+  // Opaque grant stamp for usage recording / receipt correlation.
+  string budget_grant_id = 9;
+  string route_bias = 10;
+  string degradation_level = 11;
+  bool budget_warning = 12;
+}
 message RecordUsageRequest {
   string user_id = 1;
   int32 tokens_used = 2;
@@ -1249,6 +1291,8 @@ service ChiseiService {
   rpc CheckBudget(CheckBudgetRequest) returns (CheckBudgetResponse);
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
   rpc SetBudgetLimit(SetBudgetLimitRequest) returns (SetBudgetLimitResponse);
+  // Single fat decide for gateway PEP thinning (Issue #163).
+  rpc DecideGatewayExecution(DecideGatewayExecutionRequest) returns (DecideGatewayExecutionResponse);
 
   // Intelligence portfolio
   rpc RecordPortfolioObservation(RecordPortfolioObservationRequest) returns (RecordPortfolioObservationResponse);
