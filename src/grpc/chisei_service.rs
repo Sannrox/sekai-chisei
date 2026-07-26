@@ -2544,22 +2544,34 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::RouteSelected,
                 "chisei.routing",
-                BTreeMap::from([
-                    ("runtime".into(), plan.resolved_runtime.clone()),
-                    ("model".into(), plan.resolved_model.clone()),
-                    (
-                        "route_override".into(),
-                        if input.route_override.trim().is_empty() {
-                            String::new()
-                        } else {
-                            plan.resolved_model.clone()
-                        },
-                    ),
-                    (
-                        "bias_bypassed".into(),
-                        (!input.route_override.trim().is_empty()).to_string(),
-                    ),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("runtime".into(), plan.resolved_runtime.clone()),
+                        ("model".into(), plan.resolved_model.clone()),
+                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
+                        (
+                            "preferred_model".into(),
+                            if input.route_override.trim().is_empty() {
+                                input.preferred_model.clone()
+                            } else {
+                                input.route_override.trim().into()
+                            },
+                        ),
+                        (
+                            "route_override".into(),
+                            if input.route_override.trim().is_empty() {
+                                String::new()
+                            } else {
+                                input.route_override.trim().into()
+                            },
+                        ),
+                        (
+                            "bias_bypassed".into(),
+                            (!input.route_override.trim().is_empty()).to_string(),
+                        ),
+                    ]);
+                    attributes
+                },
             ),
             receipt_event(
                 &operation_id,
@@ -5670,16 +5682,18 @@ impl ChiseiService for ChiseiServiceImpl {
                     Sha256::digest(format!("{}\0{}\0{}", report.namespace, actor, request_id))
                 )
             };
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: decision_id,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: actor.clone(),
-                action: "policy.dry_run".into(),
-                reason: "historical policy dry-run over operation receipts".into(),
-                evidence,
-                target_id: format!("policy-dry-run:{}", report.namespace),
-                outcome: "succeeded".into(),
-            });
+            self.db
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: decision_id,
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    actor: actor.clone(),
+                    action: "policy.dry_run".into(),
+                    reason: "historical policy dry-run over operation receipts".into(),
+                    evidence,
+                    target_id: format!("policy-dry-run:{}", report.namespace),
+                    outcome: "succeeded".into(),
+                })
+                .map_err(Status::internal)?;
 
             let samples = report
                 .samples
