@@ -1,4 +1,5 @@
 pub mod console;
+pub mod console_workspace;
 pub mod correlation;
 pub mod grpc_layer;
 pub mod labels;

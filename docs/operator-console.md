@@ -9,9 +9,8 @@ The shell ships in-process on the **ops HTTP listener** (`OPS_BIND` /
 `OPS_PORT`). Process health and metrics stay unauthenticated; every `/console`
 route fails closed without a valid session.
 
-Domain workspaces (causal operations, pressure tiles, policy promote) land in
-follow-up Issues #285–#287. This document covers the **shell only**: login,
-namespace context, navigation chrome, and authorization boundaries.
+Domain follow-ups: governance pressure (#286) and policy promote (#287).
+The **causal operation workspace** (#285) is available under Operations.
 
 ## Local development
 
@@ -86,11 +85,27 @@ server {
 | `POST /console/login` | public | Exchange token for session cookie |
 | `POST /console/logout` | session | Clear session |
 | `GET /console/` | session | Shell home + namespace switcher |
-| `GET /console/n/{ns}/ops` | session + ns | Operations stub (#285) |
+| `GET /console/n/{ns}/ops` | session + ns | Recent visible operations (7-day window) |
+| `GET /console/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Causal operation workspace |
+| `GET /console/api/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Authorized report + causal stages JSON |
 | `GET /console/n/{ns}/pressure` | session + ns | Pressure stub (#286) |
 | `GET /console/n/{ns}/policy` | session + ns | Policy stub (#287) |
 | `GET /console/api/session` | session | JSON session summary |
 | `GET /console/api/namespaces` | session | JSON memberships for the principal |
+
+### Causal operation workspace
+
+Deep link: `/console/n/{namespace}/ops/{operation_id}`.
+
+- Projects the same authorized `OperationReport` as `sekaictl report` (receipt →
+  causal stages → event sections → missing/uncovered surfaces).
+- Side panel exposes authorized JSON only; credential-like attribute keys are
+  scrubbed. Omitted references from retention remain explicit.
+- Visibility matches `GetOperationReceipt`: initiating actor, or bootstrap
+  principals `root` / `local` / `chisei-gateway`.
+- Cross-namespace IDs return **403** without disclosing foreign receipt content.
+- Initial fixture-sized load budget: **2s** (`WORKSPACE_INITIAL_LOAD_BUDGET_MS`).
+- List home caps at **50** operations over the last **7 days**.
 
 Namespace URL segments must be short ASCII tokens (`[A-Za-z0-9._-]+`). Bootstrap
 principals `root` and `local` (legacy root token / local socket principal) may
