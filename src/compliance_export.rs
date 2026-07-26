@@ -495,6 +495,7 @@ fn redact_event(event: &mut OperationReceiptEvent) {
         reference.reference = "[redacted]".into();
         reference.content_hash = None;
         reference.disclosed_fields.clear();
+        reference.omission_reason = None;
     }
 }
 
