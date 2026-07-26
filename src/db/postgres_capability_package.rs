@@ -19,6 +19,18 @@ impl PostgresDb {
         now_ms: i64,
     ) -> Result<PackageInstallation, String> {
         validate_context(namespace, actor, request_id)?;
+        // Until package-trust tables are complete on PostgreSQL, only the
+        // grandfather path is available: reject invalid signatures but keep
+        // unsigned installs allowed. Operators cannot enable `signed` here yet.
+        let trust = crate::sekai::capability_package::evaluate_package_trust(
+            crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED,
+            &[],
+            manifest,
+        )?;
+        if !trust.allowed {
+            return Err(format!("package trust denied: {}", trust.reason));
+        }
+        let trust_evidence = crate::sekai::capability_package::package_trust_evidence(&trust);
         let manifest_digest = manifest.digest()?;
         let request_digest = package_request_digest("install", namespace, manifest, "")?;
         let mut connection = self.connection()?;
@@ -56,7 +68,7 @@ impl PostgresDb {
             request_id,
             &request_digest,
             &manifest_digest,
-            "manifest_validated",
+            &format!("manifest_validated;{trust_evidence}"),
             now_ms,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -73,6 +85,15 @@ impl PostgresDb {
         now_ms: i64,
     ) -> Result<PackageInstallation, String> {
         validate_context(namespace, actor, request_id)?;
+        let trust = crate::sekai::capability_package::evaluate_package_trust(
+            crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED,
+            &[],
+            manifest,
+        )?;
+        if !trust.allowed {
+            return Err(format!("package trust denied: {}", trust.reason));
+        }
+        let trust_evidence = crate::sekai::capability_package::package_trust_evidence(&trust);
         let manifest_digest = manifest.digest()?;
         let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
         let mut connection = self.connection()?;
@@ -117,7 +138,7 @@ impl PostgresDb {
             request_id,
             &request_digest,
             &manifest_digest,
-            "manifest_validated",
+            &format!("manifest_validated;{trust_evidence}"),
             now_ms,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
