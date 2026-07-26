@@ -690,12 +690,10 @@ impl SekaiDb {
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
                  FROM sekai_decisions
                  WHERE timestamp >= ?1 AND timestamp < ?2
+                   AND json_valid(evidence)
                    AND (
-                     namespace = ?3
-                     OR (json_valid(evidence) AND (
-                       json_extract(evidence, '$.namespace') = ?3
-                       OR json_extract(evidence, '$.project') = ?3
-                     ))
+                     json_extract(evidence, '$.namespace') = ?3
+                     OR json_extract(evidence, '$.project') = ?3
                    )
                  ORDER BY timestamp ASC, rowid ASC
                  LIMIT ?4",
