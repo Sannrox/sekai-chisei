@@ -751,29 +751,17 @@ mod tests {
             1_000,
         )
         .unwrap();
-        let prompt = bundle.receipts[0].events[0]
-            .attributes
-            .get("prompt")
-            .unwrap();
-        assert_eq!(prompt, "[redacted]");
-        assert_eq!(
-            bundle.receipts[0].events[0]
-                .attributes
-                .get("route")
-                .unwrap(),
-            "ollama/local"
-        );
-        assert_eq!(
-            bundle.decisions[0].evidence.get("token").unwrap(),
-            "[redacted]"
-        );
-        assert_eq!(
-            bundle.decisions[0].evidence.get("route").unwrap(),
-            "allowed"
-        );
+        assert!(bundle.receipts[0].events[0].attributes.is_empty());
+        assert_eq!(bundle.receipts[0].initiating_actor, "[redacted]");
+        assert!(!bundle.decisions[0].evidence.contains_key("token"));
+        assert!(!bundle.decisions[0].evidence.contains_key("route"));
         assert_eq!(bundle.decisions[0].reason, "[redacted]");
         assert_eq!(bundle.decisions[0].actor, "[redacted]");
-        assert_eq!(bundle.decisions[0].evidence.get("namespace").unwrap(), "ns");
+        assert_eq!(
+            bundle.decisions[0].evidence.get("namespace").unwrap(),
+            "ns"
+        );
+        assert_eq!(bundle.manifest.exported_by, "[redacted]");
         assert!(verify_compliance_export(&bundle, None).ok);
     }
 
