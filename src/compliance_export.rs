@@ -430,13 +430,15 @@ fn receipt_overlaps_window(
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
 ) -> bool {
-    // Half-open window [start, end): completion exactly at start is wholly before.
-    receipt.started_at_ms < end_timestamp_ms
-        && receipt
-            .completed_at_ms
-            .unwrap_or(receipt.started_at_ms)
-            .max(receipt.started_at_ms)
-            > start_timestamp_ms
+    // Half-open window [start, end). Open (uncompleted) receipts that started
+    // before end are treated as still active and therefore overlapping.
+    if receipt.started_at_ms >= end_timestamp_ms {
+        return false;
+    }
+    match receipt.completed_at_ms {
+        None => true,
+        Some(completed) => completed.max(receipt.started_at_ms) > start_timestamp_ms,
+    }
 }
 
 fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
