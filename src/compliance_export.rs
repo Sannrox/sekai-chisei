@@ -247,6 +247,12 @@ pub fn verify_compliance_export(
             bundle.manifest.bundle_version
         ));
     }
+    if bundle.manifest.digest_algorithm != COMPLIANCE_DIGEST_ALGORITHM {
+        errors.push(format!(
+            "unsupported digest algorithm {}",
+            bundle.manifest.digest_algorithm
+        ));
+    }
     if bundle.manifest.receipt_count as usize != bundle.receipts.len() {
         errors.push("manifest receipt_count does not match receipts".into());
     }
@@ -424,12 +430,13 @@ fn receipt_overlaps_window(
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
 ) -> bool {
+    // Half-open window [start, end): completion exactly at start is wholly before.
     receipt.started_at_ms < end_timestamp_ms
         && receipt
             .completed_at_ms
             .unwrap_or(receipt.started_at_ms)
             .max(receipt.started_at_ms)
-            >= start_timestamp_ms
+            > start_timestamp_ms
 }
 
 fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
