@@ -261,6 +261,8 @@ message ActionTypeDef {
   repeated ActionOp ops = 4;
   string target_kind = 5;
   int64 created = 6;
+  // Optional purpose required to invoke this action. Empty means no purpose gate.
+  string required_purpose = 7;
 }
 
 // A versioned description of an existing native query, retrieval, or action

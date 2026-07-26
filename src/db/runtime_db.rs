@@ -859,9 +859,7 @@ impl RuntimeDb {
     pub fn find_all_by_external_id(&self, external_id: &str) -> Result<Vec<Object>, String> {
         match self {
             Self::Sqlite(db) => db.find_all_by_external_id(external_id),
-            Self::Postgres(_) => Err(
-                "find_all_by_external_id is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => db.find_all_by_external_id(external_id),
         }
     }
 

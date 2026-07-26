@@ -167,6 +167,7 @@ fn exercise_actions(db: &dyn ActionTypeBackend, prefix: &str) {
         }],
         target_kind: "artifact".into(),
         created: 10,
+        required_purpose: String::new(),
     };
     assert_eq!(db.upsert_action_type(&action).unwrap(), action);
     assert_eq!(db.list_action_types().unwrap(), vec![action.clone()]);
