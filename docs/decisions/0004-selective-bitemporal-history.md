@@ -1,11 +1,11 @@
 # ADR 0004: Add selective bitemporal history to the current graph
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-22
 - Owners: @Sannrox
 - Source: [Issue #146](https://github.com/Sannrox/sekai-chisei/issues/146)
-- Discussion: this proposed ADR pull request is the solo-maintainer
-  decision-review surface because GitHub Discussions are disabled
+- Discussion: accepted via [PR #223](https://github.com/Sannrox/sekai-chisei/pull/223);
+  storage implementation begins at Issue #225
 - Supersedes: none
 - Superseded by: none
 
