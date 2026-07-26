@@ -118,6 +118,12 @@ impl SekaiDb {
                 dispatch_started INTEGER NOT NULL DEFAULT 0,
                 dispatch_token TEXT,
                 PRIMARY KEY(caller_scope, request_alias)
+            );
+            CREATE TABLE IF NOT EXISTS chisei_gunshi_allocation_state (
+                namespace TEXT PRIMARY KEY,
+                revision_id TEXT NOT NULL,
+                changed_at_ms INTEGER NOT NULL,
+                state_json TEXT NOT NULL
             );",
         )
         .map_err(|e| e.to_string())?;
@@ -1236,6 +1242,69 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Load durable Gunshi namespace allocation control state (JSON blob).
+    pub fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT state_json FROM chisei_gunshi_allocation_state WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// Insert or CAS-update Gunshi allocation state.
+    ///
+    /// When `expected_revision` is `None`, the row must not exist yet (install).
+    /// When `Some(rev)`, the existing `revision_id` must match for the update to apply.
+    pub fn put_gunshi_allocation_state_cas(
+        &self,
+        namespace: &str,
+        revision_id: &str,
+        changed_at_ms: i64,
+        state_json: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let current = tx
+            .query_row(
+                "SELECT revision_id FROM chisei_gunshi_allocation_state WHERE namespace = ?1",
+                params![namespace],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match (current.as_deref(), expected_revision) {
+            (None, None) => {
+                tx.execute(
+                    "INSERT INTO chisei_gunshi_allocation_state
+                        (namespace, revision_id, changed_at_ms, state_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![namespace, revision_id, changed_at_ms, state_json],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            (Some(existing), Some(expected)) if existing == expected => {
+                let updated = tx
+                    .execute(
+                        "UPDATE chisei_gunshi_allocation_state
+                         SET revision_id = ?2, changed_at_ms = ?3, state_json = ?4
+                         WHERE namespace = ?1 AND revision_id = ?5",
+                        params![namespace, revision_id, changed_at_ms, state_json, expected],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if updated != 1 {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String> {
