@@ -337,8 +337,16 @@ mod tests {
 
     fn seed_feedback(db: &RuntimeDb) -> GunshiFeedbackRecord {
         let plan = plan();
-        record_issued_recommendations(db, "issuer", "iss-1", "digest", &[plan.clone()], 10, 5)
-            .unwrap();
+        record_issued_recommendations(
+            db,
+            "issuer",
+            "iss-1",
+            "digest",
+            std::slice::from_ref(&plan),
+            10,
+            5,
+        )
+        .unwrap();
         let choice = OperatorChoice {
             operation_id: plan.operation_id.clone(),
             allocation_id: plan.allocation_id.clone(),
