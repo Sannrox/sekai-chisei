@@ -1302,13 +1302,12 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::capability_package::PackageTrustPolicy, String> {
         match self {
             Self::Sqlite(db) => db.get_capability_package_trust_policy(namespace),
-            Self::Postgres(_) => Ok(crate::sekai::capability_package::PackageTrustPolicy {
-                namespace: namespace.into(),
-                required_trust_level:
-                    crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED.into(),
-                updated_by: "system".into(),
-                updated_at_ms: 0,
-            }),
+            // Fail closed: do not invent a soft default that looks like a
+            // configured policy while package-trust tables are unavailable.
+            Self::Postgres(_) => Err(
+                "capability package trust policy is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
         }
     }
 
@@ -1345,7 +1344,12 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::capability_package::PackageSigner>, String> {
         match self {
             Self::Sqlite(db) => db.list_capability_package_signers(namespace),
-            Self::Postgres(_) => Ok(Vec::new()),
+            // Fail closed: an empty list would look like "no signers configured"
+            // rather than "trust admin is unavailable on this backend".
+            Self::Postgres(_) => Err(
+                "capability package signers are unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
         }
     }
 
