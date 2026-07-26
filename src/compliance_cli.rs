@@ -62,6 +62,13 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         actor: config.actor,
         request_id: config.request_id,
     };
+    if config.output.exists() {
+        return Err(std::io::Error::other(format!(
+            "output already exists: {} (refusing to overwrite a compliance artifact)",
+            config.output.display()
+        ))
+        .into());
+    }
     let signing_parts = [
         config.signing_key.is_some(),
         config.identity.is_some(),
