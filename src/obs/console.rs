@@ -101,6 +101,11 @@ pub fn router(state: ConsoleState) -> Router {
             get(api_operation_workspace),
         )
         .route("/console/n/{namespace}/pressure", get(screen_pressure))
+        .route("/console/api/n/{namespace}/pressure", get(api_pressure))
+        .route(
+            "/console/n/{namespace}/pressure/kill-switch",
+            post(pressure_kill_switch),
+        )
         .route("/console/n/{namespace}/policy", get(screen_policy))
         .with_state(state)
 }
@@ -397,6 +402,20 @@ button.secondary {
   background: var(--bg);
   font-size: 0.85rem;
 }
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  background: var(--bg);
+}
+.tile-label { color: var(--muted); font-size: 0.85rem; }
+.tile-value { font-size: 1.35rem; font-weight: 650; margin-top: 0.2rem; }
 "#;
 
 fn html_page(title: &str, body: &str) -> Html<String> {
@@ -827,7 +846,166 @@ async fn screen_pressure(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Response {
-    namespace_screen(state, headers, namespace, Screen::Pressure).await
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    match crate::obs::console_pressure::load_pressure_snapshot(
+        &state.db,
+        &session.principal,
+        &namespace,
+    ) {
+        Ok(snapshot) => {
+            let main = crate::obs::console_pressure::render_pressure_page(&snapshot, None);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Pressure,
+                &main,
+            )
+            .into_response()
+        }
+        Err(error) => {
+            let denied = error.contains("denied") || error.contains("invalid");
+            (
+                if denied {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                shell_chrome(
+                    &session.principal,
+                    None,
+                    &namespaces,
+                    Screen::Home,
+                    &format!(
+                        r#"<section class="panel"><h1>Governance pressure</h1><p class="error" role="alert">{}</p></section>"#,
+                        // reuse workspace HTML escaper via simple escape
+                        error
+                            .replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    ),
+                ),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_pressure(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "unauthenticated"})),
+        )
+            .into_response();
+    };
+    match crate::obs::console_pressure::load_pressure_snapshot(
+        &state.db,
+        &session.principal,
+        &namespace,
+    ) {
+        Ok(snapshot) => (StatusCode::OK, axum::Json(snapshot)).into_response(),
+        Err(error) => {
+            let status = if error.contains("denied") || error.contains("invalid") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, axum::Json(serde_json::json!({"error": error}))).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KillSwitchForm {
+    enabled: String,
+    reason: Option<String>,
+    confirm: Option<String>,
+}
+
+async fn pressure_kill_switch(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+    Form(form): Form<KillSwitchForm>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    if form.confirm.as_deref() != Some("1") {
+        let snapshot = crate::obs::console_pressure::load_pressure_snapshot(
+            &state.db,
+            &session.principal,
+            &namespace,
+        );
+        let main = match snapshot {
+            Ok(snap) => crate::obs::console_pressure::render_pressure_page(
+                &snap,
+                Some("Confirmation checkbox is required."),
+            ),
+            Err(error) => format!(
+                r#"<section class="panel"><h1>Governance pressure</h1><p class="error">{error}</p></section>"#
+            ),
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Pressure,
+                &main,
+            ),
+        )
+            .into_response();
+    }
+    let enabled = form.enabled == "1";
+    let reason = form.reason.unwrap_or_default();
+    match crate::obs::console_pressure::apply_kill_switch(
+        &state.db,
+        &session.principal,
+        &namespace,
+        enabled,
+        &reason,
+    ) {
+        Ok(_) => Redirect::to(&format!("/console/n/{namespace}/pressure")).into_response(),
+        Err(error) => {
+            let snapshot = crate::obs::console_pressure::load_pressure_snapshot(
+                &state.db,
+                &session.principal,
+                &namespace,
+            );
+            let main = match snapshot {
+                Ok(snap) => crate::obs::console_pressure::render_pressure_page(&snap, Some(&error)),
+                Err(_) => format!(
+                    r#"<section class="panel"><h1>Governance pressure</h1><p class="error">{}</p></section>"#,
+                    error
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                ),
+            };
+            (
+                StatusCode::FORBIDDEN,
+                shell_chrome(
+                    &session.principal,
+                    Some(&namespace),
+                    &namespaces,
+                    Screen::Pressure,
+                    &main,
+                ),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn screen_policy(
