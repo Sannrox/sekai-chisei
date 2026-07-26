@@ -23,14 +23,16 @@ how routes and allow/deny outcomes would have changed.
 
 Accurate dry-run needs `RouteSelected` attributes:
 
-- `preferred_runtime` / `preferred_model` (original request)
+- `preferred_runtime` / `preferred_model` (effective pre-resolution preference)
 - `runtime` / `model` (historical resolved route)
 
-and `PolicyDecided.executable` (`true`/`false`) for historical allow/deny.
+Historical allow/deny for this surface is inferred from whether a route was
+selected. Composite `PolicyDecided.executable=false` (budget, privacy, eval,
+etc.) is **not** treated as a namespace route-policy denial when a route exists.
 
-New planned executions persist those preferred fields. Older receipts without
-preferences are counted as `insufficient_history` rather than inventing a
-request from the resolved route.
+New planned executions persist effective preferred fields (request values when
+set; otherwise the resolved route used after recommendation/fallback). Older
+receipts without preferences are counted as `insufficient_history`.
 
 ## Delta classes
 

@@ -111,15 +111,29 @@ pub fn snapshot_from_receipt(receipt: &OperationReceipt) -> HistoricalRouteSnaps
         .and_then(|event| attr(event, &["preferred_runtime", "requested_runtime"]))
         .unwrap_or_default();
 
-    let historical_outcome = policy
-        .and_then(|event| {
-            if let Some(executable) = attr(event, &["executable"]) {
-                return Some(classify_executable(&executable));
-            }
-            attr(event, &["outcome", "decision", "result"])
-                .map(|value| classify_historical_outcome(&value))
-        })
-        .unwrap_or(HistoricalOutcomeClass::Unknown);
+    // Route-policy dry-run only. A selected route means the namespace route
+    // policy allowed the request; composite `executable=false` (budget, privacy,
+    // eval, etc.) must not be treated as a route-policy denial.
+    let historical_outcome = if !historical_runtime.is_empty() || !historical_model.is_empty() {
+        HistoricalOutcomeClass::Allowed
+    } else if let Some(value) = policy.and_then(|event| {
+        attr(
+            event,
+            &["route_policy_decision", "outcome", "decision", "result"],
+        )
+    }) {
+        classify_historical_outcome(&value)
+    } else if policy
+        .and_then(|event| attr(event, &["executable"]))
+        .as_deref()
+        == Some("false")
+    {
+        // No route was selected and the plan was not executable — treat as deny
+        // only when no resolved route evidence exists.
+        HistoricalOutcomeClass::Denied
+    } else {
+        HistoricalOutcomeClass::Unknown
+    };
 
     HistoricalRouteSnapshot {
         operation_id: receipt.operation_id.clone(),
