@@ -6120,6 +6120,11 @@ impl SekaiService for SekaiServiceImpl {
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        check_action_admin(
+            &self.security,
+            &format!("capability_package:{}", inner.namespace),
+            &principals,
+        )?;
         let policy = self
             .db
             .get_capability_package_trust_policy(&inner.namespace)
@@ -6173,6 +6178,11 @@ impl SekaiService for SekaiServiceImpl {
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        check_action_admin(
+            &self.security,
+            &format!("capability_package:{}", inner.namespace),
+            &principals,
+        )?;
         let signers = self
             .db
             .list_capability_package_signers(&inner.namespace)
