@@ -518,7 +518,8 @@ impl SekaiDb {
         end_timestamp_ms: i64,
         limit: usize,
     ) -> Result<Vec<OperationReceipt>, String> {
-        let limit = limit.min(5_000) as i64;
+        // Callers may pass max+1 to detect overflow; allow that sentinel.
+        let limit = limit.min(5_001) as i64;
         let conn = self.conn();
         let mut statement = conn
             .prepare(
