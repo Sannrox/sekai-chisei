@@ -91,8 +91,9 @@ leaking classification details in the RPC error.
 
 ## Residual risks (v1)
 
-- **Deleted-object history**: `ListObjectChanges` for a missing object is
-  credential-admin only (fail closed) until tombstones retain `access_marking`.
+- **Deleted-object history**: `ListObjectChanges` for a missing object cannot
+  reconstruct `access_marking` and falls back to ACL-only until tombstones
+  retain markings.
 - **List scan cost**: marking-aware list walks the ACL-visible set in pages to
   compute exact visible totals (fine for typical namespaces).
 
