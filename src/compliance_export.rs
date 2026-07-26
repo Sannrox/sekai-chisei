@@ -478,7 +478,7 @@ pub fn export_compliance_from_db(
 ) -> Result<ComplianceExportBundle, String> {
     validate_request(request)?;
     // Fetch limit+1 so silent truncation is impossible.
-    let mut receipts = db.list_operation_receipts_in_window(
+    let receipts = db.list_operation_receipts_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
@@ -489,7 +489,7 @@ pub fn export_compliance_from_db(
             "compliance export receipt limit exceeded ({MAX_COMPLIANCE_RECEIPTS}); narrow the time window"
         ));
     }
-    let mut decisions = db.list_compliance_decisions_in_window(
+    let decisions = db.list_compliance_decisions_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
