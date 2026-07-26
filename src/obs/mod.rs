@@ -1,3 +1,4 @@
+pub mod console;
 pub mod correlation;
 pub mod grpc_layer;
 pub mod labels;

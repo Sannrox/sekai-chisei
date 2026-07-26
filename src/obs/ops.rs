@@ -1,4 +1,6 @@
 use crate::db::runtime_db::RuntimeDb;
+use crate::obs::console::{self, ConsoleState, DEFAULT_SESSION_TTL_SECS, SessionStore};
+use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -6,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -15,15 +18,31 @@ struct OpsState {
     provider_registry_state_path: PathBuf,
 }
 
-pub fn router(db: Arc<RuntimeDb>, provider_registry_state_path: PathBuf) -> Router {
-    Router::new()
+/// Build the ops HTTP router: unauthenticated health/metrics plus the
+/// authenticated operator console under `/console`.
+pub fn router(
+    db: Arc<RuntimeDb>,
+    provider_registry_state_path: PathBuf,
+    credential_store: Arc<PrincipalCredentialStore>,
+    legacy_root_token: Option<String>,
+) -> Router {
+    let ops = Router::new()
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(OpsState {
-            db,
+            db: db.clone(),
             provider_registry_state_path,
-        })
+        });
+
+    let console = console::router(ConsoleState {
+        db: db.clone(),
+        auth: crate::grpc::TokenAuthInterceptor::new(credential_store, db, legacy_root_token),
+        sessions: Arc::new(SessionStore::new()),
+        session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
+    });
+
+    ops.merge(console)
 }
 
 pub async fn bind_and_spawn(
@@ -31,15 +50,25 @@ pub async fn bind_and_spawn(
     port: u16,
     db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
+    credential_store: Arc<PrincipalCredentialStore>,
+    legacy_root_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::obs::metrics::handle();
     crate::obs::metrics::spawn_upkeep_task();
 
     let listener = TcpListener::bind((bind, port)).await?;
     let actual_addr = listener.local_addr()?;
-    let app = router(db, provider_registry_state_path);
+    let app = router(
+        db,
+        provider_registry_state_path,
+        credential_store,
+        legacy_root_token,
+    );
 
-    info!(addr = %actual_addr, "ops listener serving health and metrics");
+    info!(
+        addr = %actual_addr,
+        "ops listener serving health, metrics, and authenticated console"
+    );
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             error!(error = %err, "ops listener exited");

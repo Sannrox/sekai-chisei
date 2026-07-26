@@ -61,7 +61,12 @@ impl TokenAuthInterceptor {
         }
     }
 
-    fn resolve_credential(&self, token: &str) -> Option<PrincipalCredential> {
+    /// Resolve a raw bearer token to an active principal credential.
+    ///
+    /// Rechecks durable state on every call so rotation/revocation cannot be
+    /// bypassed by a stale process-local cache. Used by gRPC interceptors and
+    /// the authenticated operator console.
+    pub fn resolve_credential(&self, token: &str) -> Option<PrincipalCredential> {
         self.store.maybe_reload(&self.db);
         let token_hash = hash_gateway_key(token);
 
@@ -83,11 +88,11 @@ impl TokenAuthInterceptor {
         // Recheck durable state for every authentication. The cache accelerates
         // startup discovery but never extends a rotated or revoked credential.
         match self.db.get_principal_credential(&token_hash) {
-            Ok(Some(credential)) => {
+            Ok(Some(credential)) if credential.status == "active" => {
                 self.store.load_credential(&credential);
                 Some(credential)
             }
-            Ok(None) => None,
+            Ok(Some(_)) | Ok(None) => None,
             Err(_) => None,
         }
     }
@@ -364,18 +369,21 @@ pub async fn run(
     let db = runtime_db.clone();
     let provider_registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
+
+    let credential_store = Arc::new(PrincipalCredentialStore::new());
+    credential_store.load(&active_credentials);
+
     if let Some(ops_port) = config.ops_port {
         crate::obs::ops::bind_and_spawn(
             &config.ops_bind,
             ops_port,
             db.clone(),
             provider_registry_state_path.clone(),
+            credential_store.clone(),
+            config.auth_token.clone(),
         )
         .await?;
     }
-
-    let credential_store = Arc::new(PrincipalCredentialStore::new());
-    credential_store.load(&active_credentials);
 
     if let Some(socket_path) = config.sekai_socket.as_deref() {
         ensure_local_gateway_credential(socket_path, &db)?;
