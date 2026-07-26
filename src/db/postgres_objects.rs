@@ -133,6 +133,18 @@ impl PostgresDb {
             .transpose()
     }
 
+    pub fn find_all_by_external_id(&self, external_id: &str) -> Result<Vec<Object>, String> {
+        self.connection()?
+            .query(
+                &format!("SELECT {OBJECT_COLUMNS} FROM sekai_objects WHERE external_id = $1"),
+                &[&external_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
+    }
+
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         self.list_objects_query(filter, None).map(|result| result.0)
     }

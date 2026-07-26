@@ -85,6 +85,10 @@ pub struct ActionTypeDef {
     pub ops: Vec<ActionOp>,
     pub target_kind: String,
     pub created: i64,
+    /// Optional purpose required to invoke this action (#301). Empty means
+    /// no purpose gate (legacy / fail-open for unmarked actions).
+    #[serde(default)]
+    pub required_purpose: String,
 }
 
 pub struct ActionExecutor {
@@ -124,6 +128,10 @@ impl ActionExecutor {
         let mut action_types: Vec<_> = self.action_types.values().cloned().collect();
         action_types.sort_by(|a, b| a.name.cmp(&b.name));
         action_types
+    }
+
+    pub fn get_action_type(&self, name: &str) -> Option<&ActionTypeDef> {
+        self.action_types.get(name)
     }
 
     /// Canonical descriptors for every action accepted by `ExecuteAction`.
@@ -554,6 +562,7 @@ fn builtin_action_types() -> Vec<ActionTypeDef> {
         }],
         target_kind: target_kind.to_string(),
         created: 0,
+        required_purpose: String::new(),
     };
 
     vec![
@@ -1281,6 +1290,7 @@ mod tests {
             }],
             target_kind: "widget".into(),
             created: 0,
+            required_purpose: String::new(),
         };
         let destructive = ActionTypeDef {
             name: "detach".into(),
@@ -1307,6 +1317,7 @@ mod tests {
             ],
             target_kind: "widget".into(),
             created: 0,
+            required_purpose: String::new(),
         };
         let mut exec = ActionExecutor::new();
         exec.action_types

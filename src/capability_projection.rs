@@ -443,6 +443,7 @@ mod tests {
                 ops: vec![],
                 target_kind: "record".into(),
                 created: 0,
+                required_purpose: String::new(),
             }),
             evidence_requirements: vec!["audit_receipt".into()],
         }

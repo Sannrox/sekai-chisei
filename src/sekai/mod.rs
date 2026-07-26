@@ -22,6 +22,7 @@ pub mod learning;
 pub mod lease;
 pub mod ledger;
 pub mod lineage;
+pub mod markings;
 pub mod observation;
 pub mod ontology;
 pub mod propagation;
