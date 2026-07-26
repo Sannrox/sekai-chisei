@@ -1397,6 +1397,42 @@
         "tests/evidence_backend_conformance.rs"
       ],
       "durable_dependencies": []
+    },
+    {
+      "rpc": "DiscoverTemporalSurfaces",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/temporal.rs",
+        "docs/temporal-history-storage.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ]
+    },
+    {
+      "rpc": "QueryTemporalAsOf",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/temporal.rs",
+        "docs/temporal-history-storage.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ]
+    },
+    {
+      "rpc": "DiffTemporalHistory",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/temporal.rs",
+        "docs/temporal-history-storage.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ]
     }
   ],
   "complete_sekai_surfaces": [
