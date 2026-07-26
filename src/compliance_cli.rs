@@ -62,6 +62,19 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         actor: config.actor,
         request_id: config.request_id,
     };
+    let signing_parts = [
+        config.signing_key.is_some(),
+        config.identity.is_some(),
+        config.key_id.is_some(),
+    ];
+    if signing_parts.iter().any(|present| *present) && !signing_parts.iter().all(|present| *present)
+    {
+        return Err(std::io::Error::other(
+            "signing requires all of --signing-key, --identity, and --key-id (or none)",
+        )
+        .into());
+    }
+
     let exported_at = Utc::now().timestamp_millis();
     let mut bundle = export_compliance_from_db(&db, &request, exported_at)?;
     if let (Some(key_path), Some(identity), Some(key_id)) =
@@ -76,9 +89,21 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
             Utc::now().timestamp_millis(),
         )?;
     }
-    std::fs::write(&config.output, compliance_bundle_bytes(&bundle)?)?;
-    // Audit only after the durable write succeeds.
-    record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())?;
+
+    // Stage the file, audit, then publish so a failed audit cannot leave an
+    // unaudited compliance artifact at the final path.
+    let staged = config.output.with_extension("compliance-export.partial");
+    std::fs::write(&staged, compliance_bundle_bytes(&bundle)?)?;
+    if let Err(error) =
+        record_compliance_export_success(&db, &request, &bundle, Utc::now().timestamp_millis())
+    {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    std::fs::rename(&staged, &config.output).map_err(|error| {
+        let _ = std::fs::remove_file(&staged);
+        error
+    })?;
     println!(
         "exported {} receipts={} decisions={} digest={}",
         config.output.display(),
