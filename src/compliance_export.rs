@@ -179,7 +179,10 @@ pub fn build_compliance_export(
         start_timestamp_ms: request.start_timestamp_ms,
         end_timestamp_ms: request.end_timestamp_ms,
         redaction: request.redaction,
-        exported_by: request.actor.clone(),
+        exported_by: match request.redaction {
+            RedactionMode::Full => request.actor.clone(),
+            RedactionMode::Redacted => "[redacted]".into(),
+        },
         export_request_id: request.request_id.clone(),
         exported_at_ms,
         receipt_count: receipts.len() as u32,
