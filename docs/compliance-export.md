@@ -60,10 +60,10 @@ No control-plane database is required for verification.
 | Mode | Behavior |
 | --- | --- |
 | `full` (default) | Keep admitted receipt attributes and decision evidence as stored |
-| `redacted` (`--redact`) | Allowlist-only free text: keep structural keys (`namespace`, `project`, `route`, `model`, …) and replace other attribute/evidence values plus free-form actors/reasons with `[redacted]` |
+| `redacted` (`--redact`) | Keep structural identifiers only: receipt/event ids, kinds, surfaces, versions, timestamps, and `namespace`/`project` evidence. Clear free-form attributes, principals, reasons, and references. |
 
-Redaction is intentionally conservative: fields not on the structural allowlist
-are scrubbed even when they do not look like credentials.
+Redaction is intentionally aggressive so offline auditor bundles cannot carry
+prompts, PII, or free-form error text under unexpected field names.
 
 ## Limits
 
