@@ -500,4 +500,43 @@ mod tests {
         assert_eq!(report.counts.evaluated, 1);
         assert!(!report.candidate_policy_version.is_empty());
     }
+
+    #[test]
+    fn empty_preferred_is_insufficient_history() {
+        let receipts = [receipt("op-legacy", "", "", "openai", "gpt-5.5", "allow")];
+        let candidate = candidate(&["gpt-5.5"], "gpt-5.5");
+        let report = dry_run_policy_over_receipts("ns", 100, 200, &candidate, &receipts).unwrap();
+        assert_eq!(report.counts.insufficient_history, 1);
+        assert_eq!(
+            report.results[0].delta,
+            DryRunDeltaClass::InsufficientHistory
+        );
+    }
+
+    #[test]
+    fn preferences_from_intent_when_route_omits_them() {
+        let mut r = receipt(
+            "op-intent",
+            "openai",
+            "gpt-5.5",
+            "openai",
+            "gpt-5.5",
+            "allow",
+        );
+        // Strip preferred_* from RouteSelected to force Intent fallback.
+        if let Some(event) = r
+            .events
+            .iter_mut()
+            .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+        {
+            event.attributes.remove("preferred_runtime");
+            event.attributes.remove("preferred_model");
+        }
+        let snapshot = snapshot_from_receipt(&r);
+        assert_eq!(snapshot.preferred_runtime, "openai");
+        assert_eq!(snapshot.preferred_model, "gpt-5.5");
+        let candidate = candidate(&["gpt-5.5"], "gpt-5.5");
+        let result = evaluate_snapshot_against_policy(&snapshot, &candidate);
+        assert_eq!(result.delta, DryRunDeltaClass::Unchanged);
+    }
 }

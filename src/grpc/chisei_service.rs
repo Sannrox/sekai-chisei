@@ -1983,7 +1983,7 @@ impl ChiseiServiceImpl {
             allowed_evidence_classes.clone(),
         );
         let fallback_runtime = pipeline_req.runtime.clone();
-        let (initial_runtime, initial_model) = self
+        let (initial_runtime, initial_model, initial_pref_runtime, initial_pref_model) = self
             .resolve_model_for_run(
                 &input,
                 &fallback_runtime,
@@ -1996,68 +1996,87 @@ impl ChiseiServiceImpl {
         let initial_provider = crate::llm::provider_name(&initial_model).to_string();
         let initial_provider_is_external =
             crate::chisei::egress::is_external_provider(&initial_provider);
-        let (run, resolved_runtime, resolved_model, provider, provider_is_external) =
-            if initial_provider_is_external || safe_only || template_only {
+        let (
+            run,
+            resolved_runtime,
+            resolved_model,
+            provider,
+            provider_is_external,
+            effective_preferred_runtime,
+            effective_preferred_model,
+        ) = if initial_provider_is_external || safe_only || template_only {
+            (
+                initial_run,
+                initial_runtime,
+                initial_model,
+                initial_provider,
+                true,
+                initial_pref_runtime,
+                initial_pref_model,
+            )
+        } else {
+            let mut local_pipeline_req = pipe::PipelineRequest {
+                request_id: input.request_id.clone(),
+                namespace: input.namespace.clone(),
+                spec: input.spec.clone(),
+                model: input.preferred_model.clone(),
+                runtime: input.preferred_runtime.clone(),
+                task_type: input.task_type.clone(),
+                priority: input.priority,
+                risk_score: 0.0,
+                budget_pressure: budget_pressure.clone(),
+                review_model: String::new(),
+                egress_records: vec![],
+                external_egress: false,
+                template_only,
+                expanded_context_items: 0,
+                evidence_references: vec![],
+                memory_references: vec![],
+                memory_holdouts: vec![],
+                memory_actor: authenticated_actor.into(),
+                memory_assignment_id: plan_id.clone(),
+                memory_token_budget: 512,
+                allowed_evidence_classes: std::collections::HashSet::new(),
+            };
+            let local_run = self.pipeline.run_with_context_admission(
+                &mut local_pipeline_req,
+                &self.db,
+                context_expansion_gate.allowed,
+                allowed_evidence_classes,
+            );
+            let (local_runtime, local_model, local_pref_runtime, local_pref_model) = self
+                .resolve_model_for_run(
+                    &input,
+                    &local_pipeline_req.runtime,
+                    &local_run,
+                    effective_policy.as_ref(),
+                    safe_only,
+                    &safe_providers,
+                )
+                .await?;
+            let local_provider = crate::llm::provider_name(&local_model).to_string();
+            if crate::chisei::egress::is_external_provider(&local_provider) {
                 (
                     initial_run,
                     initial_runtime,
                     initial_model,
                     initial_provider,
                     true,
+                    initial_pref_runtime,
+                    initial_pref_model,
                 )
             } else {
-                let mut local_pipeline_req = pipe::PipelineRequest {
-                    request_id: input.request_id.clone(),
-                    namespace: input.namespace.clone(),
-                    spec: input.spec.clone(),
-                    model: input.preferred_model.clone(),
-                    runtime: input.preferred_runtime.clone(),
-                    task_type: input.task_type.clone(),
-                    priority: input.priority,
-                    risk_score: 0.0,
-                    budget_pressure: budget_pressure.clone(),
-                    review_model: String::new(),
-                    egress_records: vec![],
-                    external_egress: false,
-                    template_only,
-                    expanded_context_items: 0,
-                    evidence_references: vec![],
-                    memory_references: vec![],
-                    memory_holdouts: vec![],
-                    memory_actor: authenticated_actor.into(),
-                    memory_assignment_id: plan_id.clone(),
-                    memory_token_budget: 512,
-                    allowed_evidence_classes: std::collections::HashSet::new(),
-                };
-                let local_run = self.pipeline.run_with_context_admission(
-                    &mut local_pipeline_req,
-                    &self.db,
-                    context_expansion_gate.allowed,
-                    allowed_evidence_classes,
-                );
-                let (local_runtime, local_model) = self
-                    .resolve_model_for_run(
-                        &input,
-                        &local_pipeline_req.runtime,
-                        &local_run,
-                        effective_policy.as_ref(),
-                        safe_only,
-                        &safe_providers,
-                    )
-                    .await?;
-                let local_provider = crate::llm::provider_name(&local_model).to_string();
-                if crate::chisei::egress::is_external_provider(&local_provider) {
-                    (
-                        initial_run,
-                        initial_runtime,
-                        initial_model,
-                        initial_provider,
-                        true,
-                    )
-                } else {
-                    (local_run, local_runtime, local_model, local_provider, false)
-                }
-            };
+                (
+                    local_run,
+                    local_runtime,
+                    local_model,
+                    local_provider,
+                    false,
+                    local_pref_runtime,
+                    local_pref_model,
+                )
+            }
+        };
         self.record_context_expansion_gate(
             &input.request_id,
             &input.namespace,
@@ -2124,6 +2143,11 @@ impl ChiseiServiceImpl {
         let mut normalized_input = input.clone();
         normalized_input.user_id = normalized_user_id;
         normalized_input.estimated_tokens = estimated_tokens;
+        // Persist the pre-policy preference actually used for resolve (request,
+        // route override, recommendation, bias, or runtime fallback)—not only
+        // empty raw request fields—so historical dry-run can replay accurately.
+        normalized_input.preferred_runtime = effective_preferred_runtime;
+        normalized_input.preferred_model = effective_preferred_model;
         let mut warnings = run.warnings();
         let final_route_bias_value =
             crate::chisei::model_routing::route_bias(&run.steps).map(str::to_string);
@@ -2490,15 +2514,10 @@ impl ChiseiServiceImpl {
                         ("request_id".into(), input.request_id.clone()),
                         ("task_type".into(), input.task_type.clone()),
                         ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
+                        // Effective pre-policy preference (request, override,
+                        // recommendation, bias, or runtime fallback).
                         ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                        (
-                            "preferred_model".into(),
-                            if input.route_override.trim().is_empty() {
-                                input.preferred_model.clone()
-                            } else {
-                                input.route_override.trim().into()
-                            },
-                        ),
+                        ("preferred_model".into(), input.preferred_model.clone()),
                     ]);
                     if !input.logical_operation_id.trim().is_empty() {
                         attributes.insert(
@@ -2564,16 +2583,9 @@ impl ChiseiServiceImpl {
                 BTreeMap::from([
                     ("runtime".into(), plan.resolved_runtime.clone()),
                     ("model".into(), plan.resolved_model.clone()),
-                    // Echo request-level preferences (also on Intent) for dry-run.
+                    // Effective pre-policy preference (also on Intent) for dry-run.
                     ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                    (
-                        "preferred_model".into(),
-                        if input.route_override.trim().is_empty() {
-                            input.preferred_model.clone()
-                        } else {
-                            input.route_override.trim().into()
-                        },
-                    ),
+                    ("preferred_model".into(), input.preferred_model.clone()),
                     (
                         "route_override".into(),
                         if input.route_override.trim().is_empty() {
@@ -2764,6 +2776,9 @@ impl ChiseiServiceImpl {
         )
     }
 
+    /// Resolve runtime/model and return the effective pre-policy preference
+    /// that was fed into policy resolution: `(resolved_runtime, resolved_model,
+    /// preferred_runtime, preferred_model)`.
     async fn resolve_model_for_run(
         &self,
         input: &ExecutionInput,
@@ -2772,7 +2787,7 @@ impl ChiseiServiceImpl {
         policy: Option<&crate::chisei::policy::Policy>,
         safe_only: bool,
         safe_providers: &std::collections::HashSet<String>,
-    ) -> Result<(String, String), Status> {
+    ) -> Result<(String, String, String, String), Status> {
         let route_override = input.route_override.trim();
         if !route_override.is_empty() && !route_override_allowed(policy, route_override) {
             return Err(Status::invalid_argument(format!(
@@ -2802,15 +2817,15 @@ impl ChiseiServiceImpl {
             .map_err(Status::invalid_argument)?
             .map(|model| model.provider);
         let preferred_runtime = if let Some(runtime) = override_runtime.as_deref() {
-            runtime
+            runtime.to_string()
         } else if input.preferred_runtime.is_empty() {
-            fallback_runtime
+            fallback_runtime.to_string()
         } else {
-            &input.preferred_runtime
+            input.preferred_runtime.clone()
         };
         let (runtime, model) = self
             .policy
-            .resolve(&input.namespace, preferred_runtime, &preferred_model)
+            .resolve(&input.namespace, &preferred_runtime, &preferred_model)
             .map_err(Status::invalid_argument)?;
         let model = self
             .resolve_live_model_with_override(
@@ -2830,7 +2845,7 @@ impl ChiseiServiceImpl {
             .map_err(Status::failed_precondition)?;
         let runtime = final_runtime_for_model(policy, &runtime, &model)
             .map_err(Status::failed_precondition)?;
-        Ok((runtime, model))
+        Ok((runtime, model, preferred_runtime, preferred_model))
     }
 
     fn data_class(&self, policy: Option<&crate::chisei::policy::Policy>) -> DataClass {
@@ -5617,8 +5632,10 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<DryRunNamespacePolicyRequest>,
     ) -> Result<Response<DryRunNamespacePolicyResponse>, Status> {
-        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
+        // Historical receipts are sensitive; always enforce namespace grants
+        // (not only team-managed namespaces).
         let actor = authenticated_actor(&req);
+        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
             let r = req.into_inner();
