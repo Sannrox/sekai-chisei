@@ -600,8 +600,12 @@ impl SekaiDb {
             params![namespace, required_trust_level, actor, now_ms],
         )
         .map_err(|error| error.to_string())?;
-        let evidence =
-            format!("trust_policy_set;required_trust_level={required_trust_level};actor={actor}");
+        let evidence = serde_json::json!({
+            "action": "trust_policy_set",
+            "required_trust_level": required_trust_level,
+            "actor": actor,
+        })
+        .to_string();
         let result_json = serde_json::to_string(&policy).map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO sekai_capability_package_events
@@ -747,7 +751,13 @@ impl SekaiDb {
             params![namespace, identity, key_id, public_key_b64, actor, now_ms],
         )
         .map_err(|error| error.to_string())?;
-        let evidence = format!("signer_put;identity={identity};key_id={key_id};actor={actor}");
+        let evidence = serde_json::json!({
+            "action": "signer_put",
+            "identity": identity,
+            "key_id": key_id,
+            "actor": actor,
+        })
+        .to_string();
         let result_json = serde_json::to_string(&signer).map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO sekai_capability_package_events
