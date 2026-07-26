@@ -470,14 +470,30 @@ fn decision_touches_namespace(decision: &Decision, namespace: &str) -> bool {
         || decision.evidence.get("project").map(String::as_str) == Some(namespace)
 }
 
+/// Attribute/evidence keys retained under redaction. Everything else is scrubbed.
+fn redaction_allowlist(key: &str) -> bool {
+    matches!(
+        key,
+        "namespace"
+            | "project"
+            | "route"
+            | "model"
+            | "provider"
+            | "decision"
+            | "outcome"
+            | "policy_version"
+            | "schema_version"
+            | "operation_class"
+            | "request_id"
+            | "status"
+    )
+}
+
 fn redact_receipt(receipt: &mut OperationReceipt) {
-    if looks_sensitive("initiating_actor", &receipt.initiating_actor) {
-        receipt.initiating_actor = "[redacted]".into();
-    }
+    // Allowlist redaction: free-form principals and text are not retained.
+    receipt.initiating_actor = "[redacted]".into();
     for grant in &mut receipt.reporter_grants {
-        if looks_sensitive("principal", &grant.principal) {
-            grant.principal = "[redacted]".into();
-        }
+        grant.principal = "[redacted]".into();
     }
     for event in &mut receipt.events {
         redact_event(event);
@@ -485,23 +501,17 @@ fn redact_receipt(receipt: &mut OperationReceipt) {
 }
 
 fn redact_event(event: &mut OperationReceiptEvent) {
-    if looks_sensitive("actor", &event.actor) {
-        event.actor = "[redacted]".into();
-    }
+    event.actor = "[redacted]".into();
     for reference in &mut event.references {
-        if looks_sensitive("reference", &reference.reference) {
-            reference.reference = "[redacted]".into();
-        }
-        if let Some(hash) = &mut reference.content_hash
-            && looks_sensitive("content_hash", hash)
-        {
-            *hash = "[redacted]".into();
+        reference.reference = "[redacted]".into();
+        if reference.content_hash.is_some() {
+            reference.content_hash = Some("[redacted]".into());
         }
     }
     let keys: Vec<String> = event.attributes.keys().cloned().collect();
     for key in keys {
-        if let Some(value) = event.attributes.get_mut(&key)
-            && looks_sensitive(&key, value)
+        if !redaction_allowlist(&key)
+            && let Some(value) = event.attributes.get_mut(&key)
         {
             *value = "[redacted]".into();
         }
@@ -509,63 +519,22 @@ fn redact_event(event: &mut OperationReceiptEvent) {
 }
 
 fn redact_decision_record(decision: &mut ComplianceDecisionRecord) {
-    if looks_sensitive("reason", &decision.reason) {
-        decision.reason = "[redacted]".into();
-    }
-    if looks_sensitive("target_id", &decision.target_id) {
+    decision.reason = "[redacted]".into();
+    decision.actor = "[redacted]".into();
+    // Keep target_id structural prefix but drop free-form tails when sensitive.
+    if !decision.target_id.starts_with("operation:")
+        && !decision.target_id.starts_with("compliance-export:")
+    {
         decision.target_id = "[redacted]".into();
-    }
-    if looks_sensitive("actor", &decision.actor) {
-        decision.actor = "[redacted]".into();
     }
     let keys: Vec<String> = decision.evidence.keys().cloned().collect();
     for key in keys {
-        // Keep structural attribution fields so offline verify still works.
-        if key == "namespace" || key == "project" {
-            continue;
-        }
-        if let Some(value) = decision.evidence.get_mut(&key)
-            && looks_sensitive(&key, value)
+        if !redaction_allowlist(&key)
+            && let Some(value) = decision.evidence.get_mut(&key)
         {
             *value = "[redacted]".into();
         }
     }
-}
-
-fn looks_sensitive(key: &str, value: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    if lower.contains("prompt")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("password")
-        || lower.contains("authorization")
-        || lower.contains("api_key")
-        || lower.contains("body")
-        || lower.contains("content")
-        || lower.contains("payload")
-        || lower.contains("credential")
-        || lower.contains("bearer")
-    {
-        return true;
-    }
-    if value.len() > 512 || value.to_ascii_uppercase().contains("BEGIN PRIVATE KEY") {
-        return true;
-    }
-    let value_lower = value.to_ascii_lowercase();
-    [
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "glpat-",
-        "xoxb-",
-        "xoxp-",
-        "bearer ",
-        "akia",
-        "asia",
-    ]
-    .iter()
-    .any(|prefix| value_lower.contains(prefix))
-        || (value_lower.starts_with("eyj") && value_lower.matches('.').count() == 2)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -821,6 +790,9 @@ mod tests {
             bundle.decisions[0].evidence.get("route").unwrap(),
             "allowed"
         );
+        assert_eq!(bundle.decisions[0].reason, "[redacted]");
+        assert_eq!(bundle.decisions[0].actor, "[redacted]");
+        assert_eq!(bundle.decisions[0].evidence.get("namespace").unwrap(), "ns");
         assert!(verify_compliance_export(&bundle, None).ok);
     }
 
