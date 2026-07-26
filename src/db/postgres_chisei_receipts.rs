@@ -103,7 +103,7 @@ impl PostgresDb {
                    AND COALESCE(
                         NULLIF(receipt_json::jsonb->>'completed_at_ms', '')::bigint,
                         (receipt_json::jsonb->>'started_at_ms')::bigint
-                      ) >= $2
+                      ) > $2
                  ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint), operation_id
                  LIMIT $4",
                 &[&namespace, &start_timestamp_ms, &end_timestamp_ms, &limit],
