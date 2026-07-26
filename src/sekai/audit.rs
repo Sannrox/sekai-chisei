@@ -692,7 +692,10 @@ impl SekaiDb {
                  WHERE timestamp >= ?1 AND timestamp < ?2
                    AND (
                      namespace = ?3
-                     OR (json_valid(evidence) AND json_extract(evidence, '$.namespace') = ?3)
+                     OR (json_valid(evidence) AND (
+                       json_extract(evidence, '$.namespace') = ?3
+                       OR json_extract(evidence, '$.project') = ?3
+                     ))
                    )
                  ORDER BY timestamp ASC, rowid ASC
                  LIMIT ?4",
