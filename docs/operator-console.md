@@ -9,8 +9,8 @@ The shell ships in-process on the **ops HTTP listener** (`OPS_BIND` /
 `OPS_PORT`). Process health and metrics stay unauthenticated; every `/console`
 route fails closed without a valid session.
 
-Domain follow-ups: governance pressure (#286) and policy promote (#287).
-The **causal operation workspace** (#285) is available under Operations.
+Domain follow-up: policy promote (#287). **Operations** (#285) and
+**Pressure** (#286) are available under the shell.
 
 ## Local development
 
@@ -88,7 +88,9 @@ server {
 | `GET /console/n/{ns}/ops` | session + ns | Recent visible operations (7-day window) |
 | `GET /console/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Causal operation workspace |
 | `GET /console/api/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Authorized report + causal stages JSON |
-| `GET /console/n/{ns}/pressure` | session + ns | Pressure stub (#286) |
+| `GET /console/n/{ns}/pressure` | session + ns | Governance pressure tiles |
+| `GET /console/api/n/{ns}/pressure` | session + ns | Pressure snapshot JSON |
+| `POST /console/n/{ns}/pressure/kill-switch` | session + ns write | Gunshi kill switch with confirm |
 | `GET /console/n/{ns}/policy` | session + ns | Policy stub (#287) |
 | `GET /console/api/session` | session | JSON session summary |
 | `GET /console/api/namespaces` | session | JSON memberships for the principal |
@@ -106,6 +108,21 @@ Deep link: `/console/n/{namespace}/ops/{operation_id}`.
 - Cross-namespace IDs return **403** without disclosing foreign receipt content.
 - Initial fixture-sized load budget: **2s** (`WORKSPACE_INITIAL_LOAD_BUDGET_MS`).
 - List home caps at **50** operations over the last **7 days**.
+
+### Governance pressure
+
+Deep link: `/console/n/{namespace}/pressure`.
+
+- 24-hour operation statistics tiles (logical ops, spend, outcome classes,
+  waiting) from `query_operation_statistics` (authorized namespace only).
+- Gunshi allocation status: revision, auto opt-in, live/advisory posture,
+  kill switch reason.
+- Kill switch POST requires namespace **editor/admin** (or bootstrap principal),
+  explicit confirm checkbox, and a reason when enabling.
+- Refresh semantics: request/response only; operators poll/reload. No SSE and
+  no shadow database in v1.
+- Provider circuits, cache effectiveness, multi-site federation, and approval
+  queue depth remain out of scope until their APIs land.
 
 Namespace URL segments must be short ASCII tokens (`[A-Za-z0-9._-]+`). Bootstrap
 principals `root` and `local` (legacy root token / local socket principal) may
