@@ -218,16 +218,54 @@ pub fn evaluate_package_trust(
             ),
         });
     }
-    let digest = manifest.digest()?;
-    let signature_bytes = base64::Engine::decode(
+    // Signature parse/decode failures are trust denials (attacker-controlled
+    // material), not hard errors — return denied decisions so install/upgrade
+    // callers can record lifecycle evidence consistently.
+    let digest = match manifest.digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            return Ok(PackageTrustDecision {
+                allowed: false,
+                required_trust_level: level.into(),
+                signature_present: true,
+                signature_valid: false,
+                signer_identity: signature.signer_identity.clone(),
+                key_id: signature.key_id.clone(),
+                reason: format!("manifest digest unavailable for verification: {error}"),
+            });
+        }
+    };
+    let signature_bytes = match base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         signature.signature_b64.as_bytes(),
-    )
-    .map_err(|error| format!("invalid package signature encoding: {error}"))?;
-    let signature_array: [u8; 64] = signature_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "package signature must be 64 bytes".to_string())?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok(PackageTrustDecision {
+                allowed: false,
+                required_trust_level: level.into(),
+                signature_present: true,
+                signature_valid: false,
+                signer_identity: signature.signer_identity.clone(),
+                key_id: signature.key_id.clone(),
+                reason: format!("invalid package signature encoding: {error}"),
+            });
+        }
+    };
+    let signature_array: [u8; 64] = match signature_bytes.as_slice().try_into() {
+        Ok(array) => array,
+        Err(_) => {
+            return Ok(PackageTrustDecision {
+                allowed: false,
+                required_trust_level: level.into(),
+                signature_present: true,
+                signature_valid: false,
+                signer_identity: signature.signer_identity.clone(),
+                key_id: signature.key_id.clone(),
+                reason: "package signature must be 64 bytes".into(),
+            });
+        }
+    };
     let ed_signature = Signature::from_bytes(&signature_array);
     let trusted = trusted_signers.iter().find(|(identity, key_id, _)| {
         identity == &signature.signer_identity && key_id == &signature.key_id
@@ -1497,6 +1535,34 @@ mod package_trust_tests {
                 .iter()
                 .any(|event| event.action == "trust_denied"),
             "unsigned install must record trust_denied"
+        );
+    }
+
+    #[test]
+    fn malformed_signature_is_denied_and_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_capability_package_trust_policy("ns", PACKAGE_TRUST_SIGNED, "admin", "policy-m", 1)
+            .unwrap();
+        let mut manifest = sample_manifest("malformed-pkg", "1.0.0");
+        manifest.signature = Some(PackageSignature {
+            algorithm: PACKAGE_SIGNATURE_ALGORITHM.into(),
+            signer_identity: "issuer:ops".into(),
+            key_id: "key-1".into(),
+            signature_b64: "not-valid-base64!!!".into(),
+        });
+        assert!(
+            db.install_capability_package("ns", &manifest, "operator", "mal-1", 2)
+                .unwrap_err()
+                .contains("signature encoding")
+        );
+        let events = db
+            .list_capability_package_events("ns", "malformed-pkg")
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "trust_denied"),
+            "malformed signature must record trust_denied"
         );
     }
 
