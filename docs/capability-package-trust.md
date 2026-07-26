@@ -53,5 +53,7 @@ Trust decisions are recorded on the install/upgrade lifecycle event evidence.
 - Tightening a namespace to `signed` does not re-trust old packages; new
   installs must present valid signatures.
 - SQLite is the reference runtime for trust policy and signer administration.
-  PostgreSQL currently remains on the grandfather path (`unsigned_allowed` only)
-  until package-trust table parity lands; invalid signatures are still rejected.
+  PostgreSQL currently remains on the grandfather path (`unsigned_allowed` only,
+  empty trusted-signer set) until package-trust table parity lands. Omit package
+  signatures on community PostgreSQL: a supplied signature still requires a
+  registered signer, so it is denied until trust-table parity lands.
