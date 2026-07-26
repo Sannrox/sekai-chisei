@@ -14,13 +14,16 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl compliance verify <bundle> [--trusted-key <file>]"
+    "sekaictl compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl compliance verify <bundle> [--trusted-key <file>]\n  sekaictl compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl compliance list-trust-roots --namespace <ns>"
 }
 
 pub async fn run_compliance_command(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
         Some("export") => export(parse_export(&args[1..])?).await,
         Some("verify") => verify(parse_verify(&args[1..])?),
+        Some("trust-root") => trust_root(parse_trust_root(&args[1..])?).await,
+        Some("import-peer") => import_peer(parse_import_peer(&args[1..])?).await,
+        Some("list-trust-roots") => list_trust_roots(parse_list_trust_roots(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -202,6 +205,169 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
         }
         Err(std::io::Error::other("compliance bundle verification failed").into())
     }
+}
+
+#[derive(Debug, Clone)]
+struct TrustRootConfig {
+    namespace: String,
+    site_identity: String,
+    key_id: String,
+    public_key_hex: String,
+    actor: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImportPeerConfig {
+    namespace: String,
+    bundle: PathBuf,
+    actor: String,
+}
+
+#[derive(Debug, Clone)]
+struct ListTrustRootsConfig {
+    namespace: String,
+}
+
+async fn open_local_db() -> Result<std::sync::Arc<crate::db::runtime_db::RuntimeDb>, BoxErr> {
+    let cfg = Config::from_env();
+    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
+    Ok(backend.database())
+}
+
+async fn trust_root(config: TrustRootConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let root = crate::sekai::peer_import::PeerTrustRoot {
+        namespace: config.namespace,
+        site_identity: config.site_identity,
+        key_id: config.key_id,
+        public_key_hex: config.public_key_hex,
+        enabled: true,
+        created_by: config.actor,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    crate::sekai::peer_import::put_trust_root(db.as_ref(), &root).map_err(std::io::Error::other)?;
+    println!(
+        "trusted peer site={} key_id={} namespace={}",
+        root.site_identity, root.key_id, root.namespace
+    );
+    Ok(())
+}
+
+async fn import_peer(config: ImportPeerConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let result = crate::sekai::peer_import::import_compliance_bundle(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &bundle,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!(
+        "imported id={} digest={} receipts={} decisions={} permit_authority={}",
+        result.record.import_id,
+        result.record.bundle_content_digest,
+        result.record.receipt_count,
+        result.record.decision_count,
+        result.record.permit_authority
+    );
+    Ok(())
+}
+
+async fn list_trust_roots(config: ListTrustRootsConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let roots = crate::sekai::peer_import::list_trust_roots(db.as_ref(), &config.namespace)
+        .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&roots)?);
+    Ok(())
+}
+
+fn parse_trust_root(args: &[String]) -> Result<TrustRootConfig, String> {
+    let mut namespace = None;
+    let mut site_identity = None;
+    let mut key_id = None;
+    let mut public_key_hex = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            "--site-identity" => {
+                site_identity = Some(require_value(args, index, "--site-identity")?);
+                index += 2;
+            }
+            "--key-id" => {
+                key_id = Some(require_value(args, index, "--key-id")?);
+                index += 2;
+            }
+            "--public-key-hex" => {
+                public_key_hex = Some(require_value(args, index, "--public-key-hex")?);
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            other => return Err(format!("unknown trust-root option {other}")),
+        }
+    }
+    Ok(TrustRootConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        site_identity: site_identity.ok_or("--site-identity is required")?,
+        key_id: key_id.ok_or("--key-id is required")?,
+        public_key_hex: public_key_hex.ok_or("--public-key-hex is required")?,
+        actor,
+    })
+}
+
+fn parse_import_peer(args: &[String]) -> Result<ImportPeerConfig, String> {
+    let mut namespace = None;
+    let mut bundle = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            other => return Err(format!("unknown import-peer option {other}")),
+        }
+    }
+    Ok(ImportPeerConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        bundle: bundle.ok_or("--bundle is required")?,
+        actor,
+    })
+}
+
+fn parse_list_trust_roots(args: &[String]) -> Result<ListTrustRootsConfig, String> {
+    let mut namespace = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown list-trust-roots option {other}")),
+        }
+    }
+    Ok(ListTrustRootsConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+    })
 }
 
 fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
