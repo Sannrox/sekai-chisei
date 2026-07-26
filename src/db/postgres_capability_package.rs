@@ -20,17 +20,30 @@ impl PostgresDb {
     ) -> Result<PackageInstallation, String> {
         validate_context(namespace, actor, request_id)?;
         // Until package-trust tables are complete on PostgreSQL, only the
-        // grandfather path is available: reject invalid signatures but keep
-        // unsigned installs allowed. Operators cannot enable `signed` here yet.
+        // grandfather path is available: unsigned installs allowed; supplied
+        // signatures still require a registered signer (empty list here means
+        // omit signatures on community PostgreSQL). Invalid encoding/algorithm
+        // is still rejected.
+        let manifest_digest = manifest.digest()?;
+        let request_digest = package_request_digest("install", namespace, manifest, "")?;
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_package(&mut tx, namespace, &manifest.name)?;
+        if let Some(existing) = replay(&mut tx, namespace, actor, request_id, &request_digest)? {
+            return existing
+                .ok_or_else(|| "idempotent install no longer has an active installation".into());
+        }
         let trust = crate::sekai::capability_package::evaluate_package_trust(
             crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED,
             &[],
             manifest,
         )?;
-        let manifest_digest = manifest.digest()?;
-        let request_digest = package_request_digest("install", namespace, manifest, "")?;
         if !trust.allowed {
             let error = format!("package trust denied: {}", trust.reason);
+            drop(tx);
+            drop(connection);
             let _ = self.record_package_trust_denial(
                 namespace,
                 manifest,
@@ -43,15 +56,6 @@ impl PostgresDb {
             return Err(error);
         }
         let trust_evidence = package_trust_evidence(&trust);
-        let mut connection = self.connection()?;
-        let mut tx = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        lock_package(&mut tx, namespace, &manifest.name)?;
-        if let Some(existing) = replay(&mut tx, namespace, actor, request_id, &request_digest)? {
-            return existing
-                .ok_or_else(|| "idempotent install no longer has an active installation".into());
-        }
         if load_installation(&mut tx, namespace, &manifest.name)?.is_some() {
             return Err("package already installed in namespace".into());
         }
@@ -95,15 +99,26 @@ impl PostgresDb {
         now_ms: i64,
     ) -> Result<PackageInstallation, String> {
         validate_context(namespace, actor, request_id)?;
+        let manifest_digest = manifest.digest()?;
+        let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_package(&mut tx, namespace, &manifest.name)?;
+        if let Some(existing) = replay(&mut tx, namespace, actor, request_id, &request_digest)? {
+            return existing
+                .ok_or_else(|| "idempotent upgrade no longer has an active installation".into());
+        }
         let trust = crate::sekai::capability_package::evaluate_package_trust(
             crate::sekai::capability_package::PACKAGE_TRUST_UNSIGNED_ALLOWED,
             &[],
             manifest,
         )?;
-        let manifest_digest = manifest.digest()?;
-        let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
         if !trust.allowed {
             let error = format!("package trust denied: {}", trust.reason);
+            drop(tx);
+            drop(connection);
             let _ = self.record_package_trust_denial(
                 namespace,
                 manifest,
@@ -116,15 +131,6 @@ impl PostgresDb {
             return Err(error);
         }
         let trust_evidence = package_trust_evidence(&trust);
-        let mut connection = self.connection()?;
-        let mut tx = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        lock_package(&mut tx, namespace, &manifest.name)?;
-        if let Some(existing) = replay(&mut tx, namespace, actor, request_id, &request_digest)? {
-            return existing
-                .ok_or_else(|| "idempotent upgrade no longer has an active installation".into());
-        }
         let current = load_installation(&mut tx, namespace, &manifest.name)?
             .ok_or_else(|| "package is not installed in namespace".to_string())?;
         let current_version = parse_package_version(&current.current_version)
