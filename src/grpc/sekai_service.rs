@@ -4007,6 +4007,99 @@ fn authorize_package_mutation(
         .ok_or_else(|| Status::unauthenticated("principal required"))
 }
 
+/// Lease keys that coordinate an existing object use this prefix so the
+/// coordination identity cannot be squatted without object ACL access.
+const OBJECT_BOUND_LEASE_KEY_PREFIX: &str = "object:";
+
+/// Returns `Ok(Some(object_id))` for a canonical `object:<object_id>` key.
+/// Non-canonical spellings (whitespace, empty id) are rejected so authorization
+/// and persistence cannot diverge across distinct keys for one object.
+fn object_bound_lease_target(key: &str) -> Result<Option<&str>, Status> {
+    let Some(rest) = key.strip_prefix(OBJECT_BOUND_LEASE_KEY_PREFIX) else {
+        return Ok(None);
+    };
+    if rest.is_empty() || rest != rest.trim() || rest.chars().any(char::is_whitespace) {
+        return Err(Status::invalid_argument(
+            "object-bound lease key must be exactly object:<object_id> with no whitespace",
+        ));
+    }
+    Ok(Some(rest))
+}
+
+/// When the lease key is object-bound (`object:<object_id>`), authorize through
+/// the target object ACL and require the lease namespace to match the object.
+///
+/// `allow_missing_target` is for `ReleaseLease` after a guarded delete: the
+/// coordination row must still be releasable when the object audit identity is
+/// gone and cannot be recreated.
+fn authorize_object_bound_lease(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    lease_namespace: &str,
+    key: &str,
+    write: bool,
+    allow_missing_target: bool,
+) -> Result<(), Status> {
+    let Some(object_id) = object_bound_lease_target(key)? else {
+        return Ok(());
+    };
+    let Some(object) = db.get_object(object_id).map_err(Status::internal)? else {
+        return if allow_missing_target {
+            // Namespace write was already enforced by the caller.
+            Ok(())
+        } else {
+            Err(Status::not_found(format!(
+                "object-bound lease target {object_id} not found"
+            )))
+        };
+    };
+    // ACL before namespace validation so inaccessible objects do not reveal
+    // their home namespace via a distinct InvalidArgument error.
+    if write {
+        check_write(security, object_id, principals)?;
+    } else {
+        check_read(security, object_id, principals)?;
+    }
+    if object.namespace != lease_namespace {
+        return Err(Status::permission_denied(
+            "object-bound lease namespace must match the target object namespace",
+        ));
+    }
+    Ok(())
+}
+
+/// Object-bound lease preconditions must name the same object being mutated
+/// and the same namespace as that object.
+fn enforce_object_bound_lease_precondition(
+    key: &str,
+    lease_namespace: &str,
+    mutation_target_object_id: Option<&str>,
+    mutation_target_namespace: Option<&str>,
+) -> Result<(), Status> {
+    let Some(bound_id) = object_bound_lease_target(key)? else {
+        return Ok(());
+    };
+    match mutation_target_object_id {
+        None => Err(Status::invalid_argument(
+            "object-bound lease keys cannot guard object creation; use a free-form key",
+        )),
+        Some(target) if target != bound_id => Err(Status::failed_precondition(
+            "object-bound lease key must match the mutation target object id",
+        )),
+        Some(_) => {
+            if let Some(object_namespace) = mutation_target_namespace
+                && object_namespace != lease_namespace
+            {
+                return Err(Status::failed_precondition(
+                    "object-bound lease namespace must match the mutation target object namespace",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
     async fn acquire_lease(
@@ -4024,6 +4117,15 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        authorize_object_bound_lease(
+            &self.db,
+            &self.security,
+            &principals,
+            &input.namespace,
+            &input.key,
+            true,
+            false,
+        )?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = self
             .db
@@ -4037,6 +4139,28 @@ impl SekaiService for SekaiServiceImpl {
                 now_millis(),
             )
             .map_err(map_lease_error)?;
+        // Re-validate object-bound targets after persistence so a concurrent
+        // delete cannot leave a freshly returned active lease without a live
+        // target. Best-effort release if the race is detected.
+        if let Ok(Some(object_id)) = object_bound_lease_target(&input.key)
+            && self
+                .db
+                .get_object(object_id)
+                .map_err(Status::internal)?
+                .is_none()
+        {
+            let _ = self.db.release_lease(
+                &input.namespace,
+                &input.key,
+                &lease.fencing_token,
+                &format!("{}:race-cleanup", input.request_id),
+                &actor,
+                now_millis(),
+            );
+            return Err(Status::not_found(format!(
+                "object-bound lease target {object_id} not found"
+            )));
+        }
         Ok(Response::new(AcquireLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
@@ -4057,6 +4181,15 @@ impl SekaiService for SekaiServiceImpl {
             false,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, false)?;
+        authorize_object_bound_lease(
+            &self.db,
+            &self.security,
+            &principals,
+            &input.namespace,
+            &input.key,
+            false,
+            false,
+        )?;
         let lease = self
             .db
             .get_lease(&input.namespace, &input.key)
@@ -4082,6 +4215,15 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        authorize_object_bound_lease(
+            &self.db,
+            &self.security,
+            &principals,
+            &input.namespace,
+            &input.key,
+            true,
+            false,
+        )?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = self
             .db
@@ -4115,6 +4257,15 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        authorize_object_bound_lease(
+            &self.db,
+            &self.security,
+            &principals,
+            &input.namespace,
+            &input.key,
+            true,
+            true,
+        )?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = self
             .db
@@ -4147,6 +4298,15 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        authorize_object_bound_lease(
+            &self.db,
+            &self.security,
+            &principals,
+            &input.namespace,
+            &input.key,
+            true,
+            false,
+        )?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = self
             .db
@@ -4210,6 +4370,12 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
+        enforce_object_bound_lease_precondition(
+            &precondition.key,
+            &precondition.namespace,
+            None,
+            None,
+        )?;
         let domain_object = from_proto_obj(&object);
         if let Some(created) = self
             .db
@@ -4324,6 +4490,12 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
+        enforce_object_bound_lease_precondition(
+            &precondition.key,
+            &precondition.namespace,
+            Some(object.id.as_str()),
+            Some(object.namespace.as_str()),
+        )?;
         let mut domain_object = from_proto_obj(&object);
         let request_object = domain_object.clone();
         if let Some(updated) = self
@@ -4423,6 +4595,12 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &input.id, &principals)?;
         let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
+        enforce_object_bound_lease_precondition(
+            &precondition.key,
+            &precondition.namespace,
+            Some(input.id.as_str()),
+            expected.as_ref().map(|object| object.namespace.as_str()),
+        )?;
         if let Some(existing) = &expected {
             enforce_namespace_tenant_context(
                 &self.db,
@@ -13936,6 +14114,215 @@ mod tests {
                 .iter()
                 .any(|object_type| object_type.kind == "namespace" && object_type.is_builtin)
         );
+    }
+
+    #[tokio::test]
+    async fn object_bound_lease_requires_target_object_authorization() {
+        let svc = service();
+        let target = Object {
+            id: "coord-target".into(),
+            kind: "component".into(),
+            name: "target".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        svc.db
+            .create_object_with_audit(&from_proto_obj(&target), "alice")
+            .unwrap();
+        grant_object_role(&svc, "coord-target", "alice", security::Role::Editor);
+
+        let key = "object:coord-target".to_string();
+        // Principal without object write cannot squat the coordination identity.
+        let denied = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                    owner: "bob".into(),
+                    ttl_ms: 60_000,
+                    request_id: "bob-acq".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let lease = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "alice-acq".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        assert_eq!(lease.key, key);
+        assert!(!lease.fencing_token.is_empty());
+
+        // Inspect also requires object read access.
+        let inspect_denied = svc
+            .get_lease(with_named_principal(
+                GetLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(inspect_denied.code(), tonic::Code::PermissionDenied);
+
+        let got = svc
+            .get_lease(with_named_principal(
+                GetLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        assert_eq!(got.fencing_token, lease.fencing_token);
+
+        // Wrong namespace fails closed even with object write rights.
+        let wrong_ns = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "other".into(),
+                    key: key.clone(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "wrong-ns".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_ns.code(), tonic::Code::PermissionDenied);
+
+        // Missing object cannot be used as a coordination target.
+        let missing = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: "object:does-not-exist".into(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "missing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        // Stale token release fails closed; holder with object write can release.
+        let stale = svc
+            .release_lease(with_named_principal(
+                ReleaseLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                    fencing_token: "not-the-token".into(),
+                    request_id: "stale".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+        svc.release_lease(with_named_principal(
+            ReleaseLeaseRequest {
+                namespace: "default".into(),
+                key: key.clone(),
+                fencing_token: lease.fencing_token,
+                request_id: "release".into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        // After release, a second authorized acquire succeeds (new generation).
+        let again = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: key.clone(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "reacquire".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        assert!(again.generation >= 1);
+
+        // Non-canonical object keys are rejected (no whitespace aliases).
+        let non_canonical = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: "object: coord-target".into(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "non-canonical".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(non_canonical.code(), tonic::Code::InvalidArgument);
+
+        // Object-bound lease cannot guard a different object mutation.
+        let other = Object {
+            id: "other-target".into(),
+            kind: "component".into(),
+            name: "other".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        svc.db
+            .create_object_with_audit(&from_proto_obj(&other), "alice")
+            .unwrap();
+        grant_object_role(&svc, "other-target", "alice", security::Role::Editor);
+        let mismatch = svc
+            .guarded_update_object(with_named_principal(
+                GuardedUpdateObjectRequest {
+                    object: Some(other),
+                    lease_precondition: Some(LeasePrecondition {
+                        namespace: "default".into(),
+                        key,
+                        fencing_token: again.fencing_token,
+                        request_id: "mismatch".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
