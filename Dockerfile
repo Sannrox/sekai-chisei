@@ -14,8 +14,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
-RUN useradd --system --create-home sekai && \
-    mkdir /data && chown sekai:sekai /data
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home sekai \
+    && mkdir /data && chown sekai:sekai /data
 
 COPY --from=builder /out/ /usr/local/bin/
 
