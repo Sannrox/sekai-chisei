@@ -511,6 +511,40 @@ impl SekaiDb {
             .transpose()
     }
 
+    pub fn list_operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        let limit = limit.min(5_000) as i64;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT receipt_json FROM chisei_operation_receipts
+                 WHERE namespace=?1
+                   AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?3
+                   AND (json_extract(receipt_json, '$.completed_at_ms') IS NULL
+                        OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?2)
+                 ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
+                 LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![namespace, start_timestamp_ms, end_timestamp_ms, limit],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut receipts = Vec::new();
+        for row in rows {
+            let json = row.map_err(|error| error.to_string())?;
+            receipts.push(serde_json::from_str(&json).map_err(|error| error.to_string())?);
+        }
+        Ok(receipts)
+    }
+
     pub fn reserve_gateway_request_alias(
         &self,
         caller_scope: &str,
