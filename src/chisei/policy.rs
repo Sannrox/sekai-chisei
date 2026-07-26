@@ -79,9 +79,9 @@ impl PolicyResolver {
         model: &str,
         data_class: &str,
     ) -> Result<ResidencyDecision, String> {
-        let decision =
-            self.residency
-                .evaluate_namespace(namespace, provider, model, data_class)?;
+        let decision = self
+            .residency
+            .evaluate_namespace(namespace, provider, model, data_class)?;
         if decision.allowed {
             Ok(decision)
         } else {
