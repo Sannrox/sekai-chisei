@@ -9,8 +9,8 @@ The shell ships in-process on the **ops HTTP listener** (`OPS_BIND` /
 `OPS_PORT`). Process health and metrics stay unauthenticated; every `/console`
 route fails closed without a valid session.
 
-Domain follow-up: policy promote (#287). **Operations** (#285) and
-**Pressure** (#286) are available under the shell.
+V1 console surfaces are complete: shell (#284), Operations (#285), Pressure
+(#286), and Policy (#287).
 
 ## Local development
 
@@ -91,7 +91,10 @@ server {
 | `GET /console/n/{ns}/pressure` | session + ns | Governance pressure tiles |
 | `GET /console/api/n/{ns}/pressure` | session + ns | Pressure snapshot JSON |
 | `POST /console/n/{ns}/pressure/kill-switch` | session + ns write | Gunshi kill switch with confirm |
-| `GET /console/n/{ns}/policy` | session + ns | Policy stub (#287) |
+| `GET /console/n/{ns}/policy` | session + ns | Policy workspace |
+| `POST /console/n/{ns}/policy/dry-run` | session + ns | Historical dry-run (audited) |
+| `POST /console/n/{ns}/policy/promote` | session + ns write | Eval-gated promote with confirm |
+| `POST /console/n/{ns}/policy/rollback` | session + ns write | Rollback with confirm + reason |
 | `GET /console/api/session` | session | JSON session summary |
 | `GET /console/api/namespaces` | session | JSON memberships for the principal |
 
@@ -123,6 +126,19 @@ Deep link: `/console/n/{namespace}/pressure`.
   no shadow database in v1.
 - Provider circuits, cache effectiveness, multi-site federation, and approval
   queue depth remain out of scope until their APIs land.
+
+### Policy workspace
+
+Deep link: `/console/n/{namespace}/policy`.
+
+- Effective summary: routing policy from durable namespace policy objects,
+  budget limit count, action policy presence, Gunshi allocation status.
+- Historical dry-run: same pure engine as `DryRunNamespacePolicy` / docs
+  [policy-dry-run.md](policy-dry-run.md); records `policy.dry_run` audit.
+- Promote/rollback: write principals only; explicit confirm; promote requires
+  candidate + evaluation JSON (same contract as `sekaictl gunshi promote`).
+- Kill switch remains on the Pressure surface; status is visible here when
+  auto-dispatch policy is installed.
 
 Namespace URL segments must be short ASCII tokens (`[A-Za-z0-9._-]+`). Bootstrap
 principals `root` and `local` (legacy root token / local socket principal) may
