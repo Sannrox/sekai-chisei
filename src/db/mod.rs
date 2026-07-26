@@ -24,6 +24,7 @@ pub mod guarded_mutation;
 pub mod handoff;
 pub mod lease;
 pub mod ontology;
+mod peer_import_store;
 #[cfg(test)]
 mod portfolio_route_test_cases;
 pub mod postgres;
