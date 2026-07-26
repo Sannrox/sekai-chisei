@@ -109,9 +109,11 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     ));
     {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&staged)?;
         file.write_all(&compliance_bundle_bytes(&bundle)?)?;
         file.sync_all()?;
