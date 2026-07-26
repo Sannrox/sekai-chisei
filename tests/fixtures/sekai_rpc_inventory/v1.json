@@ -386,6 +386,58 @@
       "durable_dependencies": []
     },
     {
+      "rpc": "SetCapabilityPackageTrustPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.capability-packages",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/capability_package.rs",
+        "docs/capability-package-trust.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetCapabilityPackageTrustPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.capability-packages",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/capability_package.rs",
+        "docs/capability-package-trust.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "PutCapabilityPackageSigner",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.capability-packages",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/capability_package.rs",
+        "docs/capability-package-trust.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ListCapabilityPackageSigners",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.capability-packages",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/capability_package.rs",
+        "docs/capability-package-trust.md"
+      ],
+      "durable_dependencies": []
+    },
+    {
       "rpc": "ListSchemaTypes",
       "kind": "persistent",
       "surfaces": [
