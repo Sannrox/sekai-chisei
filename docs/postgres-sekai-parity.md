@@ -37,6 +37,9 @@ Evidence is checked in as:
   `docs/postgres-chisei-parity.md`
 - Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
 - Tenant state, tenant RPCs, OIDC, and OAuth
+- Selective bitemporal history storage (#225) is **SQLite-first**; see
+  `docs/temporal-history-storage.md` for PostgreSQL implications without a
+  present parity claim
 
 ## Operator posture
 
