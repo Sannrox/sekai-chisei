@@ -27,16 +27,22 @@ impl PostgresDb {
             &[],
             manifest,
         )?;
+        let manifest_digest = manifest.digest()?;
+        let request_digest = package_request_digest("install", namespace, manifest, "")?;
         if !trust.allowed {
             let error = format!("package trust denied: {}", trust.reason);
             let _ = self.record_package_trust_denial(
-                namespace, manifest, actor, request_id, &trust, now_ms,
+                namespace,
+                manifest,
+                actor,
+                request_id,
+                &request_digest,
+                &trust,
+                now_ms,
             );
             return Err(error);
         }
         let trust_evidence = package_trust_evidence(&trust);
-        let manifest_digest = manifest.digest()?;
-        let request_digest = package_request_digest("install", namespace, manifest, "")?;
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -94,16 +100,22 @@ impl PostgresDb {
             &[],
             manifest,
         )?;
+        let manifest_digest = manifest.digest()?;
+        let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
         if !trust.allowed {
             let error = format!("package trust denied: {}", trust.reason);
             let _ = self.record_package_trust_denial(
-                namespace, manifest, actor, request_id, &trust, now_ms,
+                namespace,
+                manifest,
+                actor,
+                request_id,
+                &request_digest,
+                &trust,
+                now_ms,
             );
             return Err(error);
         }
         let trust_evidence = package_trust_evidence(&trust);
-        let manifest_digest = manifest.digest()?;
-        let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -443,18 +455,24 @@ impl PostgresDb {
     }
 
     /// Record a denied trust decision without installing/upgrading the package.
+    ///
+    /// Uses the original install/upgrade request digest so retries remain in the
+    /// existing idempotency keyspace and replay the same denial.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_package_trust_denial(
         &self,
         namespace: &str,
         manifest: &CapabilityPackageManifest,
         actor: &str,
         request_id: &str,
+        operation_request_digest: &str,
         decision: &PackageTrustDecision,
         now_ms: i64,
     ) -> Result<(), String> {
         let evidence = package_trust_evidence(decision);
-        let request_digest =
-            package_request_digest("trust_deny", namespace, manifest, request_id)?;
+        let denial_error = format!("package trust denied: {}", decision.reason);
+        let result_json = serde_json::to_string(&serde_json::json!({"error": denial_error}))
+            .map_err(|error| error.to_string())?;
         let manifest_digest = manifest.digest().unwrap_or_default();
         let mut connection = self.connection()?;
         let mut tx = connection
@@ -465,7 +483,7 @@ impl PostgresDb {
             "INSERT INTO sekai_capability_package_events
              (namespace,package_name,package_version,action,actor,request_id,request_digest,
               manifest_digest,evidence,result_json,recorded_at_ms)
-             VALUES($1,$2,$3,'trust_denied',$4,$5,$6,$7,$8,'null',$9)
+             VALUES($1,$2,$3,'trust_denied',$4,$5,$6,$7,$8,$9,$10)
              ON CONFLICT DO NOTHING",
             &[
                 &namespace,
@@ -473,9 +491,10 @@ impl PostgresDb {
                 &manifest.version.as_str(),
                 &actor,
                 &request_id,
-                &request_digest.as_str(),
+                &operation_request_digest,
                 &manifest_digest.as_str(),
                 &evidence.as_str(),
+                &result_json.as_str(),
                 &now_ms,
             ],
         );
@@ -714,7 +733,7 @@ fn replay(
 ) -> Result<Option<Option<PackageInstallation>>, String> {
     let prior = tx
         .query_opt(
-            "SELECT request_digest,result_json FROM sekai_capability_package_events
+            "SELECT request_digest,result_json,action FROM sekai_capability_package_events
              WHERE namespace=$1 AND actor=$2 AND request_id=$3",
             &[&namespace, &actor, &request_id],
         )
@@ -724,14 +743,27 @@ fn replay(
         Some(row) => {
             let digest: String = row.get(0);
             let result_json: String = row.get(1);
+            let action: String = row.get(2);
             if digest != expected_digest {
                 return Err("request_id was already used for different package input".into());
+            }
+            if action == "trust_denied" {
+                return Err(parse_trust_denial_error(&result_json));
             }
             Ok(Some(
                 serde_json::from_str(&result_json).map_err(|error| error.to_string())?,
             ))
         }
     }
+}
+
+fn parse_trust_denial_error(result_json: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result_json)
+        && let Some(error) = value.get("error").and_then(|item| item.as_str())
+    {
+        return error.to_string();
+    }
+    "package trust denied (idempotent replay of prior denial)".into()
 }
 
 fn row_to_installation(row: postgres::Row) -> Result<PackageInstallation, String> {
