@@ -317,11 +317,64 @@ message CapabilityPackageComponent {
   string definition_json = 3;
 }
 
+message CapabilityPackageSignature {
+  string algorithm = 1; // ed25519
+  string signer_identity = 2;
+  string key_id = 3;
+  string signature_b64 = 4;
+}
+
 message CapabilityPackageManifest {
   string manifest_version = 1;
   string name = 2;
   string version = 3;
   repeated CapabilityPackageComponent components = 4;
+  // Optional; not part of the unsigned digest used for verification.
+  CapabilityPackageSignature signature = 5;
+}
+
+message CapabilityPackageTrustPolicy {
+  string namespace = 1;
+  // unsigned_allowed (default) or signed
+  string required_trust_level = 2;
+  string updated_by = 3;
+  int64 updated_at_ms = 4;
+}
+
+message CapabilityPackageSigner {
+  string namespace = 1;
+  string identity = 2;
+  string key_id = 3;
+  string public_key_b64 = 4;
+  string created_by = 5;
+  int64 created_at_ms = 6;
+}
+
+message SetCapabilityPackageTrustPolicyRequest {
+  string namespace = 1;
+  string required_trust_level = 2;
+  string request_id = 3;
+}
+message SetCapabilityPackageTrustPolicyResponse {
+  CapabilityPackageTrustPolicy policy = 1;
+}
+message GetCapabilityPackageTrustPolicyRequest { string namespace = 1; }
+message GetCapabilityPackageTrustPolicyResponse {
+  CapabilityPackageTrustPolicy policy = 1;
+}
+message PutCapabilityPackageSignerRequest {
+  string namespace = 1;
+  string identity = 2;
+  string key_id = 3;
+  string public_key_b64 = 4;
+  string request_id = 5;
+}
+message PutCapabilityPackageSignerResponse {
+  CapabilityPackageSigner signer = 1;
+}
+message ListCapabilityPackageSignersRequest { string namespace = 1; }
+message ListCapabilityPackageSignersResponse {
+  repeated CapabilityPackageSigner signers = 1;
 }
 
 message CapabilityPackageInstallation {
@@ -1275,6 +1328,10 @@ service SekaiService {
   rpc RollbackCapabilityPackage(CapabilityPackageTransitionRequest) returns (CapabilityPackageTransitionResponse);
   rpc DisableCapabilityPackage(CapabilityPackageTransitionRequest) returns (CapabilityPackageTransitionResponse);
   rpc UninstallCapabilityPackage(CapabilityPackageTransitionRequest) returns (UninstallCapabilityPackageResponse);
+  rpc SetCapabilityPackageTrustPolicy(SetCapabilityPackageTrustPolicyRequest) returns (SetCapabilityPackageTrustPolicyResponse);
+  rpc GetCapabilityPackageTrustPolicy(GetCapabilityPackageTrustPolicyRequest) returns (GetCapabilityPackageTrustPolicyResponse);
+  rpc PutCapabilityPackageSigner(PutCapabilityPackageSignerRequest) returns (PutCapabilityPackageSignerResponse);
+  rpc ListCapabilityPackageSigners(ListCapabilityPackageSignersRequest) returns (ListCapabilityPackageSignersResponse);
 
   rpc ListSchemaTypes(ListSchemaTypesRequest) returns (ListSchemaTypesResponse);
   rpc CreateSchemaType(CreateSchemaTypeRequest) returns (CreateSchemaTypeResponse);
