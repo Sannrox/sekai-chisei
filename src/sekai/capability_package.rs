@@ -308,15 +308,18 @@ pub fn evaluate_package_trust(
 }
 
 pub fn package_trust_evidence(decision: &PackageTrustDecision) -> String {
-    format!(
-        "trust_level={};signature_present={};signature_valid={};signer={};key_id={};reason={}",
-        decision.required_trust_level,
-        decision.signature_present,
-        decision.signature_valid,
-        decision.signer_identity,
-        decision.key_id,
-        decision.reason
-    )
+    // Structured JSON so attacker-controlled signer/key/reason values cannot
+    // inject delimiters into a semicolon-separated audit string.
+    serde_json::json!({
+        "trust_level": decision.required_trust_level,
+        "signature_present": decision.signature_present,
+        "signature_valid": decision.signature_valid,
+        "signer": decision.signer_identity,
+        "key_id": decision.key_id,
+        "reason": decision.reason,
+        "allowed": decision.allowed,
+    })
+    .to_string()
 }
 
 fn valid_identifier(value: &str) -> bool {
