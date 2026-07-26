@@ -187,6 +187,7 @@ impl SekaiDb {
         self.migrate_action_types()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
+        self.migrate_temporal_history()?;
         Ok(())
     }
 
