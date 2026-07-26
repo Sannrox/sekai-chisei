@@ -13,7 +13,8 @@ how routes and allow/deny outcomes would have changed.
 - **No side effects**: does not call providers, redeem permits, mutate policy,
   or execute host tools.
 - **Candidate only**: the supplied policy is never activated.
-- **Namespace authorized**: gRPC requires team-namespace access.
+- **Namespace authorized**: gRPC always requires namespace grant access
+  (authenticated actor must hold a grant on the namespace boundary).
 - **Audited**: each dry-run records a `policy.dry_run` decision with counts and
   the candidate policy version (RPC fails if audit persistence fails).
 - **Bounded**: at most 5,000 receipts; sample operation IDs capped per delta
@@ -30,9 +31,11 @@ Historical allow/deny for this surface is inferred from whether a route was
 selected. Composite `PolicyDecided.executable=false` (budget, privacy, eval,
 etc.) is **not** treated as a namespace route-policy denial when a route exists.
 
-New planned executions persist effective preferred fields (request values when
-set; otherwise the resolved route used after recommendation/fallback). Older
-receipts without preferences are counted as `insufficient_history`.
+New planned executions persist the **effective pre-policy preference** actually
+fed into route resolution: request values when set, otherwise route override,
+pipeline recommendation, route bias, or runtime fallback. This is not the same
+as post-policy `runtime`/`model`. Older receipts without preferences are
+counted as `insufficient_history`.
 
 ## Delta classes
 
