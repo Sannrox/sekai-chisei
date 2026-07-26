@@ -81,3 +81,16 @@ prompts, PII, or free-form error text under unexpected field names.
 - Cross-tenant / org-wide export
 - Continuous SIEM streaming
 - gRPC transport (library + sekaictl; RPC can follow once consumers need it)
+
+## Peer import (#290)
+
+Cross-site compliance bundles can be imported after configuring trust roots:
+
+```text
+sekaictl compliance trust-root --namespace <ns> --site-identity <site> --key-id <id> --public-key-hex <hex>
+sekaictl compliance import-peer --namespace <ns> --bundle <export.json>
+sekaictl compliance list-trust-roots --namespace <ns>
+```
+
+Imported records are verified under enabled roots and stored with
+`permit_authority=false`. They never authorize local permit redemption.

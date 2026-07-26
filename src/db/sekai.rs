@@ -241,7 +241,25 @@ impl SekaiDb {
                 revoked_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_principal_credentials_token_hash ON sekai_principal_credentials(token_hash);
-            CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);",
+            CREATE INDEX IF NOT EXISTS idx_sekai_principal_credentials_principal ON sekai_principal_credentials(principal);
+            CREATE TABLE IF NOT EXISTS sekai_peer_trust_roots (
+                namespace TEXT NOT NULL,
+                site_identity TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                public_key_hex TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (namespace, site_identity, key_id)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_peer_imports (
+                import_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                imported_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sekai_peer_imports_namespace
+                ON sekai_peer_imports(namespace, imported_at_ms);",
         )
         .map_err(|e| e.to_string())?;
         Ok(())

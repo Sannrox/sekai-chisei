@@ -25,6 +25,7 @@ pub mod lineage;
 pub mod markings;
 pub mod observation;
 pub mod ontology;
+pub mod peer_import;
 pub mod propagation;
 pub mod query;
 pub mod relation_object;
