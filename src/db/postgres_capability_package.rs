@@ -1,9 +1,9 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::audit::Decision;
 use crate::sekai::capability_package::{
-    CapabilityPackageManifest, PackageInstallation, PackageLifecycleEvent, parse_package_version,
-    request_digest as package_request_digest, run_eval_suites,
-    simple_request_digest as package_simple_request_digest, validate_context,
+    CapabilityPackageManifest, PackageInstallation, PackageLifecycleEvent, PackageTrustDecision,
+    package_trust_evidence, parse_package_version, request_digest as package_request_digest,
+    run_eval_suites, simple_request_digest as package_simple_request_digest, validate_context,
 };
 use crate::sekai::ledger;
 use sha2::{Digest, Sha256};
@@ -28,9 +28,13 @@ impl PostgresDb {
             manifest,
         )?;
         if !trust.allowed {
-            return Err(format!("package trust denied: {}", trust.reason));
+            let error = format!("package trust denied: {}", trust.reason);
+            let _ = self.record_package_trust_denial(
+                namespace, manifest, actor, request_id, &trust, now_ms,
+            );
+            return Err(error);
         }
-        let trust_evidence = crate::sekai::capability_package::package_trust_evidence(&trust);
+        let trust_evidence = package_trust_evidence(&trust);
         let manifest_digest = manifest.digest()?;
         let request_digest = package_request_digest("install", namespace, manifest, "")?;
         let mut connection = self.connection()?;
@@ -91,9 +95,13 @@ impl PostgresDb {
             manifest,
         )?;
         if !trust.allowed {
-            return Err(format!("package trust denied: {}", trust.reason));
+            let error = format!("package trust denied: {}", trust.reason);
+            let _ = self.record_package_trust_denial(
+                namespace, manifest, actor, request_id, &trust, now_ms,
+            );
+            return Err(error);
         }
-        let trust_evidence = crate::sekai::capability_package::package_trust_evidence(&trust);
+        let trust_evidence = package_trust_evidence(&trust);
         let manifest_digest = manifest.digest()?;
         let request_digest = package_request_digest("upgrade", namespace, manifest, "")?;
         let mut connection = self.connection()?;
@@ -432,6 +440,71 @@ impl PostgresDb {
             .into_iter()
             .map(row_to_decision)
             .collect()
+    }
+
+    /// Record a denied trust decision without installing/upgrading the package.
+    pub fn record_package_trust_denial(
+        &self,
+        namespace: &str,
+        manifest: &CapabilityPackageManifest,
+        actor: &str,
+        request_id: &str,
+        decision: &PackageTrustDecision,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let evidence = package_trust_evidence(decision);
+        let request_digest =
+            package_request_digest("trust_deny", namespace, manifest, request_id)?;
+        let manifest_digest = manifest.digest().unwrap_or_default();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        // Best-effort: ignore unique conflicts on retry of the same denial.
+        let _ = tx.execute(
+            "INSERT INTO sekai_capability_package_events
+             (namespace,package_name,package_version,action,actor,request_id,request_digest,
+              manifest_digest,evidence,result_json,recorded_at_ms)
+             VALUES($1,$2,$3,'trust_denied',$4,$5,$6,$7,$8,'null',$9)
+             ON CONFLICT DO NOTHING",
+            &[
+                &namespace,
+                &manifest.name.as_str(),
+                &manifest.version.as_str(),
+                &actor,
+                &request_id,
+                &request_digest.as_str(),
+                &manifest_digest.as_str(),
+                &evidence.as_str(),
+                &now_ms,
+            ],
+        );
+        let audit_evidence = HashMap::from([
+            ("namespace".into(), namespace.into()),
+            ("package_name".into(), manifest.name.clone()),
+            ("package_version".into(), manifest.version.clone()),
+            ("manifest_digest".into(), manifest_digest),
+            ("request_id".into(), request_id.into()),
+            ("lifecycle_evidence".into(), evidence),
+        ]);
+        let _ = insert_chained_decision(
+            &mut tx,
+            &Decision {
+                id: format!(
+                    "capability-package-trust-deny:{:x}",
+                    Sha256::digest(format!("{namespace}\0{actor}\0{request_id}"))
+                ),
+                timestamp: now_ms,
+                actor: actor.into(),
+                action: "capability_package.trust_denied".into(),
+                reason: decision.reason.clone(),
+                evidence: audit_evidence,
+                target_id: format!("capability-package:{namespace}:{}", manifest.name),
+                outcome: "denied".into(),
+            },
+        );
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 }
 
