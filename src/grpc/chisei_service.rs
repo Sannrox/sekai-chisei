@@ -7816,6 +7816,29 @@ impl ChiseiService for ChiseiServiceImpl {
                 enrichments_served: learning.enrichments_served,
                 escalations_answered: learning.escalations_answered,
             }),
+            outcome_spend: statistics
+                .outcome_spend
+                .by_outcome
+                .into_iter()
+                .map(|(outcome, value)| OperationStatisticValue {
+                    labels: HashMap::from([("outcome".into(), outcome)]),
+                    value,
+                })
+                .collect(),
+            capability_outcome_spend: statistics
+                .outcome_spend
+                .by_capability_outcome
+                .into_iter()
+                .map(|((capability, outcome), value)| OperationStatisticValue {
+                    labels: HashMap::from([
+                        ("capability".into(), capability),
+                        ("outcome".into(), outcome),
+                    ]),
+                    value,
+                })
+                .collect(),
+            cost_per_verified_usd_micros: statistics.outcome_spend.cost_per_verified_usd_micros,
+            cost_per_failed_usd_micros: statistics.outcome_spend.cost_per_failed_usd_micros,
         }))
     }
 
