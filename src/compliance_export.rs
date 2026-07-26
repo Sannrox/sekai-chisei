@@ -321,6 +321,43 @@ pub fn verify_compliance_export(
             ));
         }
     }
+    if bundle.manifest.redaction == RedactionMode::Redacted {
+        if bundle.manifest.exported_by != "[redacted]" {
+            errors.push("redacted bundle must scrub exported_by".into());
+        }
+        for receipt in &bundle.receipts {
+            if receipt.initiating_actor != "[redacted]" {
+                errors.push(format!(
+                    "redacted receipt {} still has initiating_actor",
+                    receipt.operation_id
+                ));
+            }
+            for event in &receipt.events {
+                if event.actor != "[redacted]" || !event.attributes.is_empty() {
+                    errors.push(format!(
+                        "redacted receipt {} event {} retains free-form data",
+                        receipt.operation_id, event.event_id
+                    ));
+                }
+            }
+        }
+        for decision in &bundle.decisions {
+            if decision.actor != "[redacted]" || decision.reason != "[redacted]" {
+                errors.push(format!(
+                    "redacted decision {} retains free-form actor/reason",
+                    decision.id
+                ));
+            }
+            for key in decision.evidence.keys() {
+                if key != "namespace" && key != "project" {
+                    errors.push(format!(
+                        "redacted decision {} retains non-structural evidence key {key}",
+                        decision.id
+                    ));
+                }
+            }
+        }
+    }
 
     let content_digest_ok = match content_digest_for(bundle) {
         Ok(digest) if digest == bundle.manifest.content_digest => true,
