@@ -197,6 +197,29 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_compliance_decisions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Decision>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_compliance_decisions_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+            Self::Postgres(db) => db.list_compliance_decisions_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+        }
+    }
+
     pub fn abandon_external_action_claim(
         &self,
         request: &ExternalActionRequest,

@@ -673,6 +673,52 @@ impl SekaiDb {
         Ok(results)
     }
 
+    /// Decisions for a namespace overlapping `[start, end)`, filtered in SQL
+    /// before the limit so other tenants cannot crowd out the window.
+    pub fn list_compliance_decisions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Decision>, String> {
+        let limit = limit.min(10_000) as i64;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
+                 FROM sekai_decisions
+                 WHERE timestamp >= ?1 AND timestamp < ?2
+                   AND (
+                     namespace = ?3
+                     OR (json_valid(evidence) AND json_extract(evidence, '$.namespace') = ?3)
+                   )
+                 ORDER BY timestamp ASC, rowid ASC
+                 LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![start_timestamp_ms, end_timestamp_ms, namespace, limit],
+                |row| {
+                    let evidence: String = row.get(5)?;
+                    Ok(Decision {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        actor: row.get(2)?,
+                        action: row.get(3)?,
+                        reason: row.get(4)?,
+                        evidence: serde_json::from_str(&evidence).unwrap_or_default(),
+                        target_id: row.get(6)?,
+                        outcome: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn list_decisions_for_action_namespace(
         &self,
         action: &str,
