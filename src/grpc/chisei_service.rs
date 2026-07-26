@@ -2490,6 +2490,15 @@ impl ChiseiServiceImpl {
                         ("request_id".into(), input.request_id.clone()),
                         ("task_type".into(), input.task_type.clone()),
                         ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
+                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
+                        (
+                            "preferred_model".into(),
+                            if input.route_override.trim().is_empty() {
+                                input.preferred_model.clone()
+                            } else {
+                                input.route_override.trim().into()
+                            },
+                        ),
                     ]);
                     if !input.logical_operation_id.trim().is_empty() {
                         attributes.insert(
@@ -2535,6 +2544,14 @@ impl ChiseiServiceImpl {
                     ("policy_version".into(), policy_version.clone()),
                     ("executable".into(), plan.executable.to_string()),
                     ("risk_score".into(), plan.risk_score.to_string()),
+                    (
+                        "route_policy_decision".into(),
+                        if plan.resolved_runtime.is_empty() && plan.resolved_model.is_empty() {
+                            "deny".into()
+                        } else {
+                            "allow".into()
+                        },
+                    ),
                 ]),
             ),
             receipt_event(
@@ -2547,24 +2564,14 @@ impl ChiseiServiceImpl {
                 BTreeMap::from([
                     ("runtime".into(), plan.resolved_runtime.clone()),
                     ("model".into(), plan.resolved_model.clone()),
-                    // Persist the effective preference used for resolution so
-                    // historical dry-run does not invent or miss preferences.
-                    (
-                        "preferred_runtime".into(),
-                        if input.preferred_runtime.trim().is_empty() {
-                            plan.resolved_runtime.clone()
-                        } else {
-                            input.preferred_runtime.clone()
-                        },
-                    ),
+                    // Echo request-level preferences (also on Intent) for dry-run.
+                    ("preferred_runtime".into(), input.preferred_runtime.clone()),
                     (
                         "preferred_model".into(),
-                        if !input.route_override.trim().is_empty() {
-                            input.route_override.trim().into()
-                        } else if input.preferred_model.trim().is_empty() {
-                            plan.resolved_model.clone()
-                        } else {
+                        if input.route_override.trim().is_empty() {
                             input.preferred_model.clone()
+                        } else {
+                            input.route_override.trim().into()
                         },
                     ),
                     (
@@ -5687,7 +5694,15 @@ impl ChiseiService for ChiseiServiceImpl {
                 use sha2::{Digest, Sha256};
                 format!(
                     "policy-dry-run:{:x}",
-                    Sha256::digest(format!("{}\0{}\0{}", report.namespace, actor, request_id))
+                    Sha256::digest(format!(
+                        "{}\0{}\0{}\0{}\0{}\0{}",
+                        report.namespace,
+                        actor,
+                        request_id,
+                        report.candidate_policy_version,
+                        report.start_timestamp_ms,
+                        report.end_timestamp_ms
+                    ))
                 )
             };
             self.db
