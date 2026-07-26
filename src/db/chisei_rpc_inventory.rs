@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 75);
+        assert_eq!(inventory.entries.len(), 76);
         assert!(inventory.by_kind()["persistent"] >= 30);
         assert!(inventory.entry("GetOperationReceipt").is_some());
         assert!(inventory.entry("ReserveGatewayRequestAlias").is_some());

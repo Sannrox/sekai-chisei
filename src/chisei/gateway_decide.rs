@@ -128,13 +128,61 @@ impl GatewayDecideResponse {
     }
 }
 
+/// Inputs collected by the control-plane handler after subsystem checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDecideInputs {
+    pub request: GatewayDecideRequest,
+    /// Ok = (runtime, model, policy_version); Err = policy/capability/residency deny.
+    pub route: Result<(String, String, String), (GatewayDecideDenyReason, String)>,
+    pub budget_allowed: bool,
+    pub budget_scope: String,
+    pub budget_grant_id: String,
+    pub route_bias: String,
+    pub degradation_level: String,
+    pub budget_warning: bool,
+}
+
+/// Compose a single fat-decide outcome from route + budget subsystem results.
+///
+/// Ordering: invalid request is rejected before this; unauthorized is handled
+/// by the auth boundary. Policy/capability/residency denials take precedence
+/// over budget so the edge sees the primary governance reason.
+pub fn compose_gateway_decide(inputs: GatewayDecideInputs) -> GatewayDecideResponse {
+    let (runtime, model, policy_version) = match inputs.route {
+        Ok(route) => route,
+        Err((reason, message)) => return GatewayDecideResponse::deny(reason, message),
+    };
+    if !inputs.budget_allowed {
+        return GatewayDecideResponse::deny(
+            GatewayDecideDenyReason::BudgetDenied,
+            format!(
+                "budget denied for scope {} (degradation={})",
+                inputs.budget_scope, inputs.degradation_level
+            ),
+        );
+    }
+    GatewayDecideResponse::admit(GatewayDecideAdmit {
+        resolved_runtime: runtime,
+        resolved_model: model,
+        policy_version,
+        budget_scope: inputs.budget_scope,
+        budget_grant_id: inputs.budget_grant_id,
+    })
+}
+
+/// Stable budget grant stamp for usage/receipt correlation.
+pub fn budget_grant_id(scope: &str, operation_id: &str, attempt: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{scope}\0{operation_id}\0{attempt}"));
+    format!("budget-grant:{:x}", digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn request_validation_and_deny_blocks_upstream() {
-        let mut request = GatewayDecideRequest {
+    fn sample_request() -> GatewayDecideRequest {
+        GatewayDecideRequest {
             contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
             namespace: "ns".into(),
             principal: "agent".into(),
@@ -143,7 +191,12 @@ mod tests {
             estimated_cost_usd_micros: 0,
             correlation_operation_id: "op-1".into(),
             correlation_attempt: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn request_validation_and_deny_blocks_upstream() {
+        let mut request = sample_request();
         request.validate().unwrap();
         request.namespace = " ".into();
         assert!(request.validate().is_err());
@@ -163,5 +216,51 @@ mod tests {
             budget_grant_id: "grant-1".into(),
         });
         assert!(admit.allows_upstream());
+    }
+
+    #[test]
+    fn compose_prefers_policy_deny_over_budget() {
+        let response = compose_gateway_decide(GatewayDecideInputs {
+            request: sample_request(),
+            route: Err((
+                GatewayDecideDenyReason::PolicyDenied,
+                "model not allowed".into(),
+            )),
+            budget_allowed: false,
+            budget_scope: "project:ns".into(),
+            budget_grant_id: "g".into(),
+            route_bias: "capable".into(),
+            degradation_level: "hard_cap".into(),
+            budget_warning: true,
+        });
+        assert!(!response.allows_upstream());
+        match response.outcome {
+            GatewayDecideOutcome::Deny(deny) => {
+                assert_eq!(deny.reason, GatewayDecideDenyReason::PolicyDenied);
+            }
+            GatewayDecideOutcome::Admit(_) => panic!("expected deny"),
+        }
+    }
+
+    #[test]
+    fn compose_admits_when_route_and_budget_pass() {
+        let response = compose_gateway_decide(GatewayDecideInputs {
+            request: sample_request(),
+            route: Ok(("ollama".into(), "llama".into(), "pv1".into())),
+            budget_allowed: true,
+            budget_scope: "project:ns".into(),
+            budget_grant_id: "grant-1".into(),
+            route_bias: "capable".into(),
+            degradation_level: "capable".into(),
+            budget_warning: false,
+        });
+        assert!(response.allows_upstream());
+        match response.outcome {
+            GatewayDecideOutcome::Admit(admit) => {
+                assert_eq!(admit.resolved_model, "llama");
+                assert_eq!(admit.budget_grant_id, "grant-1");
+            }
+            GatewayDecideOutcome::Deny(_) => panic!("expected admit"),
+        }
     }
 }
