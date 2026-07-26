@@ -107,6 +107,18 @@ pub fn router(state: ConsoleState) -> Router {
             post(pressure_kill_switch),
         )
         .route("/console/n/{namespace}/policy", get(screen_policy))
+        .route(
+            "/console/n/{namespace}/policy/dry-run",
+            post(policy_dry_run),
+        )
+        .route(
+            "/console/n/{namespace}/policy/promote",
+            post(policy_promote),
+        )
+        .route(
+            "/console/n/{namespace}/policy/rollback",
+            post(policy_rollback),
+        )
         .with_state(state)
 }
 
@@ -416,6 +428,15 @@ button.secondary {
 }
 .tile-label { color: var(--muted); font-size: 0.85rem; }
 .tile-value { font-size: 1.35rem; font-weight: 650; margin-top: 0.2rem; }
+textarea {
+  width: min(100%, 40rem);
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
 "#;
 
 fn html_page(title: &str, body: &str) -> Html<String> {
@@ -1013,37 +1034,27 @@ async fn screen_policy(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Response {
-    namespace_screen(state, headers, namespace, Screen::Policy).await
-}
-
-async fn namespace_screen(
-    state: ConsoleState,
-    headers: HeaderMap,
-    namespace: String,
-    screen: Screen,
-) -> Response {
     let Some(session) = resolve_session(&state, &headers) else {
         return Redirect::to("/console/login").into_response();
     };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
-    if !is_safe_namespace(&namespace) {
-        return (
-            StatusCode::BAD_REQUEST,
+    match crate::obs::console_policy::load_effective_policy_view(
+        &state.db,
+        &session.principal,
+        &namespace,
+    ) {
+        Ok(view) => {
+            let main = crate::obs::console_policy::render_policy_page(&view, None, None);
             shell_chrome(
                 &session.principal,
-                None,
+                Some(&namespace),
                 &namespaces,
-                Screen::Home,
-                r#"<section class="panel"><h1>Invalid namespace</h1><p class="error">Namespace identifiers must be short ASCII tokens.</p></section>"#,
-            ),
-        )
-            .into_response();
-    }
-    let allowed =
-        principal_can_access_namespace(&state.db, &session.principal, &namespace).unwrap_or(false);
-    if !allowed {
-        // Fail closed: no foreign data, no partial workspace for unauthorized ns.
-        return (
+                Screen::Policy,
+                &main,
+            )
+            .into_response()
+        }
+        Err(error) => (
             StatusCode::FORBIDDEN,
             shell_chrome(
                 &session.principal,
@@ -1051,52 +1062,245 @@ async fn namespace_screen(
                 &namespaces,
                 Screen::Home,
                 &format!(
-                    r#"<section class="panel" aria-labelledby="denied-heading">
-  <h1 id="denied-heading">Namespace access denied</h1>
-  <p class="error">Principal <strong>{}</strong> is not authorized for namespace <strong>{}</strong>.</p>
-  <p class="stub">No foreign namespace data was loaded.</p>
-</section>"#,
-                    escape_html(&session.principal),
-                    escape_html(&namespace)
+                    r#"<section class="panel"><h1>Policy</h1><p class="error">{}</p></section>"#,
+                    error
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
                 ),
             ),
         )
-            .into_response();
+            .into_response(),
     }
+}
 
-    let (heading, stub) = match screen {
-        Screen::Home => ("Home", "Select a workspace."),
-        Screen::Operations => (
-            "Operations",
-            "Use this route's list handler; if you see this stub, open /console/n/{namespace}/ops.",
+#[derive(Debug, Deserialize)]
+struct DryRunForm {
+    start_timestamp_ms: String,
+    end_timestamp_ms: String,
+    allowed_runtimes: Option<String>,
+    allowed_models: Option<String>,
+    default_runtime: Option<String>,
+    default_model: Option<String>,
+    data_class: Option<String>,
+}
+
+fn split_csv(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+async fn policy_dry_run(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+    Form(form): Form<DryRunForm>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    let start = form.start_timestamp_ms.parse::<i64>().unwrap_or(0);
+    let end = form.end_timestamp_ms.parse::<i64>().unwrap_or(0);
+    let candidate = crate::chisei::policy::Policy {
+        allowed_runtimes: split_csv(form.allowed_runtimes),
+        allowed_models: split_csv(form.allowed_models),
+        default_runtime: form.default_runtime.unwrap_or_default(),
+        default_model: form.default_model.unwrap_or_default(),
+        data_class: form.data_class.unwrap_or_default(),
+    };
+    let view = crate::obs::console_policy::load_effective_policy_view(
+        &state.db,
+        &session.principal,
+        &namespace,
+    );
+    match (
+        view,
+        crate::obs::console_policy::run_console_dry_run(
+            &state.db,
+            &session.principal,
+            &namespace,
+            start,
+            end,
+            &candidate,
         ),
-        Screen::Pressure => (
-            "Governance pressure",
-            "Live fleet / governance pressure arrives in #286. Kill switch and budget tiles are not exposed here yet.",
+    ) {
+        (Ok(view), Ok(report)) => {
+            let main = crate::obs::console_policy::render_policy_page(&view, Some(&report), None);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Policy,
+                &main,
+            )
+            .into_response()
+        }
+        (Ok(view), Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Policy,
+                &crate::obs::console_policy::render_policy_page(&view, None, Some(&error)),
+            ),
+        )
+            .into_response(),
+        (Err(error), _) => (
+            StatusCode::FORBIDDEN,
+            shell_chrome(
+                &session.principal,
+                None,
+                &namespaces,
+                Screen::Home,
+                &format!(
+                    r#"<section class="panel"><h1>Policy</h1><p class="error">{}</p></section>"#,
+                    error
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                ),
+            ),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteForm {
+    confirm: Option<String>,
+    expected_revision: String,
+    candidate_json: String,
+    baseline_eval_json: String,
+    candidate_eval_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackForm {
+    confirm: Option<String>,
+    expected_revision: String,
+    reason: String,
+}
+
+async fn policy_promote(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+    Form(form): Form<PromoteForm>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    if form.confirm.as_deref() != Some("1") {
+        return policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            "Confirmation checkbox is required for promote.",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match crate::obs::console_policy::console_promote(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &form.expected_revision,
+        &form.candidate_json,
+        &form.baseline_eval_json,
+        &form.candidate_eval_json,
+    ) {
+        Ok(_) => Redirect::to(&format!("/console/n/{namespace}/policy")).into_response(),
+        Err(error) => policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            &error,
+            StatusCode::FORBIDDEN,
         ),
-        Screen::Policy => (
-            "Policy",
-            "Policy authoring, dry-run, and promote arrive in #287. This route only proves shell navigation.",
+    }
+}
+
+async fn policy_rollback(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+    Form(form): Form<RollbackForm>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    if form.confirm.as_deref() != Some("1") {
+        return policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            "Confirmation checkbox is required for rollback.",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match crate::obs::console_policy::console_rollback(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &form.expected_revision,
+        &form.reason,
+    ) {
+        Ok(_) => Redirect::to(&format!("/console/n/{namespace}/policy")).into_response(),
+        Err(error) => policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            &error,
+            StatusCode::FORBIDDEN,
+        ),
+    }
+}
+
+fn policy_flash(
+    state: &ConsoleState,
+    session: &ConsoleSession,
+    namespaces: &[(String, crate::sekai::security::Role)],
+    namespace: &str,
+    message: &str,
+    status: StatusCode,
+) -> Response {
+    let view = crate::obs::console_policy::load_effective_policy_view(
+        &state.db,
+        &session.principal,
+        namespace,
+    );
+    let main = match view {
+        Ok(view) => crate::obs::console_policy::render_policy_page(&view, None, Some(message)),
+        Err(error) => format!(
+            r#"<section class="panel"><h1>Policy</h1><p class="error">{}</p></section>"#,
+            error
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
         ),
     };
-    let main = format!(
-        r#"<section class="panel" aria-labelledby="screen-heading">
-  <h1 id="screen-heading">{heading}</h1>
-  <p>Active namespace: <strong>{ns}</strong></p>
-  <p class="stub">{stub}</p>
-</section>"#,
-        heading = escape_html(heading),
-        ns = escape_html(&namespace),
-        stub = escape_html(stub),
-    );
-    shell_chrome(
-        &session.principal,
-        Some(&namespace),
-        &namespaces,
-        screen,
-        &main,
+    (
+        status,
+        shell_chrome(
+            &session.principal,
+            Some(namespace),
+            namespaces,
+            Screen::Policy,
+            &main,
+        ),
     )
-    .into_response()
+        .into_response()
 }
 
 #[cfg(test)]
