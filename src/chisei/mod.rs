@@ -20,6 +20,7 @@ pub use sekai_provider::model_availability;
 pub mod model_routing;
 pub mod pipeline;
 pub mod policy;
+pub mod policy_dry_run;
 pub mod portfolio;
 pub mod privacy;
 pub mod promotion;
