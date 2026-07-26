@@ -609,6 +609,7 @@ impl SekaiDb {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn put_capability_package_signer(
         &self,
         namespace: &str,
