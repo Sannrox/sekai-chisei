@@ -39,6 +39,8 @@ in order.
   environment variables.
 - [Operations and security](operations.md) — credentials, TLS, observability,
   backups, and deployment checks.
+- [Operator console](operator-console.md) — authenticated browser shell on the
+  ops listener (login, namespace context, fail-closed routes).
 - [Docker](docker.md) — run the server and gateway with Docker Compose.
 - [Security policy](../SECURITY.md) — supported versions and private
   vulnerability reporting.
