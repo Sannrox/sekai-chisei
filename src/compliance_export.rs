@@ -253,6 +253,42 @@ pub fn verify_compliance_export(
     if bundle.manifest.decision_count as usize != bundle.decisions.len() {
         errors.push("manifest decision_count does not match decisions".into());
     }
+    for receipt in &bundle.receipts {
+        if receipt.namespace != bundle.manifest.namespace {
+            errors.push(format!(
+                "receipt {} namespace {} does not match manifest",
+                receipt.operation_id, receipt.namespace
+            ));
+        }
+        if !receipt_overlaps_window(
+            receipt,
+            bundle.manifest.start_timestamp_ms,
+            bundle.manifest.end_timestamp_ms,
+        ) {
+            errors.push(format!(
+                "receipt {} is outside the declared export window",
+                receipt.operation_id
+            ));
+        }
+    }
+    for decision in &bundle.decisions {
+        if decision.timestamp < bundle.manifest.start_timestamp_ms
+            || decision.timestamp >= bundle.manifest.end_timestamp_ms
+        {
+            errors.push(format!(
+                "decision {} is outside the declared export window",
+                decision.id
+            ));
+        }
+        if decision.evidence.get("namespace").map(String::as_str)
+            != Some(bundle.manifest.namespace.as_str())
+        {
+            errors.push(format!(
+                "decision {} is not attributed to manifest namespace",
+                decision.id
+            ));
+        }
+    }
 
     let content_digest_ok = match content_digest_for(bundle) {
         Ok(digest) if digest == bundle.manifest.content_digest => true,
