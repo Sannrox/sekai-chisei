@@ -5,6 +5,31 @@ logical key. Acquire returns both a monotonically increasing `generation` and
 a unique `fencing_token`. Release keeps the key and its audit history, so a
 later acquire creates a new generation rather than reusing an object identity.
 
+## Object-bound lease keys
+
+To coordinate mutations against an **existing object** without letting unrelated
+namespace writers squat the coordination identity, use the key form:
+
+```text
+object:<object_id>
+```
+
+Object-bound keys (see [ADR 0005](decisions/0005-object-bound-coordination-leases.md)):
+
+- must be spelled exactly `object:<object_id>` (no extra whitespace);
+- require the target object to exist;
+- require the lease namespace to equal the object namespace;
+- require **object write** for acquire, refresh, release, and takeover;
+- require **object read** for `GetLease`;
+- when used as a `LeasePrecondition`, must match the mutation target object id
+  (and cannot guard object creation);
+- after a successful guarded delete of the target, `ReleaseLease` remains
+  authorized with namespace write so the coordination row can be cleaned up
+  even though the object identity cannot be recreated.
+
+Free-form keys remain available for non-object coordination and continue to use
+namespace authorization only.
+
 Use a unique `request_id` for each intended operation and reuse it unchanged
 after an ambiguous transport failure. Reusing it with different input is an
 error. Refresh and release require the active fencing token. Expired leases are
