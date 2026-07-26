@@ -92,6 +92,14 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/console/api/namespaces", get(api_namespaces))
         .route("/console/n/{namespace}", get(namespace_root))
         .route("/console/n/{namespace}/ops", get(screen_operations))
+        .route(
+            "/console/n/{namespace}/ops/{operation_id}",
+            get(screen_operation_workspace),
+        )
+        .route(
+            "/console/api/n/{namespace}/ops/{operation_id}",
+            get(api_operation_workspace),
+        )
         .route("/console/n/{namespace}/pressure", get(screen_pressure))
         .route("/console/n/{namespace}/policy", get(screen_policy))
         .with_state(state)
@@ -371,6 +379,24 @@ button.secondary {
 .error { color: var(--danger); margin: 0.5rem 0; }
 .stub { color: var(--muted); }
 .inline-form { display: inline; margin: 0; }
+.ops-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+.ops-table th, .ops-table td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.ops-table th { color: var(--muted); font-weight: 600; }
+.causal { padding-left: 1.25rem; }
+.json-panel {
+  overflow: auto;
+  max-height: 28rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--bg);
+  font-size: 0.85rem;
+}
 "#;
 
 fn html_page(title: &str, body: &str) -> Html<String> {
@@ -669,7 +695,131 @@ async fn screen_operations(
     headers: HeaderMap,
     Path(namespace): Path<String>,
 ) -> Response {
-    namespace_screen(state, headers, namespace, Screen::Operations).await
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    match crate::obs::console_workspace::list_visible_operations(
+        &state.db,
+        &session.principal,
+        &namespace,
+    ) {
+        Ok(items) => {
+            let main = crate::obs::console_workspace::render_operations_home(&namespace, &items);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Operations,
+                &main,
+            )
+            .into_response()
+        }
+        Err(err) => {
+            let status = match err {
+                crate::obs::console_workspace::WorkspaceError::InvalidNamespace => {
+                    StatusCode::BAD_REQUEST
+                }
+                crate::obs::console_workspace::WorkspaceError::NamespaceDenied => {
+                    StatusCode::FORBIDDEN
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                shell_chrome(
+                    &session.principal,
+                    None,
+                    &namespaces,
+                    Screen::Home,
+                    &crate::obs::console_workspace::workspace_error_panel(err),
+                ),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn screen_operation_workspace(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path((namespace, operation_id)): Path<(String, String)>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    match crate::obs::console_workspace::timed_load_report(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &operation_id,
+    ) {
+        Ok((report, _elapsed_ms)) => {
+            let main = crate::obs::console_workspace::render_operation_workspace(&report);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Operations,
+                &main,
+            )
+            .into_response()
+        }
+        Err(err) => {
+            let status = match err {
+                crate::obs::console_workspace::WorkspaceError::NotFound => StatusCode::NOT_FOUND,
+                crate::obs::console_workspace::WorkspaceError::InvalidNamespace => {
+                    StatusCode::BAD_REQUEST
+                }
+                crate::obs::console_workspace::WorkspaceError::NamespaceDenied
+                | crate::obs::console_workspace::WorkspaceError::ReceiptForbidden
+                | crate::obs::console_workspace::WorkspaceError::CrossNamespace => {
+                    StatusCode::FORBIDDEN
+                }
+                crate::obs::console_workspace::WorkspaceError::Unauthenticated => {
+                    StatusCode::UNAUTHORIZED
+                }
+                crate::obs::console_workspace::WorkspaceError::Internal => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            (
+                status,
+                shell_chrome(
+                    &session.principal,
+                    principal_can_access_namespace(&state.db, &session.principal, &namespace)
+                        .unwrap_or(false)
+                        .then_some(namespace.as_str()),
+                    &namespaces,
+                    Screen::Operations,
+                    &crate::obs::console_workspace::workspace_error_panel(err),
+                ),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_operation_workspace(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path((namespace, operation_id)): Path<(String, String)>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return crate::obs::console_workspace::json_error_response(
+            crate::obs::console_workspace::WorkspaceError::Unauthenticated,
+        );
+    };
+    match crate::obs::console_workspace::load_authorized_report(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &operation_id,
+    ) {
+        Ok(report) => crate::obs::console_workspace::json_report_response(&report),
+        Err(err) => crate::obs::console_workspace::json_error_response(err),
+    }
 }
 
 async fn screen_pressure(
@@ -740,7 +890,7 @@ async fn namespace_screen(
         Screen::Home => ("Home", "Select a workspace."),
         Screen::Operations => (
             "Operations",
-            "Causal operation workspace arrives in a follow-up issue (#285). This shell route is intentionally a stub.",
+            "Use this route's list handler; if you see this stub, open /console/n/{namespace}/ops.",
         ),
         Screen::Pressure => (
             "Governance pressure",
@@ -962,7 +1112,8 @@ mod tests {
         assert_eq!(allowed.status(), StatusCode::OK);
         let body = to_bytes(allowed.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Active namespace: <strong>alpha</strong>"));
+        assert!(body.contains("Operations"));
+        assert!(body.contains("<strong>alpha</strong>"));
         assert!(body.contains("aria-label=\"Primary\""));
         assert!(body.contains("Skip to main content"));
 
