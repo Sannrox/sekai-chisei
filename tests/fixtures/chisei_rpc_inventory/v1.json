@@ -255,6 +255,19 @@
       ]
     },
     {
+      "rpc": "DryRunNamespacePolicy",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/policy_dry_run.rs",
+        "docs/policy-dry-run.md"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.receipts"
+      ]
+    },
+    {
       "rpc": "GetEffectivePolicySummary",
       "kind": "query",
       "surfaces": [],

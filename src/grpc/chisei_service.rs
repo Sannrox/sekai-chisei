@@ -5586,6 +5586,182 @@ impl ChiseiService for ChiseiServiceImpl {
         .await
     }
 
+    async fn dry_run_namespace_policy(
+        &self,
+        req: Request<DryRunNamespacePolicyRequest>,
+    ) -> Result<Response<DryRunNamespacePolicyResponse>, Status> {
+        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
+        let actor = authenticated_actor(&req);
+        let registry = self.refresh_provider_registry_for_resolution().await?;
+        crate::provider_profile::with_provider_registry_snapshot(registry, async {
+            let r = req.into_inner();
+            if r.namespace.trim().is_empty() {
+                return Err(Status::invalid_argument("namespace required"));
+            }
+            if r.end_timestamp_ms <= r.start_timestamp_ms {
+                return Err(Status::invalid_argument(
+                    "end_timestamp_ms must be greater than start_timestamp_ms",
+                ));
+            }
+            let candidate = normalize_legacy_policy_provider_pairs(Policy {
+                allowed_runtimes: r.allowed_runtimes,
+                allowed_models: r.allowed_models,
+                default_runtime: r.default_runtime,
+                default_model: r.default_model,
+                data_class: DataClass::parse(&r.data_class).as_str().into(),
+            });
+            validate_policy_provider_pairs(&candidate).map_err(Status::invalid_argument)?;
+
+            // Probe limit+1 so truncation is never silent.
+            let receipts = self
+                .db
+                .list_operation_receipts_in_window(
+                    &r.namespace,
+                    r.start_timestamp_ms,
+                    r.end_timestamp_ms,
+                    crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS.saturating_add(1),
+                )
+                .map_err(Status::internal)?;
+            if receipts.len() > crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS {
+                return Err(Status::resource_exhausted(format!(
+                    "policy dry-run receipt limit exceeded ({})",
+                    crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS
+                )));
+            }
+
+            let report = crate::chisei::policy_dry_run::dry_run_policy_over_receipts(
+                &r.namespace,
+                r.start_timestamp_ms,
+                r.end_timestamp_ms,
+                &candidate,
+                &receipts,
+            )
+            .map_err(Status::failed_precondition)?;
+
+            let request_id = if r.request_id.trim().is_empty() {
+                format!("policy-dry-run-{}", chrono::Utc::now().timestamp_millis())
+            } else {
+                r.request_id
+            };
+            let evidence = HashMap::from([
+                ("namespace".into(), report.namespace.clone()),
+                (
+                    "start_timestamp_ms".into(),
+                    report.start_timestamp_ms.to_string(),
+                ),
+                (
+                    "end_timestamp_ms".into(),
+                    report.end_timestamp_ms.to_string(),
+                ),
+                (
+                    "candidate_policy_version".into(),
+                    report.candidate_policy_version.clone(),
+                ),
+                ("evaluated".into(), report.counts.evaluated.to_string()),
+                ("would_deny".into(), report.counts.would_deny.to_string()),
+                ("would_allow".into(), report.counts.would_allow.to_string()),
+                ("re_routed".into(), report.counts.re_routed.to_string()),
+                ("request_id".into(), request_id.clone()),
+            ]);
+            let decision_id = {
+                use sha2::{Digest, Sha256};
+                format!(
+                    "policy-dry-run:{:x}",
+                    Sha256::digest(format!("{}\0{}\0{}", report.namespace, actor, request_id))
+                )
+            };
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: decision_id,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: actor.clone(),
+                action: "policy.dry_run".into(),
+                reason: "historical policy dry-run over operation receipts".into(),
+                evidence,
+                target_id: format!("policy-dry-run:{}", report.namespace),
+                outcome: "succeeded".into(),
+            });
+
+            let samples = report
+                .samples
+                .into_iter()
+                .map(|(delta_class, operation_ids)| DryRunNamespacePolicySample {
+                    delta_class,
+                    operation_ids,
+                })
+                .collect();
+            let results = report
+                .results
+                .into_iter()
+                .take(128)
+                .map(|result| DryRunNamespacePolicyResult {
+                    operation_id: result.operation_id,
+                    delta_class: match result.delta {
+                        crate::chisei::policy_dry_run::DryRunDeltaClass::Unchanged => {
+                            "unchanged".into()
+                        }
+                        crate::chisei::policy_dry_run::DryRunDeltaClass::ReRouted => {
+                            "re_routed".into()
+                        }
+                        crate::chisei::policy_dry_run::DryRunDeltaClass::WouldDeny => {
+                            "would_deny".into()
+                        }
+                        crate::chisei::policy_dry_run::DryRunDeltaClass::WouldAllow => {
+                            "would_allow".into()
+                        }
+                        crate::chisei::policy_dry_run::DryRunDeltaClass::InsufficientHistory => {
+                            "insufficient_history".into()
+                        }
+                    },
+                    historical_outcome: match result.historical_outcome {
+                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Allowed => {
+                            "allowed".into()
+                        }
+                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Denied => {
+                            "denied".into()
+                        }
+                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Unknown => {
+                            "unknown".into()
+                        }
+                    },
+                    candidate_outcome: result
+                        .candidate_outcome
+                        .map(|outcome| match outcome {
+                            crate::chisei::policy_dry_run::CandidateOutcomeClass::Allow => {
+                                "allow".into()
+                            }
+                            crate::chisei::policy_dry_run::CandidateOutcomeClass::Deny => {
+                                "deny".into()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    historical_runtime: result.historical_runtime,
+                    historical_model: result.historical_model,
+                    candidate_runtime: result.candidate_runtime,
+                    candidate_model: result.candidate_model,
+                    detail: result.detail,
+                })
+                .collect();
+
+            Ok(Response::new(DryRunNamespacePolicyResponse {
+                namespace: report.namespace,
+                start_timestamp_ms: report.start_timestamp_ms,
+                end_timestamp_ms: report.end_timestamp_ms,
+                candidate_policy_version: report.candidate_policy_version,
+                counts: Some(DryRunNamespacePolicyCounts {
+                    evaluated: report.counts.evaluated,
+                    unchanged: report.counts.unchanged,
+                    re_routed: report.counts.re_routed,
+                    would_deny: report.counts.would_deny,
+                    would_allow: report.counts.would_allow,
+                    insufficient_history: report.counts.insufficient_history,
+                }),
+                samples,
+                results,
+            }))
+        })
+        .await
+    }
+
     async fn get_effective_policy_summary(
         &self,
         req: Request<GetEffectivePolicySummaryRequest>,
