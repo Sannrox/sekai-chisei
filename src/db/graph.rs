@@ -316,14 +316,17 @@ fn sqlite_update_object(
     if changed != 1 {
         return Err("object revision conflict".into());
     }
+    let now = chrono::Utc::now().timestamp_millis();
     crate::sekai::audit::insert_object_changes(
         &transaction,
-        &crate::sekai::audit::object_diff_changes(
-            actor,
-            Some(&before),
-            Some(object),
-            chrono::Utc::now().timestamp_millis(),
-        ),
+        &crate::sekai::audit::object_diff_changes(actor, Some(&before), Some(object), now),
+    )?;
+    crate::sekai::temporal::retain_object_history_in_tx(
+        &transaction,
+        Some(&before),
+        Some(object),
+        actor,
+        now,
     )?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(Some(before))

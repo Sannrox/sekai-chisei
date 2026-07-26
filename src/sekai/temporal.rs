@@ -813,6 +813,336 @@ impl SekaiDb {
         }
         Ok(())
     }
+
+    /// Schema discovery: list temporal policies for a namespace (empty namespace =
+    /// policies registered under `""` plus exact matches). Surfaces without a
+    /// policy are non-retained by default.
+    pub fn discover_temporal_surfaces(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<TemporalSurfaceDiscovery>, String> {
+        let policies = self.list_temporal_policies()?;
+        Ok(policies
+            .into_iter()
+            .filter(|p| p.namespace == namespace)
+            .map(|p| TemporalSurfaceDiscovery {
+                namespace: p.namespace,
+                surface_kind: p.surface_kind,
+                surface_name: p.surface_name,
+                history_retained: p.enabled,
+                policy_version: p.policy_version,
+                preserve_conflicts: p.preserve_conflicts,
+            })
+            .collect())
+    }
+}
+
+/// Discovery row distinguishing retained vs non-retained schema surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalSurfaceDiscovery {
+    pub namespace: String,
+    pub surface_kind: TemporalSurfaceKind,
+    pub surface_name: String,
+    pub history_retained: bool,
+    pub policy_version: i64,
+    pub preserve_conflicts: bool,
+}
+
+/// Within an existing graph mutation transaction, retain history for temporal
+/// object-type and property policies. No-op when nothing is enabled.
+pub(crate) fn retain_object_history_in_tx(
+    tx: &Transaction<'_>,
+    before: Option<&crate::domain::Object>,
+    after: Option<&crate::domain::Object>,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let sample = after.or(before);
+    let Some(object) = sample else {
+        return Ok(());
+    };
+    let namespace = object.namespace.as_str();
+    let kind = object.kind.as_str();
+
+    // Object-type policy: full property snapshot.
+    if policy_enabled_tx(tx, namespace, TemporalSurfaceKind::ObjectType, kind)? {
+        let assertion_id = object_type_assertion_id(namespace, &object.id);
+        match (before, after) {
+            (None, Some(created)) => {
+                let payload = object_payload(created)?;
+                append_version_in_tx(
+                    tx,
+                    &MutationVersionWrite {
+                        assertion_id: &assertion_id,
+                        namespace,
+                        subject_id: &created.id,
+                        predicate: kind,
+                        object_ref: "",
+                        payload_json: &payload,
+                        actor,
+                        now_ms,
+                    },
+                )?;
+            }
+            (Some(_), Some(updated)) => {
+                let payload = object_payload(updated)?;
+                append_version_in_tx(
+                    tx,
+                    &MutationVersionWrite {
+                        assertion_id: &assertion_id,
+                        namespace,
+                        subject_id: &updated.id,
+                        predicate: kind,
+                        object_ref: "",
+                        payload_json: &payload,
+                        actor,
+                        now_ms,
+                    },
+                )?;
+            }
+            (Some(_), None) => {
+                close_open_version_in_tx(tx, &assertion_id, now_ms)?;
+            }
+            (None, None) => {}
+        }
+    }
+
+    // Property policies: only named properties on this object kind.
+    let property_policies = list_enabled_property_policies_tx(tx, namespace, kind)?;
+    for property in property_policies {
+        let before_val = before.and_then(|o| o.properties.get(&property).cloned());
+        let after_val = after.and_then(|o| o.properties.get(&property).cloned());
+        let assertion_id = property_assertion_id(namespace, &object.id, &property);
+        match (before_val, after_val) {
+            (old, Some(new)) if old.as_ref() != Some(&new) => {
+                let payload = serde_json::json!({ "value": new }).to_string();
+                let predicate = format!("{kind}.{property}");
+                append_version_in_tx(
+                    tx,
+                    &MutationVersionWrite {
+                        assertion_id: &assertion_id,
+                        namespace,
+                        subject_id: &object.id,
+                        predicate: &predicate,
+                        object_ref: "",
+                        payload_json: &payload,
+                        actor,
+                        now_ms,
+                    },
+                )?;
+            }
+            (Some(_), None) => {
+                close_open_version_in_tx(tx, &assertion_id, now_ms)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Within an existing link mutation transaction, retain history when the
+/// relation surface is temporal-enabled.
+pub(crate) fn retain_link_history_in_tx(
+    tx: &Transaction<'_>,
+    before: Option<&crate::domain::Link>,
+    after: Option<&crate::domain::Link>,
+    namespace: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let sample = after.or(before);
+    let Some(link) = sample else {
+        return Ok(());
+    };
+    if !policy_enabled_tx(tx, namespace, TemporalSurfaceKind::Relation, &link.relation)? {
+        return Ok(());
+    }
+    let assertion_id = link_assertion_id(namespace, &link.id);
+    match (before, after) {
+        (None, Some(created)) => {
+            let payload = link_payload(created)?;
+            append_version_in_tx(
+                tx,
+                &MutationVersionWrite {
+                    assertion_id: &assertion_id,
+                    namespace,
+                    subject_id: &created.from_id,
+                    predicate: &created.relation,
+                    object_ref: &created.to_id,
+                    payload_json: &payload,
+                    actor,
+                    now_ms,
+                },
+            )?;
+        }
+        (Some(_), Some(updated)) => {
+            let payload = link_payload(updated)?;
+            append_version_in_tx(
+                tx,
+                &MutationVersionWrite {
+                    assertion_id: &assertion_id,
+                    namespace,
+                    subject_id: &updated.from_id,
+                    predicate: &updated.relation,
+                    object_ref: &updated.to_id,
+                    payload_json: &payload,
+                    actor,
+                    now_ms,
+                },
+            )?;
+        }
+        (Some(_), None) => {
+            close_open_version_in_tx(tx, &assertion_id, now_ms)?;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+fn object_type_assertion_id(namespace: &str, object_id: &str) -> String {
+    format!("obj:{namespace}:{object_id}")
+}
+
+fn property_assertion_id(namespace: &str, object_id: &str, property: &str) -> String {
+    format!("prop:{namespace}:{object_id}:{property}")
+}
+
+fn link_assertion_id(namespace: &str, link_id: &str) -> String {
+    format!("link:{namespace}:{link_id}")
+}
+
+fn object_payload(object: &crate::domain::Object) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "kind": object.kind,
+        "name": object.name,
+        "properties": object.properties,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn link_payload(link: &crate::domain::Link) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "id": link.id,
+        "from_id": link.from_id,
+        "to_id": link.to_id,
+        "relation": link.relation,
+        "created": link.created,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn policy_enabled_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    kind: TemporalSurfaceKind,
+    name: &str,
+) -> Result<bool, String> {
+    Ok(read_policy_tx(tx, namespace, kind, name)?.is_some_and(|p| p.enabled))
+}
+
+fn list_enabled_property_policies_tx(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    object_kind: &str,
+) -> Result<Vec<String>, String> {
+    let prefix = format!("{object_kind}.");
+    let mut stmt = tx
+        .prepare(
+            "SELECT surface_name FROM sekai_temporal_policies
+             WHERE namespace = ?1 AND surface_kind = 'property' AND enabled = 1
+               AND surface_name LIKE ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![namespace, format!("{prefix}%")], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| e.to_string())?;
+    let mut props = Vec::new();
+    for row in rows {
+        let surface = row.map_err(|e| e.to_string())?;
+        if let Some(prop) = surface.strip_prefix(&prefix) {
+            props.push(prop.to_string());
+        }
+    }
+    Ok(props)
+}
+
+struct MutationVersionWrite<'a> {
+    assertion_id: &'a str,
+    namespace: &'a str,
+    subject_id: &'a str,
+    predicate: &'a str,
+    object_ref: &'a str,
+    payload_json: &'a str,
+    actor: &'a str,
+    now_ms: i64,
+}
+
+fn append_version_in_tx(
+    tx: &Transaction<'_>,
+    write: &MutationVersionWrite<'_>,
+) -> Result<(), String> {
+    let open = open_version_tx(tx, write.assertion_id)?;
+    let next_version = match &open {
+        Some(prev) => prev.version + 1,
+        None => 1,
+    };
+    let (revision, recorded_at_ms) = allocate_revision_tx(tx, write.now_ms)?;
+    if let Some(prev) = &open {
+        tx.execute(
+            "UPDATE sekai_temporal_assertions
+             SET recorded_to_revision = ?1
+             WHERE assertion_id = ?2 AND version = ?3
+               AND recorded_to_revision IS NULL",
+            params![revision, write.assertion_id, prev.version],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    insert_assertion_tx(
+        tx,
+        &TemporalAssertionVersion {
+            assertion_id: write.assertion_id.to_string(),
+            version: next_version,
+            namespace: write.namespace.to_string(),
+            subject_id: write.subject_id.to_string(),
+            predicate: write.predicate.to_string(),
+            object_ref: write.object_ref.to_string(),
+            payload_json: write.payload_json.to_string(),
+            valid_from: TemporalBound::unbounded(),
+            valid_to: TemporalBound::unbounded(),
+            recorded_from_revision: revision,
+            recorded_to_revision: None,
+            recorded_at_ms,
+            source_observed_at_ms: None,
+            source_id: "graph-mutation".into(),
+            actor: write.actor.to_string(),
+            evidence_ref: String::new(),
+            lineage_ref: String::new(),
+            is_backfill: false,
+        },
+    )
+}
+
+fn close_open_version_in_tx(
+    tx: &Transaction<'_>,
+    assertion_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let open = open_version_tx(tx, assertion_id)?;
+    let Some(prev) = open else {
+        return Ok(());
+    };
+    let (revision, _) = allocate_revision_tx(tx, now_ms)?;
+    tx.execute(
+        "UPDATE sekai_temporal_assertions
+         SET recorded_to_revision = ?1
+         WHERE assertion_id = ?2 AND version = ?3
+           AND recorded_to_revision IS NULL",
+        params![revision, assertion_id, prev.version],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn allocate_revision_tx(tx: &Transaction<'_>, now_ms: i64) -> Result<(i64, i64), String> {
@@ -1307,6 +1637,139 @@ mod tests {
         assert!(
             !db.is_temporal_enabled("ns", TemporalSurfaceKind::Relation, "works_for")
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn temporal_mutations_are_atomic_with_current_and_audit() {
+        let db = memory_db();
+        db.upsert_temporal_policy(&policy_write(
+            "ns",
+            TemporalSurfaceKind::ObjectType,
+            "person",
+            true,
+            false,
+            None,
+        ))
+        .unwrap();
+        db.upsert_temporal_policy(&policy_write(
+            "ns",
+            TemporalSurfaceKind::Relation,
+            "works_for",
+            true,
+            false,
+            None,
+        ))
+        .unwrap();
+
+        let mut person = Object {
+            id: "ada".into(),
+            kind: "person".into(),
+            name: "Ada".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("title".into(), "engineer".into())]),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&person, "alice").unwrap();
+        assert_eq!(
+            db.temporal_storage_stats().unwrap().assertion_version_count,
+            1
+        );
+        let audit = db.list_object_changes("ada", 10, 0).unwrap();
+        assert!(!audit.is_empty());
+
+        person.name = "Ada Lovelace".into();
+        person.updated = 2;
+        db.update_object_with_audit(&person, "alice").unwrap();
+        let versions = db
+            .list_temporal_assertions_for_subject("ns", "ada", "person")
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions[0].recorded_to_revision,
+            Some(versions[1].recorded_from_revision)
+        );
+
+        let org = Object {
+            id: "northwind".into(),
+            kind: "org".into(),
+            name: "Northwind".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&org, "alice").unwrap();
+        let link = crate::domain::Link {
+            id: "link-1".into(),
+            from_id: "ada".into(),
+            to_id: "northwind".into(),
+            relation: "works_for".into(),
+            created: 1,
+        };
+        db.create_link(&link).unwrap();
+        let link_versions = db
+            .list_temporal_assertions_for_subject("ns", "ada", "works_for")
+            .unwrap();
+        assert_eq!(link_versions.len(), 1);
+
+        // Non-temporal kind still creates no history.
+        let session = Object {
+            id: "sess-1".into(),
+            kind: "active_session".into(),
+            name: "s".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        };
+        let before = db.temporal_storage_stats().unwrap().assertion_version_count;
+        db.create_object_with_audit(&session, "alice").unwrap();
+        assert_eq!(
+            db.temporal_storage_stats().unwrap().assertion_version_count,
+            before
+        );
+
+        // Discovery distinguishes retained surfaces.
+        let discovery = db.discover_temporal_surfaces("ns").unwrap();
+        assert!(
+            discovery
+                .iter()
+                .any(|d| d.surface_name == "person" && d.history_retained)
+        );
+        assert!(
+            discovery
+                .iter()
+                .any(|d| d.surface_name == "works_for" && d.history_retained)
+        );
+
+        // Disable stops prospective retention; existing versions remain.
+        db.upsert_temporal_policy(&policy_write(
+            "ns",
+            TemporalSurfaceKind::ObjectType,
+            "person",
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        person.name = "Ada L.".into();
+        person.updated = 3;
+        let count_before = db.temporal_storage_stats().unwrap().assertion_version_count;
+        db.update_object_with_audit(&person, "alice").unwrap();
+        assert_eq!(
+            db.temporal_storage_stats().unwrap().assertion_version_count,
+            count_before
+        );
+        assert_eq!(
+            db.list_temporal_assertions_for_subject("ns", "ada", "person")
+                .unwrap()
+                .len(),
+            2
         );
     }
 
