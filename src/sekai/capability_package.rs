@@ -1,4 +1,5 @@
 use crate::db::sekai::SekaiDb;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,6 +8,9 @@ use std::collections::{BTreeSet, HashMap};
 use crate::sekai::audit::Decision;
 
 pub const MANIFEST_VERSION: &str = "sekai.capability-package/v1";
+pub const PACKAGE_SIGNATURE_ALGORITHM: &str = "ed25519";
+pub const PACKAGE_TRUST_UNSIGNED_ALLOWED: &str = "unsigned_allowed";
+pub const PACKAGE_TRUST_SIGNED: &str = "signed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageComponent {
@@ -15,12 +19,56 @@ pub struct PackageComponent {
     pub definition: serde_json::Value,
 }
 
+/// Optional ed25519 signature over the unsigned manifest digest.
+/// Excluded from `digest()` so the signature cannot depend on itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PackageSignature {
+    pub algorithm: String,
+    pub signer_identity: String,
+    pub key_id: String,
+    /// Base64 (standard) encoding of the 64-byte ed25519 signature.
+    pub signature_b64: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityPackageManifest {
     pub manifest_version: String,
     pub name: String,
     pub version: String,
     pub components: Vec<PackageComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PackageSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageTrustPolicy {
+    pub namespace: String,
+    /// `unsigned_allowed` (default/grandfather) or `signed`.
+    pub required_trust_level: String,
+    pub updated_by: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageSigner {
+    pub namespace: String,
+    pub identity: String,
+    pub key_id: String,
+    /// Base64 of the 32-byte ed25519 verifying key.
+    pub public_key_b64: String,
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageTrustDecision {
+    pub allowed: bool,
+    pub required_trust_level: String,
+    pub signature_present: bool,
+    pub signature_valid: bool,
+    pub signer_identity: String,
+    pub key_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,9 +146,137 @@ impl CapabilityPackageManifest {
 
     pub fn digest(&self) -> Result<String, String> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        let bytes = serde_json::to_vec(&unsigned).map_err(|error| error.to_string())?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
+
+    /// Sign the unsigned digest with an ed25519 signing key.
+    pub fn sign(
+        &mut self,
+        signer_identity: impl Into<String>,
+        key_id: impl Into<String>,
+        signing_key: &SigningKey,
+    ) -> Result<(), String> {
+        let digest = self.digest()?;
+        let signature = signing_key.sign(digest.as_bytes());
+        self.signature = Some(PackageSignature {
+            algorithm: PACKAGE_SIGNATURE_ALGORITHM.into(),
+            signer_identity: signer_identity.into(),
+            key_id: key_id.into(),
+            signature_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                signature.to_bytes().as_ref(),
+            ),
+        });
+        Ok(())
+    }
+}
+
+/// Evaluate whether a package may be installed under the namespace trust policy.
+pub fn evaluate_package_trust(
+    policy_level: &str,
+    trusted_signers: &[(String, String, VerifyingKey)],
+    manifest: &CapabilityPackageManifest,
+) -> Result<PackageTrustDecision, String> {
+    let level = if policy_level.is_empty() {
+        PACKAGE_TRUST_UNSIGNED_ALLOWED
+    } else {
+        policy_level
+    };
+    if level != PACKAGE_TRUST_UNSIGNED_ALLOWED && level != PACKAGE_TRUST_SIGNED {
+        return Err(format!("unsupported package trust level: {level}"));
+    }
+    let Some(signature) = &manifest.signature else {
+        let allowed = level == PACKAGE_TRUST_UNSIGNED_ALLOWED;
+        return Ok(PackageTrustDecision {
+            allowed,
+            required_trust_level: level.into(),
+            signature_present: false,
+            signature_valid: false,
+            signer_identity: String::new(),
+            key_id: String::new(),
+            reason: if allowed {
+                "unsigned package allowed by namespace policy".into()
+            } else {
+                "signed package required by namespace policy".into()
+            },
+        });
+    };
+    if signature.algorithm != PACKAGE_SIGNATURE_ALGORITHM {
+        return Ok(PackageTrustDecision {
+            allowed: false,
+            required_trust_level: level.into(),
+            signature_present: true,
+            signature_valid: false,
+            signer_identity: signature.signer_identity.clone(),
+            key_id: signature.key_id.clone(),
+            reason: format!(
+                "unsupported package signature algorithm {}",
+                signature.algorithm
+            ),
+        });
+    }
+    let digest = manifest.digest()?;
+    let signature_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        signature.signature_b64.as_bytes(),
+    )
+    .map_err(|error| format!("invalid package signature encoding: {error}"))?;
+    let signature_array: [u8; 64] = signature_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "package signature must be 64 bytes".to_string())?;
+    let ed_signature = Signature::from_bytes(&signature_array);
+    let trusted = trusted_signers.iter().find(|(identity, key_id, _)| {
+        identity == &signature.signer_identity && key_id == &signature.key_id
+    });
+    let Some((_, _, verifying_key)) = trusted else {
+        return Ok(PackageTrustDecision {
+            allowed: false,
+            required_trust_level: level.into(),
+            signature_present: true,
+            signature_valid: false,
+            signer_identity: signature.signer_identity.clone(),
+            key_id: signature.key_id.clone(),
+            reason: format!(
+                "signer {} key {} is not trusted for this namespace",
+                signature.signer_identity, signature.key_id
+            ),
+        });
+    };
+    let valid = verifying_key
+        .verify(digest.as_bytes(), &ed_signature)
+        .is_ok();
+    Ok(PackageTrustDecision {
+        allowed: valid,
+        required_trust_level: level.into(),
+        signature_present: true,
+        signature_valid: valid,
+        signer_identity: signature.signer_identity.clone(),
+        key_id: signature.key_id.clone(),
+        reason: if valid {
+            format!(
+                "valid signature from trusted signer {}/{}",
+                signature.signer_identity, signature.key_id
+            )
+        } else {
+            "package signature verification failed".into()
+        },
+    })
+}
+
+pub fn package_trust_evidence(decision: &PackageTrustDecision) -> String {
+    format!(
+        "trust_level={};signature_present={};signature_valid={};signer={};key_id={};reason={}",
+        decision.required_trust_level,
+        decision.signature_present,
+        decision.signature_valid,
+        decision.signer_identity,
+        decision.key_id,
+        decision.reason
+    )
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -302,9 +478,375 @@ impl SekaiDb {
                     UNIQUE(namespace, actor, request_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_capability_package_events_lookup
-                    ON sekai_capability_package_events(namespace, package_name, sequence);",
+                    ON sekai_capability_package_events(namespace, package_name, sequence);
+                CREATE TABLE IF NOT EXISTS sekai_capability_package_trust_policy (
+                    namespace TEXT PRIMARY KEY,
+                    required_trust_level TEXT NOT NULL
+                        CHECK(required_trust_level IN ('unsigned_allowed','signed')),
+                    updated_by TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sekai_capability_package_signers (
+                    namespace TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    public_key_b64 TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(namespace, identity, key_id)
+                );",
             )
             .map_err(|error| error.to_string())
+    }
+
+    pub fn set_capability_package_trust_policy(
+        &self,
+        namespace: &str,
+        required_trust_level: &str,
+        actor: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> Result<PackageTrustPolicy, String> {
+        if namespace.trim().is_empty() || actor.trim().is_empty() || request_id.trim().is_empty() {
+            return Err("namespace, actor, and request_id required".into());
+        }
+        if required_trust_level != PACKAGE_TRUST_UNSIGNED_ALLOWED
+            && required_trust_level != PACKAGE_TRUST_SIGNED
+        {
+            return Err(format!(
+                "required_trust_level must be {PACKAGE_TRUST_UNSIGNED_ALLOWED} or {PACKAGE_TRUST_SIGNED}"
+            ));
+        }
+        self.migrate_capability_packages()?;
+        let request_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(format!(
+                "trust_policy\0{namespace}\0{required_trust_level}\0{request_id}"
+            ))
+        );
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        if let Some((prior_digest, result_json)) = tx
+            .query_row(
+                "SELECT request_digest,result_json FROM sekai_capability_package_events
+                 WHERE namespace=?1 AND actor=?2 AND request_id=?3",
+                params![namespace, actor, request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            if prior_digest != request_digest {
+                return Err("request_id was already used for different trust policy input".into());
+            }
+            return serde_json::from_str(&result_json).map_err(|error| error.to_string());
+        }
+        let policy = PackageTrustPolicy {
+            namespace: namespace.into(),
+            required_trust_level: required_trust_level.into(),
+            updated_by: actor.into(),
+            updated_at_ms: now_ms,
+        };
+        tx.execute(
+            "INSERT INTO sekai_capability_package_trust_policy(namespace,required_trust_level,updated_by,updated_at_ms)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(namespace) DO UPDATE SET
+               required_trust_level=excluded.required_trust_level,
+               updated_by=excluded.updated_by,
+               updated_at_ms=excluded.updated_at_ms",
+            params![namespace, required_trust_level, actor, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        let evidence =
+            format!("trust_policy_set;required_trust_level={required_trust_level};actor={actor}");
+        let result_json = serde_json::to_string(&policy).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_capability_package_events
+             (namespace,package_name,package_version,action,actor,request_id,request_digest,manifest_digest,evidence,result_json,recorded_at_ms)
+             VALUES(?1,'__trust_policy__','0.0.0','trust_policy',?2,?3,?4,'',?5,?6,?7)",
+            params![
+                namespace,
+                actor,
+                request_id,
+                request_digest,
+                evidence,
+                result_json,
+                now_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(policy)
+    }
+
+    pub fn get_capability_package_trust_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<PackageTrustPolicy, String> {
+        self.migrate_capability_packages()?;
+        let conn = self.conn();
+        let policy = conn
+            .query_row(
+                "SELECT namespace,required_trust_level,updated_by,updated_at_ms
+                 FROM sekai_capability_package_trust_policy WHERE namespace=?1",
+                params![namespace],
+                |row| {
+                    Ok(PackageTrustPolicy {
+                        namespace: row.get(0)?,
+                        required_trust_level: row.get(1)?,
+                        updated_by: row.get(2)?,
+                        updated_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(policy.unwrap_or(PackageTrustPolicy {
+            namespace: namespace.into(),
+            required_trust_level: PACKAGE_TRUST_UNSIGNED_ALLOWED.into(),
+            updated_by: "system".into(),
+            updated_at_ms: 0,
+        }))
+    }
+
+    pub fn put_capability_package_signer(
+        &self,
+        namespace: &str,
+        identity: &str,
+        key_id: &str,
+        public_key_b64: &str,
+        actor: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> Result<PackageSigner, String> {
+        if namespace.trim().is_empty()
+            || identity.trim().is_empty()
+            || key_id.trim().is_empty()
+            || actor.trim().is_empty()
+            || request_id.trim().is_empty()
+        {
+            return Err("namespace, identity, key_id, actor, and request_id required".into());
+        }
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            public_key_b64.as_bytes(),
+        )
+        .map_err(|error| format!("invalid public key encoding: {error}"))?;
+        let key_array: [u8; 32] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "ed25519 public key must be 32 bytes".to_string())?;
+        let _ = VerifyingKey::from_bytes(&key_array)
+            .map_err(|error| format!("invalid ed25519 public key: {error}"))?;
+        self.migrate_capability_packages()?;
+        let request_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(format!(
+                "trust_signer\0{namespace}\0{identity}\0{key_id}\0{public_key_b64}\0{request_id}"
+            ))
+        );
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        if let Some((prior_digest, result_json)) = tx
+            .query_row(
+                "SELECT request_digest,result_json FROM sekai_capability_package_events
+                 WHERE namespace=?1 AND actor=?2 AND request_id=?3",
+                params![namespace, actor, request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            if prior_digest != request_digest {
+                return Err("request_id was already used for different trust signer input".into());
+            }
+            return serde_json::from_str(&result_json).map_err(|error| error.to_string());
+        }
+        let signer = PackageSigner {
+            namespace: namespace.into(),
+            identity: identity.into(),
+            key_id: key_id.into(),
+            public_key_b64: public_key_b64.into(),
+            created_by: actor.into(),
+            created_at_ms: now_ms,
+        };
+        tx.execute(
+            "INSERT INTO sekai_capability_package_signers
+             (namespace,identity,key_id,public_key_b64,created_by,created_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(namespace,identity,key_id) DO UPDATE SET
+               public_key_b64=excluded.public_key_b64,
+               created_by=excluded.created_by,
+               created_at_ms=excluded.created_at_ms",
+            params![namespace, identity, key_id, public_key_b64, actor, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        let evidence = format!("signer_put;identity={identity};key_id={key_id};actor={actor}");
+        let result_json = serde_json::to_string(&signer).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_capability_package_events
+             (namespace,package_name,package_version,action,actor,request_id,request_digest,manifest_digest,evidence,result_json,recorded_at_ms)
+             VALUES(?1,'__trust_signer__','0.0.0','trust_signer',?2,?3,?4,'',?5,?6,?7)",
+            params![
+                namespace,
+                actor,
+                request_id,
+                request_digest,
+                evidence,
+                result_json,
+                now_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(signer)
+    }
+
+    pub fn list_capability_package_signers(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<PackageSigner>, String> {
+        self.migrate_capability_packages()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT namespace,identity,key_id,public_key_b64,created_by,created_at_ms
+                 FROM sekai_capability_package_signers WHERE namespace=?1
+                 ORDER BY identity, key_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| {
+                Ok(PackageSigner {
+                    namespace: row.get(0)?,
+                    identity: row.get(1)?,
+                    key_id: row.get(2)?,
+                    public_key_b64: row.get(3)?,
+                    created_by: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(rows)
+    }
+
+    fn load_package_trust_signers_tx(
+        tx: &Transaction<'_>,
+        namespace: &str,
+    ) -> Result<Vec<(String, String, VerifyingKey)>, String> {
+        let mut stmt = tx
+            .prepare(
+                "SELECT identity,key_id,public_key_b64 FROM sekai_capability_package_signers
+                 WHERE namespace=?1 ORDER BY identity, key_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let mut keys = Vec::new();
+        for (identity, key_id, public_key_b64) in rows {
+            let key_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                public_key_b64.as_bytes(),
+            )
+            .map_err(|error| format!("stored signer key invalid: {error}"))?;
+            let key_array: [u8; 32] = key_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "stored signer key must be 32 bytes".to_string())?;
+            let verifying = VerifyingKey::from_bytes(&key_array)
+                .map_err(|error| format!("stored signer key invalid: {error}"))?;
+            keys.push((identity, key_id, verifying));
+        }
+        Ok(keys)
+    }
+
+    fn load_package_trust_policy_tx(
+        tx: &Transaction<'_>,
+        namespace: &str,
+    ) -> Result<PackageTrustPolicy, String> {
+        let policy = tx
+            .query_row(
+                "SELECT namespace,required_trust_level,updated_by,updated_at_ms
+                 FROM sekai_capability_package_trust_policy WHERE namespace=?1",
+                params![namespace],
+                |row| {
+                    Ok(PackageTrustPolicy {
+                        namespace: row.get(0)?,
+                        required_trust_level: row.get(1)?,
+                        updated_by: row.get(2)?,
+                        updated_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(policy.unwrap_or(PackageTrustPolicy {
+            namespace: namespace.into(),
+            required_trust_level: PACKAGE_TRUST_UNSIGNED_ALLOWED.into(),
+            updated_by: "system".into(),
+            updated_at_ms: 0,
+        }))
+    }
+
+    fn enforce_package_trust_tx(
+        tx: &Transaction<'_>,
+        namespace: &str,
+        manifest: &CapabilityPackageManifest,
+    ) -> Result<PackageTrustDecision, String> {
+        let policy = Self::load_package_trust_policy_tx(tx, namespace)?;
+        let signers = Self::load_package_trust_signers_tx(tx, namespace)?;
+        let decision = evaluate_package_trust(&policy.required_trust_level, &signers, manifest)?;
+        if !decision.allowed {
+            return Err(format!("package trust denied: {}", decision.reason));
+        }
+        Ok(decision)
+    }
+
+    /// Record a denied trust decision without installing the package.
+    pub fn record_package_trust_denial(
+        &self,
+        namespace: &str,
+        manifest: &CapabilityPackageManifest,
+        actor: &str,
+        request_id: &str,
+        decision: &PackageTrustDecision,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.migrate_capability_packages()?;
+        let evidence = package_trust_evidence(decision);
+        let request_digest = request_digest("trust_deny", namespace, manifest, request_id)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // Best-effort: ignore unique conflicts on retry of the same denial.
+        let _ = tx.execute(
+            "INSERT OR IGNORE INTO sekai_capability_package_events
+             (namespace,package_name,package_version,action,actor,request_id,request_digest,manifest_digest,evidence,result_json,recorded_at_ms)
+             VALUES(?1,?2,?3,'trust_denied',?4,?5,?6,?7,?8,'null',?9)",
+            params![
+                namespace,
+                manifest.name,
+                manifest.version,
+                actor,
+                request_id,
+                request_digest,
+                manifest.digest().unwrap_or_default(),
+                evidence,
+                now_ms
+            ],
+        );
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn install_capability_package(
@@ -324,6 +866,38 @@ impl SekaiDb {
             return existing
                 .ok_or_else(|| "idempotent install no longer has an active installation".into());
         }
+        let trust = match Self::enforce_package_trust_tx(&tx, namespace, manifest) {
+            Ok(decision) => decision,
+            Err(error) => {
+                drop(tx);
+                drop(conn);
+                let decision = PackageTrustDecision {
+                    allowed: false,
+                    required_trust_level: self
+                        .get_capability_package_trust_policy(namespace)
+                        .map(|policy| policy.required_trust_level)
+                        .unwrap_or_else(|_| PACKAGE_TRUST_UNSIGNED_ALLOWED.into()),
+                    signature_present: manifest.signature.is_some(),
+                    signature_valid: false,
+                    signer_identity: manifest
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.signer_identity.clone())
+                        .unwrap_or_default(),
+                    key_id: manifest
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.key_id.clone())
+                        .unwrap_or_default(),
+                    reason: error.clone(),
+                };
+                let _ = self.record_package_trust_denial(
+                    namespace, manifest, actor, request_id, &decision, now_ms,
+                );
+                return Err(error);
+            }
+        };
+        let trust_evidence = package_trust_evidence(&trust);
         if load_installation(&tx, namespace, &manifest.name)?.is_some() {
             return Err("package already installed in namespace".into());
         }
@@ -343,7 +917,7 @@ impl SekaiDb {
             request_id,
             &request_digest,
             &manifest_digest,
-            "manifest_validated",
+            &format!("manifest_validated;{trust_evidence}"),
             now_ms,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -369,6 +943,8 @@ impl SekaiDb {
             return existing
                 .ok_or_else(|| "idempotent upgrade no longer has an active installation".into());
         }
+        let trust = Self::enforce_package_trust_tx(&tx, namespace, manifest)?;
+        let trust_evidence = package_trust_evidence(&trust);
         let current = load_installation(&tx, namespace, &manifest.name)?
             .ok_or_else(|| "package is not installed in namespace".to_string())?;
         let current_version = parse_package_version(&current.current_version)
@@ -392,7 +968,7 @@ impl SekaiDb {
             request_id,
             &request_digest,
             &manifest_digest,
-            "manifest_validated",
+            &format!("manifest_validated;{trust_evidence}"),
             now_ms,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -696,14 +1272,43 @@ fn store_manifest(
     now_ms: i64,
 ) -> Result<(), String> {
     let json = serde_json::to_string(manifest).map_err(|error| error.to_string())?;
-    let existing: Option<String> = tx.query_row("SELECT manifest_digest FROM sekai_capability_package_versions WHERE namespace=?1 AND package_name=?2 AND package_version=?3", params![namespace, manifest.name, manifest.version], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
-    if existing
-        .as_deref()
-        .is_some_and(|existing| existing != digest)
-    {
-        return Err("package version is immutable".into());
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT manifest_digest,manifest_json FROM sekai_capability_package_versions
+             WHERE namespace=?1 AND package_name=?2 AND package_version=?3",
+            params![namespace, manifest.name, manifest.version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((existing_digest, existing_json)) = existing {
+        if existing_digest != digest {
+            return Err("package version is immutable".into());
+        }
+        // Same unsigned content must also keep the same signature provenance so
+        // reinstalls cannot leave a stale signer on record.
+        if existing_json != json {
+            return Err(
+                "package version signature/provenance must match the previously stored manifest"
+                    .into(),
+            );
+        }
+        return Ok(());
     }
-    tx.execute("INSERT OR IGNORE INTO sekai_capability_package_versions(namespace,package_name,package_version,manifest_json,manifest_digest,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![namespace, manifest.name, manifest.version, json, digest, now_ms]).map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_capability_package_versions
+         (namespace,package_name,package_version,manifest_json,manifest_digest,created_at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            namespace,
+            manifest.name,
+            manifest.version,
+            json,
+            digest,
+            now_ms
+        ],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -808,4 +1413,121 @@ pub(crate) fn simple_request_digest(action: &str, namespace: &str, package_name:
         "sha256:{:x}",
         Sha256::digest(format!("{action}\0{namespace}\0{package_name}"))
     )
+}
+
+#[cfg(test)]
+mod package_trust_tests {
+    use super::*;
+
+    fn sample_manifest(name: &str, version: &str) -> CapabilityPackageManifest {
+        CapabilityPackageManifest {
+            manifest_version: MANIFEST_VERSION.into(),
+            name: name.into(),
+            version: version.into(),
+            components: vec![PackageComponent {
+                kind: "policy_default".into(),
+                name: "default-allow".into(),
+                definition: serde_json::json!({"decision": "allow"}),
+            }],
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn unsigned_packages_install_under_default_policy() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let manifest = sample_manifest("demo-pkg", "1.0.0");
+        let installed = db
+            .install_capability_package("ns", &manifest, "operator", "install-1", 10)
+            .unwrap();
+        assert_eq!(installed.current_version, "1.0.0");
+    }
+
+    #[test]
+    fn signed_policy_rejects_unsigned_and_accepts_valid_signature() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_capability_package_trust_policy("ns", PACKAGE_TRUST_SIGNED, "admin", "policy-1", 5)
+            .unwrap();
+        let mut manifest = sample_manifest("signed-pkg", "1.0.0");
+        assert!(
+            db.install_capability_package("ns", &manifest, "operator", "u1", 10)
+                .unwrap_err()
+                .contains("signed package required")
+        );
+
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying = signing.verifying_key();
+        let public_key_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            verifying.as_bytes(),
+        );
+        db.put_capability_package_signer(
+            "ns",
+            "issuer:ops",
+            "key-1",
+            &public_key_b64,
+            "admin",
+            "signer-1",
+            6,
+        )
+        .unwrap();
+        manifest
+            .sign("issuer:ops", "key-1", &signing)
+            .expect("sign");
+        let installed = db
+            .install_capability_package("ns", &manifest, "operator", "s1", 20)
+            .unwrap();
+        assert_eq!(installed.package_name, "signed-pkg");
+
+        let mut bad = sample_manifest("bad-pkg", "1.0.0");
+        bad.sign("issuer:ops", "key-1", &signing).unwrap();
+        if let Some(signature) = bad.signature.as_mut() {
+            signature.signature_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 64]);
+        }
+        assert!(
+            db.install_capability_package("ns", &bad, "operator", "b1", 30)
+                .unwrap_err()
+                .contains("signature")
+        );
+
+        let mut untrusted = sample_manifest("other-pkg", "1.0.0");
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        untrusted.sign("issuer:evil", "key-x", &other).unwrap();
+        assert!(
+            db.install_capability_package("ns", &untrusted, "operator", "e1", 40)
+                .unwrap_err()
+                .contains("not trusted")
+        );
+    }
+
+    #[test]
+    fn trust_policy_change_is_audited_and_does_not_silently_retrust() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_capability_package_trust_policy(
+            "ns",
+            PACKAGE_TRUST_SIGNED,
+            "admin",
+            "policy-audit",
+            1,
+        )
+        .unwrap();
+        let policy = db.get_capability_package_trust_policy("ns").unwrap();
+        assert_eq!(policy.required_trust_level, PACKAGE_TRUST_SIGNED);
+        let replay = db
+            .set_capability_package_trust_policy(
+                "ns",
+                PACKAGE_TRUST_SIGNED,
+                "admin",
+                "policy-audit",
+                2,
+            )
+            .unwrap();
+        assert_eq!(replay.required_trust_level, PACKAGE_TRUST_SIGNED);
+        let events = db
+            .list_capability_package_events("ns", "__trust_policy__")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events.iter().any(|event| event.action == "trust_policy"));
+    }
 }
