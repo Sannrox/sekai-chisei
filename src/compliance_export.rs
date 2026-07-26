@@ -332,8 +332,34 @@ pub fn verify_compliance_export(
                     receipt.operation_id
                 ));
             }
+            if receipt
+                .reporter_grants
+                .iter()
+                .any(|grant| grant.principal != "[redacted]")
+            {
+                errors.push(format!(
+                    "redacted receipt {} retains reporter principal",
+                    receipt.operation_id
+                ));
+            }
+            if receipt
+                .uncovered_surfaces
+                .iter()
+                .any(|surface| surface.reason != "[redacted]")
+            {
+                errors.push(format!(
+                    "redacted receipt {} retains uncovered-surface reason",
+                    receipt.operation_id
+                ));
+            }
             for event in &receipt.events {
-                if event.actor != "[redacted]" || !event.attributes.is_empty() {
+                let refs_clean = event.references.iter().all(|reference| {
+                    reference.reference == "[redacted]"
+                        && reference.content_hash.is_none()
+                        && reference.disclosed_fields.is_empty()
+                        && reference.omission_reason.is_none()
+                });
+                if event.actor != "[redacted]" || !event.attributes.is_empty() || !refs_clean {
                     errors.push(format!(
                         "redacted receipt {} event {} retains free-form data",
                         receipt.operation_id, event.event_id
