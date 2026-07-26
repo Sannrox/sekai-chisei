@@ -51,17 +51,23 @@ composition through the public extension contracts.
 
 ## Observability
 
-The loopback ops listener exposes unauthenticated process endpoints:
+The loopback ops listener exposes unauthenticated process endpoints and the
+authenticated [operator console](operator-console.md):
 
 ```bash
 curl --fail http://127.0.0.1:9464/healthz
 curl --fail http://127.0.0.1:9464/readyz
 curl --fail http://127.0.0.1:9464/metrics
+# browser: http://127.0.0.1:9464/console/
 ```
 
 - `/healthz` reports process health.
 - `/readyz` verifies that the service is ready to handle governed work.
 - `/metrics` exports Prometheus metrics.
+- `/console/*` is the authenticated operator shell (principal Bearer login,
+  HttpOnly session cookie, namespace context). It always fails closed without a
+  valid session. See [operator-console.md](operator-console.md) for local and
+  TLS run paths.
 
 The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
