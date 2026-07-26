@@ -31,12 +31,30 @@ Receipt attributes (when applied):
 - `residency_provider_region` / `residency_model_region` (when known)
 - `residency_denial_reasons` on deny
 
+## Call sites (wired)
+
+| Surface | Behavior |
+| --- | --- |
+| `PlanExecution` / `resolve_model_for_run` | Enforces residency after final model/runtime resolution |
+| `ExecutePlan` / `ExecutePlanStream` | Re-checks residency so cached plans cannot outrun policy |
+| `DecideGatewayExecution` | Enforces residency as part of fat-decide route composition |
+| Gunshi `AuthorizeGunshiAutoDispatch` | Forces advisory + denial reasons when selected model is residency-illegal; stamps receipt attributes |
+
 ## Gunshi
 
-Auto-dispatch and advisory selection must not pick a residency-illegal model;
-call `ResidencyResolver::evaluate_namespace` after model resolution.
+Auto-dispatch cannot authorize a residency-illegal model. Advisory selection
+still ranks candidates; the authorize path fail-closes before automatic mode
+is granted.
+
+## Setting policy
+
+In-process: `PolicyResolver::set_residency_policy(namespace, policy)`.
+Durable namespace policy objects for residency (alongside route policy load)
+remain an optional follow-up; process-local set is sufficient for tests and
+single-plane control-plane configuration today.
 
 ## Non-goals (this slice)
 
 - Multi-region write topology (#292–#294)
 - Cross-site federation wire protocol (#291)
+- Durable residency policy object schema / SetResidencyPolicy RPC (follow-up)

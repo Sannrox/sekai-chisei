@@ -2845,6 +2845,15 @@ impl ChiseiServiceImpl {
             .map_err(Status::failed_precondition)?;
         let runtime = final_runtime_for_model(policy, &runtime, &model)
             .map_err(Status::failed_precondition)?;
+        // Single-plane residency (#289): fail closed before any provider contact.
+        let data_class = policy
+            .map(|policy| policy.data_class.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unclassified");
+        let provider = crate::llm::provider_name(&model);
+        self.policy
+            .enforce_residency(&input.namespace, provider, &model, data_class)
+            .map_err(Status::permission_denied)?;
         Ok((runtime, model, preferred_runtime, preferred_model))
     }
 
@@ -6727,6 +6736,17 @@ impl ChiseiService for ChiseiServiceImpl {
         let task_class = TaskClass::parse(&plan.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
         let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
+        // Re-check residency on execute so cached plans cannot outrun policy.
+        if let Err(error) = self.policy.enforce_residency(
+            &input.namespace,
+            &provider,
+            &plan.resolved_model,
+            data_class.as_str(),
+        ) {
+            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
+                .map_err(Status::internal)?;
+            return Err(Status::permission_denied(error));
+        }
         if safe_only && !crate::chisei::privacy::provider_safe_to_send(&provider, &safe_providers) {
             self.record_privacy_audit(
                 "blocked",
@@ -6992,6 +7012,18 @@ impl ChiseiService for ChiseiServiceImpl {
         require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
+        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let data_class = self.data_class(effective_policy.as_ref());
+        if let Err(error) = self.policy.enforce_residency(
+            &input.namespace,
+            &provider,
+            &plan.resolved_model,
+            data_class.as_str(),
+        ) {
+            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
+                .map_err(Status::internal)?;
+            return Err(Status::permission_denied(error));
+        }
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
@@ -7694,7 +7726,7 @@ impl ChiseiService for ChiseiServiceImpl {
             serde_json::from_str(&input.capacity_json).map_err(|error| {
                 Status::invalid_argument(format!("invalid capacity envelope: {error}"))
             })?;
-        let (authorization, attributes) =
+        let (mut authorization, mut attributes) =
             crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
                 &self.db,
                 &input.namespace,
@@ -7703,6 +7735,34 @@ impl ChiseiService for ChiseiServiceImpl {
                 &capacity,
             )
             .map_err(Status::failed_precondition)?;
+        // Residency cannot be bypassed by auto-dispatch (#289 residual wiring).
+        let data_class = self
+            .policy
+            .effective_policy(&input.namespace)
+            .map(|policy| policy.data_class)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unclassified".into());
+        let provider = crate::llm::provider_name(&plan.selection.model);
+        match self.policy.enforce_residency(
+            &input.namespace,
+            provider,
+            &plan.selection.model,
+            &data_class,
+        ) {
+            Ok(decision) => {
+                attributes.extend(self.policy.residency_receipt_attributes(&decision));
+            }
+            Err(error) => {
+                authorization.authorized = false;
+                authorization.mode = crate::chisei::gunshi_dispatch::DispatchMode::AdvisoryOnly;
+                authorization.reasons.push(error);
+                attributes.insert("residency_allowed".into(), "false".into());
+                attributes.insert(
+                    "residency_denial_reasons".into(),
+                    authorization.reasons.last().cloned().unwrap_or_default(),
+                );
+            }
+        }
         Ok(Response::new(AuthorizeGunshiAutoDispatchResponse {
             authorization_json: serde_json::to_string(&authorization)
                 .map_err(|error| Status::internal(error.to_string()))?,
