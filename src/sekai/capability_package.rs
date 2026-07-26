@@ -271,6 +271,24 @@ pub fn evaluate_package_trust(
         identity == &signature.signer_identity && key_id == &signature.key_id
     });
     let Some((_, _, verifying_key)) = trusted else {
+        // Under unsigned_allowed, signatures are optional. An unregistered
+        // signer cannot be cryptographically checked, so accept the package
+        // (format/algorithm already validated above). Signed policy still
+        // fails closed until the identity/key is registered.
+        if level == PACKAGE_TRUST_UNSIGNED_ALLOWED {
+            return Ok(PackageTrustDecision {
+                allowed: true,
+                required_trust_level: level.into(),
+                signature_present: true,
+                signature_valid: false,
+                signer_identity: signature.signer_identity.clone(),
+                key_id: signature.key_id.clone(),
+                reason: format!(
+                    "signature from unregistered signer {}/{}; allowed under {PACKAGE_TRUST_UNSIGNED_ALLOWED}",
+                    signature.signer_identity, signature.key_id
+                ),
+            });
+        }
         return Ok(PackageTrustDecision {
             allowed: false,
             required_trust_level: level.into(),
@@ -613,6 +631,28 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
+        let audit_evidence = HashMap::from([
+            ("namespace".into(), namespace.into()),
+            ("required_trust_level".into(), required_trust_level.into()),
+            ("request_id".into(), request_id.into()),
+            ("lifecycle_evidence".into(), evidence),
+        ]);
+        crate::sekai::ledger::insert_chained_decision(
+            &tx,
+            &Decision {
+                id: format!(
+                    "capability-package-trust-policy:{:x}",
+                    Sha256::digest(format!("{namespace}\0{actor}\0{request_id}"))
+                ),
+                timestamp: now_ms,
+                actor: actor.into(),
+                action: "capability_package.trust_policy".into(),
+                reason: "namespace capability-package trust policy change".into(),
+                evidence: audit_evidence,
+                target_id: format!("capability-package-trust:{namespace}"),
+                outcome: "succeeded".into(),
+            },
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(policy)
     }
@@ -737,6 +777,29 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
+        let audit_evidence = HashMap::from([
+            ("namespace".into(), namespace.into()),
+            ("signer_identity".into(), identity.into()),
+            ("key_id".into(), key_id.into()),
+            ("request_id".into(), request_id.into()),
+            ("lifecycle_evidence".into(), evidence),
+        ]);
+        crate::sekai::ledger::insert_chained_decision(
+            &tx,
+            &Decision {
+                id: format!(
+                    "capability-package-trust-signer:{:x}",
+                    Sha256::digest(format!("{namespace}\0{actor}\0{request_id}"))
+                ),
+                timestamp: now_ms,
+                actor: actor.into(),
+                action: "capability_package.trust_signer".into(),
+                reason: "namespace capability-package trusted signer put".into(),
+                evidence: audit_evidence,
+                target_id: format!("capability-package-trust:{namespace}"),
+                outcome: "succeeded".into(),
+            },
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(signer)
     }
@@ -1510,6 +1573,76 @@ mod package_trust_tests {
             .install_capability_package("ns", &manifest, "operator", "install-1", 10)
             .unwrap();
         assert_eq!(installed.current_version, "1.0.0");
+    }
+
+    #[test]
+    fn unsigned_allowed_accepts_signature_from_unregistered_signer() {
+        // Grandfather / empty-signer path used by PostgreSQL: signatures are
+        // optional under unsigned_allowed and must not hard-fail install.
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut manifest = sample_manifest("optional-sig", "1.0.0");
+        let signing = SigningKey::from_bytes(&[3u8; 32]);
+        manifest
+            .sign("issuer:unknown", "key-x", &signing)
+            .expect("sign");
+        let installed = db
+            .install_capability_package("ns", &manifest, "operator", "opt-1", 10)
+            .unwrap();
+        assert_eq!(installed.package_name, "optional-sig");
+    }
+
+    #[test]
+    fn trust_root_mutations_write_audit_decisions() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_capability_package_trust_policy("ns", PACKAGE_TRUST_SIGNED, "admin", "pol-1", 1)
+            .unwrap();
+        let signing = SigningKey::from_bytes(&[5u8; 32]);
+        let public_key_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            signing.verifying_key().as_bytes(),
+        );
+        db.put_capability_package_signer(
+            "ns",
+            "issuer:ops",
+            "key-1",
+            &public_key_b64,
+            "admin",
+            "sig-1",
+            2,
+        )
+        .unwrap();
+        let decisions = db
+            .list_capability_package_decisions("ns", "__trust_policy__")
+            .unwrap();
+        // Decisions are keyed by trust target, not package name; query via ledger
+        // by scanning package-adjacent decisions through the events path is enough
+        // when the event rows exist and decisions are non-empty for the trust target.
+        let events = db
+            .list_capability_package_events("ns", "__trust_policy__")
+            .unwrap();
+        assert!(events.iter().any(|event| event.action == "trust_policy"));
+        let signer_events = db
+            .list_capability_package_events("ns", "__trust_signer__")
+            .unwrap();
+        assert!(
+            signer_events
+                .iter()
+                .any(|event| event.action == "trust_signer")
+        );
+        // Chained audit decisions use target_id capability-package-trust:{ns}.
+        let conn = db.conn();
+        let decision_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_decisions
+                 WHERE target_id=?1 AND action IN (
+                   'capability_package.trust_policy','capability_package.trust_signer'
+                 )",
+                params!["capability-package-trust:ns"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision_count, 2);
+        let _ = decisions;
     }
 
     #[test]
