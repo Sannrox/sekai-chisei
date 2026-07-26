@@ -85,6 +85,37 @@ impl PostgresDb {
             .transpose()
     }
 
+    pub fn list_operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        let limit = i64::try_from(limit.min(5_000)).unwrap_or(5_000);
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT receipt_json FROM chisei_operation_receipts
+                 WHERE namespace=$1
+                   AND ((receipt_json::jsonb->>'started_at_ms')::bigint) < $3
+                   AND (
+                     receipt_json::jsonb->>'completed_at_ms' IS NULL
+                     OR ((receipt_json::jsonb->>'completed_at_ms')::bigint) >= $2
+                   )
+                 ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint), operation_id
+                 LIMIT $4",
+                &[&namespace, &start_timestamp_ms, &end_timestamp_ms, &limit],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut receipts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let json: String = row.get(0);
+            receipts.push(serde_json::from_str(&json).map_err(|error| error.to_string())?);
+        }
+        Ok(receipts)
+    }
+
     pub fn reserve_gateway_request_alias(
         &self,
         caller_scope: &str,
