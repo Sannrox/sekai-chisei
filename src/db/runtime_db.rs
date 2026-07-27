@@ -1790,6 +1790,47 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_action_effects(
+        &self,
+        effects: &[crate::sekai::action_effect::ActionEffect],
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.put_action_effects(effects),
+            Self::Postgres(db) => db.put_action_effects(effects),
+        }
+    }
+
+    pub fn get_action_effect(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_action_effect(effect_id),
+            Self::Postgres(db) => db.get_action_effect(effect_id),
+        }
+    }
+
+    pub fn list_action_effects_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_action_effects_for_instance(instance_id),
+            Self::Postgres(db) => db.list_action_effects_for_instance(instance_id),
+        }
+    }
+
+    pub fn list_pending_runtime_dispatch_effects(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_pending_runtime_dispatch_effects(namespace, limit),
+            Self::Postgres(db) => db.list_pending_runtime_dispatch_effects(namespace, limit),
+        }
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_grants(),

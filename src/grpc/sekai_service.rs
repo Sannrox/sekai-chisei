@@ -5779,6 +5779,23 @@ fn to_proto_action_instance(
     }
 }
 
+fn to_proto_action_effect(
+    domain: &crate::sekai::action_effect::ActionEffect,
+) -> super::pb::sekai::ActionEffect {
+    super::pb::sekai::ActionEffect {
+        effect_id: domain.effect_id.clone(),
+        instance_id: domain.instance_id.clone(),
+        namespace: domain.namespace.clone(),
+        operation_id: domain.operation_id.clone(),
+        kind: domain.kind.clone(),
+        status: domain.status.clone(),
+        payload_json: domain.payload_json.clone(),
+        failure_reason: domain.failure_reason.clone(),
+        created_at_ms: domain.created_at_ms,
+        updated_at_ms: domain.updated_at_ms,
+    }
+}
+
 fn authorize_action_instance_submit(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -10230,6 +10247,30 @@ impl SekaiService for SekaiServiceImpl {
                 if let Some(budget) = &self.budget {
                     budget.record(&budget_subject, 1);
                 }
+                // #398: materialize typed effects after durable admit (internal SoR first).
+                // Notify delivery is best-effort: failure does not un-admit.
+                let force_notify_fail =
+                    serde_json::from_str::<serde_json::Value>(&stored.parameters_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("notify_delivery")
+                                .and_then(|d| d.as_str())
+                                .map(|s| s == "fail")
+                        })
+                        .unwrap_or(false);
+                let effects = crate::sekai::action_effect::plan_effects_for_admit(
+                    &stored.instance_id,
+                    &stored.namespace,
+                    &stored.operation_id,
+                    &type_def.allowed_effect_kinds,
+                    &stored.parameters_json,
+                    now,
+                    force_notify_fail,
+                )
+                .map_err(Status::invalid_argument)?;
+                self.db
+                    .put_action_effects(&effects)
+                    .map_err(Status::internal)?;
             }
         }
 
@@ -10299,6 +10340,69 @@ impl SekaiService for SekaiServiceImpl {
             .map(to_proto_action_instance)
             .collect();
         Ok(Response::new(ListActionInstancesResponse { instances }))
+    }
+
+    async fn get_action_effect(
+        &self,
+        req: Request<GetActionEffectRequest>,
+    ) -> Result<Response<GetActionEffectResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        if inner.effect_id.trim().is_empty() {
+            return Err(Status::invalid_argument("effect_id required"));
+        }
+        let stored = self
+            .db
+            .get_action_effect(&inner.effect_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("action effect not found"))?;
+        authorize_action_instance_read(self, &principals, &stored.namespace)?;
+        Ok(Response::new(GetActionEffectResponse {
+            effect: Some(to_proto_action_effect(&stored)),
+        }))
+    }
+
+    async fn list_action_effects(
+        &self,
+        req: Request<ListActionEffectsRequest>,
+    ) -> Result<Response<ListActionEffectsResponse>, Status> {
+        use crate::sekai::action_effect::EFFECT_STATUS_PENDING;
+        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let effects = if !inner.instance_id.trim().is_empty() {
+            let listed = self
+                .db
+                .list_action_effects_for_instance(&inner.instance_id)
+                .map_err(Status::internal)?;
+            if let Some(first) = listed.first() {
+                authorize_action_instance_read(self, &principals, &first.namespace)?;
+            } else {
+                require_authenticated(&principals)?;
+            }
+            listed
+        } else if !inner.namespace.trim().is_empty()
+            && (inner.kind.is_empty() || inner.kind == EFFECT_KIND_RUNTIME_DISPATCH)
+            && (inner.status.is_empty() || inner.status == EFFECT_STATUS_PENDING)
+        {
+            authorize_action_instance_read(self, &principals, &inner.namespace)?;
+            let limit = if inner.limit == 0 {
+                100
+            } else {
+                inner.limit as usize
+            };
+            self.db
+                .list_pending_runtime_dispatch_effects(&inner.namespace, limit)
+                .map_err(Status::internal)?
+        } else {
+            return Err(Status::invalid_argument(
+                "instance_id or namespace (pending runtime_dispatch) required",
+            ));
+        };
+        Ok(Response::new(ListActionEffectsResponse {
+            effects: effects.iter().map(to_proto_action_effect).collect(),
+        }))
     }
 
     async fn execute_action(
@@ -18775,6 +18879,146 @@ mod tests {
         assert_eq!(policy_denied.status, STATUS_DENIED);
         assert_eq!(policy_denied.policy_decision, "deny");
         assert!(policy_denied.deny_reason.contains("policy"));
+    }
+
+    #[tokio::test]
+    async fn action_effects_materialize_on_admit_and_notify_fail_retains_instance() {
+        // #398: typed effects on admit; notify failure does not un-admit.
+        use crate::sekai::action_effect::{
+            EFFECT_STATUS_FAILED, EFFECT_STATUS_PENDING, EFFECT_STATUS_SENT,
+        };
+        use crate::sekai::action_instance::STATUS_ADMITTED;
+        use crate::sekai::governed_action_type::{
+            EFFECT_KIND_NOTIFY, EFFECT_KIND_RUNTIME_DISPATCH,
+        };
+
+        let svc = service();
+        grant_action_admin(&svc);
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "dispatch.notify".into(),
+                version: "1.0.0".into(),
+                description: "effects".into(),
+                parameter_schema_json: r#"{"type":"object"}"#.into(),
+                allowed_effect_kinds: vec![
+                    EFFECT_KIND_RUNTIME_DISPATCH.into(),
+                    EFFECT_KIND_NOTIFY.into(),
+                ],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+            }),
+            request_id: "put-fx".into(),
+        }))
+        .await
+        .unwrap();
+
+        let admit = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "dispatch.notify".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"runtime":"shikigami","notify_channel":"slack"}"#.into(),
+                idempotency_key: "fx-1".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-fx-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(admit.status, STATUS_ADMITTED);
+
+        let effects = svc
+            .list_action_effects(with_principal(ListActionEffectsRequest {
+                instance_id: admit.instance_id.clone(),
+                namespace: String::new(),
+                kind: String::new(),
+                status: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effects;
+        assert_eq!(effects.len(), 2);
+        let dispatch = effects
+            .iter()
+            .find(|e| e.kind == EFFECT_KIND_RUNTIME_DISPATCH)
+            .unwrap();
+        assert_eq!(dispatch.status, EFFECT_STATUS_PENDING);
+        let notify = effects
+            .iter()
+            .find(|e| e.kind == EFFECT_KIND_NOTIFY)
+            .unwrap();
+        assert_eq!(notify.status, EFFECT_STATUS_SENT);
+
+        let pending = svc
+            .list_action_effects(with_principal(ListActionEffectsRequest {
+                instance_id: String::new(),
+                namespace: "acme".into(),
+                kind: EFFECT_KIND_RUNTIME_DISPATCH.into(),
+                status: EFFECT_STATUS_PENDING.into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effects;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].effect_id, dispatch.effect_id);
+
+        let got = svc
+            .get_action_effect(with_principal(GetActionEffectRequest {
+                effect_id: dispatch.effect_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effect
+            .unwrap();
+        assert_eq!(got.instance_id, admit.instance_id);
+
+        let fail_admit = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "dispatch.notify".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"notify_delivery":"fail"}"#.into(),
+                idempotency_key: "fx-fail".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-fx-fail".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(fail_admit.status, STATUS_ADMITTED);
+        let fail_effects = svc
+            .list_action_effects(with_principal(ListActionEffectsRequest {
+                instance_id: fail_admit.instance_id.clone(),
+                namespace: String::new(),
+                kind: String::new(),
+                status: String::new(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effects;
+        let failed_notify = fail_effects
+            .iter()
+            .find(|e| e.kind == EFFECT_KIND_NOTIFY)
+            .unwrap();
+        assert_eq!(failed_notify.status, EFFECT_STATUS_FAILED);
+        assert!(failed_notify.failure_reason.contains("best-effort"));
     }
 
     #[tokio::test]
