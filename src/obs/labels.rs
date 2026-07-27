@@ -283,6 +283,28 @@ impl FallbackTrigger {
     }
 }
 
+/// Answer path taken by the S1 lookup-first short-circuit (#281).
+///
+/// Closed vocabulary: either a full structured lookup hit or the model path
+/// (including fail-closed refusals). Never records free-form content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LookupFirstPath {
+    LookupHit,
+    ModelPath,
+}
+
+impl LookupFirstPath {
+    pub const ALL: &'static [LookupFirstPath] =
+        &[LookupFirstPath::LookupHit, LookupFirstPath::ModelPath];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LookupFirstPath::LookupHit => "lookup_hit",
+            LookupFirstPath::ModelPath => "model_path",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,7 +312,7 @@ mod tests {
 
     /// Upper bound on distinct label values across the whole vocabulary. A
     /// change here is a deliberate cardinality decision, not an accident.
-    const MAX_TOTAL_LABEL_VALUES: usize = 40;
+    const MAX_TOTAL_LABEL_VALUES: usize = 42;
 
     fn rendered<T: Copy>(all: &[T], render: fn(T) -> &'static str) -> Vec<&'static str> {
         all.iter().copied().map(render).collect()
@@ -308,6 +330,7 @@ mod tests {
             rendered(LagSurface::ALL, LagSurface::as_str),
             rendered(FallbackTrigger::ALL, FallbackTrigger::as_str),
             rendered(DeduplicationEvent::ALL, DeduplicationEvent::as_str),
+            rendered(LookupFirstPath::ALL, LookupFirstPath::as_str),
         ];
 
         let mut total = 0;
@@ -348,5 +371,6 @@ mod tests {
         assert_eq!(LagSurface::ALL.len(), 3);
         assert_eq!(FallbackTrigger::ALL.len(), 2);
         assert_eq!(DeduplicationEvent::ALL.len(), 2);
+        assert_eq!(LookupFirstPath::ALL.len(), 2);
     }
 }

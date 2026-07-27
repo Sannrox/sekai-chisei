@@ -10,8 +10,8 @@
 //! the histogram buckets installed in [`crate::obs::metrics::handle`].
 
 use crate::obs::labels::{
-    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, Outcome, RejectionReason,
-    Subsystem, WaitKind,
+    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, LookupFirstPath, Outcome,
+    RejectionReason, Subsystem, WaitKind,
 };
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -27,6 +27,7 @@ pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
 pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
 pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
 pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
+pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
 
 /// Register descriptions for every signal family.
 ///
@@ -59,6 +60,10 @@ pub fn describe_all() {
     describe_counter!(
         DEDUPLICATION_TOTAL,
         "Deduplication and idempotency decisions"
+    );
+    describe_counter!(
+        LOOKUP_FIRST_TOTAL,
+        "Lookup-first answer path decisions (hit vs model)"
     );
 }
 
@@ -146,6 +151,11 @@ pub fn record_deduplication(subsystem: Subsystem, event: DeduplicationEvent) {
     .increment(1);
 }
 
+/// Record a lookup-first answer path decision (#281 S1).
+pub fn record_lookup_first(path: LookupFirstPath) {
+    counter!(LOOKUP_FIRST_TOTAL, "path" => path.as_str()).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +176,7 @@ mod tests {
             FALLBACK_TOTAL,
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
         ] {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
@@ -183,6 +194,7 @@ mod tests {
             FALLBACK_TOTAL,
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
         ] {
             assert!(
                 name.ends_with("_total"),
