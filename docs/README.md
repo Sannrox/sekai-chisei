@@ -21,15 +21,25 @@ in order.
   model set through CLI, gRPC, or HTTP.
 - [Responses harness profile](responses-harness-profile.md) — implement the
   supported request, streaming, and error contract.
+- [Capability catalog](capability-catalog.md) — discover visible queries,
+  retrieval, and governed actions without treating visibility as a grant.
 - [`proto/`](../proto/) — inspect the native gRPC APIs.
 - [Ontology definitions](ontology.md) — model semantic classes and relations,
   project schemas, and understand current validation boundaries.
 - [Standalone ontology](../crates/sekai-ontology/README.md) — use an ontology
   library and SQLite command-line tool in a separate application.
+- [SQLite FTS text representation](text-fts.md) — rebuildable lexical projection
+  and `HybridCandidate` envelope (`text.fts5_bm25/v1`, #360).
+- [Late-fusion hybrid retrieval](hybrid-retrieval.md) — explicit graph + FTS
+  plan under versioned fusion profiles (#361).
 - [External evidence adapters](../adapters/README.md) — submit evidence through
   the versioned adapter contract.
 - [External-action execution evidence](external-action-execution.md) — report
   host lifecycle observations and reconcile missing terminal evidence.
+- [Coordination leases](leases.md) — object-bound fencing, generations, and
+  lease-guarded mutations.
+- [Region/site pins](region-pins.md) — single-writer pins for leases and online
+  permit redemption (#293).
 - [Tenant isolation conformance](tenant-isolation-conformance.md) — run the
   reusable enterprise extension isolation suite or community negative profile.
 
@@ -39,6 +49,10 @@ in order.
   environment variables.
 - [Operations and security](operations.md) — credentials, TLS, observability,
   backups, and deployment checks.
+- [Budget topology](budget-topology.md) — multi-region budget modes and site
+  pins (#294).
+- [Replica safety](replica-safety.md) — multi-replica durable authority inventory
+  and two-replica harness.
 - [Operator console](operator-console.md) — authenticated browser shell on the
   ops listener (login, namespace context, fail-closed routes).
 - [Docker](docker.md) — run the server and gateway with Docker Compose.
@@ -61,8 +75,8 @@ in order.
 - [Operator console information architecture](research/283-operator-console-ia.md)
 - [Lookup vs model call (S1 shipped via #281)](research/175-lookup-vs-model-call.md)
 - [Governed hybrid retrieval contract](research/152-hybrid-retrieval.md)
-- [SQLite FTS text representation and HybridCandidate](text-fts.md) — rebuildable
-  lexical projection, `text.fts5_bm25/v1`, authz re-check (#360).
+  — operator guides: [text-fts.md](text-fts.md) (#360),
+  [hybrid-retrieval.md](hybrid-retrieval.md) (#361).
 - [Semantic pattern-query surface](research/145-semantic-pattern-query.md)
 - [Multi-hop pattern plan IR (`pattern_plan/v1`)](pattern-plan.md) — structured
   execute + EXPLAIN (#375); no SQL/SPARQL/Cypher
@@ -75,7 +89,8 @@ in order.
   hypothesis deltas and domain-neutral impact projection (#362).
 - [Gateway PEP fat-decide freeze](research/163-gateway-pep-fat-decide.md)
 - [Provider and data-class residency](residency-policy.md)
-  — research recommendation for bounded automatic dispatch (#279 → #280).
+  — model/provider residency policy (#289); research:
+  [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
 - [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
   tenant-free Sekai surface set, inventory evidence, and remaining runtime
   activation gates.
