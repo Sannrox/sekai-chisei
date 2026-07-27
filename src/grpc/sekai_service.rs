@@ -5714,6 +5714,48 @@ fn authorize_package_mutation(
         .ok_or_else(|| Status::unauthenticated("principal required"))
 }
 
+fn from_proto_governed_action_type(
+    proto: super::pb::sekai::GovernedActionType,
+) -> Result<crate::sekai::governed_action_type::GovernedActionType, Status> {
+    let domain = crate::sekai::governed_action_type::GovernedActionType {
+        namespace: proto.namespace,
+        type_id: proto.type_id,
+        version: proto.version,
+        description: proto.description,
+        parameter_schema_json: proto.parameter_schema_json,
+        allowed_effect_kinds: proto.allowed_effect_kinds,
+        policy_scope: proto.policy_scope,
+        budget_scope: proto.budget_scope,
+        enabled: proto.enabled,
+        created_by: proto.created_by,
+        created_at_ms: proto.created_at_ms,
+        updated_at_ms: proto.updated_at_ms,
+        disabled_at_ms: proto.disabled_at_ms,
+    };
+    domain.validate().map_err(Status::invalid_argument)?;
+    Ok(domain)
+}
+
+fn to_proto_governed_action_type(
+    domain: &crate::sekai::governed_action_type::GovernedActionType,
+) -> super::pb::sekai::GovernedActionType {
+    super::pb::sekai::GovernedActionType {
+        namespace: domain.namespace.clone(),
+        type_id: domain.type_id.clone(),
+        version: domain.version.clone(),
+        description: domain.description.clone(),
+        parameter_schema_json: domain.parameter_schema_json.clone(),
+        allowed_effect_kinds: domain.allowed_effect_kinds.clone(),
+        policy_scope: domain.policy_scope.clone(),
+        budget_scope: domain.budget_scope.clone(),
+        enabled: domain.enabled,
+        created_by: domain.created_by.clone(),
+        created_at_ms: domain.created_at_ms,
+        updated_at_ms: domain.updated_at_ms,
+        disabled_at_ms: domain.disabled_at_ms,
+    }
+}
+
 /// Lease keys that coordinate an existing object use this prefix so the
 /// coordination identity cannot be squatted without object ACL access.
 const OBJECT_BOUND_LEASE_KEY_PREFIX: &str = "object:";
@@ -9724,6 +9766,113 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|_| Status::internal("action registry unavailable"))?
             .remove_action_type(&name);
         Ok(Response::new(DeleteActionTypeResponse {}))
+    }
+
+    async fn put_governed_action_type(
+        &self,
+        req: Request<PutGovernedActionTypeRequest>,
+    ) -> Result<Response<PutGovernedActionTypeResponse>, Status> {
+        // Governed Action type registry (#396). Distinct from graph CreateActionType.
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let proto = inner
+            .r#type
+            .ok_or_else(|| Status::invalid_argument("type required"))?;
+        let actor = authorize_package_mutation(self, &principals, &proto.namespace)?;
+        let domain = from_proto_governed_action_type(proto)?;
+        let stored = self
+            .db
+            .put_governed_action_type(domain, &actor, now_millis())
+            .map_err(|e| {
+                if e.contains("immutable") || e.contains("required") || e.contains("unknown effect")
+                {
+                    Status::invalid_argument(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+        Ok(Response::new(PutGovernedActionTypeResponse {
+            r#type: Some(to_proto_governed_action_type(&stored)),
+        }))
+    }
+
+    async fn get_governed_action_type(
+        &self,
+        req: Request<GetGovernedActionTypeRequest>,
+    ) -> Result<Response<GetGovernedActionTypeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        check_action_admin(
+            &self.security,
+            &format!("governed_action:{}", inner.namespace),
+            &principals,
+        )?;
+        let stored = self
+            .db
+            .get_governed_action_type(&inner.namespace, &inner.type_id, &inner.version)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("governed action type not found"))?;
+        Ok(Response::new(GetGovernedActionTypeResponse {
+            r#type: Some(to_proto_governed_action_type(&stored)),
+        }))
+    }
+
+    async fn list_governed_action_types(
+        &self,
+        req: Request<ListGovernedActionTypesRequest>,
+    ) -> Result<Response<ListGovernedActionTypesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        check_action_admin(
+            &self.security,
+            &format!("governed_action:{}", inner.namespace),
+            &principals,
+        )?;
+        let type_id = if inner.type_id.trim().is_empty() {
+            None
+        } else {
+            Some(inner.type_id.as_str())
+        };
+        let types = self
+            .db
+            .list_governed_action_types(&inner.namespace, type_id, inner.enabled_only)
+            .map_err(Status::internal)?
+            .iter()
+            .map(to_proto_governed_action_type)
+            .collect();
+        Ok(Response::new(ListGovernedActionTypesResponse { types }))
+    }
+
+    async fn set_governed_action_type_enabled(
+        &self,
+        req: Request<SetGovernedActionTypeEnabledRequest>,
+    ) -> Result<Response<SetGovernedActionTypeEnabledResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let _actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let stored = self
+            .db
+            .set_governed_action_type_enabled(
+                &inner.namespace,
+                &inner.type_id,
+                &inner.version,
+                inner.enabled,
+                now_millis(),
+            )
+            .map_err(|e| {
+                if e.contains("not found") {
+                    Status::not_found(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+        Ok(Response::new(SetGovernedActionTypeEnabledResponse {
+            r#type: Some(to_proto_governed_action_type(&stored)),
+        }))
     }
 
     async fn execute_action(
@@ -17919,6 +18068,105 @@ mod tests {
                 .name,
             "after"
         );
+    }
+
+    #[tokio::test]
+    async fn governed_action_type_registry_put_get_list_disable() {
+        // #396: namespace-scoped governed Action type registry (not graph ActionType).
+        let svc = service();
+        grant_action_admin(&svc);
+        let type_def = GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "review.intake".into(),
+            version: "1.0.0".into(),
+            description: "Admit review".into(),
+            parameter_schema_json: r#"{"type":"object"}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into(), "notify".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+        };
+        let put = svc
+            .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+                r#type: Some(type_def.clone()),
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .r#type
+            .unwrap();
+        assert!(put.enabled);
+        assert_eq!(put.created_by, "tester");
+
+        let got = svc
+            .get_governed_action_type(with_principal(GetGovernedActionTypeRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .r#type
+            .unwrap();
+        assert_eq!(got.type_id, "review.intake");
+
+        let listed = svc
+            .list_governed_action_types(with_principal(ListGovernedActionTypesRequest {
+                namespace: "acme".into(),
+                type_id: String::new(),
+                enabled_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .types;
+        assert_eq!(listed.len(), 1);
+
+        // Version immutability
+        let mut changed = type_def.clone();
+        changed.description = "nope".into();
+        let err = svc
+            .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+                r#type: Some(changed),
+                request_id: "put-bad".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        svc.set_governed_action_type_enabled(with_principal(SetGovernedActionTypeEnabledRequest {
+            namespace: "acme".into(),
+            type_id: "review.intake".into(),
+            version: "1.0.0".into(),
+            enabled: false,
+            request_id: "disable-1".into(),
+        }))
+        .await
+        .unwrap();
+        let deny = svc
+            .db
+            .require_enabled_governed_action_type("acme", "review.intake", "1.0.0")
+            .unwrap_err();
+        assert!(deny.contains("disabled"), "{deny}");
+
+        // Unauthorized principal
+        let denied = svc
+            .put_governed_action_type(with_named_principal(
+                PutGovernedActionTypeRequest {
+                    r#type: Some(type_def),
+                    request_id: "put-denied".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

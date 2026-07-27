@@ -186,6 +186,7 @@ impl SekaiDb {
         self.migrate_chisei()?;
         self.migrate_kioku()?;
         self.migrate_action_types()?;
+        self.migrate_governed_action_types()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
         self.migrate_temporal_history()?;

@@ -1238,6 +1238,42 @@ message ListActionTypesResponse { repeated ActionTypeDef action_types = 1; }
 message DeleteActionTypeRequest { string name = 1; }
 message DeleteActionTypeResponse {}
 
+// Governed Action type registry (#396 / research #395). Distinct from graph ActionTypeDef.
+message GovernedActionType {
+  string namespace = 1;
+  string type_id = 2;
+  string version = 3;
+  string description = 4;
+  string parameter_schema_json = 5;
+  repeated string allowed_effect_kinds = 6;
+  string policy_scope = 7;
+  string budget_scope = 8;
+  bool enabled = 9;
+  string created_by = 10;
+  int64 created_at_ms = 11;
+  int64 updated_at_ms = 12;
+  int64 disabled_at_ms = 13;
+}
+message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
+message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
+message GetGovernedActionTypeRequest { string namespace = 1; string type_id = 2; string version = 3; }
+message GetGovernedActionTypeResponse { GovernedActionType type = 1; }
+message ListGovernedActionTypesRequest {
+  string namespace = 1;
+  string type_id = 2;
+  bool enabled_only = 3;
+}
+message ListGovernedActionTypesResponse { repeated GovernedActionType types = 1; }
+message SetGovernedActionTypeEnabledRequest {
+  string namespace = 1;
+  string type_id = 2;
+  string version = 3;
+  bool enabled = 4;
+  string request_id = 5;
+}
+message SetGovernedActionTypeEnabledResponse { GovernedActionType type = 1; }
+
+
 message ExecuteActionRequest {
   ActionRequest request = 1;
   bool dry_run = 2; // when true, plan and policy-check without mutating
@@ -1945,6 +1981,11 @@ service SekaiService {
   rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);
   rpc DeleteActionType(DeleteActionTypeRequest) returns (DeleteActionTypeResponse);
+  // Governed Action type registry (#396). Not graph CreateActionType.
+  rpc PutGovernedActionType(PutGovernedActionTypeRequest) returns (PutGovernedActionTypeResponse);
+  rpc GetGovernedActionType(GetGovernedActionTypeRequest) returns (GetGovernedActionTypeResponse);
+  rpc ListGovernedActionTypes(ListGovernedActionTypesRequest) returns (ListGovernedActionTypesResponse);
+  rpc SetGovernedActionTypeEnabled(SetGovernedActionTypeEnabledRequest) returns (SetGovernedActionTypeEnabledResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);

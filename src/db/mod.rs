@@ -46,6 +46,7 @@ mod postgres_evidence;
 mod postgres_external_action;
 mod postgres_external_permit;
 mod postgres_function;
+mod postgres_governed_action_type;
 mod postgres_grants;
 mod postgres_guarded_mutation;
 mod postgres_handoff;
