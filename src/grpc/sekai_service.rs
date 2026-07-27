@@ -39,7 +39,7 @@ use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
     audit, compute, coordination, dataset, function, hybrid, ontology, ontology_proposal,
-    retrieval, scenario, security, semantic, text_fts,
+    pattern_plan, retrieval, scenario, security, semantic, text_fts,
 };
 use uuid::Uuid;
 
@@ -1014,6 +1014,77 @@ impl SekaiServiceImpl {
         })
     }
 
+    fn run_execute_pattern_plan(
+        &self,
+        principals: &[String],
+        inner: ExecutePatternPlanRequest,
+    ) -> Result<ExecutePatternPlanResponse, Status> {
+        let plan = from_proto_pattern_plan(inner.plan)?;
+        let (relation_visible, kind_visible) =
+            pattern_plan_name_visibility(&self.db, &self.security, principals);
+        let security = Arc::clone(&self.security);
+        let db = Arc::clone(&self.db);
+        let principals_owned = principals.to_vec();
+        let object_visible = move |object: &domain::Object| {
+            let principal_refs: Vec<&str> = principals_owned.iter().map(String::as_str).collect();
+            security.can_access(&object.id, &principal_refs)
+                && check_team_namespace(&db, &principals_owned, &object.namespace, false).is_ok()
+                && object_passes_marking(&db, object, &principals_owned).unwrap_or(false)
+                && !is_reserved_governance_kind(&object.kind)
+        };
+        let result = pattern_plan::execute_plan(
+            &self.db,
+            &plan,
+            inner.include_objects,
+            &object_visible,
+            Some(&relation_visible),
+            Some(&kind_visible),
+        )
+        .map_err(map_pattern_plan_error)?;
+        let include_objects = inner.include_objects;
+        Ok(ExecutePatternPlanResponse {
+            plan_version: result.plan_version,
+            rows: result
+                .rows
+                .into_iter()
+                .map(|row| to_proto_pattern_binding(row, include_objects))
+                .collect(),
+            truncated: result.truncated,
+            truncation_reasons: result.truncation_reasons,
+            source_rows: result.source_rows,
+        })
+    }
+
+    fn run_explain_pattern_plan(
+        &self,
+        principals: &[String],
+        inner: ExplainPatternPlanRequest,
+    ) -> Result<ExplainPatternPlanResponse, Status> {
+        let plan = from_proto_pattern_plan(inner.plan)?;
+        let (relation_visible, kind_visible) =
+            pattern_plan_name_visibility(&self.db, &self.security, principals);
+        let explained =
+            pattern_plan::explain_plan(&plan, Some(&relation_visible), Some(&kind_visible))
+                .map_err(map_pattern_plan_error)?;
+        Ok(ExplainPatternPlanResponse {
+            plan_version: explained.plan_version,
+            bounds: Some(to_proto_pattern_bounds(&explained.bounds)),
+            steps: explained
+                .steps
+                .into_iter()
+                .map(|step| PatternExplainStep {
+                    index: step.index,
+                    op: step.op,
+                    summary: step.summary,
+                    vars_in: step.vars_in,
+                    vars_out: step.vars_out,
+                })
+                .collect(),
+            expand_edge_count: explained.expand_edge_count,
+            projected_vars: explained.projected_vars,
+        })
+    }
+
     fn run_hybrid_graph_adapter(
         &self,
         principals: &[String],
@@ -1292,6 +1363,8 @@ impl SekaiServiceImpl {
         entries.push(retrieve_context_capability());
         entries.push(search_text_capability());
         entries.push(hybrid_retrieve_capability());
+        entries.push(execute_pattern_plan_capability());
+        entries.push(explain_pattern_plan_capability());
         entries.push(explain_derivation_capability());
         entries.push(evaluate_scenario_capability());
         entries.push(kioku_candidates_capability());
@@ -2009,6 +2082,80 @@ fn search_text_capability() -> CapabilityEntry {
         "score_kind_text_fts5_bm25_v1".into(),
         "authz_recheck_per_hit".into(),
         "entity_ref_from_source_of_truth_only".into(),
+    ];
+    entry
+}
+
+fn execute_pattern_plan_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_EXECUTE_PATTERN_PLAN.into(),
+        "Execute a versioned multi-hop pattern plan (pattern_plan/v1) with hop-time ACL re-check and hard bounds.".into(),
+        "retrieval",
+        "sekai.ExecutePatternPlanRequest",
+        "sekai.ExecutePatternPlanResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+        "ontology_acl".into(),
+    ];
+    entry.limits = {
+        let mut limits = semantic_reasoning_limits();
+        limits.push(CapabilityLimit {
+            name: "max_depth".into(),
+            value: u64::from(pattern_plan::MAX_DEPTH),
+        });
+        limits.push(CapabilityLimit {
+            name: "max_rows".into(),
+            value: u64::from(pattern_plan::MAX_ROWS),
+        });
+        limits.push(CapabilityLimit {
+            name: "plan_version_pattern_plan_v1".into(),
+            value: 1,
+        });
+        limits.push(CapabilityLimit {
+            name: "asserted_graph_only".into(),
+            value: 1,
+        });
+        limits
+    };
+    entry.evidence_requirements = vec![
+        "pattern_plan_ir_v1".into(),
+        "hop_time_acl_recheck".into(),
+        "fail_closed_denied_hops".into(),
+        "deterministic_ordering".into(),
+    ];
+    entry
+}
+
+fn explain_pattern_plan_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_EXPLAIN_PATTERN_PLAN.into(),
+        "Deterministic EXPLAIN of a multi-hop pattern plan shape (no graph side effects).".into(),
+        "retrieval",
+        "sekai.ExplainPatternPlanRequest",
+        "sekai.ExplainPatternPlanResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec!["ontology_acl".into()];
+    entry.limits = {
+        let mut limits = semantic_reasoning_limits();
+        limits.push(CapabilityLimit {
+            name: "plan_version_pattern_plan_v1".into(),
+            value: 1,
+        });
+        limits.push(CapabilityLimit {
+            name: "side_effect_free".into(),
+            value: 1,
+        });
+        limits
+    };
+    entry.evidence_requirements = vec![
+        "pattern_plan_ir_v1".into(),
+        "explain_plan_shape_only".into(),
+        "plan_time_name_visibility".into(),
     ];
     entry
 }
@@ -5092,6 +5239,171 @@ fn map_hybrid_error(error: hybrid::HybridError) -> Status {
     }
 }
 
+fn map_pattern_plan_error(error: pattern_plan::PatternPlanError) -> Status {
+    match error {
+        pattern_plan::PatternPlanError::InvalidArgument(message) => {
+            Status::invalid_argument(message)
+        }
+        // Non-disclosing: never echo hidden relation/kind/object names.
+        pattern_plan::PatternPlanError::PolicyDenied(_) => {
+            Status::permission_denied("access denied")
+        }
+        pattern_plan::PatternPlanError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn from_proto_pattern_bounds(bounds: Option<PatternPlanBounds>) -> pattern_plan::PatternPlanBounds {
+    let Some(b) = bounds else {
+        return pattern_plan::PatternPlanBounds::default();
+    };
+    pattern_plan::PatternPlanBounds {
+        max_depth: b.max_depth,
+        max_rows: b.max_rows,
+        max_time_ms: b.max_time_ms,
+        max_memory_bytes: b.max_memory_bytes,
+        max_source_rows: b.max_source_rows,
+    }
+}
+
+fn from_proto_pattern_step(step: PatternStep) -> Result<pattern_plan::PatternStep, Status> {
+    let match_set = step.match_node.is_some();
+    let expand_set = step.expand_edge.is_some();
+    let bind_set = step.bind.is_some();
+    let set_count = usize::from(match_set) + usize::from(expand_set) + usize::from(bind_set);
+    if set_count != 1 {
+        return Err(Status::invalid_argument(
+            "pattern step requires exactly one of match_node, expand_edge, or bind",
+        ));
+    }
+    if let Some(m) = step.match_node {
+        return Ok(pattern_plan::PatternStep::MatchNode(
+            pattern_plan::MatchNodeStep {
+                var: m.var,
+                object_id: m.object_id,
+                external_id: m.external_id,
+                kind: m.kind,
+            },
+        ));
+    }
+    if let Some(e) = step.expand_edge {
+        let direction =
+            pattern_plan::direction_from_wire(&e.direction).map_err(map_pattern_plan_error)?;
+        return Ok(pattern_plan::PatternStep::ExpandEdge(
+            pattern_plan::ExpandEdgeStep {
+                from_var: e.from_var,
+                to_var: e.to_var,
+                relation: e.relation,
+                direction,
+                kind_filter: e.kind_filter,
+            },
+        ));
+    }
+    let b = step.bind.expect("bind set");
+    Ok(pattern_plan::PatternStep::Bind(pattern_plan::BindStep {
+        vars: b.vars,
+    }))
+}
+
+fn from_proto_pattern_plan(plan: Option<PatternPlan>) -> Result<pattern_plan::PatternPlan, Status> {
+    let Some(plan) = plan else {
+        return Err(Status::invalid_argument("pattern plan is required"));
+    };
+    let steps = plan
+        .steps
+        .into_iter()
+        .map(from_proto_pattern_step)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(pattern_plan::PatternPlan {
+        version: plan.version,
+        bounds: from_proto_pattern_bounds(plan.bounds),
+        steps,
+    })
+}
+
+fn to_proto_pattern_bounds(bounds: &pattern_plan::PatternPlanBounds) -> PatternPlanBounds {
+    PatternPlanBounds {
+        max_depth: bounds.max_depth,
+        max_rows: bounds.max_rows,
+        max_time_ms: bounds.max_time_ms,
+        max_memory_bytes: bounds.max_memory_bytes,
+        max_source_rows: bounds.max_source_rows,
+    }
+}
+
+fn to_proto_pattern_binding(
+    binding: pattern_plan::PatternBinding,
+    include_objects: bool,
+) -> PatternBinding {
+    PatternBinding {
+        vars: binding.vars.into_iter().collect(),
+        objects: if include_objects {
+            binding
+                .objects
+                .into_iter()
+                .map(|(var, obj)| (var, to_proto_obj(&obj)))
+                .collect()
+        } else {
+            Default::default()
+        },
+    }
+}
+
+fn pattern_plan_name_visibility(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    principals: &[String],
+) -> (impl Fn(&str) -> bool + use<>, impl Fn(&str) -> bool + use<>) {
+    // Plan-time visibility: ontology-defined relation/class names the principal
+    // cannot read are hidden. Free-form asserted names (not in ontology) remain
+    // usable; hop-time object ACL is the data gate.
+    let relations = db.list_ontology_relations().unwrap_or_default();
+    let classes = db.list_ontology_classes().unwrap_or_default();
+    let mut hidden_relations = std::collections::HashSet::new();
+    let mut known_relations = std::collections::HashSet::new();
+    for relation in relations {
+        known_relations.insert(relation.name.clone());
+        if check_read(
+            security,
+            &ontology_relation_object_id(&relation.name),
+            principals,
+        )
+        .is_err()
+        {
+            hidden_relations.insert(relation.name);
+        }
+    }
+    let mut hidden_kinds = std::collections::HashSet::new();
+    let mut known_kinds = std::collections::HashSet::new();
+    for class in classes {
+        let kind_name = if class.mapped_kind.is_empty() {
+            class.name.clone()
+        } else {
+            class.mapped_kind.clone()
+        };
+        known_kinds.insert(kind_name.clone());
+        known_kinds.insert(class.name.clone());
+        if check_read(security, &ontology_class_object_id(&class.name), principals).is_err() {
+            hidden_kinds.insert(kind_name);
+            hidden_kinds.insert(class.name);
+        }
+    }
+    let relation_visible = move |name: &str| {
+        if !known_relations.contains(name) {
+            true
+        } else {
+            !hidden_relations.contains(name)
+        }
+    };
+    let kind_visible = move |name: &str| {
+        if !known_kinds.contains(name) {
+            true
+        } else {
+            !hidden_kinds.contains(name)
+        }
+    };
+    (relation_visible, kind_visible)
+}
+
 fn to_proto_hybrid_candidate(candidate: hybrid::HybridCandidate) -> HybridCandidate {
     HybridCandidate {
         representation_id: candidate.representation_id,
@@ -7468,6 +7780,70 @@ impl SekaiService for SekaiServiceImpl {
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
         let response = self.execute_hybrid_retrieve(&principals, req.into_inner())?;
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn execute_pattern_plan(
+        &self,
+        req: Request<ExecutePatternPlanRequest>,
+    ) -> Result<Response<ExecutePatternPlanResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default();
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_EXECUTE_PATTERN_PLAN,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let response = self.run_execute_pattern_plan(&principals, req.into_inner())?;
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn explain_pattern_plan(
+        &self,
+        req: Request<ExplainPatternPlanRequest>,
+    ) -> Result<Response<ExplainPatternPlanResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default();
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_EXPLAIN_PATTERN_PLAN,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let response = self.run_explain_pattern_plan(&principals, req.into_inner())?;
         if let Some((_, guard)) = receipt_guard.as_mut() {
             guard.finalize("allow", "succeeded")?;
         }
@@ -23368,6 +23744,344 @@ mod tests {
                     .any(|r| r == "max_per_representation" || r == "max_candidates")
             );
         }
+    }
+
+    fn pattern_entity(id: &str, name: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: "widget".into(),
+            name: name.into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("name".into(), name.into())]),
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    fn three_hop_pattern_plan(root_id: &str) -> PatternPlan {
+        PatternPlan {
+            version: pattern_plan::PLAN_VERSION_V1.into(),
+            bounds: Some(PatternPlanBounds {
+                max_depth: 3,
+                max_rows: 20,
+                max_time_ms: 500,
+                max_memory_bytes: 0,
+                max_source_rows: 200,
+            }),
+            steps: vec![
+                PatternStep {
+                    match_node: Some(PatternMatchNode {
+                        var: "A".into(),
+                        object_id: root_id.into(),
+                        external_id: String::new(),
+                        kind: String::new(),
+                    }),
+                    ..Default::default()
+                },
+                PatternStep {
+                    expand_edge: Some(PatternExpandEdge {
+                        from_var: "A".into(),
+                        to_var: "B".into(),
+                        relation: "rel_works_for".into(),
+                        direction: "outgoing".into(),
+                        kind_filter: vec![],
+                    }),
+                    ..Default::default()
+                },
+                PatternStep {
+                    expand_edge: Some(PatternExpandEdge {
+                        from_var: "B".into(),
+                        to_var: "C".into(),
+                        relation: "rel_owns".into(),
+                        direction: "outgoing".into(),
+                        kind_filter: vec![],
+                    }),
+                    ..Default::default()
+                },
+                PatternStep {
+                    expand_edge: Some(PatternExpandEdge {
+                        from_var: "C".into(),
+                        to_var: "D".into(),
+                        relation: "rel_uses".into(),
+                        direction: "outgoing".into(),
+                        kind_filter: vec![],
+                    }),
+                    ..Default::default()
+                },
+                PatternStep {
+                    bind: Some(PatternBind {
+                        vars: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+                    }),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    async fn seed_pattern_fixture(svc: &SekaiServiceImpl) {
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, name) in [
+            ("pp-a", "alice"),
+            ("pp-b", "company"),
+            ("pp-c", "project"),
+            ("pp-d", "dataset"),
+            ("pp-secret", "secret-hop"),
+            ("pp-after-secret", "after-secret"),
+        ] {
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(pattern_entity(id, name)),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        for (id, from, to, rel) in [
+            ("pp-e1", "pp-a", "pp-b", "rel_works_for"),
+            ("pp-e2", "pp-b", "pp-c", "rel_owns"),
+            ("pp-e3", "pp-c", "pp-d", "rel_uses"),
+            ("pp-es1", "pp-a", "pp-secret", "rel_works_for"),
+            ("pp-es2", "pp-secret", "pp-after-secret", "rel_owns"),
+        ] {
+            svc.create_link(with_named_principal(
+                CreateLinkRequest {
+                    link: Some(Link {
+                        id: id.into(),
+                        from_id: from.into(),
+                        to_id: to.into(),
+                        relation: rel.into(),
+                        created: 0,
+                    }),
+                    fail_if_exists: false,
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_pattern_plan_multi_hop_returns_authorized_bindings() {
+        let svc = service();
+        seed_pattern_fixture(&svc).await;
+        let response = svc
+            .execute_pattern_plan(with_named_principal(
+                ExecutePatternPlanRequest {
+                    plan: Some(three_hop_pattern_plan("pp-a")),
+                    include_objects: false,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.plan_version, pattern_plan::PLAN_VERSION_V1);
+        assert_eq!(response.rows.len(), 1);
+        let row = &response.rows[0];
+        assert_eq!(row.vars.get("A").map(String::as_str), Some("pp-a"));
+        assert_eq!(row.vars.get("B").map(String::as_str), Some("pp-b"));
+        assert_eq!(row.vars.get("C").map(String::as_str), Some("pp-c"));
+        assert_eq!(row.vars.get("D").map(String::as_str), Some("pp-d"));
+        assert!(!response.truncated);
+    }
+
+    #[tokio::test]
+    async fn execute_pattern_plan_denied_intermediate_fails_closed() {
+        let svc = service();
+        seed_pattern_fixture(&svc).await;
+        // ACL on secret intermediate: only root can see it.
+        add_object_grant(&svc, "pp-secret", "root", security::Role::Viewer);
+        add_object_grant(&svc, "pp-after-secret", "root", security::Role::Viewer);
+
+        let response = svc
+            .execute_pattern_plan(with_named_principal(
+                ExecutePatternPlanRequest {
+                    plan: Some(three_hop_pattern_plan("pp-a")),
+                    include_objects: false,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        // Authorized path remains; secret branch is absent, not errored.
+        assert_eq!(response.rows.len(), 1);
+        assert_eq!(
+            response.rows[0].vars.get("B").map(String::as_str),
+            Some("pp-b")
+        );
+        for row in &response.rows {
+            for id in row.vars.values() {
+                assert_ne!(id, "pp-secret");
+                assert_ne!(id, "pp-after-secret");
+            }
+        }
+        for reason in &response.truncation_reasons {
+            assert!(!reason.contains("secret"));
+            assert!(!reason.contains("pp-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_pattern_plan_is_deterministic() {
+        let svc = service();
+        seed_pattern_fixture(&svc).await;
+        // Second company branch for ordering stress.
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(pattern_entity("pp-b2", "company-2")),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.create_link(with_named_principal(
+            CreateLinkRequest {
+                link: Some(Link {
+                    id: "pp-e1b".into(),
+                    from_id: "pp-a".into(),
+                    to_id: "pp-b2".into(),
+                    relation: "rel_works_for".into(),
+                    created: 0,
+                }),
+                fail_if_exists: false,
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.create_link(with_named_principal(
+            CreateLinkRequest {
+                link: Some(Link {
+                    id: "pp-e2b".into(),
+                    from_id: "pp-b2".into(),
+                    to_id: "pp-c".into(),
+                    relation: "rel_owns".into(),
+                    created: 0,
+                }),
+                fail_if_exists: false,
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let req = ExecutePatternPlanRequest {
+            plan: Some(three_hop_pattern_plan("pp-a")),
+            include_objects: false,
+        };
+        let a = svc
+            .execute_pattern_plan(with_named_principal(req.clone(), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        let b = svc
+            .execute_pattern_plan(with_named_principal(req, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(a.truncation_reasons, b.truncation_reasons);
+        assert_eq!(a.source_rows, b.source_rows);
+        let bs: Vec<_> = a
+            .rows
+            .iter()
+            .map(|r| r.vars.get("B").cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(bs, vec!["pp-b".to_string(), "pp-b2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn explain_pattern_plan_is_stable_without_side_effects() {
+        let svc = service();
+        // EXPLAIN does not require graph state.
+        let plan = three_hop_pattern_plan("pp-a");
+        let a = svc
+            .explain_pattern_plan(with_named_principal(
+                ExplainPatternPlanRequest {
+                    plan: Some(plan.clone()),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let b = svc
+            .explain_pattern_plan(with_named_principal(
+                ExplainPatternPlanRequest { plan: Some(plan) },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(a, b);
+        assert_eq!(a.plan_version, pattern_plan::PLAN_VERSION_V1);
+        assert_eq!(a.expand_edge_count, 3);
+        assert_eq!(a.projected_vars, vec!["A", "B", "C", "D"]);
+        assert_eq!(a.steps.len(), 5);
+        for step in &a.steps {
+            assert!(!step.summary.contains("pp-secret"));
+            assert!(!step.summary.contains("found="));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_pattern_plan_rejects_invalid_version() {
+        let svc = service();
+        let mut plan = three_hop_pattern_plan("pp-a");
+        plan.version = "pattern_plan/v0".into();
+        let err = svc
+            .execute_pattern_plan(with_named_principal(
+                ExecutePatternPlanRequest {
+                    plan: Some(plan),
+                    include_objects: false,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown pattern plan version"));
+    }
+
+    #[tokio::test]
+    async fn execute_pattern_plan_rejects_unbound_from_var() {
+        let svc = service();
+        let plan = PatternPlan {
+            version: pattern_plan::PLAN_VERSION_V1.into(),
+            bounds: Some(PatternPlanBounds::default()),
+            steps: vec![PatternStep {
+                expand_edge: Some(PatternExpandEdge {
+                    from_var: "A".into(),
+                    to_var: "B".into(),
+                    relation: "rel".into(),
+                    direction: "outgoing".into(),
+                    kind_filter: vec![],
+                }),
+                ..Default::default()
+            }],
+        };
+        let err = svc
+            .execute_pattern_plan(with_named_principal(
+                ExecutePatternPlanRequest {
+                    plan: Some(plan),
+                    include_objects: false,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

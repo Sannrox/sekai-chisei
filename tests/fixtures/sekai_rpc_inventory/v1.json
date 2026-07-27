@@ -322,6 +322,32 @@
       ]
     },
     {
+      "rpc": "ExecutePatternPlan",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/pattern_plan.rs",
+        "docs/pattern-plan.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization"
+      ]
+    },
+    {
+      "rpc": "ExplainPatternPlan",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/pattern_plan.rs",
+        "docs/pattern-plan.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization"
+      ]
+    },
+    {
       "rpc": "EvaluateScenario",
       "kind": "computed",
       "surfaces": [],
