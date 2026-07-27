@@ -1831,6 +1831,101 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_claimable_action_work(
+        &self,
+        namespace: &str,
+        runtime_id: Option<&str>,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_claimable_action_work(namespace, runtime_id, now_ms, limit),
+            Self::Postgres(db) => {
+                db.list_claimable_action_work(namespace, runtime_id, now_ms, limit)
+            }
+        }
+    }
+
+    pub fn claim_action_work(
+        &self,
+        effect_id: &str,
+        runtime_id: &str,
+        request_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.claim_action_work(effect_id, runtime_id, request_id, ttl_ms, now_ms)
+            }
+            Self::Postgres(db) => {
+                db.claim_action_work(effect_id, runtime_id, request_id, ttl_ms, now_ms)
+            }
+        }
+    }
+
+    pub fn heartbeat_action_claim(
+        &self,
+        effect_id: &str,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
+        match self {
+            Self::Sqlite(db) => db.heartbeat_action_claim(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                ttl_ms,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.heartbeat_action_claim(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                ttl_ms,
+                now_ms,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ack_action_work(
+        &self,
+        effect_id: &str,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token: &str,
+        outcome: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
+        match self {
+            Self::Sqlite(db) => db.ack_action_work(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                outcome,
+                reason,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.ack_action_work(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                outcome,
+                reason,
+                now_ms,
+            ),
+        }
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_grants(),
