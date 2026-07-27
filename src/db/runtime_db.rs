@@ -364,6 +364,42 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn budget_check_and_reserve_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_and_reserve_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                idempotency_key,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+            Self::Postgres(db) => db.budget_check_and_reserve_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                idempotency_key,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+        }
+    }
+
     pub fn budget_check_chain(
         &self,
         scope_id: &str,
@@ -374,6 +410,203 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.budget_check_chain(scope_id, metric, amount, now_ms),
             Self::Postgres(db) => db.budget_check_chain(scope_id, metric, amount, now_ms),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn budget_check_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_check_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+            Self::Postgres(db) => db.budget_check_chain_for_site(
+                scope_id,
+                metric,
+                amount,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+                partition_simulated,
+            ),
+        }
+    }
+
+    pub fn budget_assert_home_writable(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        local_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_assert_home_writable(scope_id, metric, local_site_id),
+            Self::Postgres(db) => db.budget_assert_home_writable(scope_id, metric, local_site_id),
+        }
+    }
+
+    pub fn budget_adjust_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_adjust_chain_for_site(
+                scope_id,
+                metric,
+                delta,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            ),
+            Self::Postgres(db) => db.budget_adjust_chain_for_site(
+                scope_id,
+                metric,
+                delta,
+                now_ms,
+                require_home_pin,
+                local_site_id,
+            ),
+        }
+    }
+
+    pub fn budget_set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_limit_scoped(
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+                pool_id,
+            ),
+            Self::Postgres(db) => db.budget_set_limit_scoped(
+                scope_id,
+                metric,
+                max_amount,
+                period_type,
+                home_site_id,
+                pool_id,
+            ),
+        }
+    }
+
+    pub fn budget_set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.budget_set_pool_ceiling(pool_id, metric, max_amount, period_type)
+            }
+            Self::Postgres(db) => {
+                db.budget_set_pool_ceiling(pool_id, metric, max_amount, period_type)
+            }
+        }
+    }
+
+    pub fn budget_transfer_capacity(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::db::chisei_budget::BudgetTransferRecord, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_transfer_capacity(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.budget_transfer_capacity(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn budget_record_transfer_refused(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<crate::db::chisei_budget::BudgetTransferRecord, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_record_transfer_refused(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                reason,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.budget_record_transfer_refused(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                reason,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn budget_get_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<crate::db::chisei_budget::BudgetTransferRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_get_transfer(transfer_id),
+            Self::Postgres(db) => db.budget_get_transfer(transfer_id),
         }
     }
 

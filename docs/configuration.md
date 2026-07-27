@@ -48,6 +48,17 @@ credentials converge. Process memory must not decide durable authority; see
 [replica-safety.md](replica-safety.md) for the surface inventory and two-replica
 test harness.
 
+## Budget topology (multi-region)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEKAI_BUDGET_TOPOLOGY` / `BUDGET_TOPOLOGY_MODE` | `single_region` | `single_region`, `regional_pinned`, or `regional_with_transfer`. Global active/active SC is rejected. |
+| `SEKAI_BUDGET_SITE_ID` / `BUDGET_SITE_ID` | empty | Local site id for home-pin checks; required when topology is regional. |
+| `SEKAI_BUDGET_PARTITION_SIMULATED` | unset | Set `1` to refuse budget transfers fail-closed (partition drills). |
+
+Operator runbook and data model: [budget-topology.md](budget-topology.md). Design freeze:
+[research/292-multi-region-consistency.md](research/292-multi-region-consistency.md).
+
 ## Providers and outbound calls
 
 | Variable | Default | Purpose |

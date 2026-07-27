@@ -34,6 +34,7 @@ const CAPABILITY_PACKAGE_PARITY_SCHEMA: &str =
 const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_namespace_parity.sql");
 const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
     include_str!("postgres/0017_chisei_execution_parity.sql");
+const BUDGET_TOPOLOGY_SCHEMA: &str = include_str!("postgres/0018_budget_topology.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -127,6 +128,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 17,
         name: "chisei_execution_parity",
         sql: CHISEI_EXECUTION_PARITY_SCHEMA,
+    },
+    Migration {
+        version: 18,
+        name: "budget_topology",
+        sql: BUDGET_TOPOLOGY_SCHEMA,
     },
 ];
 
@@ -635,6 +641,17 @@ mod tests {
         }
         assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("AUTOINCREMENT"));
         assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("INSERT OR"));
+        for table in ["chisei_budget_pools", "chisei_budget_transfers"] {
+            assert!(
+                BUDGET_TOPOLOGY_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL table {table}"
+            );
+        }
+        assert!(BUDGET_TOPOLOGY_SCHEMA.contains("home_site_id"));
+        assert!(BUDGET_TOPOLOGY_SCHEMA.contains("pool_id"));
+        for excluded in ["tenant", "oauth", "oidc"] {
+            assert!(!BUDGET_TOPOLOGY_SCHEMA.contains(excluded));
+        }
     }
 
     #[test]
