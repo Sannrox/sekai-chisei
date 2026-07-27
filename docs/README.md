@@ -61,6 +61,7 @@ in order.
 - [Operator console information architecture](research/283-operator-console-ia.md)
 - [Lookup vs model call (defer)](research/175-lookup-vs-model-call.md)
 - [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
+- [Multi-region consistency for budgets, leases, and permits](research/292-multi-region-consistency.md)
 - [Gateway PEP fat-decide freeze](research/163-gateway-pep-fat-decide.md)
 - [Provider and data-class residency](residency-policy.md)
   — research recommendation for bounded automatic dispatch (#279 → #280).
