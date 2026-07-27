@@ -87,8 +87,16 @@ pub struct Permit {
     pub revocation_latency_ms: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub offline_revocation_unavailable: bool,
+    /// Region/site pin for online redeem. Default `"local"` for single-region
+    /// and for legacy permits that omit the field (#293).
+    #[serde(default = "default_permit_site_id")]
+    pub site_id: String,
     pub signed_digest: String,
     pub signature: Vec<u8>,
+}
+
+fn default_permit_site_id() -> String {
+    crate::sekai::lease::DEFAULT_SITE_ID.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +121,9 @@ pub struct Redemption {
     pub invocation_ordinal: u32,
     #[serde(default)]
     pub evidence_due_at_ms: i64,
+    /// Site pin that performed the redeem (evidence attribute).
+    #[serde(default = "default_permit_site_id")]
+    pub site_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +139,8 @@ pub struct Issuance<'a> {
     pub permit_id: String,
     pub nonce: String,
     pub now_ms: i64,
+    /// Region/site pin stamped onto the signed permit (default `"local"`).
+    pub site_id: &'a str,
 }
 
 impl Permit {
@@ -271,6 +284,7 @@ pub fn issue(
     {
         return Err("v1 permits refuse unrestricted command contracts".into());
     }
+    let site_id = crate::config::validate_site_id(issuance.site_id)?;
     let mut permit = Permit {
         version: PERMIT_VERSION.into(),
         permit_id: issuance.permit_id,
@@ -320,6 +334,7 @@ pub fn issue(
         issued_at_ms: issuance.now_ms,
         revocation_latency_ms: 0,
         offline_revocation_unavailable: false,
+        site_id,
         signed_digest: String::new(),
         signature: Vec::new(),
     };
@@ -791,6 +806,7 @@ impl SekaiDb {
         Ok(changed != 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn redeem_permit(
         &self,
         permit: &Permit,
@@ -798,6 +814,7 @@ impl SekaiDb {
         trusted_key: &VerifyingKey,
         idempotency_key: &str,
         execution_id: &str,
+        host_site_id: &str,
         now_ms: i64,
     ) -> Result<Redemption, String> {
         self.redeem_or_reconcile_permit(
@@ -806,6 +823,7 @@ impl SekaiDb {
             trusted_key,
             idempotency_key,
             execution_id,
+            host_site_id,
             RedemptionTiming {
                 invoked_at_ms: 0,
                 reconciled_at_ms: now_ms,
@@ -813,6 +831,7 @@ impl SekaiDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn redeem_or_reconcile_permit(
         &self,
         permit: &Permit,
@@ -820,12 +839,25 @@ impl SekaiDb {
         trusted_key: &VerifyingKey,
         idempotency_key: &str,
         execution_id: &str,
+        host_site_id: &str,
         timing: RedemptionTiming,
     ) -> Result<Redemption, String> {
         let RedemptionTiming {
             invoked_at_ms,
             reconciled_at_ms: now_ms,
         } = timing;
+        let host_site_id = crate::config::validate_site_id(host_site_id)?;
+        // Fail closed: online (and offline reconcile) authority is pin-home only.
+        let permit_site = if permit.site_id.trim().is_empty() {
+            crate::sekai::lease::DEFAULT_SITE_ID
+        } else {
+            permit.site_id.as_str()
+        };
+        if permit_site != host_site_id {
+            return Err(format!(
+                "permit is pinned to site '{permit_site}' (host site '{host_site_id}'); foreign pin fail closed"
+            ));
+        }
         self.ensure_external_permit_tables()?;
         let offline_reconciliation = permit.redemption_mode == OFFLINE_REDEMPTION_MODE;
         if offline_reconciliation
@@ -945,6 +977,7 @@ impl SekaiDb {
             },
             invocation_ordinal: count + 1,
             evidence_due_at_ms: permit.expires_at_ms,
+            site_id: host_site_id.clone(),
         };
         let json = serde_json::to_string(&redemption).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,redemption.redeemed_at_ms,redemption.invocation_ordinal,redemption.redemption_id,redemption.evidence_due_at_ms]).map_err(|error| error.to_string())?;
@@ -975,6 +1008,7 @@ impl SekaiDb {
                         "invocation_ordinal".into(),
                         redemption.invocation_ordinal.to_string(),
                     ),
+                    ("site_id".into(), redemption.site_id.clone()),
                 ]),
                 target_id: permit.permit_id.clone(),
                 outcome: if offline_reconciliation {
@@ -1252,6 +1286,7 @@ mod tests {
                 permit_id: "permit-1".into(),
                 nonce: "nonce-1".into(),
                 now_ms: 2_000,
+                site_id: "local",
             },
         )
         .unwrap();
@@ -1355,6 +1390,7 @@ mod tests {
                     &key.verifying_key(),
                     "redeem-1",
                     "execution-1",
+                    "local",
                     3_000,
                 )
                 .unwrap();
@@ -1365,6 +1401,7 @@ mod tests {
                     &key.verifying_key(),
                     "redeem-1",
                     "execution-1",
+                    "local",
                     3_001,
                 )
                 .unwrap();
@@ -1386,6 +1423,7 @@ mod tests {
                 &key.verifying_key(),
                 "redeem-1",
                 "execution-1",
+                "local",
                 11_000,
             )
             .unwrap();
@@ -1397,6 +1435,7 @@ mod tests {
                 &key.verifying_key(),
                 "redeem-2",
                 "execution-2",
+                "local",
                 3_002,
             )
             .unwrap_err();
@@ -1433,6 +1472,7 @@ mod tests {
                     &key.verifying_key(),
                     &format!("redeem-{ordinal}"),
                     &format!("execution-{ordinal}"),
+                    "local",
                     3_000,
                 )
             }));
@@ -1457,9 +1497,17 @@ mod tests {
             .observed_preconditions
             .insert("resource_version".into(), "git:def456".into());
         assert!(
-            db.redeem_permit(&permit, &changed, &key.verifying_key(), "r-1", "e-1", 3_000)
-                .unwrap_err()
-                .contains("reauthorization")
+            db.redeem_permit(
+                &permit,
+                &changed,
+                &key.verifying_key(),
+                "r-1",
+                "e-1",
+                "local",
+                3_000
+            )
+            .unwrap_err()
+            .contains("reauthorization")
         );
         db.revoke_permit(&permit.revocation_handle, "operator revoked", 3_001)
             .unwrap();
@@ -1470,6 +1518,7 @@ mod tests {
                 &key.verifying_key(),
                 "r-2",
                 "e-2",
+                "local",
                 3_002
             )
             .unwrap_err()
@@ -1495,6 +1544,7 @@ mod tests {
                     permit_id: "permit-2".into(),
                     nonce: "nonce-2".into(),
                     now_ms: 2_000,
+                    site_id: "local",
                 },
             )
             .unwrap();
@@ -1511,6 +1561,7 @@ mod tests {
                 &key2.verifying_key(),
                 "r-3",
                 "e-3",
+                "local",
                 3_004
             )
             .unwrap_err()
@@ -1544,6 +1595,7 @@ mod tests {
                 permit_id: "offline-1".into(),
                 nonce: "offline-nonce".into(),
                 now_ms: 2_000,
+                site_id: "local",
             },
         )
         .unwrap();
@@ -1577,6 +1629,7 @@ mod tests {
                 &key.verifying_key(),
                 "offline-reconcile-1",
                 "offline-execution-1",
+                "local",
                 RedemptionTiming {
                     invoked_at_ms: 3_000,
                     reconciled_at_ms: 5_000,
@@ -1596,6 +1649,7 @@ mod tests {
             &key.verifying_key(),
             "offline-reconcile-2",
             "offline-execution-2",
+            "local",
             RedemptionTiming {
                 invoked_at_ms: 3_500,
                 reconciled_at_ms: 5_001,
@@ -1609,10 +1663,11 @@ mod tests {
                 &key.verifying_key(),
                 "offline-reconcile-3",
                 "offline-execution-3",
+                "local",
                 RedemptionTiming {
                     invoked_at_ms: 3_750,
                     reconciled_at_ms: 5_002,
-                },
+                }
             )
             .unwrap_err()
             .contains("invocation count exhausted")
@@ -1639,6 +1694,7 @@ mod tests {
                     permit_id: "offline-2".into(),
                     nonce: "n".into(),
                     now_ms: 2_000,
+                    site_id: "local",
                 }
             )
             .unwrap_err()
@@ -1659,6 +1715,7 @@ mod tests {
                     permit_id: "offline-3".into(),
                     nonce: "n".into(),
                     now_ms: 2_000,
+                    site_id: "local",
                 }
             )
             .unwrap_err()
@@ -1860,5 +1917,116 @@ mod tests {
             .unwrap_err()
             .contains("cannot be delegated")
         );
+    }
+
+    #[test]
+    fn issue_stamps_default_local_site_and_redeem_exposes_pin() {
+        let record = authorization(10_000, 1);
+        let (permit, key) = signed(&record);
+        assert_eq!(permit.site_id, "local");
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        persist_authorization(&db, &record);
+        db.put_permit(&permit, "issue-1", "agent:test").unwrap();
+        let redemption = db
+            .redeem_permit(
+                &permit,
+                &context(&permit),
+                &key.verifying_key(),
+                "r-1",
+                "e-1",
+                "local",
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(redemption.site_id, "local");
+    }
+
+    #[test]
+    fn dual_region_foreign_pin_redeem_fails_closed() {
+        let record = authorization(10_000, 1);
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let permit = issue(
+            &record,
+            &key,
+            Issuance {
+                approval_identities: vec![],
+                issuer: "issuer:test",
+                key_id: "key-1",
+                permit_id: "permit-us".into(),
+                nonce: "nonce-us".into(),
+                now_ms: 2_000,
+                site_id: "us-east",
+            },
+        )
+        .unwrap();
+        assert_eq!(permit.site_id, "us-east");
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        persist_authorization(&db, &record);
+        db.put_permit(&permit, "issue-us", "agent:test").unwrap();
+        let foreign = db.redeem_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "r-foreign",
+            "e-foreign",
+            "eu-west",
+            3_000,
+        );
+        assert!(
+            foreign.unwrap_err().contains("pinned to site 'us-east'"),
+            "foreign region must fail closed"
+        );
+        let home = db
+            .redeem_permit(
+                &permit,
+                &context(&permit),
+                &key.verifying_key(),
+                "r-home",
+                "e-home",
+                "us-east",
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(home.site_id, "us-east");
+        // Second distinct redeem at home fails on invocation count, not pin.
+        let double = db.redeem_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "r-home-2",
+            "e-home-2",
+            "us-east",
+            3_001,
+        );
+        assert!(double.unwrap_err().contains("exhausted"));
+    }
+
+    #[test]
+    fn legacy_permit_without_site_id_defaults_to_local() {
+        let record = authorization(10_000, 1);
+        let (mut permit, key) = signed(&record);
+        let mut json: serde_json::Value = serde_json::to_value(&permit).unwrap();
+        json.as_object_mut().unwrap().remove("site_id");
+        let restored: Permit = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.site_id, "local");
+        // Re-sign after restore so the digest includes the defaulted field only
+        // when present; omit field then sign without site_id in unsigned form
+        // by clearing and re-signing with explicit local.
+        permit.site_id = "local".into();
+        permit.sign(&key).unwrap();
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        persist_authorization(&db, &record);
+        db.put_permit(&permit, "issue-legacy", "agent:test")
+            .unwrap();
+        db.redeem_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "r-legacy",
+            "e-legacy",
+            "local",
+            3_000,
+        )
+        .unwrap();
     }
 }

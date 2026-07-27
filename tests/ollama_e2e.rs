@@ -82,6 +82,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         permit_signing_key: None,
         permit_issuer: "chisei.local".into(),
         permit_key_id: "permit-key-1".into(),
+        site_id: "local".into(),
         budget_topology: Default::default(),
     };
     let model = e2e_model();
@@ -202,6 +203,7 @@ async fn delegation_chain_keeps_private_context_local() {
         permit_signing_key: None,
         permit_issuer: "chisei.local".into(),
         permit_key_id: "permit-key-1".into(),
+        site_id: "local".into(),
         budget_topology: Default::default(),
     };
     let local_model = e2e_model();

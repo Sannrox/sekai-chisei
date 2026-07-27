@@ -14,10 +14,12 @@ impl PostgresDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, owner, ttl_ms, request_id)?;
-        let digest = digest(&[owner, &ttl_ms.to_string()]);
+        let site_id = crate::sekai::lease::validate_site_id_public(site_id)?;
+        let digest = digest(&[owner, &ttl_ms.to_string(), &site_id]);
         self.mutate_lease(
             namespace,
             key,
@@ -34,7 +36,7 @@ impl PostgresDb {
                     return Err(LeaseError::Conflict("lease is already active".into()));
                 }
                 let generation = previous.as_ref().map_or(1, |lease| lease.generation + 1);
-                new_lease(namespace, key, owner, generation, ttl_ms, now_ms)
+                new_lease(namespace, key, owner, generation, ttl_ms, now_ms, &site_id)
             },
         )
     }
@@ -46,7 +48,7 @@ impl PostgresDb {
             .map_err(storage)?
             .query_opt(
                 "SELECT namespace,lease_key,generation,fencing_token,owner,status,
-                        acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms
+                        acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id
                  FROM sekai_leases WHERE namespace=$1 AND lease_key=$2",
                 &[&namespace, &key],
             )
@@ -63,10 +65,12 @@ impl PostgresDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, token, ttl_ms, request_id)?;
-        let digest = digest(&[token, &ttl_ms.to_string()]);
+        let site_id = crate::sekai::lease::validate_site_id_public(site_id)?;
+        let digest = digest(&[token, &ttl_ms.to_string(), &site_id]);
         self.mutate_lease(
             namespace,
             key,
@@ -77,6 +81,7 @@ impl PostgresDb {
             now_ms,
             |_, previous| {
                 let mut lease = active_with_token(previous, token)?;
+                crate::sekai::lease::require_site_pin(&lease, &site_id)?;
                 if now_ms >= lease.expires_at_ms {
                     return Err(LeaseError::Stale("lease has expired".into()));
                 }
@@ -95,13 +100,15 @@ impl PostgresDb {
         token: &str,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate_text(namespace, "namespace")?;
         validate_text(key, "key")?;
         validate_text(token, "fencing_token")?;
         validate_text(request_id, "request_id")?;
-        let digest = digest(&[token]);
+        let site_id = crate::sekai::lease::validate_site_id_public(site_id)?;
+        let digest = digest(&[token, &site_id]);
         self.mutate_lease(
             namespace,
             key,
@@ -112,6 +119,7 @@ impl PostgresDb {
             now_ms,
             |_, previous| {
                 let mut lease = active_with_token(previous, token)?;
+                crate::sekai::lease::require_site_pin(&lease, &site_id)?;
                 lease.status = "released".into();
                 lease.released_at_ms = now_ms;
                 Ok(lease)
@@ -130,15 +138,18 @@ impl PostgresDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, owner, ttl_ms, request_id)?;
         validate_text(expected_token, "expected_fencing_token")?;
+        let site_id = crate::sekai::lease::validate_site_id_public(site_id)?;
         let digest = digest(&[
             owner,
             expected_token,
             &expected_expires_at_ms.to_string(),
             &ttl_ms.to_string(),
+            &site_id,
         ]);
         self.mutate_lease(
             namespace,
@@ -150,6 +161,7 @@ impl PostgresDb {
             now_ms,
             |_, previous| {
                 let previous = active_with_token(previous, expected_token)?;
+                crate::sekai::lease::require_site_pin(&previous, &site_id)?;
                 if previous.expires_at_ms != expected_expires_at_ms {
                     return Err(LeaseError::Stale("lease expiry changed".into()));
                 }
@@ -163,6 +175,7 @@ impl PostgresDb {
                     previous.generation + 1,
                     ttl_ms,
                     now_ms,
+                    &site_id,
                 )
             },
         )
@@ -213,7 +226,7 @@ impl PostgresDb {
         let previous = transaction
             .query_opt(
                 "SELECT namespace,lease_key,generation,fencing_token,owner,status,
-                        acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms
+                        acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id
                  FROM sekai_leases
                  WHERE namespace=$1 AND lease_key=$2 FOR UPDATE",
                 &[&namespace, &key],
@@ -227,8 +240,8 @@ impl PostgresDb {
             .execute(
                 "INSERT INTO sekai_leases
                     (namespace,lease_key,generation,fencing_token,owner,status,
-                     acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                  ON CONFLICT(namespace,lease_key) DO UPDATE SET
                     generation=EXCLUDED.generation,
                     fencing_token=EXCLUDED.fencing_token,
@@ -236,7 +249,8 @@ impl PostgresDb {
                     acquired_at_ms=EXCLUDED.acquired_at_ms,
                     refreshed_at_ms=EXCLUDED.refreshed_at_ms,
                     expires_at_ms=EXCLUDED.expires_at_ms,
-                    released_at_ms=EXCLUDED.released_at_ms",
+                    released_at_ms=EXCLUDED.released_at_ms,
+                    site_id=EXCLUDED.site_id",
                 &[
                     &lease.namespace,
                     &lease.key,
@@ -248,6 +262,7 @@ impl PostgresDb {
                     &lease.refreshed_at_ms,
                     &lease.expires_at_ms,
                     &lease.released_at_ms,
+                    &lease.site_id,
                 ],
             )
             .map_err(storage)?;
@@ -314,6 +329,7 @@ fn new_lease(
     generation: u64,
     ttl_ms: i64,
     now_ms: i64,
+    site_id: &str,
 ) -> Result<Lease, LeaseError> {
     Ok(Lease {
         namespace: namespace.into(),
@@ -326,6 +342,7 @@ fn new_lease(
         refreshed_at_ms: now_ms,
         expires_at_ms: checked_expiry(now_ms, ttl_ms)?,
         released_at_ms: 0,
+        site_id: site_id.into(),
     })
 }
 
@@ -364,6 +381,11 @@ fn validate_text(value: &str, field: &str) -> Result<(), LeaseError> {
 
 fn row_to_lease(row: postgres::Row) -> Lease {
     let generation: i64 = row.get(2);
+    let site_id: String = row
+        .try_get::<_, String>(10)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| crate::sekai::lease::DEFAULT_SITE_ID.into());
     Lease {
         namespace: row.get(0),
         key: row.get(1),
@@ -375,6 +397,7 @@ fn row_to_lease(row: postgres::Row) -> Lease {
         refreshed_at_ms: row.get(7),
         expires_at_ms: row.get(8),
         released_at_ms: row.get(9),
+        site_id,
     }
 }
 

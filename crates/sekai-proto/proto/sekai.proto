@@ -1337,6 +1337,8 @@ message Lease {
   int64 refreshed_at_ms = 8;
   int64 expires_at_ms = 9;
   int64 released_at_ms = 10;
+  // Region/site pin stamped from SEKAI_SITE_ID (default "local"). #293
+  string site_id = 11;
 }
 message AcquireLeaseRequest {
   string namespace = 1;

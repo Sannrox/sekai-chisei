@@ -648,7 +648,8 @@ fn build_services(
             db.clone(),
             budget.clone(),
             config.gateway_receipt_principals.clone(),
-        ),
+        )
+        .with_site_id(config.site_id.clone()),
     );
     let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
         db.clone(),

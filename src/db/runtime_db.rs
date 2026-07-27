@@ -239,15 +239,16 @@ impl RuntimeDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         match self {
-            Self::Sqlite(db) => {
-                db.acquire_lease(namespace, key, owner, ttl_ms, request_id, actor, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.acquire_lease(namespace, key, owner, ttl_ms, request_id, actor, now_ms)
-            }
+            Self::Sqlite(db) => db.acquire_lease(
+                namespace, key, owner, ttl_ms, request_id, actor, site_id, now_ms,
+            ),
+            Self::Postgres(db) => db.acquire_lease(
+                namespace, key, owner, ttl_ms, request_id, actor, site_id, now_ms,
+            ),
         }
     }
 
@@ -2260,6 +2261,7 @@ impl RuntimeDb {
         trusted_key: &VerifyingKey,
         idempotency_key: &str,
         execution_id: &str,
+        host_site_id: &str,
         timing: RedemptionTiming,
     ) -> Result<Redemption, String> {
         match self {
@@ -2269,6 +2271,7 @@ impl RuntimeDb {
                 trusted_key,
                 idempotency_key,
                 execution_id,
+                host_site_id,
                 timing,
             ),
             Self::Postgres(_) => Err(
@@ -2286,15 +2289,16 @@ impl RuntimeDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         match self {
-            Self::Sqlite(db) => {
-                db.refresh_lease(namespace, key, token, ttl_ms, request_id, actor, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.refresh_lease(namespace, key, token, ttl_ms, request_id, actor, now_ms)
-            }
+            Self::Sqlite(db) => db.refresh_lease(
+                namespace, key, token, ttl_ms, request_id, actor, site_id, now_ms,
+            ),
+            Self::Postgres(db) => db.refresh_lease(
+                namespace, key, token, ttl_ms, request_id, actor, site_id, now_ms,
+            ),
         }
     }
 
@@ -2345,12 +2349,15 @@ impl RuntimeDb {
         token: &str,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         match self {
-            Self::Sqlite(db) => db.release_lease(namespace, key, token, request_id, actor, now_ms),
+            Self::Sqlite(db) => {
+                db.release_lease(namespace, key, token, request_id, actor, site_id, now_ms)
+            }
             Self::Postgres(db) => {
-                db.release_lease(namespace, key, token, request_id, actor, now_ms)
+                db.release_lease(namespace, key, token, request_id, actor, site_id, now_ms)
             }
         }
     }
@@ -2582,6 +2589,7 @@ impl RuntimeDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         match self {
@@ -2594,6 +2602,7 @@ impl RuntimeDb {
                 ttl_ms,
                 request_id,
                 actor,
+                site_id,
                 now_ms,
             ),
             Self::Postgres(db) => db.takeover_expired_lease(
@@ -2605,6 +2614,7 @@ impl RuntimeDb {
                 ttl_ms,
                 request_id,
                 actor,
+                site_id,
                 now_ms,
             ),
         }
@@ -3488,6 +3498,7 @@ impl RuntimeDb {
         trusted_key: &VerifyingKey,
         idempotency_key: &str,
         execution_id: &str,
+        host_site_id: &str,
         now_ms: i64,
     ) -> Result<Redemption, String> {
         match self {
@@ -3497,6 +3508,7 @@ impl RuntimeDb {
                 trusted_key,
                 idempotency_key,
                 execution_id,
+                host_site_id,
                 now_ms,
             ),
             Self::Postgres(_) => {

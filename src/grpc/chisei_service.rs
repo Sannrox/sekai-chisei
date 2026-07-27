@@ -679,6 +679,7 @@ fn external_permit_to_proto(value: &permit::Permit) -> ExternalActionPermit {
         initiating_actor: value.initiating_actor.clone(),
         offline_revocation_unavailable: value.offline_revocation_unavailable,
         policy_scope: value.policy_scope.clone(),
+        site_id: value.site_id.clone(),
     }
 }
 
@@ -728,6 +729,11 @@ fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
         public_key: value.public_key,
         issued_at_ms: value.issued_at_ms,
         revocation_latency_ms: value.revocation_latency_ms,
+        site_id: if value.site_id.trim().is_empty() {
+            crate::sekai::lease::DEFAULT_SITE_ID.into()
+        } else {
+            value.site_id
+        },
         signed_digest: value.signed_digest,
         signature: value.signature,
     }
@@ -4515,6 +4521,7 @@ impl ChiseiService for ChiseiServiceImpl {
             permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
             nonce: uuid::Uuid::new_v4().simple().to_string(),
             now_ms,
+            site_id: &self.config.site_id,
         };
         let value = if input.offline {
             let policy = self
@@ -4608,6 +4615,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     redeemed_at_ms: redemption.redeemed_at_ms,
                     invocation_ordinal: redemption.invocation_ordinal,
                     evidence_due_at_ms: redemption.evidence_due_at_ms,
+                    site_id: redemption.site_id,
                 }),
             }));
         }
@@ -4631,6 +4639,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 &key,
                 &input.idempotency_key,
                 &input.execution_id,
+                &self.config.site_id,
                 crate::chisei::external_permit::RedemptionTiming {
                     invoked_at_ms: input.invoked_at_ms,
                     reconciled_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -4646,6 +4655,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 redeemed_at_ms: redemption.redeemed_at_ms,
                 invocation_ordinal: redemption.invocation_ordinal,
                 evidence_due_at_ms: redemption.evidence_due_at_ms,
+                site_id: redemption.site_id,
             }),
         }))
     }
@@ -10201,6 +10211,7 @@ mod tests {
             permit_signing_key: Some("07".repeat(32)),
             permit_issuer: "issuer:test".into(),
             permit_key_id: "key-1".into(),
+            site_id: "local".into(),
             budget_topology: Default::default(),
         }
     }

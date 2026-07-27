@@ -14,6 +14,7 @@ pub trait LeaseBackend: Send + Sync {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError>;
     fn get_lease(&self, namespace: &str, key: &str) -> Result<Option<Lease>, LeaseError>;
@@ -26,6 +27,7 @@ pub trait LeaseBackend: Send + Sync {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError>;
     #[allow(clippy::too_many_arguments)]
@@ -36,6 +38,7 @@ pub trait LeaseBackend: Send + Sync {
         token: &str,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError>;
     #[allow(clippy::too_many_arguments)]
@@ -49,6 +52,7 @@ pub trait LeaseBackend: Send + Sync {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError>;
 }
@@ -63,10 +67,11 @@ macro_rules! forward {
             ttl_ms: i64,
             request_id: &str,
             actor: &str,
+            site_id: &str,
             now_ms: i64,
         ) -> Result<Lease, LeaseError> {
             <$target>::acquire_lease(
-                self, namespace, key, owner, ttl_ms, request_id, actor, now_ms,
+                self, namespace, key, owner, ttl_ms, request_id, actor, site_id, now_ms,
             )
         }
         fn get_lease(&self, namespace: &str, key: &str) -> Result<Option<Lease>, LeaseError> {
@@ -80,10 +85,11 @@ macro_rules! forward {
             ttl_ms: i64,
             request_id: &str,
             actor: &str,
+            site_id: &str,
             now_ms: i64,
         ) -> Result<Lease, LeaseError> {
             <$target>::refresh_lease(
-                self, namespace, key, token, ttl_ms, request_id, actor, now_ms,
+                self, namespace, key, token, ttl_ms, request_id, actor, site_id, now_ms,
             )
         }
         fn release_lease(
@@ -93,9 +99,12 @@ macro_rules! forward {
             token: &str,
             request_id: &str,
             actor: &str,
+            site_id: &str,
             now_ms: i64,
         ) -> Result<Lease, LeaseError> {
-            <$target>::release_lease(self, namespace, key, token, request_id, actor, now_ms)
+            <$target>::release_lease(
+                self, namespace, key, token, request_id, actor, site_id, now_ms,
+            )
         }
         fn takeover_expired_lease(
             &self,
@@ -107,6 +116,7 @@ macro_rules! forward {
             ttl_ms: i64,
             request_id: &str,
             actor: &str,
+            site_id: &str,
             now_ms: i64,
         ) -> Result<Lease, LeaseError> {
             <$target>::takeover_expired_lease(
@@ -119,6 +129,7 @@ macro_rules! forward {
                 ttl_ms,
                 request_id,
                 actor,
+                site_id,
                 now_ms,
             )
         }

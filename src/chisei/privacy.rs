@@ -228,6 +228,7 @@ mod tests {
             permit_signing_key: None,
             permit_issuer: "chisei.local".into(),
             permit_key_id: "permit-key-1".into(),
+            site_id: "local".into(),
             budget_topology: Default::default(),
         };
         let safe = safe_providers(&config);

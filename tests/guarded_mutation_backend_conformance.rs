@@ -29,7 +29,9 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
     let key = format!("{prefix}-key");
     let object_id = format!("{prefix}-obj");
     let lease = db
-        .acquire_lease(&namespace, &key, "worker-a", 100, "lease-1", "actor-a", 10)
+        .acquire_lease(
+            &namespace, &key, "worker-a", 100, "lease-1", "actor-a", "local", 10,
+        )
         .unwrap();
     let original = object(&object_id, "original", &namespace);
 
@@ -195,7 +197,9 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
     let key = format!("{prefix}-fence-key");
     let object_id = format!("{prefix}-fence-obj");
     let first = db
-        .acquire_lease(&namespace, &key, "worker-a", 10, "lease-a", "actor-a", 10)
+        .acquire_lease(
+            &namespace, &key, "worker-a", 10, "lease-a", "actor-a", "local", 10,
+        )
         .unwrap();
     let original = object(&object_id, "original", &namespace);
     db.guarded_create_object(
@@ -236,6 +240,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
             10,
             "lease-b",
             "actor-b",
+            "local",
             20,
         )
         .unwrap();
@@ -259,6 +264,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
         &second.fencing_token,
         "release",
         "actor-b",
+        "local",
         22,
     )
     .unwrap();
@@ -323,7 +329,9 @@ fn postgres_guarded_update_and_takeover_have_one_serializable_order() {
     let key = format!("{prefix}-key");
     let object_id = format!("{prefix}-obj");
     let first = db
-        .acquire_lease(&namespace, &key, "worker-a", 10, "lease-1", "actor-a", 10)
+        .acquire_lease(
+            &namespace, &key, "worker-a", 10, "lease-1", "actor-a", "local", 10,
+        )
         .unwrap();
     let original = object(&object_id, "before", &namespace);
     GraphBackend::create_object(db.as_ref(), &original, "actor-a").unwrap();
@@ -360,7 +368,7 @@ fn postgres_guarded_update_and_takeover_have_one_serializable_order() {
         std::thread::spawn(move || {
             barrier.wait();
             db.takeover_expired_lease(
-                &namespace, &key, "worker-b", &token, 20, 10, "lease-2", "actor-b", 20,
+                &namespace, &key, "worker-b", &token, 20, 10, "lease-2", "actor-b", "local", 20,
             )
         })
     };

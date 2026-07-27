@@ -723,6 +723,7 @@ mod tests {
             issued_at_ms: 1_000,
             revocation_latency_ms: 0,
             offline_revocation_unavailable: false,
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
             signed_digest: String::new(),
             signature: vec![],
         };
@@ -873,6 +874,7 @@ mod tests {
             redeemed_at_ms: 1_000,
             invocation_ordinal: 1,
             evidence_due_at_ms: 2_000,
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
         };
         db.conn()
             .execute(
@@ -986,6 +988,7 @@ mod tests {
             redeemed_at_ms: 1_000,
             invocation_ordinal: 1,
             evidence_due_at_ms: 2_000,
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
         };
         db.conn().execute(
             "INSERT INTO chisei_external_action_redemptions
