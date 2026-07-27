@@ -26334,6 +26334,7 @@ mod tests {
                     catalog_version: first.catalog_version.clone(),
                     page_size: 2,
                     page_token: first.next_page_token,
+                    product_tier_filter: String::new(),
                     ..Default::default()
                 },
                 "local",
@@ -26547,6 +26548,7 @@ mod tests {
                     catalog_version: first.catalog_version,
                     page_size: 1,
                     page_token: first.next_page_token,
+                    product_tier_filter: String::new(),
                     ..Default::default()
                 },
                 "local",
