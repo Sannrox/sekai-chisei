@@ -360,7 +360,22 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 137);
+        assert_eq!(inventory.entries.len(), 138);
+        assert!(inventory.entry("TransitionCapabilityPackage").is_some());
+        assert_eq!(
+            inventory
+                .entry("TransitionCapabilityPackage")
+                .unwrap()
+                .product_tier,
+            ProductTier::Advanced
+        );
+        assert_eq!(
+            inventory
+                .entry("UpgradeCapabilityPackage")
+                .unwrap()
+                .product_tier,
+            ProductTier::Experimental
+        );
         assert!(inventory.entry("ResolveSemanticRef").is_some());
         assert!(inventory.entry("ExpandRelations").is_some());
         assert!(inventory.entry("ExplainDerivation").is_some());
