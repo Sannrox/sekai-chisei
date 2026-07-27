@@ -50,25 +50,56 @@ for approval later.
 
 ## Governed invocation binding
 
-The v1 receipt-attributed binding covers typed object-query entries and
-governed-action entries. Invoke those entries through the canonical RPC named
-by `input_type` and send `x-sekai-capability` with the discovered capability
-name. Action calls also send `x-sekai-namespace`; query calls use the namespace
-in their existing filter. An optional `x-sekai-operation-id` supplies caller
+The v1 receipt-attributed binding covers typed object-query entries,
+governed-action entries, and the semantic retrieval capabilities below. Invoke
+those entries through the canonical RPC named by `input_type` and send
+`x-sekai-capability` with the discovered capability name. Action and semantic
+calls also send `x-sekai-namespace`; object-query calls use the namespace in
+their existing filter. An optional `x-sekai-operation-id` supplies caller
 correlation and is atomically reserved before an effectful action. The server
 generates one when omitted and returns the effective identifier on successful
 response metadata. Callers that need to correlate a refused or failed RPC must
 supply the header, because generic gRPC error propagation does not guarantee
-generated response metadata. Traverse, context retrieval, and Kioku candidate
-entries continue to use their canonical governed RPCs but do not yet
-participate in this receipt-attribution metadata contract.
+generated response metadata. Traverse and Kioku candidate entries continue to
+use their canonical governed RPCs but do not yet participate in this
+receipt-attribution metadata contract.
 
 The binding is deliberately not a generic execution endpoint. Before entering
-the normal query or action implementation, the server rebuilds the catalog for
-the authenticated authorization context and verifies that the named entry is
-still visible and matches the requested object kind or action type. A revoked
-credential, removed grant, changed action policy, or unavailable capability is
-therefore enforced even when the caller cached an older catalog.
+the normal query, retrieval, or action implementation, the server rebuilds the
+catalog for the authenticated authorization context and verifies that the named
+entry is still visible and matches the requested object kind, action type, or
+semantic capability. A revoked credential, removed grant, changed action
+policy, or unavailable capability is therefore enforced even when the caller
+cached an older catalog.
+
+## Semantic retrieval capabilities
+
+Agent runtimes should compose the following discoverable capabilities instead
+of hard-coding graph RPC sequences. Natural-language planning and summarization
+stay with the runtime or a governed model call; Sekai returns structured
+results, truncation metadata, evidence references, and receipts only.
+
+| Capability | RPC / input type | Purpose |
+| --- | --- | --- |
+| `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | Resolve an object (`object_id` / `external_id`) or ontology class/relation under live authorization. Absence and denial are indistinguishable (`resolved=false`). |
+| `sekai.semantic.expand_relations` | `ExpandRelations` | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
+| `sekai.context.retrieve` | `RetrieveContext` | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
+| `sekai.semantic.explain_derivation` | `ExplainDerivation` | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
+
+Each entry advertises:
+
+- protobuf input and output types;
+- required scopes and policy decision points (`namespace_access`, `object_acl`,
+  `classification`, `ontology_acl` as applicable);
+- hard bounds (`max_depth`, `max_objects`, `max_links`, source/derived row caps,
+  time, explanation size);
+- `reasoning_profile_version` and `ontology_contract_version`; and
+- evidence requirements such as derivation steps, source fact ids, and ontology
+  revision.
+
+A typical compose order is resolve → expand → retrieve → explain. Each step
+rechecks authorization independently; a cached catalog version is observational
+provenance on the receipt (`reported_catalog_version`), not a grant.
 
 Attributed invocations write a canonical `operation.receipt/v1` record with
 intent, live policy, native routing, budget-check, and outcome events. Receipt
