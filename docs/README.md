@@ -103,12 +103,12 @@ in order.
 - [Provider and data-class residency](residency-policy.md)
   — model/provider residency policy (#289); research:
   [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
-- [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
-  tenant-free Sekai surface set and inventory evidence; activate with
+- [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — dual-backend
+  tenant-free Sekai inventory and known SQLite-only exceptions; activate with
   `SEKAI_DB_BACKEND=postgres` and `DATABASE_URL`.
-- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — complete Chisei
-  decision/execution inventory with dual-backend conformance (including
-  budget, policy, learning, approvals, and gateway governance).
+- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — dual-backend Chisei
+  inventory (budget, policy, Kioku, gateway governance) plus SQLite-only
+  redeem and Gunshi allocation notes.
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
   enforcement.
 

@@ -40,12 +40,16 @@ Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend, its
 supported reusable surfaces, and (for PostgreSQL) the applied migration version.
-PostgreSQL implements the complete reusable community surface set—Sekai, Chisei,
-gateway governance, and operations health—with shared SQLite/PostgreSQL
-conformance. Selecting `SEKAI_DB_BACKEND=postgres` starts the public control
-plane against PostgreSQL when `DATABASE_URL` is set and migrations/capabilities
-validate. Backend selection does not enable tenant, OIDC, OAuth, or identity
-endpoints.
+PostgreSQL implements the reusable community surface set—Sekai, Chisei, gateway
+governance, and operations health—with shared SQLite/PostgreSQL conformance for
+the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts the
+public control plane against PostgreSQL when `DATABASE_URL` is set and
+migrations/capabilities validate. Some public paths remain SQLite-only and fail
+closed on community Postgres (audited ontology mutations, online permit
+redeem/reconcile, Gunshi allocation state, FTS text search, federation peer
+tables). See [postgres-sekai-parity.md](postgres-sekai-parity.md) and
+[postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does
+not enable tenant, OIDC, OAuth, or identity endpoints.
 
 For multi-replica control planes, use a shared backend so budgets, leases, and
 credentials converge. Process memory must not decide durable authority; see

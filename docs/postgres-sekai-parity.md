@@ -5,10 +5,20 @@ PostgreSQL runtime selection is activated by #238.
 
 ## Outcome
 
-Every remaining tenant-free `SekaiService` operation required by the public
-reusable runtime has PostgreSQL persistence with shared SQLite/PostgreSQL
-conformance, or is an explicit computed/query path with named durable
-dependencies.
+Most tenant-free `SekaiService` operations required by the public reusable
+runtime have PostgreSQL persistence with shared SQLite/PostgreSQL conformance,
+or are explicit computed/query paths with named durable dependencies.
+
+**Known SQLite-only public paths** (community Postgres fails closed; do not
+treat inventory “complete” as dual-backend for these RPCs):
+
+- audited ontology mutations and definition proposals
+  (`upsert_*_with_audit`, proposal review/get/list, evidence-driven propose);
+- SQLite FTS `SearchText` / hybrid text adapter (see [text-fts.md](text-fts.md));
+- multi-control-plane federation site/peer tables (see
+  [federation-profile.md](federation-profile.md));
+- selective bitemporal history storage (SQLite-first; see
+  [temporal-history-storage.md](temporal-history-storage.md)).
 
 Evidence is checked in as:
 
@@ -44,5 +54,7 @@ Evidence is checked in as:
 ## Operator posture
 
 SQLite remains the default community backend. Select PostgreSQL with
-`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for the complete reusable public
-control plane (see [configuration.md](configuration.md) and #238).
+`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for the reusable public control
+plane when you need shared multi-replica authority for the dual-backend
+surfaces above (see [configuration.md](configuration.md) and #238). Prefer
+SQLite when you need the SQLite-only paths listed under Outcome.

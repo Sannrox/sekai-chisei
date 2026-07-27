@@ -16,7 +16,14 @@ sekai --db knowledge.db --json entity list
 sekai --db knowledge.db --json relation list
 ```
 
-Set `SEKAI_DB` instead of passing `--db`. The default is `knowledge.db`.
+The database is resolved in this order (first match wins):
+
+1. `--db <path>` (explicit flag)
+2. `SEKAI_DB` environment variable
+3. User-level default when the file exists:
+   - macOS: `~/Library/Application Support/sekai/knowledge.db`
+   - Linux: `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
+4. `knowledge.db` in the current directory
 
 Import accepts a versioned JSON document:
 
