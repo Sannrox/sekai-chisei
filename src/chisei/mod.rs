@@ -1,4 +1,5 @@
 pub mod affinity;
+pub mod billing_adapter;
 pub mod budget;
 pub mod cache_policy;
 pub mod capability;
