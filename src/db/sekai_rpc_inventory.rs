@@ -29,10 +29,11 @@ pub enum RpcPersistenceKind {
 
 /// Product-facing stability tier (#383 / #386). Orthogonal to backend
 /// `surfaces` / completeness — do not use this to redefine dual-backend claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductTier {
     Core,
+    #[default]
     Advanced,
     Experimental,
 }
@@ -55,12 +56,6 @@ impl ProductTier {
                 "product_tier must be core|advanced|experimental, got {other:?}"
             )),
         }
-    }
-}
-
-impl Default for ProductTier {
-    fn default() -> Self {
-        Self::Advanced
     }
 }
 
