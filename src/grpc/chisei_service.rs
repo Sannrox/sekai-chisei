@@ -1199,6 +1199,139 @@ fn record_completed_operation_on(
     attempt_started_at_ms: i64,
     completed_at_ms: i64,
 ) -> Result<(), String> {
+    record_completed_operation_on_with_path(
+        db,
+        plan,
+        actor,
+        response,
+        attempt_started_at_ms,
+        completed_at_ms,
+        None,
+        None,
+    )
+}
+
+/// Complete an operation that was fully answered by structured lookup (#281).
+/// Records `answer_path=lookup_hit`, zero provider tokens, and no billable model call.
+#[allow(clippy::too_many_arguments)]
+fn record_completed_lookup_operation_on(
+    db: &RuntimeDb,
+    plan: &ExecutionPlan,
+    actor: &str,
+    response: &PlannedChatResponse,
+    attempt_started_at_ms: i64,
+    completed_at_ms: i64,
+    capability: &str,
+    provenance: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    db.update_operation_receipt(&plan.plan_id, |receipt| {
+        if receipt.completed_at_ms.is_some() {
+            return Err("operation receipt already has a terminal outcome".into());
+        }
+        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
+        let parent = if receipt.events.iter().any(|event| {
+            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
+        }) {
+            "egress"
+        } else {
+            "budget"
+        };
+        let mut artifact_attrs = BTreeMap::from([
+            ("artifact_type".into(), "structured_lookup".into()),
+            ("content_hash".into(), planned_response_hash(response)),
+            ("content_stored".into(), "false".into()),
+            (
+                crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+            ),
+            ("capability".into(), capability.into()),
+            (
+                "provider".into(),
+                crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+            ),
+            ("input_tokens".into(), "0".into()),
+            ("output_tokens".into(), "0".into()),
+        ]);
+        for (key, value) in provenance {
+            artifact_attrs.insert(format!("provenance_{key}"), value.clone());
+        }
+        receipt.events.extend([
+            receipt_event(
+                &receipt.operation_id,
+                "attempt-1",
+                Some(parent),
+                attempt_started_at_ms,
+                ReceiptEventKind::AttemptStarted,
+                actor,
+                BTreeMap::from([("attempt".into(), "1".into())]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "artifact-1",
+                Some("attempt-1"),
+                completed_at_ms,
+                ReceiptEventKind::ArtifactProduced,
+                "chisei.lookup_first",
+                artifact_attrs,
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "verification",
+                Some("artifact-1"),
+                completed_at_ms,
+                ReceiptEventKind::VerificationRecorded,
+                "chisei.execution",
+                BTreeMap::from([("status".into(), "not_requested".into())]),
+            ),
+            receipt_event(
+                &receipt.operation_id,
+                "outcome",
+                Some("verification"),
+                completed_at_ms,
+                ReceiptEventKind::OutcomeRecorded,
+                actor,
+                BTreeMap::from([
+                    ("status".into(), "succeeded".into()),
+                    (
+                        "completion_reason".into(),
+                        crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                    ),
+                    (
+                        crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                        crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+                    ),
+                    ("provider_tokens".into(), "0".into()),
+                    (
+                        "latency_ms".into(),
+                        completed_at_ms
+                            .saturating_sub(receipt.started_at_ms)
+                            .to_string(),
+                    ),
+                ]),
+            ),
+        ]);
+        receipt.completed_at_ms = Some(completed_at_ms);
+        // ModelCall remains uncovered by design: zero provider tokens, no adapter call.
+        receipt.uncovered_surfaces = vec![UncoveredSurface {
+            surface: ReceiptSurface::ModelCall,
+            reason: "answered by structured lookup without a provider model call".into(),
+        }];
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_completed_operation_on_with_path(
+    db: &RuntimeDb,
+    plan: &ExecutionPlan,
+    actor: &str,
+    response: &PlannedChatResponse,
+    attempt_started_at_ms: i64,
+    completed_at_ms: i64,
+    answer_path: Option<&str>,
+    lookup_refusal: Option<&str>,
+) -> Result<(), String> {
     let cost_usd_micros = crate::cost_estimate::pricing_from_env()
         .ok()
         .and_then(|pricing| native_execution_cost(plan, response, &pricing));
@@ -1241,6 +1374,18 @@ fn record_completed_operation_on(
                     if let Some(cost_usd_micros) = cost_usd_micros {
                         attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
                     }
+                    if let Some(path) = answer_path {
+                        attributes.insert(
+                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            path.into(),
+                        );
+                    }
+                    if let Some(reason) = lookup_refusal {
+                        attributes.insert(
+                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            reason.into(),
+                        );
+                    }
                     attributes
                 },
             ),
@@ -1273,16 +1418,31 @@ fn record_completed_operation_on(
                 completed_at_ms,
                 ReceiptEventKind::OutcomeRecorded,
                 actor,
-                BTreeMap::from([
-                    ("status".into(), "succeeded".into()),
-                    ("completion_reason".into(), response.stop_reason.clone()),
-                    (
-                        "latency_ms".into(),
-                        completed_at_ms
-                            .saturating_sub(receipt.started_at_ms)
-                            .to_string(),
-                    ),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("status".into(), "succeeded".into()),
+                        ("completion_reason".into(), response.stop_reason.clone()),
+                        (
+                            "latency_ms".into(),
+                            completed_at_ms
+                                .saturating_sub(receipt.started_at_ms)
+                                .to_string(),
+                        ),
+                    ]);
+                    if let Some(path) = answer_path {
+                        attributes.insert(
+                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            path.into(),
+                        );
+                    }
+                    if let Some(reason) = lookup_refusal {
+                        attributes.insert(
+                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            reason.into(),
+                        );
+                    }
+                    attributes
+                },
             ),
         ]);
         receipt.completed_at_ms = Some(completed_at_ms);
@@ -1290,6 +1450,78 @@ fn record_completed_operation_on(
         Ok(())
     })?;
     Ok(())
+}
+
+/// Result of the post-authz lookup-first attempt on ExecutePlan.
+#[derive(Debug)]
+enum ExecuteLookupFirst {
+    /// Full structured answer; caller must return without a provider call.
+    Hit {
+        response: PlannedChatResponse,
+        capability: String,
+        provenance: BTreeMap<String, String>,
+    },
+    /// Fail closed to the model path; record `lookup_refusal` on the receipt.
+    ModelPath { lookup_refusal: Option<String> },
+}
+
+/// After namespace authz, try allow-listed structured lookup before provider routing.
+fn evaluate_execute_lookup_first(
+    db: &RuntimeDb,
+    input: &ExecutionInput,
+    actor: &str,
+) -> ExecuteLookupFirst {
+    if !crate::chisei::lookup_first::is_lookup_first_capability(&input.task_type) {
+        return ExecuteLookupFirst::ModelPath {
+            lookup_refusal: None,
+        };
+    }
+    match crate::chisei::lookup_first::try_lookup_first(
+        &input.task_type,
+        &input.namespace,
+        actor,
+        &input.spec,
+        db,
+    ) {
+        Ok(crate::chisei::lookup_first::LookupDecision::Hit {
+            answer_json,
+            capability,
+            provenance,
+        }) => {
+            crate::chisei::lookup_first::record_lookup_hit();
+            ExecuteLookupFirst::Hit {
+                response: PlannedChatResponse {
+                    content: answer_json,
+                    tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    stop_reason: crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                    provider: crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                capability,
+                provenance,
+            }
+        }
+        Ok(crate::chisei::lookup_first::LookupDecision::Refusal { reason, .. }) => {
+            crate::chisei::lookup_first::record_model_path(true);
+            ExecuteLookupFirst::ModelPath {
+                lookup_refusal: Some(reason),
+            }
+        }
+        Ok(crate::chisei::lookup_first::LookupDecision::NotEligible) => {
+            ExecuteLookupFirst::ModelPath {
+                lookup_refusal: None,
+            }
+        }
+        Err(error) => {
+            crate::chisei::lookup_first::record_model_path(true);
+            ExecuteLookupFirst::ModelPath {
+                lookup_refusal: Some(format!("storage_error:{error}")),
+            }
+        }
+    }
 }
 
 fn native_execution_cost(
@@ -6872,6 +7104,52 @@ impl ChiseiService for ChiseiServiceImpl {
             &plan.memory_holdouts,
         )?;
         self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
+
+        // Lookup-first short-circuit: after authz, before provider routing (#281 S1).
+        let lookup_refusal = match evaluate_execute_lookup_first(&self.db, &input, &actor) {
+            ExecuteLookupFirst::Hit {
+                response,
+                capability,
+                provenance,
+            } => {
+                if let Err(error) = self.record_evolve_task(
+                    &input.request_id,
+                    &namespace_hint,
+                    &plan.enriched_spec,
+                    self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
+                        .as_deref(),
+                    "done",
+                    0,
+                ) {
+                    record_failed_operation_on(
+                        &self.db,
+                        &plan,
+                        &actor,
+                        "execution_bookkeeping_failed",
+                    )
+                    .map_err(Status::internal)?;
+                    return Err(Status::internal(error));
+                }
+                let completed_at_ms = chrono::Utc::now().timestamp_millis();
+                record_completed_lookup_operation_on(
+                    &self.db,
+                    &plan,
+                    &actor,
+                    &response,
+                    attempt_started_at_ms,
+                    completed_at_ms,
+                    &capability,
+                    &provenance,
+                )
+                .map_err(Status::internal)?;
+                return Ok(Response::new(ExecutePlanResponse {
+                    response: Some(response),
+                    executed_at: completed_at_ms / 1000,
+                }));
+            }
+            ExecuteLookupFirst::ModelPath { lookup_refusal } => lookup_refusal,
+        };
+
         let cacheable_message_count =
             native_cacheable_message_count(&input, &plan.prepared_messages);
         let chat = match execute_native_chat_request(
@@ -6921,14 +7199,28 @@ impl ChiseiService for ChiseiServiceImpl {
             return Err(Status::internal(error));
         }
         let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        self.record_completed_operation(
-            &plan,
-            &actor,
-            &response,
-            attempt_started_at_ms,
-            completed_at_ms,
-        )
-        .map_err(Status::internal)?;
+        if let Some(refusal) = lookup_refusal.as_deref() {
+            record_completed_operation_on_with_path(
+                &self.db,
+                &plan,
+                &actor,
+                &response,
+                attempt_started_at_ms,
+                completed_at_ms,
+                Some(crate::chisei::lookup_first::ANSWER_PATH_MODEL),
+                Some(refusal),
+            )
+            .map_err(Status::internal)?;
+        } else {
+            self.record_completed_operation(
+                &plan,
+                &actor,
+                &response,
+                attempt_started_at_ms,
+                completed_at_ms,
+            )
+            .map_err(Status::internal)?;
+        }
         // Sampling consumption: a sampled request was selected for deeper
         // observation, so capture its actual execution outcome as a durable
         // audit record keyed to the request. Unsampled executions skip this —
@@ -7109,6 +7401,58 @@ impl ChiseiService for ChiseiServiceImpl {
             &plan.memory_holdouts,
         )?;
         self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
+
+        // Lookup-first short-circuit for stream execute (#281 S1).
+        let lookup_refusal = match evaluate_execute_lookup_first(&self.db, &input, &actor) {
+            ExecuteLookupFirst::Hit {
+                response,
+                capability,
+                provenance,
+            } => {
+                if let Err(error) = self.record_evolve_task(
+                    &input.request_id,
+                    &namespace_hint,
+                    &plan.enriched_spec,
+                    self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
+                        .as_deref(),
+                    "done",
+                    0,
+                ) {
+                    record_failed_operation_on(
+                        &self.db,
+                        &plan,
+                        &actor,
+                        "execution_bookkeeping_failed",
+                    )
+                    .map_err(Status::internal)?;
+                    return Err(Status::internal(error));
+                }
+                let completed_at_ms = chrono::Utc::now().timestamp_millis();
+                record_completed_lookup_operation_on(
+                    &self.db,
+                    &plan,
+                    &actor,
+                    &response,
+                    attempt_started_at_ms,
+                    completed_at_ms,
+                    &capability,
+                    &provenance,
+                )
+                .map_err(Status::internal)?;
+                let content = response.content.clone();
+                let stream = async_stream::stream! {
+                    yield Ok(ExecutePlanStreamEvent {
+                        content_delta: content,
+                        response: Some(response),
+                        done: true,
+                        executed_at: completed_at_ms / 1000,
+                    });
+                };
+                return Ok(Response::new(Box::pin(stream)));
+            }
+            ExecuteLookupFirst::ModelPath { lookup_refusal } => lookup_refusal,
+        };
+
         let cacheable_message_count =
             native_cacheable_message_count(&input, &plan.prepared_messages);
         let chat_stream = match execute_native_chat_request_stream(
@@ -7229,13 +7573,18 @@ impl ChiseiService for ChiseiServiceImpl {
                     };
                     let _ = finish_streamed_execution(&execution);
                     let completed_at_ms = chrono::Utc::now().timestamp_millis();
-                    if let Err(error) = record_completed_operation_on(
+                    let answer_path = lookup_refusal
+                        .as_ref()
+                        .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                    if let Err(error) = record_completed_operation_on_with_path(
                         db.as_ref(),
                         &receipt_plan,
                         &actor,
                         &response,
                         attempt_started_at_ms,
                         completed_at_ms,
+                        answer_path,
+                        lookup_refusal.as_deref(),
                     ) {
                         yield Err(Status::internal(error));
                         return;
@@ -7290,13 +7639,18 @@ impl ChiseiService for ChiseiServiceImpl {
                 };
                 let _ = finish_streamed_execution(&execution);
                 let completed_at_ms = chrono::Utc::now().timestamp_millis();
-                if let Err(error) = record_completed_operation_on(
+                let answer_path = lookup_refusal
+                    .as_ref()
+                    .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                if let Err(error) = record_completed_operation_on_with_path(
                     &db,
                     &receipt_plan,
                     &actor,
                     &response,
                     attempt_started_at_ms,
                     completed_at_ms,
+                    answer_path,
+                    lookup_refusal.as_deref(),
                 ) {
                     yield Err(Status::internal(error));
                     return;
@@ -14825,5 +15179,165 @@ mod tests {
             .into_inner();
         assert!(!denied.admitted, "{denied:?}");
         assert_eq!(denied.deny_reason, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
+        use crate::chisei::lookup_first;
+        use crate::sekai::semantic;
+
+        let svc = memory_service();
+        lookup_first::seed_s1_fixture_graph(&svc.db).expect("seed lookup fixtures");
+
+        let plan = ExecutionPlan {
+            plan_id: "lookup-hit-plan".into(),
+            input: Some(ExecutionInput {
+                request_id: "lookup-hit-req".into(),
+                namespace: "acme".into(),
+                spec: r#"{"external_id":"widget:lookup-root"}"#.into(),
+                preferred_model: "llama3.2".into(),
+                preferred_runtime: "ollama".into(),
+                task_type: semantic::CAPABILITY_RESOLVE_REF.into(),
+                priority: 0,
+                user_id: "alice".into(),
+                estimated_tokens: 0,
+                messages: vec![],
+                tools: vec![],
+                system: String::new(),
+                max_tokens: 256,
+                task_class: String::new(),
+                ..Default::default()
+            }),
+            resolved_runtime: "ollama".into(),
+            resolved_model: "llama3.2".into(),
+            enriched_spec: r#"{"external_id":"widget:lookup-root"}"#.into(),
+            prepared_system: String::new(),
+            prepared_messages: vec![ChatMessage {
+                role: "user".into(),
+                content: r#"{"external_id":"widget:lookup-root"}"#.into(),
+                tool_call_id: String::new(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            budget: Some(BudgetVerdict {
+                allowed: true,
+                usage: None,
+                reason: String::new(),
+            }),
+            steps: vec![],
+            review_policy: None,
+            risk_score: 0.0,
+            low_success_namespace: false,
+            executable: true,
+            warnings: vec![],
+            max_tokens: 256,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            affinity_namespaces: vec![],
+            eval_regressed: false,
+            eval_regression_reason: String::new(),
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
+            egress_decisions: vec![],
+            task_class: String::new(),
+            evidence_references: vec![],
+            memory_references: vec![],
+            planning_actor: "local".into(),
+            memory_holdouts: vec![],
+        };
+        svc.record_planned_operation(&plan, "local").unwrap();
+        svc.cache_plan(plan.clone());
+
+        let mut request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+
+        let response = svc
+            .execute_plan(request)
+            .await
+            .expect("lookup hit should execute without provider")
+            .into_inner()
+            .response
+            .expect("response body");
+        assert_eq!(response.provider, lookup_first::LOOKUP_PROVIDER);
+        assert_eq!(response.stop_reason, lookup_first::LOOKUP_HIT_STOP_REASON);
+        assert_eq!(response.input_tokens, 0);
+        assert_eq!(response.output_tokens, 0);
+        assert_eq!(response.cache_read_input_tokens, 0);
+        assert_eq!(response.cache_creation_input_tokens, 0);
+        let body: serde_json::Value = serde_json::from_str(&response.content).unwrap();
+        assert_eq!(body["resolved"], true);
+        assert_eq!(body["object"]["id"], "lookup-root");
+
+        let receipt = svc
+            .db
+            .get_operation_receipt("lookup-hit-plan")
+            .unwrap()
+            .unwrap();
+        let outcome = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .expect("outcome");
+        assert_eq!(
+            outcome
+                .attributes
+                .get(lookup_first::ANSWER_PATH_ATTR)
+                .map(String::as_str),
+            Some(lookup_first::ANSWER_PATH_LOOKUP_HIT)
+        );
+        assert_eq!(
+            outcome
+                .attributes
+                .get("provider_tokens")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::ModelCalled),
+            "lookup hit must not record a model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path() {
+        use crate::chisei::lookup_first;
+        use crate::sekai::semantic;
+
+        // Only evaluate the decision path here — full model execute needs a live
+        // provider. The fail-closed refusal is unit-tested below via evaluate.
+        let db = RuntimeDb::memory();
+        lookup_first::seed_s1_fixture_graph(&db).unwrap();
+        let input = ExecutionInput {
+            request_id: "incomplete".into(),
+            namespace: "acme".into(),
+            spec: r#"{"object_id":"does-not-exist"}"#.into(),
+            task_type: semantic::CAPABILITY_RESOLVE_REF.into(),
+            ..Default::default()
+        };
+        match evaluate_execute_lookup_first(&db, &input, "alice") {
+            ExecuteLookupFirst::ModelPath {
+                lookup_refusal: Some(reason),
+            } => assert_eq!(reason, "incomplete"),
+            other => panic!("expected incomplete model path, got {other:?}"),
+        }
+
+        let cross = ExecutionInput {
+            request_id: "cross".into(),
+            namespace: "acme".into(),
+            spec: r#"{"object_id":"other-ns-object"}"#.into(),
+            task_type: semantic::CAPABILITY_RESOLVE_REF.into(),
+            ..Default::default()
+        };
+        match evaluate_execute_lookup_first(&db, &cross, "alice") {
+            ExecuteLookupFirst::ModelPath {
+                lookup_refusal: Some(reason),
+            } => assert_eq!(reason, "cross_namespace"),
+            other => panic!("expected cross_namespace model path, got {other:?}"),
+        }
     }
 }

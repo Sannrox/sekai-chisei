@@ -1,0 +1,54 @@
+{
+  "suite": "s1-lookup-first",
+  "issue": 281,
+  "decision": "S1",
+  "description": "Checked-in fixture suite for allow-listed structured lookup-first answers. Dual-run shadow uses structural equality of golden answers; no fleet spend claim.",
+  "allowlist": [
+    "sekai.semantic.resolve_ref",
+    "sekai.semantic.expand_relations",
+    "sekai.context.retrieve",
+    "sekai.semantic.explain_derivation"
+  ],
+  "s1_short_circuit_capability": "sekai.semantic.resolve_ref",
+  "cases": [
+    {
+      "id": "resolve_ref_hit",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "external_id": "widget:lookup-root" },
+      "expected_path": "lookup_hit",
+      "notes": "Known graph fact answers without LLM adapters; zero provider tokens."
+    },
+    {
+      "id": "resolve_ref_incomplete_fallback",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "object_id": "does-not-exist" },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete",
+      "notes": "Missing fact fails closed to model path with lookup_refusal=incomplete."
+    },
+    {
+      "id": "resolve_ref_cross_namespace_deny",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "object_id": "other-ns-object" },
+      "expected_path": "model_path",
+      "expected_refusal": "cross_namespace",
+      "notes": "Cross-namespace object is never disclosed; model path with refusal."
+    },
+    {
+      "id": "resolve_ref_acl_denied_fallback",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "object_id": "acl-denied" },
+      "expected_path": "model_path",
+      "expected_refusal": "acl_denied",
+      "notes": "ACL miss fails closed; catalog visibility is not an authz token."
+    }
+  ]
+}

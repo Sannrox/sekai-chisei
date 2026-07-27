@@ -16,6 +16,7 @@ pub mod evidence;
 pub mod evidence_projection;
 pub mod evidence_store;
 pub mod execution_evidence;
+pub mod federation_profile;
 pub mod function;
 pub mod handoff;
 pub mod hybrid;

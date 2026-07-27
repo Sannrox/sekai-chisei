@@ -35,6 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::compliance_cli::run_compliance_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "federation" => {
+            sekai_chisei::federation_cli::run_federation_command(args.into_iter().skip(1).collect())
+                .await
+        }
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
@@ -461,7 +465,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|federation|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi> ...\n"
     );
     println!("Credential commands:");
     println!("  {}", credential_usage());
@@ -488,6 +492,10 @@ fn print_root_usage() {
     println!(
         "\nCompliance export:\n  {}",
         sekai_chisei::compliance_cli::usage()
+    );
+    println!(
+        "\nFederation profile:\n  {}",
+        sekai_chisei::federation_cli::usage()
     );
     println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
     println!(

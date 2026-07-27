@@ -263,7 +263,27 @@ impl SekaiDb {
                 imported_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sekai_peer_imports_namespace
-                ON sekai_peer_imports(namespace, imported_at_ms);",
+                ON sekai_peer_imports(namespace, imported_at_ms);
+            CREATE TABLE IF NOT EXISTS sekai_federation_local_site (
+                site_id TEXT PRIMARY KEY,
+                key_id TEXT NOT NULL,
+                public_key_hex TEXT NOT NULL,
+                region TEXT,
+                residency_data_classes_json TEXT NOT NULL,
+                registered_by TEXT NOT NULL,
+                registered_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sekai_federation_peers (
+                local_site_id TEXT NOT NULL,
+                peer_site_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                membership TEXT NOT NULL,
+                health TEXT NOT NULL,
+                joined_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (local_site_id, peer_site_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sekai_federation_peers_membership
+                ON sekai_federation_peers(membership, health);",
         )
         .map_err(|e| e.to_string())?;
         Ok(())

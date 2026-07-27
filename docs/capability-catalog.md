@@ -103,6 +103,28 @@ A typical compose order is resolve → expand → retrieve → explain. Each ste
 rechecks authorization independently; a cached catalog version is observational
 provenance on the receipt (`reported_catalog_version`), not a grant.
 
+## Lookup-first answers (S1 / #281)
+
+When `ChiseiService.ExecutePlan` (or stream) is invoked with
+`ExecutionInput.task_type` set to an **allow-listed** semantic capability id
+and `spec` holding that capability's fixed structured JSON input, Chisei may
+short-circuit **after** namespace authorization and **before** provider routing:
+
+| Capability | S1 short-circuit |
+| --- | --- |
+| `sekai.semantic.resolve_ref` | Full hit returns structured JSON with **zero provider tokens** (`provider=lookup`, `answer_path=lookup_hit`). |
+| `sekai.semantic.expand_relations` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
+| `sekai.context.retrieve` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
+| `sekai.semantic.explain_derivation` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
+
+Fail closed: incomplete graph state, ACL miss, cross-namespace object, or
+schema miss records `lookup_refusal` on the operation receipt and continues on
+the normal model path (`answer_path=model_path`). Free-form natural-language
+substitution is out of scope. Fixture suite (hit / incomplete / cross-namespace
+/ ACL) and dual-run structural equality live under
+`tests/fixtures/lookup_first/` and `chisei::lookup_first`. No fleet-wide spend
+percentage is claimed from this surface.
+
 Attributed invocations write a canonical `operation.receipt/v1` record with
 intent, live policy, native routing, budget-check, and outcome events. Receipt
 and audit evidence contain principal identifiers and opaque approval or permit
