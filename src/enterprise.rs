@@ -331,6 +331,23 @@ pub trait EnterpriseExtension: Send + Sync {
         namespace: &str,
         action: NamespaceAction,
     ) -> Result<(), ExtensionError>;
+
+    /// Resolve a tenant-scoped model-provider credential (#118).
+    ///
+    /// Default: unavailable. Enterprise distributions must implement this so
+    /// each authenticated tenant supplies isolated provider secrets. Callers
+    /// pass only `AuthenticatedContext`; request-selected tenant ids are never
+    /// accepted. Implementations must not log or persist secret material.
+    fn resolve_provider_credential(
+        &self,
+        context: &AuthenticatedContext,
+        provider: &str,
+    ) -> Result<crate::provider_credentials::ResolvedProviderCredential, ExtensionError> {
+        let _ = (context, provider);
+        Err(ExtensionError::Unavailable(
+            "tenant-scoped provider credentials are not implemented".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
