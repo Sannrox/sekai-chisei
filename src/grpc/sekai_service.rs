@@ -8514,50 +8514,147 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    async fn transition_capability_package(
+        &self,
+        req: Request<TransitionCapabilityPackageRequest>,
+    ) -> Result<Response<TransitionCapabilityPackageResponse>, Status> {
+        // Unified package transition path (#389): one RPC + enum for evaluate /
+        // upgrade / rollback / disable / uninstall. Peer RPCs remain experimental
+        // shims.
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
+        let action = CapabilityPackageTransitionAction::try_from(inner.action).map_err(|_| {
+            Status::invalid_argument("unknown capability package transition action")
+        })?;
+        let now = now_millis();
+        match action {
+            CapabilityPackageTransitionAction::Unspecified => Err(Status::invalid_argument(
+                "capability package transition action required",
+            )),
+            CapabilityPackageTransitionAction::Evaluate => {
+                let passed = self
+                    .db
+                    .evaluate_capability_package(
+                        &inner.namespace,
+                        &inner.package_name,
+                        &actor,
+                        &inner.request_id,
+                        now,
+                    )
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionCapabilityPackageResponse {
+                    installation: None,
+                    evaluate_passed: passed,
+                }))
+            }
+            CapabilityPackageTransitionAction::Upgrade => {
+                let manifest =
+                    from_proto_package_manifest(inner.manifest.ok_or_else(|| {
+                        Status::invalid_argument("manifest required for upgrade")
+                    })?)?;
+                let installation = self
+                    .db
+                    .upgrade_capability_package(
+                        &inner.namespace,
+                        &manifest,
+                        &actor,
+                        &inner.request_id,
+                        now,
+                    )
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionCapabilityPackageResponse {
+                    installation: Some(to_proto_package_installation(&installation)),
+                    evaluate_passed: false,
+                }))
+            }
+            CapabilityPackageTransitionAction::Rollback => {
+                let installation = self
+                    .db
+                    .rollback_capability_package(
+                        &inner.namespace,
+                        &inner.package_name,
+                        &actor,
+                        &inner.request_id,
+                        now,
+                    )
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionCapabilityPackageResponse {
+                    installation: Some(to_proto_package_installation(&installation)),
+                    evaluate_passed: false,
+                }))
+            }
+            CapabilityPackageTransitionAction::Disable => {
+                let installation = self
+                    .db
+                    .disable_capability_package(
+                        &inner.namespace,
+                        &inner.package_name,
+                        &actor,
+                        &inner.request_id,
+                        now,
+                    )
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionCapabilityPackageResponse {
+                    installation: Some(to_proto_package_installation(&installation)),
+                    evaluate_passed: false,
+                }))
+            }
+            CapabilityPackageTransitionAction::Uninstall => {
+                self.db
+                    .uninstall_capability_package(
+                        &inner.namespace,
+                        &inner.package_name,
+                        &actor,
+                        &inner.request_id,
+                        now,
+                    )
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionCapabilityPackageResponse {
+                    installation: None,
+                    evaluate_passed: false,
+                }))
+            }
+        }
+    }
+
     async fn evaluate_capability_package(
         &self,
         req: Request<CapabilityPackageTransitionRequest>,
     ) -> Result<Response<EvaluateCapabilityPackageResponse>, Status> {
-        let principals = caller_principals(&req);
+        let metadata = req.metadata().clone();
         let inner = req.into_inner();
-        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
-        let passed = self
-            .db
-            .evaluate_capability_package(
-                &inner.namespace,
-                &inner.package_name,
-                &actor,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
-        Ok(Response::new(EvaluateCapabilityPackageResponse { passed }))
+        let mut unified = Request::new(TransitionCapabilityPackageRequest {
+            namespace: inner.namespace,
+            package_name: inner.package_name,
+            request_id: inner.request_id,
+            action: CapabilityPackageTransitionAction::Evaluate as i32,
+            manifest: None,
+        });
+        *unified.metadata_mut() = metadata;
+        let response = self.transition_capability_package(unified).await?;
+        Ok(Response::new(EvaluateCapabilityPackageResponse {
+            passed: response.into_inner().evaluate_passed,
+        }))
     }
 
     async fn upgrade_capability_package(
         &self,
         req: Request<UpgradeCapabilityPackageRequest>,
     ) -> Result<Response<UpgradeCapabilityPackageResponse>, Status> {
-        let principals = caller_principals(&req);
+        let metadata = req.metadata().clone();
         let inner = req.into_inner();
-        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
-        let manifest = from_proto_package_manifest(
-            inner
-                .manifest
-                .ok_or_else(|| Status::invalid_argument("manifest required"))?,
-        )?;
-        let installation = self
-            .db
-            .upgrade_capability_package(
-                &inner.namespace,
-                &manifest,
-                &actor,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
+        let mut unified = Request::new(TransitionCapabilityPackageRequest {
+            namespace: inner.namespace,
+            package_name: String::new(),
+            request_id: inner.request_id,
+            action: CapabilityPackageTransitionAction::Upgrade as i32,
+            manifest: inner.manifest,
+        });
+        *unified.metadata_mut() = metadata;
+        let response = self.transition_capability_package(unified).await?;
         Ok(Response::new(UpgradeCapabilityPackageResponse {
-            installation: Some(to_proto_package_installation(&installation)),
+            installation: response.into_inner().installation,
         }))
     }
 
@@ -8565,21 +8662,19 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CapabilityPackageTransitionRequest>,
     ) -> Result<Response<CapabilityPackageTransitionResponse>, Status> {
-        let principals = caller_principals(&req);
+        let metadata = req.metadata().clone();
         let inner = req.into_inner();
-        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
-        let installation = self
-            .db
-            .rollback_capability_package(
-                &inner.namespace,
-                &inner.package_name,
-                &actor,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
+        let mut unified = Request::new(TransitionCapabilityPackageRequest {
+            namespace: inner.namespace,
+            package_name: inner.package_name,
+            request_id: inner.request_id,
+            action: CapabilityPackageTransitionAction::Rollback as i32,
+            manifest: None,
+        });
+        *unified.metadata_mut() = metadata;
+        let response = self.transition_capability_package(unified).await?;
         Ok(Response::new(CapabilityPackageTransitionResponse {
-            installation: Some(to_proto_package_installation(&installation)),
+            installation: response.into_inner().installation,
         }))
     }
 
@@ -8587,21 +8682,19 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CapabilityPackageTransitionRequest>,
     ) -> Result<Response<CapabilityPackageTransitionResponse>, Status> {
-        let principals = caller_principals(&req);
+        let metadata = req.metadata().clone();
         let inner = req.into_inner();
-        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
-        let installation = self
-            .db
-            .disable_capability_package(
-                &inner.namespace,
-                &inner.package_name,
-                &actor,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
+        let mut unified = Request::new(TransitionCapabilityPackageRequest {
+            namespace: inner.namespace,
+            package_name: inner.package_name,
+            request_id: inner.request_id,
+            action: CapabilityPackageTransitionAction::Disable as i32,
+            manifest: None,
+        });
+        *unified.metadata_mut() = metadata;
+        let response = self.transition_capability_package(unified).await?;
         Ok(Response::new(CapabilityPackageTransitionResponse {
-            installation: Some(to_proto_package_installation(&installation)),
+            installation: response.into_inner().installation,
         }))
     }
 
@@ -8609,18 +8702,17 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CapabilityPackageTransitionRequest>,
     ) -> Result<Response<UninstallCapabilityPackageResponse>, Status> {
-        let principals = caller_principals(&req);
+        let metadata = req.metadata().clone();
         let inner = req.into_inner();
-        let actor = authorize_package_mutation(self, &principals, &inner.namespace)?;
-        self.db
-            .uninstall_capability_package(
-                &inner.namespace,
-                &inner.package_name,
-                &actor,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
+        let mut unified = Request::new(TransitionCapabilityPackageRequest {
+            namespace: inner.namespace,
+            package_name: inner.package_name,
+            request_id: inner.request_id,
+            action: CapabilityPackageTransitionAction::Uninstall as i32,
+            manifest: None,
+        });
+        *unified.metadata_mut() = metadata;
+        self.transition_capability_package(unified).await?;
         Ok(Response::new(UninstallCapabilityPackageResponse {}))
     }
 
@@ -17827,6 +17919,57 @@ mod tests {
                 .name,
             "after"
         );
+    }
+
+    #[tokio::test]
+    async fn transition_capability_package_evaluate_and_rejects_unspecified() {
+        // #389: unified TransitionCapabilityPackage enum path.
+        let svc = service();
+        grant_action_admin(&svc);
+        let manifest: package_domain::CapabilityPackageManifest = serde_json::from_str(
+            include_str!("../../examples/capability-packages/reference-v1.json"),
+        )
+        .unwrap();
+        svc.db
+            .install_capability_package("acme", &manifest, "tester", "install-transition", 10)
+            .unwrap();
+
+        let evaluated = svc
+            .transition_capability_package(with_principal(TransitionCapabilityPackageRequest {
+                namespace: "acme".into(),
+                package_name: "reference-review".into(),
+                request_id: "eval-transition".into(),
+                action: CapabilityPackageTransitionAction::Evaluate as i32,
+                manifest: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(evaluated.evaluate_passed);
+
+        let unspecified = svc
+            .transition_capability_package(with_principal(TransitionCapabilityPackageRequest {
+                namespace: "acme".into(),
+                package_name: "reference-review".into(),
+                request_id: "unspecified-transition".into(),
+                action: CapabilityPackageTransitionAction::Unspecified as i32,
+                manifest: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unspecified.code(), tonic::Code::InvalidArgument);
+
+        // Peer shim still works through the unified path.
+        let via_shim = svc
+            .evaluate_capability_package(with_principal(CapabilityPackageTransitionRequest {
+                namespace: "acme".into(),
+                package_name: "reference-review".into(),
+                request_id: "eval-shim".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(via_shim.passed);
     }
 
     #[tokio::test]

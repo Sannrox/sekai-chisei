@@ -224,6 +224,14 @@ evaluate, upgrade, rollback, disable, and uninstall events atomically with
 lifecycle state. Request IDs are actor- and namespace-scoped and bound to
 canonical input, so an ambiguous retry cannot apply different content.
 
+**Product transition path (#389):** prefer `TransitionCapabilityPackage` with
+`CapabilityPackageTransitionAction` (`evaluate` / `upgrade` / `rollback` /
+`disable` / `uninstall`). Upgrade requires `manifest` on the same request.
+The peer RPCs (`EvaluateCapabilityPackage`, `UpgradeCapabilityPackage`,
+`RollbackCapabilityPackage`, `DisableCapabilityPackage`,
+`UninstallCapabilityPackage`) remain experimental shims over that path.
+`InstallCapabilityPackage` and `GetCapabilityPackage` stay separate.
+
 Uninstall removes only the active installation. Immutable manifests and the
 append-only event stream remain as evidence. Package state is namespace-scoped,
 so neither installation nor removal mutates another namespace. The manually

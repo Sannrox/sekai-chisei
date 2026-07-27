@@ -475,6 +475,20 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "TransitionCapabilityPackage",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.capability-packages",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "tests/capability_package_backend_conformance.rs",
+        "tests/capability_package_lifecycle.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "EvaluateCapabilityPackage",
       "kind": "persistent",
       "surfaces": [
@@ -498,7 +512,7 @@
         "tests/capability_package_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "RollbackCapabilityPackage",
@@ -511,7 +525,7 @@
         "tests/capability_package_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "DisableCapabilityPackage",
@@ -524,7 +538,7 @@
         "tests/capability_package_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "UninstallCapabilityPackage",
@@ -537,7 +551,7 @@
         "tests/capability_package_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "SetCapabilityPackageTrustPolicy",

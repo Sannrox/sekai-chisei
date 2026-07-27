@@ -414,12 +414,37 @@ message InstallCapabilityPackageRequest { string namespace = 1; CapabilityPackag
 message InstallCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; }
 message UpgradeCapabilityPackageRequest { string namespace = 1; CapabilityPackageManifest manifest = 2; string request_id = 3; }
 message UpgradeCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; }
+// Legacy per-action transition request (shims for Evaluate/Rollback/Disable/Uninstall).
 message CapabilityPackageTransitionRequest { string namespace = 1; string package_name = 2; string request_id = 3; }
 message CapabilityPackageTransitionResponse { CapabilityPackageInstallation installation = 1; }
 message GetCapabilityPackageRequest { string namespace = 1; string package_name = 2; }
 message GetCapabilityPackageResponse { CapabilityPackageInstallation installation = 1; CapabilityPackageManifest manifest = 2; repeated CapabilityPackageEvent events = 3; }
 message EvaluateCapabilityPackageResponse { bool passed = 1; }
 message UninstallCapabilityPackageResponse {}
+
+// Unified product transition path (#389 / #383 S5). Prefer this over peer RPCs.
+enum CapabilityPackageTransitionAction {
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_UNSPECIFIED = 0;
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_EVALUATE = 1;
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_UPGRADE = 2;
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_ROLLBACK = 3;
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_DISABLE = 4;
+  CAPABILITY_PACKAGE_TRANSITION_ACTION_UNINSTALL = 5;
+}
+message TransitionCapabilityPackageRequest {
+  string namespace = 1;
+  string package_name = 2;
+  string request_id = 3;
+  CapabilityPackageTransitionAction action = 4;
+  // Required when action == UPGRADE; ignored otherwise.
+  CapabilityPackageManifest manifest = 5;
+}
+message TransitionCapabilityPackageResponse {
+  // Present for upgrade/rollback/disable.
+  CapabilityPackageInstallation installation = 1;
+  // Meaningful when action == EVALUATE.
+  bool evaluate_passed = 2;
+}
 
 message LineageNode {
   Object object = 1;
@@ -1853,6 +1878,9 @@ service SekaiService {
   rpc DiscoverCapabilities(DiscoverCapabilitiesRequest) returns (DiscoverCapabilitiesResponse);
   rpc InstallCapabilityPackage(InstallCapabilityPackageRequest) returns (InstallCapabilityPackageResponse);
   rpc GetCapabilityPackage(GetCapabilityPackageRequest) returns (GetCapabilityPackageResponse);
+  // Product transition path: evaluate/upgrade/rollback/disable/uninstall (#389).
+  rpc TransitionCapabilityPackage(TransitionCapabilityPackageRequest) returns (TransitionCapabilityPackageResponse);
+  // Experimental shims over TransitionCapabilityPackage (deprecated aliases).
   rpc EvaluateCapabilityPackage(CapabilityPackageTransitionRequest) returns (EvaluateCapabilityPackageResponse);
   rpc UpgradeCapabilityPackage(UpgradeCapabilityPackageRequest) returns (UpgradeCapabilityPackageResponse);
   rpc RollbackCapabilityPackage(CapabilityPackageTransitionRequest) returns (CapabilityPackageTransitionResponse);
