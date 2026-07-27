@@ -533,6 +533,7 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn budget_transfer_capacity(
         &self,
         transfer_id: &str,
@@ -565,6 +566,7 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn budget_record_transfer_refused(
         &self,
         transfer_id: &str,

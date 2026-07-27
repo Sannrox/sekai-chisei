@@ -672,6 +672,7 @@ fn pg_enforce_pool_member_sum(
 }
 
 impl PostgresDb {
+    #[allow(clippy::too_many_arguments)]
     pub fn budget_transfer_capacity(
         &self,
         transfer_id: &str,
@@ -792,6 +793,7 @@ impl PostgresDb {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn budget_record_transfer_refused(
         &self,
         transfer_id: &str,

@@ -311,6 +311,7 @@ impl SekaiDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn budget_check_and_reserve_chain_for_site(
         &self,
         scope_id: &str,
@@ -334,6 +335,7 @@ impl SekaiDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn budget_check_and_reserve_chain_inner(
         &self,
         scope_id: &str,
@@ -452,6 +454,7 @@ impl SekaiDb {
         self.budget_check_chain_for_site(scope_id, metric, amount, now_ms, false, "", false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn budget_check_chain_for_site(
         &self,
         scope_id: &str,
@@ -603,6 +606,7 @@ impl SekaiDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn budget_transfer_capacity(
         &self,
         transfer_id: &str,
@@ -700,6 +704,7 @@ impl SekaiDb {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn budget_record_transfer_refused(
         &self,
         transfer_id: &str,
