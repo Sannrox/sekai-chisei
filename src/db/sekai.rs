@@ -188,6 +188,7 @@ impl SekaiDb {
         self.migrate_action_types()?;
         self.migrate_governed_action_types()?;
         self.migrate_action_instances()?;
+        self.migrate_action_effects()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
         self.migrate_temporal_history()?;

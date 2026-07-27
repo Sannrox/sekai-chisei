@@ -1323,6 +1323,33 @@ message ListActionInstancesRequest {
 }
 message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
 
+// Typed ActionInstance effects (#398). Children of admitted instances.
+message ActionEffect {
+  string effect_id = 1;
+  string instance_id = 2;
+  string namespace = 3;
+  string operation_id = 4;
+  // runtime_dispatch | notify | external_mutate
+  string kind = 5;
+  // pending | claimed | sent | failed | skipped
+  string status = 6;
+  string payload_json = 7;
+  string failure_reason = 8;
+  int64 created_at_ms = 9;
+  int64 updated_at_ms = 10;
+}
+message GetActionEffectRequest { string effect_id = 1; }
+message GetActionEffectResponse { ActionEffect effect = 1; }
+message ListActionEffectsRequest {
+  string instance_id = 1;
+  // When set without instance_id: list pending runtime_dispatch for claim prep.
+  string namespace = 2;
+  string kind = 3;
+  string status = 4;
+  uint32 limit = 5;
+}
+message ListActionEffectsResponse { repeated ActionEffect effects = 1; }
+
 
 message ExecuteActionRequest {
   ActionRequest request = 1;
@@ -2040,6 +2067,9 @@ service SekaiService {
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
+  // Typed effects on admitted ActionInstances (#398).
+  rpc GetActionEffect(GetActionEffectRequest) returns (GetActionEffectResponse);
+  rpc ListActionEffects(ListActionEffectsRequest) returns (ListActionEffectsResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);

@@ -1260,6 +1260,30 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetActionEffect",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_effect.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListActionEffects",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_effect.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ExecuteAction",
       "kind": "computed",
       "surfaces": [],
