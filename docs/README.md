@@ -63,6 +63,8 @@ in order.
 - [Governed hybrid retrieval contract](research/152-hybrid-retrieval.md)
 - [Semantic pattern-query surface](research/145-semantic-pattern-query.md)
 - [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
+- [Multi-control-plane federation profile v1](research/291-federation-profile.md)
+  — operator guide: [federation-profile.md](federation-profile.md)
 - [Multi-region consistency for budgets, leases, and permits](research/292-multi-region-consistency.md)
 - [Governed what-if simulation over graph projections](research/148-what-if-simulation.md)
 - [Non-authoritative scenario overlay](scenario-overlay.md) — request-scoped

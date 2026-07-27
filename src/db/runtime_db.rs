@@ -3038,6 +3038,66 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_federation_local_site(
+        &self,
+        site: &crate::sekai::federation_profile::LocalSiteIdentity,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_local_site(site),
+            Self::Postgres(_) => Err(
+                "put_federation_local_site is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_federation_local_site(
+        &self,
+    ) -> Result<Option<crate::sekai::federation_profile::LocalSiteIdentity>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_local_site(),
+            Self::Postgres(_) => Err(
+                "get_federation_local_site is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn put_federation_peer(
+        &self,
+        peer: &crate::sekai::federation_profile::FederationPeer,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_peer(peer),
+            Self::Postgres(_) => {
+                Err("put_federation_peer is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
+    pub fn get_federation_peer(
+        &self,
+        peer_site_id: &str,
+    ) -> Result<Option<crate::sekai::federation_profile::FederationPeer>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_peer(peer_site_id),
+            Self::Postgres(_) => {
+                Err("get_federation_peer is unavailable on the PostgreSQL community runtime".into())
+            }
+        }
+    }
+
+    pub fn list_federation_peers(
+        &self,
+    ) -> Result<Vec<crate::sekai::federation_profile::FederationPeer>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_peers(),
+            Self::Postgres(_) => Err(
+                "list_federation_peers is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

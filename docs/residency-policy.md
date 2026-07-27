@@ -58,5 +58,7 @@ single-plane control-plane configuration today.
 - Multi-region write topology (see
   [research/292-multi-region-consistency.md](research/292-multi-region-consistency.md);
   features #293–#294)
-- Cross-site federation wire protocol (#291)
+- Cross-site federation profile (see
+  [research/291-federation-profile.md](research/291-federation-profile.md) and
+  [federation-profile.md](federation-profile.md); #291)
 - Durable residency policy object schema / SetResidencyPolicy RPC (follow-up)

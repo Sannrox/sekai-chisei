@@ -94,3 +94,7 @@ sekaictl compliance list-trust-roots --namespace <ns>
 
 Imported records are verified under enabled roots and stored with
 `permit_authority=false`. They never authorize local permit redemption.
+
+Federation membership, policy pack pins, and peer health for multi-plane
+operation are documented in [federation-profile.md](federation-profile.md)
+(`sekai.federation-profile/v1`, #291).

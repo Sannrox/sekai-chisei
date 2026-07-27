@@ -7,6 +7,7 @@ pub mod compat_shims;
 pub mod compliance_cli;
 pub mod compliance_export;
 pub mod config;
+pub mod federation_cli;
 pub use sekai_provider::cost_estimate;
 pub mod credential_cli;
 pub mod db;
