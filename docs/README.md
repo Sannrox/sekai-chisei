@@ -23,6 +23,8 @@ in order.
   supported request, streaming, and error contract.
 - [Capability catalog](capability-catalog.md) — discover visible queries,
   retrieval, and governed actions without treating visibility as a grant.
+- [Capability package trust](capability-package-trust.md) — Ed25519 package
+  trust roots and verification fail-closed rules.
 - [`proto/`](../proto/) — inspect the native gRPC APIs.
 - [Ontology definitions](ontology.md) — model semantic classes and relations,
   project schemas, and understand current validation boundaries.
@@ -55,6 +57,16 @@ in order.
   and two-replica harness.
 - [Operator console](operator-console.md) — authenticated browser shell on the
   ops listener (login, namespace context, fail-closed routes).
+- [Policy dry-run](policy-dry-run.md) — side-effect-free policy counterfactuals
+  over receipts.
+- [Classification markings](classification-markings.md) — provisional marking
+  and purpose constraints.
+- [Temporal history storage](temporal-history-storage.md) — selective bitemporal
+  as-of history and correction semantics.
+- [Team operations](team-operations.md) — team-namespace bootstrap and operator
+  workflows.
+- [Compliance export](compliance-export.md) — governed export packaging for
+  audit and residency evidence.
 - [Docker](docker.md) — run the server and gateway with Docker Compose.
 - [Security policy](../SECURITY.md) — supported versions and private
   vulnerability reporting.
@@ -92,11 +104,11 @@ in order.
   — model/provider residency policy (#289); research:
   [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
 - [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — complete
-  tenant-free Sekai surface set, inventory evidence, and remaining runtime
-  activation gates.
-- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — in-progress Chisei
-  decision/execution inventory, proven budget/receipt surfaces, and remaining
-  learning/approval/gateway work.
+  tenant-free Sekai surface set and inventory evidence; activate with
+  `SEKAI_DB_BACKEND=postgres` and `DATABASE_URL`.
+- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — complete Chisei
+  decision/execution inventory with dual-backend conformance (including
+  budget, policy, learning, approvals, and gateway governance).
 - [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
   enforcement.
 
