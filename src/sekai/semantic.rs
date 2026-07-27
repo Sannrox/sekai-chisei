@@ -18,6 +18,8 @@ pub const CAPABILITY_RESOLVE_REF: &str = "sekai.semantic.resolve_ref";
 pub const CAPABILITY_EXPAND_RELATIONS: &str = "sekai.semantic.expand_relations";
 pub const CAPABILITY_RETRIEVE_CONTEXT: &str = "sekai.context.retrieve";
 pub const CAPABILITY_EXPLAIN_DERIVATION: &str = "sekai.semantic.explain_derivation";
+/// Non-authoritative scenario overlay evaluation (#362 / research #148).
+pub const CAPABILITY_EVALUATE_SCENARIO: &str = "sekai.scenario.evaluate";
 
 pub const REF_KIND_OBJECT: &str = "object";
 pub const REF_KIND_ONTOLOGY_CLASS: &str = "ontology_class";

@@ -39,7 +39,7 @@ use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, ontology_proposal, retrieval,
-    security, semantic,
+    scenario, security, semantic,
 };
 use uuid::Uuid;
 
@@ -855,6 +855,92 @@ impl SekaiServiceImpl {
         })
     }
 
+    fn execute_evaluate_scenario(
+        &self,
+        principals: &[String],
+        inner: EvaluateScenarioRequest,
+    ) -> Result<EvaluateScenarioResponse, Status> {
+        let namespace = inner.namespace.trim().to_string();
+        if namespace.is_empty() || namespace != inner.namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        check_team_namespace(&self.db, principals, &namespace, false)?;
+        let base_mode = scenario::BaseMode::parse(&inner.base_mode).map_err(map_scenario_error)?;
+        if inner.valid_at_ms != 0 || inner.recorded_revision != 0 {
+            return Err(Status::invalid_argument(
+                "temporal as-of base fields are not enabled in this vertical; omit valid_at_ms and recorded_revision",
+            ));
+        }
+        let mut deltas = Vec::with_capacity(inner.deltas.len());
+        for delta in inner.deltas {
+            let op = scenario::DeltaOp::parse(
+                &delta.op,
+                &delta.object_id,
+                &delta.property_key,
+                &delta.property_value,
+                &delta.link_id,
+                &delta.from_id,
+                &delta.to_id,
+                &delta.relation,
+            )
+            .map_err(map_scenario_error)?;
+            deltas.push(scenario::HypothesisDelta { id: delta.id, op });
+        }
+        let request = scenario::ScenarioRequest {
+            namespace: namespace.clone(),
+            base_mode,
+            seed_object_ids: inner.seed_object_ids,
+            deltas,
+            bounds: scenario::ScenarioBounds {
+                max_depth: inner.max_depth,
+                max_objects: inner.max_objects,
+                max_links: inner.max_links,
+                max_time_ms: inner.max_time_ms,
+                max_explanation_bytes: inner.max_explanation_bytes,
+                max_deltas: inner.max_deltas,
+                max_expansion_work_units: inner.max_expansion_work_units,
+            },
+        };
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let scenario_id = if inner.request_id.trim().is_empty() {
+            format!("scenario-{}", Uuid::new_v4().simple())
+        } else {
+            format!("scenario-{}", inner.request_id.trim())
+        };
+        let result = scenario::evaluate_scenario(&self.db, &request, scenario_id, |object| {
+            self.security.can_access(&object.id, &principal_refs)
+                && check_team_namespace(&self.db, principals, &object.namespace, false).is_ok()
+                && object_passes_marking(&self.db, object, principals).unwrap_or(false)
+                && !is_reserved_governance_kind(&object.kind)
+        })
+        .map_err(map_scenario_error)?;
+        Ok(EvaluateScenarioResponse {
+            epistemic_class: result.epistemic_class,
+            scenario_id: result.scenario_id,
+            base_mode: result.base_mode,
+            namespace: result.namespace,
+            impact_rows: result
+                .impact_rows
+                .into_iter()
+                .map(|row| ScenarioImpactRow {
+                    target_kind: row.target_kind,
+                    object_id: row.object_id,
+                    link_id: row.link_id,
+                    property_key: row.property_key,
+                    op: row.op,
+                    delta_ids: row.delta_ids,
+                    explanation_steps: row.explanation_steps,
+                    before_value: row.before_value,
+                    after_value: row.after_value,
+                })
+                .collect(),
+            truncated: result.truncated,
+            truncation_reasons: result.truncation_reasons,
+            expansion_work_units: result.expansion_work_units,
+            applied_deltas: result.applied_deltas,
+        })
+    }
+
     fn discoverable_capabilities(
         &self,
         namespace: &str,
@@ -896,6 +982,7 @@ impl SekaiServiceImpl {
         entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
         entries.push(explain_derivation_capability());
+        entries.push(evaluate_scenario_capability());
         entries.push(kioku_candidates_capability());
 
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -1571,6 +1658,45 @@ fn explain_derivation_capability() -> CapabilityEntry {
         "source_fact_ids".into(),
         "ontology_revision".into(),
         "explicit_rules_only".into(),
+    ];
+    entry
+}
+
+fn evaluate_scenario_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_EVALUATE_SCENARIO.into(),
+        "Evaluate a request-scoped non-authoritative scenario overlay and return a hypothesis-labeled impact set.".into(),
+        "retrieval",
+        "sekai.EvaluateScenarioRequest",
+        "sekai.EvaluateScenarioResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+    ];
+    entry.limits = {
+        let mut limits = semantic_reasoning_limits();
+        limits.push(CapabilityLimit {
+            name: "max_deltas".into(),
+            value: u64::from(scenario::MAX_DELTAS),
+        });
+        limits.push(CapabilityLimit {
+            name: "max_expansion_work_units".into(),
+            value: u64::from(scenario::MAX_EXPANSION_WORK_UNITS),
+        });
+        limits.push(CapabilityLimit {
+            name: "mutates_canonical_graph".into(),
+            value: 0,
+        });
+        limits
+    };
+    entry.evidence_requirements = vec![
+        "epistemic_class_hypothesis".into(),
+        "domain_neutral_impact_rows".into(),
+        "truncation_metadata".into(),
+        "no_canonical_mutation".into(),
     ];
     entry
 }
@@ -4561,6 +4687,14 @@ fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
     }
 }
 
+fn map_scenario_error(error: scenario::ScenarioError) -> Status {
+    match error {
+        scenario::ScenarioError::InvalidArgument(message) => Status::invalid_argument(message),
+        scenario::ScenarioError::Conflict(message) => Status::failed_precondition(message),
+        scenario::ScenarioError::Storage(message) => Status::internal(message),
+    }
+}
+
 fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
     use crate::sekai::lease::LeaseError;
     match error {
@@ -6723,6 +6857,42 @@ impl SekaiService for SekaiServiceImpl {
             }
             Err(status) => Err(status),
         }
+    }
+
+    async fn evaluate_scenario(
+        &self,
+        req: Request<EvaluateScenarioRequest>,
+    ) -> Result<Response<EvaluateScenarioResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = req.get_ref().namespace.trim().to_string();
+        if namespace.is_empty() || namespace != req.get_ref().namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        check_team_namespace(&self.db, &principals, &namespace, false)?;
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_EVALUATE_SCENARIO,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let response = self.execute_evaluate_scenario(&principals, req.into_inner())?;
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
     }
 
     async fn resolve_semantic_ref(
@@ -22044,6 +22214,234 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn evaluate_scenario_projects_hypothesis_impact_without_mutating_graph() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, props) in [
+            (
+                "wh-1",
+                HashMap::from([
+                    ("name".into(), "warehouse".into()),
+                    ("free_capacity_units".into(), "2".into()),
+                ]),
+            ),
+            (
+                "ship-1",
+                HashMap::from([("name".into(), "shipment".into())]),
+            ),
+            (
+                "secret-bay",
+                HashMap::from([("name".into(), "secret".into())]),
+            ),
+        ] {
+            let mut object = widget_object(id, props);
+            object.namespace = "ops".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.db
+            .create_link(&domain::Link {
+                id: "assign-1".into(),
+                from_id: "wh-1".into(),
+                to_id: "ship-1".into(),
+                relation: "assigned_to".into(),
+                created: 0,
+            })
+            .unwrap();
+        svc.db
+            .create_link(&domain::Link {
+                id: "secret-link".into(),
+                from_id: "wh-1".into(),
+                to_id: "secret-bay".into(),
+                relation: "contains".into(),
+                created: 0,
+            })
+            .unwrap();
+        let denied_grant = security::Grant {
+            id: "scenario-denied-grant".into(),
+            object_id: "secret-bay".into(),
+            principal: "bob".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&denied_grant).unwrap();
+        svc.security.add_grant(&denied_grant);
+
+        let before = svc.db.get_object("wh-1").unwrap().unwrap();
+        let before_link = svc.db.get_link("assign-1").unwrap();
+        assert!(before_link.is_some());
+
+        let deltas = scenario::warehouse_release_capacity_deltas("assign-1", "wh-1", 7)
+            .into_iter()
+            .map(|delta| match delta.op {
+                scenario::DeltaOp::SetProperty {
+                    object_id,
+                    key,
+                    value,
+                } => ScenarioDelta {
+                    id: delta.id,
+                    op: "set_property".into(),
+                    object_id,
+                    property_key: key,
+                    property_value: value,
+                    ..Default::default()
+                },
+                scenario::DeltaOp::RemoveLink { link_id } => ScenarioDelta {
+                    id: delta.id,
+                    op: "remove_link".into(),
+                    link_id,
+                    ..Default::default()
+                },
+                other => panic!("unexpected fixture op {other:?}"),
+            })
+            .chain(std::iter::once(ScenarioDelta {
+                id: "denied-delta".into(),
+                op: "set_property".into(),
+                object_id: "secret-bay".into(),
+                property_key: "name".into(),
+                property_value: "leaked".into(),
+                ..Default::default()
+            }))
+            .collect::<Vec<_>>();
+
+        let response = svc
+            .evaluate_scenario(with_named_principal(
+                EvaluateScenarioRequest {
+                    namespace: "ops".into(),
+                    base_mode: "current".into(),
+                    seed_object_ids: vec!["wh-1".into(), "secret-bay".into()],
+                    deltas,
+                    max_depth: 1,
+                    max_objects: 20,
+                    max_links: 20,
+                    request_id: "grpc-test".into(),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            response.epistemic_class,
+            scenario::EPISTEMIC_CLASS_HYPOTHESIS
+        );
+        assert_eq!(response.namespace, "ops");
+        assert!(response.scenario_id.contains("grpc-test"));
+        assert_eq!(response.applied_deltas, 2);
+        assert_eq!(response.impact_rows.len(), 2);
+        assert!(
+            response
+                .impact_rows
+                .iter()
+                .all(|row| row.object_id != "secret-bay" && row.link_id != "secret-link")
+        );
+        let capacity = response
+            .impact_rows
+            .iter()
+            .find(|row| row.property_key == "free_capacity_units")
+            .unwrap();
+        assert_eq!(capacity.before_value, "2");
+        assert_eq!(capacity.after_value, "7");
+
+        let after = svc.db.get_object("wh-1").unwrap().unwrap();
+        assert_eq!(
+            before.properties.get("free_capacity_units"),
+            after.properties.get("free_capacity_units")
+        );
+        assert!(svc.db.get_link("assign-1").unwrap().is_some());
+        let blob = format!("{response:?}");
+        assert!(
+            !blob.contains("secret-bay"),
+            "denied object id leaked: {blob}"
+        );
+        assert!(!blob.contains("leaked"), "denied value leaked: {blob}");
+    }
+
+    #[tokio::test]
+    async fn evaluate_scenario_rejects_same_key_conflict_and_requires_auth() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let mut object = widget_object(
+            "wh-1",
+            HashMap::from([
+                ("name".into(), "warehouse".into()),
+                ("free_capacity_units".into(), "1".into()),
+            ]),
+        );
+        object.namespace = "ops".into();
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(object),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let err = svc
+            .evaluate_scenario(with_named_principal(
+                EvaluateScenarioRequest {
+                    namespace: "ops".into(),
+                    seed_object_ids: vec!["wh-1".into()],
+                    deltas: vec![
+                        ScenarioDelta {
+                            id: "a".into(),
+                            op: "set_property".into(),
+                            object_id: "wh-1".into(),
+                            property_key: "free_capacity_units".into(),
+                            property_value: "2".into(),
+                            ..Default::default()
+                        },
+                        ScenarioDelta {
+                            id: "b".into(),
+                            op: "set_property".into(),
+                            object_id: "wh-1".into(),
+                            property_key: "free_capacity_units".into(),
+                            property_value: "3".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        let unauth = svc
+            .evaluate_scenario(Request::new(EvaluateScenarioRequest {
+                namespace: "ops".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unauth.code(), tonic::Code::Unauthenticated);
     }
 
     fn with_semantic_catalog_headers<T>(

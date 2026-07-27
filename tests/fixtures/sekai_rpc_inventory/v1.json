@@ -290,6 +290,19 @@
       ]
     },
     {
+      "rpc": "EvaluateScenario",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/scenario.rs",
+        "docs/scenario-overlay.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization"
+      ]
+    },
+    {
       "rpc": "ResolveSemanticRef",
       "kind": "computed",
       "surfaces": [],
