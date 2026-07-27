@@ -44,6 +44,6 @@ for tests. The ActionInstance remains `admitted`; only the effect is `failed`.
 
 ## Non-goals
 
-- Runtime claim/lease fencing (#399)
+- Runtime claim/lease fencing — see [runtime-claim.md](runtime-claim.md) (#399)
 - Generic HTTP webhook effects
 - Plane-side external mutations without permits
