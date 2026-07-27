@@ -31,6 +31,7 @@ pub mod operation_statistics;
 pub mod perf_regression;
 pub use sekai_provider::pricing;
 pub mod provenance;
+pub mod provider_credentials;
 pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
 pub mod receipt_cli;
