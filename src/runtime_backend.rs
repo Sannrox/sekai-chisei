@@ -269,6 +269,35 @@ impl RuntimeBackend {
         }
     }
 
+    /// SQLite runtime with an optional enterprise identity extension.
+    ///
+    /// Community `initialize` always constructs a tenant-free SQLite store.
+    /// Enterprise assemblers (for example Aldunis) inject a private
+    /// [`crate::enterprise::EnterpriseExtension`] implementation through this
+    /// constructor so gRPC can authorize tenant-scoped operations.
+    pub fn from_sqlite_with_enterprise_extension(
+        path: &str,
+        extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
+        let sqlite = Arc::new(SekaiDb::new_with_enterprise_extension(path, extension)?);
+        let capabilities = BackendCapabilities {
+            contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
+            backend: BackendIdentity::Sqlite,
+            reusable_surfaces: COMMUNITY_REQUIRED_SURFACES
+                .iter()
+                .map(|surface| (*surface).to_string())
+                .collect(),
+            migration_version: None,
+        };
+        capabilities.validate_required(COMMUNITY_REQUIRED_SURFACES)?;
+        // Enterprise assemblers may advertise additional tenant surfaces through
+        // the extension; community surface requirements still apply.
+        Ok(Self {
+            db: Arc::new(RuntimeDb::Sqlite(sqlite)),
+            capabilities,
+        })
+    }
+
     pub fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
     }
