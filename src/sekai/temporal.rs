@@ -17,7 +17,6 @@ const TEMPORAL_ASSERTION_BUDGET: i64 = 500_000;
 /// Non-disclosing payload written when retention or erasure removes content.
 pub const TEMPORAL_PAYLOAD_OMISSION: &str = r#"{"omission":"retention"}"#;
 
-
 /// How a bound is represented for valid time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
