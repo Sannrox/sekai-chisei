@@ -39,7 +39,7 @@ use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, ontology_proposal, retrieval,
-    security,
+    security, semantic,
 };
 use uuid::Uuid;
 
@@ -519,6 +519,342 @@ impl SekaiServiceImpl {
         Ok(())
     }
 
+    fn catalog_metadata_value(req: &Request<impl prost::Message>, key: &str) -> Option<String> {
+        req.metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Begin a receipt-attributed catalog invocation for a semantic capability.
+    /// Returns `None` when the caller did not send `x-sekai-capability` (direct RPC).
+    /// Live discovery is rechecked; a previously observed catalog is never a grant.
+    fn begin_semantic_catalog_invocation<'a>(
+        &'a self,
+        req: &Request<impl prost::Message>,
+        expected_capability: &str,
+        namespace: &str,
+        principals: &[String],
+    ) -> Result<Option<(String, CatalogReceiptGuard<'a>)>, Status> {
+        let Some(capability_name) = Self::catalog_metadata_value(req, "x-sekai-capability") else {
+            return Ok(None);
+        };
+        let catalog_namespace = Self::catalog_metadata_value(req, "x-sekai-namespace")
+            .unwrap_or_else(|| namespace.to_string());
+        if catalog_namespace.is_empty() {
+            return Err(Status::invalid_argument(
+                "catalog semantic invocation requires namespace",
+            ));
+        }
+        if catalog_namespace != namespace && !namespace.is_empty() {
+            return Err(Status::invalid_argument(
+                "catalog namespace metadata must match request namespace",
+            ));
+        }
+        let namespace = if namespace.is_empty() {
+            catalog_namespace.as_str()
+        } else {
+            namespace
+        };
+        let operation_id = Self::catalog_metadata_value(req, "x-sekai-operation-id")
+            .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()));
+        let catalog_version = Self::catalog_metadata_value(req, "x-sekai-catalog-version");
+        let actor = principals.first().cloned().unwrap_or_default();
+
+        let visible = self
+            .discoverable_capabilities(namespace, principals)?
+            .into_iter()
+            .any(|entry| entry.name == capability_name && capability_name == expected_capability);
+        if !visible {
+            self.record_catalog_invocation_receipt(
+                &operation_id,
+                namespace,
+                &actor,
+                &capability_name,
+                catalog_version.as_deref(),
+                "refuse",
+                "capability_unavailable",
+                true,
+            )?;
+            return Err(Status::failed_precondition("capability unavailable"));
+        }
+
+        self.record_catalog_invocation_receipt(
+            &operation_id,
+            namespace,
+            &actor,
+            &capability_name,
+            catalog_version.as_deref(),
+            "pending",
+            "invocation_started",
+            true,
+        )?;
+        Ok(Some((
+            operation_id.clone(),
+            CatalogReceiptGuard {
+                service: self,
+                operation_id,
+                namespace: namespace.to_string(),
+                actor,
+                capability_name,
+                catalog_version,
+                policy_decision: None,
+                budget_decision: None,
+                finalized: false,
+            },
+        )))
+    }
+
+    fn authorized_ontology_revision(&self, principals: &[String]) -> Result<String, Status> {
+        let classes = self
+            .db
+            .list_ontology_classes()
+            .map_err(Status::internal)?
+            .into_iter()
+            .filter(|class| check_ontology_class_read(&self.security, class, principals).is_ok())
+            .collect::<Vec<_>>();
+        let relations = self
+            .db
+            .list_ontology_relations()
+            .map_err(Status::internal)?
+            .into_iter()
+            .filter(|relation| {
+                check_ontology_relation_read(&self.security, relation, principals).is_ok()
+            })
+            .collect::<Vec<_>>();
+        Ok(ontology::OntologyRegistry::from_parts(classes, relations).revision())
+    }
+
+    fn execute_retrieve_context(
+        &self,
+        principals: &[String],
+        inner: RetrieveContextRequest,
+    ) -> Result<RetrieveContextResponse, Status> {
+        let reasoning_started = std::time::Instant::now();
+        let roots = inner
+            .roots
+            .into_iter()
+            .map(from_proto_context_root)
+            .collect::<Result<Vec<_>, _>>()?;
+        let direction =
+            retrieval::RetrievalDirection::parse(&inner.direction).map_err(map_retrieval_error)?;
+        let reasoning_mode =
+            retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
+        let mut query = retrieval::RetrievalQuery {
+            roots,
+            relations: inner.relations,
+            direction,
+            max_depth: inner.max_depth,
+            max_objects: inner.max_objects,
+            max_links: inner.max_links,
+            kind_filter: inner.kind_filter,
+            reasoning_mode,
+            max_source_rows: inner.max_source_rows,
+            max_derived_rows: inner.max_derived_rows,
+            max_derivation_steps: inner.max_derivation_steps,
+            max_time_ms: inner.max_time_ms,
+            max_explanation_bytes: inner.max_explanation_bytes,
+            initial_source_rows: 0,
+            source_rows_truncated: false,
+        };
+        let reasoning_timeout =
+            std::time::Duration::from_millis(u64::from(if query.max_time_ms == 0 {
+                retrieval::DEFAULT_MAX_TIME_MS
+            } else {
+                query.max_time_ms.min(retrieval::MAX_TIME_MS)
+            }));
+        let reasoning_deadline = reasoning_started + reasoning_timeout;
+        let ontology_row_limit = if query.max_source_rows == 0 {
+            retrieval::DEFAULT_MAX_SOURCE_ROWS
+        } else {
+            query.max_source_rows.min(retrieval::MAX_SOURCE_ROWS)
+        };
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        // Build one authorization-filtered immutable snapshot before inference.
+        // Hidden definitions cannot influence closure, counts, explanations,
+        // errors, or truncation metadata.
+        let mut ontology_source_rows = 0u32;
+        let mut ontology_source_truncated = false;
+        let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
+            let class_rows = match self.db.list_readable_ontology_classes(
+                principals,
+                reasoning_deadline,
+                ontology_row_limit.saturating_add(1),
+            ) {
+                Ok(classes) => classes,
+                Err(_) if reasoning_started.elapsed() >= reasoning_timeout => Vec::new(),
+                Err(error) => return Err(Status::internal(error)),
+            };
+            let mut classes = class_rows;
+            if classes.len() > ontology_row_limit as usize {
+                classes.truncate(ontology_row_limit as usize);
+                ontology_source_truncated = true;
+            }
+            ontology_source_rows = classes.len().min(u32::MAX as usize) as u32;
+            let mut classes = classes
+                .into_iter()
+                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
+                .filter(|class| {
+                    check_read(
+                        &self.security,
+                        &ontology_class_object_id(&class.name),
+                        principals,
+                    )
+                    .is_ok()
+                })
+                .collect::<Vec<_>>();
+            let visible_class_names = classes
+                .iter()
+                .map(|class| class.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for class in &mut classes {
+                class
+                    .superclasses
+                    .retain(|name| visible_class_names.contains(name));
+                class
+                    .equivalent_classes
+                    .retain(|name| visible_class_names.contains(name));
+                class
+                    .disjoint_classes
+                    .retain(|name| visible_class_names.contains(name));
+            }
+            let remaining_rows = ontology_row_limit.saturating_sub(ontology_source_rows);
+            let relation_rows =
+                if !ontology_source_truncated && reasoning_started.elapsed() < reasoning_timeout {
+                    self.db
+                        .list_readable_ontology_relations(
+                            principals,
+                            reasoning_deadline,
+                            remaining_rows.saturating_add(1),
+                        )
+                        .or_else(|error| {
+                            if reasoning_started.elapsed() >= reasoning_timeout {
+                                Ok(Vec::new())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .map_err(Status::internal)?
+                } else {
+                    Vec::new()
+                };
+            let mut relation_rows = relation_rows;
+            if relation_rows.len() > remaining_rows as usize {
+                relation_rows.truncate(remaining_rows as usize);
+                ontology_source_truncated = true;
+            }
+            ontology_source_rows = ontology_source_rows
+                .saturating_add(relation_rows.len().min(u32::MAX as usize) as u32);
+            let mut relations = relation_rows
+                .into_iter()
+                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
+                .filter(|relation| {
+                    check_read(
+                        &self.security,
+                        &ontology_relation_object_id(&relation.name),
+                        principals,
+                    )
+                    .is_ok()
+                })
+                .filter(|relation| {
+                    visible_class_names.contains(&relation.domain)
+                        && visible_class_names.contains(&relation.range)
+                })
+                .collect::<Vec<_>>();
+            let visible_relation_names = relations
+                .iter()
+                .map(|relation| relation.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for relation in &mut relations {
+                if !relation.inverse.is_empty()
+                    && !visible_relation_names.contains(&relation.inverse)
+                {
+                    relation.inverse.clear();
+                }
+            }
+            Some(ontology::OntologyRegistry::from_parts(classes, relations))
+        } else {
+            None
+        };
+        query.initial_source_rows = ontology_source_rows;
+        query.source_rows_truncated = ontology_source_truncated;
+        let mut result = retrieval::retrieve_with_ontology_started(
+            &self.db,
+            &query,
+            ontology.as_ref(),
+            reasoning_started,
+            |object| {
+                self.security.can_access(&object.id, &principal_refs)
+                    && check_team_namespace(&self.db, principals, &object.namespace, false).is_ok()
+                    && object_passes_marking(&self.db, object, principals).unwrap_or(false)
+            },
+            |object| is_reserved_governance_kind(&object.kind),
+        )
+        .map_err(map_retrieval_error)?;
+        if reasoning_mode == retrieval::ReasoningMode::Entailment {
+            // Hidden objects are intentionally indistinguishable from absent
+            // objects in inference metadata.
+            result.denied_objects = 0;
+            if reasoning_started.elapsed() >= reasoning_timeout
+                && !result
+                    .truncation_reasons
+                    .iter()
+                    .any(|reason| reason == "time")
+            {
+                result.truncation_reasons.push("time".into());
+                result.truncated = true;
+            }
+        }
+        for candidate in &mut result.candidates {
+            candidate.object =
+                self.resolve_computed_for_response(candidate.object.clone(), principals, None)?;
+        }
+
+        Ok(RetrieveContextResponse {
+            candidates: result
+                .candidates
+                .iter()
+                .map(|candidate| ContextCandidate {
+                    object: Some(to_proto_obj(&candidate.object)),
+                    depth: candidate.depth,
+                    via_relation: candidate.via_relation.clone(),
+                    affinity: candidate.affinity,
+                    explanation: Some(ContextExplanation {
+                        steps: candidate
+                            .explanation
+                            .steps
+                            .iter()
+                            .map(|step| ContextDerivationStep {
+                                kind: step.kind.into(),
+                                relation: step.relation.clone(),
+                                from_id: step.from_id.clone(),
+                                to_id: step.to_id.clone(),
+                                source_fact_ids: step.source_fact_ids.clone(),
+                                ontology_revision: step.ontology_revision.clone(),
+                                rule: step.rule.into(),
+                            })
+                            .collect(),
+                        source_fact_ids: candidate.explanation.source_fact_ids.clone(),
+                        ontology_revision: candidate.explanation.ontology_revision.clone(),
+                        derived: candidate.explanation.derived,
+                    }),
+                })
+                .collect(),
+            links: result.links.iter().map(to_proto_link).collect(),
+            truncated: result.truncated,
+            unresolved_roots: result.unresolved_roots,
+            denied_objects: result.denied_objects,
+            truncated_objects: result.truncated_objects,
+            truncated_links: result.truncated_links,
+            truncation_reasons: result.truncation_reasons,
+            source_rows: result.source_rows,
+            derived_rows: result.derived_rows,
+            ontology_revision: result.ontology_revision,
+        })
+    }
+
     fn discoverable_capabilities(
         &self,
         namespace: &str,
@@ -556,7 +892,10 @@ impl SekaiServiceImpl {
             .map(object_query_capability)
             .collect::<Vec<_>>();
         entries.push(traverse_capability());
+        entries.push(resolve_semantic_ref_capability());
+        entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
+        entries.push(explain_derivation_capability());
         entries.push(kioku_candidates_capability());
 
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -1075,10 +1414,121 @@ fn traverse_capability() -> CapabilityEntry {
     entry
 }
 
+fn semantic_reasoning_limits() -> Vec<CapabilityLimit> {
+    vec![
+        CapabilityLimit {
+            name: "max_depth".into(),
+            value: u64::from(retrieval::MAX_DEPTH),
+        },
+        CapabilityLimit {
+            name: "max_links".into(),
+            value: u64::from(retrieval::MAX_LINKS),
+        },
+        CapabilityLimit {
+            name: "max_objects".into(),
+            value: u64::from(retrieval::MAX_OBJECTS),
+        },
+        CapabilityLimit {
+            name: "max_source_rows".into(),
+            value: u64::from(retrieval::MAX_SOURCE_ROWS),
+        },
+        CapabilityLimit {
+            name: "max_derived_rows".into(),
+            value: u64::from(retrieval::MAX_DERIVED_ROWS),
+        },
+        CapabilityLimit {
+            name: "max_derivation_steps".into(),
+            value: u64::from(retrieval::MAX_DERIVATION_STEPS),
+        },
+        CapabilityLimit {
+            name: "max_time_ms".into(),
+            value: u64::from(retrieval::MAX_TIME_MS),
+        },
+        CapabilityLimit {
+            name: "max_explanation_bytes".into(),
+            value: retrieval::MAX_EXPLANATION_BYTES,
+        },
+        CapabilityLimit {
+            name: "reasoning_profile_version".into(),
+            value: semantic::REASONING_PROFILE_VERSION,
+        },
+        CapabilityLimit {
+            name: "ontology_contract_version".into(),
+            value: semantic::ONTOLOGY_CONTRACT_VERSION,
+        },
+        CapabilityLimit {
+            name: "supports_asserted_only".into(),
+            value: 1,
+        },
+        CapabilityLimit {
+            name: "supports_entailment".into(),
+            value: 1,
+        },
+    ]
+}
+
+fn resolve_semantic_ref_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_RESOLVE_REF.into(),
+        "Resolve an authorized object or ontology reference in a namespace.".into(),
+        "query",
+        "sekai.ResolveSemanticRefRequest",
+        "sekai.ResolveSemanticRefResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "schema_visibility".into(),
+        "ontology_acl".into(),
+    ];
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "reasoning_profile_version".into(),
+            value: semantic::REASONING_PROFILE_VERSION,
+        },
+        CapabilityLimit {
+            name: "ontology_contract_version".into(),
+            value: semantic::ONTOLOGY_CONTRACT_VERSION,
+        },
+    ];
+    entry.evidence_requirements = vec![
+        "typed_reference".into(),
+        "live_authorization".into(),
+        "ontology_revision".into(),
+    ];
+    entry
+}
+
+fn expand_relations_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_EXPAND_RELATIONS.into(),
+        "Expand authorized relations from a root in asserted or entailment mode.".into(),
+        "retrieval",
+        "sekai.ExpandRelationsRequest",
+        "sekai.ExpandRelationsResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+        "ontology_acl".into(),
+    ];
+    entry.limits = semantic_reasoning_limits();
+    entry.evidence_requirements = vec![
+        "derivation_steps".into(),
+        "source_fact_ids".into(),
+        "ontology_revision".into(),
+        "truncation_metadata".into(),
+    ];
+    entry
+}
+
 fn retrieve_context_capability() -> CapabilityEntry {
     let mut entry = base_capability(
-        "sekai.context.retrieve".into(),
-        "Retrieve bounded, authorized context candidates.".into(),
+        semantic::CAPABILITY_RETRIEVE_CONTEXT.into(),
+        "Retrieve bounded, authorized context candidates with provenance.".into(),
         "retrieval",
         "sekai.RetrieveContextRequest",
         "sekai.RetrieveContextResponse",
@@ -1088,40 +1538,39 @@ fn retrieve_context_capability() -> CapabilityEntry {
         "namespace_access".into(),
         "object_acl".into(),
         "classification".into(),
+        "ontology_acl".into(),
     ];
-    entry.limits = vec![
-        CapabilityLimit {
-            name: "max_depth".into(),
-            value: 3,
-        },
-        CapabilityLimit {
-            name: "max_links".into(),
-            value: 200,
-        },
-        CapabilityLimit {
-            name: "max_objects".into(),
-            value: 100,
-        },
-        CapabilityLimit {
-            name: "max_source_rows".into(),
-            value: 1000,
-        },
-        CapabilityLimit {
-            name: "max_derived_rows".into(),
-            value: 500,
-        },
-        CapabilityLimit {
-            name: "max_derivation_steps".into(),
-            value: 32,
-        },
-        CapabilityLimit {
-            name: "max_time_ms".into(),
-            value: 1000,
-        },
-        CapabilityLimit {
-            name: "max_explanation_bytes".into(),
-            value: 16 * 1024 * 1024,
-        },
+    entry.limits = semantic_reasoning_limits();
+    entry.evidence_requirements = vec![
+        "derivation_steps".into(),
+        "source_fact_ids".into(),
+        "ontology_revision".into(),
+        "truncation_metadata".into(),
+    ];
+    entry
+}
+
+fn explain_derivation_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+        "Explain an authorized derivation path without hidden policy inputs.".into(),
+        "retrieval",
+        "sekai.ExplainDerivationRequest",
+        "sekai.ExplainDerivationResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+        "ontology_acl".into(),
+    ];
+    entry.limits = semantic_reasoning_limits();
+    entry.evidence_requirements = vec![
+        "derivation_steps".into(),
+        "source_fact_ids".into(),
+        "ontology_revision".into(),
+        "explicit_rules_only".into(),
     ];
     entry
 }
@@ -6243,231 +6692,350 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<RetrieveContextRequest>,
     ) -> Result<Response<RetrieveContextResponse>, Status> {
-        let reasoning_started = std::time::Instant::now();
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let namespace = Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default();
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_RETRIEVE_CONTEXT,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let result = self.execute_retrieve_context(&principals, req.into_inner());
+        match result {
+            Ok(response) => {
+                if let Some((_, guard)) = receipt_guard.as_mut() {
+                    guard.finalize("allow", "succeeded")?;
+                }
+                let mut response = Response::new(response);
+                if let Some(operation_id) = operation_id.as_deref() {
+                    response.metadata_mut().insert(
+                        "x-sekai-operation-id",
+                        operation_id
+                            .parse()
+                            .map_err(|_| Status::internal("invalid operation id"))?,
+                    );
+                }
+                Ok(response)
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn resolve_semantic_ref(
+        &self,
+        req: Request<ResolveSemanticRefRequest>,
+    ) -> Result<Response<ResolveSemanticRefResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = req.get_ref().namespace.trim().to_string();
+        if namespace.is_empty() || namespace != req.get_ref().namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        check_team_namespace(&self.db, &principals, &namespace, false)?;
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_RESOLVE_REF,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
         let inner = req.into_inner();
-        let roots = inner
-            .roots
-            .into_iter()
-            .map(from_proto_context_root)
-            .collect::<Result<Vec<_>, _>>()?;
-        let direction =
-            retrieval::RetrievalDirection::parse(&inner.direction).map_err(map_retrieval_error)?;
-        let reasoning_mode =
-            retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
-        let mut query = retrieval::RetrievalQuery {
-            roots,
-            relations: inner.relations,
-            direction,
-            max_depth: inner.max_depth,
-            max_objects: inner.max_objects,
-            max_links: inner.max_links,
-            kind_filter: inner.kind_filter,
-            reasoning_mode,
-            max_source_rows: inner.max_source_rows,
-            max_derived_rows: inner.max_derived_rows,
-            max_derivation_steps: inner.max_derivation_steps,
-            max_time_ms: inner.max_time_ms,
-            max_explanation_bytes: inner.max_explanation_bytes,
-            initial_source_rows: 0,
-            source_rows_truncated: false,
+        if semantic::resolve_ref_field_count(
+            &inner.object_id,
+            &inner.external_id,
+            &inner.ontology_class,
+            &inner.ontology_relation,
+        ) != 1
+        {
+            return Err(Status::invalid_argument(
+                "exactly one of object_id, external_id, ontology_class, or ontology_relation is required",
+            ));
+        }
+        let ontology_revision = self.authorized_ontology_revision(&principals)?;
+        let mut response = ResolveSemanticRefResponse {
+            ref_kind: semantic::REF_KIND_UNAVAILABLE.into(),
+            object: None,
+            ontology_class: None,
+            ontology_relation: None,
+            ontology_revision: ontology_revision.clone(),
+            resolved: false,
         };
-        let reasoning_timeout =
-            std::time::Duration::from_millis(u64::from(if query.max_time_ms == 0 {
-                retrieval::DEFAULT_MAX_TIME_MS
+
+        if !inner.object_id.is_empty() || !inner.external_id.is_empty() {
+            let object = if !inner.object_id.is_empty() {
+                self.db
+                    .get_object(&inner.object_id)
+                    .map_err(Status::internal)?
             } else {
-                query.max_time_ms.min(retrieval::MAX_TIME_MS)
-            }));
-        let reasoning_deadline = reasoning_started + reasoning_timeout;
-        let ontology_row_limit = if query.max_source_rows == 0 {
-            retrieval::DEFAULT_MAX_SOURCE_ROWS
-        } else {
-            query.max_source_rows.min(retrieval::MAX_SOURCE_ROWS)
-        };
-        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-        // Build one authorization-filtered immutable snapshot before inference.
-        // Hidden definitions cannot influence closure, counts, explanations,
-        // errors, or truncation metadata.
-        let mut ontology_source_rows = 0u32;
-        let mut ontology_source_truncated = false;
-        let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
-            let class_rows = match self.db.list_readable_ontology_classes(
-                &principals,
-                reasoning_deadline,
-                ontology_row_limit.saturating_add(1),
-            ) {
-                Ok(classes) => classes,
-                Err(_) if reasoning_started.elapsed() >= reasoning_timeout => Vec::new(),
-                Err(error) => return Err(Status::internal(error)),
+                self.db
+                    .find_by_external_id(&inner.external_id)
+                    .map_err(Status::internal)?
             };
-            let mut classes = class_rows;
-            if classes.len() > ontology_row_limit as usize {
-                classes.truncate(ontology_row_limit as usize);
-                ontology_source_truncated = true;
-            }
-            ontology_source_rows = classes.len().min(u32::MAX as usize) as u32;
-            let mut classes = classes
-                .into_iter()
-                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
-                .filter(|class| {
-                    check_read(
-                        &self.security,
-                        &ontology_class_object_id(&class.name),
-                        &principals,
-                    )
-                    .is_ok()
-                })
-                .collect::<Vec<_>>();
-            let visible_class_names = classes
-                .iter()
-                .map(|class| class.name.clone())
-                .collect::<std::collections::HashSet<_>>();
-            for class in &mut classes {
-                class
-                    .superclasses
-                    .retain(|name| visible_class_names.contains(name));
-                class
-                    .equivalent_classes
-                    .retain(|name| visible_class_names.contains(name));
-                class
-                    .disjoint_classes
-                    .retain(|name| visible_class_names.contains(name));
-            }
-            let remaining_rows = ontology_row_limit.saturating_sub(ontology_source_rows);
-            let relation_rows =
-                if !ontology_source_truncated && reasoning_started.elapsed() < reasoning_timeout {
-                    self.db
-                        .list_readable_ontology_relations(
-                            &principals,
-                            reasoning_deadline,
-                            remaining_rows.saturating_add(1),
-                        )
-                        .or_else(|error| {
-                            if reasoning_started.elapsed() >= reasoning_timeout {
-                                Ok(Vec::new())
-                            } else {
-                                Err(error)
-                            }
-                        })
-                        .map_err(Status::internal)?
-                } else {
-                    Vec::new()
-                };
-            let mut relation_rows = relation_rows;
-            if relation_rows.len() > remaining_rows as usize {
-                relation_rows.truncate(remaining_rows as usize);
-                ontology_source_truncated = true;
-            }
-            ontology_source_rows = ontology_source_rows
-                .saturating_add(relation_rows.len().min(u32::MAX as usize) as u32);
-            let mut relations = relation_rows
-                .into_iter()
-                .take_while(|_| reasoning_started.elapsed() < reasoning_timeout)
-                .filter(|relation| {
-                    check_read(
-                        &self.security,
-                        &ontology_relation_object_id(&relation.name),
-                        &principals,
-                    )
-                    .is_ok()
-                })
-                .filter(|relation| {
-                    visible_class_names.contains(&relation.domain)
-                        && visible_class_names.contains(&relation.range)
-                })
-                .collect::<Vec<_>>();
-            let visible_relation_names = relations
-                .iter()
-                .map(|relation| relation.name.clone())
-                .collect::<std::collections::HashSet<_>>();
-            for relation in &mut relations {
-                if !relation.inverse.is_empty()
-                    && !visible_relation_names.contains(&relation.inverse)
-                {
-                    relation.inverse.clear();
+            if let Some(object) = object {
+                let authorized = object.namespace == namespace
+                    && !is_reserved_governance_kind(&object.kind)
+                    && check_read(&self.security, &object.id, &principals).is_ok()
+                    && object_passes_marking(&self.db, &object, &principals).unwrap_or(false);
+                if authorized {
+                    let object = self.resolve_computed_for_response(object, &principals, None)?;
+                    response.ref_kind = semantic::REF_KIND_OBJECT.into();
+                    response.object = Some(to_proto_obj(&object));
+                    response.resolved = true;
                 }
             }
-            Some(ontology::OntologyRegistry::from_parts(classes, relations))
-        } else {
-            None
-        };
-        query.initial_source_rows = ontology_source_rows;
-        query.source_rows_truncated = ontology_source_truncated;
-        let mut result = retrieval::retrieve_with_ontology_started(
-            &self.db,
-            &query,
-            ontology.as_ref(),
-            reasoning_started,
-            |object| {
-                self.security.can_access(&object.id, &principal_refs)
-                    && check_team_namespace(&self.db, &principals, &object.namespace, false).is_ok()
-                    && object_passes_marking(&self.db, object, &principals).unwrap_or(false)
-            },
-            |object| is_reserved_governance_kind(&object.kind),
-        )
-        .map_err(map_retrieval_error)?;
-        if reasoning_mode == retrieval::ReasoningMode::Entailment {
-            // Hidden objects are intentionally indistinguishable from absent
-            // objects in inference metadata.
-            result.denied_objects = 0;
-            if reasoning_started.elapsed() >= reasoning_timeout
-                && !result
-                    .truncation_reasons
-                    .iter()
-                    .any(|reason| reason == "time")
+        } else if !inner.ontology_class.is_empty() {
+            if let Some(class) = self
+                .db
+                .get_ontology_class(&inner.ontology_class)
+                .map_err(Status::internal)?
             {
-                result.truncation_reasons.push("time".into());
-                result.truncated = true;
+                if check_ontology_class_read(&self.security, &class, &principals).is_ok() {
+                    response.ref_kind = semantic::REF_KIND_ONTOLOGY_CLASS.into();
+                    response.ontology_class = Some(to_proto_ontology_class(&class));
+                    response.resolved = true;
+                }
+            }
+        } else if let Some(relation) = self
+            .db
+            .get_ontology_relation(&inner.ontology_relation)
+            .map_err(Status::internal)?
+        {
+            if check_ontology_relation_read(&self.security, &relation, &principals).is_ok() {
+                response.ref_kind = semantic::REF_KIND_ONTOLOGY_RELATION.into();
+                response.ontology_relation = Some(to_proto_ontology_relation(&relation));
+                response.resolved = true;
             }
         }
-        for candidate in &mut result.candidates {
-            candidate.object =
-                self.resolve_computed_for_response(candidate.object.clone(), &principals, None)?;
+
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn expand_relations(
+        &self,
+        req: Request<ExpandRelationsRequest>,
+    ) -> Result<Response<ExpandRelationsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = req.get_ref().namespace.trim().to_string();
+        if namespace.is_empty() || namespace != req.get_ref().namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        check_team_namespace(&self.db, &principals, &namespace, false)?;
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_EXPAND_RELATIONS,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let inner = req.into_inner();
+        let root = inner
+            .root
+            .ok_or_else(|| Status::invalid_argument("root required"))?;
+        let reasoning_mode =
+            retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
+        let retrieved = self.execute_retrieve_context(
+            &principals,
+            RetrieveContextRequest {
+                roots: vec![root],
+                relations: inner.relations,
+                direction: inner.direction,
+                max_depth: inner.max_depth,
+                max_objects: inner.max_objects,
+                max_links: inner.max_links,
+                kind_filter: inner.kind_filter,
+                reasoning_mode: inner.reasoning_mode,
+                max_source_rows: inner.max_source_rows,
+                max_derived_rows: inner.max_derived_rows,
+                max_derivation_steps: inner.max_derivation_steps,
+                max_time_ms: inner.max_time_ms,
+                max_explanation_bytes: inner.max_explanation_bytes,
+            },
+        )?;
+        // Keep expansion results inside the requested namespace boundary.
+        let candidates = retrieved
+            .candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.object.as_ref().is_some_and(|object| {
+                    object.namespace == namespace || object.namespace.is_empty()
+                })
+            })
+            .collect::<Vec<_>>();
+        let visible_ids = candidates
+            .iter()
+            .filter_map(|candidate| candidate.object.as_ref().map(|object| object.id.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        let links = retrieved
+            .links
+            .into_iter()
+            .filter(|link| {
+                visible_ids.contains(link.from_id.as_str())
+                    && visible_ids.contains(link.to_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(ExpandRelationsResponse {
+            candidates,
+            links,
+            truncated: retrieved.truncated,
+            unresolved_roots: retrieved.unresolved_roots,
+            denied_objects: retrieved.denied_objects,
+            truncated_objects: retrieved.truncated_objects,
+            truncated_links: retrieved.truncated_links,
+            truncation_reasons: retrieved.truncation_reasons,
+            source_rows: retrieved.source_rows,
+            derived_rows: retrieved.derived_rows,
+            ontology_revision: retrieved.ontology_revision,
+            reasoning_mode: semantic::reasoning_mode_label(reasoning_mode).into(),
+        });
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn explain_derivation(
+        &self,
+        req: Request<ExplainDerivationRequest>,
+    ) -> Result<Response<ExplainDerivationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = req.get_ref().namespace.trim().to_string();
+        if namespace.is_empty() || namespace != req.get_ref().namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        check_team_namespace(&self.db, &principals, &namespace, false)?;
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_EXPLAIN_DERIVATION,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let inner = req.into_inner();
+        let from = inner
+            .from
+            .ok_or_else(|| Status::invalid_argument("from root required"))?;
+        let to = inner
+            .to
+            .ok_or_else(|| Status::invalid_argument("to root required"))?;
+        let to_root = from_proto_context_root(to.clone())?;
+        let reasoning_mode =
+            retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
+        let retrieved = self.execute_retrieve_context(
+            &principals,
+            RetrieveContextRequest {
+                roots: vec![from],
+                relations: inner.relations,
+                direction: inner.direction,
+                max_depth: if inner.max_depth == 0 {
+                    retrieval::MAX_DEPTH
+                } else {
+                    inner.max_depth
+                },
+                max_objects: inner.max_objects,
+                max_links: inner.max_links,
+                kind_filter: Vec::new(),
+                reasoning_mode: inner.reasoning_mode,
+                max_source_rows: inner.max_source_rows,
+                max_derived_rows: inner.max_derived_rows,
+                max_derivation_steps: inner.max_derivation_steps,
+                max_time_ms: inner.max_time_ms,
+                max_explanation_bytes: inner.max_explanation_bytes,
+            },
+        )?;
+
+        let mut found_explanation = None;
+        for candidate in &retrieved.candidates {
+            let Some(object) = candidate.object.as_ref() else {
+                continue;
+            };
+            if object.namespace != namespace && !object.namespace.is_empty() {
+                continue;
+            }
+            let matches = match &to_root {
+                retrieval::RetrievalRoot::Object(id) => object.id == *id,
+                retrieval::RetrievalRoot::External(external_id) => {
+                    object.external_id == *external_id
+                }
+                retrieval::RetrievalRoot::Link(link_id) => retrieved.links.iter().any(|link| {
+                    link.id == *link_id && (link.from_id == object.id || link.to_id == object.id)
+                }),
+            };
+            if matches {
+                found_explanation = candidate.explanation.clone();
+                break;
+            }
         }
 
-        Ok(Response::new(RetrieveContextResponse {
-            candidates: result
-                .candidates
-                .iter()
-                .map(|candidate| ContextCandidate {
-                    object: Some(to_proto_obj(&candidate.object)),
-                    depth: candidate.depth,
-                    via_relation: candidate.via_relation.clone(),
-                    affinity: candidate.affinity,
-                    explanation: Some(ContextExplanation {
-                        steps: candidate
-                            .explanation
-                            .steps
-                            .iter()
-                            .map(|step| ContextDerivationStep {
-                                kind: step.kind.into(),
-                                relation: step.relation.clone(),
-                                from_id: step.from_id.clone(),
-                                to_id: step.to_id.clone(),
-                                source_fact_ids: step.source_fact_ids.clone(),
-                                ontology_revision: step.ontology_revision.clone(),
-                                rule: step.rule.into(),
-                            })
-                            .collect(),
-                        source_fact_ids: candidate.explanation.source_fact_ids.clone(),
-                        ontology_revision: candidate.explanation.ontology_revision.clone(),
-                        derived: candidate.explanation.derived,
-                    }),
-                })
-                .collect(),
-            links: result.links.iter().map(to_proto_link).collect(),
-            truncated: result.truncated,
-            unresolved_roots: result.unresolved_roots,
-            denied_objects: result.denied_objects,
-            truncated_objects: result.truncated_objects,
-            truncated_links: result.truncated_links,
-            truncation_reasons: result.truncation_reasons,
-            source_rows: result.source_rows,
-            derived_rows: result.derived_rows,
-            ontology_revision: result.ontology_revision,
-        }))
+        let mut evidence_refs = Vec::new();
+        if let Some(explanation) = found_explanation.as_ref() {
+            evidence_refs.extend(explanation.source_fact_ids.iter().cloned());
+            for step in &explanation.steps {
+                for fact in &step.source_fact_ids {
+                    if !evidence_refs.contains(fact) {
+                        evidence_refs.push(fact.clone());
+                    }
+                }
+            }
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
+
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let found = found_explanation.is_some();
+        let mut response = Response::new(ExplainDerivationResponse {
+            explanation: found_explanation,
+            found,
+            truncated: retrieved.truncated,
+            truncation_reasons: retrieved.truncation_reasons,
+            ontology_revision: retrieved.ontology_revision,
+            reasoning_mode: semantic::reasoning_mode_label(reasoning_mode).into(),
+            evidence_refs,
+        });
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
     }
+
     async fn discover_capabilities(
         &self,
         req: Request<DiscoverCapabilitiesRequest>,
@@ -21476,6 +22044,459 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    fn with_semantic_catalog_headers<T>(
+        mut req: Request<T>,
+        capability: &str,
+        namespace: &str,
+        operation_id: &str,
+        catalog_version: Option<&str>,
+    ) -> Request<T> {
+        req.metadata_mut().insert(
+            "x-sekai-capability",
+            capability.parse().expect("capability metadata"),
+        );
+        req.metadata_mut().insert(
+            "x-sekai-namespace",
+            namespace.parse().expect("namespace metadata"),
+        );
+        req.metadata_mut().insert(
+            "x-sekai-operation-id",
+            operation_id.parse().expect("operation metadata"),
+        );
+        if let Some(catalog_version) = catalog_version {
+            req.metadata_mut().insert(
+                "x-sekai-catalog-version",
+                catalog_version.parse().expect("catalog version metadata"),
+            );
+        }
+        req
+    }
+
+    async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        for (id, external_id, namespace) in [
+            ("sem-root", "widget:sem-root", "acme"),
+            ("sem-allowed", "widget:sem-allowed", "acme"),
+            ("sem-denied", "widget:sem-denied", "acme"),
+        ] {
+            let mut object = widget_object(
+                id,
+                HashMap::from([("name".into(), id.into()), ("color".into(), "red".into())]),
+            );
+            object.external_id = external_id.into();
+            object.namespace = namespace.into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        for link in [
+            domain::Link {
+                id: "sem-visible-link".into(),
+                from_id: "sem-root".into(),
+                to_id: "sem-allowed".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "sem-denied-link".into(),
+                from_id: "sem-root".into(),
+                to_id: "sem-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+        ] {
+            svc.db.create_link(&link).unwrap();
+        }
+        let denied_grant = security::Grant {
+            id: "sem-denied-grant".into(),
+            object_id: "sem-denied".into(),
+            principal: "bob".into(),
+            role: security::Role::Viewer,
+            created: 0,
+        };
+        svc.db.create_grant(&denied_grant).unwrap();
+        svc.security.add_grant(&denied_grant);
+
+        grant_ontology_admin(svc);
+        svc.create_ontology_class(with_named_principal(
+            CreateOntologyClassRequest {
+                class: Some(OntologyClass {
+                    name: "WidgetClass".into(),
+                    description: "semantic widget".into(),
+                    mapped_kind: "widget".into(),
+                    ..Default::default()
+                }),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_capabilities_are_discoverable_with_bounds_and_versions() {
+        let svc = service();
+        seed_semantic_catalog_graph(&svc).await;
+        let discovered = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let by_name = discovered
+            .capabilities
+            .into_iter()
+            .map(|entry| (entry.name.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        for name in [
+            semantic::CAPABILITY_RESOLVE_REF,
+            semantic::CAPABILITY_EXPAND_RELATIONS,
+            semantic::CAPABILITY_RETRIEVE_CONTEXT,
+            semantic::CAPABILITY_EXPLAIN_DERIVATION,
+        ] {
+            let entry = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing semantic capability {name}"));
+            assert_eq!(entry.contract_version, capability::CONTRACT_VERSION);
+            assert!(
+                entry
+                    .policy_decision_points
+                    .iter()
+                    .any(|point| point == "namespace_access")
+            );
+            let limits = entry
+                .limits
+                .iter()
+                .map(|limit| (limit.name.as_str(), limit.value))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                limits.get("reasoning_profile_version"),
+                Some(&semantic::REASONING_PROFILE_VERSION)
+            );
+            assert_eq!(
+                limits.get("ontology_contract_version"),
+                Some(&semantic::ONTOLOGY_CONTRACT_VERSION)
+            );
+            if name != semantic::CAPABILITY_RESOLVE_REF {
+                assert_eq!(
+                    limits.get("max_depth"),
+                    Some(&(u64::from(retrieval::MAX_DEPTH)))
+                );
+                assert_eq!(limits.get("supports_entailment"), Some(&1));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_resolve_expand_retrieve_explain_chain_returns_structured_evidence() {
+        let svc = service();
+        seed_semantic_catalog_graph(&svc).await;
+        let discovered = svc
+            .discover_capabilities(with_named_principal(
+                DiscoverCapabilitiesRequest {
+                    namespace: "acme".into(),
+                    page_size: 200,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let catalog_version = discovered.catalog_version;
+
+        let resolve = svc
+            .resolve_semantic_ref(with_semantic_catalog_headers(
+                with_named_principal(
+                    ResolveSemanticRefRequest {
+                        namespace: "acme".into(),
+                        external_id: "widget:sem-root".into(),
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                semantic::CAPABILITY_RESOLVE_REF,
+                "acme",
+                "semantic-resolve-1",
+                Some(&catalog_version),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve.metadata().get("x-sekai-operation-id").unwrap(),
+            "semantic-resolve-1"
+        );
+        let resolve = resolve.into_inner();
+        assert!(resolve.resolved);
+        assert_eq!(resolve.ref_kind, semantic::REF_KIND_OBJECT);
+        assert_eq!(resolve.object.as_ref().unwrap().id, "sem-root");
+        assert!(!resolve.ontology_revision.is_empty());
+
+        let expand = svc
+            .expand_relations(with_semantic_catalog_headers(
+                with_named_principal(
+                    ExpandRelationsRequest {
+                        namespace: "acme".into(),
+                        root: Some(ContextRoot {
+                            object_id: "sem-root".into(),
+                            ..Default::default()
+                        }),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        reasoning_mode: "asserted_only".into(),
+                        max_depth: 2,
+                        max_objects: 20,
+                        max_links: 20,
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                semantic::CAPABILITY_EXPAND_RELATIONS,
+                "acme",
+                "semantic-expand-1",
+                Some(&catalog_version),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let expand_ids = expand
+            .candidates
+            .iter()
+            .map(|candidate| candidate.object.as_ref().unwrap().id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(expand_ids, vec!["sem-root", "sem-allowed"]);
+        assert_eq!(expand.denied_objects, 1);
+        assert_eq!(expand.reasoning_mode, "asserted_only");
+
+        let retrieve = svc
+            .retrieve_context(with_semantic_catalog_headers(
+                with_named_principal(
+                    RetrieveContextRequest {
+                        roots: vec![ContextRoot {
+                            object_id: "sem-root".into(),
+                            ..Default::default()
+                        }],
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 2,
+                        max_objects: 20,
+                        max_links: 20,
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                semantic::CAPABILITY_RETRIEVE_CONTEXT,
+                "acme",
+                "semantic-retrieve-1",
+                Some(&catalog_version),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            retrieve
+                .candidates
+                .iter()
+                .any(|candidate| candidate.object.as_ref().unwrap().id == "sem-allowed")
+        );
+        assert!(retrieve.candidates.iter().any(|candidate| {
+            candidate
+                .explanation
+                .as_ref()
+                .is_some_and(|explanation| !explanation.steps.is_empty())
+        }));
+
+        let explain = svc
+            .explain_derivation(with_semantic_catalog_headers(
+                with_named_principal(
+                    ExplainDerivationRequest {
+                        namespace: "acme".into(),
+                        from: Some(ContextRoot {
+                            object_id: "sem-root".into(),
+                            ..Default::default()
+                        }),
+                        to: Some(ContextRoot {
+                            object_id: "sem-allowed".into(),
+                            ..Default::default()
+                        }),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        reasoning_mode: "asserted_only".into(),
+                        max_depth: 2,
+                        max_objects: 20,
+                        max_links: 20,
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                semantic::CAPABILITY_EXPLAIN_DERIVATION,
+                "acme",
+                "semantic-explain-1",
+                Some(&catalog_version),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(explain.found);
+        let explanation = explain.explanation.unwrap();
+        assert!(!explanation.steps.is_empty());
+        assert!(explanation.steps.iter().all(|step| {
+            !step.rule.is_empty() && (step.kind == "asserted" || step.kind == "derived")
+        }));
+        // Denied intermediate must not surface through explain.
+        let denied_explain = svc
+            .explain_derivation(with_named_principal(
+                ExplainDerivationRequest {
+                    namespace: "acme".into(),
+                    from: Some(ContextRoot {
+                        object_id: "sem-root".into(),
+                        ..Default::default()
+                    }),
+                    to: Some(ContextRoot {
+                        object_id: "sem-denied".into(),
+                        ..Default::default()
+                    }),
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    max_depth: 2,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied_explain.found);
+        assert!(denied_explain.explanation.is_none());
+
+        for operation_id in [
+            "semantic-resolve-1",
+            "semantic-expand-1",
+            "semantic-retrieve-1",
+            "semantic-explain-1",
+        ] {
+            let receipt = svc.db.get_operation_receipt(operation_id).unwrap().unwrap();
+            assert_eq!(receipt.operation_class, "catalog_invocation");
+            assert!(receipt.completeness().complete);
+            assert_eq!(
+                receipt.events[0].attributes["reported_catalog_version"],
+                catalog_version
+            );
+            assert!(receipt.events[0].attributes["capability"].starts_with("sekai."));
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_catalog_invocation_rechecks_authz_and_rejects_stale_binding() {
+        let svc = service();
+        seed_semantic_catalog_graph(&svc).await;
+
+        // Stale capability name (or wrong expected binding) is not a grant.
+        let stale = svc
+            .resolve_semantic_ref(with_semantic_catalog_headers(
+                with_named_principal(
+                    ResolveSemanticRefRequest {
+                        namespace: "acme".into(),
+                        object_id: "sem-root".into(),
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                "sekai.semantic.not_a_real_capability",
+                "acme",
+                "semantic-stale-1",
+                Some("sha256:stale-catalog"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(stale.message(), "capability unavailable");
+        let stale_receipt = svc
+            .db
+            .get_operation_receipt("semantic-stale-1")
+            .unwrap()
+            .unwrap();
+        assert!(!stale_receipt.completeness().complete);
+        assert!(
+            serde_json::to_string(&stale_receipt)
+                .unwrap()
+                .contains("capability_unavailable")
+        );
+
+        // Denied object resolves as unavailable without leaking ACL detail.
+        let denied = svc
+            .resolve_semantic_ref(with_named_principal(
+                ResolveSemanticRefRequest {
+                    namespace: "acme".into(),
+                    object_id: "sem-denied".into(),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.resolved);
+        assert_eq!(denied.ref_kind, semantic::REF_KIND_UNAVAILABLE);
+        assert!(denied.object.is_none());
+
+        // Bound expansion respects hard caps.
+        let bounded = svc
+            .expand_relations(with_semantic_catalog_headers(
+                with_named_principal(
+                    ExpandRelationsRequest {
+                        namespace: "acme".into(),
+                        root: Some(ContextRoot {
+                            object_id: "sem-root".into(),
+                            ..Default::default()
+                        }),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 3,
+                        max_objects: 1,
+                        max_links: 1,
+                        ..Default::default()
+                    },
+                    "alice",
+                ),
+                semantic::CAPABILITY_EXPAND_RELATIONS,
+                "acme",
+                "semantic-bound-1",
+                None,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(bounded.candidates.len() <= 1);
+        assert!(
+            bounded.truncated || bounded.truncated_objects > 0 || bounded.candidates.len() == 1
+        );
+        let bound_receipt = svc
+            .db
+            .get_operation_receipt("semantic-bound-1")
+            .unwrap()
+            .unwrap();
+        assert!(bound_receipt.completeness().complete);
     }
 
     #[tokio::test]

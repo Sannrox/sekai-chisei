@@ -542,6 +542,91 @@ message RetrieveContextResponse {
   string ontology_revision = 11;
 }
 
+// Semantic catalog capabilities (#151). These are discoverable through
+// DiscoverCapabilities and invokable with the #107 receipt-attributed binding
+// (x-sekai-capability, x-sekai-namespace, x-sekai-operation-id). Natural-
+// language planning and summarization remain outside Sekai.
+message ResolveSemanticRefRequest {
+  string namespace = 1;
+  // Exactly one of the following reference fields must be set.
+  string object_id = 2;
+  string external_id = 3;
+  string ontology_class = 4;
+  string ontology_relation = 5;
+}
+
+message ResolveSemanticRefResponse {
+  // object | ontology_class | ontology_relation | unavailable
+  string ref_kind = 1;
+  Object object = 2;
+  OntologyClass ontology_class = 3;
+  OntologyRelation ontology_relation = 4;
+  string ontology_revision = 5;
+  // False when the reference is absent or not authorized for the caller.
+  // Absence and denial are intentionally indistinguishable.
+  bool resolved = 6;
+}
+
+message ExpandRelationsRequest {
+  string namespace = 1;
+  ContextRoot root = 2;
+  repeated string relations = 3;
+  string direction = 4; // outgoing | incoming | both; empty defaults to both
+  string reasoning_mode = 5; // empty/asserted_only | entailment
+  uint32 max_depth = 6; // 0 is roots-only; values above 3 are capped
+  uint32 max_objects = 7; // 0 defaults to 20; absolute cap is 100
+  uint32 max_links = 8; // 0 defaults to 40 when expanding; cap is 200
+  repeated string kind_filter = 9;
+  uint32 max_source_rows = 10; // 0 defaults to 200; cap is 1000
+  uint32 max_derived_rows = 11; // 0 defaults to 100; cap is 500
+  uint32 max_derivation_steps = 12; // 0 defaults to 12; cap is 32
+  uint32 max_time_ms = 13; // 0 defaults to 100; cap is 1000
+  uint64 max_explanation_bytes = 14; // 0 defaults to 1 MiB; cap is 16 MiB
+}
+
+message ExpandRelationsResponse {
+  repeated ContextCandidate candidates = 1;
+  repeated Link links = 2;
+  bool truncated = 3;
+  uint32 unresolved_roots = 4;
+  uint32 denied_objects = 5;
+  uint32 truncated_objects = 6;
+  uint32 truncated_links = 7;
+  repeated string truncation_reasons = 8;
+  uint32 source_rows = 9;
+  uint32 derived_rows = 10;
+  string ontology_revision = 11;
+  string reasoning_mode = 12;
+}
+
+message ExplainDerivationRequest {
+  string namespace = 1;
+  ContextRoot from = 2;
+  ContextRoot to = 3;
+  repeated string relations = 4;
+  string direction = 5; // outgoing | incoming | both; empty defaults to both
+  string reasoning_mode = 6; // empty/asserted_only | entailment
+  uint32 max_depth = 7;
+  uint32 max_objects = 8;
+  uint32 max_links = 9;
+  uint32 max_source_rows = 10;
+  uint32 max_derived_rows = 11;
+  uint32 max_derivation_steps = 12;
+  uint32 max_time_ms = 13;
+  uint64 max_explanation_bytes = 14;
+}
+
+message ExplainDerivationResponse {
+  ContextExplanation explanation = 1;
+  bool found = 2;
+  bool truncated = 3;
+  repeated string truncation_reasons = 4;
+  string ontology_revision = 5;
+  string reasoning_mode = 6;
+  // Opaque evidence references (source fact ids). Never secrets or tokens.
+  repeated string evidence_refs = 7;
+}
+
 message ListSchemaTypesRequest {}
 message ListSchemaTypesResponse { repeated ObjectType types = 1; }
 message CreateSchemaTypeRequest { ObjectType type = 1; }
@@ -1434,6 +1519,9 @@ service SekaiService {
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
+  rpc ResolveSemanticRef(ResolveSemanticRefRequest) returns (ResolveSemanticRefResponse);
+  rpc ExpandRelations(ExpandRelationsRequest) returns (ExpandRelationsResponse);
+  rpc ExplainDerivation(ExplainDerivationRequest) returns (ExplainDerivationResponse);
   rpc DiscoverCapabilities(DiscoverCapabilitiesRequest) returns (DiscoverCapabilitiesResponse);
   rpc InstallCapabilityPackage(InstallCapabilityPackageRequest) returns (InstallCapabilityPackageResponse);
   rpc GetCapabilityPackage(GetCapabilityPackageRequest) returns (GetCapabilityPackageResponse);

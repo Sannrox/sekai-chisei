@@ -34,6 +34,7 @@ pub mod retention;
 pub mod retrieval;
 pub mod schema;
 pub mod security;
+pub mod semantic;
 pub mod sentinel;
 pub mod skillextract;
 pub mod temporal;
