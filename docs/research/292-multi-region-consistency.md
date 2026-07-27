@@ -1,12 +1,14 @@
 # Research: multi-region consistency for budgets, leases, and permits
 
-Issue: [#292](https://github.com/Sannrox/sekai-chisei/issues/292)  
+Issue: [#292](https://github.com/Sannrox/sekai-chisei/issues/292)
 Related: [#117](https://github.com/Sannrox/sekai-chisei/issues/117) (closed),
 [#288](https://github.com/Sannrox/sekai-chisei/issues/288) (closed),
-[#293](https://github.com/Sannrox/sekai-chisei/issues/293) (open),
-[#294](https://github.com/Sannrox/sekai-chisei/issues/294) (open)  
-Date: 2026-07-27  
-Status: **recommendation complete**
+[#293](https://github.com/Sannrox/sekai-chisei/issues/293) (shipped region pins;
+see [region-pins.md](../region-pins.md)),
+[#294](https://github.com/Sannrox/sekai-chisei/issues/294) (budget topology;
+see [budget-topology.md](../budget-topology.md))
+Date: 2026-07-27
+Status: **recommendation complete — #293 shipped; #294 operator guide exists**
 
 ## Decision question
 
@@ -158,12 +160,13 @@ No new Issues are required. Implement against this freeze:
 
 | Order | Issue | Outcome under this freeze |
 | --- | --- | --- |
-| 1 | **#293** region-pinned leases and permit redemption | Persist `site_id`/`region` pin on lease records and online redeem rows; foreign pin fail closed; dual-region (or simulated) test that double redeem / dual acquire fails; receipts/evidence expose pin; document handoff as non-goal for v1 or specify the protocol above |
-| 2 | **#294** multi-region budget topology | Document and implement topology modes; partition test: cannot overspend combined ceiling; transfer/reconcile audited if `regional_with_transfer`; operator pressure views may show regional vs global **only when** topology exposes both; auto-allocation and gateway preflight share `BudgetTracker` authority |
+| 1 | **#293** region-pinned leases and permit redemption | **Shipped.** Persist `site_id` pin on lease records and online redeem rows; foreign pin fail closed; dual-region tests for double redeem / dual acquire; operator guide [region-pins.md](../region-pins.md) |
+| 2 | **#294** multi-region budget topology | Topology modes and site pins; partition test: cannot overspend combined ceiling; transfer/reconcile audited if `regional_with_transfer`; operator guide [budget-topology.md](../budget-topology.md) |
 
-**Preferred sequencing:** land **#293** before or concurrent with **#294**. Budget
-topology that assumes multi-region without pinned coordination will re-open
-double-redeem and dual-lease races under the same lag model.
+**Preferred sequencing:** land **#293** before or concurrent with **#294**
+(#293 is landed). Budget topology that assumes multi-region without pinned
+coordination will re-open double-redeem and dual-lease races under the same lag
+model.
 
 ### Acceptance anchors for implementers
 

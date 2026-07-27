@@ -306,11 +306,12 @@ request idempotency, advance fencing generations monotonically, and record
 their audit row in the same transaction. Evidence identity, payload, lifecycle,
 projection, integrity, and audit records share their required transactions.
 
-PostgreSQL is still not a drop-in replacement for the community process's
-complete SQLite runtime. Chisei governed-decision persistence, gateway
-governance, and operations composition remain outside the complete reusable
-Sekai advertisement, so public runtime selection of PostgreSQL continues to
-fail closed until those surfaces have equivalent parity. Object-kind changes
+PostgreSQL is a supported community runtime backend when `SEKAI_DB_BACKEND=postgres`
+and `DATABASE_URL` are set and migrations plus capability inventories validate
+before listeners bind. The reusable Sekai, Chisei, gateway governance, and
+operations health surfaces advertise only after dual-backend conformance
+evidence is present (see [postgres-sekai-parity.md](postgres-sekai-parity.md)
+and [postgres-chisei-parity.md](postgres-chisei-parity.md)). Object-kind changes
 that require ontology constraint validation still fail closed on PostgreSQL
 where that validation path is unavailable. Provider streams and secrets are not
 treated as durable credentials. This contract does not activate tenant
@@ -319,9 +320,9 @@ persistence or identity endpoints.
 Runtime composition uses the versioned `sekai.runtime-backend/v1` contract.
 Its public metadata names the backend and the reusable Sekai, Chisei, gateway,
 and operations surfaces it supports. Startup validates the complete community
-requirement before binding listeners. SQLite advertises that complete set;
-PostgreSQL selection fails early until later Chisei and gateway parity can
-truthfully complete it.
+requirement before binding listeners. Both SQLite and PostgreSQL advertise that
+complete community set when their inventories validate; incomplete schemas fail
+closed.
 
 External evidence submissions are retained source records. Graph objects,
 links, and evidence observations are rebuildable projections. Conflicting

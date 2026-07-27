@@ -1,9 +1,10 @@
 # Research: when can a governed ontology lookup replace a model call?
 
-Issue: [#175](https://github.com/Sannrox/sekai-chisei/issues/175)  
-Related: #144 (closed), #151 (open), #152 (blocked), #281 (feature, blocked on this research)  
-Date: 2026-07-26  
-Status: **recommendation complete — defer**
+Issue: [#175](https://github.com/Sannrox/sekai-chisei/issues/175)
+Related: #144 (closed), #151 (catalog), #152 (recommendation complete; #360/#361
+shipped), #281 (feature; S1 shipped)
+Date: 2026-07-26
+Status: **recommendation complete — S1 shipped (#281)**
 
 ## Decision question
 
@@ -133,7 +134,9 @@ See `docs/capability-catalog.md` (Lookup-first answers) and
 
 ## Conclusion
 
-There is a **plausible narrow deterministic set** of lookup-shaped capabilities,
-but **measurement and catalog substrate are not ready**. Close this research
-with **defer**; no Design Discussion or implementation Issue beyond the existing
-#281 placeholder until the re-open conditions hold.
+There is a **plausible narrow deterministic set** of lookup-shaped capabilities.
+Research initially deferred broad fleet measurement; maintainer **S1** then
+shipped a bounded allow-list short-circuit via #281 (see Impact section above).
+Close this research as **recommendation complete with S1 shipped**; further
+spend % claims still require measured corpora beyond the structural dual-run
+fixture suite.

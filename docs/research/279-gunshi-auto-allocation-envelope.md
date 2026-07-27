@@ -1,9 +1,10 @@
 # Research: safe envelope for Gunshi auto-allocation
 
-Issue: [#279](https://github.com/Sannrox/sekai-chisei/issues/279)  
-Follow-up feature: [#280](https://github.com/Sannrox/sekai-chisei/issues/280)  
-Date: 2026-07-26  
+Issue: [#279](https://github.com/Sannrox/sekai-chisei/issues/279)
+Follow-up feature: [#280](https://github.com/Sannrox/sekai-chisei/issues/280)
+Date: 2026-07-26
 Status: **recommendation complete**
+Operator guide: [gunshi-auto-allocation.md](../gunshi-auto-allocation.md)
 
 ## Decision question
 

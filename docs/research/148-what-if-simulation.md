@@ -1,13 +1,14 @@
 # Research: governed what-if simulation over graph projections
 
-Issue: [#148](https://github.com/Sannrox/sekai-chisei/issues/148)  
+Issue: [#148](https://github.com/Sannrox/sekai-chisei/issues/148)
 Related: [#143](https://github.com/Sannrox/sekai-chisei/issues/143) (closed → ADR 0001 / #144),
 [#146](https://github.com/Sannrox/sekai-chisei/issues/146) (closed → ADR 0004 / #225–#228),
 [#145](https://github.com/Sannrox/sekai-chisei/issues/145) (closed),
 [#282](https://github.com/Sannrox/sekai-chisei/issues/282) (closed policy dry-run),
-[#362](https://github.com/Sannrox/sekai-chisei/issues/362) (implementation vertical)  
-Date: 2026-07-27  
-Status: **recommendation complete**
+[#362](https://github.com/Sannrox/sekai-chisei/issues/362) (shipped scenario overlay)
+Date: 2026-07-27
+Status: **recommendation complete — shipped via #362**
+Operator guide: [scenario-overlay.md](../scenario-overlay.md)
 
 ## Decision question
 
@@ -57,7 +58,7 @@ twin, DES engine, or workflow simulator is out of product boundary.
 | `RetrieveContext` | `src/sekai/retrieval.rs` | Asserted/entailment modes; ACL deny non-disclosure; hard bounds | Read-only over canonical + ontology; no hypotheticals |
 | Temporal as-of / diff | `src/sekai/temporal.rs`, historical RPCs | Bitemporal coordinates; `outcome=not_retained` non-synthesis | History is truth-at-time, not counterfactual |
 | Lineage | `src/sekai/lineage.rs` | Explicit `derived_from` / revision edges | Time order is not causality (ADR 0004 constraint) |
-| Capability catalog | #106/#107, #151 | Governed invocation composition | No scenario capability yet |
+| Capability catalog | #106/#107, #151 | Governed invocation composition | `sekai.scenario.evaluate` shipped (#362); see [scenario-overlay.md](../scenario-overlay.md) |
 
 ### Hard bounds already proven in retrieval (reuse, do not invent a second budget model)
 
@@ -132,62 +133,62 @@ overlay deltas; core merges deltas and returns **domain-neutral impact sets**.
 
 ### Direction (v1 freeze)
 
-1. **Scenario session (ephemeral by default)**  
+1. **Scenario session (ephemeral by default)**
    - Inputs: namespace, actor, optional base coordinates
      (`current` or temporal `valid_at` + `recorded_revision`), seed object/link
      ids, and a bounded list of **hypothesis deltas** (add/remove/replace
-     property or link; all labeled hypothesis).  
-   - Storage: process/request scoped; no write to current objects/links.  
+     property or link; all labeled hypothesis).
+   - Storage: process/request scoped; no write to current objects/links.
    - Optional later: persist scenario metadata + deltas as a non-authoritative
      resource with TTL/retention and ACL — still never current-state.
 
-2. **Overlay merge semantics**  
-   - Read path = authorized base projection ⊕ ordered deltas.  
+2. **Overlay merge semantics**
+   - Read path = authorized base projection ⊕ ordered deltas.
    - Conflicts among deltas are explicit (last-write-wins within the session
      only after ordered apply, or fail closed — pick one and document; prefer
-     **fail closed on conflicting same-key deltas** for determinism).  
+     **fail closed on conflicting same-key deltas** for determinism).
    - Entailment, if requested, runs **after** overlay merge on the
      authorization-filtered view, still without persisting derived facts
      (ADR 0001).
 
-3. **Impact set output (domain-neutral)**  
+3. **Impact set output (domain-neutral)**
    - Touched object ids, link ids, property keys, delta ops, and derivation
      steps (source fact ids + hypothesis delta ids + ontology revision when
-     entailment used).  
-   - No shipment/customer/revenue fields in core types.  
+     entailment used).
+   - No shipment/customer/revenue fields in core types.
    - Epistemic class always `hypothesis` (distinct from fact, evidence,
      forecast).
 
-4. **Authorization**  
-   - Namespace grant required.  
+4. **Authorization**
+   - Namespace grant required.
    - Seed and every expansion hop re-check object/link visibility
-     (`SecurityChecker` / grant model).  
+     (`SecurityChecker` / grant model).
    - Denied material must not appear in impact rows, counts, explanations, or
-     truncation reasons (retrieval non-disclosure pattern).  
+     truncation reasons (retrieval non-disclosure pattern).
    - Scenario create/read/list (if persisted) is a separate grant surface.
 
-5. **Bounds**  
-   - Reuse retrieval-class ceilings for depth, rows, time, explanation size.  
+5. **Bounds**
+   - Reuse retrieval-class ceilings for depth, rows, time, explanation size.
    - Add scenario-specific caps: max deltas per session, max concurrent
-     sessions per namespace, optional max expansion work units.  
+     sessions per namespace, optional max expansion work units.
    - Fail closed with non-sensitive truncation metadata.
 
-6. **Causality**  
+6. **Causality**
    - Propagation rules are explicit (adapter-supplied delta lists or a tiny
-     closed set of structural expansions such as “incident edges of seed”).  
+     closed set of structural expansions such as “incident edges of seed”).
    - Temporal order and audit sequence never invent causal edges.
 
-7. **Promotion**  
-   - **v1 non-goal:** no “apply scenario to canonical graph” API.  
+7. **Promotion**
+   - **v1 non-goal:** no “apply scenario to canonical graph” API.
    - Future promote would be a separate governed action with lease fencing,
      policy, audit, and explicit actor consent — never automatic from impact
      computation.
 
-8. **Composition with external simulators**  
+8. **Composition with external simulators**
    - Core may expose an **authorized snapshot cursor** (bounded, ACL-filtered)
-     for adapters.  
+     for adapters.
    - Adapters return hypothesis deltas; core re-validates authz and bounds
-     before merge.  
+     before merge.
    - Adapters never write the control-plane graph directly for “what-if.”
 
 ### Explicit non-actions
@@ -250,4 +251,5 @@ Acceptance sketch:
 **Recommend a minimal non-authoritative scenario overlay** (option 1 as core,
 option 2 as optional durability, option 3 as adapter composition) and **reject
 a core twin engine or adapter-only terminal exit**. Close research #148 with
-this freeze; implement **#362** when scheduled.
+this freeze; **#362** shipped the operator surface
+([scenario-overlay.md](../scenario-overlay.md), `EvaluateScenario`).

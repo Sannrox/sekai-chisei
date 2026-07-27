@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite access, `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic, and `src/llm/` contains provider adapters. Protocol definitions are in `proto/`. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state.
+`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite access, `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Provider adapters live in `crates/sekai-provider/` (re-exported as `sekai_chisei::llm` from `src/lib.rs`). Protocol definitions are in `proto/`. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state.
 
 ## Build, Test, and Development Commands
 
@@ -24,7 +24,7 @@ Select the ontology database explicitly with `--db <path>` or `SEKAI_DB`, then r
 
 ## Coding Style & Naming Conventions
 
-Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `src/llm/` abstractions. Prefer explicit policy, audit, and authorization behavior over hidden side effects.
+Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `crates/sekai-provider/` abstractions (re-exported as `sekai_chisei::llm`). Prefer explicit policy, audit, and authorization behavior over hidden side effects.
 
 ## Testing Guidelines
 

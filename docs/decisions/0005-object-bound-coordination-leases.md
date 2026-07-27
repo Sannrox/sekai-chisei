@@ -32,8 +32,9 @@ identity.
    - inspect (`GetLease`) requires object read authorization.
 3. Free-form keys remain available for non-object coordination and continue to
    use namespace authorization only.
-4. PostgreSQL continues to fail closed where the lease API is unimplemented;
-   object-bound checks apply on the SQLite path that implements leases.
+4. Object-bound checks apply on every backend that implements the lease API
+   (SQLite and PostgreSQL community runtimes). Incomplete backends fail closed
+   rather than skipping the object-bound checks.
 
 ## Alternatives considered
 

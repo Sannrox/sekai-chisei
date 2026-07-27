@@ -66,7 +66,8 @@ tests for the affected path.
 - Use namespace as the isolation and policy boundary; do not introduce a
   separate application scope.
 - Keep domain concepts in schemas and adapters rather than the core ontology.
-- Put provider-specific behavior behind `src/llm/` abstractions.
+- Put provider-specific behavior behind `crates/sekai-provider/` abstractions
+  (re-exported as `sekai_chisei::llm`).
 - Prefer explicit policy, audit, approval, and authorization behavior over
   hidden side effects.
 - Preserve transaction boundaries when a mutation and its audit record must
@@ -129,8 +130,11 @@ cargo test --locked
 cargo clippy --all-targets -- -D warnings
 ```
 
-Maintainers normally use GitHub rebase merges so reviewed commits remain visible
-and `main` stays linear.
+Maintainers normally squash-merge PRs (`gh pr merge --squash --delete-branch`)
+so the land commit on `main` is GitHub-signed/Verified and history stays linear.
+Use a merge commit only when multi-commit history must be preserved. Avoid
+GitHub rebase-merge when Verified history matters: rebase rewrites commits and
+drops signatures. See `AGENTS.md` for the verified-push workflow.
 
 ## License
 

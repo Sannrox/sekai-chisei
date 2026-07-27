@@ -65,8 +65,8 @@ monotonic generation is the downstream ordering primitive.
 
 Lease transitions and retry results are stored durably with the active record.
 Acquire, refresh, release, and takeover are committed atomically with their
-transition audit entry. The current server persistence path is SQLite; the
-partial PostgreSQL interfaces do not yet implement this API.
+transition audit entry. Both SQLite and PostgreSQL implement the lease API with
+shared dual-backend conformance (see [postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
 ## Lease-guarded object mutations
 
@@ -94,6 +94,7 @@ committed delete remains successful even though the object is gone.
 
 Guarded mutation audit records the lease namespace, key, generation, actor,
 operation, target, and request digest. It does not retain the reusable fencing
-token. Unguarded object RPCs retain their existing behavior. The partial
-PostgreSQL object interfaces do not expose guarded operations and therefore
-fail closed rather than performing a non-atomic lease check.
+token. Unguarded object RPCs retain their existing behavior. Guarded create,
+update, and delete are available on both SQLite and PostgreSQL with shared
+conformance evidence; lease preconditions remain atomic with the mutation on
+each backend.
