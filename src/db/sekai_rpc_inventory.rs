@@ -27,6 +27,38 @@ pub enum RpcPersistenceKind {
     Query,
 }
 
+/// Product-facing stability tier (#383 / #386). Orthogonal to backend
+/// `surfaces` / completeness — do not use this to redefine dual-backend claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductTier {
+    Core,
+    #[default]
+    Advanced,
+    Experimental,
+}
+
+impl ProductTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Advanced => "advanced",
+            Self::Experimental => "experimental",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "core" => Ok(Self::Core),
+            "advanced" => Ok(Self::Advanced),
+            "experimental" => Ok(Self::Experimental),
+            other => Err(format!(
+                "product_tier must be core|advanced|experimental, got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RpcInventoryEntry {
     pub rpc: String,
@@ -35,6 +67,9 @@ pub struct RpcInventoryEntry {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub durable_dependencies: Vec<String>,
+    /// Product tier for docs/SDKs/agents (#386). Defaults to advanced when absent.
+    #[serde(default)]
+    pub product_tier: ProductTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -100,6 +135,7 @@ impl SekaiRpcInventory {
             if entry.evidence.is_empty() {
                 return Err(format!("rpc {} is missing evidence links", entry.rpc));
             }
+            // product_tier is always present after deserialize (default advanced).
             match entry.kind {
                 RpcPersistenceKind::Persistent => {
                     if entry.surfaces.is_empty() {
@@ -229,6 +265,12 @@ impl SekaiRpcInventory {
         self.entries.iter().find(|entry| entry.rpc == rpc)
     }
 
+    pub fn entries_for_tier(&self, tier: ProductTier) -> impl Iterator<Item = &RpcInventoryEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.product_tier == tier)
+    }
+
     pub fn by_kind(&self) -> HashMap<&'static str, usize> {
         let mut counts = HashMap::from([
             ("persistent", 0usize),
@@ -241,6 +283,18 @@ impl SekaiRpcInventory {
                 RpcPersistenceKind::Computed => *counts.get_mut("computed").unwrap() += 1,
                 RpcPersistenceKind::Query => *counts.get_mut("query").unwrap() += 1,
             }
+        }
+        counts
+    }
+
+    pub fn by_product_tier(&self) -> HashMap<&'static str, usize> {
+        let mut counts = HashMap::from([
+            ("core", 0usize),
+            ("advanced", 0usize),
+            ("experimental", 0usize),
+        ]);
+        for entry in &self.entries {
+            *counts.get_mut(entry.product_tier.as_str()).unwrap() += 1;
         }
         counts
     }
@@ -322,6 +376,24 @@ mod tests {
         assert_eq!(
             inventory.entry("ExecuteFunction").unwrap().kind,
             RpcPersistenceKind::Computed
+        );
+        assert_eq!(
+            inventory.entry("CreateObject").unwrap().product_tier,
+            ProductTier::Core
+        );
+        assert_eq!(
+            inventory.entry("HybridRetrieve").unwrap().product_tier,
+            ProductTier::Experimental
+        );
+        let tiers = inventory.by_product_tier();
+        assert!(
+            tiers["core"] >= 30,
+            "core pack unexpectedly small: {tiers:?}"
+        );
+        assert!(tiers["advanced"] >= 50);
+        assert_eq!(
+            inventory.entries_for_tier(ProductTier::Core).count(),
+            tiers["core"]
         );
     }
 

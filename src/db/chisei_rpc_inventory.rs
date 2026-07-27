@@ -25,6 +25,8 @@ pub enum RpcPersistenceKind {
     Query,
 }
 
+pub use crate::db::sekai_rpc_inventory::ProductTier;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RpcInventoryEntry {
     pub rpc: String,
@@ -33,6 +35,9 @@ pub struct RpcInventoryEntry {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub durable_dependencies: Vec<String>,
+    /// Product tier for docs/SDKs/agents (#386). Defaults to advanced when absent.
+    #[serde(default)]
+    pub product_tier: ProductTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -232,6 +237,12 @@ impl ChiseiRpcInventory {
         self.entries.iter().find(|entry| entry.rpc == rpc)
     }
 
+    pub fn entries_for_tier(&self, tier: ProductTier) -> impl Iterator<Item = &RpcInventoryEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.product_tier == tier)
+    }
+
     pub fn by_kind(&self) -> HashMap<&'static str, usize> {
         let mut counts = HashMap::from([
             ("persistent", 0usize),
@@ -244,6 +255,18 @@ impl ChiseiRpcInventory {
                 RpcPersistenceKind::Computed => *counts.get_mut("computed").unwrap() += 1,
                 RpcPersistenceKind::Query => *counts.get_mut("query").unwrap() += 1,
             }
+        }
+        counts
+    }
+
+    pub fn by_product_tier(&self) -> HashMap<&'static str, usize> {
+        let mut counts = HashMap::from([
+            ("core", 0usize),
+            ("advanced", 0usize),
+            ("experimental", 0usize),
+        ]);
+        for entry in &self.entries {
+            *counts.get_mut(entry.product_tier.as_str()).unwrap() += 1;
         }
         counts
     }
@@ -324,6 +347,20 @@ mod tests {
         assert_eq!(
             inventory.entry("ResolvePolicy").unwrap().kind,
             RpcPersistenceKind::Computed
+        );
+        assert_eq!(
+            inventory.entry("PlanExecution").unwrap().product_tier,
+            ProductTier::Core
+        );
+        assert_eq!(
+            inventory.entry("EvolveSuggest").unwrap().product_tier,
+            ProductTier::Experimental
+        );
+        let tiers = inventory.by_product_tier();
+        assert!(tiers["core"] >= 15, "core chisei pack small: {tiers:?}");
+        assert_eq!(
+            inventory.entries_for_tier(ProductTier::Core).count(),
+            tiers["core"]
         );
         assert!(
             inventory

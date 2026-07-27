@@ -79,17 +79,37 @@ of hard-coding graph RPC sequences. Natural-language planning and summarization
 stay with the runtime or a governed model call; Sekai returns structured
 results, truncation metadata, evidence references, and receipts only.
 
-| Capability | RPC / input type | Purpose |
-| --- | --- | --- |
-| `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | Resolve an object (`object_id` / `external_id`) or ontology class/relation under live authorization. Absence and denial are indistinguishable (`resolved=false`). |
-| `sekai.semantic.expand_relations` | `ExpandRelations` | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
-| `sekai.context.retrieve` | `RetrieveContext` | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
-| `sekai.text.search` | `SearchText` | Search the rebuildable SQLite FTS5 text projection and return `HybridCandidate` rows with `text.fts5_bm25/v1` scores and live authz re-check. Similarity never mints identity. See [text-fts.md](text-fts.md). |
-| `sekai.hybrid.retrieve` | `HybridRetrieve` | Late-fuse explicit representations (`graph.retrieve_context`, `text.fts5`) under a versioned fusion profile (`late_fusion.rrf/v1`, `late_fusion.graph_priority/v1`, `late_fusion.identity/v1`). Returns mixed `HybridCandidate` rows plus per-adapter status; partial adapter failure does not drop healthy sides. Pure graph callers keep `RetrieveContext`. See [hybrid-retrieval.md](hybrid-retrieval.md). |
-| `sekai.pattern.execute` | `ExecutePatternPlan` | Execute a versioned multi-hop pattern plan (`pattern_plan/v1`) with hop-time ACL re-check and hard bounds. Denied intermediate hops fail closed as absence. See [pattern-plan.md](pattern-plan.md). |
-| `sekai.pattern.explain` | `ExplainPatternPlan` | Deterministic EXPLAIN of pattern plan shape (no graph side effects). Plan-time ontology name visibility applies. See [pattern-plan.md](pattern-plan.md). |
-| `sekai.semantic.explain_derivation` | `ExplainDerivation` | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
-| `sekai.scenario.evaluate` | `EvaluateScenario` | Evaluate a request-scoped non-authoritative scenario overlay over authorized graph projections and return a hypothesis-labeled, domain-neutral impact set. Never mutates canonical facts. See [scenario-overlay.md](scenario-overlay.md). |
+| Capability | RPC / input type | Product tier | Purpose |
+| --- | --- | --- | --- |
+| `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | **core** | Resolve an object (`object_id` / `external_id`) or ontology class/relation under live authorization. Absence and denial are indistinguishable (`resolved=false`). |
+| `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
+| `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
+| `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
+| `sekai.text.search` | `SearchText` | experimental | Search the rebuildable SQLite FTS5 text projection and return `HybridCandidate` rows with `text.fts5_bm25/v1` scores and live authz re-check. Similarity never mints identity. See [text-fts.md](text-fts.md). |
+| `sekai.hybrid.retrieve` | `HybridRetrieve` | experimental | Late-fuse explicit representations (`graph.retrieve_context`, `text.fts5`) under a versioned fusion profile (`late_fusion.rrf/v1`, `late_fusion.graph_priority/v1`, `late_fusion.identity/v1`). Returns mixed `HybridCandidate` rows plus per-adapter status; partial adapter failure does not drop healthy sides. Pure graph callers keep `RetrieveContext`. See [hybrid-retrieval.md](hybrid-retrieval.md). |
+| `sekai.pattern.execute` | `ExecutePatternPlan` | advanced | Execute a versioned multi-hop pattern plan (`pattern_plan/v1`) with hop-time ACL re-check and hard bounds. Denied intermediate hops fail closed as absence. See [pattern-plan.md](pattern-plan.md). |
+| `sekai.pattern.explain` | `ExplainPatternPlan` | advanced | Deterministic EXPLAIN of pattern plan shape (no graph side effects). Plan-time ontology name visibility applies. See [pattern-plan.md](pattern-plan.md). |
+| `sekai.scenario.evaluate` | `EvaluateScenario` | experimental | Evaluate a request-scoped non-authoritative scenario overlay over authorized graph projections and return a hypothesis-labeled, domain-neutral impact set. Never mutates canonical facts. See [scenario-overlay.md](scenario-overlay.md). |
+
+### Product tier filter (core pack)
+
+Research [#383](research/383-core-product-interface.md) and feature #386 tag
+RPC inventories and catalog entries with `product_tier`: `core` | `advanced` |
+`experimental`. This is **orthogonal** to backend completeness
+(`complete_*_surfaces` in the RPC inventories).
+
+Agents should start with the **core pack**:
+
+```text
+DiscoverCapabilitiesRequest {
+  namespace: "...",
+  product_tier_filter: "core",
+}
+```
+
+Empty `product_tier_filter` returns the full authorized catalog (previous
+behavior). Each `CapabilityEntry` also carries `product_tier` for client-side
+filtering.
 
 Each entry advertises:
 

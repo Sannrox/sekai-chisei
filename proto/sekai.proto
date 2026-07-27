@@ -287,6 +287,9 @@ message CapabilityEntry {
   ObjectType object_type = 16;
   ActionTypeDef action_type = 17;
   repeated string evidence_requirements = 18;
+  // Product tier for discovery filters (#386 / research #383): core | advanced | experimental.
+  // Empty means untagged (treated as advanced for filtering).
+  string product_tier = 19;
 }
 
 message CapabilityLimit {
@@ -300,6 +303,9 @@ message DiscoverCapabilitiesRequest {
   string catalog_version = 3; // pins pagination to an observed snapshot
   uint32 page_size = 4; // defaults to 50 and is capped at 200
   string page_token = 5;
+  // Optional product-tier filter (#386): empty = all tiers; "core" returns the
+  // starter pack only (core product capabilities). Values: core | advanced | experimental.
+  string product_tier_filter = 6;
 }
 
 message DiscoverCapabilitiesResponse {

@@ -12,7 +12,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetLease",
@@ -23,7 +24,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RefreshLease",
@@ -34,7 +36,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReleaseLease",
@@ -45,7 +48,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "TakeoverExpiredLease",
@@ -56,7 +60,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GuardedCreateObject",
@@ -70,7 +75,8 @@
       "evidence": [
         "tests/guarded_mutation_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GuardedUpdateObject",
@@ -84,7 +90,8 @@
       "evidence": [
         "tests/guarded_mutation_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GuardedDeleteObject",
@@ -98,7 +105,8 @@
       "evidence": [
         "tests/guarded_mutation_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateObject",
@@ -109,7 +117,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetObject",
@@ -120,7 +129,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "UpdateObject",
@@ -131,7 +141,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "DeleteObject",
@@ -142,7 +153,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListObjects",
@@ -153,7 +165,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "CreateObjectSet",
@@ -164,7 +177,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListObjectSets",
@@ -175,7 +189,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DeleteObjectSet",
@@ -186,7 +201,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ResolveObjectSet",
@@ -197,7 +213,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "FindByExternalId",
@@ -208,7 +225,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "FindByProperty",
@@ -219,7 +237,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "CreateLink",
@@ -230,7 +249,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "DeleteLink",
@@ -241,7 +261,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetLinks",
@@ -252,7 +273,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetLinkedObjects",
@@ -263,7 +285,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "Traverse",
@@ -274,7 +297,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "RetrieveContext",
@@ -287,7 +311,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "SearchText",
@@ -302,7 +327,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.evidence"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "HybridRetrieve",
@@ -319,7 +345,8 @@
         "sekai.authorization",
         "sekai.ontology-definitions",
         "sekai.evidence"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "ExecutePatternPlan",
@@ -332,7 +359,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.authorization"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "ExplainPatternPlan",
@@ -345,7 +373,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.authorization"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "EvaluateScenario",
@@ -358,7 +387,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.authorization"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "ResolveSemanticRef",
@@ -372,7 +402,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "ExpandRelations",
@@ -386,7 +417,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "ExplainDerivation",
@@ -400,7 +432,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "DiscoverCapabilities",
@@ -412,7 +445,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.authorization"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "InstallCapabilityPackage",
@@ -424,7 +458,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetCapabilityPackage",
@@ -436,7 +471,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "EvaluateCapabilityPackage",
@@ -448,7 +484,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "experimental"
     },
     {
       "rpc": "UpgradeCapabilityPackage",
@@ -460,7 +497,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RollbackCapabilityPackage",
@@ -472,7 +510,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DisableCapabilityPackage",
@@ -484,7 +523,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "UninstallCapabilityPackage",
@@ -496,7 +536,8 @@
       "evidence": [
         "tests/capability_package_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "SetCapabilityPackageTrustPolicy",
@@ -509,7 +550,8 @@
         "src/sekai/capability_package.rs",
         "docs/capability-package-trust.md"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetCapabilityPackageTrustPolicy",
@@ -522,7 +564,8 @@
         "src/sekai/capability_package.rs",
         "docs/capability-package-trust.md"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "PutCapabilityPackageSigner",
@@ -535,7 +578,8 @@
         "src/sekai/capability_package.rs",
         "docs/capability-package-trust.md"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListCapabilityPackageSigners",
@@ -548,7 +592,8 @@
         "src/sekai/capability_package.rs",
         "docs/capability-package-trust.md"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListSchemaTypes",
@@ -559,7 +604,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateSchemaType",
@@ -570,7 +616,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DeleteSchemaType",
@@ -581,7 +628,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListInterfaces",
@@ -592,7 +640,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateInterface",
@@ -603,7 +652,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DeleteInterface",
@@ -614,7 +664,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListOntologyClasses",
@@ -625,7 +676,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetOntologyClass",
@@ -636,7 +688,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "CreateOntologyClass",
@@ -647,7 +700,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "DeleteOntologyClass",
@@ -658,7 +712,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListOntologyRelations",
@@ -669,7 +724,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetOntologyRelation",
@@ -680,7 +736,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "CreateOntologyRelation",
@@ -691,7 +748,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "DeleteOntologyRelation",
@@ -702,7 +760,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ProjectSchemaToOntology",
@@ -714,7 +773,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReportOntologyLinkViolations",
@@ -726,7 +786,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.ontology-definitions"
-      ]
+      ],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ProposeOntologyDefinitions",
@@ -737,7 +798,8 @@
       "evidence": [
         "src/sekai/ontology_proposal.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListOntologyDefinitionProposals",
@@ -748,7 +810,8 @@
       "evidence": [
         "src/sekai/ontology_proposal.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetOntologyDefinitionProposal",
@@ -759,7 +822,8 @@
       "evidence": [
         "src/sekai/ontology_proposal.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReviewOntologyDefinitionProposal",
@@ -770,7 +834,8 @@
       "evidence": [
         "src/sekai/ontology_proposal.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateFunction",
@@ -781,7 +846,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListFunctions",
@@ -792,7 +858,8 @@
       "evidence": [
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ExecuteFunction",
@@ -806,7 +873,8 @@
         "sekai.graph",
         "sekai.datasets",
         "sekai.authorization"
-      ]
+      ],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateDataset",
@@ -817,7 +885,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "UpdateDataset",
@@ -828,7 +897,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListDatasets",
@@ -839,7 +909,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "AppendRows",
@@ -850,7 +921,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "QueryRows",
@@ -861,7 +933,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateVirtualTable",
@@ -872,7 +945,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListVirtualTables",
@@ -883,7 +957,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateGrant",
@@ -894,7 +969,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "DeleteGrant",
@@ -905,7 +981,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListGrants",
@@ -916,7 +993,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "CheckAccess",
@@ -927,7 +1005,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "EnsureTeamNamespace",
@@ -941,7 +1020,8 @@
       "evidence": [
         "tests/team_namespace_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RecordDecision",
@@ -952,7 +1032,8 @@
       "evidence": [
         "tests/decision_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListDecisions",
@@ -963,7 +1044,8 @@
       "evidence": [
         "tests/decision_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListObjectChanges",
@@ -975,7 +1057,8 @@
       "evidence": [
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "VerifyAuditLedger",
@@ -986,7 +1069,8 @@
       ],
       "durable_dependencies": [
         "sekai.audit"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "GetAttestation",
@@ -998,7 +1082,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListAttestations",
@@ -1010,7 +1095,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "VerifyAttestation",
@@ -1022,7 +1108,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ExportAssurance",
@@ -1035,7 +1122,8 @@
         "sekai.audit",
         "sekai.attestations",
         "sekai.evidence"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "CreateActionType",
@@ -1046,7 +1134,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListActionTypes",
@@ -1057,7 +1146,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DeleteActionType",
@@ -1068,7 +1158,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ExecuteAction",
@@ -1082,7 +1173,8 @@
         "sekai.graph",
         "sekai.authorization",
         "sekai.audit"
-      ]
+      ],
+      "product_tier": "advanced"
     },
     {
       "rpc": "SetActionPolicy",
@@ -1094,7 +1186,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetActionPolicy",
@@ -1106,7 +1199,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListActionPolicies",
@@ -1118,7 +1212,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ApproveAction",
@@ -1130,7 +1225,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DenyAction",
@@ -1142,7 +1238,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListPendingApprovals",
@@ -1154,7 +1251,8 @@
       "evidence": [
         "tests/action_governance_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetLineage",
@@ -1166,7 +1264,8 @@
       "durable_dependencies": [
         "sekai.graph",
         "sekai.audit"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "CreateContentionScope",
@@ -1177,7 +1276,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "UpdateContentionScope",
@@ -1188,7 +1288,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetContentionScope",
@@ -1199,7 +1300,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListContentionScopes",
@@ -1210,7 +1312,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateWorkUnit",
@@ -1221,7 +1324,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetWorkUnit",
@@ -1232,7 +1336,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListWorkUnits",
@@ -1243,7 +1348,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "TryAdmitWorkUnit",
@@ -1254,7 +1360,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "HeartbeatWorkUnit",
@@ -1265,7 +1372,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CompleteWorkUnit",
@@ -1276,7 +1384,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "FailWorkUnit",
@@ -1287,7 +1396,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CancelWorkUnit",
@@ -1298,7 +1408,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReleaseReservation",
@@ -1309,7 +1420,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListReservations",
@@ -1320,7 +1432,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListRunEvents",
@@ -1331,7 +1444,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReconcileWorkUnits",
@@ -1342,7 +1456,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetCoordinationSnapshot",
@@ -1353,7 +1468,8 @@
       "evidence": [
         "tests/coordination_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateCredential",
@@ -1364,7 +1480,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "RotateCredential",
@@ -1375,7 +1492,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "RevokeCredential",
@@ -1386,7 +1504,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "ListCredentials",
@@ -1397,7 +1516,8 @@
       "evidence": [
         "tests/reusable_sekai_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "core"
     },
     {
       "rpc": "GetProvenanceReport",
@@ -1410,7 +1530,8 @@
         "sekai.audit",
         "sekai.evidence",
         "sekai.graph"
-      ]
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "RegisterEvidenceProducer",
@@ -1421,7 +1542,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RegisterEvidenceSchema",
@@ -1432,7 +1554,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "SubmitEvidence",
@@ -1443,7 +1566,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "SubmitEvidenceBatch",
@@ -1454,7 +1578,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetEvidenceSubmission",
@@ -1465,7 +1590,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ListEvidenceSubmissions",
@@ -1476,7 +1602,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReplayEvidenceSubmission",
@@ -1487,7 +1614,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RetractEvidence",
@@ -1498,7 +1626,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "MarkEvidenceStale",
@@ -1509,7 +1638,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetEvidenceSubmissionContent",
@@ -1520,7 +1650,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "CreateHandoff",
@@ -1531,7 +1662,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "ResolveHandoff",
@@ -1542,7 +1674,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "RevokeHandoff",
@@ -1553,7 +1686,8 @@
       "evidence": [
         "tests/evidence_backend_conformance.rs"
       ],
-      "durable_dependencies": []
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "DiscoverTemporalSurfaces",
@@ -1565,7 +1699,8 @@
       ],
       "durable_dependencies": [
         "sekai.graph"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "QueryTemporalAsOf",
@@ -1577,7 +1712,8 @@
       ],
       "durable_dependencies": [
         "sekai.graph"
-      ]
+      ],
+      "product_tier": "experimental"
     },
     {
       "rpc": "DiffTemporalHistory",
@@ -1589,7 +1725,8 @@
       ],
       "durable_dependencies": [
         "sekai.graph"
-      ]
+      ],
+      "product_tier": "experimental"
     }
   ],
   "complete_sekai_surfaces": [

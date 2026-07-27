@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             catalog_version: String::new(),
             page_size: 200,
             page_token: String::new(),
+            product_tier_filter: String::new(),
         })
         .await?
         .into_inner();

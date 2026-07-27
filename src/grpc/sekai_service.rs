@@ -1828,6 +1828,7 @@ fn base_capability(
     input_type: &str,
     output_type: &str,
 ) -> CapabilityEntry {
+    let product_tier = capability_product_tier(&name).to_string();
     CapabilityEntry {
         name,
         description,
@@ -1847,6 +1848,29 @@ fn base_capability(
         object_type: None,
         action_type: None,
         evidence_requirements: Vec::new(),
+        product_tier,
+    }
+}
+
+/// Product tier for catalog discovery (#386 / research #383).
+/// Orthogonal to backend inventory completeness.
+fn capability_product_tier(name: &str) -> &'static str {
+    match name {
+        semantic::CAPABILITY_RESOLVE_REF
+        | semantic::CAPABILITY_EXPAND_RELATIONS
+        | semantic::CAPABILITY_RETRIEVE_CONTEXT
+        | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
+        semantic::CAPABILITY_SEARCH_TEXT
+        | semantic::CAPABILITY_HYBRID_RETRIEVE
+        | semantic::CAPABILITY_EVALUATE_SCENARIO => "experimental",
+        semantic::CAPABILITY_EXECUTE_PATTERN_PLAN | semantic::CAPABILITY_EXPLAIN_PATTERN_PLAN => {
+            "advanced"
+        }
+        "sekai.relations.traverse" => "core",
+        other if other.starts_with("sekai.objects.query.") => "core",
+        other if other.starts_with("sekai.actions.") => "advanced",
+        other if other.contains("kioku") => "experimental",
+        _ => "advanced",
     }
 }
 
@@ -8217,13 +8241,32 @@ impl SekaiService for SekaiServiceImpl {
         if namespace.is_empty() || namespace != inner.namespace {
             return Err(Status::invalid_argument("canonical namespace required"));
         }
+        let tier_filter = inner.product_tier_filter.trim();
+        if !tier_filter.is_empty() && !matches!(tier_filter, "core" | "advanced" | "experimental") {
+            return Err(Status::invalid_argument(
+                "product_tier_filter must be empty or one of core|advanced|experimental",
+            ));
+        }
         let contract_version = capability::negotiate_contract_version(&inner.contract_version)
             .map_err(map_capability_error)?;
-        let entries = self.discoverable_capabilities(namespace, &principals)?;
+        let mut entries = self.discoverable_capabilities(namespace, &principals)?;
+        if !tier_filter.is_empty() {
+            entries.retain(|entry| {
+                let tier = if entry.product_tier.trim().is_empty() {
+                    "advanced"
+                } else {
+                    entry.product_tier.as_str()
+                };
+                tier == tier_filter
+            });
+        }
         let mut context = principals.clone();
         context.sort();
         context.dedup();
         context.insert(0, namespace.to_string());
+        if !tier_filter.is_empty() {
+            context.push(format!("product_tier:{tier_filter}"));
+        }
         let canonical_entries = entries
             .iter()
             .map(Message::encode_to_vec)
@@ -26291,6 +26334,7 @@ mod tests {
                     catalog_version: first.catalog_version.clone(),
                     page_size: 2,
                     page_token: first.next_page_token,
+                    product_tier_filter: String::new(),
                     ..Default::default()
                 },
                 "local",
@@ -26504,6 +26548,7 @@ mod tests {
                     catalog_version: first.catalog_version,
                     page_size: 1,
                     page_token: first.next_page_token,
+                    product_tier_filter: String::new(),
                     ..Default::default()
                 },
                 "local",

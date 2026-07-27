@@ -2,7 +2,8 @@
 
 Issue: [#383](https://github.com/Sannrox/sekai-chisei/issues/383)  
 Date: 2026-07-27  
-Status: **recommendation complete**
+Status: **recommendation complete**  
+Follow-ups: #385 (landed), #386 product_tier (in progress), #387–#389
 
 ## Decision question
 
