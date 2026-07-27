@@ -83,7 +83,8 @@ semantic retrieval surfaces (`x-sekai-capability`, `x-sekai-namespace`,
 ## Non-goals
 
 - Building the FTS index (done in #360).
-- Multi-hop pattern IR (#145).
+- Multi-hop pattern IR (delivered as [#375](https://github.com/Sannrox/sekai-chisei/issues/375);
+  see [pattern-plan.md](pattern-plan.md) / research [#145](research/145-semantic-pattern-query.md)).
 - Automatic NL adapter selection or embedding training.
 - Identity reconciliation from similarity scores.
 - Replacing catalog composition (#151) or lookup-first model substitution.

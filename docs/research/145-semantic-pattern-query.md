@@ -1,9 +1,11 @@
 # Research: semantic pattern-query surface
 
 Issue: [#145](https://github.com/Sannrox/sekai-chisei/issues/145)  
-Related: #141 (closed), #144 (closed), #151 (open), #152 (open)  
+Related: #141 (closed), #144 (closed), #151 (open), #152 (open),
+implementation [#375](https://github.com/Sannrox/sekai-chisei/issues/375)
+([pattern-plan.md](../pattern-plan.md), plan version `pattern_plan/v1`)  
 Date: 2026-07-27  
-Status: **recommendation complete**
+Status: **recommendation complete** (IR vertical: #375)
 
 ## Decision question
 

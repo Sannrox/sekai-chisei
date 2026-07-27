@@ -78,6 +78,8 @@ in order.
   — operator guides: [text-fts.md](text-fts.md) (#360),
   [hybrid-retrieval.md](hybrid-retrieval.md) (#361).
 - [Semantic pattern-query surface](research/145-semantic-pattern-query.md)
+- [Multi-hop pattern plan IR (`pattern_plan/v1`)](pattern-plan.md) — structured
+  execute + EXPLAIN (#375); no SQL/SPARQL/Cypher
 - [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
 - [Multi-control-plane federation profile v1](research/291-federation-profile.md)
   — operator guide: [federation-profile.md](federation-profile.md)
