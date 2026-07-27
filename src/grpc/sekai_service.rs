@@ -879,9 +879,7 @@ impl SekaiServiceImpl {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            sqlite
-                .rebuild_text_fts(now_ms)
-                .map_err(|e| Status::internal(e))?;
+            sqlite.rebuild_text_fts(now_ms).map_err(Status::internal)?;
         }
         let principal_class = principals
             .iter()
