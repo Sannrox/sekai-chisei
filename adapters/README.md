@@ -14,7 +14,7 @@ the Sekai core:
   ontology-definition proposals (#147). Extraction and review stay in Sekai
   core; the adapter never mutates definitions.
 
-Both use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
+All three use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
 the content digest and replay key, persist the exact delivery in a durable local
 outbox, and call `SubmitEvidence`. Unknown-outcome retries reload the same
 envelope and idempotency key; a returned Sekai result acknowledges the outbox

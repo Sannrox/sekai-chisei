@@ -17,7 +17,7 @@ Build an evidence-backed impact map before implementation or review.
    - Sekai durable facts versus Chisei governed decisions;
    - gateway-compatible requests versus native gRPC execution;
    - SQLite versus implemented PostgreSQL interfaces;
-   - provider-neutral behavior versus `src/llm/` adapters;
+   - provider-neutral behavior versus `crates/sekai-provider/` adapters;
    - namespace authorization, egress, approval, budget, audit, lineage,
      retention, and secrets;
    - public `proto/`, configuration, CLI, receipt, metrics, and operator

@@ -22,6 +22,10 @@ policy holds the discovered action. Production deployments use
 Runnable examples for the `sekai-chisei` control plane. Each one is a standalone
 binary that links the library crate and talks to a running gRPC server.
 
+Evidence adapter examples (`evidence_*`) and the batch Responses harness live
+under `examples/` as thin runners and are documented in
+[adapters/README.md](../adapters/README.md).
+
 ## demo_client
 
 [demo_client.rs](demo_client.rs) is an end-to-end client that walks through a
