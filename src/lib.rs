@@ -11,6 +11,7 @@ pub use sekai_provider::cost_estimate;
 pub mod credential_cli;
 pub mod db;
 pub mod domain;
+pub mod domain_admin;
 pub mod enterprise;
 pub mod enterprise_conformance;
 pub use sekai_provider::gateway_keys;
