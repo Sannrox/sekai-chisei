@@ -1,8 +1,9 @@
 # Research: operator console information architecture
 
-Issue: [#283](https://github.com/Sannrox/sekai-chisei/issues/283)  
-Date: 2026-07-26  
+Issue: [#283](https://github.com/Sannrox/sekai-chisei/issues/283)
+Date: 2026-07-26
 Status: **recommendation complete**
+Operator guide: [operator-console.md](../operator-console.md)
 
 ## Decision question
 

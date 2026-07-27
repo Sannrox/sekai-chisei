@@ -23,7 +23,7 @@ template.
 | `SEKAI_AUTH_TOKEN` | unset | Deprecated single-principal bootstrap token |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
-| `SEKAI_TLS_CA` | unset | Optional client CA PEM path |
+| `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `RUST_LOG` | `info` | Tracing filter |
 | `LOG_FORMAT` | `pretty` | Use `json` for structured logs |
@@ -91,15 +91,15 @@ value to stdout.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address |
+| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS`, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable `CHISEI_GATEWAY_NO_PREFLIGHT` or auth passthrough |
 | `CHISEI_GRPC_URL` | unset | Control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
 | `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |
 | `CHISEI_ANTHROPIC_BASE_URL` | Anthropic API | Anthropic-compatible upstream; include `/v1` |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models |
-| `GATEWAY_KEYS` | empty | Explicit `key=agent:project` development/compose allowlist |
+| `GATEWAY_KEYS` | empty | Explicit `key=agent:project` development/compose allowlist (required when the bind is non-loopback) |
 | `GATEWAY_DEFAULT_PROJECT` | `default` | Attribution fallback when a key omits a project |
-| `GATEWAY_GOVERNANCE_FAILURE` | `open` | Failure posture; use `closed` to refuse all governance failures |
+| `GATEWAY_GOVERNANCE_FAILURE` | `open` | Failure posture; use `closed` to refuse governance failures. Required `closed` for any non-loopback bind |
 | `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | Enables cache refresh; must be at least 32 bytes |
 | `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `33554432` | Maximum buffered request body |
 | `CHISEI_GATEWAY_RATE_LIMIT_REQUESTS` | `120` | Requests per identity and window |
@@ -108,7 +108,7 @@ value to stdout.
 | `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` | `4000` | Maximum injected graph-context characters |
 | `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS` | `30` | Virtual-key lookup cache lifetime |
 | `CHISEI_GATEWAY_GOVERNANCE_CACHE_TTL_SECS` | `300` | Maximum age of last-known governance decisions |
-| `CHISEI_GATEWAY_AUDIT_SPOOL_PATH` | beside database | Durable degraded/fail-open JSONL audit spool |
+| `CHISEI_GATEWAY_AUDIT_SPOOL_PATH` | `data/chisei-gateway-audit.jsonl` | Durable degraded/fail-open JSONL audit spool (process CWD-relative unless absolute) |
 | `CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES` | `67108864` | Audit spool rotation threshold |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
 | `CHISEI_GATEWAY_FAT_DECIDE` | on | Use `DecideGatewayExecution` for budget/policy preflight (deny fail-closed; admit replaces CheckBudget+ResolvePolicy). Set `0`/`false`/`off` for legacy multi-RPC preflight |

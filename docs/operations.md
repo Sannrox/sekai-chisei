@@ -106,12 +106,20 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
 ## Gateway safeguards
 
 - Use virtual keys or authenticated passthrough only on a trusted gateway.
-- Set `GATEWAY_GOVERNANCE_FAILURE=closed` when availability must never override
-  governance.
+- Seed durable virtual keys with `sekaictl gateway setup` /
+  `sekaictl gateway key create`. Control-plane `sekaictl credential create`
+  tokens are for gRPC principals, not gateway HTTP keys.
+- Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
+  `GATEWAY_KEYS` entry, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable
+  `CHISEI_GATEWAY_NO_PREFLIGHT` or auth passthrough. Startup fails closed if
+  those gates are missing.
+- Set `GATEWAY_GOVERNANCE_FAILURE=closed` on loopback when availability must
+  never override governance.
 - Protect the admin refresh endpoint with a random
   `CHISEI_GATEWAY_ADMIN_TOKEN` of at least 32 bytes; it is disabled when unset.
-- Keep the durable audit spool writable. A fail-open decision is refused when
-  it cannot be recorded.
+- Keep the durable audit spool writable (default
+  `data/chisei-gateway-audit.jsonl` relative to process CWD). A fail-open
+  decision is refused when it cannot be recorded.
 - Treat cross-provider routing as opt-in because request/response translation
   can be lossy. Tool-call streams remain denied where semantics cannot be
   preserved.
