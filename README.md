@@ -106,6 +106,19 @@ location, and an inspection command:
 cargo run --bin sekaictl -- receipt <operation_id>
 ```
 
+### Product loop (ontology-first)
+
+Define a small domain, seed facts, run one governed lookup, and inspect the
+receipt—without raw gRPC. Fixture files live under
+`tests/fixtures/product_loop/`. Details: [docs/ontology.md](docs/ontology.md).
+
+```bash
+cargo run --bin sekaictl -- ontology first-run \
+  --domain tests/fixtures/product_loop/domain-v1.json \
+  --seed tests/fixtures/product_loop/seed-v1.json \
+  --resolve-object svc-api
+```
+
 ### Local ontology tool
 
 The `sekai` CLI is a standalone tool for portable ontology databases. It does

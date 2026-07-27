@@ -339,7 +339,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("created {}", output.display());
                 Ok(())
             }
-            _ => Err(std::io::Error::other(sekai_chisei::ontology_inspect::usage()).into()),
+            Some("apply" | "seed" | "run" | "first-run") => {
+                sekai_chisei::launch::load_local_env();
+                sekai_chisei::ontology_product_cli::run_ontology_product_command(
+                    args.into_iter().skip(1).collect(),
+                )
+                .await
+            }
+            _ => Err(std::io::Error::other(sekai_chisei::ontology_product_cli::usage()).into()),
         },
         other => {
             eprintln!("unknown command {other:?}");
@@ -467,7 +474,10 @@ fn print_root_usage() {
     println!(
         "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|federation|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi> ...\n"
     );
-    println!("Credential commands:");
+    println!("Product loop (ontology-first):");
+    println!("  {}", sekai_chisei::ontology_product_cli::usage());
+    println!("  {}", sekai_chisei::ontology_inspect::usage());
+    println!("\nCredential commands:");
     println!("  {}", credential_usage());
     println!("\nGateway commands:");
     println!("  sekaictl gateway setup [...]");
@@ -476,7 +486,7 @@ fn print_root_usage() {
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
     println!("\nDiagnostics:\n  sekaictl doctor [codex-app|claude-code]");
-    println!("\nFirst governed operation:\n  sekaictl smoke [model]");
+    println!("\nFirst governed operation (model smoke):\n  sekaictl smoke [model]");
     println!("\nCost estimate:");
     println!("  {}", estimate_usage());
     println!("\nTeam operations:");
@@ -498,10 +508,6 @@ fn print_root_usage() {
         sekai_chisei::federation_cli::usage()
     );
     println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
-    println!(
-        "\nOntology inspection:\n  {}",
-        sekai_chisei::ontology_inspect::usage()
-    );
     println!(
         "\nOperation receipt:\n  {}",
         sekai_chisei::receipt_cli::usage()
