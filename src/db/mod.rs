@@ -18,6 +18,7 @@ pub mod dataset;
 pub mod decision;
 pub mod deduplication;
 pub mod evidence;
+mod federation_store;
 pub mod function;
 pub mod graph;
 pub mod guarded_mutation;

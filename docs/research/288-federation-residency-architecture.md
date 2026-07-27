@@ -74,7 +74,7 @@ contract, then multi-region consistency research/features.
 | --- | --- | --- |
 | 1 | **#289** provider + data-class residency enforcement | Single plane: fail closed before upstream; policy pins on model/provider/data class |
 | 2 | **#290** cross-site attestation verify/import | Import attested artifacts; no remote write |
-| 3 | **#291** multi-control-plane federation contract | Wire contract for site identity, pack exchange, verify-only API |
+| 3 | **#291** multi-control-plane federation contract | **Closed freeze:** [291-federation-profile.md](291-federation-profile.md) |
 | 4 | **#292** multi-region consistency research | **Closed freeze:** [292-multi-region-consistency.md](292-multi-region-consistency.md) |
 | 5 | **#293** region-pinned leases/permits | Explicit redeem authority (pinned single writer) |
 | 6 | **#294** multi-region budget topology | Single writer per budget scope + optional transfer |
