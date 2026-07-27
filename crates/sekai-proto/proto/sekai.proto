@@ -605,6 +605,72 @@ message SearchTextResponse {
   uint32 scanned = 7;
 }
 
+// Late-fusion hybrid retrieval plan (#361 / research #152 phase B).
+// Callers must name representations explicitly. fusion_profile is required
+// when more than one representation is selected. Pure graph callers should
+// continue to use RetrieveContext (unchanged).
+message HybridGraphParams {
+  repeated ContextRoot roots = 1;
+  repeated string relations = 2;
+  string direction = 3; // outgoing | incoming | both; empty defaults to both
+  uint32 max_depth = 4;
+  uint32 max_objects = 5;
+  uint32 max_links = 6;
+  repeated string kind_filter = 7;
+  string reasoning_mode = 8; // empty/asserted_only | entailment
+  uint32 max_source_rows = 9;
+  uint32 max_derived_rows = 10;
+  uint32 max_derivation_steps = 11;
+  uint64 max_explanation_bytes = 12;
+}
+
+message HybridTextParams {
+  string query = 1;
+  // Optional namespace filter; empty means all namespaces the principal may see.
+  string namespace = 2;
+  // all | evidence | object_props (empty defaults to all)
+  string source_kinds = 3;
+  // When true, rebuild the FTS projection from sources of truth before search.
+  bool rebuild = 4;
+}
+
+message HybridRetrieveRequest {
+  // Explicit representation ids (graph.retrieve_context, text.fts5). Non-empty.
+  repeated string representations = 1;
+  HybridGraphParams graph = 2;
+  HybridTextParams text = 3;
+  // Required when len(representations) > 1.
+  // e.g. late_fusion.rrf/v1 | late_fusion.graph_priority/v1
+  string fusion_profile = 4;
+  // 0 defaults to 40; absolute cap is 200
+  uint32 max_candidates = 5;
+  // 0 defaults to 20; absolute cap is 100
+  uint32 max_per_representation = 6;
+  // Shared wall-clock budget across adapters; 0 defaults to 100; cap is 1000
+  uint32 max_time_ms = 7;
+}
+
+message HybridAdapterResult {
+  string representation_id = 1;
+  // ok | truncated | denied_empty | error
+  string status = 2;
+  repeated string truncation_reasons = 3;
+  // Stable code when status=error (e.g. invalid_argument, storage, unavailable)
+  string error_code = 4;
+  // Non-sensitive message; never includes hidden object names
+  string error_message = 5;
+  uint32 candidate_count = 6;
+  uint32 denied_count = 7;
+}
+
+message HybridRetrieveResponse {
+  repeated HybridCandidate candidates = 1;
+  repeated HybridAdapterResult adapter_results = 2;
+  string fusion_profile = 3;
+  bool truncated = 4;
+  repeated string truncation_reasons = 5;
+}
+
 // Non-authoritative scenario overlay (#362 / research #148). Session is
 // request-scoped: create overlay, apply ordered hypothesis deltas, project a
 // domain-neutral impact set. Never mutates canonical objects/links/temporal
@@ -1652,6 +1718,8 @@ service SekaiService {
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
   // Lexical FTS5 text representation + HybridCandidate envelope (#360).
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
+  // Late-fusion hybrid plan over explicit representations (#361).
+  rpc HybridRetrieve(HybridRetrieveRequest) returns (HybridRetrieveResponse);
   // Request-scoped non-authoritative scenario overlay (#362).
   rpc EvaluateScenario(EvaluateScenarioRequest) returns (EvaluateScenarioResponse);
   rpc ResolveSemanticRef(ResolveSemanticRefRequest) returns (ResolveSemanticRefResponse);

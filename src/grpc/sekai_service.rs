@@ -927,6 +927,243 @@ impl SekaiServiceImpl {
         })
     }
 
+    fn execute_hybrid_retrieve(
+        &self,
+        principals: &[String],
+        inner: HybridRetrieveRequest,
+    ) -> Result<HybridRetrieveResponse, Status> {
+        let started = std::time::Instant::now();
+        let representations =
+            hybrid::normalize_representations(&inner.representations).map_err(map_hybrid_error)?;
+        let fusion_profile =
+            hybrid::resolve_fusion_profile(&inner.fusion_profile, representations.len())
+                .map_err(map_hybrid_error)?;
+        let max_candidates = hybrid::normalize_max_candidates(inner.max_candidates);
+        let max_per_representation =
+            hybrid::normalize_max_per_representation(inner.max_per_representation);
+        let max_time_ms = hybrid::normalize_max_time_ms(inner.max_time_ms);
+        let deadline = started + std::time::Duration::from_millis(u64::from(max_time_ms));
+        let principal_class = principals
+            .iter()
+            .find(|p| p.as_str() != "anonymous")
+            .cloned()
+            .unwrap_or_else(|| "anonymous".into());
+
+        let mut adapter_results = Vec::with_capacity(representations.len());
+        for representation in representations {
+            if started.elapsed() >= std::time::Duration::from_millis(u64::from(max_time_ms)) {
+                adapter_results.push(hybrid::AdapterResult::error(
+                    representation,
+                    "deadline_exceeded",
+                    "shared max_time_ms exhausted before adapter ran",
+                ));
+                continue;
+            }
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32;
+            let adapter = match representation {
+                hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT => self.run_hybrid_graph_adapter(
+                    principals,
+                    &principal_class,
+                    inner.graph.as_ref(),
+                    remaining_ms,
+                    max_per_representation,
+                ),
+                hybrid::REPRESENTATION_TEXT_FTS5 => self.run_hybrid_text_adapter(
+                    principals,
+                    &principal_class,
+                    inner.text.as_ref(),
+                    remaining_ms,
+                    max_per_representation,
+                ),
+                other => hybrid::AdapterResult::error(
+                    other,
+                    "unavailable",
+                    "representation is not implemented in this vertical",
+                ),
+            };
+            adapter_results.push(adapter);
+        }
+
+        let fused = hybrid::late_fuse(fusion_profile, &adapter_results, max_candidates);
+        // Overall wall-clock truncation is explicit and non-sensitive.
+        let mut truncated = fused.truncated;
+        let mut truncation_reasons = fused.truncation_reasons;
+        if started.elapsed() >= std::time::Duration::from_millis(u64::from(max_time_ms)) {
+            truncated = true;
+            if !truncation_reasons.iter().any(|r| r == "max_time_ms") {
+                truncation_reasons.push("max_time_ms".into());
+            }
+        }
+
+        Ok(HybridRetrieveResponse {
+            candidates: fused
+                .candidates
+                .into_iter()
+                .map(to_proto_hybrid_candidate)
+                .collect(),
+            adapter_results: adapter_results
+                .into_iter()
+                .map(to_proto_hybrid_adapter_result)
+                .collect(),
+            fusion_profile: fused.fusion_profile,
+            truncated,
+            truncation_reasons,
+        })
+    }
+
+    fn run_hybrid_graph_adapter(
+        &self,
+        principals: &[String],
+        principal_class: &str,
+        graph: Option<&HybridGraphParams>,
+        remaining_ms: u32,
+        max_per_representation: u32,
+    ) -> hybrid::AdapterResult {
+        let Some(graph) = graph else {
+            return hybrid::AdapterResult::error(
+                hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT,
+                "invalid_argument",
+                "graph params required when graph.retrieve_context is selected",
+            );
+        };
+        if graph.roots.is_empty() {
+            return hybrid::AdapterResult::error(
+                hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT,
+                "invalid_argument",
+                "graph.roots must be non-empty when graph.retrieve_context is selected",
+            );
+        }
+        // Cap graph wall-clock by the shared hybrid remaining budget.
+        let graph_time_ms = remaining_ms.max(1);
+        let max_objects = if graph.max_objects == 0 {
+            max_per_representation
+        } else {
+            graph.max_objects.min(max_per_representation)
+        };
+        let request = RetrieveContextRequest {
+            roots: graph.roots.clone(),
+            relations: graph.relations.clone(),
+            direction: graph.direction.clone(),
+            max_depth: graph.max_depth,
+            max_objects,
+            max_links: graph.max_links,
+            kind_filter: graph.kind_filter.clone(),
+            reasoning_mode: graph.reasoning_mode.clone(),
+            max_source_rows: graph.max_source_rows,
+            max_derived_rows: graph.max_derived_rows,
+            max_derivation_steps: graph.max_derivation_steps,
+            max_time_ms: graph_time_ms,
+            max_explanation_bytes: graph.max_explanation_bytes,
+        };
+
+        match self.execute_retrieve_context(principals, request) {
+            Ok(response) => {
+                let mut candidates = Vec::with_capacity(response.candidates.len());
+                for candidate in &response.candidates {
+                    let Some(object) = candidate.object.as_ref() else {
+                        continue;
+                    };
+                    candidates.push(hybrid::HybridCandidate::graph_context(
+                        if response.ontology_revision.is_empty() {
+                            "asserted".to_string()
+                        } else {
+                            response.ontology_revision.clone()
+                        },
+                        candidate.affinity,
+                        Some(hybrid::EntityRef {
+                            kind: hybrid::ENTITY_KIND_OBJECT.into(),
+                            id: object.id.clone(),
+                        }),
+                        hybrid::AuthzContextSummary {
+                            namespace: object.namespace.clone(),
+                            principal_class: principal_class.into(),
+                            classification_ceiling: String::new(),
+                        },
+                    ));
+                }
+                let status = hybrid::status_from_adapter_outcome(
+                    candidates.len(),
+                    response.denied_objects,
+                    response.truncated,
+                );
+                let mut result = hybrid::AdapterResult {
+                    representation_id: hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
+                    status,
+                    candidates,
+                    truncation_reasons: response.truncation_reasons,
+                    denied_count: response.denied_objects,
+                    error_code: String::new(),
+                    error_message: String::new(),
+                };
+                result = hybrid::apply_max_per_representation(result, max_per_representation);
+                result
+            }
+            Err(status) => {
+                hybrid_adapter_status_error(hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT, status)
+            }
+        }
+    }
+
+    fn run_hybrid_text_adapter(
+        &self,
+        principals: &[String],
+        principal_class: &str,
+        text: Option<&HybridTextParams>,
+        remaining_ms: u32,
+        max_per_representation: u32,
+    ) -> hybrid::AdapterResult {
+        let Some(text) = text else {
+            return hybrid::AdapterResult::error(
+                hybrid::REPRESENTATION_TEXT_FTS5,
+                "invalid_argument",
+                "text params required when text.fts5 is selected",
+            );
+        };
+        let request = SearchTextRequest {
+            query: text.query.clone(),
+            namespace: text.namespace.clone(),
+            source_kinds: text.source_kinds.clone(),
+            max_candidates: max_per_representation,
+            max_time_ms: remaining_ms.max(1),
+            rebuild: text.rebuild,
+        };
+        match self.execute_search_text(principals, request) {
+            Ok(response) => {
+                let candidates = response
+                    .candidates
+                    .into_iter()
+                    .map(from_proto_hybrid_candidate)
+                    .collect::<Vec<_>>();
+                let status = hybrid::status_from_adapter_outcome(
+                    candidates.len(),
+                    response.denied_count,
+                    response.truncated,
+                );
+                let mut result = hybrid::AdapterResult {
+                    representation_id: hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    status,
+                    candidates,
+                    truncation_reasons: response.truncation_reasons,
+                    denied_count: response.denied_count,
+                    error_code: String::new(),
+                    error_message: String::new(),
+                };
+                // principal_class already applied inside search; ensure envelope consistency.
+                for candidate in &mut result.candidates {
+                    if candidate.authz_context.principal_class.is_empty() {
+                        candidate.authz_context.principal_class = principal_class.into();
+                    }
+                }
+                result = hybrid::apply_max_per_representation(result, max_per_representation);
+                result
+            }
+            Err(status) => hybrid_adapter_status_error(hybrid::REPRESENTATION_TEXT_FTS5, status),
+        }
+    }
+
     fn execute_evaluate_scenario(
         &self,
         principals: &[String],
@@ -1054,6 +1291,7 @@ impl SekaiServiceImpl {
         entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
         entries.push(search_text_capability());
+        entries.push(hybrid_retrieve_capability());
         entries.push(explain_derivation_capability());
         entries.push(evaluate_scenario_capability());
         entries.push(kioku_candidates_capability());
@@ -1771,6 +2009,53 @@ fn search_text_capability() -> CapabilityEntry {
         "score_kind_text_fts5_bm25_v1".into(),
         "authz_recheck_per_hit".into(),
         "entity_ref_from_source_of_truth_only".into(),
+    ];
+    entry
+}
+
+fn hybrid_retrieve_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_HYBRID_RETRIEVE.into(),
+        "Late-fuse explicit graph and/or text.fts5 adapters into HybridCandidate rows under a versioned fusion profile.".into(),
+        "retrieval",
+        "sekai.HybridRetrieveRequest",
+        "sekai.HybridRetrieveResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+        "ontology_acl".into(),
+        "evidence_content_acl".into(),
+    ];
+    entry.limits = {
+        let mut limits = semantic_reasoning_limits();
+        limits.push(CapabilityLimit {
+            name: "max_candidates".into(),
+            value: u64::from(hybrid::MAX_HYBRID_CANDIDATES),
+        });
+        limits.push(CapabilityLimit {
+            name: "max_per_representation".into(),
+            value: u64::from(hybrid::MAX_PER_REPRESENTATION),
+        });
+        limits.push(CapabilityLimit {
+            name: "mints_identity_from_similarity".into(),
+            value: 0,
+        });
+        limits.push(CapabilityLimit {
+            name: "requires_explicit_representations".into(),
+            value: 1,
+        });
+        limits
+    };
+    entry.evidence_requirements = vec![
+        "hybrid_candidate_envelope".into(),
+        "per_adapter_status".into(),
+        "versioned_fusion_profile".into(),
+        "authz_recheck_per_hit".into(),
+        "entity_ref_from_source_of_truth_only".into(),
+        "partial_adapter_failure_metadata".into(),
     ];
     entry
 }
@@ -4828,6 +5113,58 @@ fn to_proto_hybrid_candidate(candidate: hybrid::HybridCandidate) -> HybridCandid
     }
 }
 
+fn from_proto_hybrid_candidate(candidate: HybridCandidate) -> hybrid::HybridCandidate {
+    hybrid::HybridCandidate {
+        representation_id: candidate.representation_id,
+        source: candidate.source,
+        source_version: candidate.source_version,
+        score: candidate.score,
+        score_kind: candidate.score_kind,
+        entity_ref: candidate.entity_ref.map(|entity| hybrid::EntityRef {
+            kind: entity.kind,
+            id: entity.id,
+        }),
+        authz_context: candidate
+            .authz_context
+            .map(|ctx| hybrid::AuthzContextSummary {
+                namespace: ctx.namespace,
+                principal_class: ctx.principal_class,
+                classification_ceiling: ctx.classification_ceiling,
+            })
+            .unwrap_or_default(),
+        truncated: candidate.truncated,
+        denied: candidate.denied,
+    }
+}
+
+fn to_proto_hybrid_adapter_result(result: hybrid::AdapterResult) -> HybridAdapterResult {
+    HybridAdapterResult {
+        representation_id: result.representation_id,
+        status: result.status.as_str().into(),
+        truncation_reasons: result.truncation_reasons,
+        error_code: result.error_code,
+        error_message: result.error_message,
+        candidate_count: result.candidates.len().min(u32::MAX as usize) as u32,
+        denied_count: result.denied_count,
+    }
+}
+
+fn hybrid_adapter_status_error(representation_id: &str, status: Status) -> hybrid::AdapterResult {
+    let code = match status.code() {
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::Internal => "storage",
+        _ => "error",
+    };
+    // Status messages from adapters must remain non-sensitive; underlying
+    // paths already avoid naming hidden objects.
+    hybrid::AdapterResult::error(representation_id, code, status.message())
+}
+
 fn search_text_authz_recheck(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -7087,6 +7424,50 @@ impl SekaiService for SekaiServiceImpl {
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
         let response = self.execute_search_text(&principals, req.into_inner())?;
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
+    }
+
+    async fn hybrid_retrieve(
+        &self,
+        req: Request<HybridRetrieveRequest>,
+    ) -> Result<Response<HybridRetrieveResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = {
+            let text_ns = req
+                .get_ref()
+                .text
+                .as_ref()
+                .map(|t| t.namespace.trim().to_string())
+                .unwrap_or_default();
+            if !text_ns.is_empty() {
+                text_ns
+            } else {
+                Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default()
+            }
+        };
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_HYBRID_RETRIEVE,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let response = self.execute_hybrid_retrieve(&principals, req.into_inner())?;
         if let Some((_, guard)) = receipt_guard.as_mut() {
             guard.finalize("allow", "succeeded")?;
         }
@@ -22505,6 +22886,488 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_rejects_empty_representation_selection() {
+        let err = service()
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![],
+                    fusion_profile: hybrid::FUSION_PROFILE_RRF_V1.into(),
+                    max_time_ms: 500,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("representations"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_requires_fusion_profile_for_multi_adapter() {
+        let err = service()
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![
+                        hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
+                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    ],
+                    fusion_profile: String::new(),
+                    max_time_ms: 500,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("fusion_profile"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_graph_only_matches_retrieve_context_ids() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for id in ["hy-root", "hy-child"] {
+            let mut object = widget_object(
+                id,
+                HashMap::from([
+                    ("name".into(), id.into()),
+                    ("body".into(), "graph only".into()),
+                ]),
+            );
+            object.namespace = "default".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.db
+            .create_link(&domain::Link {
+                id: "hy-root->hy-child".into(),
+                from_id: "hy-root".into(),
+                to_id: "hy-child".into(),
+                relation: "contains".into(),
+                created: 0,
+            })
+            .unwrap();
+
+        let roots = vec![ContextRoot {
+            object_id: "hy-root".into(),
+            ..Default::default()
+        }];
+        let retrieve = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: roots.clone(),
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    max_depth: 1,
+                    max_objects: 20,
+                    max_links: 20,
+                    max_time_ms: 500,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let hybrid = svc
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into()],
+                    graph: Some(HybridGraphParams {
+                        roots,
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 1,
+                        max_objects: 20,
+                        max_links: 20,
+                        ..Default::default()
+                    }),
+                    max_candidates: 20,
+                    max_per_representation: 20,
+                    max_time_ms: 500,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let retrieve_ids: Vec<_> = retrieve
+            .candidates
+            .iter()
+            .map(|c| c.object.as_ref().unwrap().id.as_str())
+            .collect();
+        let hybrid_ids: Vec<_> = hybrid
+            .candidates
+            .iter()
+            .map(|c| c.entity_ref.as_ref().map(|e| e.id.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(retrieve_ids, hybrid_ids);
+        assert_eq!(hybrid.fusion_profile, hybrid::FUSION_PROFILE_IDENTITY_V1);
+        assert!(hybrid.candidates.iter().all(|c| c.representation_id
+            == hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT
+            && c.score_kind == hybrid::SCORE_KIND_GRAPH_CONTEXT_AFFINITY_V1));
+        assert_eq!(hybrid.adapter_results.len(), 1);
+        assert_eq!(hybrid.adapter_results[0].status, hybrid::ADAPTER_STATUS_OK);
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_graph_and_text_returns_mixed_candidates_with_profile() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, body) in [
+            ("mix-root", "alpha lattice report"),
+            ("mix-text", "alpha lattice document"),
+        ] {
+            let mut object = widget_object(
+                id,
+                HashMap::from([("name".into(), id.into()), ("body".into(), body.into())]),
+            );
+            object.namespace = "default".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+
+        let response = svc
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![
+                        hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
+                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    ],
+                    graph: Some(HybridGraphParams {
+                        roots: vec![ContextRoot {
+                            object_id: "mix-root".into(),
+                            ..Default::default()
+                        }],
+                        max_depth: 0,
+                        max_objects: 10,
+                        ..Default::default()
+                    }),
+                    text: Some(HybridTextParams {
+                        query: "alpha lattice".into(),
+                        namespace: "default".into(),
+                        source_kinds: "object_props".into(),
+                        rebuild: true,
+                    }),
+                    fusion_profile: hybrid::FUSION_PROFILE_GRAPH_PRIORITY_V1.into(),
+                    max_candidates: 20,
+                    max_per_representation: 10,
+                    max_time_ms: 500,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            response.fusion_profile,
+            hybrid::FUSION_PROFILE_GRAPH_PRIORITY_V1
+        );
+        assert!(
+            response
+                .candidates
+                .iter()
+                .any(|c| c.representation_id == hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT)
+        );
+        assert!(
+            response
+                .candidates
+                .iter()
+                .any(|c| c.representation_id == hybrid::REPRESENTATION_TEXT_FTS5
+                    && c.score_kind == hybrid::SCORE_KIND_TEXT_FTS5_BM25_V1)
+        );
+        // graph_priority: first candidate is graph.
+        assert_eq!(
+            response.candidates[0].representation_id,
+            hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT
+        );
+        assert_eq!(response.adapter_results.len(), 2);
+        for adapter in &response.adapter_results {
+            assert!(
+                adapter.status == hybrid::ADAPTER_STATUS_OK
+                    || adapter.status == hybrid::ADAPTER_STATUS_TRUNCATED
+            );
+            assert!(adapter.candidate_count > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_partial_text_failure_keeps_graph_candidates() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let mut object = widget_object(
+            "partial-root",
+            HashMap::from([("name".into(), "partial".into())]),
+        );
+        object.namespace = "default".into();
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(object),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let response = svc
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![
+                        hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
+                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    ],
+                    graph: Some(HybridGraphParams {
+                        roots: vec![ContextRoot {
+                            object_id: "partial-root".into(),
+                            ..Default::default()
+                        }],
+                        max_depth: 0,
+                        ..Default::default()
+                    }),
+                    text: Some(HybridTextParams {
+                        // Empty query forces text adapter error without failing the RPC.
+                        query: String::new(),
+                        rebuild: false,
+                        ..Default::default()
+                    }),
+                    fusion_profile: hybrid::FUSION_PROFILE_RRF_V1.into(),
+                    max_candidates: 10,
+                    max_per_representation: 10,
+                    max_time_ms: 500,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            response
+                .candidates
+                .iter()
+                .any(|c| c.entity_ref.as_ref().map(|e| e.id.as_str()) == Some("partial-root"))
+        );
+        let text_adapter = response
+            .adapter_results
+            .iter()
+            .find(|a| a.representation_id == hybrid::REPRESENTATION_TEXT_FTS5)
+            .expect("text adapter result");
+        assert_eq!(text_adapter.status, hybrid::ADAPTER_STATUS_ERROR);
+        assert_eq!(text_adapter.error_code, "invalid_argument");
+        assert!(!text_adapter.error_message.contains("secret"));
+        let graph_adapter = response
+            .adapter_results
+            .iter()
+            .find(|a| a.representation_id == hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT)
+            .expect("graph adapter result");
+        assert_eq!(graph_adapter.status, hybrid::ADAPTER_STATUS_OK);
+        assert!(graph_adapter.candidate_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_authz_does_not_leak_hidden_text_via_fusion() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, body) in [
+            ("hy-public", "nebula signal public"),
+            ("hy-secret", "nebula signal classified"),
+        ] {
+            let mut object = widget_object(
+                id,
+                HashMap::from([("name".into(), id.into()), ("body".into(), body.into())]),
+            );
+            object.namespace = "default".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        add_object_grant(&svc, "hy-secret", "root", security::Role::Viewer);
+
+        let response = svc
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![
+                        hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
+                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    ],
+                    graph: Some(HybridGraphParams {
+                        roots: vec![ContextRoot {
+                            object_id: "hy-public".into(),
+                            ..Default::default()
+                        }],
+                        max_depth: 0,
+                        ..Default::default()
+                    }),
+                    text: Some(HybridTextParams {
+                        query: "nebula signal".into(),
+                        namespace: "default".into(),
+                        source_kinds: "object_props".into(),
+                        rebuild: true,
+                    }),
+                    fusion_profile: hybrid::FUSION_PROFILE_RRF_V1.into(),
+                    max_candidates: 20,
+                    max_per_representation: 10,
+                    max_time_ms: 500,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        for candidate in &response.candidates {
+            let id = candidate
+                .entity_ref
+                .as_ref()
+                .map(|e| e.id.as_str())
+                .unwrap_or("");
+            assert_ne!(id, "hy-secret");
+        }
+        for adapter in &response.adapter_results {
+            assert!(!adapter.error_message.contains("hy-secret"));
+            assert!(!adapter.error_message.contains("secret"));
+            for reason in &adapter.truncation_reasons {
+                assert!(!reason.contains("hy-secret"));
+            }
+        }
+        for reason in &response.truncation_reasons {
+            assert!(!reason.contains("hy-secret"));
+        }
+        let text_adapter = response
+            .adapter_results
+            .iter()
+            .find(|a| a.representation_id == hybrid::REPRESENTATION_TEXT_FTS5)
+            .expect("text adapter");
+        assert!(text_adapter.denied_count >= 1);
+        assert!(
+            response
+                .candidates
+                .iter()
+                .any(|c| c.entity_ref.as_ref().map(|e| e.id.as_str()) == Some("hy-public"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_retrieve_max_per_representation_is_enforced() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for i in 0..5 {
+            let id = format!("cap-{i}");
+            let mut object = widget_object(
+                &id,
+                HashMap::from([
+                    ("name".into(), id.clone()),
+                    ("body".into(), format!("tokenizable payload {i}")),
+                ]),
+            );
+            object.namespace = "default".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+
+        let response = svc
+            .hybrid_retrieve(with_named_principal(
+                HybridRetrieveRequest {
+                    representations: vec![hybrid::REPRESENTATION_TEXT_FTS5.into()],
+                    text: Some(HybridTextParams {
+                        query: "tokenizable payload".into(),
+                        namespace: "default".into(),
+                        source_kinds: "object_props".into(),
+                        rebuild: true,
+                    }),
+                    max_candidates: 50,
+                    max_per_representation: 2,
+                    max_time_ms: 500,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.candidates.len() <= 2);
+        let text_adapter = &response.adapter_results[0];
+        assert!(text_adapter.candidate_count <= 2);
+        assert!(
+            text_adapter.status == hybrid::ADAPTER_STATUS_TRUNCATED
+                || text_adapter.candidate_count <= 2
+        );
+        if text_adapter.status == hybrid::ADAPTER_STATUS_TRUNCATED {
+            assert!(
+                text_adapter
+                    .truncation_reasons
+                    .iter()
+                    .any(|r| r == "max_per_representation" || r == "max_candidates")
+            );
+        }
     }
 
     #[tokio::test]

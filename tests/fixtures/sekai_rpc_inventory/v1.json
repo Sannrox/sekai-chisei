@@ -305,6 +305,23 @@
       ]
     },
     {
+      "rpc": "HybridRetrieve",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/hybrid.rs",
+        "src/sekai/retrieval.rs",
+        "src/sekai/text_fts.rs",
+        "docs/hybrid-retrieval.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization",
+        "sekai.ontology-definitions",
+        "sekai.evidence"
+      ]
+    },
+    {
       "rpc": "EvaluateScenario",
       "kind": "computed",
       "surfaces": [],
