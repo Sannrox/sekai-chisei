@@ -290,6 +290,48 @@
       ]
     },
     {
+      "rpc": "ResolveSemanticRef",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "src/sekai/retrieval.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization",
+        "sekai.ontology-definitions"
+      ]
+    },
+    {
+      "rpc": "ExpandRelations",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "src/sekai/retrieval.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization",
+        "sekai.ontology-definitions"
+      ]
+    },
+    {
+      "rpc": "ExplainDerivation",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "src/sekai/retrieval.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization",
+        "sekai.ontology-definitions"
+      ]
+    },
+    {
       "rpc": "DiscoverCapabilities",
       "kind": "computed",
       "surfaces": [],
