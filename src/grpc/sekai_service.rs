@@ -10555,6 +10555,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action effect not found"))?;
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+        let now = now_millis();
         let stored = self
             .db
             .ack_action_work(
@@ -10564,7 +10565,7 @@ impl SekaiService for SekaiServiceImpl {
                 &inner.fencing_token,
                 &inner.outcome,
                 &inner.reason,
-                now_millis(),
+                now,
             )
             .map_err(|e| {
                 if e.contains("fencing") || e.contains("expired") || e.contains("not claimed") {
@@ -10577,10 +10578,67 @@ impl SekaiService for SekaiServiceImpl {
                     Status::internal(e)
                 }
             })?;
+        // #400: bind host ack into the operation receipt harvest spine.
+        if matches!(
+            stored.status.as_str(),
+            crate::sekai::action_effect::EFFECT_STATUS_COMPLETED
+                | crate::sekai::action_effect::EFFECT_STATUS_FAILED
+        ) {
+            if let Some(mut receipt) = self
+                .db
+                .get_operation_receipt(&stored.operation_id)
+                .map_err(Status::internal)?
+            {
+                let has_outcome = receipt
+                    .events
+                    .iter()
+                    .any(|e| e.kind == ReceiptEventKind::OutcomeRecorded);
+                if !has_outcome {
+                    let parent = receipt
+                        .events
+                        .last()
+                        .map(|e| e.event_id.clone())
+                        .unwrap_or_else(|| format!("{}:intent", stored.operation_id));
+                    receipt.events.push(OperationReceiptEvent {
+                        event_id: format!("{}:action-ack", stored.operation_id),
+                        operation_id: stored.operation_id.clone(),
+                        parent_event_id: Some(parent.clone()),
+                        timestamp_ms: now,
+                        kind: ReceiptEventKind::ActionPerformed,
+                        surface: ReceiptEventKind::ActionPerformed.surface(),
+                        actor: inner.runtime_id.clone(),
+                        references: Vec::new(),
+                        attributes: BTreeMap::from([
+                            ("effect_id".into(), stored.effect_id.clone()),
+                            ("instance_id".into(), stored.instance_id.clone()),
+                            ("source".into(), "ack_action_work".into()),
+                        ]),
+                    });
+                    receipt.events.push(OperationReceiptEvent {
+                        event_id: format!("{}:outcome", stored.operation_id),
+                        operation_id: stored.operation_id.clone(),
+                        parent_event_id: Some(format!("{}:action-ack", stored.operation_id)),
+                        timestamp_ms: now,
+                        kind: ReceiptEventKind::OutcomeRecorded,
+                        surface: ReceiptEventKind::OutcomeRecorded.surface(),
+                        actor: inner.runtime_id.clone(),
+                        references: Vec::new(),
+                        attributes: BTreeMap::from([
+                            ("outcome".into(), stored.status.clone()),
+                            ("effect_id".into(), stored.effect_id.clone()),
+                        ]),
+                    });
+                    receipt.completed_at_ms = Some(now);
+                    self.db
+                        .put_operation_receipt(&receipt)
+                        .map_err(Status::internal)?;
+                }
+            }
+        }
         let actor = principals.first().cloned().unwrap_or_default();
         let _ = self.db.record_decision(&audit::Decision {
             id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now_millis(),
+            timestamp: now,
             actor,
             action: "ack_action_work".into(),
             reason: format!("action_effect_{}", stored.status),
@@ -19333,6 +19391,33 @@ mod tests {
             .effect
             .unwrap();
         assert_eq!(acked.status, EFFECT_STATUS_COMPLETED);
+        // #400: ack binds harvest/outcome onto the operation receipt spine.
+        let receipt = svc
+            .db
+            .get_operation_receipt(&admit.operation_id)
+            .unwrap()
+            .expect("receipt");
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|e| e.kind == ReceiptEventKind::OutcomeRecorded)
+        );
+        let effects = svc
+            .db
+            .list_action_effects_for_instance(&admit.instance_id)
+            .unwrap();
+        let instance = svc
+            .db
+            .get_action_instance(&admit.instance_id)
+            .unwrap()
+            .unwrap();
+        let view = crate::sekai::action_lifecycle::evaluate_action_lifecycle(
+            &instance,
+            &effects,
+            Some(&receipt),
+        );
+        assert!(view.mismatches.is_empty(), "{:?}", view.mismatches);
 
         // Unauthorized principal denied
         let unauth = svc
