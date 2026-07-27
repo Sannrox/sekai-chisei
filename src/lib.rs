@@ -34,6 +34,7 @@ pub use sekai_provider::pricing;
 pub mod provenance;
 pub mod provider_credentials;
 pub mod tenant_invitation;
+pub mod tenant_lifecycle;
 pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
 pub mod receipt_cli;
