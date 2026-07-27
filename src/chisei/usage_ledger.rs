@@ -86,7 +86,7 @@ pub struct UsageEvent {
     pub corrects_event_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UsageAggregate {
     pub tenant_id: String,
     pub unit: String,
