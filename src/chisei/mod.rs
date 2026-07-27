@@ -32,3 +32,4 @@ pub mod residency;
 pub mod sampling;
 pub mod scoring;
 pub mod tenant_quota;
+pub mod usage_ledger;
