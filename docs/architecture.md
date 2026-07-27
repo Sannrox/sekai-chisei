@@ -149,7 +149,14 @@ acts as an authorization token; invocation always rechecks live controls.
 `SearchText` exposes the rebuildable SQLite FTS5 text representation and the
 shared `HybridCandidate` envelope (research #152 / issue #360). Scores use
 `text.fts5_bm25/v1` and never mint durable identities; authz is re-checked per
-hit. See [text-fts.md](text-fts.md). Late fusion across adapters is #361.
+hit. See [text-fts.md](text-fts.md).
+
+`HybridRetrieve` late-fuses explicit adapters (`graph.retrieve_context`,
+`text.fts5`) under a versioned fusion profile (`late_fusion.rrf/v1`,
+`late_fusion.graph_priority/v1`) and returns mixed `HybridCandidate` rows with
+per-adapter status (`ok | truncated | denied_empty | error`). Callers must name
+representations; pure graph remains on `RetrieveContext`. See
+[hybrid-retrieval.md](hybrid-retrieval.md) (issue #361).
 
 `RetrieveContext` is asserted-only by default. Callers may opt into the fixed
 query-time entailment profile for class inheritance/equivalence and explicitly

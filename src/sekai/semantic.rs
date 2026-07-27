@@ -20,6 +20,8 @@ pub const CAPABILITY_RETRIEVE_CONTEXT: &str = "sekai.context.retrieve";
 pub const CAPABILITY_EXPLAIN_DERIVATION: &str = "sekai.semantic.explain_derivation";
 /// Lexical FTS5 text search returning HybridCandidate rows (#360 / research #152).
 pub const CAPABILITY_SEARCH_TEXT: &str = "sekai.text.search";
+/// Late-fusion hybrid retrieval plan over explicit representations (#361).
+pub const CAPABILITY_HYBRID_RETRIEVE: &str = "sekai.hybrid.retrieve";
 /// Non-authoritative scenario overlay evaluation (#362 / research #148).
 pub const CAPABILITY_EVALUATE_SCENARIO: &str = "sekai.scenario.evaluate";
 

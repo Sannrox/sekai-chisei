@@ -84,7 +84,7 @@ rebuild.
 
 ## Non-goals
 
-- Late-fusion multi-adapter plan (#361).
+- Late-fusion multi-adapter plan (see [hybrid-retrieval.md](hybrid-retrieval.md) / #361).
 - Embedding models, vectors, or ANN indexes.
 - Replacing `RetrieveContext`, evidence get/list, `QueryRows`, or Kioku APIs.
 - Automatic adapter selection.
