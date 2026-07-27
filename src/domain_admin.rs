@@ -20,7 +20,6 @@ use crate::provider_credentials::{
 };
 use crate::tenant_invitation::{
     AcceptedMembership, InvitationError, InvitationRole, InvitationView, MemoryInvitationHooks,
-    human_context,
 };
 
 pub const DOMAIN_ADMIN_VERSION: &str = "sekai.domain-admin/v1";
