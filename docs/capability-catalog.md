@@ -85,6 +85,7 @@ results, truncation metadata, evidence references, and receipts only.
 | `sekai.semantic.expand_relations` | `ExpandRelations` | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
 | `sekai.context.retrieve` | `RetrieveContext` | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
 | `sekai.semantic.explain_derivation` | `ExplainDerivation` | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
+| `sekai.scenario.evaluate` | `EvaluateScenario` | Evaluate a request-scoped non-authoritative scenario overlay over authorized graph projections and return a hypothesis-labeled, domain-neutral impact set. Never mutates canonical facts. See [scenario-overlay.md](scenario-overlay.md). |
 
 Each entry advertises:
 

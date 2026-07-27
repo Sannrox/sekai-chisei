@@ -542,6 +542,74 @@ message RetrieveContextResponse {
   string ontology_revision = 11;
 }
 
+// Non-authoritative scenario overlay (#362 / research #148). Session is
+// request-scoped: create overlay, apply ordered hypothesis deltas, project a
+// domain-neutral impact set. Never mutates canonical objects/links/temporal
+// assertions. Epistemic class is always "hypothesis".
+message ScenarioDelta {
+  // Caller-supplied stable id referenced from impact explanation steps.
+  string id = 1;
+  // set_property | remove_property | add_link | remove_link
+  string op = 2;
+  string object_id = 3;
+  string property_key = 4;
+  string property_value = 5;
+  string link_id = 6;
+  string from_id = 7;
+  string to_id = 8;
+  string relation = 9;
+}
+
+message EvaluateScenarioRequest {
+  string namespace = 1;
+  // current (default). Temporal as-of is reserved and rejected in this vertical.
+  string base_mode = 2;
+  // Reserved for future temporal as-of base; ignored when base_mode=current.
+  int64 valid_at_ms = 3;
+  int64 recorded_revision = 4;
+  repeated string seed_object_ids = 5;
+  repeated ScenarioDelta deltas = 6;
+  // Retrieval-class bounds (0 = defaults; values above hard max are capped).
+  uint32 max_depth = 7;
+  uint32 max_objects = 8;
+  uint32 max_links = 9;
+  uint32 max_time_ms = 10;
+  uint64 max_explanation_bytes = 11;
+  // Scenario-specific caps.
+  uint32 max_deltas = 12;
+  uint32 max_expansion_work_units = 13;
+  string request_id = 14;
+}
+
+message ScenarioImpactRow {
+  // object | link | property
+  string target_kind = 1;
+  string object_id = 2;
+  string link_id = 3;
+  string property_key = 4;
+  // set_property | remove_property | add_link | remove_link
+  string op = 5;
+  repeated string delta_ids = 6;
+  repeated string explanation_steps = 7;
+  string before_value = 8;
+  string after_value = 9;
+}
+
+message EvaluateScenarioResponse {
+  // Always "hypothesis". Distinct from fact / evidence / forecast.
+  string epistemic_class = 1;
+  // Ephemeral correlation id for this request-scoped evaluation.
+  string scenario_id = 2;
+  string base_mode = 3;
+  string namespace = 4;
+  repeated ScenarioImpactRow impact_rows = 5;
+  bool truncated = 6;
+  // Non-sensitive bound names only (deltas, objects, links, time, ...).
+  repeated string truncation_reasons = 7;
+  uint32 expansion_work_units = 8;
+  uint32 applied_deltas = 9;
+}
+
 // Semantic catalog capabilities (#151). These are discoverable through
 // DiscoverCapabilities and invokable with the #107 receipt-attributed binding
 // (x-sekai-capability, x-sekai-namespace, x-sekai-operation-id). Natural-
@@ -1519,6 +1587,8 @@ service SekaiService {
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
+  // Request-scoped non-authoritative scenario overlay (#362).
+  rpc EvaluateScenario(EvaluateScenarioRequest) returns (EvaluateScenarioResponse);
   rpc ResolveSemanticRef(ResolveSemanticRefRequest) returns (ResolveSemanticRefResponse);
   rpc ExpandRelations(ExpandRelationsRequest) returns (ExpandRelationsResponse);
   rpc ExplainDerivation(ExplainDerivationRequest) returns (ExplainDerivationResponse);

@@ -65,6 +65,8 @@ in order.
 - [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
 - [Multi-region consistency for budgets, leases, and permits](research/292-multi-region-consistency.md)
 - [Governed what-if simulation over graph projections](research/148-what-if-simulation.md)
+- [Non-authoritative scenario overlay](scenario-overlay.md) — request-scoped
+  hypothesis deltas and domain-neutral impact projection (#362).
 - [Gateway PEP fat-decide freeze](research/163-gateway-pep-fat-decide.md)
 - [Provider and data-class residency](residency-policy.md)
   — research recommendation for bounded automatic dispatch (#279 → #280).

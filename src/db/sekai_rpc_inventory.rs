@@ -306,10 +306,11 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 132);
+        assert_eq!(inventory.entries.len(), 133);
         assert!(inventory.entry("ResolveSemanticRef").is_some());
         assert!(inventory.entry("ExpandRelations").is_some());
         assert!(inventory.entry("ExplainDerivation").is_some());
+        assert!(inventory.entry("EvaluateScenario").is_some());
         assert!(inventory.by_kind()["persistent"] >= 100);
         assert!(inventory.by_kind()["computed"] >= 1);
         assert!(inventory.entry("CreateObject").is_some());
