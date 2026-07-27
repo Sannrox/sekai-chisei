@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 
 const MAX_BACKFILL_SUBJECTS: usize = 10_000;
 const MAX_PAYLOAD_BYTES: usize = 1_048_576;
+const DAY_MS: i64 = 86_400_000;
+/// Fail-closed local budget for retained assertion versions (payload-bearing or not).
+const TEMPORAL_ASSERTION_BUDGET: i64 = 500_000;
+/// Non-disclosing payload written when retention or erasure removes content.
+pub const TEMPORAL_PAYLOAD_OMISSION: &str = r#"{"omission":"retention"}"#;
+
 
 /// How a bound is represented for valid time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +176,18 @@ pub struct TemporalAssertionVersion {
     pub evidence_ref: String,
     pub lineage_ref: String,
     pub is_backfill: bool,
+    /// When true, collection and erasure leave the envelope and skip payload removal.
+    pub legal_hold: bool,
+    /// When true, `payload_json` is a non-disclosing omission tombstone.
+    pub payload_omitted: bool,
+}
+
+/// Result of temporal retention collection or subject erasure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalRetentionRun {
+    pub payloads_omitted: i64,
+    pub held_skipped: i64,
+    pub already_omitted: i64,
 }
 
 /// Caller-supplied fields for appending a new assertion version.
@@ -320,6 +338,8 @@ impl SekaiDb {
                     evidence_ref TEXT NOT NULL DEFAULT '',
                     lineage_ref TEXT NOT NULL DEFAULT '',
                     is_backfill INTEGER NOT NULL DEFAULT 0,
+                    legal_hold INTEGER NOT NULL DEFAULT 0,
+                    payload_omitted INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (assertion_id, version),
                     CHECK (version >= 1),
                     CHECK (valid_from_kind IN ('known', 'unbounded', 'unknown')),
@@ -335,7 +355,9 @@ impl SekaiDb {
                         recorded_to_revision IS NULL
                         OR recorded_from_revision < recorded_to_revision
                     ),
-                    CHECK (is_backfill IN (0, 1))
+                    CHECK (is_backfill IN (0, 1)),
+                    CHECK (legal_hold IN (0, 1)),
+                    CHECK (payload_omitted IN (0, 1))
                 );
                 CREATE INDEX IF NOT EXISTS idx_temporal_assertions_as_of
                     ON sekai_temporal_assertions(
@@ -356,7 +378,35 @@ impl SekaiDb {
                     completed_at_ms INTEGER NOT NULL
                 );",
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // Additive columns for upgraded databases created before #228.
+        let conn = self.conn();
+        for column in [
+            "legal_hold INTEGER NOT NULL DEFAULT 0",
+            "payload_omitted INTEGER NOT NULL DEFAULT 0",
+        ] {
+            let name = column.split_whitespace().next().unwrap();
+            let exists: bool = conn
+                .prepare("PRAGMA table_info(sekai_temporal_assertions)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    for row in rows {
+                        if row? == name {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                conn.execute(
+                    &format!("ALTER TABLE sekai_temporal_assertions ADD COLUMN {column}"),
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// Upsert a temporal policy. Enabling is prospective: it records the current
@@ -538,6 +588,7 @@ impl SekaiDb {
         if request.object_ref.len() > 512 {
             return Err("object_ref must be at most 512 bytes".into());
         }
+        self.enforce_temporal_assertion_budget()?;
 
         let now = now_ms();
         let conn = self.conn();
@@ -584,6 +635,8 @@ impl SekaiDb {
             evidence_ref: request.evidence_ref.clone(),
             lineage_ref: request.lineage_ref.clone(),
             is_backfill: false,
+            legal_hold: false,
+            payload_omitted: false,
         };
         insert_assertion_tx(&tx, &version)?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -602,7 +655,7 @@ impl SekaiDb {
                     payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                     recorded_from_revision, recorded_to_revision, recorded_at_ms,
                     source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                    is_backfill
+                    is_backfill, legal_hold, payload_omitted
              FROM sekai_temporal_assertions
              WHERE assertion_id = ?1 AND version = ?2",
             params![assertion_id, version],
@@ -610,6 +663,7 @@ impl SekaiDb {
         )
         .optional()
         .map_err(|e| e.to_string())
+        .map(|opt| opt.map(redact_omitted_payload))
     }
 
     pub fn list_temporal_assertions_for_subject(
@@ -625,7 +679,7 @@ impl SekaiDb {
                         payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                         recorded_from_revision, recorded_to_revision, recorded_at_ms,
                         source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                        is_backfill
+                        is_backfill, legal_hold, payload_omitted
                  FROM sekai_temporal_assertions
                  WHERE namespace = ?1 AND subject_id = ?2 AND predicate = ?3
                  ORDER BY assertion_id, version",
@@ -636,7 +690,7 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| e.to_string())?);
+            out.push(redact_omitted_payload(row.map_err(|e| e.to_string())?));
         }
         Ok(out)
     }
@@ -746,6 +800,8 @@ impl SekaiDb {
                     evidence_ref: String::new(),
                     lineage_ref: String::new(),
                     is_backfill: true,
+                    legal_hold: false,
+                    payload_omitted: false,
                 },
             )?;
             created += 1;
@@ -814,6 +870,159 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Set or clear a legal hold on one assertion version. Held versions skip
+    /// payload collection and subject-erasure tombstoning.
+    pub fn set_temporal_legal_hold(
+        &self,
+        assertion_id: &str,
+        version: i64,
+        legal_hold: bool,
+    ) -> Result<(), String> {
+        validate_text(assertion_id, "assertion_id")?;
+        if version < 1 {
+            return Err("version must be >= 1".into());
+        }
+        let conn = self.conn();
+        let updated = conn
+            .execute(
+                "UPDATE sekai_temporal_assertions
+                 SET legal_hold = ?1
+                 WHERE assertion_id = ?2 AND version = ?3",
+                params![legal_hold as i64, assertion_id, version],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated != 1 {
+            return Err("temporal assertion version not found".into());
+        }
+        Ok(())
+    }
+
+    /// Collect expired temporal payloads according to per-policy retention_days.
+    /// Leaves temporal/audit/lineage envelope rows; replaces payloads with a
+    /// non-disclosing omission tombstone. Legal holds skip collection.
+    pub fn collect_temporal_history(&self, now_ms: i64) -> Result<TemporalRetentionRun, String> {
+        let policies = self.list_temporal_policies()?;
+        let mut run = TemporalRetentionRun::default();
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
+        for policy in policies {
+            let Some(days) = policy.retention_days else {
+                continue;
+            };
+            let cutoff = now_ms.saturating_sub(i64::from(days) * DAY_MS);
+            // Map surface to stored predicate used by mutation history.
+            let predicate = policy.surface_name.clone();
+            let mut stmt = tx
+                .prepare(
+                    "SELECT assertion_id, version, legal_hold, payload_omitted
+                     FROM sekai_temporal_assertions
+                     WHERE namespace = ?1 AND predicate = ?2
+                       AND recorded_at_ms < ?3",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![policy.namespace, predicate, cutoff], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            let candidates: Vec<_> = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            drop(stmt);
+            for (assertion_id, version, legal_hold, already) in candidates {
+                if legal_hold {
+                    run.held_skipped += 1;
+                    continue;
+                }
+                if already {
+                    run.already_omitted += 1;
+                    continue;
+                }
+                omit_payload_tx(&tx, &assertion_id, version)?;
+                run.payloads_omitted += 1;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(run)
+    }
+
+    /// Erase retained temporal payloads for a graph subject. Legal holds block
+    /// the whole erasure (fail closed) so operators clear holds deliberately.
+    pub fn erase_temporal_subject(
+        &self,
+        namespace: &str,
+        subject_id: &str,
+    ) -> Result<TemporalRetentionRun, String> {
+        if !namespace.is_empty() {
+            validate_text(namespace, "namespace")?;
+        }
+        validate_text(subject_id, "subject_id")?;
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let held: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_temporal_assertions
+                 WHERE namespace = ?1 AND subject_id = ?2 AND legal_hold = 1
+                   AND payload_omitted = 0",
+                params![namespace, subject_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if held > 0 {
+            return Err(
+                "temporal subject erasure is blocked by a legal hold on retained history".into(),
+            );
+        }
+        let mut run = TemporalRetentionRun::default();
+        let mut stmt = tx
+            .prepare(
+                "SELECT assertion_id, version, payload_omitted
+                 FROM sekai_temporal_assertions
+                 WHERE namespace = ?1 AND subject_id = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace, subject_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let candidates: Vec<_> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(stmt);
+        for (assertion_id, version, already) in candidates {
+            if already {
+                run.already_omitted += 1;
+                continue;
+            }
+            omit_payload_tx(&tx, &assertion_id, version)?;
+            run.payloads_omitted += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(run)
+    }
+
+    fn enforce_temporal_assertion_budget(&self) -> Result<(), String> {
+        let count = self.temporal_storage_stats()?.assertion_version_count;
+        if count >= TEMPORAL_ASSERTION_BUDGET {
+            return Err(format!(
+                "temporal assertion budget exhausted ({count} >= {TEMPORAL_ASSERTION_BUDGET}); \
+                 collect or export retained history before accepting more versions"
+            ));
+        }
+        Ok(())
+    }
+
     /// Schema discovery: list temporal policies for a namespace (empty namespace =
     /// policies registered under `""` plus exact matches). Surfaces without a
     /// policy are non-retained by default.
@@ -875,7 +1084,7 @@ impl SekaiDb {
                     payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                     recorded_from_revision, recorded_to_revision, recorded_at_ms,
                     source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                    is_backfill
+                    is_backfill, legal_hold, payload_omitted
              FROM sekai_temporal_assertions
              WHERE namespace = ?1 AND subject_id = ?2
                AND recorded_from_revision <= ?3
@@ -922,7 +1131,7 @@ impl SekaiDb {
                 query.valid_at_ms,
                 query.unknown_bounds,
             ) {
-                matched.push(version);
+                matched.push(redact_omitted_payload(version));
             }
         }
 
@@ -992,7 +1201,7 @@ impl SekaiDb {
                     payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                     recorded_from_revision, recorded_to_revision, recorded_at_ms,
                     source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                    is_backfill
+                    is_backfill, legal_hold, payload_omitted
              FROM sekai_temporal_assertions
              WHERE namespace = ?1 AND subject_id = ?2
                AND recorded_from_revision > ?3 AND recorded_from_revision <= ?4",
@@ -1002,7 +1211,7 @@ impl SekaiDb {
                     payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                     recorded_from_revision, recorded_to_revision, recorded_at_ms,
                     source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                    is_backfill
+                    is_backfill, legal_hold, payload_omitted
              FROM sekai_temporal_assertions
              WHERE namespace = ?1 AND subject_id = ?2
                AND recorded_to_revision IS NOT NULL
@@ -1062,7 +1271,10 @@ impl SekaiDb {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
         };
-        Ok(TemporalDiffResult { opened, closed })
+        Ok(TemporalDiffResult {
+            opened: opened.into_iter().map(redact_omitted_payload).collect(),
+            closed: closed.into_iter().map(redact_omitted_payload).collect(),
+        })
     }
 }
 
@@ -1398,6 +1610,17 @@ fn append_version_in_tx(
     tx: &Transaction<'_>,
     write: &MutationVersionWrite<'_>,
 ) -> Result<(), String> {
+    let count: i64 = tx
+        .query_row("SELECT COUNT(*) FROM sekai_temporal_assertions", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    if count >= TEMPORAL_ASSERTION_BUDGET {
+        return Err(format!(
+            "temporal assertion budget exhausted ({count} >= {TEMPORAL_ASSERTION_BUDGET}); \
+             collect or export retained history before accepting more versions"
+        ));
+    }
     let open = open_version_tx(tx, write.assertion_id)?;
     let next_version = match &open {
         Some(prev) => prev.version + 1,
@@ -1435,6 +1658,8 @@ fn append_version_in_tx(
             evidence_ref: String::new(),
             lineage_ref: String::new(),
             is_backfill: false,
+            legal_hold: false,
+            payload_omitted: false,
         },
     )
 }
@@ -1458,6 +1683,31 @@ fn close_open_version_in_tx(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn omit_payload_tx(tx: &Transaction<'_>, assertion_id: &str, version: i64) -> Result<(), String> {
+    let updated = tx
+        .execute(
+            "UPDATE sekai_temporal_assertions
+             SET payload_json = ?1, payload_omitted = 1, object_ref = ''
+             WHERE assertion_id = ?2 AND version = ?3
+               AND payload_omitted = 0 AND legal_hold = 0",
+            params![TEMPORAL_PAYLOAD_OMISSION, assertion_id, version],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated != 1 {
+        return Err("failed to omit temporal payload (held, missing, or already omitted)".into());
+    }
+    Ok(())
+}
+
+fn redact_omitted_payload(mut version: TemporalAssertionVersion) -> TemporalAssertionVersion {
+    if version.payload_omitted {
+        // Non-disclosing: no residual values or object refs after collection/erasure.
+        version.payload_json = TEMPORAL_PAYLOAD_OMISSION.into();
+        version.object_ref.clear();
+    }
+    version
 }
 
 fn allocate_revision_tx(tx: &Transaction<'_>, now_ms: i64) -> Result<(i64, i64), String> {
@@ -1510,7 +1760,7 @@ fn open_version_tx(
                 payload_json, valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
                 recorded_from_revision, recorded_to_revision, recorded_at_ms,
                 source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
-                is_backfill
+                is_backfill, legal_hold, payload_omitted
          FROM sekai_temporal_assertions
          WHERE assertion_id = ?1 AND recorded_to_revision IS NULL
          ORDER BY version DESC
@@ -1531,8 +1781,9 @@ fn insert_assertion_tx(
          (assertion_id, version, namespace, subject_id, predicate, object_ref, payload_json,
           valid_from_kind, valid_from_ms, valid_to_kind, valid_to_ms,
           recorded_from_revision, recorded_to_revision, recorded_at_ms,
-          source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref, is_backfill)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+          source_observed_at_ms, source_id, actor, evidence_ref, lineage_ref,
+          is_backfill, legal_hold, payload_omitted)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             version.assertion_id,
             version.version,
@@ -1554,6 +1805,8 @@ fn insert_assertion_tx(
             version.evidence_ref,
             version.lineage_ref,
             version.is_backfill as i64,
+            version.legal_hold as i64,
+            version.payload_omitted as i64,
         ],
     )
     .map_err(|e| {
@@ -1633,6 +1886,8 @@ fn row_to_assertion(row: &rusqlite::Row<'_>) -> rusqlite::Result<TemporalAsserti
         evidence_ref: row.get(17)?,
         lineage_ref: row.get(18)?,
         is_backfill: row.get::<_, i64>(19)? != 0,
+        legal_hold: row.get::<_, i64>(20)? != 0,
+        payload_omitted: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -1953,6 +2208,112 @@ mod tests {
             !db.is_temporal_enabled("ns", TemporalSurfaceKind::Relation, "works_for")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn retention_collection_and_legal_hold_and_subject_erasure() {
+        let db = memory_db();
+        db.upsert_temporal_policy(&policy_write(
+            "ns",
+            TemporalSurfaceKind::ObjectType,
+            "person",
+            true,
+            false,
+            Some(1), // 1 day
+        ))
+        .unwrap();
+        let person = Object {
+            id: "ada".into(),
+            kind: "person".into(),
+            name: "Ada".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&person, "alice").unwrap();
+        let versions = db
+            .list_temporal_assertions_for_subject("ns", "ada", "person")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        let assertion_id = versions[0].assertion_id.clone();
+        let version = versions[0].version;
+
+        // Legal hold blocks collection.
+        db.set_temporal_legal_hold(&assertion_id, version, true)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis() + 3 * DAY_MS;
+        let held_run = db.collect_temporal_history(now).unwrap();
+        assert_eq!(held_run.held_skipped, 1);
+        assert_eq!(held_run.payloads_omitted, 0);
+        let still = db
+            .get_temporal_assertion(&assertion_id, version)
+            .unwrap()
+            .unwrap();
+        assert!(!still.payload_omitted);
+        assert!(still.payload_json.contains("Ada") || still.payload_json.contains("person"));
+
+        // Clear hold; collection omits payload.
+        db.set_temporal_legal_hold(&assertion_id, version, false)
+            .unwrap();
+        let collected = db.collect_temporal_history(now).unwrap();
+        assert_eq!(collected.payloads_omitted, 1);
+        let omitted = db
+            .get_temporal_assertion(&assertion_id, version)
+            .unwrap()
+            .unwrap();
+        assert!(omitted.payload_omitted);
+        assert_eq!(omitted.payload_json, TEMPORAL_PAYLOAD_OMISSION);
+        assert!(omitted.object_ref.is_empty());
+
+        // As-of reports omission without inventing content.
+        let as_of = db
+            .query_temporal_as_of(&TemporalAsOfQuery {
+                namespace: "ns".into(),
+                subject_id: "ada".into(),
+                predicate: "person".into(),
+                recorded_revision: 0,
+                valid_at_ms: None,
+                unknown_bounds: UnknownBoundsPolicy::Exclude,
+                limit: 10,
+                page_token: None,
+            })
+            .unwrap();
+        assert_eq!(as_of.assertions.len(), 1);
+        assert!(as_of.assertions[0].payload_omitted);
+        assert_eq!(as_of.assertions[0].payload_json, TEMPORAL_PAYLOAD_OMISSION);
+
+        // Fresh subject for erasure path.
+        let person2 = Object {
+            id: "grace".into(),
+            kind: "person".into(),
+            name: "Grace".into(),
+            namespace: "ns".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&person2, "alice").unwrap();
+        let v2 = db
+            .list_temporal_assertions_for_subject("ns", "grace", "person")
+            .unwrap();
+        db.set_temporal_legal_hold(&v2[0].assertion_id, v2[0].version, true)
+            .unwrap();
+        let err = db.erase_temporal_subject("ns", "grace").unwrap_err();
+        assert!(err.contains("legal hold"));
+        db.set_temporal_legal_hold(&v2[0].assertion_id, v2[0].version, false)
+            .unwrap();
+        let erased = db.erase_temporal_subject("ns", "grace").unwrap();
+        assert_eq!(erased.payloads_omitted, 1);
+        let gone = db
+            .get_temporal_assertion(&v2[0].assertion_id, v2[0].version)
+            .unwrap()
+            .unwrap();
+        assert!(gone.payload_omitted);
+        // Envelope remains queryable.
+        assert_eq!(gone.subject_id, "grace");
     }
 
     #[test]

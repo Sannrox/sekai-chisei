@@ -60,6 +60,44 @@ committed. Requests for subjects with no retained history return
 `outcome=not_retained` and never synthesize rows from audit. PostgreSQL
 returns `failed_precondition` until a parity slice lands.
 
+## Retention and operations (#228)
+
+| API | Role |
+| --- | --- |
+| `set_temporal_legal_hold` | Pin a version against collection/erasure |
+| `collect_temporal_history` | Age out payloads per policy `retention_days` |
+| `erase_temporal_subject` | Tombstone all payloads for a subject (blocked by holds) |
+
+Collection and erasure **never delete** the temporal envelope (assertion id,
+version, bounds, revisions, actor). They replace `payload_json` with
+`{"omission":"retention"}` and clear `object_ref`. Historical reads return that
+omission without reconstructing erased content.
+
+Local storage budget: appends fail closed at **500_000** assertion versions
+(`TEMPORAL_ASSERTION_BUDGET`) so unconstrained local growth is rejected before
+the database becomes unbounded.
+
+### Operator runbook (SQLite)
+
+1. **Backup**: copy the SQLite file after `PRAGMA wal_checkpoint(TRUNCATE)`.
+   Temporal tables are additive; restore restores policies + history together.
+2. **Disable history**: `upsert_temporal_policy(..., enabled=false)` stops new
+   writes; retained rows remain until collection/erasure.
+3. **Downgrade**: software that does not understand `legal_hold` /
+   `payload_omitted` columns must refuse to open the DB or ignore unknown
+   columns; do not silently drop retained history.
+4. **Corruption**: if `sekai_temporal_revisions` or assertion PK integrity
+   fails, treat as fail-closed and restore from backup; do not rebuild history
+   from audit.
+
+### PostgreSQL (future parity, not claimed)
+
+- Map `legal_hold` / `payload_omitted` as booleans.
+- Prefer range types + exclusion for recorded intervals; keep the three-way
+  valid-bound encoding for unknown.
+- Collection/erasure must use the same tombstone semantics, not hard DELETE of
+  envelope rows required for non-disclosure proofs.
+
 Directional storage cost can be re-checked with:
 
 ```bash
