@@ -47,6 +47,9 @@ Issue stamps `site_id` from `SEKAI_SITE_ID` (default `"local"`) into the signed
 permit. Redeem requires the host site to match and fails closed on a foreign
 pin, preventing double-redeem under multi-region lag when each site has its own
 process identity. Redemption records and redeem audit evidence expose `site_id`.
+**Backend note:** control-plane online redeem and offline reconciliation are
+implemented on SQLite; the community PostgreSQL runtime fails closed on those
+methods (see [postgres-chisei-parity.md](postgres-chisei-parity.md)).
 
 Cross-region pin handoff is a **non-goal for v1**. See
 [region-pins.md](region-pins.md). Offline permits remain weaker than online

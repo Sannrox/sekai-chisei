@@ -37,7 +37,11 @@ Definitions without an ACL entry follow the existing world-readable ACL
 default. Once grants exist for a definition, list operations omit it for
 unauthorized principals. Mutations require ontology, schema, or definition
 administration and append a decision to the tamper-evident audit ledger in the
-same SQLite transaction as the definition change.
+same transaction as the definition change. On the community SQLite runtime that
+transaction is local SQLite; on community PostgreSQL the public audited
+mutation RPCs fail closed until dual-backend audit parity lands (see
+[architecture.md](architecture.md#persistence) and
+[postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
 ## Validation and deletion
 
@@ -55,12 +59,13 @@ inverse, and transitivity metadata do not synthesize links or facts.
 Generate a browser-readable snapshot through the same authenticated gRPC path:
 
 ```bash
+# Default target is ./data/sekai.sock (or CHISEI_GRPC_URL / SEKAI_SOCKET).
 export SEKAI_AUTH_TOKEN='<operator token>'
 cargo run --bin sekaictl -- ontology inspect \
-  --target https://127.0.0.1:50051 \
   --root <object-id> \
   --authorization-context '<non-secret access-scope label>' \
   --output ontology-inspection.html
+# TCP example: --target https://127.0.0.1:50051
 ```
 
 The default lifetime is one hour. Use `--ttl-seconds` to select a value from 1

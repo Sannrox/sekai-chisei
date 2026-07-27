@@ -250,10 +250,13 @@ the configured issuer and key, every binding, their advertised enforcement
 capabilities, and current resource preconditions immediately before execution.
 
 Online redemption consumes an invocation in the same SQLite transaction that
-records its audit decision. Request, permit, redemption, and execution IDs stay
-distinct, and an idempotency key makes an ambiguous retry return the original
-redemption. Revocation and action/executor/harness/namespace/signing-key kill
-switches stop future redemption without removing issuance or redemption
+records its audit decision. Community PostgreSQL fails closed on
+`redeem_permit` / `redeem_or_reconcile_permit` until dual-backend redeem
+parity lands; hosts that need online redeem should use SQLite (or an enterprise
+backend that implements redeem). Request, permit, redemption, and execution IDs
+stay distinct, and an idempotency key makes an ambiguous retry return the
+original redemption. Revocation and action/executor/harness/namespace/signing-key
+kill switches stop future redemption without removing issuance or redemption
 history. They cannot undo an effect that already started. The control plane
 does not claim exactly-once external effects: redemption proves consumed
 authorization, not execution or outcome.
@@ -290,18 +293,18 @@ downstream outcome separate.
 ## Persistence
 
 SQLite is the server's default storage backend and runs in WAL mode for file
-databases. PostgreSQL implements the complete reusable, non-tenant Sekai
-persistence surface with backend-neutral contracts and shared
-SQLite/PostgreSQL conformance: core graph and authorization, object-change and
-decision audit, datasets and virtual tables, action definitions, function
-definitions, generation-fenced leases and guarded object mutations,
-capability-package lifecycle, team-namespace bootstrap, principal credentials,
-coordination and work admission, external evidence admission and projection,
-policy attestations, handoffs, retention, scoped content, and reconciliation.
-Ontology class/relation **storage helpers** exist on both backends, but public
-audited ontology mutation RPCs (`CreateOntologyClass` / relation upsert paths
-that call `upsert_*_with_audit`) remain SQLite-only and fail closed on the
-community PostgreSQL runtime until dual-backend audit parity lands.
+databases. PostgreSQL implements the reusable, non-tenant Sekai persistence
+surface with backend-neutral contracts and shared SQLite/PostgreSQL
+conformance for dual-backend inventory paths: core graph and authorization,
+object-change and decision audit, datasets and virtual tables, action
+definitions, function definitions, generation-fenced leases and guarded object
+mutations, capability-package lifecycle, team-namespace bootstrap, principal
+credentials, coordination and work admission, external evidence admission and
+projection, policy attestations, handoffs, retention, scoped content, and
+reconciliation. Known community Postgres fail-closed exceptions include public
+audited ontology mutation RPCs (`upsert_*_with_audit` and definition
+proposals), FTS text search, federation peer tables, and (on the Chisei side)
+online permit redeem and Gunshi allocation state — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

@@ -163,8 +163,9 @@ durable facts, governed decisions, evaluation, and learning.
 The codebase already establishes the core direction:
 
 - a Rust gRPC server with separate `sekai`, `chisei`, and `llm` services
-- a SQLite-backed object graph with links, datasets, virtual tables, lineage,
-  audit, actions, and security controls
+- a SQLite-default object graph (optional community PostgreSQL for dual-backend
+  reusable surfaces) with links, datasets, virtual tables, lineage, audit,
+  actions, and security controls
 - policy resolution, context enrichment, budget tracking, and model routing
 - governed native execution and a compatible HTTP gateway
 - evaluation, outcome, learning, and evolution primitives
