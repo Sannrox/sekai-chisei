@@ -1,5 +1,6 @@
 #[path = "../adapters/ontology_concept_catalog.rs"]
 mod ontology_concept_catalog;
+#[allow(dead_code)]
 #[path = "../adapters/sdk.rs"]
 mod sdk;
 
@@ -11,6 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::io::stdin().read_to_end(&mut input)?;
     let config = sdk::AdapterConfig::from_env()?;
     let draft = ontology_concept_catalog::translate(ontology_concept_catalog::parse(&input)?)?;
+    ontology_concept_catalog::CONFORMANCE_PROFILE.validate(&draft)?;
     let (envelope, outbox) =
         sdk::prepare_delivery(&config, draft, chrono::Utc::now().timestamp_millis())?;
     let result = sdk::submit(&config, envelope).await?;
