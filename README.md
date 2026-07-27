@@ -143,7 +143,8 @@ usage.
 ## What is implemented
 
 - SQLite-backed typed-object graph with schemas, links, datasets, and virtual
-  tables;
+  tables, plus optional `SEKAI_DB_BACKEND=postgres` for the reusable community
+  surface (no tenant/OIDC);
 - namespace-first access control, audit, lineage, and retention primitives;
 - work-unit admission, heartbeat, completion, and reconciliation;
 - policy resolution, context enrichment, budgets, model routing, and

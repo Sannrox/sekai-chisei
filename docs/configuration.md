@@ -25,6 +25,10 @@ template.
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
+| `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
+| `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
+| `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
+| `CHISEI_PERMIT_KEY_ID` | `permit-key-1` | Key id embedded in signed permits for rotation |
 | `RUST_LOG` | `info` | Tracing filter |
 | `LOG_FORMAT` | `pretty` | Use `json` for structured logs |
 
@@ -91,7 +95,7 @@ value to stdout.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS`, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable `CHISEI_GATEWAY_NO_PREFLIGHT` or auth passthrough |
+| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS`, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable `CHISEI_GATEWAY_NO_PREFLIGHT` or `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
 | `CHISEI_GRPC_URL` | unset | Control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
 | `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite access, `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Provider adapters live in `crates/sekai-provider/` (re-exported as `sekai_chisei::llm` from `src/lib.rs`). Protocol definitions are in `proto/`. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state.
+`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Provider adapters live in `crates/sekai-provider/` (re-exported as `sekai_chisei::llm` from `src/lib.rs`). Protocol definitions are in `proto/`. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state.
 
 ## Build, Test, and Development Commands
 
@@ -63,4 +63,4 @@ immediately after the correction.
 
 ## Security & Configuration Tips
 
-Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, set `SEKAI_AUTH_TOKEN` and require `authorization: Bearer <token>` metadata on gRPC requests. Report vulnerabilities through `SECURITY.md`.
+Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. Prefer that path over the deprecated single-principal `SEKAI_AUTH_TOKEN` bootstrap. Report vulnerabilities through `SECURITY.md`.

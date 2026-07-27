@@ -43,9 +43,10 @@ immutable content, legal and operational holds, transactional garbage
 collection, integrity-checked lifecycle archives, and reversible object
 reconciliation. PostgreSQL collectors serialize per namespace so concurrent
 release, hold, reconciliation, and collection attempts cannot double-delete a
-payload or lose a retaining obligation. These reusable surfaces do not activate
-PostgreSQL as the community runtime backend and do not add tenant or identity
-capabilities.
+payload or lose a retaining obligation. Selecting `SEKAI_DB_BACKEND=postgres`
+with a validated `DATABASE_URL` activates these reusable surfaces as the
+community runtime backend; it still does not add tenant, OIDC, OAuth, or
+identity capabilities.
 
 Reusable coordination leases use a dedicated namespace-scoped API. Every
 acquisition receives a monotonically increasing generation and unique fencing
@@ -285,11 +286,15 @@ SQLite is the server's default storage backend and runs in WAL mode for file
 databases. PostgreSQL implements the complete reusable, non-tenant Sekai
 persistence surface with backend-neutral contracts and shared
 SQLite/PostgreSQL conformance: core graph and authorization, object-change and
-decision audit, datasets and virtual tables, ontology and action definitions,
-function definitions, generation-fenced leases and guarded object mutations,
+decision audit, datasets and virtual tables, action definitions, function
+definitions, generation-fenced leases and guarded object mutations,
 capability-package lifecycle, team-namespace bootstrap, principal credentials,
 coordination and work admission, external evidence admission and projection,
 policy attestations, handoffs, retention, scoped content, and reconciliation.
+Ontology class/relation **storage helpers** exist on both backends, but public
+audited ontology mutation RPCs (`CreateOntologyClass` / relation upsert paths
+that call `upsert_*_with_audit`) remain SQLite-only and fail closed on the
+community PostgreSQL runtime until dual-backend audit parity lands.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation
