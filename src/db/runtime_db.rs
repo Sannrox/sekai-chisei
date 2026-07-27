@@ -1676,6 +1676,76 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_governed_action_type(
+        &self,
+        type_def: crate::sekai::governed_action_type::GovernedActionType,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_action_type::GovernedActionType, String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_action_type(type_def, actor, now_ms),
+            Self::Postgres(db) => db.put_governed_action_type(type_def, actor, now_ms),
+        }
+    }
+
+    pub fn get_governed_action_type(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        version: &str,
+    ) -> Result<Option<crate::sekai::governed_action_type::GovernedActionType>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_action_type(namespace, type_id, version),
+            Self::Postgres(db) => db.get_governed_action_type(namespace, type_id, version),
+        }
+    }
+
+    pub fn list_governed_action_types(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        enabled_only: bool,
+    ) -> Result<Vec<crate::sekai::governed_action_type::GovernedActionType>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_action_types(namespace, type_id, enabled_only),
+            Self::Postgres(db) => db.list_governed_action_types(namespace, type_id, enabled_only),
+        }
+    }
+
+    pub fn set_governed_action_type_enabled(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        version: &str,
+        enabled: bool,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_action_type::GovernedActionType, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.set_governed_action_type_enabled(namespace, type_id, version, enabled, now_ms)
+            }
+            Self::Postgres(db) => {
+                db.set_governed_action_type_enabled(namespace, type_id, version, enabled, now_ms)
+            }
+        }
+    }
+
+    pub fn require_enabled_governed_action_type(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        version: &str,
+    ) -> Result<crate::sekai::governed_action_type::GovernedActionType, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.require_enabled_governed_action_type(namespace, type_id, version)
+            }
+            Self::Postgres(db) => {
+                db.require_enabled_governed_action_type(namespace, type_id, version)
+            }
+        }
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_grants(),
