@@ -419,11 +419,7 @@ pub fn run_fixture_suite(
             db,
         );
         let result = match decision {
-            Ok(LookupDecision::Hit {
-                answer_json,
-                provenance: _,
-                ..
-            }) => {
+            Ok(LookupDecision::Hit { answer_json, .. }) => {
                 report.lookup_hits += 1;
                 let mut passed = case.expected_path == ANSWER_PATH_LOOKUP_HIT;
                 let mut detail = None;
