@@ -4,6 +4,7 @@ pub mod cache_policy;
 pub mod capability;
 pub mod controller;
 pub mod egress;
+pub mod entitlements;
 pub mod eval;
 pub mod evolve;
 pub mod external_action;

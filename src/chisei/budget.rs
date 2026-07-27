@@ -5,7 +5,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PeriodType {
     Daily,
     Weekly,

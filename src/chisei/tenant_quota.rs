@@ -11,6 +11,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::chisei::budget::{BudgetTracker, PeriodType};
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
@@ -22,7 +24,7 @@ pub const METRIC_CONCURRENCY: &str = "concurrency";
 pub const METRIC_STORAGE_BYTES: &str = "storage_bytes";
 
 /// Versioned, operator-configured tenant limits (not a commercial plan catalog).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantQuotaLimits {
     /// Monotonic assignment version from enterprise/operator control.
     pub version: u64,
