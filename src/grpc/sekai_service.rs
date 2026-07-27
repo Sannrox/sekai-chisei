@@ -5756,6 +5756,52 @@ fn to_proto_governed_action_type(
     }
 }
 
+fn to_proto_action_instance(
+    domain: &crate::sekai::action_instance::ActionInstance,
+) -> super::pb::sekai::ActionInstance {
+    super::pb::sekai::ActionInstance {
+        instance_id: domain.instance_id.clone(),
+        namespace: domain.namespace.clone(),
+        type_id: domain.type_id.clone(),
+        version: domain.version.clone(),
+        principal: domain.principal.clone(),
+        parameters_json: domain.parameters_json.clone(),
+        request_digest: domain.request_digest.clone(),
+        idempotency_key: domain.idempotency_key.clone(),
+        operation_id: domain.operation_id.clone(),
+        status: domain.status.clone(),
+        deny_reason: domain.deny_reason.clone(),
+        evidence_submission_ids: domain.evidence_submission_ids.clone(),
+        policy_decision: domain.policy_decision.clone(),
+        budget_decision: domain.budget_decision.clone(),
+        created_at_ms: domain.created_at_ms,
+        decided_at_ms: domain.decided_at_ms,
+    }
+}
+
+fn authorize_action_instance_submit(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> Result<String, Status> {
+    require_authenticated(principals)?;
+    check_team_namespace(&service.db, principals, namespace, true)?;
+    principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))
+}
+
+fn authorize_action_instance_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> Result<(), Status> {
+    require_authenticated(principals)?;
+    check_team_namespace(&service.db, principals, namespace, false)?;
+    Ok(())
+}
+
 /// Lease keys that coordinate an existing object use this prefix so the
 /// coordination identity cannot be squatted without object ACL access.
 const OBJECT_BOUND_LEASE_KEY_PREFIX: &str = "object:";
@@ -9873,6 +9919,386 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(SetGovernedActionTypeEnabledResponse {
             r#type: Some(to_proto_governed_action_type(&stored)),
         }))
+    }
+
+    async fn submit_action_instance(
+        &self,
+        req: Request<SubmitActionInstanceRequest>,
+    ) -> Result<Response<SubmitActionInstanceResponse>, Status> {
+        // #397: admit a governed ActionInstance with idempotency + operation binding.
+        use crate::sekai::action::RiskClass;
+        use crate::sekai::action_instance::{
+            ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION,
+            compute_request_digest, submit_budget_subject, validate_parameters_json,
+        };
+
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let inner = req.into_inner();
+        let namespace = inner.namespace.trim().to_string();
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
+        }
+        let actor = authorize_action_instance_submit(self, &principals, &namespace)?;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &namespace, true)?;
+
+        if inner.type_id.trim().is_empty() {
+            return Err(Status::invalid_argument("type_id required"));
+        }
+        if inner.version.trim().is_empty() {
+            return Err(Status::invalid_argument("version required"));
+        }
+        if inner.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument("idempotency_key required"));
+        }
+        if inner.idempotency_key.chars().any(char::is_whitespace) {
+            return Err(Status::invalid_argument(
+                "idempotency_key must not contain whitespace",
+            ));
+        }
+        validate_parameters_json(&inner.parameters_json).map_err(Status::invalid_argument)?;
+
+        let mut evidence_ids = inner.evidence_submission_ids.clone();
+        evidence_ids.sort();
+        evidence_ids.dedup();
+        for id in &evidence_ids {
+            if id.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "evidence_submission_ids must not contain empty ids",
+                ));
+            }
+        }
+
+        let request_digest = compute_request_digest(
+            &namespace,
+            &inner.type_id,
+            &inner.version,
+            &inner.parameters_json,
+            &evidence_ids,
+        )
+        .map_err(Status::invalid_argument)?;
+
+        // Idempotent replay before type/policy work when possible.
+        if let Some(existing) = self
+            .db
+            .get_action_instance_by_idempotency(&namespace, &inner.idempotency_key)
+            .map_err(Status::internal)?
+        {
+            if existing.request_digest != request_digest {
+                return Err(Status::already_exists(
+                    "idempotency key conflict: same key with different request digest",
+                ));
+            }
+            return Ok(Response::new(SubmitActionInstanceResponse {
+                instance: Some(to_proto_action_instance(&existing)),
+                replay: true,
+            }));
+        }
+
+        let type_def = self
+            .db
+            .require_enabled_governed_action_type(&namespace, &inner.type_id, &inner.version)
+            .map_err(|e| {
+                if e.contains("unknown") || e.contains("disabled") {
+                    Status::failed_precondition(e)
+                } else {
+                    Status::internal(e)
+                }
+            })?;
+
+        // Policy gate: policy_scope on type, else namespace/agent resolution.
+        let policy_project = if type_def.policy_scope.trim().is_empty() {
+            namespace.clone()
+        } else {
+            type_def.policy_scope.clone()
+        };
+        let resolved_policy = self
+            .db
+            .resolve_action_policy(&actor, &namespace, &policy_project)
+            .map_err(Status::internal)?;
+        let (policy_decision, policy_scope_label) = match &resolved_policy {
+            Some(policy) => (
+                policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write),
+                policy.scope.clone(),
+            ),
+            None => (action_policy::ActionDecision::Allow, String::new()),
+        };
+
+        let now = now_millis();
+        let instance_id = format!("gai-{}", Uuid::new_v4().simple());
+        let operation_id = format!("op-gai-{}", Uuid::new_v4().simple());
+
+        let mut status = STATUS_ADMITTED.to_string();
+        let mut deny_reason = String::new();
+        let mut policy_decision_str = policy_decision.as_str().to_string();
+        let mut budget_decision_str = if self.budget.is_some() {
+            "allow".to_string()
+        } else {
+            "not_configured".to_string()
+        };
+
+        if policy_decision == action_policy::ActionDecision::Deny {
+            status = STATUS_DENIED.to_string();
+            deny_reason = if policy_scope_label.is_empty() {
+                "action policy denied submit_action_instance".into()
+            } else {
+                format!("action policy denied submit_action_instance ({policy_scope_label})")
+            };
+        } else if policy_decision == action_policy::ActionDecision::RequireApproval {
+            // #397 non-goal: approval workflow for instances. Treat as deny until
+            // a dedicated approval path exists.
+            status = STATUS_DENIED.to_string();
+            deny_reason = "submit_action_instance requires approval (not yet supported)".into();
+            policy_decision_str = "require_approval".into();
+        }
+
+        let budget_subject = submit_budget_subject(&namespace, &actor, &type_def.budget_scope);
+        if status == STATUS_ADMITTED {
+            if let Some(budget) = &self.budget {
+                if let Err(_err) = budget.check(&budget_subject, 1) {
+                    status = STATUS_DENIED.to_string();
+                    deny_reason = format!("action budget exhausted for {budget_subject}");
+                    budget_decision_str = "budget_exceeded".into();
+                }
+            }
+        }
+
+        let instance = ActionInstance {
+            instance_id: instance_id.clone(),
+            namespace: namespace.clone(),
+            type_id: inner.type_id.clone(),
+            version: inner.version.clone(),
+            principal: actor.clone(),
+            parameters_json: inner.parameters_json.clone(),
+            request_digest: request_digest.clone(),
+            idempotency_key: inner.idempotency_key.clone(),
+            operation_id: operation_id.clone(),
+            status: status.clone(),
+            deny_reason: deny_reason.clone(),
+            evidence_submission_ids: evidence_ids.clone(),
+            policy_decision: policy_decision_str.clone(),
+            budget_decision: budget_decision_str.clone(),
+            created_at_ms: now,
+            decided_at_ms: now,
+        };
+
+        let stored = self.db.put_action_instance(&instance).map_err(|e| {
+            if e.contains("conflict") {
+                Status::already_exists(e)
+            } else if e.contains("required") || e.contains("must") {
+                Status::invalid_argument(e)
+            } else {
+                Status::internal(e)
+            }
+        })?;
+
+        // If put returned an earlier winner (race), treat as replay.
+        let replay = stored.instance_id != instance_id;
+        if !replay {
+            // Bind operation receipt spine (intent + policy + budget + outcome).
+            let outcome = if stored.status == STATUS_ADMITTED {
+                "admitted"
+            } else {
+                "denied"
+            };
+            let mut intent_attrs = BTreeMap::from([
+                ("instance_id".into(), stored.instance_id.clone()),
+                ("type_id".into(), stored.type_id.clone()),
+                ("version".into(), stored.version.clone()),
+                ("request_digest".into(), stored.request_digest.clone()),
+                ("idempotency_key".into(), stored.idempotency_key.clone()),
+            ]);
+            if !evidence_ids.is_empty() {
+                intent_attrs.insert("evidence_submission_ids".into(), evidence_ids.join(","));
+            }
+            let intent = OperationReceiptEvent {
+                event_id: format!("{operation_id}:intent"),
+                operation_id: operation_id.clone(),
+                parent_event_id: None,
+                timestamp_ms: now,
+                kind: ReceiptEventKind::IntentRecorded,
+                surface: ReceiptEventKind::IntentRecorded.surface(),
+                actor: actor.clone(),
+                references: Vec::new(),
+                attributes: intent_attrs,
+            };
+            let policy_evt = OperationReceiptEvent {
+                event_id: format!("{operation_id}:policy"),
+                operation_id: operation_id.clone(),
+                parent_event_id: Some(format!("{operation_id}:intent")),
+                timestamp_ms: now,
+                kind: ReceiptEventKind::PolicyDecided,
+                surface: ReceiptEventKind::PolicyDecided.surface(),
+                actor: actor.clone(),
+                references: Vec::new(),
+                attributes: BTreeMap::from([
+                    ("decision".into(), stored.policy_decision.clone()),
+                    ("action".into(), SUBMIT_POLICY_ACTION.into()),
+                ]),
+            };
+            let budget_evt = OperationReceiptEvent {
+                event_id: format!("{operation_id}:budget"),
+                operation_id: operation_id.clone(),
+                parent_event_id: Some(format!("{operation_id}:policy")),
+                timestamp_ms: now,
+                kind: ReceiptEventKind::BudgetDecided,
+                surface: ReceiptEventKind::BudgetDecided.surface(),
+                actor: actor.clone(),
+                references: Vec::new(),
+                attributes: BTreeMap::from([
+                    ("decision".into(), stored.budget_decision.clone()),
+                    ("subject".into(), budget_subject.clone()),
+                ]),
+            };
+            let mut outcome_attrs = BTreeMap::from([("outcome".into(), outcome.into())]);
+            if !stored.deny_reason.is_empty() {
+                outcome_attrs.insert("deny_reason".into(), stored.deny_reason.clone());
+            }
+            let outcome_evt = OperationReceiptEvent {
+                event_id: format!("{operation_id}:outcome"),
+                operation_id: operation_id.clone(),
+                parent_event_id: Some(format!("{operation_id}:budget")),
+                timestamp_ms: now,
+                kind: ReceiptEventKind::OutcomeRecorded,
+                surface: ReceiptEventKind::OutcomeRecorded.surface(),
+                actor: actor.clone(),
+                references: Vec::new(),
+                attributes: outcome_attrs,
+            };
+            let receipt = OperationReceipt {
+                version: OPERATION_RECEIPT_VERSION.into(),
+                operation_id: operation_id.clone(),
+                parent_operation_id: None,
+                namespace: namespace.clone(),
+                operation_class: "governed_action_instance".into(),
+                initiating_actor: actor.clone(),
+                schema_version: "action-instance/v1".into(),
+                policy_version: if policy_scope_label.is_empty() {
+                    "implicit-allow".into()
+                } else {
+                    policy_scope_label.clone()
+                },
+                started_at_ms: now,
+                completed_at_ms: Some(now),
+                events: vec![intent, policy_evt, budget_evt, outcome_evt],
+                uncovered_surfaces: vec![UncoveredSurface {
+                    surface: ReceiptSurface::Routing,
+                    reason: "routing not applicable to action instance admission".into(),
+                }],
+                reporter_grants: Vec::new(),
+            };
+            self.db
+                .put_operation_receipt(&receipt)
+                .map_err(Status::internal)?;
+
+            let mut evidence = HashMap::from([
+                ("instance_id".into(), stored.instance_id.clone()),
+                ("type_id".into(), stored.type_id.clone()),
+                ("version".into(), stored.version.clone()),
+                ("request_digest".into(), stored.request_digest.clone()),
+                ("idempotency_key".into(), stored.idempotency_key.clone()),
+                ("operation_id".into(), stored.operation_id.clone()),
+                ("status".into(), stored.status.clone()),
+                ("policy_decision".into(), stored.policy_decision.clone()),
+                ("budget_decision".into(), stored.budget_decision.clone()),
+                // Parameters are untrusted data; only record digest, not body text.
+                ("parameters_untrusted".into(), "true".into()),
+            ]);
+            if !stored.deny_reason.is_empty() {
+                evidence.insert("deny_reason".into(), stored.deny_reason.clone());
+            }
+            self.db
+                .record_decision(&audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    actor: actor.clone(),
+                    action: "submit_action_instance".into(),
+                    reason: if stored.status == STATUS_ADMITTED {
+                        "action_instance_admitted".into()
+                    } else if stored.budget_decision == "budget_exceeded" {
+                        "action_instance_budget_denied".into()
+                    } else {
+                        "action_instance_policy_denied".into()
+                    },
+                    evidence,
+                    target_id: stored.instance_id.clone(),
+                    outcome: stored.status.clone(),
+                })
+                .map_err(Status::internal)?;
+
+            if stored.status == STATUS_ADMITTED {
+                if let Some(budget) = &self.budget {
+                    budget.record(&budget_subject, 1);
+                }
+            }
+        }
+
+        Ok(Response::new(SubmitActionInstanceResponse {
+            instance: Some(to_proto_action_instance(&stored)),
+            replay,
+        }))
+    }
+
+    async fn get_action_instance(
+        &self,
+        req: Request<GetActionInstanceRequest>,
+    ) -> Result<Response<GetActionInstanceResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        let stored = if !inner.instance_id.trim().is_empty() {
+            self.db
+                .get_action_instance(&inner.instance_id)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::not_found("action instance not found"))?
+        } else if !inner.namespace.trim().is_empty() && !inner.idempotency_key.trim().is_empty() {
+            self.db
+                .get_action_instance_by_idempotency(&inner.namespace, &inner.idempotency_key)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::not_found("action instance not found"))?
+        } else {
+            return Err(Status::invalid_argument(
+                "instance_id or (namespace, idempotency_key) required",
+            ));
+        };
+        authorize_action_instance_read(self, &principals, &stored.namespace)?;
+        Ok(Response::new(GetActionInstanceResponse {
+            instance: Some(to_proto_action_instance(&stored)),
+        }))
+    }
+
+    async fn list_action_instances(
+        &self,
+        req: Request<ListActionInstancesRequest>,
+    ) -> Result<Response<ListActionInstancesResponse>, Status> {
+        let principals = caller_principals(&req);
+        let inner = req.into_inner();
+        if inner.namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
+        }
+        authorize_action_instance_read(self, &principals, &inner.namespace)?;
+        let type_id = if inner.type_id.trim().is_empty() {
+            None
+        } else {
+            Some(inner.type_id.as_str())
+        };
+        let status = if inner.status.trim().is_empty() {
+            None
+        } else {
+            Some(inner.status.as_str())
+        };
+        let limit = if inner.limit == 0 {
+            100
+        } else {
+            inner.limit as usize
+        };
+        let instances = self
+            .db
+            .list_action_instances(&inner.namespace, type_id, status, limit)
+            .map_err(Status::internal)?
+            .iter()
+            .map(to_proto_action_instance)
+            .collect();
+        Ok(Response::new(ListActionInstancesResponse { instances }))
     }
 
     async fn execute_action(
@@ -18167,6 +18593,188 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn submit_action_instance_admit_replay_conflict_policy_budget() {
+        // #397: submit/admit ActionInstance with idempotency, policy, budget.
+        use crate::chisei::budget::{BudgetTracker, PeriodType};
+        use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION};
+
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let budget = Arc::new(BudgetTracker::new(db.clone()));
+        budget
+            .set_limit("action:governed", 1, PeriodType::Daily)
+            .unwrap();
+        let svc = SekaiServiceImpl::with_budget(db, budget.clone());
+        grant_action_admin(&svc);
+
+        let type_def = GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "review.intake".into(),
+            version: "1.0.0".into(),
+            description: "Admit review".into(),
+            parameter_schema_json: r#"{"type":"object"}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+        };
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(type_def),
+            request_id: "put-1".into(),
+        }))
+        .await
+        .unwrap();
+
+        let params = r#"{"summary":"ship it"}"#.to_string();
+        let admit = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+                parameters_json: params.clone(),
+                idempotency_key: "idem-1".into(),
+                evidence_submission_ids: vec!["ev-1".into()],
+                request_id: "req-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!admit.replay);
+        let inst = admit.instance.unwrap();
+        assert_eq!(inst.status, STATUS_ADMITTED);
+        assert!(!inst.instance_id.is_empty());
+        assert!(!inst.operation_id.is_empty());
+        assert!(!inst.request_digest.is_empty());
+        assert_eq!(inst.evidence_submission_ids, vec!["ev-1".to_string()]);
+
+        // Receipt spine bound to operation_id.
+        let receipt = svc
+            .db
+            .get_operation_receipt(&inst.operation_id)
+            .unwrap()
+            .expect("operation receipt");
+        assert_eq!(receipt.operation_class, "governed_action_instance");
+        assert_eq!(receipt.namespace, "acme");
+
+        // Idempotent replay
+        let replay = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+                parameters_json: params.clone(),
+                idempotency_key: "idem-1".into(),
+                evidence_submission_ids: vec!["ev-1".into()],
+                request_id: "req-2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(replay.replay);
+        assert_eq!(replay.instance.unwrap().instance_id, inst.instance_id);
+
+        // Key conflict on different digest
+        let conflict = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"summary":"other"}"#.into(),
+                idempotency_key: "idem-1".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-3".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+        // Get + list
+        let got = svc
+            .get_action_instance(with_principal(GetActionInstanceRequest {
+                instance_id: inst.instance_id.clone(),
+                namespace: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(got.instance_id, inst.instance_id);
+
+        let listed = svc
+            .list_action_instances(with_principal(ListActionInstancesRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                status: STATUS_ADMITTED.into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instances;
+        assert_eq!(listed.len(), 1);
+
+        // Budget deny (limit was 1; second distinct admit exhausts)
+        let budget_denied = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"summary":"second"}"#.into(),
+                idempotency_key: "idem-budget".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-budget".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(budget_denied.status, STATUS_DENIED);
+        assert_eq!(budget_denied.budget_decision, "budget_exceeded");
+        assert!(budget_denied.deny_reason.contains("budget"));
+
+        // Policy deny
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: action_policy::ActionDecision::Allow,
+                action_overrides: HashMap::from([(
+                    SUBMIT_POLICY_ACTION.into(),
+                    action_policy::ActionDecision::Deny,
+                )]),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let policy_denied = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "review.intake".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"summary":"policy"}"#.into(),
+                idempotency_key: "idem-policy".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-policy".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(policy_denied.status, STATUS_DENIED);
+        assert_eq!(policy_denied.policy_decision, "deny");
+        assert!(policy_denied.deny_reason.contains("policy"));
     }
 
     #[tokio::test]

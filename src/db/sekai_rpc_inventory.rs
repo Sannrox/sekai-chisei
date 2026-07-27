@@ -360,8 +360,11 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 142);
+        assert_eq!(inventory.entries.len(), 145);
         assert!(inventory.entry("PutGovernedActionType").is_some());
+        assert!(inventory.entry("SubmitActionInstance").is_some());
+        assert!(inventory.entry("GetActionInstance").is_some());
+        assert!(inventory.entry("ListActionInstances").is_some());
         assert!(inventory.entry("TransitionCapabilityPackage").is_some());
         assert_eq!(
             inventory

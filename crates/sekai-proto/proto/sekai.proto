@@ -1273,6 +1273,56 @@ message SetGovernedActionTypeEnabledRequest {
 }
 message SetGovernedActionTypeEnabledResponse { GovernedActionType type = 1; }
 
+// Governed ActionInstance admission (#397 / research #395). Not graph ExecuteAction.
+message ActionInstance {
+  string instance_id = 1;
+  string namespace = 2;
+  string type_id = 3;
+  string version = 4;
+  string principal = 5;
+  // JSON object. Untrusted producer/user content — plane never treats as instructions.
+  string parameters_json = 6;
+  string request_digest = 7;
+  string idempotency_key = 8;
+  // Bound operation correlation spine for receipts/harvest.
+  string operation_id = 9;
+  // admitted | denied
+  string status = 10;
+  string deny_reason = 11;
+  repeated string evidence_submission_ids = 12;
+  string policy_decision = 13;
+  string budget_decision = 14;
+  int64 created_at_ms = 15;
+  int64 decided_at_ms = 16;
+}
+message SubmitActionInstanceRequest {
+  string namespace = 1;
+  string type_id = 2;
+  string version = 3;
+  string parameters_json = 4;
+  string idempotency_key = 5;
+  repeated string evidence_submission_ids = 6;
+  string request_id = 7;
+}
+message SubmitActionInstanceResponse {
+  ActionInstance instance = 1;
+  bool replay = 2;
+}
+message GetActionInstanceRequest {
+  string instance_id = 1;
+  // Optional alternate lookup when instance_id empty.
+  string namespace = 2;
+  string idempotency_key = 3;
+}
+message GetActionInstanceResponse { ActionInstance instance = 1; }
+message ListActionInstancesRequest {
+  string namespace = 1;
+  string type_id = 2;
+  string status = 3;
+  uint32 limit = 4;
+}
+message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
+
 
 message ExecuteActionRequest {
   ActionRequest request = 1;
@@ -1986,6 +2036,10 @@ service SekaiService {
   rpc GetGovernedActionType(GetGovernedActionTypeRequest) returns (GetGovernedActionTypeResponse);
   rpc ListGovernedActionTypes(ListGovernedActionTypesRequest) returns (ListGovernedActionTypesResponse);
   rpc SetGovernedActionTypeEnabled(SetGovernedActionTypeEnabledRequest) returns (SetGovernedActionTypeEnabledResponse);
+  // Governed ActionInstance admission (#397). Not ExecuteAction.
+  rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
+  rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
+  rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);

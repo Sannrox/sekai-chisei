@@ -105,6 +105,7 @@ in order.
 - [Action/Effect mapping onto plane primitives](research/395-action-effect-mapping.md)
   — ActionInstance admission envelope bound to operation receipts (#395).
 - [Governed Action type registry](governed-action-types.md) — namespace-scoped versioned decision types (#396).
+- [Governed ActionInstance admission](governed-action-instances.md) — submit/admit decision units with idempotency (#397).
 - [Provider and data-class residency](residency-policy.md)
   — model/provider residency policy (#289); research:
   [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
