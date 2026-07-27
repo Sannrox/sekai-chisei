@@ -121,9 +121,15 @@ shipping #281.
 
 ## Impact on #281
 
-#281 remains **blocked** on this research’s re-open condition (and preferably
-#151). When reopened, implement only allow-listed structured capabilities with
-fail-closed fallback and receipt fields as already sketched in #281.
+Maintainer decision **S1** (issue #281 comment) unblocked a narrow
+implementation after #151 landed:
+
+- Allow-listed structured capabilities only (`sekai.semantic.*` / `sekai.context.retrieve`).
+- Fixture suite + dual-run structural equality (no production corpus / no fleet spend %).
+- Fail closed to model path with `lookup_refusal`; receipts mark `lookup_hit` vs `model_path`.
+
+See `docs/capability-catalog.md` (Lookup-first answers) and
+`src/chisei/lookup_first.rs`.
 
 ## Conclusion
 
