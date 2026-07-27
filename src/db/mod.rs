@@ -31,6 +31,7 @@ mod portfolio_route_test_cases;
 pub mod postgres;
 mod postgres_action;
 mod postgres_action_governance;
+mod postgres_action_instance;
 mod postgres_attestation;
 mod postgres_audit;
 mod postgres_authorization;

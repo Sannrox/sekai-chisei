@@ -30,7 +30,7 @@ row for history.
 | `parameter_schema_json` | JSON object (JSON Schema or plane map) |
 | `allowed_effect_kinds` | Subset of `runtime_dispatch`, `notify`, `external_mutate` |
 | `policy_scope` / `budget_scope` | Empty = use namespace defaults |
-| `enabled` | Fail-closed gate for submit (#397 uses `require_enabled`) |
+| `enabled` | Fail-closed gate for submit ([#397](governed-action-instances.md) uses `require_enabled`) |
 
 ## Authz
 

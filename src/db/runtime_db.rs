@@ -1746,6 +1746,50 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_action_instance(
+        &self,
+        instance: &crate::sekai::action_instance::ActionInstance,
+    ) -> Result<crate::sekai::action_instance::ActionInstance, String> {
+        match self {
+            Self::Sqlite(db) => db.put_action_instance(instance),
+            Self::Postgres(db) => db.put_action_instance(instance),
+        }
+    }
+
+    pub fn get_action_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_action_instance(instance_id),
+            Self::Postgres(db) => db.get_action_instance(instance_id),
+        }
+    }
+
+    pub fn get_action_instance_by_idempotency(
+        &self,
+        namespace: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_action_instance_by_idempotency(namespace, idempotency_key),
+            Self::Postgres(db) => db.get_action_instance_by_idempotency(namespace, idempotency_key),
+        }
+    }
+
+    pub fn list_action_instances(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_action_instances(namespace, type_id, status, limit),
+            Self::Postgres(db) => db.list_action_instances(namespace, type_id, status, limit),
+        }
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_grants(),

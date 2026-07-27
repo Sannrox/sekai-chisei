@@ -1,5 +1,6 @@
 pub mod action;
 pub mod action_approval;
+pub mod action_instance;
 pub mod action_policy;
 pub mod attestation;
 pub mod audit;

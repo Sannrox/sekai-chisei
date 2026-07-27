@@ -37,6 +37,8 @@ const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
 const BUDGET_TOPOLOGY_SCHEMA: &str = include_str!("postgres/0018_budget_topology.sql");
 const LEASE_SITE_ID_SCHEMA: &str = include_str!("postgres/0019_lease_site_id.sql");
 const GOVERNED_ACTION_TYPES_SCHEMA: &str = include_str!("postgres/0020_governed_action_types.sql");
+const GOVERNED_ACTION_INSTANCES_SCHEMA: &str =
+    include_str!("postgres/0021_governed_action_instances.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -145,6 +147,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 20,
         name: "governed_action_types",
         sql: GOVERNED_ACTION_TYPES_SCHEMA,
+    },
+    Migration {
+        version: 21,
+        name: "governed_action_instances",
+        sql: GOVERNED_ACTION_INSTANCES_SCHEMA,
     },
 ];
 
