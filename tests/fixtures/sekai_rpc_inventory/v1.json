@@ -76,7 +76,7 @@
         "tests/guarded_mutation_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "GuardedUpdateObject",
@@ -91,7 +91,7 @@
         "tests/guarded_mutation_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "GuardedDeleteObject",
@@ -106,7 +106,7 @@
         "tests/guarded_mutation_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "CreateObject",

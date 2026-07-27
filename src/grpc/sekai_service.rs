@@ -6645,12 +6645,28 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<CreateObjectRequest>,
     ) -> Result<Response<CreateObjectResponse>, Status> {
+        // Unified mutation path (#388): optional lease_precondition uses the
+        // generation-fenced guarded implementation; GuardedCreateObject remains
+        // a thin shim that requires the precondition.
+        let metadata = req.metadata().clone();
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
-        let obj = req
-            .into_inner()
-            .object
-            .ok_or(Status::invalid_argument("object required"))?;
+        let CreateObjectRequest {
+            object,
+            lease_precondition,
+        } = req.into_inner();
+        if let Some(lease_precondition) = lease_precondition {
+            let mut guarded = Request::new(GuardedCreateObjectRequest {
+                object,
+                lease_precondition: Some(lease_precondition),
+            });
+            *guarded.metadata_mut() = metadata;
+            let response = self.guarded_create_object(guarded).await?;
+            return Ok(Response::new(CreateObjectResponse {
+                object: response.into_inner().object,
+            }));
+        }
+        let obj = object.ok_or(Status::invalid_argument("object required"))?;
         if obj.id.is_empty() {
             return Err(Status::invalid_argument("id required"));
         }
@@ -6806,12 +6822,25 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<UpdateObjectRequest>,
     ) -> Result<Response<UpdateObjectResponse>, Status> {
+        let metadata = req.metadata().clone();
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
-        let obj = req
-            .into_inner()
-            .object
-            .ok_or(Status::invalid_argument("object required"))?;
+        let UpdateObjectRequest {
+            object,
+            lease_precondition,
+        } = req.into_inner();
+        if let Some(lease_precondition) = lease_precondition {
+            let mut guarded = Request::new(GuardedUpdateObjectRequest {
+                object,
+                lease_precondition: Some(lease_precondition),
+            });
+            *guarded.metadata_mut() = metadata;
+            let response = self.guarded_update_object(guarded).await?;
+            return Ok(Response::new(UpdateObjectResponse {
+                object: response.into_inner().object,
+            }));
+        }
+        let obj = object.ok_or(Status::invalid_argument("object required"))?;
         if obj.id.is_empty() {
             return Err(Status::invalid_argument("id required"));
         }
@@ -6967,9 +6996,22 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
+        let metadata = req.metadata().clone();
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
-        let id = req.into_inner().id;
+        let DeleteObjectRequest {
+            id,
+            lease_precondition,
+        } = req.into_inner();
+        if let Some(lease_precondition) = lease_precondition {
+            let mut guarded = Request::new(GuardedDeleteObjectRequest {
+                id,
+                lease_precondition: Some(lease_precondition),
+            });
+            *guarded.metadata_mut() = metadata;
+            self.guarded_delete_object(guarded).await?;
+            return Ok(Response::new(DeleteObjectResponse {}));
+        }
         let Some(existing) = self.db.get_object(&id).map_err(Status::internal)? else {
             return Ok(Response::new(DeleteObjectResponse {}));
         };
@@ -14579,6 +14621,7 @@ mod tests {
                 "widget-purpose",
                 HashMap::from([("name".into(), "w".into())]),
             )),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -14625,6 +14668,7 @@ mod tests {
                 "widget-purpose-ok",
                 HashMap::from([("name".into(), "w".into())]),
             )),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -14957,6 +15001,7 @@ mod tests {
                         ("ai_result".into(), initial_value.into()),
                     ]),
                 )),
+                lease_precondition: None,
             }))
             .await
             .unwrap()
@@ -14986,6 +15031,7 @@ mod tests {
             .insert("ai_result".into(), updated_value.into());
         svc.update_object(with_principal(UpdateObjectRequest {
             object: Some(updated),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -15002,6 +15048,7 @@ mod tests {
                         ("ai_result".into(), r#"{"value":"approve"}"#.into()),
                     ]),
                 )),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -15021,6 +15068,7 @@ mod tests {
                         ),
                     ]),
                 )),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -15059,6 +15107,7 @@ mod tests {
                         ("secret_note".into(), "launch code".into()),
                     ]),
                 )),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -15074,6 +15123,7 @@ mod tests {
                         ("secret_note".into(), "launch code".into()),
                     ]),
                 )),
+                lease_precondition: None,
             },
             "root",
         ))
@@ -15240,6 +15290,7 @@ mod tests {
         update.name = "renamed".into();
         svc.update_object(with_principal(UpdateObjectRequest {
             object: Some(update),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -15253,6 +15304,7 @@ mod tests {
             .insert("secret_note".into(), "attacker code".into());
         svc.update_object(with_principal(UpdateObjectRequest {
             object: Some(to_proto_obj(&attempted_overwrite)),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -15298,6 +15350,7 @@ mod tests {
         grant_object_role(&svc, "widget-secret", "reader", security::Role::Viewer);
         svc.delete_object(with_principal(DeleteObjectRequest {
             id: "widget-secret".into(),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -16609,6 +16662,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -16744,6 +16798,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -16758,6 +16813,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -16888,6 +16944,7 @@ mod tests {
                         namespace: namespace.into(),
                         ..Default::default()
                     }),
+                    lease_precondition: None,
                 },
                 "local",
             ))
@@ -17038,6 +17095,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17072,6 +17130,7 @@ mod tests {
                     created: 1,
                     updated: 1,
                 }),
+                lease_precondition: None,
             },
             "alice",
         ))
@@ -17090,6 +17149,7 @@ mod tests {
                     created: 1,
                     updated: 2,
                 }),
+                lease_precondition: None,
             },
             "alice",
         ))
@@ -17099,6 +17159,7 @@ mod tests {
         svc.delete_object(with_named_principal(
             DeleteObjectRequest {
                 id: "audit-1".into(),
+                lease_precondition: None,
             },
             "alice",
         ))
@@ -17150,12 +17211,14 @@ mod tests {
         };
         svc.create_object(with_principal(CreateObjectRequest {
             object: Some(object.clone()),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
 
         svc.update_object(with_principal(UpdateObjectRequest {
             object: Some(object),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17195,6 +17258,7 @@ mod tests {
                     created: 1,
                     updated: 1,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -17217,6 +17281,7 @@ mod tests {
                 created: 1,
                 updated: 1,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17228,6 +17293,7 @@ mod tests {
         let err = svc
             .delete_object(with_principal(DeleteObjectRequest {
                 id: "delete-audit-fail".into(),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -17242,6 +17308,7 @@ mod tests {
 
         svc.delete_object(with_principal(DeleteObjectRequest {
             id: "missing-object".into(),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17276,6 +17343,7 @@ mod tests {
         let missing_required = svc
             .create_object(with_principal(CreateObjectRequest {
                 object: Some(widget_object("w1", HashMap::new())),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -17290,6 +17358,7 @@ mod tests {
                     ("color".into(), "red".into()),
                 ]),
             )),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17303,6 +17372,7 @@ mod tests {
                         ("color".into(), "green".into()),
                     ]),
                 )),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -17331,6 +17401,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -17638,6 +17709,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_object_with_lease_precondition_enforces_fencing() {
+        // #388: Create/Update/DeleteObject with lease_precondition share Guarded* semantics.
+        let svc = service();
+        let lease = svc
+            .acquire_lease(with_named_principal(
+                AcquireLeaseRequest {
+                    namespace: "default".into(),
+                    key: "environment".into(),
+                    owner: "alice".into(),
+                    ttl_ms: 60_000,
+                    request_id: "acquire-unified".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        let original = Object {
+            id: "unified-guarded".into(),
+            kind: "component".into(),
+            name: "before".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        svc.db
+            .create_object_with_audit(&from_proto_obj(&original), "alice")
+            .unwrap();
+        grant_object_role(&svc, "unified-guarded", "alice", security::Role::Editor);
+
+        let mut updated = original.clone();
+        updated.name = "fenced".into();
+        updated.updated = 2;
+        svc.update_object(with_named_principal(
+            UpdateObjectRequest {
+                object: Some(updated.clone()),
+                lease_precondition: Some(LeasePrecondition {
+                    namespace: "default".into(),
+                    key: "environment".into(),
+                    fencing_token: lease.fencing_token.clone(),
+                    request_id: "update-unified".into(),
+                }),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.db.get_object("unified-guarded").unwrap().unwrap().name,
+            "fenced"
+        );
+
+        updated.name = "stale".into();
+        updated.updated = 3;
+        let stale = svc
+            .update_object(with_named_principal(
+                UpdateObjectRequest {
+                    object: Some(updated),
+                    lease_precondition: Some(LeasePrecondition {
+                        namespace: "default".into(),
+                        key: "environment".into(),
+                        fencing_token: "not-the-token".into(),
+                        request_id: "update-stale".into(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.db.get_object("unified-guarded").unwrap().unwrap().name,
+            "fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_object_without_lease_precondition_remains_unguarded() {
+        let svc = service();
+        let original = Object {
+            id: "unified-unguarded".into(),
+            kind: "component".into(),
+            name: "before".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        svc.db
+            .create_object_with_audit(&from_proto_obj(&original), "alice")
+            .unwrap();
+        grant_object_role(&svc, "unified-unguarded", "alice", security::Role::Editor);
+
+        let mut updated = original;
+        updated.name = "after".into();
+        updated.updated = 2;
+        svc.update_object(with_named_principal(
+            UpdateObjectRequest {
+                object: Some(updated),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.db
+                .get_object("unified-unguarded")
+                .unwrap()
+                .unwrap()
+                .name,
+            "after"
+        );
+    }
+
+    #[tokio::test]
     async fn list_schema_types_requires_principal() {
         let svc = service();
         let err = svc
@@ -17875,9 +18067,12 @@ mod tests {
             created: 0,
             updated: 0,
         };
-        svc.create_object(with_principal(CreateObjectRequest { object: Some(obj) }))
-            .await
-            .expect("object create after kind ensure");
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(obj),
+            lease_precondition: None,
+        }))
+        .await
+        .expect("object create after kind ensure");
     }
 
     #[tokio::test]
@@ -18169,6 +18364,7 @@ mod tests {
                 created: 0,
                 updated: 1,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -18183,6 +18379,7 @@ mod tests {
                 created: 0,
                 updated: 2,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -18199,6 +18396,7 @@ mod tests {
                     created: 0,
                     updated: 1,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -18286,6 +18484,7 @@ mod tests {
                     created: 0,
                     updated: 1,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -18312,6 +18511,7 @@ mod tests {
                 created: 0,
                 updated: 1,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -18947,6 +19147,7 @@ mod tests {
                     ("tracking_id".into(), "trk-1".into()),
                 ]),
             )),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -18961,6 +19162,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -19007,6 +19209,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -19023,6 +19226,7 @@ mod tests {
                     created: 0,
                     updated: 0,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -19052,6 +19256,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -19165,6 +19370,7 @@ mod tests {
                     created: 0,
                     updated: 0,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -19187,6 +19393,7 @@ mod tests {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -19255,6 +19462,7 @@ mod tests {
 
         svc.create_object(with_principal(CreateObjectRequest {
             object: Some(widget_object("w1", HashMap::new())),
+            lease_precondition: None,
         }))
         .await
         .unwrap();
@@ -19469,6 +19677,7 @@ mod tests {
                         created: 1,
                         updated: 1,
                     }),
+                    lease_precondition: None,
                 },
                 "alice",
             ))
@@ -19489,6 +19698,7 @@ mod tests {
                         created: 1,
                         updated: 1,
                     }),
+                    lease_precondition: None,
                 },
                 "local",
             ))
@@ -19514,6 +19724,7 @@ mod tests {
             .delete_object(with_named_principal(
                 DeleteObjectRequest {
                     id: namespace.id.clone(),
+                    lease_precondition: None,
                 },
                 "local",
             ))
@@ -19555,7 +19766,10 @@ mod tests {
         );
         assert_eq!(
             svc.delete_object(with_named_principal(
-                DeleteObjectRequest { id: adopted.id },
+                DeleteObjectRequest {
+                    id: adopted.id,
+                    lease_precondition: None
+                },
                 "local",
             ))
             .await
@@ -19603,6 +19817,7 @@ mod tests {
                         created: 1,
                         updated: 1,
                     }),
+                    lease_precondition: None,
                 },
                 "local",
             ))
@@ -19670,6 +19885,7 @@ mod tests {
                         created: 1,
                         updated: 1,
                     }),
+                    lease_precondition: None,
                 },
                 "alice",
             ))
@@ -19690,6 +19906,7 @@ mod tests {
                     created: 1,
                     updated: 1,
                 }),
+                lease_precondition: None,
             },
             "bob",
         ))
@@ -20160,6 +20377,7 @@ mod tests {
         svc.delete_object(with_named_principal(
             DeleteObjectRequest {
                 id: "beta-object".into(),
+                lease_precondition: None,
             },
             "local",
         ))
@@ -20243,6 +20461,7 @@ mod tests {
                         namespace: "acme".into(),
                         ..Default::default()
                     }),
+                    lease_precondition: None,
                 },
                 "bob",
             ))
@@ -22901,6 +23120,7 @@ mod tests {
                     created: 0,
                     updated: 0,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -23012,6 +23232,7 @@ mod tests {
                     created: 0,
                     updated: 0,
                 }),
+                lease_precondition: None,
             }))
             .await
             .unwrap_err();
@@ -23190,6 +23411,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23335,6 +23557,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23453,6 +23676,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23557,6 +23781,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23648,6 +23873,7 @@ mod tests {
         svc.create_object(with_named_principal(
             CreateObjectRequest {
                 object: Some(object),
+                lease_precondition: None,
             },
             "root",
         ))
@@ -23732,6 +23958,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23828,6 +24055,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -23966,6 +24194,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(pattern_entity(id, name)),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -24067,6 +24296,7 @@ mod tests {
         svc.create_object(with_named_principal(
             CreateObjectRequest {
                 object: Some(pattern_entity("pp-b2", "company-2")),
+                lease_precondition: None,
             },
             "root",
         ))
@@ -24275,6 +24505,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "root",
             ))
@@ -24423,6 +24654,7 @@ mod tests {
         svc.create_object(with_named_principal(
             CreateObjectRequest {
                 object: Some(object),
+                lease_precondition: None,
             },
             "root",
         ))
@@ -24521,6 +24753,7 @@ mod tests {
             svc.create_object(with_named_principal(
                 CreateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 },
                 "local",
             ))
@@ -25048,6 +25281,7 @@ mod tests {
         svc.create_object(with_tenant_context(
             CreateObjectRequest {
                 object: Some(object.clone()),
+                lease_precondition: None,
             },
             "root",
             &tenant_a.id,
@@ -25973,6 +26207,7 @@ mod tests {
                         ]),
                     )
                 }),
+                lease_precondition: None,
             },
             "local",
         ))

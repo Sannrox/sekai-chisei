@@ -441,13 +441,26 @@ message LineageResult {
 
 // --- Request/Response wrappers ---
 
-message CreateObjectRequest { Object object = 1; }
+// Optional lease_precondition unifies the product mutation path with generation-
+// fenced writes (#388). When unset, behavior matches the historical unguarded
+// RPCs. When set, semantics match GuardedCreate/Update/DeleteObject (which remain
+// as shims).
+message CreateObjectRequest {
+  Object object = 1;
+  LeasePrecondition lease_precondition = 2;
+}
 message CreateObjectResponse { Object object = 1; }
 message GetObjectRequest { string id = 1; }
 message GetObjectResponse { Object object = 1; }
-message UpdateObjectRequest { Object object = 1; }
+message UpdateObjectRequest {
+  Object object = 1;
+  LeasePrecondition lease_precondition = 2;
+}
 message UpdateObjectResponse { Object object = 1; }
-message DeleteObjectRequest { string id = 1; }
+message DeleteObjectRequest {
+  string id = 1;
+  LeasePrecondition lease_precondition = 2;
+}
 message DeleteObjectResponse {}
 message ListObjectsRequest { ListFilter filter = 1; }
 message ListObjectsResponse { repeated Object objects = 1; int32 total = 2; }
