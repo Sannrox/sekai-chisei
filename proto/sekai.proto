@@ -587,6 +587,49 @@ message OntologyLinkViolation {
 message ReportOntologyLinkViolationsRequest { string ontology_relation = 1; }
 message ReportOntologyLinkViolationsResponse { repeated OntologyLinkViolation violations = 1; }
 
+// Governed ontology-definition proposals from admitted external evidence (#147).
+// Proposal bodies are versioned JSON contracts (sekai.ontology_proposal/v1).
+message ProposeOntologyDefinitionsRequest {
+  repeated string submission_ids = 1;
+  string extractor_id = 2;
+  map<string, string> extractor_config = 3;
+  map<string, string> model_config = 4;
+  string authorization_context = 5;
+  bool dry_run = 6;
+}
+message ProposeOntologyDefinitionsResponse {
+  repeated string proposals_json = 1;
+  bool dry_run = 2;
+  bool persisted = 3;
+}
+message ListOntologyDefinitionProposalsRequest {
+  string state = 1;
+  string kind = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+message ListOntologyDefinitionProposalsResponse {
+  repeated string proposals_json = 1;
+}
+message GetOntologyDefinitionProposalRequest {
+  string id = 1;
+  uint32 version = 2;
+}
+message GetOntologyDefinitionProposalResponse {
+  string proposal_json = 1;
+}
+message ReviewOntologyDefinitionProposalRequest {
+  string id = 1;
+  uint32 version = 2;
+  // accept | reject | supersede
+  string action = 3;
+  string rationale = 4;
+}
+message ReviewOntologyDefinitionProposalResponse {
+  string proposal_json = 1;
+  repeated string lifecycle_events_json = 2;
+}
+
 message ExecuteFunctionRequest { string name = 1; map<string, string> params = 2; }
 message ExecuteFunctionResponse { FunctionResult result = 1; }
 message CreateFunctionRequest { Function function = 1; }
@@ -1418,6 +1461,10 @@ service SekaiService {
   rpc DeleteOntologyRelation(DeleteOntologyRelationRequest) returns (DeleteOntologyRelationResponse);
   rpc ProjectSchemaToOntology(ProjectSchemaToOntologyRequest) returns (ProjectSchemaToOntologyResponse);
   rpc ReportOntologyLinkViolations(ReportOntologyLinkViolationsRequest) returns (ReportOntologyLinkViolationsResponse);
+  rpc ProposeOntologyDefinitions(ProposeOntologyDefinitionsRequest) returns (ProposeOntologyDefinitionsResponse);
+  rpc ListOntologyDefinitionProposals(ListOntologyDefinitionProposalsRequest) returns (ListOntologyDefinitionProposalsResponse);
+  rpc GetOntologyDefinitionProposal(GetOntologyDefinitionProposalRequest) returns (GetOntologyDefinitionProposalResponse);
+  rpc ReviewOntologyDefinitionProposal(ReviewOntologyDefinitionProposalRequest) returns (ReviewOntologyDefinitionProposalResponse);
 
   rpc CreateFunction(CreateFunctionRequest) returns (CreateFunctionResponse);
   rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse);

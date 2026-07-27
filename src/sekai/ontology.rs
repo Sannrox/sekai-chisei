@@ -36,7 +36,7 @@ pub struct Cardinality {
 
 /// A property attached to an ontology class. Reuses the schema `PropertyType`
 /// vocabulary so classes and object types describe values the same way.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyProperty {
     pub name: String,
     pub prop_type: PropertyType,
@@ -49,7 +49,7 @@ pub struct OntologyProperty {
 /// A first-class semantic concept. `mapped_kind` records the existing sekai
 /// object kind this class projects from (empty when the class is purely
 /// semantic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyClass {
     pub name: String,
     #[serde(default)]
@@ -72,7 +72,7 @@ pub struct OntologyClass {
 /// A typed, directed relation between two classes. `inverse` names the relation
 /// that holds in the opposite direction (empty when none); `transitive` is
 /// durable metadata consumed by later reasoning work (#143).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyRelation {
     pub name: String,
     #[serde(default)]

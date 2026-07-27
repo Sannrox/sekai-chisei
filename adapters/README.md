@@ -9,6 +9,10 @@ the Sekai core:
 - `evidence_http_health_poll` performs one bounded HTTP GET against a health
   endpoint and translates the response into expiring operational-health
   evidence.
+- `evidence_ontology_concept_catalog` maps one structured concept-catalog
+  document into `ontology.concept_catalog` evidence for governed
+  ontology-definition proposals (#147). Extraction and review stay in Sekai
+  core; the adapter never mutates definitions.
 
 Both use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
 the content digest and replay key, persist the exact delivery in a durable local
@@ -50,6 +54,16 @@ The health adapter uses evidence type `operations.health_snapshot` and schema
 
 ```sh
 cargo run --example evidence_http_health_poll
+```
+
+The concept-catalog adapter uses evidence type `ontology.concept_catalog` and
+schema `adapter.ontology.concept_catalog@1.0.0`. After admission, ontology
+admins call `ProposeOntologyDefinitions` (prefer `dry_run=true` first) and
+`ReviewOntologyDefinitionProposal`:
+
+```sh
+cargo run --example evidence_ontology_concept_catalog \
+  < adapters/fixtures/ontology_concept_catalog.service.json
 ```
 
 Conformance fixtures live in `adapters/fixtures/` and run without network access
