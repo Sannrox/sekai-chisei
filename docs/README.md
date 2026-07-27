@@ -100,6 +100,8 @@ in order.
 - [Non-authoritative scenario overlay](scenario-overlay.md) — request-scoped
   hypothesis deltas and domain-neutral impact projection (#362).
 - [Gateway PEP fat-decide freeze](research/163-gateway-pep-fat-decide.md)
+- [Core product interface vs full platform RPC surface](research/383-core-product-interface.md)
+  — core map, tiers, type-system reduction, shrink shortlist (#383).
 - [Provider and data-class residency](residency-policy.md)
   — model/provider residency policy (#289); research:
   [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
