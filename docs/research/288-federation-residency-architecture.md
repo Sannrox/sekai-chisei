@@ -75,9 +75,9 @@ contract, then multi-region consistency research/features.
 | 1 | **#289** provider + data-class residency enforcement | Single plane: fail closed before upstream; policy pins on model/provider/data class |
 | 2 | **#290** cross-site attestation verify/import | Import attested artifacts; no remote write |
 | 3 | **#291** multi-control-plane federation contract | Wire contract for site identity, pack exchange, verify-only API |
-| 4 | **#292** multi-region consistency research | Budgets/leases/permits under lag (design freeze before #293/#294) |
-| 5 | **#293** region-pinned leases/permits | Explicit redeem authority |
-| 6 | **#294** multi-region budget topology | Single writer per budget scope |
+| 4 | **#292** multi-region consistency research | **Closed freeze:** [292-multi-region-consistency.md](292-multi-region-consistency.md) |
+| 5 | **#293** region-pinned leases/permits | Explicit redeem authority (pinned single writer) |
+| 6 | **#294** multi-region budget topology | Single writer per budget scope + optional transfer |
 
 ### Single-plane residency (#289) freeze sketch
 
@@ -116,4 +116,6 @@ auto on a remote revision without local promote + local opt-in.
 Adopt **regional write authorities + verify-only federation** with
 **single-plane residency first**. Existing Issues #289–#294 are the correct
 sequence; no further research is required before implementing #289 under this
-freeze. #292 remains the gate before multi-region lease/budget features.
+freeze. Multi-region lease/budget design is frozen in
+[292-multi-region-consistency.md](292-multi-region-consistency.md); implement
+#293 then #294 against that freeze.

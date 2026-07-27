@@ -5,6 +5,11 @@ logical key. Acquire returns both a monotonically increasing `generation` and
 a unique `fencing_token`. Release keeps the key and its audit history, so a
 later acquire creates a new generation rather than reusing an object identity.
 
+Multi-region write topology is out of scope for the current single-region
+lease store. The design freeze for region/site pins and fail-closed foreign
+pins is [research/292-multi-region-consistency.md](research/292-multi-region-consistency.md)
+(implementation: #293).
+
 ## Object-bound lease keys
 
 To coordinate mutations against an **existing object** without letting unrelated
