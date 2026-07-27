@@ -51,9 +51,10 @@ two `PostgresDb` pools against one `SEKAI_TEST_POSTGRES_URL` when available
 
 ## Non-goals
 
-- Multi-region topology (design freeze:
-  [research/292-multi-region-consistency.md](research/292-multi-region-consistency.md);
-  implementation #293–#294)
+- Multi-region **active/active global SC** ledgers (rejected; design freeze:
+  [research/292-multi-region-consistency.md](research/292-multi-region-consistency.md))
+- Multi-region budget topology modes are documented in
+  [budget-topology.md](budget-topology.md) (#294); leases/permits pins in #293
 - Tenant quotas (#119)
 - Managed HA packaging
 - Exactly-once external side effects beyond the control plane

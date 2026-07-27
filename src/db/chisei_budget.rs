@@ -8,6 +8,21 @@ use crate::db::sekai::SekaiDb;
 pub const METRIC_TOKENS: &str = "tokens";
 pub const METRIC_REQUESTS: &str = "requests";
 
+/// Durable result of an audited budget capacity transfer (#294).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetTransferRecord {
+    pub transfer_id: String,
+    pub metric: String,
+    pub pool_id: String,
+    pub from_scope_id: String,
+    pub to_scope_id: String,
+    pub amount: i64,
+    pub actor: String,
+    pub status: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
 /// Root of every budget scope chain. A bare `global` limit applies to every
 /// scope in the system; leaving it unset preserves today's "no limit = allow"
 /// behavior at that level.
@@ -117,6 +132,8 @@ impl SekaiDb {
                 parent_scope_id TEXT NOT NULL DEFAULT '',
                 max_amount INTEGER NOT NULL,
                 period_type TEXT NOT NULL,
+                home_site_id TEXT NOT NULL DEFAULT '',
+                pool_id TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (scope_id, metric)
             );
             CREATE TABLE IF NOT EXISTS chisei_budget_usage (
@@ -140,9 +157,36 @@ impl SekaiDb {
                 period_start INTEGER NOT NULL,
                 amount_used INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (source_scope_id, applied_scope_id, metric, period_start)
+            );
+            CREATE TABLE IF NOT EXISTS chisei_budget_pools (
+                pool_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                max_amount INTEGER NOT NULL,
+                period_type TEXT NOT NULL DEFAULT 'daily',
+                PRIMARY KEY (pool_id, metric)
+            );
+            CREATE TABLE IF NOT EXISTS chisei_budget_transfers (
+                transfer_id TEXT PRIMARY KEY,
+                metric TEXT NOT NULL,
+                pool_id TEXT NOT NULL DEFAULT '',
+                from_scope_id TEXT NOT NULL,
+                to_scope_id TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
             );",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // Forward-compatible columns for databases created before #294.
+        for ddl in [
+            "ALTER TABLE chisei_budget_limits ADD COLUMN home_site_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE chisei_budget_limits ADD COLUMN pool_id TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(ddl, []);
+        }
+        Ok(())
     }
 
     pub(crate) fn budget_set_limit(
@@ -152,19 +196,81 @@ impl SekaiDb {
         max_amount: i64,
         period_type: &str,
     ) -> Result<(), String> {
-        let conn = self.conn();
+        self.budget_set_limit_scoped(scope_id, metric, max_amount, period_type, "", "")
+    }
+
+    pub(crate) fn budget_set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String> {
+        if max_amount < 0 {
+            return Err("budget max_amount must be non-negative".into());
+        }
+        let mut conn = self.conn();
         let parent = parent_scope_id(scope_id);
-        conn.execute(
-            "INSERT INTO chisei_budget_limits (scope_id, metric, parent_scope_id, max_amount, period_type)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO chisei_budget_limits
+                (scope_id, metric, parent_scope_id, max_amount, period_type, home_site_id, pool_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(scope_id, metric) DO UPDATE SET
                 parent_scope_id = excluded.parent_scope_id,
                 max_amount = excluded.max_amount,
-                period_type = excluded.period_type",
-            params![scope_id, metric, parent, max_amount, period_type],
+                period_type = excluded.period_type,
+                home_site_id = excluded.home_site_id,
+                pool_id = excluded.pool_id",
+            params![
+                scope_id,
+                metric,
+                parent,
+                max_amount,
+                period_type,
+                home_site_id,
+                pool_id
+            ],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        if !pool_id.is_empty() {
+            enforce_pool_member_sum(&tx, pool_id, metric)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn budget_set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period_type: &str,
+    ) -> Result<(), String> {
+        if pool_id.trim().is_empty() {
+            return Err("pool_id required".into());
+        }
+        if max_amount < 0 {
+            return Err("pool max_amount must be non-negative".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO chisei_budget_pools (pool_id, metric, max_amount, period_type)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(pool_id, metric) DO UPDATE SET
+                max_amount = excluded.max_amount,
+                period_type = excluded.period_type",
+            params![pool_id, metric, max_amount, period_type],
+        )
+        .map_err(|e| e.to_string())?;
+        enforce_pool_member_sum(&tx, pool_id, metric)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Checks every bounded level of `scope_id`'s ancestor chain for headroom
@@ -180,7 +286,9 @@ impl SekaiDb {
         amount: i64,
         now_ms: i64,
     ) -> Result<(), String> {
-        self.budget_check_and_reserve_chain_inner(scope_id, metric, amount, now_ms, None)
+        self.budget_check_and_reserve_chain_inner(
+            scope_id, metric, amount, now_ms, None, false, "", false,
+        )
     }
 
     pub(crate) fn budget_check_and_reserve_chain_idempotent(
@@ -197,9 +305,37 @@ impl SekaiDb {
             amount,
             now_ms,
             Some(idempotency_key),
+            false,
+            "",
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn budget_check_and_reserve_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
+    ) -> Result<(), String> {
+        self.budget_check_and_reserve_chain_inner(
+            scope_id,
+            metric,
+            amount,
+            now_ms,
+            idempotency_key,
+            require_home_pin,
+            local_site_id,
+            partition_simulated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn budget_check_and_reserve_chain_inner(
         &self,
         scope_id: &str,
@@ -207,7 +343,11 @@ impl SekaiDb {
         amount: i64,
         now_ms: i64,
         idempotency_key: Option<&str>,
+        require_home_pin: bool,
+        local_site_id: &str,
+        partition_simulated: bool,
     ) -> Result<(), String> {
+        let _ = partition_simulated; // local limits already bound combined ceiling under split
         let chain = scope_chain(scope_id);
         let mut conn = self.conn();
         let transaction = conn
@@ -237,17 +377,21 @@ impl SekaiDb {
             }
         }
         for scope in &chain {
-            let limit: Option<(i64, String)> = transaction
+            let limit: Option<(i64, String, String, String)> = transaction
                 .query_row(
-                    "SELECT max_amount, period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                    "SELECT max_amount, period_type, home_site_id, pool_id
+                     FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                     params![scope, metric],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let Some((max_amount, period_type)) = limit else {
+            let Some((max_amount, period_type, home_site_id, _pool_id)) = limit else {
                 continue;
             };
+            if require_home_pin {
+                assert_home_pin(scope, &home_site_id, local_site_id)?;
+            }
             let period_start = period_start_ms(&period_type, now_ms);
             let used: i64 = transaction
                 .query_row(
@@ -307,20 +451,38 @@ impl SekaiDb {
         amount: i64,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.budget_check_chain_for_site(scope_id, metric, amount, now_ms, false, "", false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn budget_check_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        amount: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+        _partition_simulated: bool,
+    ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
         let conn = self.conn();
         for scope in &chain {
-            let limit: Option<(i64, String)> = conn
+            let limit: Option<(i64, String, String)> = conn
                 .query_row(
-                    "SELECT max_amount, period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                    "SELECT max_amount, period_type, home_site_id
+                     FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                     params![scope, metric],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let Some((max_amount, period_type)) = limit else {
+            let Some((max_amount, period_type, home_site_id)) = limit else {
                 continue;
             };
+            if require_home_pin {
+                assert_home_pin(scope, &home_site_id, local_site_id)?;
+            }
             let period_start = period_start_ms(&period_type, now_ms);
             let used: i64 = conn
                 .query_row(
@@ -340,6 +502,30 @@ impl SekaiDb {
         Ok(())
     }
 
+    pub(crate) fn budget_assert_home_writable(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        local_site_id: &str,
+    ) -> Result<(), String> {
+        let chain = scope_chain(scope_id);
+        let conn = self.conn();
+        for scope in &chain {
+            let home: Option<String> = conn
+                .query_row(
+                    "SELECT home_site_id FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                    params![scope, metric],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(home_site_id) = home {
+                assert_home_pin(scope, &home_site_id, local_site_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Applies `delta` (positive or negative, floored at 0) to every level of
     /// `scope_id`'s ancestor chain — used both for plain usage recording and
     /// for reconciling an earlier reservation to actual usage.
@@ -350,8 +536,35 @@ impl SekaiDb {
         delta: i64,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.budget_adjust_chain_for_site(scope_id, metric, delta, now_ms, false, "")
+    }
+
+    pub(crate) fn budget_adjust_chain_for_site(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        delta: i64,
+        now_ms: i64,
+        require_home_pin: bool,
+        local_site_id: &str,
+    ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
         let conn = self.conn();
+        if require_home_pin && delta > 0 {
+            for scope in &chain {
+                let home: Option<String> = conn
+                    .query_row(
+                        "SELECT home_site_id FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+                        params![scope, metric],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if let Some(home_site_id) = home {
+                    assert_home_pin(scope, &home_site_id, local_site_id)?;
+                }
+            }
+        }
         for scope in &chain {
             let period_type = conn
                 .query_row(
@@ -391,6 +604,176 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn budget_transfer_capacity(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String> {
+        if transfer_id.trim().is_empty() {
+            return Err("transfer_id required".into());
+        }
+        if amount <= 0 {
+            return Err("transfer amount must be positive".into());
+        }
+        if from_scope_id == to_scope_id {
+            return Err("transfer from_scope and to_scope must differ".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if let Some(existing) = load_transfer_tx(&tx, transfer_id)? {
+            if existing.from_scope_id != from_scope_id
+                || existing.to_scope_id != to_scope_id
+                || existing.amount != amount
+                || existing.metric != metric
+            {
+                return Err("transfer_id was already used for a different budget transfer".into());
+            }
+            if existing.status != "completed" {
+                return Err(format!(
+                    "transfer_id already recorded with status {}",
+                    existing.status
+                ));
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(existing);
+        }
+
+        let from = load_limit_row_tx(&tx, from_scope_id, metric)?
+            .ok_or_else(|| format!("from scope limit not found: {from_scope_id}"))?;
+        let to = load_limit_row_tx(&tx, to_scope_id, metric)?
+            .ok_or_else(|| format!("to scope limit not found: {to_scope_id}"))?;
+        if from.pool_id.is_empty() || from.pool_id != to.pool_id {
+            return Err(
+                "budget transfer requires both scopes to share the same non-empty pool_id".into(),
+            );
+        }
+        let period_start = period_start_ms(&from.period_type, now_ms);
+        let used_from: i64 = tx
+            .query_row(
+                "SELECT amount_used FROM chisei_budget_usage
+                 WHERE scope_id=?1 AND metric=?2 AND period_start=?3",
+                params![from_scope_id, metric, period_start],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        let available = from.max_amount - used_from;
+        if amount > available {
+            return Err(format!(
+                "insufficient transferable capacity at {from_scope_id}: available {available} < {amount}"
+            ));
+        }
+        let new_from = from.max_amount - amount;
+        let new_to = to.max_amount + amount;
+        tx.execute(
+            "UPDATE chisei_budget_limits SET max_amount=?1 WHERE scope_id=?2 AND metric=?3",
+            params![new_from, from_scope_id, metric],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE chisei_budget_limits SET max_amount=?1 WHERE scope_id=?2 AND metric=?3",
+            params![new_to, to_scope_id, metric],
+        )
+        .map_err(|e| e.to_string())?;
+        enforce_pool_member_sum(&tx, &from.pool_id, metric)?;
+        let record = BudgetTransferRecord {
+            transfer_id: transfer_id.to_string(),
+            metric: metric.to_string(),
+            pool_id: from.pool_id.clone(),
+            from_scope_id: from_scope_id.to_string(),
+            to_scope_id: to_scope_id.to_string(),
+            amount,
+            actor: actor.to_string(),
+            status: "completed".into(),
+            reason: String::new(),
+            created_at: now_ms,
+        };
+        insert_transfer_tx(&tx, &record)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn budget_record_transfer_refused(
+        &self,
+        transfer_id: &str,
+        metric: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<BudgetTransferRecord, String> {
+        if transfer_id.trim().is_empty() {
+            return Err("transfer_id required".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if let Some(existing) = load_transfer_tx(&tx, transfer_id)? {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(existing);
+        }
+        let pool_id = load_limit_row_tx(&tx, from_scope_id, metric)?
+            .map(|row| row.pool_id)
+            .unwrap_or_default();
+        let record = BudgetTransferRecord {
+            transfer_id: transfer_id.to_string(),
+            metric: metric.to_string(),
+            pool_id,
+            from_scope_id: from_scope_id.to_string(),
+            to_scope_id: to_scope_id.to_string(),
+            amount,
+            actor: actor.to_string(),
+            status: "refused".into(),
+            reason: reason.to_string(),
+            created_at: now_ms,
+        };
+        insert_transfer_tx(&tx, &record)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(record)
+    }
+
+    pub(crate) fn budget_get_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<BudgetTransferRecord>, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT transfer_id, metric, pool_id, from_scope_id, to_scope_id, amount,
+                    actor, status, reason, created_at
+             FROM chisei_budget_transfers WHERE transfer_id=?1",
+            params![transfer_id],
+            |row| {
+                Ok(BudgetTransferRecord {
+                    transfer_id: row.get(0)?,
+                    metric: row.get(1)?,
+                    pool_id: row.get(2)?,
+                    from_scope_id: row.get(3)?,
+                    to_scope_id: row.get(4)?,
+                    amount: row.get(5)?,
+                    actor: row.get(6)?,
+                    status: row.get(7)?,
+                    reason: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
     }
 
     /// Applies a usage delta once for a stable caller-generated key. The event
@@ -574,6 +957,139 @@ impl SekaiDb {
         }
         Ok(worst)
     }
+}
+
+struct LimitRow {
+    max_amount: i64,
+    period_type: String,
+    #[allow(dead_code)]
+    home_site_id: String,
+    pool_id: String,
+}
+
+fn assert_home_pin(scope: &str, home_site_id: &str, local_site_id: &str) -> Result<(), String> {
+    if home_site_id.is_empty() {
+        return Ok(());
+    }
+    if local_site_id.is_empty() {
+        return Err(format!(
+            "budget scope {scope} is home-pinned to {home_site_id} but local site_id is unset"
+        ));
+    }
+    if home_site_id != local_site_id {
+        return Err(format!(
+            "budget scope {scope} is pinned to home site {home_site_id}; local site is {local_site_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_pool_member_sum(
+    tx: &rusqlite::Transaction<'_>,
+    pool_id: &str,
+    metric: &str,
+) -> Result<(), String> {
+    let ceiling: Option<i64> = tx
+        .query_row(
+            "SELECT max_amount FROM chisei_budget_pools WHERE pool_id=?1 AND metric=?2",
+            params![pool_id, metric],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(ceiling) = ceiling else {
+        return Ok(());
+    };
+    let sum: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(max_amount), 0) FROM chisei_budget_limits
+             WHERE pool_id=?1 AND metric=?2",
+            params![pool_id, metric],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if sum > ceiling {
+        return Err(format!(
+            "pool {pool_id} member limits sum {sum} exceeds combined ceiling {ceiling}"
+        ));
+    }
+    Ok(())
+}
+
+fn load_limit_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+    metric: &str,
+) -> Result<Option<LimitRow>, String> {
+    tx.query_row(
+        "SELECT max_amount, period_type, home_site_id, pool_id
+         FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
+        params![scope_id, metric],
+        |row| {
+            Ok(LimitRow {
+                max_amount: row.get(0)?,
+                period_type: row.get(1)?,
+                home_site_id: row.get(2)?,
+                pool_id: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn load_transfer_tx(
+    tx: &rusqlite::Transaction<'_>,
+    transfer_id: &str,
+) -> Result<Option<BudgetTransferRecord>, String> {
+    tx.query_row(
+        "SELECT transfer_id, metric, pool_id, from_scope_id, to_scope_id, amount,
+                actor, status, reason, created_at
+         FROM chisei_budget_transfers WHERE transfer_id=?1",
+        params![transfer_id],
+        |row| {
+            Ok(BudgetTransferRecord {
+                transfer_id: row.get(0)?,
+                metric: row.get(1)?,
+                pool_id: row.get(2)?,
+                from_scope_id: row.get(3)?,
+                to_scope_id: row.get(4)?,
+                amount: row.get(5)?,
+                actor: row.get(6)?,
+                status: row.get(7)?,
+                reason: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn insert_transfer_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &BudgetTransferRecord,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO chisei_budget_transfers
+            (transfer_id, metric, pool_id, from_scope_id, to_scope_id, amount,
+             actor, status, reason, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            record.transfer_id,
+            record.metric,
+            record.pool_id,
+            record.from_scope_id,
+            record.to_scope_id,
+            record.amount,
+            record.actor,
+            record.status,
+            record.reason,
+            record.created_at,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Backend-neutral budget persistence used by dual-backend conformance.

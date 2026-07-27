@@ -10201,6 +10201,7 @@ mod tests {
             permit_signing_key: Some("07".repeat(32)),
             permit_issuer: "issuer:test".into(),
             permit_key_id: "key-1".into(),
+            budget_topology: Default::default(),
         }
     }
 

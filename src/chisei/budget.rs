@@ -1,9 +1,109 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
+use crate::sekai::audit::Decision;
+
+pub use crate::db::chisei_budget::BudgetTransferRecord;
+
+/// Operator-visible multi-region budget topology (#294).
+///
+/// `active_active_global_sc` is intentionally **not** a supported mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetTopologyMode {
+    /// Single shared store / single site (default). Today's chain reserve.
+    #[default]
+    SingleRegion,
+    /// Per-scope home site pins; foreign pin fails closed; no transfer.
+    RegionalPinned,
+    /// Regional homes plus rare audited transfer of limit capacity for pools.
+    RegionalWithTransfer,
+}
+
+impl BudgetTopologyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleRegion => "single_region",
+            Self::RegionalPinned => "regional_pinned",
+            Self::RegionalWithTransfer => "regional_with_transfer",
+        }
+    }
+
+    /// Parse config values. Unknown / rejected modes (including global SC) err.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "single_region" | "single-region" | "single" => Ok(Self::SingleRegion),
+            "regional_pinned" | "regional-pinned" | "pinned" => Ok(Self::RegionalPinned),
+            "regional_with_transfer" | "regional-with-transfer" | "transfer" => {
+                Ok(Self::RegionalWithTransfer)
+            }
+            "active_active_global_sc" | "global_sc" | "active_active" => Err(
+                "budget topology active_active_global_sc is not supported; use single_region, regional_pinned, or regional_with_transfer"
+                    .into(),
+            ),
+            other => Err(format!(
+                "unsupported budget topology mode '{other}'; expected single_region, regional_pinned, or regional_with_transfer"
+            )),
+        }
+    }
+
+    pub fn requires_home_pin(self) -> bool {
+        !matches!(self, Self::SingleRegion)
+    }
+
+    pub fn allows_transfer(self) -> bool {
+        matches!(self, Self::RegionalWithTransfer)
+    }
+}
+
+/// Process-local budget authority topology settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BudgetTopologyConfig {
+    pub mode: BudgetTopologyMode,
+    /// Local site identity used for home-pin checks (independent of #293).
+    pub site_id: String,
+    /// When true, refuse transfers and any debit that cannot prove pooled ceilings.
+    pub partition_simulated: bool,
+}
+
+impl BudgetTopologyConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let mode_raw = std::env::var("SEKAI_BUDGET_TOPOLOGY")
+            .or_else(|_| std::env::var("BUDGET_TOPOLOGY_MODE"))
+            .unwrap_or_default();
+        let mode = BudgetTopologyMode::parse(&mode_raw)?;
+        let site_id = std::env::var("SEKAI_BUDGET_SITE_ID")
+            .or_else(|_| std::env::var("BUDGET_SITE_ID"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let partition_simulated = matches!(
+            std::env::var("SEKAI_BUDGET_PARTITION_SIMULATED")
+                .unwrap_or_default()
+                .trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES"
+        );
+        if mode.requires_home_pin() && site_id.is_empty() {
+            return Err(
+                "SEKAI_BUDGET_SITE_ID (or BUDGET_SITE_ID) is required when budget topology is regional_pinned or regional_with_transfer"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            mode,
+            site_id,
+            partition_simulated,
+        })
+    }
+
+    pub fn single_region() -> Self {
+        Self::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PeriodType {
@@ -86,13 +186,37 @@ fn now_ms() -> i64 {
 /// unset `global` root) or a `/`-joined hierarchical id such as
 /// `project:p/agent:a/work_unit:w`, whose ancestors (`global`, `project:p`,
 /// `project:p/agent:a`) are all checked and deducted together atomically.
+///
+/// Gateway preflight (`CheckBudget`), fat-decide budget admission, and
+/// auto-allocation paths that share this tracker all hit the **same** store
+/// APIs — there is no process-local or region-shadow ledger for durable spend.
 pub struct BudgetTracker {
     db: Arc<RuntimeDb>,
+    topology: BudgetTopologyConfig,
 }
 
 impl BudgetTracker {
     pub fn new(db: Arc<RuntimeDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            topology: BudgetTopologyConfig::single_region(),
+        }
+    }
+
+    pub fn with_topology(db: Arc<RuntimeDb>, topology: BudgetTopologyConfig) -> Self {
+        Self { db, topology }
+    }
+
+    pub fn topology(&self) -> &BudgetTopologyConfig {
+        &self.topology
+    }
+
+    fn require_home_pin(&self) -> bool {
+        self.topology.mode.requires_home_pin()
+    }
+
+    fn local_site_id(&self) -> &str {
+        &self.topology.site_id
     }
 
     pub fn set_limit(
@@ -111,11 +235,57 @@ impl BudgetTracker {
         max_tokens: i32,
         period: PeriodType,
     ) -> Result<(), String> {
+        self.set_limit_scoped(scope_id, metric, max_tokens, period, "", "")
+    }
+
+    /// Set a scope limit with optional home site pin and pool membership.
+    ///
+    /// `home_site_id` is required for durable multi-region pins under
+    /// `regional_pinned` / `regional_with_transfer`. `pool_id` groups scopes
+    /// under a combined ceiling enforced by
+    /// [`Self::set_pool_ceiling`] + transfer invariants.
+    pub fn set_limit_scoped(
+        &self,
+        scope_id: &str,
+        metric: &str,
+        max_tokens: i32,
+        period: PeriodType,
+        home_site_id: &str,
+        pool_id: &str,
+    ) -> Result<(), String> {
+        let home = if home_site_id.trim().is_empty() && self.require_home_pin() {
+            self.local_site_id()
+        } else {
+            home_site_id.trim()
+        };
         self.db
-            .budget_set_limit(scope_id, metric, max_tokens as i64, period.as_str())
+            .budget_set_limit_scoped(
+                scope_id,
+                metric,
+                max_tokens as i64,
+                period.as_str(),
+                home,
+                pool_id.trim(),
+            )
             .inspect_err(
                 |err| tracing::error!(error = %err, scope_id, "failed to persist budget limit"),
             )
+    }
+
+    /// Declare a pooled combined ceiling for scopes sharing `pool_id`.
+    pub fn set_pool_ceiling(
+        &self,
+        pool_id: &str,
+        metric: &str,
+        max_amount: i64,
+        period: PeriodType,
+    ) -> Result<(), String> {
+        if !self.topology.mode.allows_transfer() && self.topology.mode.requires_home_pin() {
+            // regional_pinned may still declare independent regional ceilings
+            // without a shared pool; pool ceilings are for transfer topology.
+        }
+        self.db
+            .budget_set_pool_ceiling(pool_id, metric, max_amount, period.as_str())
     }
 
     pub fn check(&self, scope_id: &str, estimated: i32) -> Result<(), String> {
@@ -128,8 +298,15 @@ impl BudgetTracker {
         estimated: i32,
         metric: &str,
     ) -> Result<(), String> {
-        self.db
-            .budget_check_chain(scope_id, metric, estimated as i64, now_ms())
+        self.db.budget_check_chain_for_site(
+            scope_id,
+            metric,
+            estimated as i64,
+            now_ms(),
+            self.require_home_pin(),
+            self.local_site_id(),
+            self.topology.partition_simulated,
+        )
     }
 
     /// Atomically checks budget headroom across the whole ancestor chain and
@@ -144,8 +321,16 @@ impl BudgetTracker {
         estimated: i32,
         metric: &str,
     ) -> Result<(), String> {
-        self.db
-            .budget_check_and_reserve_chain(scope_id, metric, estimated as i64, now_ms())
+        self.db.budget_check_and_reserve_chain_for_site(
+            scope_id,
+            metric,
+            estimated as i64,
+            now_ms(),
+            None,
+            self.require_home_pin(),
+            self.local_site_id(),
+            self.topology.partition_simulated,
+        )
     }
 
     pub fn check_and_reserve_idempotent(
@@ -154,13 +339,104 @@ impl BudgetTracker {
         estimated: i32,
         idempotency_key: &str,
     ) -> Result<(), String> {
-        self.db.budget_check_and_reserve_chain_idempotent(
+        self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             METRIC_TOKENS,
             i64::from(estimated),
             now_ms(),
-            idempotency_key,
+            Some(idempotency_key),
+            self.require_home_pin(),
+            self.local_site_id(),
+            self.topology.partition_simulated,
         )
+    }
+
+    /// Rare audited movement of **limit capacity** between scope homes.
+    /// Not a 2PC on live request traffic — only for `regional_with_transfer`.
+    pub fn transfer_capacity(
+        &self,
+        transfer_id: &str,
+        from_scope_id: &str,
+        to_scope_id: &str,
+        amount: i64,
+        metric: &str,
+        actor: &str,
+    ) -> Result<BudgetTransferRecord, String> {
+        if !self.topology.mode.allows_transfer() {
+            return Err(format!(
+                "budget transfer requires regional_with_transfer topology (current={})",
+                self.topology.mode.as_str()
+            ));
+        }
+        if self.topology.partition_simulated {
+            let had = self.db.budget_get_transfer(transfer_id)?.is_some();
+            let refused = self.db.budget_record_transfer_refused(
+                transfer_id,
+                metric,
+                from_scope_id,
+                to_scope_id,
+                amount,
+                actor,
+                "partition_simulated: transfer refused fail-closed",
+                now_ms(),
+            )?;
+            if !had {
+                self.audit_transfer(&refused, actor)?;
+            }
+            return Err(format!(
+                "budget transfer refused under partition: {}",
+                refused.reason
+            ));
+        }
+        let had = self.db.budget_get_transfer(transfer_id)?.is_some();
+        let record = self.db.budget_transfer_capacity(
+            transfer_id,
+            metric,
+            from_scope_id,
+            to_scope_id,
+            amount,
+            actor,
+            now_ms(),
+        )?;
+        if !had {
+            self.audit_transfer(&record, actor)?;
+        }
+        Ok(record)
+    }
+
+    pub fn get_transfer(&self, transfer_id: &str) -> Result<Option<BudgetTransferRecord>, String> {
+        self.db.budget_get_transfer(transfer_id)
+    }
+
+    fn audit_transfer(&self, record: &BudgetTransferRecord, actor: &str) -> Result<(), String> {
+        let mut evidence = HashMap::new();
+        evidence.insert("transfer_id".into(), record.transfer_id.clone());
+        evidence.insert("metric".into(), record.metric.clone());
+        evidence.insert("pool_id".into(), record.pool_id.clone());
+        evidence.insert("from_scope_id".into(), record.from_scope_id.clone());
+        evidence.insert("to_scope_id".into(), record.to_scope_id.clone());
+        evidence.insert("amount".into(), record.amount.to_string());
+        evidence.insert("status".into(), record.status.clone());
+        evidence.insert("topology".into(), self.topology.mode.as_str().into());
+        evidence.insert("site_id".into(), self.topology.site_id.clone());
+        if !record.reason.is_empty() {
+            evidence.insert("reason".into(), record.reason.clone());
+        }
+        let decision = Decision {
+            id: format!("budget-transfer:{}", record.transfer_id),
+            timestamp: record.created_at,
+            actor: actor.to_string(),
+            action: "budget.transfer".into(),
+            reason: if record.status == "completed" {
+                "audited budget capacity transfer".into()
+            } else {
+                format!("budget transfer {}", record.status)
+            },
+            evidence,
+            target_id: record.from_scope_id.clone(),
+            outcome: record.status.clone(),
+        };
+        self.db.record_decision(&decision)
     }
 
     /// Adjust reservation to actual usage after the call completes.
@@ -170,10 +446,14 @@ impl BudgetTracker {
 
     pub fn adjust_with_metric(&self, scope_id: &str, reserved: i32, actual: i32, metric: &str) {
         let delta = actual as i64 - reserved as i64;
-        if let Err(err) = self
-            .db
-            .budget_adjust_chain(scope_id, metric, delta, now_ms())
-        {
+        if let Err(err) = self.db.budget_adjust_chain_for_site(
+            scope_id,
+            metric,
+            delta,
+            now_ms(),
+            self.require_home_pin(),
+            self.local_site_id(),
+        ) {
             tracing::error!(error = %err, scope_id, "failed to adjust budget usage");
         }
     }
@@ -183,10 +463,14 @@ impl BudgetTracker {
     }
 
     pub fn record_with_metric(&self, scope_id: &str, amount: i32, metric: &str) {
-        if let Err(err) = self
-            .db
-            .budget_adjust_chain(scope_id, metric, amount as i64, now_ms())
-        {
+        if let Err(err) = self.db.budget_adjust_chain_for_site(
+            scope_id,
+            metric,
+            amount as i64,
+            now_ms(),
+            self.require_home_pin(),
+            self.local_site_id(),
+        ) {
             tracing::error!(error = %err, scope_id, "failed to record budget usage");
         }
     }
@@ -198,6 +482,12 @@ impl BudgetTracker {
         metric: &str,
         idempotency_key: &str,
     ) -> Result<bool, String> {
+        // Idempotent record still goes through the shared store; pin is
+        // enforced on positive debits of limited scopes.
+        if amount > 0 && self.require_home_pin() {
+            self.db
+                .budget_assert_home_writable(scope_id, metric, self.local_site_id())?;
+        }
         self.db.budget_record_idempotent(
             scope_id,
             metric,
@@ -314,6 +604,284 @@ mod tests {
         BudgetTracker::new(Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
             SekaiDb::new(":memory:").unwrap(),
         ))))
+    }
+
+    fn tracker_with(topology: BudgetTopologyConfig) -> BudgetTracker {
+        BudgetTracker::with_topology(
+            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+                SekaiDb::new(":memory:").unwrap(),
+            ))),
+            topology,
+        )
+    }
+
+    #[test]
+    fn topology_default_is_single_region() {
+        let t = tracker();
+        assert_eq!(t.topology().mode, BudgetTopologyMode::SingleRegion);
+        assert!(!t.topology().mode.requires_home_pin());
+        assert!(!t.topology().mode.allows_transfer());
+    }
+
+    #[test]
+    fn topology_parse_rejects_global_sc() {
+        assert!(BudgetTopologyMode::parse("active_active_global_sc").is_err());
+        assert!(BudgetTopologyMode::parse("global_sc").is_err());
+        assert_eq!(
+            BudgetTopologyMode::parse("single_region").unwrap(),
+            BudgetTopologyMode::SingleRegion
+        );
+        assert_eq!(
+            BudgetTopologyMode::parse("regional_with_transfer").unwrap(),
+            BudgetTopologyMode::RegionalWithTransfer
+        );
+    }
+
+    #[test]
+    fn foreign_home_pin_fails_closed_on_reserve() {
+        let t = tracker_with(BudgetTopologyConfig {
+            mode: BudgetTopologyMode::RegionalPinned,
+            site_id: "us-east".into(),
+            partition_simulated: false,
+        });
+        t.set_limit_scoped(
+            "region:eu",
+            METRIC_TOKENS,
+            100,
+            PeriodType::Daily,
+            "eu-west",
+            "",
+        )
+        .unwrap();
+        let err = t.check_and_reserve("region:eu", 10).unwrap_err();
+        assert!(
+            err.contains("pinned") || err.contains("home"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn regional_with_transfer_partition_cannot_overspend_combined_ceiling() {
+        // Combined pool ceiling 100, pre-split us=60 / eu=40. Under partition,
+        // each home can only spend its local allocation; total ≤ 100.
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let us = BudgetTracker::with_topology(
+            db.clone(),
+            BudgetTopologyConfig {
+                mode: BudgetTopologyMode::RegionalWithTransfer,
+                site_id: "us-east".into(),
+                partition_simulated: true,
+            },
+        );
+        let eu = BudgetTracker::with_topology(
+            db.clone(),
+            BudgetTopologyConfig {
+                mode: BudgetTopologyMode::RegionalWithTransfer,
+                site_id: "eu-west".into(),
+                partition_simulated: true,
+            },
+        );
+        us.set_pool_ceiling("org", METRIC_TOKENS, 100, PeriodType::Daily)
+            .unwrap();
+        us.set_limit_scoped(
+            "region:us",
+            METRIC_TOKENS,
+            60,
+            PeriodType::Daily,
+            "us-east",
+            "org",
+        )
+        .unwrap();
+        eu.set_limit_scoped(
+            "region:eu",
+            METRIC_TOKENS,
+            40,
+            PeriodType::Daily,
+            "eu-west",
+            "org",
+        )
+        .unwrap();
+
+        assert!(us.check_and_reserve("region:us", 60).is_ok());
+        assert!(eu.check_and_reserve("region:eu", 40).is_ok());
+        assert!(us.check_and_reserve("region:us", 1).is_err());
+        assert!(eu.check_and_reserve("region:eu", 1).is_err());
+        // Foreign pin still fails closed under partition.
+        assert!(us.check_and_reserve("region:eu", 1).is_err());
+
+        let used_us = us.get_usage("region:us").tokens_used;
+        let used_eu = eu.get_usage("region:eu").tokens_used;
+        assert_eq!(used_us + used_eu, 100);
+        assert!(used_us + used_eu <= 100);
+
+        // Transfer refused under partition (fail closed).
+        let err = us
+            .transfer_capacity(
+                "xfer-part-1",
+                "region:us",
+                "region:eu",
+                10,
+                METRIC_TOKENS,
+                "ops",
+            )
+            .unwrap_err();
+        assert!(err.contains("partition"), "{err}");
+        let refused = us.get_transfer("xfer-part-1").unwrap().unwrap();
+        assert_eq!(refused.status, "refused");
+    }
+
+    #[test]
+    fn transfer_moves_capacity_and_is_audited_idempotent() {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let t = BudgetTracker::with_topology(
+            db.clone(),
+            BudgetTopologyConfig {
+                mode: BudgetTopologyMode::RegionalWithTransfer,
+                site_id: "us-east".into(),
+                partition_simulated: false,
+            },
+        );
+        t.set_pool_ceiling("org", METRIC_TOKENS, 100, PeriodType::Daily)
+            .unwrap();
+        t.set_limit_scoped(
+            "region:us",
+            METRIC_TOKENS,
+            100,
+            PeriodType::Daily,
+            "us-east",
+            "org",
+        )
+        .unwrap();
+        t.set_limit_scoped(
+            "region:eu",
+            METRIC_TOKENS,
+            0,
+            PeriodType::Daily,
+            "eu-west",
+            "org",
+        )
+        .unwrap();
+
+        let first = t
+            .transfer_capacity(
+                "xfer-1",
+                "region:us",
+                "region:eu",
+                40,
+                METRIC_TOKENS,
+                "operator",
+            )
+            .unwrap();
+        assert_eq!(first.status, "completed");
+        assert_eq!(first.amount, 40);
+        // Replay same transfer_id is idempotent.
+        let replay = t
+            .transfer_capacity(
+                "xfer-1",
+                "region:us",
+                "region:eu",
+                40,
+                METRIC_TOKENS,
+                "operator",
+            )
+            .unwrap();
+        assert_eq!(replay.status, "completed");
+        assert_eq!(t.get_usage("region:us").max_tokens, 60);
+        assert_eq!(t.get_usage("region:eu").max_tokens, 40);
+
+        // Audit decision recorded.
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("budget.transfer".into()),
+                target_id: Some("region:us".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decisions.iter().any(|d| d.id == "budget-transfer:xfer-1"),
+            "missing transfer audit: {decisions:?}"
+        );
+
+        // After transfer, local home can spend its remaining share only.
+        assert!(t.check_and_reserve("region:us", 60).is_ok());
+        assert!(t.check_and_reserve("region:us", 1).is_err());
+    }
+
+    #[test]
+    fn dual_home_race_against_split_limits_never_overspends_pool() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let setup = BudgetTracker::with_topology(
+            db.clone(),
+            BudgetTopologyConfig {
+                mode: BudgetTopologyMode::RegionalWithTransfer,
+                site_id: "us-east".into(),
+                partition_simulated: false,
+            },
+        );
+        setup
+            .set_pool_ceiling("org", METRIC_TOKENS, 100, PeriodType::Daily)
+            .unwrap();
+        setup
+            .set_limit_scoped(
+                "region:us",
+                METRIC_TOKENS,
+                50,
+                PeriodType::Daily,
+                "us-east",
+                "org",
+            )
+            .unwrap();
+        setup
+            .set_limit_scoped(
+                "region:eu",
+                METRIC_TOKENS,
+                50,
+                PeriodType::Daily,
+                "eu-west",
+                "org",
+            )
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(20));
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let site = if i % 2 == 0 { "us-east" } else { "eu-west" };
+                let scope = if i % 2 == 0 { "region:us" } else { "region:eu" };
+                let t = BudgetTracker::with_topology(
+                    db,
+                    BudgetTopologyConfig {
+                        mode: BudgetTopologyMode::RegionalWithTransfer,
+                        site_id: site.into(),
+                        partition_simulated: true,
+                    },
+                );
+                barrier.wait();
+                t.check_and_reserve(scope, 10).is_ok()
+            }));
+        }
+        let admitted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        // Each region admits at most 5 × 10 = 50 → combined ≤ 100.
+        assert!(admitted <= 10, "admitted {admitted}");
+        let used =
+            setup.get_usage("region:us").tokens_used + setup.get_usage("region:eu").tokens_used;
+        assert!(used <= 100, "combined used {used}");
+        assert_eq!(used, admitted as i32 * 10);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::env;
 use tracing::warn;
 
+use crate::chisei::budget::BudgetTopologyConfig;
+
 #[derive(Clone)]
 pub struct Config {
     pub grpc_port: u16,
@@ -37,6 +39,8 @@ pub struct Config {
     pub permit_signing_key: Option<String>,
     pub permit_issuer: String,
     pub permit_key_id: String,
+    /// Multi-region budget topology (#294). Default `single_region`.
+    pub budget_topology: BudgetTopologyConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +91,10 @@ impl Config {
             permit_signing_key: optional_env("CHISEI_PERMIT_SIGNING_KEY"),
             permit_issuer: env("CHISEI_PERMIT_ISSUER", "chisei.local"),
             permit_key_id: env("CHISEI_PERMIT_KEY_ID", "permit-key-1"),
+            budget_topology: BudgetTopologyConfig::from_env().unwrap_or_else(|err| {
+                warn!(error = %err, "invalid budget topology config; using single_region");
+                BudgetTopologyConfig::single_region()
+            }),
         }
     }
 
