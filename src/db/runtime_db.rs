@@ -2739,6 +2739,75 @@ impl RuntimeDb {
         }
     }
 
+    pub fn propose_ontology_definitions_from_evidence(
+        &self,
+        request: &crate::sekai::ontology_proposal::ProposeOntologyDefinitionsRequest,
+    ) -> Result<crate::sekai::ontology_proposal::ProposeOntologyDefinitionsResult, String> {
+        match self {
+            Self::Sqlite(db) => db.propose_ontology_definitions_from_evidence(request),
+            Self::Postgres(_) => Err(
+                "propose_ontology_definitions_from_evidence is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_ontology_definition_proposal(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Option<crate::sekai::ontology_proposal::OntologyDefinitionProposal>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_ontology_definition_proposal(id, version),
+            Self::Postgres(_) => Err(
+                "get_ontology_definition_proposal is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_ontology_definition_proposals(
+        &self,
+        filter: &crate::sekai::ontology_proposal::ProposalFilter,
+    ) -> Result<Vec<crate::sekai::ontology_proposal::OntologyDefinitionProposal>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_ontology_definition_proposals(filter),
+            Self::Postgres(_) => Err(
+                "list_ontology_definition_proposals is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_ontology_definition_proposal_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<crate::sekai::ontology_proposal::ProposalLifecycleEvent>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_ontology_definition_proposal_events(id, version),
+            Self::Postgres(_) => Err(
+                "list_ontology_definition_proposal_events is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn review_ontology_definition_proposal(
+        &self,
+        id: &str,
+        version: u32,
+        review: crate::sekai::ontology_proposal::OntologyProposalReview,
+    ) -> Result<crate::sekai::ontology_proposal::OntologyDefinitionProposal, String> {
+        match self {
+            Self::Sqlite(db) => db.review_ontology_definition_proposal(id, version, review),
+            Self::Postgres(_) => Err(
+                "review_ontology_definition_proposal is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn upsert_ontology_class_with_audit(
         &self,
         class: &OntologyClass,

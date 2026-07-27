@@ -97,3 +97,46 @@ This first inspection surface is intentionally not an ontology editor or a
 general administration console. See
 [ADR 0003](decisions/0003-authenticated-static-ontology-inspection.md) for the
 trust-boundary decision.
+
+## Definition proposals from external evidence
+
+Issue #147 adds a governed path from **admitted** external evidence to
+ontology-definition proposals. Production connectors stay outside core: a
+reference adapter under `adapters/ontology_concept_catalog.rs` maps one
+structured concept-catalog document into `ontology.concept_catalog` evidence.
+The core extractor `concept_catalog_v1` is deterministic and rule-based.
+
+Lifecycle:
+
+1. Admit evidence through the normal evidence funnel (capability, schema,
+   validation, projection).
+2. Call `ProposeOntologyDefinitions` with one or more admitted submission ids.
+   Set `dry_run=true` to generate proposals without writing the proposal store
+   or mutating definitions.
+3. Human review via `ReviewOntologyDefinitionProposal` with `accept`, `reject`,
+   or `supersede`. Review is authenticated, audited, and idempotent for the same
+   terminal action.
+4. **Accept** re-checks that every cited source submission is still usable and
+   digest-stable, validates the proposed class/relation/property through the
+   normal definition validators, then applies the change with the audited
+   ontology mutation path from #141. Invalid or stale proposals fail closed.
+5. **Reject** and dry-run never mutate ontology classes, relations, or graph
+   objects.
+
+Proposals store bounded source citations (`submission_id`, `content_digest`,
+source identity) plus extractor/model configuration keys, confidence, and an
+authorization-context label. Raw evidence content is not copied into proposal
+rows, lifecycle events, or audit evidence. Do not put credentials in
+`authorization_context` or review rationales.
+
+Example (after admitting the reference catalog fixture):
+
+```bash
+# dry-run first
+# ProposeOntologyDefinitions(submission_ids=[...], dry_run=true,
+#   authorization_context="ontology-review:team-alpha")
+# then persist and review accept/reject/supersede as an ontology admin
+```
+
+Instance-fact extraction remains an evidence-projection concern and is out of
+scope here.
