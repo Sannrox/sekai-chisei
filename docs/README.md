@@ -61,6 +61,8 @@ in order.
 - [Operator console information architecture](research/283-operator-console-ia.md)
 - [Lookup vs model call (S1 shipped via #281)](research/175-lookup-vs-model-call.md)
 - [Governed hybrid retrieval contract](research/152-hybrid-retrieval.md)
+- [SQLite FTS text representation and HybridCandidate](text-fts.md) — rebuildable
+  lexical projection, `text.fts5_bm25/v1`, authz re-check (#360).
 - [Semantic pattern-query surface](research/145-semantic-pattern-query.md)
 - [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
 - [Multi-control-plane federation profile v1](research/291-federation-profile.md)

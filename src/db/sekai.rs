@@ -190,6 +190,7 @@ impl SekaiDb {
         self.migrate_portfolio()?;
         self.migrate_temporal_history()?;
         self.migrate_usage_ledger()?;
+        self.migrate_text_fts()?;
         Ok(())
     }
 

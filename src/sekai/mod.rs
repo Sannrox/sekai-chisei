@@ -19,6 +19,7 @@ pub mod execution_evidence;
 pub mod federation_profile;
 pub mod function;
 pub mod handoff;
+pub mod hybrid;
 pub mod learning;
 pub mod lease;
 pub mod ledger;
@@ -42,4 +43,5 @@ pub mod skillextract;
 pub mod temporal;
 #[cfg(any())]
 pub mod tenant;
+pub mod text_fts;
 pub mod tool_bridge;

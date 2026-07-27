@@ -542,6 +542,69 @@ message RetrieveContextResponse {
   string ontology_revision = 11;
 }
 
+// Shared hybrid retrieval candidate envelope (#360 / research #152).
+// Scores are only comparable within the same score_kind. Similarity never
+// mints durable object identities; entity_kind/entity_id are set only when a
+// source of truth already asserts the identifier.
+message HybridEntityRef {
+  // object | evidence_submission | link
+  string kind = 1;
+  string id = 2;
+}
+
+message HybridAuthzContext {
+  string namespace = 1;
+  // Authenticated principal class/label used for the re-check (not a grant).
+  string principal_class = 2;
+  // Classification ceiling applied, if any.
+  string classification_ceiling = 3;
+}
+
+message HybridCandidate {
+  // e.g. text.fts5, graph.retrieve_context
+  string representation_id = 1;
+  // e.g. sqlite.text_fts5
+  string source = 2;
+  // Index generation and/or content hash, e.g. gen:3#sha256...
+  string source_version = 3;
+  double score = 4;
+  // e.g. text.fts5_bm25/v1 (higher is better for FTS BM25 as -bm25(table))
+  string score_kind = 5;
+  HybridEntityRef entity_ref = 6;
+  HybridAuthzContext authz_context = 7;
+  bool truncated = 8;
+  // Disclosed responses normally omit denied material; reserved for accounting.
+  bool denied = 9;
+}
+
+// Lexical text search over the rebuildable SQLite FTS5 projection (#360).
+// Does not perform late fusion (see #361). Authz is re-checked per hit.
+message SearchTextRequest {
+  string query = 1;
+  // Optional namespace filter; empty means all namespaces the principal may see.
+  string namespace = 2;
+  // all | evidence | object_props (empty defaults to all)
+  string source_kinds = 3;
+  // 0 defaults to 20; absolute cap is 100
+  uint32 max_candidates = 4;
+  // 0 defaults to 100; absolute cap is 1000
+  uint32 max_time_ms = 5;
+  // When true, rebuild the FTS projection from sources of truth before search.
+  bool rebuild = 6;
+}
+
+message SearchTextResponse {
+  repeated HybridCandidate candidates = 1;
+  string representation_id = 2;
+  string source_version = 3;
+  bool truncated = 4;
+  repeated string truncation_reasons = 5;
+  // Count of hits omitted after authz re-check or stale/deleted source.
+  // Never includes secret names.
+  uint32 denied_count = 6;
+  uint32 scanned = 7;
+}
+
 // Non-authoritative scenario overlay (#362 / research #148). Session is
 // request-scoped: create overlay, apply ordered hypothesis deltas, project a
 // domain-neutral impact set. Never mutates canonical objects/links/temporal
@@ -1587,6 +1650,8 @@ service SekaiService {
 
   rpc Traverse(TraverseRequest) returns (TraverseResponse);
   rpc RetrieveContext(RetrieveContextRequest) returns (RetrieveContextResponse);
+  // Lexical FTS5 text representation + HybridCandidate envelope (#360).
+  rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   // Request-scoped non-authoritative scenario overlay (#362).
   rpc EvaluateScenario(EvaluateScenarioRequest) returns (EvaluateScenarioResponse);
   rpc ResolveSemanticRef(ResolveSemanticRefRequest) returns (ResolveSemanticRefResponse);
