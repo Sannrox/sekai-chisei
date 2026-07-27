@@ -10,6 +10,8 @@
 !.agents/skills/sekai-ontology/
 !.agents/skills/shape-work-item/
 !.agents/skills/verify-change/
+!.agents/skills/technical-documentation/
+!.agents/skills/refactor-docs/
 .claude/
 data/*.db
 data/*.db-*
