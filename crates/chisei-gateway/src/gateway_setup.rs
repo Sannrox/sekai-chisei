@@ -495,6 +495,7 @@ where
             sekai
                 .update_object(gateway_request(UpdateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 }))
                 .await?;
             println!("rotated gateway key {name}");
@@ -517,6 +518,7 @@ where
             sekai
                 .update_object(gateway_request(UpdateObjectRequest {
                     object: Some(object),
+                    lease_precondition: None,
                 }))
                 .await?;
             println!("revoked gateway key {name}");
@@ -848,6 +850,7 @@ async fn upsert_object(
                 sekai
                     .update_object(gateway_request(UpdateObjectRequest {
                         object: Some(object),
+                        lease_precondition: None,
                     }))
                     .await?;
                 return Ok(());
@@ -860,6 +863,7 @@ async fn upsert_object(
     sekai
         .create_object(gateway_request(CreateObjectRequest {
             object: Some(object),
+            lease_precondition: None,
         }))
         .await?;
     Ok(())

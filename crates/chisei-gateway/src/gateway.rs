@@ -10609,6 +10609,7 @@ async fn ensure_gateway_object(
                 created: Utc::now().timestamp_millis(),
                 updated: Utc::now().timestamp_millis(),
             }),
+            lease_precondition: None,
         }))
         .await
     {

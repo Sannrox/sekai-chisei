@@ -156,6 +156,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     match sekai
         .create_object(CreateObjectRequest {
             object: Some(context_obj),
+            lease_precondition: None,
         })
         .await
     {
@@ -176,6 +177,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     match sekai
         .create_object(CreateObjectRequest {
             object: Some(service),
+            lease_precondition: None,
         })
         .await
     {

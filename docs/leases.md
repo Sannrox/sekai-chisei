@@ -17,6 +17,17 @@ matching pin and **fail closed** on a foreign site. The pin is visible on
 Cross-region handoff is a **non-goal for v1**; operators drain work in-region.
 See [region-pins.md](region-pins.md).
 
+## Product mutation path (#388)
+
+`CreateObject` / `UpdateObject` / `DeleteObject` accept an optional
+`lease_precondition`. When set, they run the same generation-fenced semantics as
+`GuardedCreateObject` / `GuardedUpdateObject` / `GuardedDeleteObject`. When
+unset, they keep the historical unguarded path.
+
+Prefer the single product family with optional `lease_precondition`. The
+`Guarded*` RPCs remain as shims (product_tier **experimental**) and require a
+precondition.
+
 ## Object-bound lease keys
 
 To coordinate mutations against an **existing object** without letting unrelated
@@ -70,8 +81,10 @@ shared dual-backend conformance (see [postgres-sekai-parity.md](postgres-sekai-p
 
 ## Lease-guarded object mutations
 
-Use `GuardedCreateObject`, `GuardedUpdateObject`, or `GuardedDeleteObject` when
-an object transition is owned by a lease generation. Each request includes a
+Prefer `CreateObject` / `UpdateObject` / `DeleteObject` with
+`lease_precondition` set (see **Product mutation path** above). The
+`GuardedCreateObject` / `GuardedUpdateObject` / `GuardedDeleteObject` RPCs remain
+as experimental shims with the same semantics. Each request includes a
 `LeasePrecondition` containing the lease namespace, logical key, opaque fencing
 token, and a unique `request_id`. The caller must have write access to both the
 target object namespace and the referenced lease namespace; possession of a

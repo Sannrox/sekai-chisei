@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 created: 0,
                 updated: 0,
             }),
+            lease_precondition: None,
         })
         .await
     {

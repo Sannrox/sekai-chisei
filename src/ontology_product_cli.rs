@@ -408,6 +408,7 @@ pub async fn seed_graph(target: &str, doc: &SeedDocument) -> Result<SeedReport, 
                     created: 0,
                     updated: 0,
                 }),
+                lease_precondition: None,
             }))
             .await;
         match created {
