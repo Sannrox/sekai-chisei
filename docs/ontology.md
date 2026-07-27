@@ -13,6 +13,60 @@ validation and reasoning work can consume. Names are stable external
 identifiers suitable for mapping in future RDF or OWL adapters; this release
 does not claim RDF, OWL, GraphQL, SPARQL, or Cypher compatibility.
 
+## First-run product loop (`sekaictl`)
+
+Research [#383](https://github.com/Sannrox/sekai-chisei/issues/383) defines the
+supported product loop as **define ontology → seed facts → plan/execute →
+receipt**. The CLI implements that loop without raw gRPC:
+
+```bash
+# Start the control plane (example: local insecure loopback).
+SEKAI_INSECURE=1 cargo run
+
+# Optional: create a principal credential when not using insecure mode.
+# cargo run --bin sekaictl -- credential create operator
+
+# Apply a domain document (classes + relations). Non-builtin mapped_kind values
+# are ensured as ObjectTypes before the ontology class is created.
+export SEKAI_AUTH_TOKEN='<token-if-required>'
+cargo run --bin sekaictl -- ontology apply \
+  --file tests/fixtures/product_loop/domain-v1.json
+
+# Seed objects and links (kinds must already exist: builtin or ensure_kind).
+cargo run --bin sekaictl -- ontology seed \
+  --file tests/fixtures/product_loop/seed-v1.json
+
+# One governed operation (lookup-first resolve_ref — no external model required
+# when the object is visible to the principal).
+cargo run --bin sekaictl -- ontology run \
+  --namespace demo \
+  --task-type sekai.semantic.resolve_ref \
+  --spec '{"object_id":"svc-api"}'
+
+# Or chain apply → seed → lookup-first resolve → receipt hint:
+cargo run --bin sekaictl -- ontology first-run \
+  --domain tests/fixtures/product_loop/domain-v1.json \
+  --seed tests/fixtures/product_loop/seed-v1.json \
+  --resolve-object svc-api
+
+# Inspect receipt (after a run that recorded one):
+cargo run --bin sekaictl -- receipt <request-id> --request-id
+```
+
+**Kind materialization (until follow-up #387 deepens the path):** `ontology apply`
+calls `CreateSchemaType` for each class with a non-builtin `mapped_kind` (or
+with `ensure_kind: true`). Builtin kinds such as `component` need no ensure.
+If a mapped kind is missing and was not ensured, create class fails closed with
+an actionable error.
+
+Document versions:
+
+- Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`)
+- Seed: `sekai.seed/v1` (`tests/fixtures/product_loop/seed-v1.json`)
+
+Domain concepts stay in **your** fixtures, not in core protos. ADR 0003
+`ontology inspect` remains a separate static HTML snapshot path.
+
 ## Schema projection
 
 `ProjectSchemaToOntology` projects the current `ObjectType` and interface
@@ -20,6 +74,8 @@ registry into ontology classes. `mapped_kind` records the source object kind.
 The schema registry remains authoritative for object validation: changing an
 ontology class does not change an `ObjectType`, and callers refresh the
 projection after schema changes. Projection does not rewrite graph objects.
+For **product onboarding**, prefer ontology-first apply (above) rather than
+schema-first projection.
 
 Domain concepts such as customers, incidents, repositories, or invoices stay
 in schemas and adapters rather than becoming built-in ontology concepts.

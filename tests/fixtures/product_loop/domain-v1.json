@@ -1,0 +1,25 @@
+{
+  "version": "sekai.ontology-product/v1",
+  "classes": [
+    {
+      "name": "Service",
+      "description": "A deployable service in the operating environment",
+      "mapped_kind": "component"
+    },
+    {
+      "name": "Incident",
+      "description": "An operational incident",
+      "mapped_kind": "incident",
+      "ensure_kind": true,
+      "kind_description": "Incident object kind for product-loop fixtures"
+    }
+  ],
+  "relations": [
+    {
+      "name": "affects",
+      "domain": "Incident",
+      "range": "Service",
+      "description": "Incident affects a service"
+    }
+  ]
+}

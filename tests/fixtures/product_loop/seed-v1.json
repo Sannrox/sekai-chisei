@@ -1,0 +1,26 @@
+{
+  "version": "sekai.seed/v1",
+  "namespace": "demo",
+  "objects": [
+    {
+      "id": "svc-api",
+      "kind": "component",
+      "name": "billing-api",
+      "properties": {
+        "tier": "prod"
+      }
+    },
+    {
+      "id": "inc-1",
+      "kind": "incident",
+      "name": "elevated latency"
+    }
+  ],
+  "links": [
+    {
+      "from": "inc-1",
+      "to": "svc-api",
+      "relation": "affects"
+    }
+  ]
+}
