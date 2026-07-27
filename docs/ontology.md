@@ -53,11 +53,14 @@ cargo run --bin sekaictl -- ontology first-run \
 cargo run --bin sekaictl -- receipt <request-id> --request-id
 ```
 
-**Kind materialization (until follow-up #387 deepens the path):** `ontology apply`
-calls `CreateSchemaType` for each class with a non-builtin `mapped_kind` (or
-with `ensure_kind: true`). Builtin kinds such as `component` need no ensure.
-If a mapped kind is missing and was not ensured, create class fails closed with
-an actionable error.
+**Kind materialization (#387):** creating an ontology class with a non-empty
+`mapped_kind` **ensures** the ObjectType when missing (schema admin required;
+ontology admin already implies schema admin). Builtin kinds such as `component`
+already exist. `sekaictl ontology apply` may still call `CreateSchemaType`
+proactively via `ensure_kind` for clarity; the server path is the durable
+guarantee. Interface registry CRUD (`CreateInterface` / …) and
+`ProjectSchemaToOntology` are **experimental** product-tier surfaces—prefer
+ontology-first authoring.
 
 Document versions:
 
@@ -70,12 +73,12 @@ Domain concepts stay in **your** fixtures, not in core protos. ADR 0003
 ## Schema projection
 
 `ProjectSchemaToOntology` projects the current `ObjectType` and interface
-registry into ontology classes. `mapped_kind` records the source object kind.
-The schema registry remains authoritative for object validation: changing an
-ontology class does not change an `ObjectType`, and callers refresh the
-projection after schema changes. Projection does not rewrite graph objects.
-For **product onboarding**, prefer ontology-first apply (above) rather than
-schema-first projection.
+registry into ontology classes (**experimental** product tier). `mapped_kind`
+records the source object kind. The schema registry remains authoritative for
+object validation: changing an ontology class does not change an `ObjectType`,
+and callers refresh the projection after schema changes. Projection does not
+rewrite graph objects. For **product onboarding**, prefer ontology-first apply
+(above) rather than schema-first projection or interface registry CRUD.
 
 Domain concepts such as customers, incidents, repositories, or invoices stay
 in schemas and adapters rather than becoming built-in ontology concepts.
