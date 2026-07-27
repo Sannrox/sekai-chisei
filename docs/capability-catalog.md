@@ -84,6 +84,7 @@ results, truncation metadata, evidence references, and receipts only.
 | `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | Resolve an object (`object_id` / `external_id`) or ontology class/relation under live authorization. Absence and denial are indistinguishable (`resolved=false`). |
 | `sekai.semantic.expand_relations` | `ExpandRelations` | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
 | `sekai.context.retrieve` | `RetrieveContext` | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
+| `sekai.text.search` | `SearchText` | Search the rebuildable SQLite FTS5 text projection and return `HybridCandidate` rows with `text.fts5_bm25/v1` scores and live authz re-check. Similarity never mints identity. See [text-fts.md](text-fts.md). |
 | `sekai.semantic.explain_derivation` | `ExplainDerivation` | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
 | `sekai.scenario.evaluate` | `EvaluateScenario` | Evaluate a request-scoped non-authoritative scenario overlay over authorized graph projections and return a hypothesis-labeled, domain-neutral impact set. Never mutates canonical facts. See [scenario-overlay.md](scenario-overlay.md). |
 

@@ -290,6 +290,21 @@
       ]
     },
     {
+      "rpc": "SearchText",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/hybrid.rs",
+        "src/sekai/text_fts.rs",
+        "docs/text-fts.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization",
+        "sekai.evidence"
+      ]
+    },
+    {
       "rpc": "EvaluateScenario",
       "kind": "computed",
       "surfaces": [],

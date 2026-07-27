@@ -211,6 +211,7 @@ Opened two focused verticals (implementation; not research):
 1. [#360](https://github.com/Sannrox/sekai-chisei/issues/360) —
    **feat(sekai): SQLite FTS text representation and HybridCandidate contract**  
    Candidate envelope + FTS5 projection + authz re-check + rebuild story.
+   Implementation notes: [../text-fts.md](../text-fts.md).
 2. [#361](https://github.com/Sannrox/sekai-chisei/issues/361) —
    **feat(sekai): late-fusion hybrid retrieval plan (graph + FTS)**  
    Explicit multi-representation plan, fusion profile v1, partial failure.

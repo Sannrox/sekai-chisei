@@ -146,6 +146,11 @@ bounded retrieval surfaces, and governed actions before invocation. Catalog
 visibility is filtered for the authenticated authorization context and never
 acts as an authorization token; invocation always rechecks live controls.
 
+`SearchText` exposes the rebuildable SQLite FTS5 text representation and the
+shared `HybridCandidate` envelope (research #152 / issue #360). Scores use
+`text.fts5_bm25/v1` and never mint durable identities; authz is re-checked per
+hit. See [text-fts.md](text-fts.md). Late fusion across adapters is #361.
+
 `RetrieveContext` is asserted-only by default. Callers may opt into the fixed
 query-time entailment profile for class inheritance/equivalence and explicitly
 transitive ontology relations. Entailment uses an authorization-filtered,

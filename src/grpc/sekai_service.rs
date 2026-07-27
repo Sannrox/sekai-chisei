@@ -38,8 +38,8 @@ use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
-    audit, compute, coordination, dataset, function, ontology, ontology_proposal, retrieval,
-    scenario, security, semantic,
+    audit, compute, coordination, dataset, function, hybrid, ontology, ontology_proposal,
+    retrieval, scenario, security, semantic, text_fts,
 };
 use uuid::Uuid;
 
@@ -855,6 +855,80 @@ impl SekaiServiceImpl {
         })
     }
 
+    fn execute_search_text(
+        &self,
+        principals: &[String],
+        inner: SearchTextRequest,
+    ) -> Result<SearchTextResponse, Status> {
+        let sqlite = self.db.as_sqlite().ok_or_else(|| {
+            Status::failed_precondition(
+                "SearchText requires the SQLite complete baseline; PostgreSQL text FTS parity is not in this vertical",
+            )
+        })?;
+        let namespace = inner.namespace.trim().to_string();
+        if !inner.namespace.is_empty() && namespace != inner.namespace {
+            return Err(Status::invalid_argument("canonical namespace required"));
+        }
+        if !namespace.is_empty() {
+            check_team_namespace(&self.db, principals, &namespace, false)?;
+        }
+        let source_kinds =
+            text_fts::TextSourceFilter::parse(&inner.source_kinds).map_err(map_hybrid_error)?;
+        if inner.rebuild {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            sqlite
+                .rebuild_text_fts(now_ms)
+                .map_err(|e| Status::internal(e))?;
+        }
+        let principal_class = principals
+            .iter()
+            .find(|p| p.as_str() != "anonymous")
+            .cloned()
+            .unwrap_or_else(|| "anonymous".into());
+        let security = Arc::clone(&self.security);
+        let db = Arc::clone(&self.db);
+        let principals_owned = principals.to_vec();
+        let authz = move |input: &text_fts::AuthzRecheckInput<'_>| {
+            let principal_refs: Vec<&str> = principals_owned.iter().map(String::as_str).collect();
+            search_text_authz_recheck(
+                db.as_ref(),
+                security.as_ref(),
+                &principals_owned,
+                &principal_refs,
+                input,
+            )
+        };
+        let result = sqlite
+            .search_text_fts(
+                &text_fts::TextSearchQuery {
+                    query: inner.query,
+                    namespace: namespace.clone(),
+                    source_kinds,
+                    max_candidates: inner.max_candidates,
+                    max_time_ms: inner.max_time_ms,
+                },
+                &principal_class,
+                &authz,
+            )
+            .map_err(map_hybrid_error)?;
+        Ok(SearchTextResponse {
+            candidates: result
+                .candidates
+                .into_iter()
+                .map(to_proto_hybrid_candidate)
+                .collect(),
+            representation_id: result.representation_id,
+            source_version: result.source_version,
+            truncated: result.truncated,
+            truncation_reasons: result.truncation_reasons,
+            denied_count: result.denied_count,
+            scanned: result.scanned,
+        })
+    }
+
     fn execute_evaluate_scenario(
         &self,
         principals: &[String],
@@ -981,6 +1055,7 @@ impl SekaiServiceImpl {
         entries.push(resolve_semantic_ref_capability());
         entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
+        entries.push(search_text_capability());
         entries.push(explain_derivation_capability());
         entries.push(evaluate_scenario_capability());
         entries.push(kioku_candidates_capability());
@@ -1658,6 +1733,46 @@ fn explain_derivation_capability() -> CapabilityEntry {
         "source_fact_ids".into(),
         "ontology_revision".into(),
         "explicit_rules_only".into(),
+    ];
+    entry
+}
+
+fn search_text_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        semantic::CAPABILITY_SEARCH_TEXT.into(),
+        "Search the rebuildable SQLite FTS5 text projection and return HybridCandidate rows with authz re-check.".into(),
+        "retrieval",
+        "sekai.SearchTextRequest",
+        "sekai.SearchTextResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "classification".into(),
+        "evidence_content_acl".into(),
+    ];
+    entry.limits = {
+        let mut limits = semantic_reasoning_limits();
+        limits.push(CapabilityLimit {
+            name: "max_candidates".into(),
+            value: u64::from(text_fts::MAX_CANDIDATES),
+        });
+        limits.push(CapabilityLimit {
+            name: "max_query_chars".into(),
+            value: text_fts::MAX_QUERY_CHARS as u64,
+        });
+        limits.push(CapabilityLimit {
+            name: "mints_identity_from_similarity".into(),
+            value: 0,
+        });
+        limits
+    };
+    entry.evidence_requirements = vec![
+        "hybrid_candidate_envelope".into(),
+        "score_kind_text_fts5_bm25_v1".into(),
+        "authz_recheck_per_hit".into(),
+        "entity_ref_from_source_of_truth_only".into(),
     ];
     entry
 }
@@ -4687,6 +4802,97 @@ fn map_retrieval_error(error: retrieval::RetrievalError) -> Status {
     }
 }
 
+fn map_hybrid_error(error: hybrid::HybridError) -> Status {
+    match error {
+        hybrid::HybridError::InvalidArgument(message) => Status::invalid_argument(message),
+        hybrid::HybridError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn to_proto_hybrid_candidate(candidate: hybrid::HybridCandidate) -> HybridCandidate {
+    HybridCandidate {
+        representation_id: candidate.representation_id,
+        source: candidate.source,
+        source_version: candidate.source_version,
+        score: candidate.score,
+        score_kind: candidate.score_kind,
+        entity_ref: candidate.entity_ref.map(|entity| HybridEntityRef {
+            kind: entity.kind,
+            id: entity.id,
+        }),
+        authz_context: Some(HybridAuthzContext {
+            namespace: candidate.authz_context.namespace,
+            principal_class: candidate.authz_context.principal_class,
+            classification_ceiling: candidate.authz_context.classification_ceiling,
+        }),
+        truncated: candidate.truncated,
+        denied: candidate.denied,
+    }
+}
+
+fn search_text_authz_recheck(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    principal_refs: &[&str],
+    input: &text_fts::AuthzRecheckInput<'_>,
+) -> text_fts::AuthzDecision {
+    match input.source_kind {
+        text_fts::SOURCE_KIND_OBJECT_PROPERTY => {
+            let Ok(Some(object)) = db.get_object(input.entity_id) else {
+                return text_fts::AuthzDecision::Gone;
+            };
+            if !object.namespace.is_empty()
+                && check_team_namespace(db, principals, &object.namespace, false).is_err()
+            {
+                return text_fts::AuthzDecision::Deny;
+            }
+            if !security.can_access(&object.id, principal_refs) {
+                return text_fts::AuthzDecision::Deny;
+            }
+            if !object_passes_marking(db, &object, principals).unwrap_or(false) {
+                return text_fts::AuthzDecision::Deny;
+            }
+            // Confirm property still present with matching content hash material.
+            match object.properties.get(input.source_key) {
+                Some(value) if !value.trim().is_empty() => text_fts::AuthzDecision::Allow,
+                _ => text_fts::AuthzDecision::Gone,
+            }
+        }
+        text_fts::SOURCE_KIND_EVIDENCE => {
+            let Ok(Some(submission)) = db.get_evidence_submission(input.source_id) else {
+                return text_fts::AuthzDecision::Gone;
+            };
+            if !text_fts::evidence_content_readable(submission.lifecycle_state) {
+                return text_fts::AuthzDecision::Gone;
+            }
+            if !submission.namespace.is_empty()
+                && check_team_namespace(db, principals, &submission.namespace, false).is_err()
+            {
+                return text_fts::AuthzDecision::Deny;
+            }
+            let Ok(Some(evidence_object_id)) =
+                db.get_evidence_projection_object_id(input.source_id)
+            else {
+                // Content path requires a projected object for ACL; without it fail closed.
+                return text_fts::AuthzDecision::Gone;
+            };
+            let producer_ok = principals
+                .iter()
+                .any(|principal| principal == &submission.producer_identity);
+            let acl_ok = security.can_access(&evidence_object_id, principal_refs);
+            if !(producer_ok || acl_ok) {
+                return text_fts::AuthzDecision::Deny;
+            }
+            if !input.content_hash.is_empty() && submission.content_digest != input.content_hash {
+                return text_fts::AuthzDecision::Gone;
+            }
+            text_fts::AuthzDecision::Allow
+        }
+        _ => text_fts::AuthzDecision::Gone,
+    }
+}
+
 fn map_scenario_error(error: scenario::ScenarioError) -> Status {
     match error {
         scenario::ScenarioError::InvalidArgument(message) => Status::invalid_argument(message),
@@ -6857,6 +7063,45 @@ impl SekaiService for SekaiServiceImpl {
             }
             Err(status) => Err(status),
         }
+    }
+
+    async fn search_text(
+        &self,
+        req: Request<SearchTextRequest>,
+    ) -> Result<Response<SearchTextResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let namespace = {
+            let inner_ns = req.get_ref().namespace.trim().to_string();
+            if !inner_ns.is_empty() {
+                inner_ns
+            } else {
+                Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default()
+            }
+        };
+        let mut receipt_guard = self.begin_semantic_catalog_invocation(
+            &req,
+            semantic::CAPABILITY_SEARCH_TEXT,
+            &namespace,
+            &principals,
+        )?;
+        let operation_id = receipt_guard
+            .as_ref()
+            .map(|(operation_id, _)| operation_id.clone());
+        let response = self.execute_search_text(&principals, req.into_inner())?;
+        if let Some((_, guard)) = receipt_guard.as_mut() {
+            guard.finalize("allow", "succeeded")?;
+        }
+        let mut response = Response::new(response);
+        if let Some(operation_id) = operation_id.as_deref() {
+            response.metadata_mut().insert(
+                "x-sekai-operation-id",
+                operation_id
+                    .parse()
+                    .map_err(|_| Status::internal("invalid operation id"))?,
+            );
+        }
+        Ok(response)
     }
 
     async fn evaluate_scenario(
@@ -22183,6 +22428,85 @@ mod tests {
             .into_inner();
         assert!(denied_root.candidates.is_empty());
         assert_eq!(denied_root.denied_objects, 1);
+    }
+
+    #[tokio::test]
+    async fn search_text_returns_hybrid_candidates_with_authz_recheck() {
+        let svc = service();
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, body) in [
+            ("fts-public", "aurora borealis briefing"),
+            ("fts-secret", "aurora borealis classified"),
+        ] {
+            let mut object = widget_object(
+                id,
+                HashMap::from([("name".into(), id.into()), ("body".into(), body.into())]),
+            );
+            object.namespace = "default".into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        // Restrict secret to root only; alice has no grant so world-readable ends
+        // once a grant exists for the object.
+        add_object_grant(&svc, "fts-secret", "root", security::Role::Viewer);
+
+        let response = svc
+            .search_text(with_named_principal(
+                SearchTextRequest {
+                    query: "aurora borealis".into(),
+                    namespace: "default".into(),
+                    source_kinds: "object_props".into(),
+                    max_candidates: 10,
+                    max_time_ms: 500,
+                    rebuild: true,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.representation_id, hybrid::REPRESENTATION_TEXT_FTS5);
+        assert!(response.source_version.starts_with("gen:"));
+        assert_eq!(response.candidates.len(), 1);
+        let candidate = &response.candidates[0];
+        assert_eq!(candidate.score_kind, hybrid::SCORE_KIND_TEXT_FTS5_BM25_V1);
+        assert_eq!(candidate.source, hybrid::SOURCE_SQLITE_TEXT_FTS5);
+        assert_eq!(
+            candidate.entity_ref.as_ref().map(|e| e.id.as_str()),
+            Some("fts-public")
+        );
+        assert!(response.denied_count >= 1);
+        for reason in &response.truncation_reasons {
+            assert!(!reason.contains("secret"));
+            assert!(!reason.contains("fts-secret"));
+        }
+
+        let empty = svc
+            .search_text(with_named_principal(
+                SearchTextRequest {
+                    query: String::new(),
+                    rebuild: false,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
