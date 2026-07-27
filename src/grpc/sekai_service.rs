@@ -8868,18 +8868,60 @@ impl SekaiService for SekaiServiceImpl {
                 &principals,
             )?;
         }
+        // Ontology-first kind ensure (#387): when mapped_kind is set and not yet
+        // registered, create an empty ObjectType under schema admin (same principal
+        // already passed ontology admin, which includes schema admin).
         if !parsed.mapped_kind.is_empty() {
-            check_read(
-                &self.security,
-                &schema_object_id(&parsed.mapped_kind),
-                &principals,
-            )?;
-            let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
-            if schema.get(&parsed.mapped_kind).is_none() {
-                return Err(Status::invalid_argument("mapped schema kind not found"));
+            let kind = parsed.mapped_kind.as_str();
+            let needs_ensure = {
+                let schema = self
+                    .schema
+                    .read()
+                    .map_err(|_| Status::internal("schema registry unavailable"))?;
+                schema.get(kind).is_none()
+            };
+            if needs_ensure {
+                if schema::is_builtin_schema_kind(kind) {
+                    return Err(Status::invalid_argument(
+                        "mapped schema kind not found for builtin kind",
+                    ));
+                }
+                // Ontology admin already authorized this mutation; ensuring the
+                // mapped kind is part of ontology-first authoring (#387), not a
+                // separate schema-only privilege.
+                let object_type = schema::ObjectType {
+                    kind: kind.to_string(),
+                    description: format!("Object kind ensured for ontology class {}", parsed.name),
+                    properties: Vec::new(),
+                    is_builtin: false,
+                    implements: Vec::new(),
+                };
+                {
+                    let registry = self
+                        .schema
+                        .read()
+                        .map_err(|_| Status::internal("schema registry unavailable"))?;
+                    schema::validate_object_type_definition(
+                        &object_type,
+                        registry.get(&object_type.kind),
+                        &registry,
+                    )
+                    .map_err(Status::invalid_argument)?;
+                }
+                validate_computed_property_functions(&self.db, &object_type)?;
+                self.db
+                    .upsert_object_type(&object_type)
+                    .map_err(Status::internal)?;
+                self.schema
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))?
+                    .register(object_type);
+                self.schema_load_errors
+                    .write()
+                    .map_err(|_| Status::internal("schema registry unavailable"))?
+                    .remove(kind);
+            } else {
+                check_read(&self.security, &schema_object_id(kind), &principals)?;
             }
         }
         let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
@@ -17794,6 +17836,48 @@ mod tests {
         assert!(!artifact.contains("Hidden"));
         assert!(!artifact.contains("denied_objects"));
         assert!(!artifact.contains("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn create_ontology_class_ensures_mapped_kind() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        let mut incident = ontology_class("Incident");
+        incident.mapped_kind = "incident_kind".into();
+        incident.description = "Operational incident".into();
+
+        // Kind must not exist yet.
+        assert!(svc.schema.read().unwrap().get("incident_kind").is_none());
+
+        let created = svc
+            .create_ontology_class(with_principal(CreateOntologyClassRequest {
+                class: Some(incident),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .class
+            .unwrap();
+        assert_eq!(created.mapped_kind, "incident_kind");
+        assert!(
+            svc.schema.read().unwrap().get("incident_kind").is_some(),
+            "mapped kind must be ensured for ontology-first product path"
+        );
+
+        // Creating an object of the ensured kind must validate.
+        let obj = Object {
+            id: "inc-ensure-1".into(),
+            kind: "incident_kind".into(),
+            name: "outage".into(),
+            namespace: "demo".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 0,
+            updated: 0,
+        };
+        svc.create_object(with_principal(CreateObjectRequest { object: Some(obj) }))
+            .await
+            .expect("object create after kind ensure");
     }
 
     #[tokio::test]

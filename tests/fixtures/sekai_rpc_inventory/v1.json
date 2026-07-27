@@ -641,7 +641,7 @@
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "CreateInterface",
@@ -653,7 +653,7 @@
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "DeleteInterface",
@@ -665,7 +665,7 @@
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "ListOntologyClasses",
@@ -774,7 +774,7 @@
         "sekai.graph",
         "sekai.ontology-definitions"
       ],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
       "rpc": "ReportOntologyLinkViolations",
