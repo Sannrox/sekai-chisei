@@ -2,6 +2,8 @@
 mod github_check_webhook;
 #[path = "../adapters/http_health_poll.rs"]
 mod http_health_poll;
+#[path = "../adapters/ontology_concept_catalog.rs"]
+mod ontology_concept_catalog;
 #[allow(dead_code)]
 #[path = "../adapters/sdk.rs"]
 mod sdk;
@@ -174,8 +176,37 @@ fn outbox_rejects_symlink_entries_without_changing_the_target() {
 }
 
 #[test]
+fn ontology_concept_catalog_fixture_conforms_to_the_canonical_envelope() {
+    let input = include_bytes!("../adapters/fixtures/ontology_concept_catalog.service.json");
+    let draft =
+        ontology_concept_catalog::translate(ontology_concept_catalog::parse(input).unwrap())
+            .expect("translate concept catalog");
+    assert_eq!(draft.source_type, "concept_catalog_document");
+    assert_eq!(draft.signal, "other");
+    assert_eq!(draft.evidence_type, ontology_concept_catalog::EVIDENCE_TYPE);
+    assert_eq!(draft.content["classes"][0]["name"], "Service");
+    assert_eq!(draft.content["relations"][0]["name"], "depends_on");
+    assert_eq!(draft.provenance["delivery"], "document");
+    ontology_concept_catalog::CONFORMANCE_PROFILE
+        .validate(&draft)
+        .unwrap();
+
+    let outbox = outbox("ontology-catalog");
+    let (envelope, receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_000_000).unwrap();
+    assert_eq!(envelope.contract_version, sdk::EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(envelope.source_record_id, "platform-services-v1");
+    assert_eq!(envelope.source_sequence, 17);
+    assert_eq!(envelope.intent, "upsert");
+    assert_eq!(envelope.content_digest.len(), 64);
+    receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
+}
+
+#[test]
 fn adapters_reject_malformed_source_inputs_before_submission() {
     assert!(github_check_webhook::parse(br#"{"action":"completed"}"#).is_err());
+    assert!(ontology_concept_catalog::parse(br#"{"catalog_id":""}"#).is_err());
     let input = br#"{"status":"ok","observed_at":"not-a-time"}"#;
     let payload = http_health_poll::parse(input).unwrap();
     assert!(http_health_poll::translate(payload, "health", None, 1_000).is_err());

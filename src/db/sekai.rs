@@ -176,6 +176,7 @@ impl SekaiDb {
         self.migrate_deduplication()?;
         self.migrate_schema_types()?;
         self.migrate_ontology()?;
+        self.migrate_ontology_proposals()?;
         self.migrate_coordination()?;
         self.migrate_leases()?;
         self.migrate_datasets()?;

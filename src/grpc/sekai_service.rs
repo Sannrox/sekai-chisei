@@ -38,7 +38,8 @@ use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::{
-    audit, compute, coordination, dataset, function, ontology, retrieval, security,
+    audit, compute, coordination, dataset, function, ontology, ontology_proposal, retrieval,
+    security,
 };
 use uuid::Uuid;
 
@@ -7369,6 +7370,228 @@ impl SekaiService for SekaiServiceImpl {
             classes.push(to_proto_ontology_class(&class));
         }
         Ok(Response::new(ProjectSchemaToOntologyResponse { classes }))
+    }
+
+    async fn propose_ontology_definitions(
+        &self,
+        req: Request<ProposeOntologyDefinitionsRequest>,
+    ) -> Result<Response<ProposeOntologyDefinitionsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        // Extraction and persistence require ontology administration; dry-run
+        // still requires authentication so unauthorized parties cannot probe
+        // admitted evidence content through proposal generation.
+        check_ontology_admin(&self.security, "ontology", &principals)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let request = req.into_inner();
+        if request.submission_ids.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one submission id is required",
+            ));
+        }
+        if request.authorization_context.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "authorization_context is required",
+            ));
+        }
+        let extractor_id = if request.extractor_id.trim().is_empty() {
+            ontology_proposal::EXTRACTOR_CONCEPT_CATALOG_V1.to_string()
+        } else {
+            request.extractor_id
+        };
+        let result = self
+            .db
+            .propose_ontology_definitions_from_evidence(
+                &ontology_proposal::ProposeOntologyDefinitionsRequest {
+                    submission_ids: request.submission_ids,
+                    extractor: ontology_proposal::ExtractorConfig {
+                        extractor_id,
+                        config: request.extractor_config.into_iter().collect(),
+                        model_config: request.model_config.into_iter().collect(),
+                    },
+                    authorization_context: request.authorization_context,
+                    proposer: actor.to_string(),
+                    dry_run: request.dry_run,
+                    now_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .map_err(|error| {
+                if error.contains("not found") || error.contains("not admitted") {
+                    Status::failed_precondition(error)
+                } else if error.contains("required") || error.contains("unsupported") {
+                    Status::invalid_argument(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
+        let proposals_json = result
+            .proposals
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(ProposeOntologyDefinitionsResponse {
+            proposals_json,
+            dry_run: result.dry_run,
+            persisted: result.persisted,
+        }))
+    }
+
+    async fn list_ontology_definition_proposals(
+        &self,
+        req: Request<ListOntologyDefinitionProposalsRequest>,
+    ) -> Result<Response<ListOntologyDefinitionProposalsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        check_ontology_admin(&self.security, "ontology", &principals)?;
+        let request = req.into_inner();
+        let state = if request.state.trim().is_empty() {
+            None
+        } else {
+            Some(
+                ontology_proposal::ProposalLifecycleState::parse(request.state.trim())
+                    .ok_or_else(|| Status::invalid_argument("invalid proposal state filter"))?,
+            )
+        };
+        let kind = if request.kind.trim().is_empty() {
+            None
+        } else {
+            Some(
+                ontology_proposal::ProposalDefinitionKind::parse(request.kind.trim())
+                    .ok_or_else(|| Status::invalid_argument("invalid proposal kind filter"))?,
+            )
+        };
+        let proposals = self
+            .db
+            .list_ontology_definition_proposals(&ontology_proposal::ProposalFilter {
+                state,
+                kind,
+                limit: request.limit,
+                offset: request.offset,
+            })
+            .map_err(Status::internal)?;
+        let proposals_json = proposals
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(ListOntologyDefinitionProposalsResponse {
+            proposals_json,
+        }))
+    }
+
+    async fn get_ontology_definition_proposal(
+        &self,
+        req: Request<GetOntologyDefinitionProposalRequest>,
+    ) -> Result<Response<GetOntologyDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        check_ontology_admin(&self.security, "ontology", &principals)?;
+        let request = req.into_inner();
+        if request.id.trim().is_empty() || request.version == 0 {
+            return Err(Status::invalid_argument(
+                "proposal id and non-zero version are required",
+            ));
+        }
+        let proposal = self
+            .db
+            .get_ontology_definition_proposal(&request.id, request.version)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("ontology definition proposal not found"))?;
+        Ok(Response::new(GetOntologyDefinitionProposalResponse {
+            proposal_json: serde_json::to_string(&proposal)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn review_ontology_definition_proposal(
+        &self,
+        req: Request<ReviewOntologyDefinitionProposalRequest>,
+    ) -> Result<Response<ReviewOntologyDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        check_ontology_admin(&self.security, "ontology", &principals)?;
+        let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let request = req.into_inner();
+        if request.id.trim().is_empty()
+            || request.version == 0
+            || request.rationale.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "proposal id, version, and rationale are required",
+            ));
+        }
+        let action = ontology_proposal::ProposalReviewAction::parse(request.action.trim())
+            .ok_or_else(|| {
+                Status::invalid_argument("action must be accept, reject, or supersede")
+            })?;
+        // Acceptance applies a definition mutation; re-check admin on the
+        // concrete definition target when available.
+        if matches!(
+            action,
+            ontology_proposal::ProposalReviewAction::Accept
+                | ontology_proposal::ProposalReviewAction::Supersede
+        ) {
+            if let Some(proposal) = self
+                .db
+                .get_ontology_definition_proposal(&request.id, request.version)
+                .map_err(Status::internal)?
+            {
+                let object_id = match proposal.definition.kind() {
+                    ontology_proposal::ProposalDefinitionKind::Class
+                    | ontology_proposal::ProposalDefinitionKind::ClassProperty => {
+                        ontology_class_object_id(proposal.definition.definition_name())
+                    }
+                    ontology_proposal::ProposalDefinitionKind::Relation => {
+                        ontology_relation_object_id(proposal.definition.definition_name())
+                    }
+                };
+                check_ontology_admin(&self.security, &object_id, &principals)?;
+            }
+        }
+        let proposal = self
+            .db
+            .review_ontology_definition_proposal(
+                &request.id,
+                request.version,
+                ontology_proposal::OntologyProposalReview {
+                    action,
+                    reviewer: actor.to_string(),
+                    rationale: request.rationale,
+                    reviewed_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .map_err(|error| {
+                if error.contains("not found") {
+                    Status::not_found(error)
+                } else if error.contains("stale source")
+                    || error.contains("validation")
+                    || error.contains("unknown")
+                    || error.contains("cannot accept")
+                    || error.contains("no longer")
+                    || error.contains("not awaiting")
+                    || error.contains("conflicts")
+                {
+                    Status::failed_precondition(error)
+                } else if error.contains("required") {
+                    Status::invalid_argument(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
+        let lifecycle_events = self
+            .db
+            .list_ontology_definition_proposal_events(&proposal.id, proposal.version)
+            .map_err(Status::internal)?;
+        Ok(Response::new(ReviewOntologyDefinitionProposalResponse {
+            proposal_json: serde_json::to_string(&proposal)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            lifecycle_events_json: lifecycle_events
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
     }
 
     async fn report_ontology_link_violations(
@@ -15693,6 +15916,23 @@ mod tests {
             .create_ontology_class(with_principal(CreateOntologyClassRequest {
                 class: Some(ontology_class("Person")),
             }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn ontology_definition_proposal_review_requires_admin() {
+        let svc = service();
+        let err = svc
+            .review_ontology_definition_proposal(with_principal(
+                ReviewOntologyDefinitionProposalRequest {
+                    id: "odp-missing".into(),
+                    version: 1,
+                    action: "accept".into(),
+                    rationale: "should be denied before lookup for non-admin".into(),
+                },
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);

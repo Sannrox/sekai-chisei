@@ -1,0 +1,40 @@
+{
+  "catalog_id": "platform-services-v1",
+  "revised_at": "2026-07-27T12:00:00Z",
+  "revision": 17,
+  "source_system": "architecture-wiki",
+  "classes": [
+    {
+      "name": "Service",
+      "description": "Runnable platform service",
+      "properties": [
+        {
+          "name": "status",
+          "type": "string",
+          "required": true,
+          "description": "lifecycle status"
+        }
+      ]
+    },
+    {
+      "name": "Service",
+      "proposal_kind": "class_property",
+      "properties": [
+        {
+          "name": "owner",
+          "type": "string",
+          "required": false,
+          "description": "owning team"
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "name": "depends_on",
+      "domain": "Service",
+      "range": "Service",
+      "description": "runtime dependency between services"
+    }
+  ]
+}

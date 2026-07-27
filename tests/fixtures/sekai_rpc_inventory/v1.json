@@ -616,6 +616,50 @@
       ]
     },
     {
+      "rpc": "ProposeOntologyDefinitions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "src/sekai/ontology_proposal.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ListOntologyDefinitionProposals",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "src/sekai/ontology_proposal.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "GetOntologyDefinitionProposal",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "src/sekai/ontology_proposal.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
+      "rpc": "ReviewOntologyDefinitionProposal",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "src/sekai/ontology_proposal.rs"
+      ],
+      "durable_dependencies": []
+    },
+    {
       "rpc": "CreateFunction",
       "kind": "persistent",
       "surfaces": [
