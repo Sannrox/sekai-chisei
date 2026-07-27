@@ -336,20 +336,46 @@ if [ -n "$new_url" ] && [ "$new_url" != "null" ]; then
   echo "URL: $new_url" >&2
 fi
 
-# Confirm the hosted tree matches the prepared local tree.
+# Confirm hosted blob contents match local HEAD. createCommitOnBranch does not
+# preserve executable mode (100755 becomes 100644), so full tree SHAs can differ
+# even when file contents are identical.
 verify_json=$(gh api "repos/${repo}/git/commits/${new_oid}")
 remote_tree=$(printf '%s' "$verify_json" | jq -r .tree.sha)
-if [ "$remote_tree" != "$head_tree" ]; then
-  echo "Hosted tree ${remote_tree} does not match local HEAD tree ${head_tree}." >&2
-  exit 1
+if [ "$remote_tree" = "$head_tree" ]; then
+  echo "Hosted tree matches local HEAD tree." >&2
+else
+  echo "Hosted tree ${remote_tree} differs from local HEAD tree ${head_tree}; checking content..." >&2
+  git fetch "https://github.com/${repo}.git" "+${new_oid}:refs/gh-verified-push/remote-tip" 2>/dev/null \
+    || git fetch origin "+${new_oid}:refs/gh-verified-push/remote-tip"
+  local_blobs=$(git ls-tree -r HEAD | awk '{print $3 "\t" $4}' | sort)
+  remote_blobs=$(git ls-tree -r refs/gh-verified-push/remote-tip | awk '{print $3 "\t" $4}' | sort)
+  if [ "$local_blobs" != "$remote_blobs" ]; then
+    echo "Hosted blob contents do not match local HEAD." >&2
+    diff -u <(printf '%s\n' "$local_blobs") <(printf '%s\n' "$remote_blobs") >&2 || true
+    git update-ref -d refs/gh-verified-push/remote-tip 2>/dev/null || true
+    exit 1
+  fi
+  local_modes=$(git ls-tree -r HEAD | awk '{print $1 "\t" $4}' | sort)
+  remote_modes=$(git ls-tree -r refs/gh-verified-push/remote-tip | awk '{print $1 "\t" $4}' | sort)
+  if [ "$local_modes" != "$remote_modes" ]; then
+    echo "Warning: file modes differ (GraphQL createCommitOnBranch stores blobs as 100644)." >&2
+    diff -u <(printf '%s\n' "$local_modes") <(printf '%s\n' "$remote_modes") >&2 || true
+  fi
+  git update-ref -d refs/gh-verified-push/remote-tip 2>/dev/null || true
+  echo "Hosted blob contents match local HEAD." >&2
 fi
 
 verification=$(gh api "repos/${repo}/commits/${new_oid}" --jq '.commit.verification.verified // false')
 echo "GitHub verification.verified=${verification}" >&2
+if [ "$verification" != "true" ]; then
+  echo "Published commit is not verified on GitHub." >&2
+  exit 1
+fi
 
 if [ "$sync_local" = true ]; then
   echo "Syncing local branch to published commit ${new_oid}..." >&2
-  git fetch "https://github.com/${repo}.git" "+${new_oid}:refs/gh-verified-push/tmp"
+  git fetch "https://github.com/${repo}.git" "+${new_oid}:refs/gh-verified-push/tmp" 2>/dev/null \
+    || git fetch origin "+${new_oid}:refs/gh-verified-push/tmp"
   git reset --hard "$new_oid"
   git update-ref -d refs/gh-verified-push/tmp 2>/dev/null || true
 fi
