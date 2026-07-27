@@ -5,10 +5,17 @@ logical key. Acquire returns both a monotonically increasing `generation` and
 a unique `fencing_token`. Release keeps the key and its audit history, so a
 later acquire creates a new generation rather than reusing an object identity.
 
-Multi-region write topology is out of scope for the current single-region
-lease store. The design freeze for region/site pins and fail-closed foreign
-pins is [research/292-multi-region-consistency.md](research/292-multi-region-consistency.md)
-(implementation: #293).
+## Region/site pins (#293)
+
+Leases are **region-pinned single writers**
+([research/292-multi-region-consistency.md](research/292-multi-region-consistency.md)).
+Each lease record stores a `site_id` stamped from `SEKAI_SITE_ID` at acquire
+(default `"local"` for single-region). Refresh, release, and takeover require a
+matching pin and **fail closed** on a foreign site. The pin is visible on
+`GetLease` / acquire responses.
+
+Cross-region handoff is a **non-goal for v1**; operators drain work in-region.
+See [region-pins.md](region-pins.md).
 
 ## Object-bound lease keys
 

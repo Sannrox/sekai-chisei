@@ -178,16 +178,29 @@ fn exercise_leases(db: &dyn LeaseBackend, prefix: &str) {
     let namespace = format!("{prefix}-namespace");
     let key = format!("{prefix}-key");
     let acquired = db
-        .acquire_lease(&namespace, &key, "worker-a", 100, "acquire", "actor", 10)
+        .acquire_lease(
+            &namespace, &key, "worker-a", 100, "acquire", "actor", "local", 10,
+        )
         .unwrap();
     assert_eq!(
-        db.acquire_lease(&namespace, &key, "worker-a", 100, "acquire", "actor", 10)
-            .unwrap(),
+        db.acquire_lease(
+            &namespace, &key, "worker-a", 100, "acquire", "actor", "local", 10
+        )
+        .unwrap(),
         acquired
     );
     assert!(
-        db.acquire_lease(&namespace, &key, "worker-b", 100, "different", "actor", 11)
-            .is_err()
+        db.acquire_lease(
+            &namespace,
+            &key,
+            "worker-b",
+            100,
+            "different",
+            "actor",
+            "local",
+            11
+        )
+        .is_err()
     );
     let refreshed = db
         .refresh_lease(
@@ -197,6 +210,7 @@ fn exercise_leases(db: &dyn LeaseBackend, prefix: &str) {
             100,
             "refresh",
             "actor",
+            "local",
             20,
         )
         .unwrap();
@@ -211,6 +225,7 @@ fn exercise_leases(db: &dyn LeaseBackend, prefix: &str) {
             100,
             "takeover",
             "actor",
+            "local",
             120,
         )
         .unwrap();
@@ -222,7 +237,8 @@ fn exercise_leases(db: &dyn LeaseBackend, prefix: &str) {
             &acquired.fencing_token,
             "stale-release",
             "actor",
-            121,
+            "local",
+            121
         )
         .is_err()
     );
@@ -314,7 +330,9 @@ fn postgres_concurrent_lease_acquisition_has_one_winner() {
         let namespace = prefix.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            db.acquire_lease(&namespace, "shared", owner, 1_000, owner, owner, 10)
+            db.acquire_lease(
+                &namespace, "shared", owner, 1_000, owner, owner, "local", 10,
+            )
         })
     });
     barrier.wait();

@@ -370,7 +370,7 @@ fn load_active_lease(
     let lease = tx
         .query_opt(
             "SELECT namespace,lease_key,generation,fencing_token,owner,status,
-                    acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms
+                    acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id
              FROM sekai_leases
              WHERE namespace=$1 AND lease_key=$2 FOR UPDATE",
             &[&namespace, &key],
@@ -436,6 +436,11 @@ fn row_to_object(row: postgres::Row) -> Result<Object, LeaseError> {
 
 fn row_to_lease(row: postgres::Row) -> Lease {
     let generation: i64 = row.get(2);
+    let site_id: String = row
+        .try_get::<_, String>(10)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| crate::sekai::lease::DEFAULT_SITE_ID.into());
     Lease {
         namespace: row.get(0),
         key: row.get(1),
@@ -447,6 +452,7 @@ fn row_to_lease(row: postgres::Row) -> Lease {
         refreshed_at_ms: row.get(7),
         expires_at_ms: row.get(8),
         released_at_ms: row.get(9),
+        site_id,
     }
 }
 

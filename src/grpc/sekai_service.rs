@@ -54,6 +54,8 @@ pub struct SekaiServiceImpl {
     schema_load_errors: Arc<RwLock<std::collections::HashMap<String, String>>>,
     budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
     gateway_schema_principals: Vec<String>,
+    /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
+    site_id: String,
 }
 
 struct CatalogReceiptGuard<'a> {
@@ -473,6 +475,7 @@ impl SekaiServiceImpl {
             schema_load_errors: Arc::new(RwLock::new(schema_load_errors)),
             budget: None,
             gateway_schema_principals,
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
         }
     }
 
@@ -495,6 +498,11 @@ impl SekaiServiceImpl {
         let mut svc = Self::new_with_gateway_schema_principals(db, gateway_schema_principals);
         svc.budget = Some(budget);
         svc
+    }
+
+    pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
+        self.site_id = site_id.into();
+        self
     }
 
     fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
@@ -4578,6 +4586,7 @@ fn to_proto_lease(lease: &crate::sekai::lease::Lease) -> Lease {
         refreshed_at_ms: lease.refreshed_at_ms,
         expires_at_ms: lease.expires_at_ms,
         released_at_ms: lease.released_at_ms,
+        site_id: lease.site_id.clone(),
     }
 }
 
@@ -4823,6 +4832,7 @@ impl SekaiService for SekaiServiceImpl {
                 input.ttl_ms,
                 &input.request_id,
                 &actor,
+                &self.site_id,
                 now_millis(),
             )
             .map_err(map_lease_error)?;
@@ -4842,6 +4852,7 @@ impl SekaiService for SekaiServiceImpl {
                 &lease.fencing_token,
                 &format!("{}:race-cleanup", input.request_id),
                 &actor,
+                &self.site_id,
                 now_millis(),
             );
             return Err(Status::not_found(format!(
@@ -4921,6 +4932,7 @@ impl SekaiService for SekaiServiceImpl {
                 input.ttl_ms,
                 &input.request_id,
                 &actor,
+                &self.site_id,
                 now_millis(),
             )
             .map_err(map_lease_error)?;
@@ -4962,6 +4974,7 @@ impl SekaiService for SekaiServiceImpl {
                 &input.fencing_token,
                 &input.request_id,
                 &actor,
+                &self.site_id,
                 now_millis(),
             )
             .map_err(map_lease_error)?;
@@ -5006,6 +5019,7 @@ impl SekaiService for SekaiServiceImpl {
                 input.ttl_ms,
                 &input.request_id,
                 &actor,
+                &self.site_id,
                 now_millis(),
             )
             .map_err(map_lease_error)?;

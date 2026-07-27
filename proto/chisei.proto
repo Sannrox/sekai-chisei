@@ -1142,6 +1142,8 @@ message ExternalActionPermit {
   string initiating_actor = 44; // immutable actor that began the chain
   bool offline_revocation_unavailable = 45;
   string policy_scope = 46;
+  // Region/site pin for online redeem (#293). Empty means default "local".
+  string site_id = 47;
 }
 
 message ExternalActionRedemption {
@@ -1152,6 +1154,8 @@ message ExternalActionRedemption {
   int64 redeemed_at_ms = 5;
   uint32 invocation_ordinal = 6;
   int64 evidence_due_at_ms = 7; // terminal host evidence deadline from the signed permit window
+  // Site pin that performed the redeem (#293).
+  string site_id = 8;
 }
 
 message ExternalActionEvidence {

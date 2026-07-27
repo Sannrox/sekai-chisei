@@ -39,6 +39,20 @@ The versioned, CI-runnable certification profile is
 [host-executor-permit-conformance.md](host-executor-permit-conformance.md)
 (`sekai.host-executor-permit-conformance/v1`).
 
+## Region/site pins (#293)
+
+Online permits and redemptions are **region-pinned single writers**
+([research/292-multi-region-consistency.md](research/292-multi-region-consistency.md)).
+Issue stamps `site_id` from `SEKAI_SITE_ID` (default `"local"`) into the signed
+permit. Redeem requires the host site to match and fails closed on a foreign
+pin, preventing double-redeem under multi-region lag when each site has its own
+process identity. Redemption records and redeem audit evidence expose `site_id`.
+
+Cross-region pin handoff is a **non-goal for v1**. See
+[region-pins.md](region-pins.md). Offline permits remain weaker than online
+(`offline_no_global_single_use`); multi-region does not claim global single-use
+for offline reconciliation.
+
 ## Offline leases
 
 Offline permits are disabled until an administrator stores an

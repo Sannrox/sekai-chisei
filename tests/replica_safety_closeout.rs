@@ -56,7 +56,16 @@ fn lease_and_admission_converge_and_stale_work_recovers() {
 
     let leases = pair.race_results(2, |i, db| {
         let owner = format!("w{i}");
-        db.acquire_lease("closeout-ns", "k", &owner, 1_000, &owner, &owner, 10)
+        db.acquire_lease(
+            "closeout-ns",
+            "k",
+            &owner,
+            1_000,
+            &owner,
+            &owner,
+            "local",
+            10,
+        )
     });
     assert_eq!(leases.iter().filter(|r| r.is_ok()).count(), 1);
 

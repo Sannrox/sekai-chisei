@@ -35,6 +35,7 @@ const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_name
 const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
     include_str!("postgres/0017_chisei_execution_parity.sql");
 const BUDGET_TOPOLOGY_SCHEMA: &str = include_str!("postgres/0018_budget_topology.sql");
+const LEASE_SITE_ID_SCHEMA: &str = include_str!("postgres/0019_lease_site_id.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -133,6 +134,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 18,
         name: "budget_topology",
         sql: BUDGET_TOPOLOGY_SCHEMA,
+    },
+    Migration {
+        version: 19,
+        name: "lease_site_id",
+        sql: LEASE_SITE_ID_SCHEMA,
     },
 ];
 

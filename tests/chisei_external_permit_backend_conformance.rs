@@ -56,6 +56,7 @@ fn sample_permit(prefix: &str) -> Permit {
         issued_at_ms: 1_000,
         revocation_latency_ms: 0,
         offline_revocation_unavailable: false,
+        site_id: "local".into(),
         signed_digest: "sha256:signed".into(),
         signature: vec![1, 2, 3],
     }

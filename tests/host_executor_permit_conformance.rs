@@ -95,6 +95,7 @@ fn signed_permit(executor: &str, capability: &str) -> (Permit, SigningKey) {
         issued_at_ms: 1_000,
         revocation_latency_ms: 0,
         offline_revocation_unavailable: false,
+        site_id: "local".into(),
         signed_digest: String::new(),
         signature: vec![],
     };
@@ -413,6 +414,7 @@ fn persist_and_issue(db: &RuntimeDb, record: &AuthorizationRecord) -> (Permit, S
             permit_id: "permit-1".into(),
             nonce: "nonce-1".into(),
             now_ms: 2_000,
+            site_id: "local",
         },
     )
     .unwrap();
@@ -505,6 +507,7 @@ fn redeem_is_idempotent_across_retries() {
             &key.verifying_key(),
             "idem-1",
             "execution-1",
+            "local",
             3_000,
         )
         .unwrap();
@@ -516,6 +519,7 @@ fn redeem_is_idempotent_across_retries() {
             &key.verifying_key(),
             "idem-1",
             "execution-1",
+            "local",
             3_001,
         )
         .unwrap();
@@ -533,6 +537,7 @@ fn redeem_is_idempotent_across_retries() {
             &key.verifying_key(),
             "idem-2",
             "execution-2",
+            "local",
             3_002,
         )
         .unwrap_err();
@@ -557,6 +562,7 @@ fn redeem_after_revoke_fails() {
             &key.verifying_key(),
             "idem-revoked",
             "execution-revoked",
+            "local",
             4_000,
         )
         .unwrap_err();
@@ -716,7 +722,8 @@ fn broken_harness_fails_every_negative_case() {
                         &key.verifying_key(),
                         "idem-broken-revoke",
                         "execution-broken-revoke",
-                        4_000,
+                        "local",
+                        4_000
                     )
                     .is_err(),
                     "reference path must refuse revoked permits"

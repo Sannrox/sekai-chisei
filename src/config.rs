@@ -39,6 +39,9 @@ pub struct Config {
     pub permit_signing_key: Option<String>,
     pub permit_issuer: String,
     pub permit_key_id: String,
+    /// Stable region/site pin for leases and online permit redemption (#293).
+    /// Default `"local"` keeps single-region deployments unchanged.
+    pub site_id: String,
     /// Multi-region budget topology (#294). Default `single_region`.
     pub budget_topology: BudgetTopologyConfig,
 }
@@ -91,6 +94,7 @@ impl Config {
             permit_signing_key: optional_env("CHISEI_PERMIT_SIGNING_KEY"),
             permit_issuer: env("CHISEI_PERMIT_ISSUER", "chisei.local"),
             permit_key_id: env("CHISEI_PERMIT_KEY_ID", "permit-key-1"),
+            site_id: site_id_env("SEKAI_SITE_ID", "local"),
             budget_topology: BudgetTopologyConfig::from_env().unwrap_or_else(|err| {
                 warn!(error = %err, "invalid budget topology config; using single_region");
                 BudgetTopologyConfig::single_region()
@@ -131,6 +135,33 @@ fn optional_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Resolve and validate `SEKAI_SITE_ID` (non-empty, no wildcards).
+fn site_id_env(key: &str, default: &str) -> String {
+    let raw = env::var(key).unwrap_or_else(|_| default.to_string());
+    match validate_site_id(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(key, value = %raw, error = %error, "invalid site id; using default");
+            default.to_string()
+        }
+    }
+}
+
+/// Validate a region/site pin used for lease and permit pinning.
+pub fn validate_site_id(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("site_id must not be empty".into());
+    }
+    if trimmed.len() > 128 {
+        return Err("site_id must be at most 128 characters".into());
+    }
+    if trimmed.contains('*') || trimmed.contains('?') || trimmed.contains('\0') {
+        return Err("site_id must not contain wildcards or null bytes".into());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn socket_path(key: &str, default: &str) -> Option<String> {
@@ -230,5 +261,15 @@ mod tests {
         assert!(!mode.token_auth_mode);
         assert!(mode.auth_configured);
         assert!(!mode.bind_inferred_from_active_credentials);
+    }
+
+    #[test]
+    fn site_id_defaults_to_local_and_rejects_wildcards() {
+        assert_eq!(validate_site_id("local").unwrap(), "local");
+        assert_eq!(validate_site_id(" us-east-1 ").unwrap(), "us-east-1");
+        assert!(validate_site_id("").is_err());
+        assert!(validate_site_id("   ").is_err());
+        assert!(validate_site_id("region*").is_err());
+        assert!(validate_site_id("region?").is_err());
     }
 }

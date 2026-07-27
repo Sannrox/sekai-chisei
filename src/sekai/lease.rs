@@ -10,6 +10,13 @@ use std::time::Instant;
 
 const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
+/// Default single-region site pin (`SEKAI_SITE_ID` default).
+pub const DEFAULT_SITE_ID: &str = "local";
+
+fn default_site_id() -> String {
+    DEFAULT_SITE_ID.into()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     pub namespace: String,
@@ -22,6 +29,10 @@ pub struct Lease {
     pub refreshed_at_ms: i64,
     pub expires_at_ms: i64,
     pub released_at_ms: i64,
+    /// Region/site pin. Acquire stamps the caller's site; refresh, release, and
+    /// takeover require a matching pin and fail closed on foreign sites (#293).
+    #[serde(default = "default_site_id")]
+    pub site_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +55,7 @@ impl SekaiDb {
                     owner TEXT NOT NULL, status TEXT NOT NULL,
                     acquired_at_ms INTEGER NOT NULL, refreshed_at_ms INTEGER NOT NULL,
                     expires_at_ms INTEGER NOT NULL, released_at_ms INTEGER NOT NULL DEFAULT 0,
+                    site_id TEXT NOT NULL DEFAULT 'local',
                     PRIMARY KEY(namespace, lease_key)
                 );
                 CREATE TABLE IF NOT EXISTS sekai_lease_requests (
@@ -72,7 +84,8 @@ impl SekaiDb {
                     PRIMARY KEY(lease_namespace, lease_key, request_id)
                 );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        ensure_lease_site_id_column(&self.conn())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -84,15 +97,17 @@ impl SekaiDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, owner, ttl_ms, request_id)?;
+        let site_id = validate_site_id(site_id)?;
         self.mutate_lease(
             namespace,
             key,
             request_id,
             "acquire",
-            &format!("{owner}\0{ttl_ms}"),
+            &format!("{owner}\0{ttl_ms}\0{site_id}"),
             |tx| {
                 let previous = read_lease(tx, namespace, key)?;
                 if previous
@@ -102,7 +117,7 @@ impl SekaiDb {
                     return Err(LeaseError::Conflict("lease is already active".into()));
                 }
                 let generation = previous.as_ref().map_or(1, |lease| lease.generation + 1);
-                let lease = new_lease(namespace, key, owner, generation, ttl_ms, now_ms);
+                let lease = new_lease(namespace, key, owner, generation, ttl_ms, now_ms, &site_id);
                 if previous.is_some() {
                     update_lease(tx, &lease)?;
                 } else {
@@ -127,7 +142,7 @@ impl SekaiDb {
         validate_text(key, "key")?;
         self.conn()
             .query_row(
-                "SELECT namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms FROM sekai_leases WHERE namespace=?1 AND lease_key=?2",
+                "SELECT namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id FROM sekai_leases WHERE namespace=?1 AND lease_key=?2",
                 params![namespace, key],
                 row_to_lease,
             )
@@ -144,17 +159,20 @@ impl SekaiDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, token, ttl_ms, request_id)?;
+        let site_id = validate_site_id(site_id)?;
         self.mutate_lease(
             namespace,
             key,
             request_id,
             "refresh",
-            &format!("{token}\0{ttl_ms}"),
+            &format!("{token}\0{ttl_ms}\0{site_id}"),
             |tx| {
                 let previous = active_with_token(tx, namespace, key, token)?;
+                require_site_pin(&previous, &site_id)?;
                 if now_ms >= previous.expires_at_ms {
                     return Err(LeaseError::Stale("lease has expired".into()));
                 }
@@ -176,6 +194,7 @@ impl SekaiDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn release_lease(
         &self,
         namespace: &str,
@@ -183,29 +202,39 @@ impl SekaiDb {
         token: &str,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate_text(namespace, "namespace")?;
         validate_text(key, "key")?;
         validate_text(token, "fencing_token")?;
         validate_text(request_id, "request_id")?;
-        self.mutate_lease(namespace, key, request_id, "release", token, |tx| {
-            let previous = active_with_token(tx, namespace, key, token)?;
-            let mut lease = previous.clone();
-            lease.status = "released".into();
-            lease.released_at_ms = now_ms;
-            update_lease(tx, &lease)?;
-            insert_audit(
-                tx,
-                Some(&previous),
-                &lease,
-                actor,
-                "release",
-                request_id,
-                now_ms,
-            )?;
-            Ok(lease)
-        })
+        let site_id = validate_site_id(site_id)?;
+        self.mutate_lease(
+            namespace,
+            key,
+            request_id,
+            "release",
+            &format!("{token}\0{site_id}"),
+            |tx| {
+                let previous = active_with_token(tx, namespace, key, token)?;
+                require_site_pin(&previous, &site_id)?;
+                let mut lease = previous.clone();
+                lease.status = "released".into();
+                lease.released_at_ms = now_ms;
+                update_lease(tx, &lease)?;
+                insert_audit(
+                    tx,
+                    Some(&previous),
+                    &lease,
+                    actor,
+                    "release",
+                    request_id,
+                    now_ms,
+                )?;
+                Ok(lease)
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -219,13 +248,17 @@ impl SekaiDb {
         ttl_ms: i64,
         request_id: &str,
         actor: &str,
+        site_id: &str,
         now_ms: i64,
     ) -> Result<Lease, LeaseError> {
         validate(namespace, key, owner, ttl_ms, request_id)?;
         validate_text(expected_token, "expected_fencing_token")?;
-        let digest = format!("{owner}\0{expected_token}\0{expected_expires_at_ms}\0{ttl_ms}");
+        let site_id = validate_site_id(site_id)?;
+        let digest =
+            format!("{owner}\0{expected_token}\0{expected_expires_at_ms}\0{ttl_ms}\0{site_id}");
         self.mutate_lease(namespace, key, request_id, "takeover", &digest, |tx| {
             let previous = active_with_token(tx, namespace, key, expected_token)?;
+            require_site_pin(&previous, &site_id)?;
             if previous.expires_at_ms != expected_expires_at_ms {
                 return Err(LeaseError::Stale("lease expiry changed".into()));
             }
@@ -239,6 +272,7 @@ impl SekaiDb {
                 previous.generation + 1,
                 ttl_ms,
                 now_ms,
+                &site_id,
             );
             update_lease(tx, &lease)?;
             insert_audit(
@@ -589,6 +623,7 @@ fn new_lease(
     generation: u64,
     ttl: i64,
     now: i64,
+    site_id: &str,
 ) -> Lease {
     Lease {
         namespace: namespace.into(),
@@ -601,17 +636,57 @@ fn new_lease(
         refreshed_at_ms: now,
         expires_at_ms: now + ttl,
         released_at_ms: 0,
+        site_id: site_id.into(),
     }
 }
 fn storage(error: impl std::fmt::Display) -> LeaseError {
     LeaseError::Storage(error.to_string())
 }
+
+pub fn validate_site_id_public(site_id: &str) -> Result<String, LeaseError> {
+    crate::config::validate_site_id(site_id).map_err(LeaseError::Invalid)
+}
+
+fn validate_site_id(site_id: &str) -> Result<String, LeaseError> {
+    validate_site_id_public(site_id)
+}
+
+/// Fail closed when the caller site does not match the durable lease pin.
+pub fn require_site_pin(lease: &Lease, site_id: &str) -> Result<(), LeaseError> {
+    if lease.site_id != site_id {
+        return Err(LeaseError::Conflict(format!(
+            "lease is pinned to site '{}' (caller site '{}'); foreign pin fail closed",
+            lease.site_id, site_id
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_lease_site_id_column(conn: &rusqlite::Connection) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sekai_leases)")
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if !columns.iter().any(|name| name == "site_id") {
+        conn.execute(
+            "ALTER TABLE sekai_leases ADD COLUMN site_id TEXT NOT NULL DEFAULT 'local'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn read_lease(
     tx: &Transaction<'_>,
     namespace: &str,
     key: &str,
 ) -> Result<Option<Lease>, LeaseError> {
-    tx.query_row("SELECT namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms FROM sekai_leases WHERE namespace=?1 AND lease_key=?2", params![namespace,key], row_to_lease).optional().map_err(storage)
+    tx.query_row("SELECT namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id FROM sekai_leases WHERE namespace=?1 AND lease_key=?2", params![namespace,key], row_to_lease).optional().map_err(storage)
 }
 fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
@@ -625,6 +700,10 @@ fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         refreshed_at_ms: row.get(7)?,
         expires_at_ms: row.get(8)?,
         released_at_ms: row.get(9)?,
+        site_id: row
+            .get::<_, Option<String>>(10)?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_SITE_ID.into()),
     })
 }
 fn active_with_token(
@@ -643,13 +722,13 @@ fn active_with_token(
 fn insert_lease(tx: &Transaction<'_>, lease: &Lease) -> Result<(), LeaseError> {
     let generation = i64::try_from(lease.generation)
         .map_err(|_| LeaseError::Storage("lease generation exceeds SQLite range".into()))?;
-    tx.execute("INSERT INTO sekai_leases(namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![lease.namespace,lease.key,generation,lease.fencing_token,lease.owner,lease.status,lease.acquired_at_ms,lease.refreshed_at_ms,lease.expires_at_ms,lease.released_at_ms]).map_err(storage)?;
+    tx.execute("INSERT INTO sekai_leases(namespace,lease_key,generation,fencing_token,owner,status,acquired_at_ms,refreshed_at_ms,expires_at_ms,released_at_ms,site_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![lease.namespace,lease.key,generation,lease.fencing_token,lease.owner,lease.status,lease.acquired_at_ms,lease.refreshed_at_ms,lease.expires_at_ms,lease.released_at_ms,lease.site_id]).map_err(storage)?;
     Ok(())
 }
 fn update_lease(tx: &Transaction<'_>, lease: &Lease) -> Result<(), LeaseError> {
     let generation = i64::try_from(lease.generation)
         .map_err(|_| LeaseError::Storage("lease generation exceeds SQLite range".into()))?;
-    tx.execute("UPDATE sekai_leases SET generation=?3,fencing_token=?4,owner=?5,status=?6,acquired_at_ms=?7,refreshed_at_ms=?8,expires_at_ms=?9,released_at_ms=?10 WHERE namespace=?1 AND lease_key=?2", params![lease.namespace,lease.key,generation,lease.fencing_token,lease.owner,lease.status,lease.acquired_at_ms,lease.refreshed_at_ms,lease.expires_at_ms,lease.released_at_ms]).map_err(storage)?;
+    tx.execute("UPDATE sekai_leases SET generation=?3,fencing_token=?4,owner=?5,status=?6,acquired_at_ms=?7,refreshed_at_ms=?8,expires_at_ms=?9,released_at_ms=?10,site_id=?11 WHERE namespace=?1 AND lease_key=?2", params![lease.namespace,lease.key,generation,lease.fencing_token,lease.owner,lease.status,lease.acquired_at_ms,lease.refreshed_at_ms,lease.expires_at_ms,lease.released_at_ms,lease.site_id]).map_err(storage)?;
     Ok(())
 }
 fn insert_audit(
@@ -689,20 +768,45 @@ mod tests {
     fn release_reacquire_and_stale_generation_are_fenced() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
-            .acquire_lease("n", "deploy", "a", 100, "a1", "a", 10)
+            .acquire_lease("n", "deploy", "a", 100, "a1", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
-        db.release_lease("n", "deploy", &first.fencing_token, "r1", "a", 20)
-            .unwrap();
+        db.release_lease(
+            "n",
+            "deploy",
+            &first.fencing_token,
+            "r1",
+            "a",
+            DEFAULT_SITE_ID,
+            20,
+        )
+        .unwrap();
         let second = db
-            .acquire_lease("n", "deploy", "b", 100, "a2", "b", 30)
+            .acquire_lease("n", "deploy", "b", 100, "a2", "b", DEFAULT_SITE_ID, 30)
             .unwrap();
         assert_eq!(second.generation, 2);
         assert!(matches!(
-            db.refresh_lease("n", "deploy", &first.fencing_token, 100, "late", "a", 40),
+            db.refresh_lease(
+                "n",
+                "deploy",
+                &first.fencing_token,
+                100,
+                "late",
+                "a",
+                DEFAULT_SITE_ID,
+                40
+            ),
             Err(LeaseError::Stale(_))
         ));
         assert!(matches!(
-            db.release_lease("n", "deploy", &first.fencing_token, "later", "a", 50),
+            db.release_lease(
+                "n",
+                "deploy",
+                &first.fencing_token,
+                "later",
+                "a",
+                DEFAULT_SITE_ID,
+                50
+            ),
             Err(LeaseError::Stale(_))
         ));
         assert_eq!(db.lease_audit_count("n", "deploy").unwrap(), 3);
@@ -711,7 +815,7 @@ mod tests {
     fn expiry_boundary_takeover_and_retry_are_deterministic() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
-            .acquire_lease("n", "k", "a", 10, "one", "a", 100)
+            .acquire_lease("n", "k", "a", 10, "one", "a", DEFAULT_SITE_ID, 100)
             .unwrap();
         assert_eq!(
             db.takeover_expired_lease(
@@ -723,6 +827,7 @@ mod tests {
                 10,
                 "two",
                 "b",
+                DEFAULT_SITE_ID,
                 109
             ),
             Err(LeaseError::NotExpired)
@@ -737,6 +842,7 @@ mod tests {
                 10,
                 "two",
                 "b",
+                DEFAULT_SITE_ID,
                 110,
             )
             .unwrap();
@@ -750,6 +856,7 @@ mod tests {
                 10,
                 "two",
                 "b",
+                DEFAULT_SITE_ID,
                 999,
             )
             .unwrap();
@@ -762,11 +869,11 @@ mod tests {
         let path = file.path().to_string_lossy().into_owned();
         let first = SekaiDb::new(&path)
             .unwrap()
-            .acquire_lease("n", "k", "a", 100, "request", "a", 10)
+            .acquire_lease("n", "k", "a", 100, "request", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let replay = SekaiDb::new(&path)
             .unwrap()
-            .acquire_lease("n", "k", "a", 100, "request", "a", 999)
+            .acquire_lease("n", "k", "a", 100, "request", "a", DEFAULT_SITE_ID, 999)
             .unwrap();
         assert_eq!(first, replay);
     }
@@ -783,7 +890,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                db.acquire_lease("n", "k", owner, 100, owner, owner, 10)
+                db.acquire_lease("n", "k", owner, 100, owner, owner, DEFAULT_SITE_ID, 10)
             })
         });
         let results = handles.map(|handle| handle.join().unwrap());
@@ -804,7 +911,7 @@ mod tests {
             SekaiDb::new(file.path().to_str().unwrap()).unwrap(),
         )));
         let first = db
-            .acquire_lease("n", "k", "a", 10, "first", "a", 10)
+            .acquire_lease("n", "k", "a", 10, "first", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let handles = ["b", "c"].map(|owner| {
@@ -813,7 +920,18 @@ mod tests {
             let token = first.fencing_token.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                db.takeover_expired_lease("n", "k", owner, &token, 20, 100, owner, owner, 20)
+                db.takeover_expired_lease(
+                    "n",
+                    "k",
+                    owner,
+                    &token,
+                    20,
+                    100,
+                    owner,
+                    owner,
+                    DEFAULT_SITE_ID,
+                    20,
+                )
             })
         });
         let results = handles.map(|handle| handle.join().unwrap());
@@ -831,7 +949,7 @@ mod tests {
     fn guarded_mutations_fence_stale_released_and_expired_generations() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let first = db
-            .acquire_lease("n", "k", "a", 10, "lease-1", "a", 10)
+            .acquire_lease("n", "k", "a", 10, "lease-1", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let original = object("o", "original");
         db.guarded_create_object(&original, "n", "k", &first.fencing_token, "create", "a", 11)
@@ -863,6 +981,7 @@ mod tests {
                 10,
                 "lease-2",
                 "b",
+                DEFAULT_SITE_ID,
                 20,
             )
             .unwrap();
@@ -879,8 +998,16 @@ mod tests {
             ),
             Err(LeaseError::Stale(_))
         ));
-        db.release_lease("n", "k", &second.fencing_token, "release", "b", 22)
-            .unwrap();
+        db.release_lease(
+            "n",
+            "k",
+            &second.fencing_token,
+            "release",
+            "b",
+            DEFAULT_SITE_ID,
+            22,
+        )
+        .unwrap();
         assert!(matches!(
             db.guarded_update_object(
                 &expired_update,
@@ -902,7 +1029,7 @@ mod tests {
     fn guarded_delete_retry_is_idempotent_and_audits_generation_without_token() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let lease = db
-            .acquire_lease("n", "k", "a", 100, "lease", "a", 10)
+            .acquire_lease("n", "k", "a", 100, "lease", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let value = object("o", "value");
         db.guarded_create_object(&value, "n", "k", &lease.fencing_token, "create", "a", 11)
@@ -975,7 +1102,7 @@ mod tests {
             SekaiDb::new(file.path().to_str().unwrap()).unwrap(),
         )));
         let first = db
-            .acquire_lease("n", "k", "a", 10, "lease-1", "a", 10)
+            .acquire_lease("n", "k", "a", 10, "lease-1", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         db.create_object_with_audit(&object("o", "before"), "a")
             .unwrap();
@@ -1006,7 +1133,18 @@ mod tests {
             let token = first.fencing_token.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                db.takeover_expired_lease("n", "k", "b", &token, 20, 10, "lease-2", "b", 20)
+                db.takeover_expired_lease(
+                    "n",
+                    "k",
+                    "b",
+                    &token,
+                    20,
+                    10,
+                    "lease-2",
+                    "b",
+                    DEFAULT_SITE_ID,
+                    20,
+                )
             })
         };
         let update_result = update.join().unwrap();
@@ -1025,7 +1163,7 @@ mod tests {
     fn guarded_update_binds_authorized_snapshot_and_replays_after_later_delete() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         let lease = db
-            .acquire_lease("n", "k", "a", 100, "lease", "a", 10)
+            .acquire_lease("n", "k", "a", 100, "lease", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let original = object("o", "before");
         db.create_object_with_audit(&original, "a").unwrap();
@@ -1089,5 +1227,95 @@ mod tests {
             canonical_object_input(&first).unwrap(),
             canonical_object_input(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn acquire_stamps_default_local_site_pin() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let lease = db
+            .acquire_lease("n", "k", "a", 100, "a1", "a", DEFAULT_SITE_ID, 10)
+            .unwrap();
+        assert_eq!(lease.site_id, DEFAULT_SITE_ID);
+        let got = db.get_lease("n", "k").unwrap().unwrap();
+        assert_eq!(got.site_id, DEFAULT_SITE_ID);
+        db.refresh_lease(
+            "n",
+            "k",
+            &lease.fencing_token,
+            100,
+            "r1",
+            "a",
+            DEFAULT_SITE_ID,
+            20,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dual_region_refresh_and_release_fail_closed_on_foreign_pin() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let home = db
+            .acquire_lease("n", "k", "a", 100, "a1", "a", "us-east", 10)
+            .unwrap();
+        assert_eq!(home.site_id, "us-east");
+        assert!(matches!(
+            db.refresh_lease("n", "k", &home.fencing_token, 100, "foreign-refresh", "b", "eu-west", 20),
+            Err(LeaseError::Conflict(message)) if message.contains("pinned to site")
+        ));
+        assert!(matches!(
+            db.release_lease("n", "k", &home.fencing_token, "foreign-release", "b", "eu-west", 30),
+            Err(LeaseError::Conflict(message)) if message.contains("pinned to site")
+        ));
+        // Home site still owns the generation.
+        db.refresh_lease(
+            "n",
+            "k",
+            &home.fencing_token,
+            100,
+            "home-refresh",
+            "a",
+            "us-east",
+            40,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dual_region_takeover_fails_closed_on_foreign_pin() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let home = db
+            .acquire_lease("n", "k", "a", 10, "a1", "a", "us-east", 100)
+            .unwrap();
+        assert!(matches!(
+            db.takeover_expired_lease(
+                "n",
+                "k",
+                "b",
+                &home.fencing_token,
+                110,
+                10,
+                "foreign-takeover",
+                "b",
+                "eu-west",
+                110,
+            ),
+            Err(LeaseError::Conflict(message)) if message.contains("pinned to site")
+        ));
+        let next = db
+            .takeover_expired_lease(
+                "n",
+                "k",
+                "c",
+                &home.fencing_token,
+                110,
+                10,
+                "home-takeover",
+                "c",
+                "us-east",
+                110,
+            )
+            .unwrap();
+        assert_eq!(next.site_id, "us-east");
+        assert_eq!(next.generation, 2);
     }
 }

@@ -65,7 +65,7 @@ fn concurrent_lease_acquire_has_one_winner_across_replicas() {
 
     let results = pair.race_results(4, |index, db| {
         let owner = format!("worker-{index}");
-        db.acquire_lease(namespace, key, &owner, 1_000, &owner, &owner, 10)
+        db.acquire_lease(namespace, key, &owner, 1_000, &owner, &owner, "local", 10)
     });
     let successes: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
     let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
@@ -88,6 +88,7 @@ fn concurrent_lease_acquire_has_one_winner_across_replicas() {
                 1_000,
                 "late-req",
                 "latecomer",
+                "local",
                 20
             )
             .is_err()
@@ -101,12 +102,12 @@ fn same_request_id_reacquire_converges_across_replicas() {
     let pair = TwoReplicaSqlite::open().unwrap();
     let first = pair
         .a
-        .acquire_lease("ns", "k", "owner-a", 500, "req-1", "actor", 10)
+        .acquire_lease("ns", "k", "owner-a", 500, "req-1", "actor", "local", 10)
         .unwrap();
     // Replica B retries the same request id for the same owner.
     let replay = pair
         .b
-        .acquire_lease("ns", "k", "owner-a", 500, "req-1", "actor", 11)
+        .acquire_lease("ns", "k", "owner-a", 500, "req-1", "actor", "local", 11)
         .unwrap();
     assert_eq!(first, replay);
     assert_eq!(first.fencing_token, replay.fencing_token);
@@ -117,7 +118,7 @@ fn expired_lease_can_be_taken_over_by_another_replica() {
     let pair = TwoReplicaSqlite::open().unwrap();
     let acquired = pair
         .a
-        .acquire_lease("ns", "k", "owner-a", 100, "acq", "actor-a", 10)
+        .acquire_lease("ns", "k", "owner-a", 100, "acq", "actor-a", "local", 10)
         .unwrap();
     assert_eq!(acquired.expires_at_ms, 110);
 
@@ -131,6 +132,7 @@ fn expired_lease_can_be_taken_over_by_another_replica() {
         100,
         "take-early",
         "actor-b",
+        "local",
         50,
     );
     assert!(matches!(not_expired, Err(LeaseError::NotExpired)));
@@ -147,6 +149,7 @@ fn expired_lease_can_be_taken_over_by_another_replica() {
             100,
             "take-late",
             "actor-b",
+            "local",
             acquired.expires_at_ms,
         )
         .unwrap();
@@ -164,7 +167,8 @@ fn expired_lease_can_be_taken_over_by_another_replica() {
                 100,
                 "stale-refresh",
                 "actor-a",
-                acquired.expires_at_ms + 1,
+                "local",
+                acquired.expires_at_ms + 1
             )
             .is_err()
     );
