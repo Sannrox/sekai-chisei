@@ -145,7 +145,8 @@ idea or report
     -> Issue: status:ready
     -> assignee opens linked PR
     -> review + required evidence
-    -> rebase merge
+    -> verified GraphQL push of PR tip
+    -> squash merge (Verified land on main)
     -> Issue closes; durable knowledge is promoted
 ```
 
@@ -307,7 +308,8 @@ Documentation stays maintainable when:
 5. Implement one outcome with focused tests and any required docs/migrations.
 6. Open a PR early when design feedback is useful; mark it draft until the
    acceptance evidence is present.
-7. Respond to every actionable review thread and rebase before merge.
+7. Respond to every actionable review thread and re-publish a Verified tip
+   (`scripts/gh-verified-push.sh`) before merge.
 
 ### AI contributors
 
@@ -349,7 +351,8 @@ Maintainers own routing and project coherence:
 - close or reroute work that violates product/security boundaries;
 - facilitate Discussions and state the final decision with rationale;
 - protect required checks and CODEOWNERS surfaces;
-- rebase-merge focused PRs and keep `main` releasable;
+- publish PR tips with `scripts/gh-verified-push.sh` (GitHub Verified commits);
+- squash-merge focused PRs so `main` stays linear and lands Verified;
 - promote only durable outcomes, then remove obsolete Issues/docs/Skills; and
 - publish releases from verified commits with known compatibility notes.
 
@@ -409,7 +412,11 @@ edited into user-facing `Added`, `Changed`, `Fixed`, `Security`, and
 
 The release owner verifies Cargo/package version, migration and configuration
 notes, CI, container build, smoke behavior, and rollback/backup implications.
-Use rebase merges by default and do not rewrite protected `main`.
+Use squash merges by default for Verified linear history on `main`. Prefer
+`scripts/gh-verified-push.sh` for PR branch publication (GraphQL
+`createCommitOnBranch`) over plain `git push` when Verified badges matter. Do
+not rewrite protected `main`. Avoid GitHub rebase-merge when signature /
+Verified status must survive landing.
 
 ### Branches and commits
 
@@ -427,6 +434,8 @@ docs: explain PostgreSQL support boundary
 ```
 
 Keep commits reviewable and do not mix unrelated formatting or generated state.
+Agent and maintainer delivery should re-publish PR tips with
+`scripts/gh-verified-push.sh` so the hosted commit is GitHub-signed.
 
 ## 8. Automation
 
