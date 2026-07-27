@@ -159,6 +159,13 @@ per-adapter status (`ok | truncated | denied_empty | error`). Callers must name
 representations; pure graph remains on `RetrieveContext`. See
 [hybrid-retrieval.md](hybrid-retrieval.md) (issue #361).
 
+`ExecutePatternPlan` / `ExplainPatternPlan` expose the versioned multi-hop
+pattern plan IR (`pattern_plan/v1`): match_node / expand_edge / bind steps with
+explicit variables, hard bounds, plan-time name visibility, hop-time ACL
+re-check, and deterministic EXPLAIN of plan shape only. Asserted graph only in
+v1; `Traverse` and `RetrieveContext` stay unchanged. See
+[pattern-plan.md](pattern-plan.md) (issue #375 / research #145).
+
 `RetrieveContext` is asserted-only by default. Callers may opt into the fixed
 query-time entailment profile for class inheritance/equivalence and explicitly
 transitive ontology relations. Entailment uses an authorization-filtered,

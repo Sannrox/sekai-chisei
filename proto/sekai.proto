@@ -671,6 +671,109 @@ message HybridRetrieveResponse {
   repeated string truncation_reasons = 5;
 }
 
+// Versioned multi-hop pattern plan IR (#375 / research #145).
+// Read-only, asserted graph only in v1. Ephemeral plans (not stored).
+// No SQL / SPARQL / Cypher dialect. Existing Traverse / RetrieveContext
+// remain unchanged for single-frontier / context callers.
+message PatternPlanBounds {
+  // Max expand_edge steps in the plan. 0 defaults to 3; absolute cap is 3.
+  uint32 max_depth = 1;
+  // Max result binding rows. 0 defaults to 20; absolute cap is 100.
+  uint32 max_rows = 2;
+  // Wall-clock budget. 0 defaults to 100; absolute cap is 1000.
+  uint32 max_time_ms = 3;
+  // Approximate binding-state memory. 0 defaults to 1 MiB; cap is 16 MiB.
+  uint64 max_memory_bytes = 4;
+  // Max edges examined. 0 defaults to 200; absolute cap is 1000.
+  uint32 max_source_rows = 5;
+}
+
+message PatternMatchNode {
+  // Required variable name (ASCII identifier).
+  string var = 1;
+  // Exactly one of object_id / external_id must be set.
+  string object_id = 2;
+  string external_id = 3;
+  // Optional kind constraint after resolve (empty = any).
+  string kind = 4;
+}
+
+message PatternExpandEdge {
+  string from_var = 1;
+  string to_var = 2;
+  // Required single relation name (asserted graph).
+  string relation = 3;
+  // outgoing | incoming; empty defaults to outgoing. "both" is rejected.
+  string direction = 4;
+  repeated string kind_filter = 5;
+}
+
+message PatternBind {
+  // Project these variables into each result row (wire order).
+  // Empty means project all bound vars in first-definition order.
+  repeated string vars = 1;
+}
+
+message PatternStep {
+  // Exactly one of match_node / expand_edge / bind must be set.
+  PatternMatchNode match_node = 1;
+  PatternExpandEdge expand_edge = 2;
+  PatternBind bind = 3;
+}
+
+message PatternPlan {
+  // Must be "pattern_plan/v1".
+  string version = 1;
+  PatternPlanBounds bounds = 2;
+  repeated PatternStep steps = 3;
+}
+
+message PatternBinding {
+  // Variable name -> object id for projected vars.
+  map<string, string> vars = 1;
+  // Optional full objects keyed by variable name when include_objects is set.
+  map<string, Object> objects = 2;
+}
+
+message ExecutePatternPlanRequest {
+  PatternPlan plan = 1;
+  // When true, include full Object payloads for projected vars.
+  bool include_objects = 2;
+}
+
+message ExecutePatternPlanResponse {
+  string plan_version = 1;
+  repeated PatternBinding rows = 2;
+  bool truncated = 3;
+  // Non-sensitive reasons only (max_rows, max_time_ms, max_source_rows,
+  // max_memory_bytes). Never includes object/relation secret names.
+  repeated string truncation_reasons = 4;
+  // Edges examined under authorization. Does not count denied targets as hits.
+  uint32 source_rows = 5;
+}
+
+message PatternExplainStep {
+  uint32 index = 1;
+  // match_node | expand_edge | bind
+  string op = 2;
+  // Deterministic plan-shape summary (caller's IR only; no path counts).
+  string summary = 3;
+  repeated string vars_in = 4;
+  repeated string vars_out = 5;
+}
+
+message ExplainPatternPlanRequest {
+  PatternPlan plan = 1;
+}
+
+message ExplainPatternPlanResponse {
+  string plan_version = 1;
+  PatternPlanBounds bounds = 2;
+  repeated PatternExplainStep steps = 3;
+  uint32 expand_edge_count = 4;
+  repeated string projected_vars = 5;
+}
+
 // Non-authoritative scenario overlay (#362 / research #148). Session is
 // request-scoped: create overlay, apply ordered hypothesis deltas, project a
 // domain-neutral impact set. Never mutates canonical objects/links/temporal
@@ -1720,6 +1823,9 @@ service SekaiService {
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   // Late-fusion hybrid plan over explicit representations (#361).
   rpc HybridRetrieve(HybridRetrieveRequest) returns (HybridRetrieveResponse);
+  // Multi-hop pattern plan IR execute + EXPLAIN (#375 / research #145).
+  rpc ExecutePatternPlan(ExecutePatternPlanRequest) returns (ExecutePatternPlanResponse);
+  rpc ExplainPatternPlan(ExplainPatternPlanRequest) returns (ExplainPatternPlanResponse);
   // Request-scoped non-authoritative scenario overlay (#362).
   rpc EvaluateScenario(EvaluateScenarioRequest) returns (EvaluateScenarioResponse);
   rpc ResolveSemanticRef(ResolveSemanticRefRequest) returns (ResolveSemanticRefResponse);
