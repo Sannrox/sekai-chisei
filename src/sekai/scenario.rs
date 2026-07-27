@@ -74,51 +74,55 @@ pub enum DeltaOp {
     },
 }
 
+/// Wire fields used to construct a [`DeltaOp`] from gRPC / adapters.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaOpInput<'a> {
+    pub op: &'a str,
+    pub object_id: &'a str,
+    pub property_key: &'a str,
+    pub property_value: &'a str,
+    pub link_id: &'a str,
+    pub from_id: &'a str,
+    pub to_id: &'a str,
+    pub relation: &'a str,
+}
+
 impl DeltaOp {
-    pub fn parse(
-        op: &str,
-        object_id: &str,
-        property_key: &str,
-        property_value: &str,
-        link_id: &str,
-        from_id: &str,
-        to_id: &str,
-        relation: &str,
-    ) -> Result<Self, ScenarioError> {
-        match op.trim().to_ascii_lowercase().as_str() {
+    pub fn parse(input: DeltaOpInput<'_>) -> Result<Self, ScenarioError> {
+        match input.op.trim().to_ascii_lowercase().as_str() {
             "set_property" => {
-                require_nonempty(object_id, "object_id for set_property")?;
-                require_nonempty(property_key, "property_key for set_property")?;
+                require_nonempty(input.object_id, "object_id for set_property")?;
+                require_nonempty(input.property_key, "property_key for set_property")?;
                 Ok(Self::SetProperty {
-                    object_id: object_id.to_string(),
-                    key: property_key.to_string(),
-                    value: property_value.to_string(),
+                    object_id: input.object_id.to_string(),
+                    key: input.property_key.to_string(),
+                    value: input.property_value.to_string(),
                 })
             }
             "remove_property" => {
-                require_nonempty(object_id, "object_id for remove_property")?;
-                require_nonempty(property_key, "property_key for remove_property")?;
+                require_nonempty(input.object_id, "object_id for remove_property")?;
+                require_nonempty(input.property_key, "property_key for remove_property")?;
                 Ok(Self::RemoveProperty {
-                    object_id: object_id.to_string(),
-                    key: property_key.to_string(),
+                    object_id: input.object_id.to_string(),
+                    key: input.property_key.to_string(),
                 })
             }
             "add_link" => {
-                require_nonempty(link_id, "link_id for add_link")?;
-                require_nonempty(from_id, "from_id for add_link")?;
-                require_nonempty(to_id, "to_id for add_link")?;
-                require_nonempty(relation, "relation for add_link")?;
+                require_nonempty(input.link_id, "link_id for add_link")?;
+                require_nonempty(input.from_id, "from_id for add_link")?;
+                require_nonempty(input.to_id, "to_id for add_link")?;
+                require_nonempty(input.relation, "relation for add_link")?;
                 Ok(Self::AddLink {
-                    link_id: link_id.to_string(),
-                    from_id: from_id.to_string(),
-                    to_id: to_id.to_string(),
-                    relation: relation.to_string(),
+                    link_id: input.link_id.to_string(),
+                    from_id: input.from_id.to_string(),
+                    to_id: input.to_id.to_string(),
+                    relation: input.relation.to_string(),
                 })
             }
             "remove_link" => {
-                require_nonempty(link_id, "link_id for remove_link")?;
+                require_nonempty(input.link_id, "link_id for remove_link")?;
                 Ok(Self::RemoveLink {
-                    link_id: link_id.to_string(),
+                    link_id: input.link_id.to_string(),
                 })
             }
             other => Err(ScenarioError::InvalidArgument(format!(
@@ -388,7 +392,7 @@ where
         let incoming = db
             .get_links(&object_id, "", &Direction::Incoming)
             .map_err(ScenarioError::Storage)?;
-        for link in links.into_iter().chain(incoming.into_iter()) {
+        for link in links.into_iter().chain(incoming) {
             work_units = work_units.saturating_add(1);
             if work_units > bounds.max_expansion_work_units {
                 add_truncation(&mut result, "expansion_work_units");
@@ -430,7 +434,7 @@ where
                     overlay
                         .objects
                         .insert(endpoint.id.clone(), endpoint.clone());
-                    if !visited.contains(&endpoint.id) && depth + 1 <= bounds.max_depth {
+                    if !visited.contains(&endpoint.id) && depth < bounds.max_depth {
                         visited.insert(endpoint.id.clone());
                         frontier.push((endpoint.id.clone(), depth + 1));
                     }
@@ -689,11 +693,8 @@ fn apply_delta(
             }))
         }
         DeltaOp::RemoveLink { link_id } => {
-            let link = overlay.links.remove(link_id).or_else(|| {
-                // May exist only on the base graph if expansion did not load it.
-                None
-            });
-            let Some(link) = link else {
+            // Link may exist only on the base graph if expansion did not load it.
+            let Some(link) = overlay.links.remove(link_id) else {
                 // Attempt to mark removed even if not in overlay map yet.
                 overlay.removed_link_ids.insert(link_id.clone());
                 return Ok(Some(ImpactRow {

@@ -873,16 +873,16 @@ impl SekaiServiceImpl {
         }
         let mut deltas = Vec::with_capacity(inner.deltas.len());
         for delta in inner.deltas {
-            let op = scenario::DeltaOp::parse(
-                &delta.op,
-                &delta.object_id,
-                &delta.property_key,
-                &delta.property_value,
-                &delta.link_id,
-                &delta.from_id,
-                &delta.to_id,
-                &delta.relation,
-            )
+            let op = scenario::DeltaOp::parse(scenario::DeltaOpInput {
+                op: &delta.op,
+                object_id: &delta.object_id,
+                property_key: &delta.property_key,
+                property_value: &delta.property_value,
+                link_id: &delta.link_id,
+                from_id: &delta.from_id,
+                to_id: &delta.to_id,
+                relation: &delta.relation,
+            })
             .map_err(map_scenario_error)?;
             deltas.push(scenario::HypothesisDelta { id: delta.id, op });
         }
