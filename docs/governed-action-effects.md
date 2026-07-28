@@ -14,7 +14,7 @@ lines; they have lifecycle status and bounded JSON payloads.
 
 | Kind | On admit | Lifecycle |
 | --- | --- | --- |
-| `runtime_dispatch` | `pending` | Claimable by runtime hosts (#399) |
+| `runtime_dispatch` | `pending` / semantic `ready` | Claimable by runtime hosts; intentional park waits for governed continuation (#399, #412) |
 | `notify` | best-effort `sent` or `failed` | Failure **does not** un-admit the instance |
 | `external_mutate` | `skipped` | Mutations stay on the existing **permit** path |
 

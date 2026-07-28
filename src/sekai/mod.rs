@@ -32,6 +32,7 @@ pub mod markings;
 pub mod observation;
 pub mod ontology;
 pub mod ontology_proposal;
+pub mod parked_work;
 pub mod pattern_plan;
 pub mod peer_import;
 pub mod propagation;

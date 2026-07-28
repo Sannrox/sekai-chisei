@@ -72,7 +72,11 @@ impl RiskClass {
 pub fn op_risk_class(op: &str) -> RiskClass {
     match op {
         "delete_link" | "delete_object" => RiskClass::Destructive,
-        "create_object" | "set_property" | "create_link" | "record_learning" => RiskClass::Write,
+        "create_object"
+        | "set_property"
+        | "create_link"
+        | "record_learning"
+        | crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION => RiskClass::Write,
         _ => RiskClass::Destructive,
     }
 }
@@ -418,6 +422,35 @@ impl ActionExecutor {
 
     fn register_builtins(&mut self) {
         self.registry.insert(
+            crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION.into(),
+            ActionDef {
+                name: crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION.into(),
+                required: vec![
+                    "resolution_action_id".into(),
+                    "effect_id".into(),
+                    "park_generation".into(),
+                    "namespace".into(),
+                ],
+                target_ids: Box::new(|_, _| Ok(Vec::new())),
+                execute: Box::new(|db, _, params, actor| {
+                    let generation = params["park_generation"]
+                        .parse::<u64>()
+                        .map_err(|_| "park_generation must be uint64")?;
+                    let continuation = db.invoke_parked_resolution(
+                        &params["resolution_action_id"],
+                        &params["effect_id"],
+                        generation,
+                        actor,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    Ok(format!(
+                        "resolved parked work {} as {}",
+                        continuation.effect_id, continuation.resolution_id
+                    ))
+                }),
+            },
+        );
+        self.registry.insert(
             crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
             ActionDef {
                 name: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
@@ -566,6 +599,18 @@ fn builtin_action_types() -> Vec<ActionTypeDef> {
     };
 
     vec![
+        definition(
+            crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION,
+            "Resolve one exact parked-work generation through governed approval.",
+            vec![
+                builtin_param("resolution_action_id", true),
+                builtin_param("effect_id", true),
+                builtin_param("park_generation", true),
+                builtin_param("namespace", true),
+            ],
+            crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION,
+            "runtime_dispatch",
+        ),
         definition(
             "create_object",
             "Create a schema-governed object in an authorized namespace.",

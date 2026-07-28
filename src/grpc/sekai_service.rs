@@ -5798,6 +5798,75 @@ fn to_proto_action_effect(
         claim_fencing_token: domain.claim_fencing_token.clone(),
         claim_expires_at_ms: domain.claim_expires_at_ms,
         claim_request_id: domain.claim_request_id.clone(),
+        park_generation: domain.park_generation,
+        active_resolution_id: domain.active_resolution_id.clone(),
+        claim_attempt_count: domain.claim_attempt_count,
+        lease_expiry_count: domain.lease_expiry_count,
+        park_count: domain.park_count,
+        lifecycle_state: domain.effective_lifecycle_state().into(),
+        retry_policy_version: domain.retry_policy_version.clone(),
+        retry_policy_digest: domain.retry_policy_digest.clone(),
+        max_claim_attempts: domain.max_claim_attempts,
+        max_lease_expiries: domain.max_lease_expiries,
+        max_park_cycles: domain.max_park_cycles,
+    }
+}
+
+fn to_proto_action_work_park(value: &crate::sekai::parked_work::ActionWorkPark) -> ActionWorkPark {
+    ActionWorkPark {
+        park_id: value.park_id.clone(),
+        effect_id: value.effect_id.clone(),
+        namespace: value.namespace.clone(),
+        operation_id: value.operation_id.clone(),
+        park_generation: value.park_generation,
+        claim_generation: value.claim_generation,
+        checkpoint_ref: value.checkpoint_ref.clone(),
+        checkpoint_digest: value.checkpoint_digest.clone(),
+        reason: value.reason.clone(),
+        parked_by: value.parked_by.clone(),
+        parked_at_ms: value.parked_at_ms,
+        request_id: value.request_id.clone(),
+        request_digest: value.request_digest.clone(),
+        checkpoint_store_id: value.checkpoint_store_id.clone(),
+    }
+}
+
+fn to_proto_parked_resolution_action(
+    value: &crate::sekai::parked_work::ParkedWorkResolutionAction,
+) -> ParkedWorkResolutionAction {
+    ParkedWorkResolutionAction {
+        resolution_action_id: value.resolution_action_id.clone(),
+        effect_id: value.effect_id.clone(),
+        namespace: value.namespace.clone(),
+        expected_park_generation: value.expected_park_generation,
+        status: value.status.clone(),
+        policy_version: value.policy_version.clone(),
+        approval_id: value.approval_id.clone(),
+        decided_by: value.decided_by.clone(),
+        created_at_ms: value.created_at_ms,
+        invoked_at_ms: value.invoked_at_ms,
+        resolution_input_id: value.resolution_input_id.clone(),
+    }
+}
+
+fn to_proto_action_work_continuation(
+    value: &crate::sekai::parked_work::ActionWorkContinuation,
+) -> ActionWorkContinuation {
+    ActionWorkContinuation {
+        resolution_id: value.resolution_id.clone(),
+        effect_id: value.effect_id.clone(),
+        namespace: value.namespace.clone(),
+        operation_id: value.operation_id.clone(),
+        park_generation: value.park_generation,
+        input_json: value.input_json.clone(),
+        input_digest: value.input_digest.clone(),
+        park_id: value.park_id.clone(),
+        resolution_action_id: value.resolution_action_id.clone(),
+        resolution_input_id: value.resolution_input_id.clone(),
+        reason: value.reason.clone(),
+        decided_by: value.decided_by.clone(),
+        decided_at_ms: value.decided_at_ms,
+        request_id: value.request_id.clone(),
     }
 }
 
@@ -10473,7 +10542,11 @@ impl SekaiService for SekaiServiceImpl {
                 now_millis(),
             )
             .map_err(|e| {
-                if e.contains("already claimed") || e.contains("not claimable") {
+                if e.contains("already claimed")
+                    || e.contains("not claimable")
+                    || e.contains("retry limit exceeded")
+                    || e.contains("dead-lettered")
+                {
                     Status::failed_precondition(e)
                 } else if e.contains("required") || e.contains("ttl") {
                     Status::invalid_argument(e)
@@ -10500,8 +10573,18 @@ impl SekaiService for SekaiServiceImpl {
             target_id: stored.effect_id.clone(),
             outcome: stored.status.clone(),
         });
+        let active = self
+            .db
+            .get_active_continuation(&stored)
+            .map_err(Status::internal)?;
         Ok(Response::new(ClaimActionWorkResponse {
             effect: Some(to_proto_action_effect(&stored)),
+            continuation: active
+                .as_ref()
+                .map(|(continuation, _)| to_proto_action_work_continuation(continuation)),
+            park: active
+                .as_ref()
+                .map(|(_, park)| to_proto_action_work_park(park)),
         }))
     }
 
@@ -10556,6 +10639,66 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or_else(|| Status::not_found("action effect not found"))?;
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         let now = now_millis();
+        let actor = principals.first().cloned().unwrap_or_default();
+        if inner.outcome == crate::sekai::action_effect::ACK_OUTCOME_PARKED {
+            let result = self
+                .db
+                .park_action_work(
+                    &inner.effect_id,
+                    &inner.runtime_id,
+                    inner.claim_generation,
+                    &inner.fencing_token,
+                    &inner.reason,
+                    &inner.request_id,
+                    &inner.checkpoint_store_id,
+                    &inner.checkpoint_ref,
+                    &inner.checkpoint_digest,
+                    &actor,
+                    now,
+                )
+                .map_err(|error| {
+                    if error.contains("fencing")
+                        || error.contains("expired")
+                        || error.contains("not claimed")
+                        || error.contains("retry limit")
+                    {
+                        Status::failed_precondition(error)
+                    } else if error.contains("required")
+                        || error.contains("checkpoint")
+                        || error.contains("bounds")
+                    {
+                        Status::invalid_argument(error)
+                    } else if error.contains("conflict") {
+                        Status::already_exists(error)
+                    } else {
+                        Status::internal(error)
+                    }
+                })?;
+            let _ = self.db.record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now,
+                actor,
+                action: "ack_action_work".into(),
+                reason: "action_effect_parked".into(),
+                evidence: HashMap::from([
+                    ("effect_id".into(), result.effect.effect_id.clone()),
+                    ("operation_id".into(), result.effect.operation_id.clone()),
+                    ("park_id".into(), result.park.park_id.clone()),
+                    (
+                        "park_generation".into(),
+                        result.park.park_generation.to_string(),
+                    ),
+                    ("request_digest".into(), result.park.request_digest.clone()),
+                ]),
+                target_id: result.effect.effect_id.clone(),
+                outcome: "awaiting_continuation".into(),
+            });
+            return Ok(Response::new(AckActionWorkResponse {
+                effect: Some(to_proto_action_effect(&result.effect)),
+                park: Some(to_proto_action_work_park(&result.park)),
+                replay: result.replay,
+            }));
+        }
         let stored = self
             .db
             .ack_action_work(
@@ -10635,7 +10778,6 @@ impl SekaiService for SekaiServiceImpl {
                 }
             }
         }
-        let actor = principals.first().cloned().unwrap_or_default();
         let _ = self.db.record_decision(&audit::Decision {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now,
@@ -10654,7 +10796,280 @@ impl SekaiService for SekaiServiceImpl {
         });
         Ok(Response::new(AckActionWorkResponse {
             effect: Some(to_proto_action_effect(&stored)),
+            park: None,
+            replay: false,
         }))
+    }
+
+    async fn submit_parked_work_resolution_action(
+        &self,
+        req: Request<SubmitParkedWorkResolutionActionRequest>,
+    ) -> Result<Response<SubmitParkedWorkResolutionActionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let effect = self
+            .db
+            .get_action_effect(&inner.effect_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("action effect not found"))?;
+        check_team_namespace(&self.db, &principals, &effect.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let policy = self
+            .db
+            .resolve_action_policy(&actor, &effect.namespace, &effect.namespace)
+            .map_err(Status::internal)?;
+        let decision = policy
+            .as_ref()
+            .map(|policy| {
+                policy.decide(
+                    crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION,
+                    RiskClass::Write,
+                )
+            })
+            .unwrap_or(ActionDecision::Allow);
+        let policy_version = policy
+            .as_ref()
+            .map(|policy| policy.scope.clone())
+            .unwrap_or_else(|| "default-allow".into());
+        let mut approval = if decision == ActionDecision::RequireApproval {
+            Some(action_approval::ActionApproval::pending(
+                actor.clone(),
+                crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION,
+                HashMap::from([
+                    ("effect_id".into(), effect.effect_id.clone()),
+                    (
+                        "park_generation".into(),
+                        inner.expected_park_generation.to_string(),
+                    ),
+                    ("namespace".into(), effect.namespace.clone()),
+                ]),
+                effect.operation_id.clone(),
+                policy_version.clone(),
+                RiskClass::Write.as_str(),
+                effect.effect_id.clone(),
+                now_millis(),
+            ))
+        } else {
+            None
+        };
+        let approval_id = approval
+            .as_ref()
+            .map(|approval| approval.id.as_str())
+            .unwrap_or("");
+        let status = match decision {
+            ActionDecision::Deny => "denied",
+            ActionDecision::Allow => "pending_execution",
+            ActionDecision::RequireApproval => "pending_approval",
+        };
+        let mut result = self
+            .db
+            .submit_parked_resolution(
+                &inner.effect_id,
+                inner.expected_park_generation,
+                &inner.input_json,
+                &inner.reason,
+                &inner.request_id,
+                &actor,
+                &policy_version,
+                status,
+                approval_id,
+                now_millis(),
+            )
+            .map_err(|error| {
+                if error.contains("stale")
+                    || error.contains("not awaiting")
+                    || error.contains("already resolved")
+                {
+                    Status::failed_precondition(error)
+                } else if error.contains("conflict") {
+                    Status::already_exists(error)
+                } else if error.contains("required")
+                    || error.contains("JSON")
+                    || error.contains("bytes")
+                {
+                    Status::invalid_argument(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
+        if result.action.status == "pending_execution" {
+            if decision != ActionDecision::Allow {
+                return Err(Status::failed_precondition(
+                    "current action policy no longer allows this resolution",
+                ));
+            }
+            let mut execute_request = Request::new(ExecuteActionRequest {
+                request: Some(ActionRequest {
+                    action: crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION.into(),
+                    params: HashMap::from([
+                        (
+                            "resolution_action_id".into(),
+                            result.action.resolution_action_id.clone(),
+                        ),
+                        ("effect_id".into(), effect.effect_id.clone()),
+                        (
+                            "park_generation".into(),
+                            inner.expected_park_generation.to_string(),
+                        ),
+                        ("namespace".into(), effect.namespace.clone()),
+                    ]),
+                    actor: actor.clone(),
+                }),
+                dry_run: false,
+            });
+            execute_request.metadata_mut().insert(
+                "x-principal",
+                tonic::metadata::MetadataValue::try_from(actor.as_str())
+                    .map_err(|_| Status::internal("invalid actor metadata"))?,
+            );
+            execute_request.metadata_mut().insert(
+                "x-chisei-work-unit",
+                tonic::metadata::MetadataValue::try_from(effect.operation_id.as_str())
+                    .map_err(|_| Status::internal("invalid operation metadata"))?,
+            );
+            let execution = self.execute_action(execute_request).await?.into_inner();
+            let execution_result = execution
+                .result
+                .ok_or_else(|| Status::internal("governed action returned no result"))?;
+            if !execution_result.approval_id.is_empty() {
+                self.db
+                    .bind_parked_resolution_approval(
+                        &result.action.resolution_action_id,
+                        &execution_result.approval_id,
+                    )
+                    .map_err(Status::internal)?;
+                result.action.status = "pending_approval".into();
+                result.action.approval_id = execution_result.approval_id;
+            } else {
+                let resolved_effect = self
+                    .db
+                    .get_action_effect(&effect.effect_id)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::internal("resolved effect disappeared"))?;
+                let (continuation, _) = self
+                    .db
+                    .get_active_continuation(&resolved_effect)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::internal("resolved continuation disappeared"))?;
+                result.action.status = "invoked".into();
+                result.action.invoked_at_ms = continuation.decided_at_ms;
+                result.continuation = Some(continuation);
+                result.effect = resolved_effect;
+            }
+        }
+        if result.action.status == "pending_approval"
+            && self
+                .db
+                .get_action_approval(&result.action.approval_id)
+                .map_err(Status::internal)?
+                .is_none()
+        {
+            let mut pending = approval.take().unwrap_or_else(|| {
+                action_approval::ActionApproval::pending(
+                    actor.clone(),
+                    crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION,
+                    HashMap::from([
+                        ("effect_id".into(), effect.effect_id.clone()),
+                        (
+                            "park_generation".into(),
+                            inner.expected_park_generation.to_string(),
+                        ),
+                        ("namespace".into(), effect.namespace.clone()),
+                    ]),
+                    effect.operation_id.clone(),
+                    result.action.policy_version.clone(),
+                    RiskClass::Write.as_str(),
+                    effect.effect_id.clone(),
+                    now_millis(),
+                )
+            });
+            pending.id = result.action.approval_id.clone();
+            pending.params.insert(
+                "resolution_action_id".into(),
+                result.action.resolution_action_id.clone(),
+            );
+            self.db
+                .create_action_approval(&pending)
+                .map_err(Status::internal)?;
+        }
+        let _ = self.db.record_decision(&audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_millis(),
+            actor,
+            action: crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION.into(),
+            reason: format!("parked_resolution_{}", result.action.status),
+            evidence: HashMap::from([
+                ("effect_id".into(), result.effect.effect_id.clone()),
+                (
+                    "park_generation".into(),
+                    result.action.expected_park_generation.to_string(),
+                ),
+                (
+                    "resolution_action_id".into(),
+                    result.action.resolution_action_id.clone(),
+                ),
+                (
+                    "resolution_input_id".into(),
+                    result.action.resolution_input_id.clone(),
+                ),
+                (
+                    "request_digest".into(),
+                    result.action.request_digest.clone(),
+                ),
+                ("policy_version".into(), policy_version),
+            ]),
+            target_id: result.effect.effect_id.clone(),
+            outcome: result.action.status.clone(),
+        });
+        Ok(Response::new(SubmitParkedWorkResolutionActionResponse {
+            action: Some(to_proto_parked_resolution_action(&result.action)),
+            effect: Some(to_proto_action_effect(&result.effect)),
+            continuation: result
+                .continuation
+                .as_ref()
+                .map(to_proto_action_work_continuation),
+            park: Some(to_proto_action_work_park(&result.park)),
+            replay: result.replay,
+        }))
+    }
+
+    async fn report_action_claim_event(
+        &self,
+        req: Request<ReportActionClaimEventRequest>,
+    ) -> Result<Response<ReportActionClaimEventResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let effect = self
+            .db
+            .get_action_effect(&inner.effect_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("action effect not found"))?;
+        check_team_namespace(&self.db, &principals, &effect.namespace, true)?;
+        let replay = self
+            .db
+            .report_action_claim_event(
+                &inner.effect_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                &inner.kind,
+                &inner.checkpoint_digest,
+                &inner.reason_code,
+                &inner.request_id,
+                now_millis(),
+            )
+            .map_err(|error| {
+                if error.contains("fence") {
+                    Status::failed_precondition(error)
+                } else if error.contains("conflict") {
+                    Status::already_exists(error)
+                } else {
+                    Status::invalid_argument(error)
+                }
+            })?;
+        Ok(Response::new(ReportActionClaimEventResponse { replay }))
     }
 
     async fn execute_action(
@@ -11608,6 +12023,28 @@ impl SekaiService for SekaiServiceImpl {
         // Resume the effect, re-checking write access, markings, and purpose
         // for the original proposer (authority may have changed while held).
         let proposer = vec![approval.actor.clone()];
+        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
+            let effect_id = approval
+                .params
+                .get("effect_id")
+                .ok_or_else(|| Status::invalid_argument("effect_id required"))?;
+            let effect = self
+                .db
+                .get_action_effect(effect_id)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::not_found("action effect not found"))?;
+            let submitted_namespace = approval
+                .params
+                .get("namespace")
+                .map(String::as_str)
+                .unwrap_or("");
+            if submitted_namespace != effect.namespace {
+                return Err(Status::failed_precondition(
+                    "parked resolution namespace no longer matches effect",
+                ));
+            }
+            check_team_namespace(&self.db, &proposer, &effect.namespace, true)?;
+        }
         let actions = self
             .actions
             .read()
@@ -11671,6 +12108,15 @@ impl SekaiService for SekaiServiceImpl {
             }
         }
         drop(actions);
+        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
+            let resolution_action_id = approval
+                .params
+                .get("resolution_action_id")
+                .ok_or_else(|| Status::invalid_argument("resolution_action_id required"))?;
+            self.db
+                .authorize_parked_resolution_approval(resolution_action_id, &approval.id)
+                .map_err(Status::failed_precondition)?;
+        }
         let msg = self.run_action_effect(
             &approval.action,
             &approval.params,
@@ -11691,6 +12137,37 @@ impl SekaiService for SekaiServiceImpl {
             budget.record(&budget_subject, 1);
         }
 
+        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
+            let effect_id = approval
+                .params
+                .get("effect_id")
+                .cloned()
+                .unwrap_or_default();
+            let park_generation = approval
+                .params
+                .get("park_generation")
+                .cloned()
+                .unwrap_or_default();
+            for mut competing in self
+                .db
+                .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
+                .map_err(Status::internal)?
+            {
+                if competing.action == approval.action
+                    && competing.id != approval.id
+                    && competing.params.get("effect_id") == Some(&effect_id)
+                    && competing.params.get("park_generation") == Some(&park_generation)
+                {
+                    competing.status = action_approval::ApprovalStatus::Denied;
+                    competing.decided_by = principals.first().cloned().unwrap_or_default();
+                    competing.outcome = format!("stale: superseded by resolution {}", approval.id);
+                    competing.updated = now_millis();
+                    self.db
+                        .update_action_approval(&competing)
+                        .map_err(Status::internal)?;
+                }
+            }
+        }
         approval.status = action_approval::ApprovalStatus::Approved;
         approval.decided_by = principals.first().cloned().unwrap_or_default();
         approval.outcome = msg.clone();
@@ -11802,6 +12279,16 @@ impl SekaiService for SekaiServiceImpl {
             r.reason.trim().to_string()
         };
         approval.updated = now_millis();
+        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
+            self.db
+                .reject_parked_resolution(
+                    &approval.id,
+                    "rejected",
+                    &approval.decided_by,
+                    approval.updated,
+                )
+                .map_err(Status::internal)?;
+        }
         self.db
             .update_action_approval(&approval)
             .map_err(Status::internal)?;
@@ -19384,6 +19871,10 @@ mod tests {
                 fencing_token: claimed.claim_fencing_token.clone(),
                 outcome: "completed".into(),
                 reason: String::new(),
+                request_id: String::new(),
+                checkpoint_store_id: String::new(),
+                checkpoint_ref: String::new(),
+                checkpoint_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -26357,6 +26848,216 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unauth.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn parked_work_resolution_is_governed_fenced_and_resumable() {
+        let svc = service();
+        let effect = crate::sekai::action_effect::plan_effects_for_admit(
+            "instance-park",
+            "acme",
+            "operation-park",
+            &["runtime_dispatch".into()],
+            r#"{"runtime":"shikigami"}"#,
+            now_millis(),
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        svc.db
+            .put_action_effects(std::slice::from_ref(&effect))
+            .unwrap();
+
+        let claimed = svc
+            .claim_action_work(with_principal(ClaimActionWorkRequest {
+                effect_id: effect.effect_id.clone(),
+                runtime_id: "shikigami".into(),
+                request_id: "claim-park".into(),
+                ttl_ms: 60_000,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effect
+            .unwrap();
+        let parked = svc
+            .ack_action_work(with_principal(AckActionWorkRequest {
+                effect_id: effect.effect_id.clone(),
+                runtime_id: "shikigami".into(),
+                claim_generation: claimed.claim_generation,
+                fencing_token: claimed.claim_fencing_token.clone(),
+                outcome: "parked".into(),
+                reason: "needs answer".into(),
+                request_id: "park-1".into(),
+                checkpoint_store_id: String::new(),
+                checkpoint_ref: String::new(),
+                checkpoint_digest: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(parked.effect.as_ref().unwrap().status, "parked");
+        assert_eq!(
+            parked.effect.as_ref().unwrap().lifecycle_state,
+            "awaiting_continuation"
+        );
+        assert_eq!(parked.park.as_ref().unwrap().park_generation, 1);
+        assert!(
+            svc.list_claimable_action_work(with_principal(ListClaimableActionWorkRequest {
+                namespace: "acme".into(),
+                runtime_id: "shikigami".into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .effects
+            .is_empty()
+        );
+
+        let resolved = svc
+            .submit_parked_work_resolution_action(with_principal(
+                SubmitParkedWorkResolutionActionRequest {
+                    effect_id: effect.effect_id.clone(),
+                    expected_park_generation: 1,
+                    input_json: r#"{"answer":"continue"}"#.into(),
+                    reason: "operator answered".into(),
+                    request_id: "resolve-1".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resolved.action.as_ref().unwrap().status, "invoked");
+        assert_eq!(resolved.effect.as_ref().unwrap().status, "pending");
+        assert!(resolved.continuation.is_some());
+
+        let resumed = svc
+            .claim_action_work(with_principal(ClaimActionWorkRequest {
+                effect_id: effect.effect_id.clone(),
+                runtime_id: "shikigami".into(),
+                request_id: "claim-resume".into(),
+                ttl_ms: 60_000,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resumed.effect.as_ref().unwrap().claim_generation, 2);
+        assert_eq!(
+            resumed.continuation.as_ref().unwrap().operation_id,
+            "operation-park"
+        );
+        assert_eq!(
+            resumed.park.as_ref().unwrap().park_id,
+            parked.park.as_ref().unwrap().park_id
+        );
+
+        let event = ReportActionClaimEventRequest {
+            effect_id: effect.effect_id,
+            runtime_id: "shikigami".into(),
+            claim_generation: resumed.effect.as_ref().unwrap().claim_generation,
+            fencing_token: resumed.effect.as_ref().unwrap().claim_fencing_token.clone(),
+            kind: "resume_started".into(),
+            checkpoint_digest: String::new(),
+            reason_code: String::new(),
+            request_id: "event-1".into(),
+        };
+        assert!(
+            !svc.report_action_claim_event(with_principal(event.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .replay
+        );
+        assert!(
+            svc.report_action_claim_event(with_principal(event))
+                .await
+                .unwrap()
+                .into_inner()
+                .replay
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_work_resolution_waits_for_and_resumes_through_approval() {
+        let svc = service();
+        grant_action_admin(&svc);
+        svc.db
+            .upsert_action_policy(&action_policy::ActionPolicy {
+                scope: "agent:tester".into(),
+                default_decision: ActionDecision::Allow,
+                action_overrides: HashMap::from([(
+                    crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION.into(),
+                    ActionDecision::RequireApproval,
+                )]),
+                risk_overrides: HashMap::new(),
+                max_mutations_per_work_unit: None,
+                max_deletes_per_work_unit: None,
+            })
+            .unwrap();
+        let effect = crate::sekai::action_effect::plan_effects_for_admit(
+            "instance-approval",
+            "acme",
+            "operation-approval",
+            &["runtime_dispatch".into()],
+            r#"{}"#,
+            now_millis(),
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        svc.db
+            .put_action_effects(std::slice::from_ref(&effect))
+            .unwrap();
+        let claim = svc
+            .db
+            .claim_action_work(&effect.effect_id, "runtime", "claim", 60_000, now_millis())
+            .unwrap();
+        svc.db
+            .park_action_work(
+                &effect.effect_id,
+                "runtime",
+                claim.claim_generation,
+                &claim.claim_fencing_token,
+                "",
+                "park",
+                "",
+                "",
+                "",
+                "runtime",
+                now_millis(),
+            )
+            .unwrap();
+        let pending = svc
+            .submit_parked_work_resolution_action(with_principal(
+                SubmitParkedWorkResolutionActionRequest {
+                    effect_id: effect.effect_id.clone(),
+                    expected_park_generation: 1,
+                    input_json: r#"{"answer":"approved"}"#.into(),
+                    reason: String::new(),
+                    request_id: "resolve".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pending.action.as_ref().unwrap().status, "pending_approval");
+        assert!(pending.continuation.is_none());
+        let approval_id = pending.action.unwrap().approval_id;
+
+        let approved = svc
+            .approve_action(with_principal(ApproveActionRequest { approval_id }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(approved.approval.as_ref().unwrap().status, "approved");
+        let ready = svc
+            .db
+            .get_action_effect(&effect.effect_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.status, "pending");
+        assert!(!ready.active_resolution_id.is_empty());
     }
 
     fn with_semantic_catalog_headers<T>(

@@ -1926,6 +1926,247 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn park_action_work(
+        &self,
+        effect_id: &str,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token: &str,
+        reason: &str,
+        request_id: &str,
+        checkpoint_store_id: &str,
+        checkpoint_ref: &str,
+        checkpoint_digest: &str,
+        parked_by: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::parked_work::ParkResult, String> {
+        match self {
+            Self::Sqlite(db) => db.park_action_work(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                reason,
+                request_id,
+                checkpoint_store_id,
+                checkpoint_ref,
+                checkpoint_digest,
+                parked_by,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.park_action_work(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                reason,
+                request_id,
+                checkpoint_store_id,
+                checkpoint_ref,
+                checkpoint_digest,
+                parked_by,
+                now_ms,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_parked_resolution(
+        &self,
+        effect_id: &str,
+        expected_park_generation: u64,
+        input_json: &str,
+        reason: &str,
+        request_id: &str,
+        submitted_by: &str,
+        policy_version: &str,
+        status: &str,
+        approval_id: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::parked_work::ResolutionResult, String> {
+        match self {
+            Self::Sqlite(db) => db.submit_parked_resolution(
+                effect_id,
+                expected_park_generation,
+                input_json,
+                reason,
+                request_id,
+                submitted_by,
+                policy_version,
+                status,
+                approval_id,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.submit_parked_resolution(
+                effect_id,
+                expected_park_generation,
+                input_json,
+                reason,
+                request_id,
+                submitted_by,
+                policy_version,
+                status,
+                approval_id,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn invoke_parked_resolution(
+        &self,
+        resolution_action_id: &str,
+        effect_id: &str,
+        park_generation: u64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::parked_work::ActionWorkContinuation, String> {
+        match self {
+            Self::Sqlite(db) => db.invoke_parked_resolution(
+                resolution_action_id,
+                effect_id,
+                park_generation,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.invoke_parked_resolution(
+                resolution_action_id,
+                effect_id,
+                park_generation,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn mark_parked_resolution_accounted(
+        &self,
+        resolution_action_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.mark_parked_resolution_accounted(resolution_action_id),
+            Self::Postgres(db) => db.mark_parked_resolution_accounted(resolution_action_id),
+        }
+    }
+
+    pub fn reserve_parked_resolution_execution(
+        &self,
+        resolution_action_id: &str,
+        effect_id: &str,
+        park_generation: u64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.reserve_parked_resolution_execution(
+                resolution_action_id,
+                effect_id,
+                park_generation,
+            ),
+            Self::Postgres(db) => db.reserve_parked_resolution_execution(
+                resolution_action_id,
+                effect_id,
+                park_generation,
+            ),
+        }
+    }
+
+    pub fn authorize_parked_resolution_approval(
+        &self,
+        resolution_action_id: &str,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.authorize_parked_resolution_approval(resolution_action_id, approval_id)
+            }
+            Self::Postgres(db) => {
+                db.authorize_parked_resolution_approval(resolution_action_id, approval_id)
+            }
+        }
+    }
+
+    pub fn bind_parked_resolution_approval(
+        &self,
+        resolution_action_id: &str,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.bind_parked_resolution_approval(resolution_action_id, approval_id)
+            }
+            Self::Postgres(db) => {
+                db.bind_parked_resolution_approval(resolution_action_id, approval_id)
+            }
+        }
+    }
+
+    pub fn reject_parked_resolution(
+        &self,
+        approval_id: &str,
+        status: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.reject_parked_resolution(approval_id, status, actor, now_ms),
+            Self::Postgres(db) => db.reject_parked_resolution(approval_id, status, actor, now_ms),
+        }
+    }
+
+    pub fn get_active_continuation(
+        &self,
+        effect: &crate::sekai::action_effect::ActionEffect,
+    ) -> Result<
+        Option<(
+            crate::sekai::parked_work::ActionWorkContinuation,
+            crate::sekai::parked_work::ActionWorkPark,
+        )>,
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => db.get_active_continuation(effect),
+            Self::Postgres(db) => db.get_active_continuation(effect),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_action_claim_event(
+        &self,
+        effect_id: &str,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token: &str,
+        kind: &str,
+        checkpoint_digest: &str,
+        reason_code: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.report_action_claim_event(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                kind,
+                checkpoint_digest,
+                reason_code,
+                request_id,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.report_action_claim_event(
+                effect_id,
+                runtime_id,
+                generation,
+                fencing_token,
+                kind,
+                checkpoint_digest,
+                reason_code,
+                request_id,
+                now_ms,
+            ),
+        }
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_grants(),
