@@ -1,116 +1,81 @@
 # sekai-chisei
 
+> Define the world your agents operate in. Govern what they do. Keep the
+> receipt.
+
 `sekai-chisei` is a local-first Rust control plane for governed agent
-operations. It puts policy, budgets, audit, evaluation, and durable operational
-context around model calls and agent actions without replacing the agent
-runtime.
+operations. Define a domain ontology, store governed facts under that model,
+run plan and execution inside policy and budget, and inspect the resulting
+receipt.
+
+Operators use `sekaictl`; agents and SDKs use the same core gRPC and capability
+catalog interfaces. The control plane owns durable facts and the decisions that
+constrain an operation. It does not replace the agent runtime.
 
 > **Project status:** early-stage (`v0.1.0`). The core server, local graph,
-> policy pipeline, compatible gateway, and native execution APIs work today.
-> Public APIs may change before v1.0.
+> ontology-first product loop, policy pipeline, receipts, and native execution
+> APIs work today. Public APIs may change before v1.0.
 
-## Why sekai-chisei?
+## What it gives you
 
-Most agent systems treat model calls as isolated events. `sekai-chisei` treats
-them as governed operations that can answer:
+- **Ontology-first authoring:** define domain classes and relations, then seed
+  typed facts and links without adding domain concepts to the core protocol.
+- **Governed execution:** apply namespace access, policy, budgets, context
+  egress, routing, evaluation, and approvals around plan and execution.
+- **Inspectable outcomes:** retain decisions, normalized usage, lineage,
+  verification, action outcomes, and provenance under a durable operation.
+- **Local-first authority:** keep the graph and governance state in SQLite, or
+  use the supported PostgreSQL community surface where shared durability is
+  required.
 
-- which actor, policy, model, runtime, and budget applied;
-- what context crossed a provider boundary;
-- which actions required approval or were denied;
-- what usage, verification, and outcome evidence was recorded; and
-- what the system may safely learn for the next operation.
+The core product loop is deliberately small:
 
-The project has three implementation layers:
+```text
+define ontology
+  → seed governed facts
+  → plan / execute under policy and budget
+  → inspect receipt and provenance
+```
+
+## How it fits
 
 - **Sekai** stores durable facts: typed objects and links, lineage, access
   control, audit history, coordination, and operational memory.
 - **Chisei** makes governed decisions about context, policy, budgets,
   approvals, routing, evaluation, and learning.
-- **LLM adapters** execute calls against OpenAI, Anthropic, Ollama-compatible,
-  and native endpoints. They are not the policy boundary.
+- **Product interfaces** expose the same core loop to operators through
+  `sekaictl` and to agents through gRPC and the capability catalog.
 
-Existing OpenAI- and Anthropic-compatible clients enter through the HTTP
-gateway. Native integrations use the gRPC `PlanExecution` and `ExecutePlan`
-APIs. Both paths use the same control plane.
+Provider adapters, the OpenAI- and Anthropic-compatible gateway, advanced
+retrieval, federation administration, and automated allocation extend the
+platform. They are useful integration or operational capabilities, not the
+product definition.
 
 ## Quick start
 
 ### Prerequisites
 
 - a recent Rust toolchain with Rust 2024 edition support;
-- macOS, Linux, or another platform supported by Rust and SQLite; and
-- Codex or Claude Code for the guided client launch, or a provider endpoint for
-  direct API use.
+- macOS, Linux, or another platform supported by Rust and SQLite.
 
 `protoc` is supplied by a vendored build dependency.
 
-### Connect an existing agent
+### Run the ontology-first product loop
 
 ```bash
 git clone https://github.com/Sannrox/sekai-chisei.git
 cd sekai-chisei
 cp .env.example .env
-cargo run --bin sekaictl -- doctor codex-app
-cargo run --bin sekaictl -- launch codex-app
 ```
 
-The `.env` file is optional. Add `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` when
-the gateway should own provider credentials. The launcher can also use a
-supported client subscription passthrough path.
-
-`launch` creates local state, runs migrations, generates a private credential,
-binds local-only endpoints, validates the client/provider contract, seeds
-policy and budget state, and opens the client. It does not require insecure
-mode.
-
-For Claude Code, replace `codex-app` with `claude-code`. See the
-[gateway and client guide](docs/gateway.md) for upstream modes, model routing,
-manual setup, and security boundaries.
-
-### Run the control plane directly
-
-For trusted local development:
+Start the control plane in one terminal:
 
 ```bash
-cp .env.example .env
 SEKAI_INSECURE=1 cargo run
 ```
 
-The defaults expose:
-
-- local gRPC over `./data/sekai.sock`;
-- local TCP gRPC on `127.0.0.1:50051`; and
-- health and Prometheus endpoints on `127.0.0.1:9464`.
-
-Do not use `SEKAI_INSECURE=1` outside a trusted local environment. Read the
-[operations and security guide](docs/operations.md) before binding to a
-network-accessible interface.
-
-### Verify the installation
-
-```bash
-cargo test --locked
-curl --fail http://127.0.0.1:9464/healthz
-```
-
-With a gateway-owned OpenAI credential, run a deterministic provider check:
-
-```bash
-cargo run --bin sekaictl -- smoke gpt-5.5
-```
-
-The output includes the operation ID, policy result, normalized usage, receipt
-location, and an inspection command:
-
-```bash
-cargo run --bin sekaictl -- receipt <operation_id>
-```
-
-### Product loop (ontology-first)
-
-Define a small domain, seed facts, run one governed lookup, and inspect the
-receipt—without raw gRPC. Fixture files live under
-`tests/fixtures/product_loop/`. Details: [docs/ontology.md](docs/ontology.md).
+In another terminal, define a small service domain, seed facts, run a governed
+lookup, and receive a receipt hint:
 
 ```bash
 cargo run --bin sekaictl -- ontology first-run \
@@ -118,6 +83,40 @@ cargo run --bin sekaictl -- ontology first-run \
   --seed tests/fixtures/product_loop/seed-v1.json \
   --resolve-object svc-api
 ```
+
+This lookup-first path requires no external model. The fixture files are
+domain-neutral examples; your domain concepts live in your own ontology and
+seed documents. Continue with the [ontology guide](docs/ontology.md) for
+separate apply, seed, run, and receipt commands.
+
+Verify the service and repository:
+
+```bash
+cargo test --locked
+curl --fail http://127.0.0.1:9464/healthz
+```
+
+`SEKAI_INSECURE=1` is only for trusted local development. Read the
+[operations and security guide](docs/operations.md) before binding to a
+network-accessible interface.
+
+### Optional: connect an existing client
+
+The compatibility gateway lets Codex, Claude Code, and OpenAI- or
+Anthropic-compatible clients use the same control plane:
+
+```bash
+cargo run --bin sekaictl -- doctor codex-app
+cargo run --bin sekaictl -- launch codex-app
+```
+
+For Claude Code, replace `codex-app` with `claude-code`. Add
+`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` when the gateway should own provider
+credentials; supported client-subscription passthrough paths are also
+available.
+
+See [Gateway and clients](docs/gateway.md) for routing, upstream modes, manual
+setup, smoke checks, and security boundaries.
 
 ### Local ontology tool
 
@@ -153,7 +152,7 @@ Do not use the control-plane database (`data/sekai.db`) as a portable ontology
 database. See the [sekai-ontology crate](crates/sekai-ontology/) for library
 usage.
 
-## What is implemented
+## What works today
 
 - SQLite-backed typed-object graph with schemas, links, datasets, and virtual
   tables, plus optional `SEKAI_DB_BACKEND=postgres` for the reusable community
@@ -179,18 +178,22 @@ in schemas and adapters rather than the core ontology.
 
 Start with the [documentation index](docs/README.md), or go directly to:
 
-- [Architecture](docs/architecture.md) — boundaries, data model, and governed
-  entry paths;
-- [Gateway and clients](docs/gateway.md) — Codex, Claude Code, provider routing,
-  authentication modes, and smoke checks;
+- [Ontology](docs/ontology.md) — define a domain, seed governed facts, run an
+  operation, and inspect its receipt;
+- [Architecture](docs/architecture.md) — control-plane boundaries, data model,
+  and governed entry paths;
 - [Configuration](docs/configuration.md) — environment variables and defaults;
 - [Operations and security](docs/operations.md) — transport, credentials,
   observability, backups, and production checks;
-- [Docker](docs/docker.md) — container quick start and transport choices;
 - [Examples](examples/README.md) — runnable, domain-neutral examples;
+- [Gateway and clients](docs/gateway.md) — optional compatibility integration
+  for Codex, Claude Code, and provider-compatible clients;
+- [Docker](docs/docker.md) — container quick start and transport choices;
 - [Vision](VISION.md) — product direction and non-goals; and
 - [Contributing](CONTRIBUTING.md) — development workflow and review
   expectations;
+- [Support](SUPPORT.md) — questions, bug reports, design proposals, and private
+  security reporting;
 - [Project operating system](docs/project-operating-system.md) — how Issues,
   Discussions, pull requests, documentation, and Skills fit together; and
 - [Code of conduct](CODE_OF_CONDUCT.md) — community standards and enforcement.
@@ -242,6 +245,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 Report vulnerabilities privately using the process in
 [SECURITY.md](SECURITY.md). Never commit credentials, tokens, local databases,
 logs, or private keys.
+
+For usage questions, reproducible bugs, and feature proposals, follow
+[SUPPORT.md](SUPPORT.md).
 
 ## License
 

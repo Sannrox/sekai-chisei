@@ -5,6 +5,8 @@ changes with clear behavior, tests, and migration impact are easier to review
 than broad rewrites.
 
 All participation is governed by the [code of conduct](CODE_OF_CONDUCT.md).
+For usage questions that do not yet require a code change, use the channels in
+[SUPPORT.md](SUPPORT.md).
 
 ## Before you start
 

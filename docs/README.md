@@ -1,129 +1,69 @@
 # Documentation
 
-This index separates the fastest path to a working system from reference and
-operator material. If you are new to the project, follow the first three links
-in order.
+Use this page to choose a path. The [reference catalog](reference.md) lists
+every maintained guide and contract; the [research index](research/README.md)
+keeps design history separate from current usage.
 
-## Get started
+## Start here
 
-1. [Repository quick start](../README.md#quick-start) — build, launch, and
-   verify a local instance.
-2. [Architecture](architecture.md) — understand what Sekai, Chisei, the
-   gateway, and agent runtimes own.
-3. [Examples](../examples/README.md) — run a client or inspect a domain-neutral
-   integration.
+If you want to run the project locally:
 
-## Integrate
+1. Complete the [repository quick start](../README.md#quick-start).
+2. Read [Ontology definitions](ontology.md) for the full apply, seed, run, and
+   receipt workflow.
+3. Run a domain-neutral [example](../examples/README.md).
 
-- [Gateway and clients](gateway.md) — use Codex, Claude Code, OpenAI-compatible,
-  or Anthropic-compatible clients.
-- [Available models](available-models.md) — enumerate the governed routable
-  model set through CLI, gRPC, or HTTP.
-- [Responses harness profile](responses-harness-profile.md) — implement the
-  supported request, streaming, and error contract.
-- [Capability catalog](capability-catalog.md) — discover visible queries,
-  retrieval, and governed actions without treating visibility as a grant.
-- [Capability package trust](capability-package-trust.md) — Ed25519 package
-  trust roots and verification fail-closed rules.
-- [`proto/`](../proto/) — inspect the native gRPC APIs.
-- [Ontology definitions](ontology.md) — model semantic classes and relations,
-  project schemas, and understand current validation boundaries.
-- [Standalone ontology](../crates/sekai-ontology/README.md) — use an ontology
-  library and SQLite command-line tool in a separate application.
-- [SQLite FTS text representation](text-fts.md) — rebuildable lexical projection
-  and `HybridCandidate` envelope (`text.fts5_bm25/v1`, #360).
-- [Late-fusion hybrid retrieval](hybrid-retrieval.md) — explicit graph + FTS
-  plan under versioned fusion profiles (#361).
-- [External evidence adapters](../adapters/README.md) — submit evidence through
-  the versioned adapter contract.
-- [External-action execution evidence](external-action-execution.md) — report
-  host lifecycle observations and reconcile missing terminal evidence.
-- [Coordination leases](leases.md) — object-bound fencing, generations, and
-  lease-guarded mutations.
-- [Region/site pins](region-pins.md) — single-writer pins for leases and online
-  permit redemption (#293).
-- [Tenant isolation conformance](tenant-isolation-conformance.md) — run the
-  reusable enterprise extension isolation suite or community negative profile.
+If you want to build an agent or SDK integration:
 
-## Configure and operate
+1. Read the [architecture overview](architecture.md) to understand the Sekai,
+   Chisei, interface, and runtime boundaries.
+2. Use the [capability catalog](capability-catalog.md) and native
+   [`proto/`](../proto/) contract.
+3. Check the [available-model discovery contract](available-models.md) when the
+   integration executes model calls.
 
-- [Configuration](configuration.md) — core, provider, gateway, and scoring
-  environment variables.
-- [Operations and security](operations.md) — credentials, TLS, observability,
-  backups, and deployment checks.
-- [Budget topology](budget-topology.md) — multi-region budget modes and site
-  pins (#294).
-- [Replica safety](replica-safety.md) — multi-replica durable authority inventory
-  and two-replica harness.
-- [Operator console](operator-console.md) — authenticated browser shell on the
-  ops listener (login, namespace context, fail-closed routes).
-- [Policy dry-run](policy-dry-run.md) — side-effect-free policy counterfactuals
-  over receipts.
-- [Classification markings](classification-markings.md) — provisional marking
-  and purpose constraints.
-- [Temporal history storage](temporal-history-storage.md) — selective bitemporal
-  as-of history and correction semantics.
-- [Team operations](team-operations.md) — team-namespace bootstrap and operator
-  workflows.
-- [Compliance export](compliance-export.md) — governed export packaging for
-  audit and residency evidence.
-- [Docker](docker.md) — run the server and gateway with Docker Compose.
-- [Security policy](../SECURITY.md) — supported versions and private
-  vulnerability reporting.
+To connect an existing Codex, Claude Code, OpenAI-compatible, or
+Anthropic-compatible client, use the optional [compatibility gateway](gateway.md).
 
-## Understand and contribute
+If you want to deploy or operate the control plane:
 
-- [Vision](../VISION.md) — product boundary, design principles, and non-goals.
-- [Contributing](../CONTRIBUTING.md) — local setup, tests, change expectations,
-  and pull requests.
-- [Project operating system](project-operating-system.md) — artifact decisions,
-  Issue lifecycles, Skills, review roles, conventions, automation, and scaling.
-- [Performance benchmarks](performance-benchmarks.md) — reproduce the sanitized
-  workload baseline and interpret regression budgets.
-- [Architecture decisions](decisions/README.md) — accepted, durable design
-  choices and the ADR template.
-- [Gunshi auto-allocation envelope](research/279-gunshi-auto-allocation-envelope.md)
-- [Gunshi eval-gated promotion and bounded auto-dispatch](gunshi-auto-allocation.md)
-- [Operator console information architecture](research/283-operator-console-ia.md)
-- [Lookup vs model call (S1 shipped via #281)](research/175-lookup-vs-model-call.md)
-- [Governed hybrid retrieval contract](research/152-hybrid-retrieval.md)
-  — operator guides: [text-fts.md](text-fts.md) (#360),
-  [hybrid-retrieval.md](hybrid-retrieval.md) (#361).
-- [Semantic pattern-query surface](research/145-semantic-pattern-query.md)
-- [Multi-hop pattern plan IR (`pattern_plan/v1`)](pattern-plan.md) — structured
-  execute + EXPLAIN (#375); no SQL/SPARQL/Cypher
-- [Federation and model-residency architecture](research/288-federation-residency-architecture.md)
-- [Multi-control-plane federation profile v1](research/291-federation-profile.md)
-  — operator guide: [federation-profile.md](federation-profile.md)
-- [Multi-region consistency for budgets, leases, and permits](research/292-multi-region-consistency.md)
-- [Governed what-if simulation over graph projections](research/148-what-if-simulation.md)
-- [Non-authoritative scenario overlay](scenario-overlay.md) — request-scoped
-  hypothesis deltas and domain-neutral impact projection (#362).
-- [Gateway PEP fat-decide freeze](research/163-gateway-pep-fat-decide.md)
-- [Core product interface vs full platform RPC surface](research/383-core-product-interface.md)
-  — core map, tiers, type-system reduction, shrink shortlist (#383).
-- [Action/Effect mapping onto plane primitives](research/395-action-effect-mapping.md)
-  — ActionInstance admission envelope bound to operation receipts (#395).
-- [Governed Action type registry](governed-action-types.md) — namespace-scoped versioned decision types (#396).
-- [Governed ActionInstance admission](governed-action-instances.md) — submit/admit decision units with idempotency (#397).
-- [Typed ActionInstance effects](governed-action-effects.md) — runtime_dispatch and notify children (#398).
-- [Runtime claim API](runtime-claim.md) — claim/heartbeat/ack for runtime_dispatch (#399).
-- [Parked-work resolution](research/410-parked-work-resolution.md) — durable
-  continuation input, park-generation fencing, and resumable/replacement claim
-  semantics (#410).
-- [Action harvest binding](action-harvest-binding.md) — instance/effect/operation correlation (#400).
-- [Evidence producer contract](action-evidence-producer-contract.md) — evidence → optional Action submit (#401).
-- [Provider and data-class residency](residency-policy.md)
-  — model/provider residency policy (#289); research:
-  [288-federation-residency-architecture.md](research/288-federation-residency-architecture.md).
-- [Reusable Sekai PostgreSQL parity](postgres-sekai-parity.md) — dual-backend
-  tenant-free Sekai inventory and known SQLite-only exceptions; activate with
-  `SEKAI_DB_BACKEND=postgres` and `DATABASE_URL`.
-- [Chisei PostgreSQL parity](postgres-chisei-parity.md) — dual-backend Chisei
-  inventory (budget, policy, Kioku, gateway governance) plus SQLite-only
-  redeem and Gunshi allocation notes.
-- [Code of conduct](../CODE_OF_CONDUCT.md) — participation standards and
-  enforcement.
+1. Review all settings in [Configuration](configuration.md).
+2. Apply the safeguards in [Operations and security](operations.md).
+3. Use the [Docker guide](docker.md) if you want the supported container
+   topology.
+
+## Core concepts
+
+- [Architecture](architecture.md) — ownership, trust boundaries, data model,
+  and governed entry paths.
+- [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
+  provenance, and validation.
+- [Capability catalog](capability-catalog.md) — discover governed queries,
+  retrieval, and actions.
+- [Governed actions](governed-action-types.md) — start of the action type,
+  instance, effect, runtime claim, and evidence lifecycle.
+- [External-action execution](external-action-execution.md) — permits,
+  execution observations, and reconciliation.
+
+## Project and community
+
+- [Vision](../VISION.md) — product direction and explicit non-goals.
+- [Contributing](../CONTRIBUTING.md) — setup, tests, design expectations, and
+  pull-request requirements.
+- [Support](../SUPPORT.md) — where to ask questions, report bugs, and disclose
+  vulnerabilities.
+- [Project operating system](project-operating-system.md) — how Issues,
+  Discussions, pull requests, decisions, and project Skills fit together.
+- [Architecture decisions](decisions/README.md) — accepted durable decisions.
+- [Code of conduct](../CODE_OF_CONDUCT.md) — community standards.
+
+## Browse all documentation
+
+- [Reference catalog](reference.md) — maintained user, integration, operator,
+  extension, and implementation documentation.
+- [Research index](research/README.md) — completed investigations and design
+  freezes. Research explains decisions but does not override current guides,
+  protocol definitions, or implementation.
 
 ## Documentation conventions
 
@@ -135,3 +75,5 @@ in order.
   documented next to the implementation until they stabilize.
 - The protocol files and implementation are authoritative when an early-stage
   API and prose documentation disagree. Please report drift as a bug.
+- Pages under `docs/research/` are design history. Follow their linked current
+  guides for shipped behavior.
