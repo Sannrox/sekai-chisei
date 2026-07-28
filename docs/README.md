@@ -108,6 +108,9 @@ in order.
 - [Governed ActionInstance admission](governed-action-instances.md) — submit/admit decision units with idempotency (#397).
 - [Typed ActionInstance effects](governed-action-effects.md) — runtime_dispatch and notify children (#398).
 - [Runtime claim API](runtime-claim.md) — claim/heartbeat/ack for runtime_dispatch (#399).
+- [Parked-work resolution](research/410-parked-work-resolution.md) — durable
+  continuation input, park-generation fencing, and resumable/replacement claim
+  semantics (#410).
 - [Action harvest binding](action-harvest-binding.md) — instance/effect/operation correlation (#400).
 - [Evidence producer contract](action-evidence-producer-contract.md) — evidence → optional Action submit (#401).
 - [Provider and data-class residency](residency-policy.md)
