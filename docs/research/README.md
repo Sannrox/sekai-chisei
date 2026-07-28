@@ -21,6 +21,7 @@ reference pages.
 | [Core product interface](383-core-product-interface.md) | Product-surface research and shrink shortlist |
 | [Action and effect mapping](395-action-effect-mapping.md) | See [Governed action types](../governed-action-types.md) and the linked action lifecycle pages |
 | [Parked-work resolution](410-parked-work-resolution.md) | Design for durable continuation input and fenced resumption |
+| [External-action permit lifecycle surface](420-external-permit-lifecycle-surface.md) | Retain explicit lifecycle RPCs; consolidation would widen trust boundaries without removing implementation paths |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
