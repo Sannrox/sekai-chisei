@@ -232,6 +232,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
         },
+        "governed-subject" => {
+            sekai_chisei::governed_subject_cli::run(args.into_iter().skip(1).collect()).await
+        }
         "team" => match args.get(1).map(String::as_str) {
             Some("join") => {
                 let config = sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(
@@ -472,7 +475,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|federation|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi> ...\n"
+        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|federation|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi|governed-subject> ...\n"
     );
     println!("Product loop (ontology-first):");
     println!("  {}", sekai_chisei::ontology_product_cli::usage());
@@ -511,6 +514,10 @@ fn print_root_usage() {
     println!(
         "\nOperation receipt:\n  {}",
         sekai_chisei::receipt_cli::usage()
+    );
+    println!(
+        "\nGoverned subject evaluation:\n  {}",
+        sekai_chisei::governed_subject_cli::usage()
     );
     println!(
         "\nOperation report:\n  {}",

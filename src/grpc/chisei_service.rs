@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
+use sha2::Digest;
 use tonic::{Request, Response, Status};
 
 use super::llm_service::{
@@ -17,6 +18,7 @@ use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::external_action as external;
 use crate::chisei::external_permit as permit;
+use crate::chisei::governed_subject as subject;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{
@@ -4339,10 +4341,299 @@ fn portfolio_objective_pb(objective: &Objective) -> PortfolioObjective {
     }
 }
 
+fn subject_reference_from_proto(
+    value: GovernedSubjectReference,
+) -> subject::GovernedSubjectReference {
+    subject::GovernedSubjectReference {
+        kind: value.kind,
+        reference: value.reference,
+        content_digest: value.content_digest,
+        observed_at_ms: value.observed_at_ms,
+    }
+}
+
+fn governed_subject_result_from_receipt(
+    receipt: &OperationReceipt,
+) -> Result<GovernedSubjectResult, Status> {
+    let intent = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+        .ok_or_else(|| Status::internal("governed-subject receipt has no intent"))?;
+    let outcome = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        .ok_or_else(|| Status::internal("governed-subject receipt has no outcome"))?;
+    let references = intent
+        .references
+        .iter()
+        .map(|reference| {
+            let observed_at_ms = intent
+                .attributes
+                .get(&format!("reference_observed_at_ms.{}", reference.kind))
+                .ok_or_else(|| Status::internal("governed-subject receipt lost evidence time"))?
+                .parse()
+                .map_err(|_| {
+                    Status::internal("governed-subject receipt has invalid evidence time")
+                })?;
+            Ok(GovernedSubjectReference {
+                kind: reference.kind.clone(),
+                reference: reference.reference.clone(),
+                content_digest: reference.content_hash.clone().unwrap_or_default(),
+                observed_at_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    let receipt_bytes =
+        serde_json::to_vec(receipt).map_err(|error| Status::internal(error.to_string()))?;
+    Ok(GovernedSubjectResult {
+        version: subject::RESULT_VERSION.into(),
+        decision: outcome
+            .attributes
+            .get("decision")
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
+        operation_id: receipt.operation_id.clone(),
+        receipt_schema: receipt.schema_version.clone(),
+        receipt_digest: format!("sha256:{:x}", sha2::Sha256::digest(receipt_bytes)),
+        references,
+        fresh: outcome
+            .attributes
+            .get("fresh")
+            .is_some_and(|value| value == "true"),
+        failure_code: outcome
+            .attributes
+            .get("failure_code")
+            .cloned()
+            .unwrap_or_default(),
+        failure_message: outcome
+            .attributes
+            .get("failure_message")
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
 #[tonic::async_trait]
 impl ChiseiService for ChiseiServiceImpl {
     type ExecutePlanStreamStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
+
+    async fn evaluate_governed_subject(
+        &self,
+        req: Request<EvaluateGovernedSubjectRequest>,
+    ) -> Result<Response<EvaluateGovernedSubjectResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let value = req
+            .into_inner()
+            .subject
+            .ok_or_else(|| Status::invalid_argument("subject required"))?;
+        let envelope = subject::GovernedSubjectEnvelope {
+            version: value.version,
+            namespace: value.namespace,
+            request_id: value.request_id,
+            subject_profile: value.subject_profile,
+            subject_identity: value.subject_identity,
+            content_digest: value.content_digest,
+            references: value
+                .references
+                .into_iter()
+                .map(subject_reference_from_proto)
+                .collect(),
+            evaluation_profile: value.evaluation_profile,
+        };
+        require_namespace_write_access(&self.db, &actor, &envelope.namespace)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let fresh = subject::validate_envelope(&envelope, &actor, now_ms)
+            .map_err(Status::invalid_argument)?;
+        if !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "governed-subject conformance evaluation requires control-plane administration",
+            ));
+        }
+        let binding_digest = subject::binding_digest(&envelope, &actor);
+        let operation_id = subject::operation_id(&envelope.namespace, &actor, &envelope.request_id);
+        if let Some(existing) = self
+            .db
+            .get_operation_receipt(&operation_id)
+            .map_err(Status::internal)?
+        {
+            let existing_binding = existing
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                .and_then(|event| event.attributes.get("binding_digest"));
+            if existing_binding != Some(&binding_digest) {
+                return Err(Status::already_exists(
+                    "request_id is already bound to different governed-subject evidence",
+                ));
+            }
+            return Ok(Response::new(EvaluateGovernedSubjectResponse {
+                result: Some(governed_subject_result_from_receipt(&existing)?),
+            }));
+        }
+
+        let (decision, failure_code) = subject::evaluation(&envelope.evaluation_profile, fresh);
+        let governed_references = envelope
+            .references
+            .iter()
+            .map(|reference| GovernedReference {
+                kind: reference.kind.clone(),
+                reference: reference.reference.clone(),
+                content_hash: Some(reference.content_digest.clone()),
+                disclosed_fields: Vec::new(),
+                omitted: true,
+                omission_reason: Some("subject payload remains externally owned".into()),
+            })
+            .collect::<Vec<_>>();
+        let event = |suffix: &str,
+                     parent: Option<&str>,
+                     kind: ReceiptEventKind,
+                     attributes: BTreeMap<String, String>,
+                     references: Vec<GovernedReference>| {
+            OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.clone(),
+                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
+                timestamp_ms: now_ms,
+                kind,
+                surface: kind.surface(),
+                actor: actor.clone(),
+                references,
+                attributes,
+            }
+        };
+        let mut intent_attributes = BTreeMap::from([
+            ("request_id".into(), operation_id.clone()),
+            ("lookup_request_id".into(), envelope.request_id.clone()),
+            (
+                "caller_scope".into(),
+                subject::caller_scope(&envelope.namespace, &actor),
+            ),
+            ("binding_digest".into(), binding_digest),
+            ("subject_profile".into(), envelope.subject_profile.clone()),
+            ("subject_identity".into(), envelope.subject_identity.clone()),
+            ("content_digest".into(), envelope.content_digest.clone()),
+            (
+                "evaluation_profile".into(),
+                envelope.evaluation_profile.clone(),
+            ),
+        ]);
+        intent_attributes.insert(
+            "reference_count".into(),
+            envelope.references.len().to_string(),
+        );
+        for reference in &envelope.references {
+            intent_attributes.insert(
+                format!("reference_observed_at_ms.{}", reference.kind),
+                reference.observed_at_ms.to_string(),
+            );
+        }
+        let policy_attributes = BTreeMap::from([
+            ("decision".into(), decision.into()),
+            (
+                "profile_registry".into(),
+                "chisei.governed-subject-registry/v1".into(),
+            ),
+        ]);
+        let mut outcome_attributes = BTreeMap::from([
+            ("decision".into(), decision.into()),
+            ("fresh".into(), fresh.to_string()),
+        ]);
+        if let Some(code) = failure_code {
+            outcome_attributes.insert("failure_code".into(), code.into());
+            outcome_attributes.insert(
+                "failure_message".into(),
+                match code {
+                    "stale_evidence" => "governed evidence is stale",
+                    "evaluation_unavailable" => "governed evaluation is unavailable",
+                    "evaluation_timeout" => "governed evaluation timed out",
+                    _ => "governed evaluation failed",
+                }
+                .into(),
+            );
+        }
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.clone(),
+            parent_operation_id: None,
+            namespace: envelope.namespace.clone(),
+            operation_class: "governed_subject_evaluation".into(),
+            initiating_actor: actor.clone(),
+            schema_version: subject::RECEIPT_SCHEMA_VERSION.into(),
+            policy_version: envelope.evaluation_profile.clone(),
+            started_at_ms: now_ms,
+            completed_at_ms: Some(now_ms),
+            events: vec![
+                event(
+                    "intent",
+                    None,
+                    ReceiptEventKind::IntentRecorded,
+                    intent_attributes,
+                    governed_references,
+                ),
+                event(
+                    "policy",
+                    Some("intent"),
+                    ReceiptEventKind::PolicyDecided,
+                    policy_attributes,
+                    Vec::new(),
+                ),
+                event(
+                    "route",
+                    Some("policy"),
+                    ReceiptEventKind::RouteSelected,
+                    BTreeMap::from([("route".into(), "registered_profile".into())]),
+                    Vec::new(),
+                ),
+                event(
+                    "budget",
+                    Some("route"),
+                    ReceiptEventKind::BudgetDecided,
+                    BTreeMap::from([("budget_effect".into(), "none".into())]),
+                    Vec::new(),
+                ),
+                event(
+                    "outcome",
+                    Some("budget"),
+                    ReceiptEventKind::OutcomeRecorded,
+                    outcome_attributes,
+                    Vec::new(),
+                ),
+            ],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+        };
+        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
+            if let Some(existing) = self
+                .db
+                .get_operation_receipt(&operation_id)
+                .map_err(Status::internal)?
+            {
+                let same_binding = existing
+                    .events
+                    .iter()
+                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                    .and_then(|event| event.attributes.get("binding_digest"))
+                    == receipt.events[0].attributes.get("binding_digest");
+                if same_binding {
+                    return Ok(Response::new(EvaluateGovernedSubjectResponse {
+                        result: Some(governed_subject_result_from_receipt(&existing)?),
+                    }));
+                }
+                return Err(Status::already_exists(
+                    "request_id is already bound to different governed-subject evidence",
+                ));
+            }
+            return Err(Status::aborted(format!(
+                "governed-subject receipt could not be committed: {error}"
+            )));
+        }
+        Ok(Response::new(EvaluateGovernedSubjectResponse {
+            result: Some(governed_subject_result_from_receipt(&receipt)?),
+        }))
+    }
 
     async fn authorize_external_action(
         &self,
@@ -10575,6 +10866,220 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
         ChiseiServiceImpl::new(db, config(":memory:"))
+    }
+
+    fn governed_subject_request(
+        request_id: &str,
+        subject_profile: &str,
+        evaluation_profile: &str,
+        observed_at_ms: i64,
+    ) -> Request<EvaluateGovernedSubjectRequest> {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let kinds = if subject_profile == subject::SOFTWARE_RELEASE_PROFILE {
+            ["source_tree", "manifest", "artifact", "build_definition"].as_slice()
+        } else {
+            ["policy_document", "policy_schema"].as_slice()
+        };
+        let mut request = Request::new(EvaluateGovernedSubjectRequest {
+            subject: Some(GovernedSubjectEnvelope {
+                version: subject::ENVELOPE_VERSION.into(),
+                namespace: "team-a".into(),
+                request_id: request_id.into(),
+                subject_profile: subject_profile.into(),
+                subject_identity: "subject-1".into(),
+                content_digest: digest.clone(),
+                references: kinds
+                    .iter()
+                    .map(|kind| GovernedSubjectReference {
+                        kind: (*kind).into(),
+                        reference: format!("{kind}-1"),
+                        content_digest: digest.clone(),
+                        observed_at_ms,
+                    })
+                    .collect(),
+                evaluation_profile: evaluation_profile.into(),
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn governed_subject_profiles_share_receipt_and_idempotency_contract() {
+        let svc = memory_service();
+        let now = chrono::Utc::now().timestamp_millis();
+        for (index, profile) in [
+            subject::SOFTWARE_RELEASE_PROFILE,
+            subject::POLICY_BUNDLE_PROFILE,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = format!("subject-request-{index}");
+            let first = svc
+                .evaluate_governed_subject(governed_subject_request(
+                    &request_id,
+                    profile,
+                    subject::ALLOW_PROFILE,
+                    now,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .result
+                .unwrap();
+            let mut replay_request =
+                governed_subject_request(&request_id, profile, subject::ALLOW_PROFILE, now - 1);
+            replay_request
+                .get_mut()
+                .subject
+                .as_mut()
+                .unwrap()
+                .references
+                .reverse();
+            let replay = svc
+                .evaluate_governed_subject(replay_request)
+                .await
+                .unwrap()
+                .into_inner()
+                .result
+                .unwrap();
+            assert_eq!(first.decision, "allow");
+            assert_eq!(first.operation_id, replay.operation_id);
+            assert_eq!(first.receipt_digest, replay.receipt_digest);
+            assert!(
+                replay
+                    .references
+                    .iter()
+                    .all(|reference| reference.observed_at_ms == now)
+            );
+            let receipt = svc
+                .db
+                .get_operation_receipt(&first.operation_id)
+                .unwrap()
+                .unwrap();
+            assert!(receipt.completeness().complete);
+            let mut reconcile = Request::new(GetOperationReceiptRequest {
+                operation_id: String::new(),
+                request_id: request_id.clone(),
+                caller_scope: subject::caller_scope("team-a", "root"),
+                attempt: 0,
+            });
+            reconcile
+                .metadata_mut()
+                .insert("x-principal", "root".parse().unwrap());
+            let reconciled = svc
+                .get_operation_receipt(reconcile)
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(reconciled.complete);
+            assert_eq!(
+                first.receipt_digest,
+                format!(
+                    "sha256:{:x}",
+                    sha2::Sha256::digest(reconciled.receipt_json.as_bytes())
+                )
+            );
+            let serialized = serde_json::to_string(&receipt).unwrap();
+            for forbidden in [
+                "subject_payload",
+                "repository_path",
+                "prompt",
+                "credential",
+                "raw_tool_output",
+            ] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_subject_rejects_changed_bindings_and_unauthorized_callers() {
+        let svc = memory_service();
+        let now = chrono::Utc::now().timestamp_millis();
+        svc.evaluate_governed_subject(governed_subject_request(
+            "binding-conflict",
+            subject::POLICY_BUNDLE_PROFILE,
+            subject::ALLOW_PROFILE,
+            now,
+        ))
+        .await
+        .unwrap();
+        let conflict = svc
+            .evaluate_governed_subject(governed_subject_request(
+                "binding-conflict",
+                subject::POLICY_BUNDLE_PROFILE,
+                subject::DENY_PROFILE,
+                now,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+        let mut unauthorized = governed_subject_request(
+            "unauthorized",
+            subject::POLICY_BUNDLE_PROFILE,
+            subject::ALLOW_PROFILE,
+            now,
+        );
+        unauthorized
+            .metadata_mut()
+            .insert("x-principal", "intruder".parse().unwrap());
+        let denied = svc
+            .evaluate_governed_subject(unauthorized)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn governed_subject_returns_fixed_failures_without_diagnostics() {
+        let svc = memory_service();
+        let now = chrono::Utc::now().timestamp_millis();
+        for (index, profile, expected_decision, expected_code) in [
+            (0, subject::DENY_PROFILE, "deny", ""),
+            (
+                1,
+                subject::UNAVAILABLE_PROFILE,
+                "unavailable",
+                "evaluation_unavailable",
+            ),
+            (2, subject::TIMEOUT_PROFILE, "unknown", "evaluation_timeout"),
+        ] {
+            let result = svc
+                .evaluate_governed_subject(governed_subject_request(
+                    &format!("fixed-outcome-{index}"),
+                    subject::POLICY_BUNDLE_PROFILE,
+                    profile,
+                    now,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .result
+                .unwrap();
+            assert_eq!(result.decision, expected_decision);
+            assert_eq!(result.failure_code, expected_code);
+            assert!(!result.failure_message.contains('/'));
+        }
+        let stale = svc
+            .evaluate_governed_subject(governed_subject_request(
+                "stale-outcome",
+                subject::POLICY_BUNDLE_PROFILE,
+                subject::ALLOW_PROFILE,
+                now - subject::MAX_EVIDENCE_AGE_MS - 1,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(stale.decision, "unknown");
+        assert_eq!(stale.failure_code, "stale_evidence");
+        assert!(!stale.fresh);
     }
 
     fn external_action_request(

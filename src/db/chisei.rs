@@ -429,13 +429,21 @@ impl SekaiDb {
 
     pub fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let request_id = receipt_intent_attr(receipt, "request_id");
+        let lookup_request_id = receipt_intent_attr(receipt, "lookup_request_id");
+        let caller_scope = receipt_intent_attr(receipt, "caller_scope");
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO chisei_operation_receipts(operation_id, initiating_actor, namespace, receipt_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO chisei_operation_receipts(
+                operation_id, request_id, lookup_request_id, initiating_actor,
+                caller_scope, namespace, receipt_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 receipt.operation_id,
+                request_id,
+                lookup_request_id,
                 receipt.initiating_actor,
+                caller_scope,
                 receipt.namespace,
                 receipt_json,
                 chrono::Utc::now().timestamp_millis(),
@@ -451,24 +459,9 @@ pub(crate) fn upsert_operation_receipt(
     receipt: &OperationReceipt,
 ) -> Result<(), String> {
     let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
-    let request_id = receipt.events.iter().find_map(|event| {
-        (event.kind == ReceiptEventKind::IntentRecorded)
-            .then(|| event.attributes.get("request_id"))
-            .flatten()
-            .filter(|request_id| !request_id.is_empty())
-    });
-    let lookup_request_id = receipt.events.iter().find_map(|event| {
-        (event.kind == ReceiptEventKind::IntentRecorded)
-            .then(|| event.attributes.get("lookup_request_id"))
-            .flatten()
-            .filter(|request_id| !request_id.is_empty())
-    });
-    let caller_scope = receipt.events.iter().find_map(|event| {
-        (event.kind == ReceiptEventKind::IntentRecorded)
-            .then(|| event.attributes.get("caller_scope"))
-            .flatten()
-            .filter(|scope| !scope.is_empty())
-    });
+    let request_id = receipt_intent_attr(receipt, "request_id");
+    let lookup_request_id = receipt_intent_attr(receipt, "lookup_request_id");
+    let caller_scope = receipt_intent_attr(receipt, "caller_scope");
     conn.execute(
             "INSERT INTO chisei_operation_receipts(operation_id, request_id, lookup_request_id, initiating_actor, caller_scope, namespace, receipt_json, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -496,6 +489,15 @@ pub(crate) fn upsert_operation_receipt(
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn receipt_intent_attr<'a>(receipt: &'a OperationReceipt, name: &str) -> Option<&'a String> {
+    receipt.events.iter().find_map(|event| {
+        (event.kind == ReceiptEventKind::IntentRecorded)
+            .then(|| event.attributes.get(name))
+            .flatten()
+            .filter(|value| !value.is_empty())
+    })
 }
 
 impl SekaiDb {

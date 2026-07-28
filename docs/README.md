@@ -44,6 +44,8 @@ If you want to deploy or operate the control plane:
   instance, effect, runtime claim, and evidence lifecycle.
 - [External-action execution](external-action-execution.md) — permits,
   execution observations, and reconciliation.
+- [Governed subject evaluation](governed-subjects.md) — payload-free
+  evaluation of externally owned immutable subjects.
 
 ## Project and community
 
