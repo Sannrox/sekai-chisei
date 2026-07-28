@@ -170,6 +170,17 @@ mod tests {
             claim_fencing_token: String::new(),
             claim_expires_at_ms: 0,
             claim_request_id: String::new(),
+            park_generation: 0,
+            active_resolution_id: String::new(),
+            claim_attempt_count: 0,
+            lease_expiry_count: 0,
+            park_count: 0,
+            lifecycle_state: String::new(),
+            retry_policy_version: String::new(),
+            retry_policy_digest: String::new(),
+            max_claim_attempts: 0,
+            max_lease_expiries: 0,
+            max_park_cycles: 0,
         }
     }
 

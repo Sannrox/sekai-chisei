@@ -1342,6 +1342,19 @@ message ActionEffect {
   string claim_fencing_token = 13;
   int64 claim_expires_at_ms = 14;
   string claim_request_id = 15;
+  uint64 park_generation = 16;
+  string active_resolution_id = 17;
+  uint32 claim_attempt_count = 18;
+  uint32 lease_expiry_count = 19;
+  uint32 park_count = 20;
+  // ready | claimed | awaiting_continuation | completed | failed |
+  // dead_lettered | superseded
+  string lifecycle_state = 21;
+  string retry_policy_version = 22;
+  string retry_policy_digest = 23;
+  uint32 max_claim_attempts = 24;
+  uint32 max_lease_expiries = 25;
+  uint32 max_park_cycles = 26;
 }
 message GetActionEffectRequest { string effect_id = 1; }
 message GetActionEffectResponse { ActionEffect effect = 1; }
@@ -1368,7 +1381,11 @@ message ClaimActionWorkRequest {
   string request_id = 3;
   int64 ttl_ms = 4;
 }
-message ClaimActionWorkResponse { ActionEffect effect = 1; }
+message ClaimActionWorkResponse {
+  ActionEffect effect = 1;
+  ActionWorkContinuation continuation = 2;
+  ActionWorkPark park = 3;
+}
 message HeartbeatActionClaimRequest {
   string effect_id = 1;
   string runtime_id = 2;
@@ -1385,8 +1402,107 @@ message AckActionWorkRequest {
   // completed | failed | parked
   string outcome = 5;
   string reason = 6;
+  // Required for parked acknowledgements; key+digest replay survives lease clear.
+  string request_id = 7;
+  string checkpoint_store_id = 8;
+  string checkpoint_ref = 9;
+  // sha256:<64 lowercase hex>
+  string checkpoint_digest = 10;
 }
-message AckActionWorkResponse { ActionEffect effect = 1; }
+message AckActionWorkResponse {
+  ActionEffect effect = 1;
+  ActionWorkPark park = 2;
+  bool replay = 3;
+}
+
+message ActionWorkPark {
+  string park_id = 1;
+  string effect_id = 2;
+  string namespace = 3;
+  string operation_id = 4;
+  uint64 park_generation = 5;
+  uint64 claim_generation = 6;
+  string checkpoint_ref = 7;
+  string checkpoint_digest = 8;
+  string reason = 9;
+  string parked_by = 10;
+  int64 parked_at_ms = 11;
+  string request_id = 12;
+  string request_digest = 13;
+  string checkpoint_store_id = 14;
+}
+
+message ParkedWorkResolutionInput {
+  string resolution_input_id = 1;
+  string effect_id = 2;
+  uint64 park_generation = 3;
+  string input_json = 4;
+  string input_digest = 5;
+  string reason = 6;
+  string submitted_by = 7;
+  int64 submitted_at_ms = 8;
+}
+
+message ParkedWorkResolutionAction {
+  string resolution_action_id = 1;
+  string effect_id = 2;
+  string namespace = 3;
+  uint64 expected_park_generation = 4;
+  // denied | pending_approval | rejected | invoked | cancelled | stale
+  string status = 5;
+  string policy_version = 6;
+  string approval_id = 7;
+  string decided_by = 8;
+  int64 created_at_ms = 9;
+  int64 invoked_at_ms = 10;
+  string resolution_input_id = 11;
+}
+
+message ActionWorkContinuation {
+  string resolution_id = 1;
+  string effect_id = 2;
+  string namespace = 3;
+  string operation_id = 4;
+  uint64 park_generation = 5;
+  string input_json = 6;
+  string input_digest = 7;
+  string park_id = 8;
+  string resolution_action_id = 9;
+  string resolution_input_id = 10;
+  string reason = 11;
+  string decided_by = 12;
+  int64 decided_at_ms = 13;
+  string request_id = 14;
+}
+
+message SubmitParkedWorkResolutionActionRequest {
+  string effect_id = 1;
+  uint64 expected_park_generation = 2;
+  string input_json = 3;
+  string reason = 4;
+  string request_id = 5;
+}
+
+message SubmitParkedWorkResolutionActionResponse {
+  ParkedWorkResolutionAction action = 1;
+  ActionEffect effect = 2;
+  ActionWorkContinuation continuation = 3;
+  ActionWorkPark park = 4;
+  bool replay = 5;
+}
+
+message ReportActionClaimEventRequest {
+  string effect_id = 1;
+  string runtime_id = 2;
+  uint64 claim_generation = 3;
+  string fencing_token = 4;
+  // resume_started | resume_succeeded | checkpoint_unavailable | replacement_started
+  string kind = 5;
+  string checkpoint_digest = 6;
+  string reason_code = 7;
+  string request_id = 8;
+}
+message ReportActionClaimEventResponse { bool replay = 1; }
 
 
 message ExecuteActionRequest {
@@ -2113,6 +2229,8 @@ service SekaiService {
   rpc ClaimActionWork(ClaimActionWorkRequest) returns (ClaimActionWorkResponse);
   rpc HeartbeatActionClaim(HeartbeatActionClaimRequest) returns (HeartbeatActionClaimResponse);
   rpc AckActionWork(AckActionWorkRequest) returns (AckActionWorkResponse);
+  rpc SubmitParkedWorkResolutionAction(SubmitParkedWorkResolutionActionRequest) returns (SubmitParkedWorkResolutionActionResponse);
+  rpc ReportActionClaimEvent(ReportActionClaimEventRequest) returns (ReportActionClaimEventResponse);
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc SetActionPolicy(SetActionPolicyRequest) returns (SetActionPolicyResponse);
   rpc GetActionPolicy(GetActionPolicyRequest) returns (GetActionPolicyResponse);

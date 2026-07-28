@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 151);
+        assert_eq!(inventory.entries.len(), 153);
         assert!(inventory.entry("PutGovernedActionType").is_some());
         assert!(inventory.entry("SubmitActionInstance").is_some());
         assert!(inventory.entry("GetActionInstance").is_some());
@@ -368,6 +368,12 @@ mod tests {
         assert!(inventory.entry("GetActionEffect").is_some());
         assert!(inventory.entry("ListActionEffects").is_some());
         assert!(inventory.entry("ClaimActionWork").is_some());
+        assert!(
+            inventory
+                .entry("SubmitParkedWorkResolutionAction")
+                .is_some()
+        );
+        assert!(inventory.entry("ReportActionClaimEvent").is_some());
         assert!(inventory.entry("ListClaimableActionWork").is_some());
         assert!(inventory.entry("HeartbeatActionClaim").is_some());
         assert!(inventory.entry("AckActionWork").is_some());

@@ -40,6 +40,8 @@ const GOVERNED_ACTION_TYPES_SCHEMA: &str = include_str!("postgres/0020_governed_
 const GOVERNED_ACTION_INSTANCES_SCHEMA: &str =
     include_str!("postgres/0021_governed_action_instances.sql");
 const ACTION_EFFECTS_SCHEMA: &str = include_str!("postgres/0022_action_effects.sql");
+const PARKED_WORK_CONTINUATION_SCHEMA: &str =
+    include_str!("postgres/0023_parked_work_continuation.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -158,6 +160,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 22,
         name: "action_effects",
         sql: ACTION_EFFECTS_SCHEMA,
+    },
+    Migration {
+        version: 23,
+        name: "parked_work_continuation",
+        sql: PARKED_WORK_CONTINUATION_SCHEMA,
     },
 ];
 

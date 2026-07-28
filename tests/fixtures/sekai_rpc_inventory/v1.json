@@ -1332,6 +1332,32 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "SubmitParkedWorkResolutionAction",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_effect.rs",
+        "src/db/postgres_action_effect.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ReportActionClaimEvent",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_effect.rs",
+        "src/db/postgres_action_effect.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ExecuteAction",
       "kind": "computed",
       "surfaces": [],
