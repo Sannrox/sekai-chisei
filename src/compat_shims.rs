@@ -45,29 +45,13 @@ pub struct ShimRecord {
 }
 
 /// Every compatibility shim currently retained.
-pub const RETAINED_SHIMS: &[ShimRecord] = &[
-    ShimRecord {
-        id: "resolve_registered_model",
-        owner: "provider_resolution",
-        usage_signal: UsageSignal::CompilerDeprecation,
-        removal_condition: "all callers use provider_resolution::resolve_model",
-        deadline: "0.2.0",
-    },
-    ShimRecord {
-        id: "resolve_registered_model_for_provider",
-        owner: "provider_resolution",
-        usage_signal: UsageSignal::CompilerDeprecation,
-        removal_condition: "all callers use provider_resolution::resolve_model_for_provider",
-        deadline: "0.2.0",
-    },
-    ShimRecord {
-        id: "SEKAI_AUTH_TOKEN",
-        owner: "sekai::credentials",
-        usage_signal: UsageSignal::RuntimeWarning,
-        removal_condition: "deployments issue principal credentials via sekaictl credential create",
-        deadline: "0.2.0",
-    },
-];
+pub const RETAINED_SHIMS: &[ShimRecord] = &[ShimRecord {
+    id: "SEKAI_AUTH_TOKEN",
+    owner: "sekai::credentials",
+    usage_signal: UsageSignal::RuntimeWarning,
+    removal_condition: "deployments issue principal credentials via sekaictl credential create",
+    deadline: "0.2.0",
+}];
 
 /// Render the shim register as a plain-text report.
 pub fn render_report() -> String {
@@ -90,6 +74,34 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn deprecated_item_names(source: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("#[deprecated") {
+                continue;
+            }
+            // Walk forward to the declaration the attribute applies to.
+            for candidate in lines.iter().skip(index + 1).take(12) {
+                let trimmed = candidate.trim_start();
+                if let Some(rest) = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        names.insert(name);
+                    }
+                    break;
+                }
+            }
+        }
+        names
+    }
+
     fn rust_sources(root: &str) -> Vec<String> {
         let mut found = Vec::new();
         let mut pending = vec![root.to_string()];
@@ -110,40 +122,21 @@ mod tests {
     }
 
     /// Names of items carrying `#[deprecated]` anywhere under `src/`.
-    fn deprecated_items() -> BTreeSet<String> {
+    fn deprecated_items_in_roots(roots: &[&str]) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
-        for path in rust_sources("src")
-            .into_iter()
-            .chain(rust_sources("crates/sekai-provider/src"))
-        {
-            let Ok(source) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let lines: Vec<&str> = source.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                if !line.trim_start().starts_with("#[deprecated") {
+        for root in roots {
+            for path in rust_sources(root) {
+                let Ok(source) = std::fs::read_to_string(&path) else {
                     continue;
-                }
-                // Walk forward to the declaration the attribute applies to.
-                for candidate in lines.iter().skip(index + 1).take(12) {
-                    let trimmed = candidate.trim_start();
-                    if let Some(rest) = trimmed
-                        .strip_prefix("pub fn ")
-                        .or_else(|| trimmed.strip_prefix("fn "))
-                    {
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_alphanumeric() || *c == '_')
-                            .collect();
-                        if !name.is_empty() {
-                            names.insert(name);
-                        }
-                        break;
-                    }
-                }
+                };
+                names.extend(deprecated_item_names(&source));
             }
         }
         names
+    }
+
+    fn deprecated_items() -> BTreeSet<String> {
+        deprecated_items_in_roots(&["src", "crates/sekai-provider/src"])
     }
 
     #[test]
@@ -161,14 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_actually_finds_the_known_shims() {
-        // Guards the guard: if the scan silently matched nothing, the
-        // completeness test above would pass for the wrong reason.
-        let found = deprecated_items();
-        assert!(
-            found.contains("resolve_registered_model"),
-            "scan found no known deprecated item: {found:?}"
+    fn deprecated_item_scan_traverses_rust_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let source = format!(
+            "{}[deprecated(since = \"0.1.0\", note = \"use replacement\")]\n\
+             pub fn legacy_alias() {{}}",
+            '#'
         );
+        std::fs::write(nested.join("fixture.rs"), source).unwrap();
+        std::fs::write(nested.join("ignored.txt"), "#[deprecated]\nfn ignored() {}").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let found = deprecated_items_in_roots(&[root]);
+        assert_eq!(found, BTreeSet::from(["legacy_alias".to_string()]));
     }
 
     #[test]
