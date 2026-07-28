@@ -91,22 +91,10 @@ The transferable rules are:
 The plane should adopt these identity and safety rules without importing
 GitHub-, Codex-, or runtime-specific concepts into the core protocol.
 
-Palantir Foundry provides the useful higher-level pattern: operational state is
-represented durably in the Ontology; Actions capture operator input and
-orchestrate governed changes; Approvals persist requests, tasks, checkpoints,
-reviewers, and invocation state; and Automate reacts to object-state conditions
-with permission-aware Actions and bounded retries. Public Palantir documentation
-does not expose an equivalent runner lease or checkpoint-fencing protocol, so
-sekai-chisei must retain its lower-level claim and park generations.
-
-Sources and analogies:
+Prior-art sources:
 
 - [Steerable Repair Automation](https://clawsweeper.bot/steerable-repair-automation.html)
 - [Auto-Updating ClawSweeper PRs](https://clawsweeper.bot/repair/auto-update-prs.html)
-- [Palantir Ontology overview](https://www.palantir.com/docs/foundry/ontology/overview)
-- [Palantir Approvals](https://www.palantir.com/docs/foundry/approvals/overview)
-- [Palantir Automate](https://www.palantir.com/docs/foundry/automate)
-- [Palantir Action effects and retries](https://www.palantir.com/docs/foundry/automate/effect-actions)
 
 ## Identity and fencing invariants
 
