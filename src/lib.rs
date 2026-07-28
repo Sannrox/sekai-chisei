@@ -18,6 +18,7 @@ pub mod enterprise_conformance;
 pub use sekai_provider::gateway_keys;
 pub mod gateway_report;
 pub mod gateway_setup;
+pub mod governed_subject_cli;
 pub mod grpc;
 pub mod gunshi_cli;
 pub mod harness;

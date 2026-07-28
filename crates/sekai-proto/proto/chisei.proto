@@ -1275,12 +1275,46 @@ message DelegateExternalActionPermitRequest {
 }
 message DelegateExternalActionPermitResponse { ExternalActionPermit permit = 1; }
 
+// --- Governed immutable-subject evaluation ---
+// The core envelope contains identifiers and digests only. Registered profile
+// adapters validate domain fields before constructing this payload.
+message GovernedSubjectReference {
+  string kind = 1;
+  string reference = 2;
+  string content_digest = 3;
+  int64 observed_at_ms = 4;
+}
+message GovernedSubjectEnvelope {
+  string version = 1; // chisei.governed-subject/v1
+  string namespace = 2;
+  string request_id = 3;
+  string subject_profile = 4;
+  string subject_identity = 5;
+  string content_digest = 6;
+  repeated GovernedSubjectReference references = 7;
+  string evaluation_profile = 8;
+}
+message EvaluateGovernedSubjectRequest { GovernedSubjectEnvelope subject = 1; }
+message GovernedSubjectResult {
+  string version = 1; // chisei.governed-subject-result/v1
+  string decision = 2; // allow | deny | unavailable | unknown
+  string operation_id = 3;
+  string receipt_schema = 4;
+  string receipt_digest = 5;
+  repeated GovernedSubjectReference references = 6;
+  bool fresh = 7;
+  string failure_code = 8;
+  string failure_message = 9;
+}
+message EvaluateGovernedSubjectResponse { GovernedSubjectResult result = 1; }
+
 // --- Service ---
 
 // Governed decisions for agent operations: context, policy, budgets, routing,
 // evaluation, approvals, and learning. Agent runtimes remain replaceable
 // clients of this service.
 service ChiseiService {
+  rpc EvaluateGovernedSubject(EvaluateGovernedSubjectRequest) returns (EvaluateGovernedSubjectResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc ResolveExternalActionApproval(ResolveExternalActionApprovalRequest) returns (ResolveExternalActionApprovalResponse);
   rpc CancelExternalActionAuthorization(CancelExternalActionAuthorizationRequest) returns (CancelExternalActionAuthorizationResponse);

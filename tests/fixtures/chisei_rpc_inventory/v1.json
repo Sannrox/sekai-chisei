@@ -499,6 +499,21 @@
       "product_tier": "core"
     },
     {
+      "rpc": "EvaluateGovernedSubject",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "src/chisei/governed_subject.rs",
+        "src/grpc/chisei_service.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "docs/governed-subjects.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "QueryOperationStatistics",
       "kind": "query",
       "surfaces": [],

@@ -83,6 +83,8 @@ lives in the separate [research index](research/README.md).
   evidence submission with optional ActionInstance creation.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
+- [Governed subject evaluation](governed-subjects.md) — payload-free,
+  content-bound evaluation through registered profiles.
 - [Host-executor permit conformance](host-executor-permit-conformance.md) —
   enforcement requirements for permit-consuming hosts.
 - [Generation-fenced leases](leases.md) — object-bound coordination.

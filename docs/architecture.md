@@ -133,6 +133,17 @@ can verify the eventual permit and enforce every declared constraint. Chisei
 does not claim that an authorization or host observation proves a physical
 effect occurred.
 
+### Governed immutable subjects
+
+Authenticated native callers can submit bounded, content-addressed subjects
+through registered profiles without transferring subject payload ownership to
+Chisei. The generic envelope contains only an opaque identity, canonical
+digest, allowlisted evidence references, and an evaluation profile. Chisei
+records the binding and fixed-vocabulary decision on the canonical operation
+receipt; reconciliation therefore uses `GetOperationReceipt`. Profile
+validators cannot grant execution authority or add arbitrary receipt
+attributes. See [Governed subject evaluation](governed-subjects.md).
+
 Operator clients may use `GetEffectivePolicySummary` to render a live,
 read-only namespace projection of effective routing, configured budget limits,
 bounded action-rule counts, and governed worker concurrency. Each section

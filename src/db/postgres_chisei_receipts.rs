@@ -12,14 +12,21 @@ impl PostgresDb {
 
     pub fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        let request_id = intent_attr(receipt, "request_id");
+        let lookup_request_id = intent_attr(receipt, "lookup_request_id");
+        let caller_scope = intent_attr(receipt, "caller_scope");
         self.connection()?
             .execute(
                 "INSERT INTO chisei_operation_receipts(
-                    operation_id, initiating_actor, namespace, receipt_json, updated_at
-                 ) VALUES ($1, $2, $3, $4, $5)",
+                    operation_id, request_id, lookup_request_id, initiating_actor,
+                    caller_scope, namespace, receipt_json, updated_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &receipt.operation_id,
+                    &request_id,
+                    &lookup_request_id,
                     &receipt.initiating_actor,
+                    &caller_scope,
                     &receipt.namespace,
                     &receipt_json,
                     &chrono::Utc::now().timestamp_millis(),
