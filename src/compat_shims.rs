@@ -49,8 +49,8 @@ pub const RETAINED_SHIMS: &[ShimRecord] = &[ShimRecord {
     id: "SEKAI_AUTH_TOKEN",
     owner: "sekai::credentials",
     usage_signal: UsageSignal::RuntimeWarning,
-    removal_condition: "deployments issue principal credentials via sekaictl credential create",
-    deadline: "0.2.0",
+    removal_condition: "TCP-only deployments have a reviewed administrator bootstrap and recovery path, and clients use a distinct bearer-token input",
+    deadline: "0.3.0",
 }];
 
 /// Render the shim register as a plain-text report.
@@ -207,5 +207,16 @@ mod tests {
                 shim.id
             );
         }
+    }
+
+    #[test]
+    fn legacy_root_token_requires_a_replacement_admin_path_before_removal() {
+        let shim = RETAINED_SHIMS
+            .iter()
+            .find(|shim| shim.id == "SEKAI_AUTH_TOKEN")
+            .unwrap();
+        assert!(shim.removal_condition.contains("administrator bootstrap"));
+        assert!(shim.removal_condition.contains("distinct bearer-token"));
+        assert_eq!(shim.deadline, "0.3.0");
     }
 }
