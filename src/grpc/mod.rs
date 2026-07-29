@@ -354,99 +354,110 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
     }
 }
 
-pub async fn run(
+pub fn run(
     config: Config,
     backend: Arc<RuntimeBackend>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
-) -> Result<(), Box<dyn std::error::Error>> {
-    backend
-        .capabilities()
-        .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
-        .map_err(std::io::Error::other)?;
-    let runtime_db = backend.database();
-    // Dual-backend handle: SQLite and PostgreSQL community stores.
-    let db = runtime_db.clone();
-    let provider_registry_state_path =
-        crate::provider_profile::provider_registry_state_path(&config.db_path);
+) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
+    // This setup deliberately executes when `run` is called, before the
+    // returned future is polled. The PostgreSQL backend uses synchronous
+    // clients, so service construction must not acquire or release them from
+    // inside Tokio.
+    let prepared = (|| -> Result<_, std::io::Error> {
+        backend
+            .capabilities()
+            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+            .map_err(std::io::Error::other)?;
+        let db = backend.database();
+        let provider_registry_state_path =
+            crate::provider_profile::provider_registry_state_path(&config.db_path);
+        let credential_store = Arc::new(PrincipalCredentialStore::new());
+        credential_store.load(&active_credentials);
 
-    let credential_store = Arc::new(PrincipalCredentialStore::new());
-    credential_store.load(&active_credentials);
+        if let Some(socket_path) = config.sekai_socket.as_deref() {
+            ensure_local_gateway_credential(socket_path, &db)?;
+        }
+        let services = build_services(&config, db.clone());
+        Ok((db, provider_registry_state_path, credential_store, services))
+    })();
 
-    if let Some(ops_port) = config.ops_port {
-        crate::obs::ops::bind_and_spawn(
-            &config.ops_bind,
-            ops_port,
-            db.clone(),
-            provider_registry_state_path.clone(),
-            credential_store.clone(),
-            config.auth_token.clone(),
-        )
-        .await?;
-    }
+    async move {
+        let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
+            prepared?;
 
-    if let Some(socket_path) = config.sekai_socket.as_deref() {
-        ensure_local_gateway_credential(socket_path, &db)?;
-    }
+        spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
 
-    let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
-
-    if let Some(socket_path) = config.sekai_socket.clone() {
-        let uds_server = serve_uds(
-            socket_path,
-            sekai_svc.clone(),
-            chisei_svc.clone(),
-            LocalOrTokenAuthInterceptor {
-                local: LocalInterceptor::new(false),
-                token: TokenAuthInterceptor::new(
-                    credential_store.clone(),
-                    db.clone(),
-                    config.auth_token.clone(),
-                ),
-            },
-            health_service.clone(),
-        );
-
-        if tcp_mode.auth_configured || config.insecure {
-            let tcp_server = run_tcp(
-                config.grpc_port,
-                &config,
-                sekai_svc,
-                chisei_svc,
-                &tcp_mode,
-                credential_store,
-                db,
-                health_service,
-            );
-            return tokio::select! {
-                result = tcp_server => result,
-                result = uds_server => result,
-            };
+        if let Some(ops_port) = config.ops_port {
+            crate::obs::ops::bind_and_spawn(
+                &config.ops_bind,
+                ops_port,
+                db.clone(),
+                provider_registry_state_path.clone(),
+                credential_store.clone(),
+                config.auth_token.clone(),
+            )
+            .await?;
         }
 
-        return uds_server.await;
-    }
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
 
-    if !tcp_mode.token_auth_mode && !config.insecure {
-        return Err(std::io::Error::other(
-            "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
+        if let Some(socket_path) = config.sekai_socket.clone() {
+            let uds_server = serve_uds(
+                socket_path,
+                sekai_svc.clone(),
+                chisei_svc.clone(),
+                LocalOrTokenAuthInterceptor {
+                    local: LocalInterceptor::new(false),
+                    token: TokenAuthInterceptor::new(
+                        credential_store.clone(),
+                        db.clone(),
+                        config.auth_token.clone(),
+                    ),
+                },
+                health_service.clone(),
+            );
+
+            if tcp_mode.auth_configured || config.insecure {
+                let tcp_server = run_tcp(
+                    config.grpc_port,
+                    &config,
+                    sekai_svc,
+                    chisei_svc,
+                    &tcp_mode,
+                    credential_store,
+                    db,
+                    health_service,
+                );
+                return tokio::select! {
+                    result = tcp_server => result,
+                    result = uds_server => result,
+                };
+            }
+
+            return uds_server.await;
+        }
+
+        if !tcp_mode.token_auth_mode && !config.insecure {
+            return Err(std::io::Error::other(
+                "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
+            )
+            .into());
+        }
+
+        run_tcp(
+            config.grpc_port,
+            &config,
+            sekai_svc,
+            chisei_svc,
+            &tcp_mode,
+            credential_store,
+            db,
+            health_service,
         )
-        .into());
+        .await
     }
-
-    run_tcp(
-        config.grpc_port,
-        &config,
-        sekai_svc,
-        chisei_svc,
-        &tcp_mode,
-        credential_store,
-        db,
-        health_service,
-    )
-    .await
 }
 
 fn ensure_local_gateway_credential(
@@ -657,6 +668,15 @@ fn build_services(
         budget,
     ));
 
+    (sekai_svc, chisei_svc)
+}
+
+fn spawn_service_background_tasks(
+    config: &Config,
+    db: Arc<RuntimeDb>,
+    sekai_svc: &Arc<sekai_service::SekaiServiceImpl>,
+    chisei_svc: &Arc<chisei_service::ChiseiServiceImpl>,
+) {
     if config.scoring_enabled {
         tracing::info!(
             model = %config.scoring_model,
@@ -672,8 +692,6 @@ fn build_services(
         );
     }
     spawn_execution_evidence_reconciler(db);
-
-    (sekai_svc, chisei_svc)
 }
 
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {

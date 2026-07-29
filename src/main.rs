@@ -90,24 +90,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let async_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = async_runtime.block_on(run_server(
+    let server = sekai_chisei::grpc::run(
         config,
         Arc::clone(&backend),
         active_credentials,
         grpc_tcp_mode,
-    ));
+    );
+    let result = {
+        let _runtime_guard = async_runtime.enter();
+        async_runtime.block_on(run_server(server))
+    };
     drop(async_runtime);
     drop(backend);
     result
 }
 
 async fn run_server(
-    config: Config,
-    backend: Arc<RuntimeBackend>,
-    active_credentials: Vec<sekai_chisei::db::sekai::PrincipalCredential>,
-    grpc_tcp_mode: sekai_chisei::config::GrpcTcpMode,
+    server: impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server = sekai_chisei::grpc::run(config, backend, active_credentials, grpc_tcp_mode);
     let shutdown = async {
         signal::ctrl_c().await.ok();
         tracing::info!("shutting down");
