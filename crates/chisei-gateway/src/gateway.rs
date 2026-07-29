@@ -100,8 +100,8 @@ const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
 const STREAM_FORWARD_CHANNEL_CAPACITY: usize = 32;
 const STREAM_FORWARD_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
-const DEFAULT_AUDIT_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PENDING_USAGE_RECOVERIES: usize = 4096;
+const DEFAULT_RECOVERY_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_CONTROL_PLANE_RETRIES: u32 = 2;
 const DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS: u64 = 25;
 const DEFAULT_CONTROL_PLANE_TIMEOUT_MS: u64 = 3_000;
@@ -113,6 +113,10 @@ const RECOVERY_REPLAY_YIELD_INTERVAL: usize = 32;
 const SCHEMA_RECONCILIATION_RETRY_MS: u64 = 60_000;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
+const DEFAULT_USAGE_RECOVERY_PATH: &str = "data/chisei-gateway-usage-recovery.json";
+const LEGACY_USAGE_RECOVERY_PATH: &str = "data/chisei-gateway-budget-reconciliation.json";
+const DEFAULT_RECOVERY_SPOOL_PATH: &str = "data/chisei-gateway-recovery.jsonl";
+const LEGACY_RECOVERY_SPOOL_BASE_PATH: &str = "data/chisei-gateway-audit.jsonl";
 pub(crate) use sekai_provider::gateway_contract::LLM_CALLS_COLUMNS;
 
 #[derive(Clone)]
@@ -372,15 +376,15 @@ struct GatewayRuntime {
     global_rate_limit_requests: u64,
     rate_limit_window: Duration,
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
-    governance_cache: Arc<RwLock<GovernanceCache>>,
-    budget_reconciliation_path: Option<PathBuf>,
-    budget_reconciliation_lock: Arc<Mutex<()>>,
+    usage_recovery: Arc<RwLock<UsageRecoveryState>>,
+    usage_recovery_path: Option<PathBuf>,
+    usage_recovery_lock: Arc<Mutex<()>>,
     provider_registry_state_path: Option<PathBuf>,
     provider_registry_refresh: Arc<Mutex<ProviderRegistryRefreshState>>,
     provider_registry_refresh_generation: Arc<AtomicU64>,
-    audit_spool_path: Option<PathBuf>,
-    audit_spool_max_bytes: u64,
-    audit_spool_lock: Arc<Mutex<()>>,
+    recovery_spool_path: Option<PathBuf>,
+    recovery_spool_max_bytes: u64,
+    recovery_spool_lock: Arc<Mutex<()>>,
     recovery_replay_running: Arc<AtomicBool>,
     llm_calls_schema_reconciled: Arc<AtomicBool>,
     llm_calls_schema_retry_after_ms: Arc<AtomicU64>,
@@ -508,13 +512,13 @@ impl CircuitBreakerState {
 }
 
 #[derive(Default)]
-struct GovernanceCache {
-    pending_budget_usage: HashMap<String, RecordUsageRequest>,
-    budget_reconciliation_saturated: bool,
+struct UsageRecoveryState {
+    pending_usage_records: HashMap<String, RecordUsageRequest>,
+    usage_recovery_saturated: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PendingBudgetUsage {
+struct PendingUsageRecovery {
     user_id: String,
     tokens_used: i32,
     subject: String,
@@ -526,7 +530,7 @@ struct PendingBudgetUsage {
     idempotency_key: String,
 }
 
-impl From<RecordUsageRequest> for PendingBudgetUsage {
+impl From<RecordUsageRequest> for PendingUsageRecovery {
     fn from(request: RecordUsageRequest) -> Self {
         Self {
             user_id: request.user_id,
@@ -542,8 +546,8 @@ impl From<RecordUsageRequest> for PendingBudgetUsage {
     }
 }
 
-impl From<PendingBudgetUsage> for RecordUsageRequest {
-    fn from(request: PendingBudgetUsage) -> Self {
+impl From<PendingUsageRecovery> for RecordUsageRequest {
+    fn from(request: PendingUsageRecovery) -> Self {
         Self {
             user_id: request.user_id,
             tokens_used: request.tokens_used,
@@ -596,23 +600,26 @@ impl GatewayRuntime {
                 .filter(|value| !value.trim().is_empty()),
         )
         .with_resilience(resilience)
-        .with_budget_reconciliation_path(Some(PathBuf::from(
-            std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
-                .unwrap_or_else(|_| "data/chisei-gateway-budget-reconciliation.json".to_string()),
+        .with_usage_recovery_path(Some(resolve_usage_recovery_path(
+            std::env::var("CHISEI_GATEWAY_USAGE_RECOVERY_PATH").ok(),
+            std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH").ok(),
+            Path::new(LEGACY_USAGE_RECOVERY_PATH).exists(),
         )))
         .with_provider_registry_state_path(Some(provider_registry_state_path(
             &std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".to_string()),
         )))
-        .with_audit_spool_path(Some(PathBuf::from(
-            std::env::var("CHISEI_GATEWAY_AUDIT_SPOOL_PATH")
-                .unwrap_or_else(|_| "data/chisei-gateway-audit.jsonl".to_string()),
+        .with_recovery_spool_path(Some(resolve_recovery_spool_path(
+            std::env::var("CHISEI_GATEWAY_RECOVERY_SPOOL_PATH").ok(),
+            std::env::var("CHISEI_GATEWAY_AUDIT_SPOOL_PATH").ok(),
+            Path::new(&format!("{LEGACY_RECOVERY_SPOOL_BASE_PATH}.recovery")).exists(),
         )))
         .with_http_timeouts(HttpTimeouts::from_env());
-        runtime.audit_spool_max_bytes = env_u64(
-            "CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES",
-            DEFAULT_AUDIT_SPOOL_MAX_BYTES,
-        )
-        .max(1);
+        runtime.recovery_spool_max_bytes = std::env::var("CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES")
+            .or_else(|_| std::env::var("CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES"))
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RECOVERY_SPOOL_MAX_BYTES)
+            .max(1);
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
         runtime.rate_limit_requests = positive_env("CHISEI_GATEWAY_RATE_LIMIT_REQUESTS")
@@ -639,17 +646,17 @@ impl GatewayRuntime {
             global_rate_limit_requests: DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS,
             rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            governance_cache: Arc::new(RwLock::new(GovernanceCache::default())),
-            budget_reconciliation_path: None,
-            budget_reconciliation_lock: Arc::new(Mutex::new(())),
+            usage_recovery: Arc::new(RwLock::new(UsageRecoveryState::default())),
+            usage_recovery_path: None,
+            usage_recovery_lock: Arc::new(Mutex::new(())),
             provider_registry_state_path: None,
             provider_registry_refresh: Arc::new(
                 Mutex::new(ProviderRegistryRefreshState::default()),
             ),
             provider_registry_refresh_generation: Arc::new(AtomicU64::new(0)),
-            audit_spool_path: None,
-            audit_spool_max_bytes: DEFAULT_AUDIT_SPOOL_MAX_BYTES,
-            audit_spool_lock: Arc::new(Mutex::new(())),
+            recovery_spool_path: None,
+            recovery_spool_max_bytes: DEFAULT_RECOVERY_SPOOL_MAX_BYTES,
+            recovery_spool_lock: Arc::new(Mutex::new(())),
             recovery_replay_running: Arc::new(AtomicBool::new(false)),
             llm_calls_schema_reconciled: Arc::new(AtomicBool::new(false)),
             llm_calls_schema_retry_after_ms: Arc::new(AtomicU64::new(0)),
@@ -671,46 +678,46 @@ impl GatewayRuntime {
         self
     }
 
-    fn with_budget_reconciliation_path(mut self, path: Option<PathBuf>) -> Self {
-        self.budget_reconciliation_path = path;
-        if let Some(path) = self.budget_reconciliation_path.as_ref() {
-            let cache = Arc::get_mut(&mut self.governance_cache)
+    fn with_usage_recovery_path(mut self, path: Option<PathBuf>) -> Self {
+        self.usage_recovery_path = path;
+        if let Some(path) = self.usage_recovery_path.as_ref() {
+            let cache = Arc::get_mut(&mut self.usage_recovery)
                 .expect("new gateway runtime cache is not shared")
                 .get_mut();
             match std::fs::read(path) {
-                Ok(bytes) => match serde_json::from_slice::<Vec<PendingBudgetUsage>>(&bytes) {
+                Ok(bytes) => match serde_json::from_slice::<Vec<PendingUsageRecovery>>(&bytes) {
                     Ok(entries) => {
                         for entry in entries {
                             let request = RecordUsageRequest::from(entry);
                             cache
-                                .pending_budget_usage
-                                .insert(usage_reconciliation_key(&request), request);
+                                .pending_usage_records
+                                .insert(usage_recovery_key(&request), request);
                         }
                     }
                     Err(error) => {
-                        error!(path = %path.display(), %error, "budget reconciliation journal is invalid");
-                        cache.budget_reconciliation_saturated = true;
+                        error!(path = %path.display(), %error, "usage recovery journal is invalid");
+                        cache.usage_recovery_saturated = true;
                     }
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match initialize_budget_reconciliation_journal(path) {
+                    match initialize_usage_recovery_journal(path) {
                         Ok(entries) => {
                             for entry in entries {
                                 let request = RecordUsageRequest::from(entry);
                                 cache
-                                    .pending_budget_usage
-                                    .insert(usage_reconciliation_key(&request), request);
+                                    .pending_usage_records
+                                    .insert(usage_recovery_key(&request), request);
                             }
                         }
                         Err(error) => {
-                            error!(path = %path.display(), %error, "budget reconciliation journal cannot be initialized");
-                            cache.budget_reconciliation_saturated = true;
+                            error!(path = %path.display(), %error, "usage recovery journal cannot be initialized");
+                            cache.usage_recovery_saturated = true;
                         }
                     }
                 }
                 Err(error) => {
-                    error!(path = %path.display(), %error, "budget reconciliation journal is unreadable");
-                    cache.budget_reconciliation_saturated = true;
+                    error!(path = %path.display(), %error, "usage recovery journal is unreadable");
+                    cache.usage_recovery_saturated = true;
                 }
             }
         }
@@ -766,8 +773,8 @@ impl GatewayRuntime {
         self.provider_registry_refresh_generation
             .fetch_add(1, Ordering::Release);
     }
-    fn with_audit_spool_path(mut self, path: Option<PathBuf>) -> Self {
-        self.audit_spool_path = path;
+    fn with_recovery_spool_path(mut self, path: Option<PathBuf>) -> Self {
+        self.recovery_spool_path = path;
         self
     }
 }
@@ -777,6 +784,50 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn resolve_usage_recovery_path(
+    configured: Option<String>,
+    legacy_configured: Option<String>,
+    legacy_default_exists: bool,
+) -> PathBuf {
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            legacy_configured
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(if legacy_default_exists {
+                LEGACY_USAGE_RECOVERY_PATH
+            } else {
+                DEFAULT_USAGE_RECOVERY_PATH
+            })
+        })
+}
+
+fn resolve_recovery_spool_path(
+    configured: Option<String>,
+    legacy_configured: Option<String>,
+    legacy_default_exists: bool,
+) -> PathBuf {
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            legacy_configured
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| PathBuf::from(format!("{value}.recovery")))
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(if legacy_default_exists {
+                concat!("data/chisei-gateway-audit.jsonl", ".recovery")
+            } else {
+                DEFAULT_RECOVERY_SPOOL_PATH
+            })
+        })
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -841,9 +892,7 @@ async fn record_control_plane_failure(runtime: &GatewayRuntime, error: &impl ToS
         .record_failure(error.to_string(), &runtime.resilience);
 }
 
-fn initialize_budget_reconciliation_journal(
-    path: &Path,
-) -> std::io::Result<Vec<PendingBudgetUsage>> {
+fn initialize_usage_recovery_journal(path: &Path) -> std::io::Result<Vec<PendingUsageRecovery>> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -869,7 +918,7 @@ fn initialize_budget_reconciliation_journal(
             }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "concurrently created budget reconciliation journal is invalid",
+                "concurrently created usage recovery journal is invalid",
             ));
         }
         Err(error) => return Err(error),
@@ -952,9 +1001,9 @@ async fn gateway_health() -> Response<Body> {
 
 async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
     let circuit_open = state.runtime.control_plane_circuit.read().await.is_open();
-    let cache = state.runtime.governance_cache.read().await;
-    let pending_budget_reconciliations = cache.pending_budget_usage.len();
-    let budget_reconciliation_saturated = cache.budget_reconciliation_saturated;
+    let cache = state.runtime.usage_recovery.read().await;
+    let pending_usage_recoveries = cache.pending_usage_records.len();
+    let usage_recovery_saturated = cache.usage_recovery_saturated;
     drop(cache);
     let provider_health = {
         let mut circuits = state.runtime.upstream_circuits.write().await;
@@ -979,16 +1028,18 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
         serde_json::json!({
             "status": if circuit_open
                 || provider_circuit_open
-                || pending_budget_reconciliations > 0
-                || budget_reconciliation_saturated
+                || pending_usage_recoveries > 0
+                || usage_recovery_saturated
             {
                 "degraded"
             } else {
                 "live"
             },
             "control_plane_circuit_open": circuit_open,
-            "pending_budget_reconciliations": pending_budget_reconciliations,
-            "budget_reconciliation_saturated": budget_reconciliation_saturated,
+            "pending_usage_recoveries": pending_usage_recoveries,
+            "usage_recovery_saturated": usage_recovery_saturated,
+            "pending_budget_reconciliations": pending_usage_recoveries,
+            "budget_reconciliation_saturated": usage_recovery_saturated,
             "provider_health": provider_health
         }),
     )
@@ -1117,9 +1168,9 @@ async fn refresh_gateway_admin(
     let cleared_entries = key_cache.len();
     key_cache.clear();
     drop(key_cache);
-    let governance_cache = state.runtime.governance_cache.read().await;
-    let pending_budget_reconciliations = governance_cache.pending_budget_usage.len();
-    drop(governance_cache);
+    let usage_recovery = state.runtime.usage_recovery.read().await;
+    let pending_usage_recoveries = usage_recovery.pending_usage_records.len();
+    drop(usage_recovery);
     record_gateway_event(
         &state.config,
         "chisei-gateway-admin",
@@ -1137,7 +1188,8 @@ async fn refresh_gateway_admin(
         serde_json::json!({
             "refreshed": true,
             "cleared_key_cache_entries": cleared_entries,
-            "pending_budget_reconciliations": pending_budget_reconciliations
+            "pending_usage_recoveries": pending_usage_recoveries,
+            "pending_budget_reconciliations": pending_usage_recoveries
         }),
     )
 }
@@ -3486,19 +3538,14 @@ async fn gateway_decision_preflight(
     match connect_governance(runtime, target).await {
         Ok(channel) => {
             let mut client = ChiseiServiceClient::new(channel);
-            if runtime
-                .governance_cache
-                .read()
-                .await
-                .budget_reconciliation_saturated
-            {
+            if runtime.usage_recovery.read().await.usage_recovery_saturated {
                 return Err(GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "governance_unavailable",
                     "budget usage reconciliation is saturated",
                 ));
             }
-            reconcile_pending_budget_usage(runtime, &mut client)
+            reconcile_pending_usage_records(runtime, &mut client)
                 .await
                 .map_err(|error| {
                     GatewayRejection::json(
@@ -3784,7 +3831,7 @@ struct ContextEgressPreflight {
     body: Vec<u8>,
 }
 
-fn governance_cache_key(parts: &[&str]) -> String {
+fn stable_recovery_key(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update((part.len() as u64).to_be_bytes());
@@ -3793,46 +3840,46 @@ fn governance_cache_key(parts: &[&str]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-async fn queue_pending_budget_usage(
+async fn queue_pending_usage_records(
     runtime: &GatewayRuntime,
     requests: impl IntoIterator<Item = RecordUsageRequest>,
 ) -> bool {
-    let _journal_guard = runtime.budget_reconciliation_lock.lock().await;
-    let mut cache = runtime.governance_cache.write().await;
+    let _journal_guard = runtime.usage_recovery_lock.lock().await;
+    let mut cache = runtime.usage_recovery.write().await;
     let mut accepted = true;
     for request in requests {
-        let key = usage_reconciliation_key(&request);
-        if cache.pending_budget_usage.contains_key(&key) {
+        let key = usage_recovery_key(&request);
+        if cache.pending_usage_records.contains_key(&key) {
             continue;
-        } else if cache.pending_budget_usage.len() < MAX_PENDING_BUDGET_RECONCILIATIONS {
-            cache.pending_budget_usage.insert(key, request);
+        } else if cache.pending_usage_records.len() < MAX_PENDING_USAGE_RECOVERIES {
+            cache.pending_usage_records.insert(key, request);
         } else {
-            cache.budget_reconciliation_saturated = true;
+            cache.usage_recovery_saturated = true;
             accepted = false;
         }
     }
     let snapshot = cache
-        .pending_budget_usage
+        .pending_usage_records
         .values()
         .cloned()
-        .map(PendingBudgetUsage::from)
+        .map(PendingUsageRecovery::from)
         .collect::<Vec<_>>();
     drop(cache);
-    if persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot).await {
+    if persist_pending_usage_records(runtime.usage_recovery_path.clone(), snapshot).await {
         accepted
     } else {
         runtime
-            .governance_cache
+            .usage_recovery
             .write()
             .await
-            .budget_reconciliation_saturated = true;
+            .usage_recovery_saturated = true;
         false
     }
 }
 
-async fn persist_pending_budget_usage(
+async fn persist_pending_usage_records(
     path: Option<PathBuf>,
-    pending: Vec<PendingBudgetUsage>,
+    pending: Vec<PendingUsageRecovery>,
 ) -> bool {
     let Some(path) = path else {
         return true;
@@ -3865,12 +3912,12 @@ async fn persist_pending_budget_usage(
     )
 }
 
-fn usage_reconciliation_key(request: &RecordUsageRequest) -> String {
+fn usage_recovery_key(request: &RecordUsageRequest) -> String {
     if !request.idempotency_key.is_empty() {
         return request.idempotency_key.clone();
     }
-    governance_cache_key(&[
-        "usage-reconciliation-v1",
+    stable_recovery_key(&[
+        "usage-recovery-v1",
         &request.subject,
         &request.project,
         &request.agent,
@@ -3881,51 +3928,49 @@ fn usage_reconciliation_key(request: &RecordUsageRequest) -> String {
     ])
 }
 
-async fn reconcile_pending_budget_usage(
+async fn reconcile_pending_usage_records(
     runtime: &GatewayRuntime,
     client: &mut ChiseiServiceClient<GatewayClient>,
 ) -> Result<usize, tonic::Status> {
-    let _journal_guard = runtime.budget_reconciliation_lock.lock().await;
+    let _journal_guard = runtime.usage_recovery_lock.lock().await;
     let pending = {
-        let mut cache = runtime.governance_cache.write().await;
-        std::mem::take(&mut cache.pending_budget_usage)
+        let mut cache = runtime.usage_recovery.write().await;
+        std::mem::take(&mut cache.pending_usage_records)
             .into_values()
             .collect::<Vec<_>>()
     };
     let mut reconciled = 0usize;
     for (index, request) in pending.iter().cloned().enumerate() {
         if let Err(status) = client.record_usage(gateway_request(request)).await {
-            let mut cache = runtime.governance_cache.write().await;
+            let mut cache = runtime.usage_recovery.write().await;
             for request in pending[index..].iter().cloned() {
-                let key = usage_reconciliation_key(&request);
-                cache.pending_budget_usage.insert(key, request);
+                let key = usage_recovery_key(&request);
+                cache.pending_usage_records.insert(key, request);
             }
             let snapshot = cache
-                .pending_budget_usage
+                .pending_usage_records
                 .values()
                 .cloned()
-                .map(PendingBudgetUsage::from)
+                .map(PendingUsageRecovery::from)
                 .collect();
             drop(cache);
-            if !persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), snapshot)
-                .await
-            {
+            if !persist_pending_usage_records(runtime.usage_recovery_path.clone(), snapshot).await {
                 runtime
-                    .governance_cache
+                    .usage_recovery
                     .write()
                     .await
-                    .budget_reconciliation_saturated = true;
+                    .usage_recovery_saturated = true;
             }
             return Err(status);
         }
         reconciled += 1;
     }
-    if !persist_pending_budget_usage(runtime.budget_reconciliation_path.clone(), Vec::new()).await {
+    if !persist_pending_usage_records(runtime.usage_recovery_path.clone(), Vec::new()).await {
         runtime
-            .governance_cache
+            .usage_recovery
             .write()
             .await
-            .budget_reconciliation_saturated = true;
+            .usage_recovery_saturated = true;
     }
     // Saturation means at least one usage event was not retained. It is
     // intentionally sticky: only operator reconciliation plus restart can
@@ -7340,7 +7385,7 @@ async fn record_usage_and_append(
         Ok(channel) => {
             spawn_gateway_recovery_replay(config.clone(), runtime.clone());
             let mut chisei = ChiseiServiceClient::new(channel.clone());
-            if let Err(err) = reconcile_pending_budget_usage(runtime, &mut chisei).await {
+            if let Err(err) = reconcile_pending_usage_records(runtime, &mut chisei).await {
                 warn!(error = %err, "chisei-gateway pending usage reconciliation failed");
             }
             if let Err(err) = chisei
@@ -7348,8 +7393,8 @@ async fn record_usage_and_append(
                 .await
             {
                 warn!(error = %err, "chisei-gateway request-count usage record failed");
-                if !queue_pending_budget_usage(runtime, [request_usage.clone()]).await {
-                    error!("chisei-gateway budget reconciliation queue is saturated");
+                if !queue_pending_usage_records(runtime, [request_usage.clone()]).await {
+                    error!("chisei-gateway usage recovery queue is saturated");
                 }
             }
             if let Some(token_usage) = token_usage.as_ref() {
@@ -7361,8 +7406,8 @@ async fn record_usage_and_append(
                     .await
                 {
                     warn!(error = %err, "chisei-gateway usage record failed");
-                    if !queue_pending_budget_usage(runtime, [token_usage.clone()]).await {
-                        error!("chisei-gateway budget reconciliation queue is saturated");
+                    if !queue_pending_usage_records(runtime, [token_usage.clone()]).await {
+                        error!("chisei-gateway usage recovery queue is saturated");
                     }
                 } else {
                     let warning_config = config.clone();
@@ -7568,14 +7613,14 @@ async fn record_usage_and_append(
             record_gateway_pipeline_decision(config, identity, context, pipeline_observation).await;
         }
         Err(err) => {
-            if !queue_pending_budget_usage(
+            if !queue_pending_usage_records(
                 runtime,
                 std::iter::once(request_usage).chain(token_usage),
             )
             .await
             {
                 error!(
-                    "chisei-gateway budget reconciliation queue saturated; cached budget admission disabled"
+                    "chisei-gateway usage recovery queue saturated; additional recovery refused"
                 );
             }
             if !matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
@@ -9067,10 +9112,7 @@ enum GatewayRecoveryRecord {
 }
 
 fn recovery_spool_path(runtime: &GatewayRuntime) -> Option<PathBuf> {
-    runtime
-        .audit_spool_path
-        .as_ref()
-        .map(|path| PathBuf::from(format!("{}.recovery", path.display())))
+    runtime.recovery_spool_path.clone()
 }
 
 async fn append_gateway_recovery(runtime: &GatewayRuntime, record: GatewayRecoveryRecord) -> bool {
@@ -9081,8 +9123,8 @@ async fn append_gateway_recovery(runtime: &GatewayRuntime, record: GatewayRecove
         return false;
     };
     line.push(b'\n');
-    let max_bytes = runtime.audit_spool_max_bytes;
-    let _guard = runtime.audit_spool_lock.lock().await;
+    let max_bytes = runtime.recovery_spool_max_bytes;
+    let _guard = runtime.recovery_spool_lock.lock().await;
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         use std::io::{Read, Seek, SeekFrom, Write};
         #[cfg(unix)]
@@ -9213,7 +9255,7 @@ async fn replay_gateway_recovery(
     else {
         return (true, false, false);
     };
-    let _guard = runtime.audit_spool_lock.lock().await;
+    let _guard = runtime.recovery_spool_lock.lock().await;
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return (false, false, false);
     };
@@ -11005,7 +11047,7 @@ fn retry_safety_for_error(error_type: &str) -> Option<&'static str> {
         | "governance_audit_unavailable"
         | "provider_registry_unavailable"
         | "audit_unavailable"
-        | "audit_spool_unavailable" => Some("safe"),
+        | "recovery_spool_unavailable" => Some("safe"),
         "upstream_timeout"
         | "upstream_unavailable"
         | "upstream_error"
@@ -11056,7 +11098,7 @@ fn stable_gateway_error_code(error_type: &str) -> &'static str {
         | "unsupported_cross_provider_route" => "capability_unsupported",
         "request_conflict"
         | "request_id_conflict"
-        | "budget_reconciliation_required"
+        | "usage_recovery_required"
         | "governance_precondition" => "request_conflict",
         "rate_limited" | "rate_limit_exceeded" => "rate_limited",
         "upstream_rate_limited" => "rate_limited",
@@ -11069,7 +11111,7 @@ fn stable_gateway_error_code(error_type: &str) -> &'static str {
         | "governance_unavailable"
         | "governance_audit_unavailable"
         | "audit_unavailable"
-        | "audit_spool_unavailable" => "upstream_unavailable",
+        | "recovery_spool_unavailable" => "upstream_unavailable",
         "upstream_invalid_response" | "gateway_response_error" => "upstream_invalid_response",
         "invalid_request"
         | "invalid_request_error"
@@ -11272,7 +11314,7 @@ mod tests {
             ("context_not_found", "invalid_request"),
             ("governance_unavailable", "upstream_unavailable"),
             ("governance_audit_unavailable", "upstream_unavailable"),
-            ("budget_reconciliation_required", "request_conflict"),
+            ("usage_recovery_required", "request_conflict"),
             ("governance_precondition", "request_conflict"),
             ("unsupported_cross_provider_route", "capability_unsupported"),
         ] {
@@ -11962,6 +12004,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_paths_preserve_legacy_state_until_explicitly_migrated() {
+        assert_eq!(
+            resolve_usage_recovery_path(None, None, true),
+            PathBuf::from(LEGACY_USAGE_RECOVERY_PATH)
+        );
+        assert_eq!(
+            resolve_usage_recovery_path(None, Some("/legacy/usage.json".into()), false),
+            PathBuf::from("/legacy/usage.json")
+        );
+        assert_eq!(
+            resolve_recovery_spool_path(None, None, true),
+            PathBuf::from("data/chisei-gateway-audit.jsonl.recovery")
+        );
+        assert_eq!(
+            resolve_recovery_spool_path(None, Some("/legacy/audit.jsonl".into()), false),
+            PathBuf::from("/legacy/audit.jsonl.recovery")
+        );
+        assert_eq!(
+            resolve_recovery_spool_path(Some("/new/recovery.jsonl".into()), None, true),
+            PathBuf::from("/new/recovery.jsonl")
+        );
+    }
+
+    #[test]
     fn exposed_gateway_requires_keys_and_no_auth_passthrough() {
         let bind = "0.0.0.0:8788".parse().unwrap();
         let mut keys = HashMap::new();
@@ -12537,7 +12603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_budget_reconciliation_is_deduplicated_and_bounded() {
+    async fn pending_usage_recovery_is_deduplicated_and_bounded() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
         let usage = |work_unit: String, tokens_used| RecordUsageRequest {
             user_id: "agent:safe-agent".into(),
@@ -12551,18 +12617,18 @@ mod tests {
             idempotency_key: format!("test-usage-{work_unit}"),
         };
         assert!(
-            queue_pending_budget_usage(
+            queue_pending_usage_records(
                 &runtime,
                 [usage("same".into(), 2), usage("same".into(), 3)],
             )
             .await
         );
         {
-            let cache = runtime.governance_cache.read().await;
-            assert_eq!(cache.pending_budget_usage.len(), 1);
+            let cache = runtime.usage_recovery.read().await;
+            assert_eq!(cache.pending_usage_records.len(), 1);
             assert_eq!(
                 cache
-                    .pending_budget_usage
+                    .pending_usage_records
                     .values()
                     .next()
                     .unwrap()
@@ -12570,66 +12636,66 @@ mod tests {
                 2
             );
         }
-        for index in 1..MAX_PENDING_BUDGET_RECONCILIATIONS {
+        for index in 1..MAX_PENDING_USAGE_RECOVERIES {
             assert!(
-                queue_pending_budget_usage(&runtime, [usage(format!("work-{index}"), 1)],).await
+                queue_pending_usage_records(&runtime, [usage(format!("work-{index}"), 1)],).await
             );
         }
-        assert!(!queue_pending_budget_usage(&runtime, [usage("overflow".into(), 1)]).await);
-        let cache = runtime.governance_cache.read().await;
+        assert!(!queue_pending_usage_records(&runtime, [usage("overflow".into(), 1)]).await);
+        let cache = runtime.usage_recovery.read().await;
         assert_eq!(
-            cache.pending_budget_usage.len(),
-            MAX_PENDING_BUDGET_RECONCILIATIONS
+            cache.pending_usage_records.len(),
+            MAX_PENDING_USAGE_RECOVERIES
         );
-        assert!(cache.budget_reconciliation_saturated);
+        assert!(cache.usage_recovery_saturated);
     }
 
     #[tokio::test]
-    async fn invalid_budget_reconciliation_journal_fails_closed() {
+    async fn invalid_usage_recovery_journal_fails_closed() {
         let path = std::env::temp_dir().join(format!(
-            "chisei-invalid-budget-reconciliation-{}.json",
+            "chisei-invalid-usage-recovery-{}.json",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"not-json").unwrap();
 
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_budget_reconciliation_path(Some(path.clone()));
-        let cache = runtime.governance_cache.read().await;
-        assert!(cache.pending_budget_usage.is_empty());
-        assert!(cache.budget_reconciliation_saturated);
+            .with_usage_recovery_path(Some(path.clone()));
+        let cache = runtime.usage_recovery.read().await;
+        assert!(cache.pending_usage_records.is_empty());
+        assert!(cache.usage_recovery_saturated);
 
         std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
-    async fn missing_budget_reconciliation_journal_is_initialized() {
+    async fn missing_usage_recovery_journal_is_initialized() {
         let path = std::env::temp_dir().join(format!(
-            "chisei-new-budget-reconciliation-{}.json",
+            "chisei-new-usage-recovery-{}.json",
             uuid::Uuid::new_v4()
         ));
 
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_budget_reconciliation_path(Some(path.clone()));
-        let cache = runtime.governance_cache.read().await;
-        assert!(!cache.budget_reconciliation_saturated);
+            .with_usage_recovery_path(Some(path.clone()));
+        let cache = runtime.usage_recovery.read().await;
+        assert!(!cache.usage_recovery_saturated);
         assert_eq!(std::fs::read(&path).unwrap(), b"[]");
 
         std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
-    async fn unavailable_budget_reconciliation_journal_fails_closed() {
+    async fn unavailable_usage_recovery_journal_fails_closed() {
         let parent = std::env::temp_dir().join(format!(
-            "chisei-blocked-budget-reconciliation-{}",
+            "chisei-blocked-usage-recovery-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&parent, b"not-a-directory").unwrap();
         let path = parent.join("journal.json");
 
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_budget_reconciliation_path(Some(path));
-        let cache = runtime.governance_cache.read().await;
-        assert!(cache.budget_reconciliation_saturated);
+        let runtime =
+            GatewayRuntime::new(Duration::from_secs(30), None).with_usage_recovery_path(Some(path));
+        let cache = runtime.usage_recovery.read().await;
+        assert!(cache.usage_recovery_saturated);
 
         std::fs::remove_file(parent).unwrap();
     }
@@ -12695,10 +12761,9 @@ mod tests {
     async fn gateway_recovery_spool_replays_llm_rows() {
         let directory =
             std::env::temp_dir().join(format!("chisei-recovery-{}", uuid::Uuid::new_v4()));
-        let audit_path = directory.join("audit.jsonl");
-        let recovery_path = PathBuf::from(format!("{}.recovery", audit_path.display()));
+        let recovery_path = directory.join("recovery.jsonl");
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_audit_spool_path(Some(audit_path.clone()));
+            .with_recovery_spool_path(Some(recovery_path.clone()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         tokio::fs::write(&recovery_path, br#"{"kind":"llm_row""#)
             .await
@@ -13347,7 +13412,7 @@ mod tests {
         std::fs::remove_file(&registry_path).unwrap();
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
             .with_provider_registry_state_path(Some(registry_path))
-            .with_audit_spool_path(Some(audit_path));
+            .with_recovery_spool_path(Some(audit_path));
         let config = routing_config();
         let state = GatewayState {
             client: runtime.http_timeouts.client(),
@@ -13572,13 +13637,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_status_surfaces_sticky_reconciliation_saturation() {
+    async fn gateway_status_surfaces_sticky_usage_recovery_saturation() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
         runtime
-            .governance_cache
+            .usage_recovery
             .write()
             .await
-            .budget_reconciliation_saturated = true;
+            .usage_recovery_saturated = true;
         let state = GatewayState {
             client: runtime.http_timeouts.client(),
             config: Arc::new(routing_config()),
@@ -13590,7 +13655,7 @@ mod tests {
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["status"], "degraded");
-        assert_eq!(body["budget_reconciliation_saturated"], true);
+        assert_eq!(body["usage_recovery_saturated"], true);
     }
 
     #[test]
@@ -14299,9 +14364,9 @@ mod tests {
         config: GatewayConfig,
         mut runtime: GatewayRuntime,
     ) -> String {
-        if runtime.audit_spool_path.is_none() {
-            runtime.audit_spool_path = Some(std::env::temp_dir().join(format!(
-                "chisei-gateway-audit-{}.jsonl",
+        if runtime.recovery_spool_path.is_none() {
+            runtime.recovery_spool_path = Some(std::env::temp_dir().join(format!(
+                "chisei-gateway-recovery-{}.jsonl",
                 uuid::Uuid::new_v4()
             )));
         }

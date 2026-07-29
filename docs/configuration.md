@@ -114,11 +114,17 @@ value to stdout.
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed rate-limit window |
 | `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` | `4000` | Maximum injected graph-context characters |
 | `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS` | `30` | Virtual-key lookup cache lifetime |
-| `CHISEI_GATEWAY_AUDIT_SPOOL_PATH` | `data/chisei-gateway-audit.jsonl` | Base path for durable recovery; receipt, usage, and refusal records are written to the sibling file with `.recovery` appended (process CWD-relative unless absolute) |
-| `CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES` | `67108864` | Hard recovery-spool capacity; new records are refused after the `.recovery` file reaches this size until replay or operator cleanup frees space |
+| `CHISEI_GATEWAY_USAGE_RECOVERY_PATH` | `data/chisei-gateway-usage-recovery.json` | Durable journal for post-call usage records that could not yet reach the control plane |
+| `CHISEI_GATEWAY_RECOVERY_SPOOL_PATH` | `data/chisei-gateway-recovery.jsonl` | Durable receipt, usage, and refusal recovery file (process CWD-relative unless absolute) |
+| `CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES` | `67108864` | Hard recovery-spool capacity; new records are refused after the file reaches this size until replay or operator cleanup frees space |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
 | `CHISEI_GATEWAY_RUN_PIPELINE` | unset | Set `1` to sample completed calls through Chisei |
 | `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table; class rates must be supplied to price provider cache-write premiums |
+
+For upgrades, the gateway still reads the former usage-journal and spool
+environment variables when the new names are unset. It also resumes existing
+legacy default files before selecting the new defaults. After the old files
+drain, set the new paths explicitly; the compatibility names are deprecated.
 
 The pricing format is
 `model=input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]`, with every

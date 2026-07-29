@@ -165,6 +165,22 @@ The gateway's own Anthropic upstream uses `CHISEI_ANTHROPIC_BASE_URL`, which
 defaults to `https://api.anthropic.com/v1`. It deliberately does not reuse the
 client-facing `ANTHROPIC_BASE_URL`.
 
+## Explicit direct-provider fallback
+
+The gateway never forwards automatically when the control plane is
+unavailable. To keep working without Sekai Chisei, explicitly return the client
+to its normal provider configuration:
+
+- Codex: let `sekaictl launch codex-app` restore the original configuration, or
+  quit the app and rerun the launcher so it recovers a stale managed config.
+- Claude Code: start a new `claude` process without the launcher's
+  `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` environment.
+
+Direct-provider calls are outside Sekai Chisei. They have no Chisei policy or
+budget enforcement, governed routing or context filtering, operation receipts,
+or usage recovery. Switching back is an explicit client/operator action, not a
+gateway availability mode.
+
 ## Virtual keys
 
 Manage hashed gateway keys through the CLI:
