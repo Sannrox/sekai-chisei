@@ -14,7 +14,7 @@ window. Reports from another namespace or outside that window are not
 projected into the output:
 
 ```sh
-sekaictl team weekly-report reports/*.json \
+sekaictl admin access team weekly-report reports/*.json \
   --namespace acme \
   --since-ms 1783900800000 \
   --until-ms 1784505600000 \
@@ -37,7 +37,7 @@ report on the next run.
 set -eu
 until_ms="$(date +%s)000"
 since_ms="$((until_ms - 604800000))"
-exec sekaictl team weekly-report /var/lib/sekai/reports/*.json \
+exec sekaictl admin access team weekly-report /var/lib/sekai/reports/*.json \
   --namespace acme \
   --since-ms "$since_ms" \
   --until-ms "$until_ms" \

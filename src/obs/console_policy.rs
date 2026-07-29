@@ -364,7 +364,7 @@ pub fn render_policy_page(
             r#"
 <section class="panel" aria-labelledby="promote-heading">
   <h2 id="promote-heading">Promote allocation policy</h2>
-  <p class="meta">Requires write access, explicit confirm, and eval-gated JSON matching <code>sekaictl gunshi promote</code>.</p>
+  <p class="meta">Requires write access, explicit confirm, and eval-gated JSON matching <code>sekaictl admin governance gunshi promote</code>.</p>
   <form method="post" action="/console/n/{ns}/policy/promote">
     <label><input type="checkbox" name="confirm" value="1" required> I confirm promote for {ns}</label>
     <label for="expected_revision">Expected revision</label>

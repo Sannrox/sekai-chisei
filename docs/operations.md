@@ -107,8 +107,9 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
 ## Gateway safeguards
 
 - Use virtual keys or authenticated passthrough only on a trusted gateway.
-- Seed durable virtual keys with `sekaictl gateway setup` /
-  `sekaictl gateway key create`. Control-plane `sekaictl credential create`
+- Seed durable virtual keys with `sekaictl admin gateway setup` /
+  `sekaictl admin gateway key create`. Control-plane
+  `sekaictl admin access credential create`
   tokens are for gRPC principals, not gateway HTTP keys.
 - Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
   `GATEWAY_KEYS` entry and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.

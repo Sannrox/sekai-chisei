@@ -47,7 +47,7 @@ The fixed software-release adapter accepts only the fields in the checked-in
 [example fixture](../tests/fixtures/governed_subject/software-release-candidate-v1.json):
 
 ```bash
-sekaictl governed-subject software-release \
+sekaictl admin governance subject software-release \
   tests/fixtures/governed_subject/software-release-candidate-v1.json \
   --namespace default \
   --request-id release-v1.2.3

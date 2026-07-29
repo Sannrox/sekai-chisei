@@ -335,7 +335,7 @@ pub fn render_pressure_page(snapshot: &PressureSnapshot, flash: Option<&str>) ->
             )
         }
     } else if !gunshi.installed {
-        r#"<p class="stub">No Gunshi allocation policy installed for this namespace. Use <code>sekaictl gunshi install-baseline</code> first.</p>"#.into()
+        r#"<p class="stub">No Gunshi allocation policy installed for this namespace. Use <code>sekaictl admin governance gunshi install-baseline</code> first.</p>"#.into()
     } else {
         r#"<p class="stub">Kill switch requires namespace editor/admin write access.</p>"#.into()
     };

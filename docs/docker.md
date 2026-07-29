@@ -20,7 +20,7 @@ exposed bind without at least one `GATEWAY_KEYS` entry.
 
 `CHISEI_GATEWAY_ADMIN_TOKEN` protects the admin refresh endpoint (`/_chisei/admin/refresh`).
 
-Use `sekaictl gateway setup` (see below) to seed control-plane policy, budgets, and
+Use `sekaictl admin gateway setup` (see below) to seed control-plane policy, budgets, and
 durable virtual keys for your environment. Compose `GATEWAY_KEYS` is the minimum
 allowlist required for the published bind; setup is still recommended for rotation
 and full governance.
@@ -107,7 +107,7 @@ deployment, or an explicit loopback `SEKAI_BIND`.
 - Seed setup data:
 
 ```bash
-docker compose run --rm gateway sekaictl gateway setup --help
+docker compose run --rm gateway sekaictl admin gateway setup --help
 ```
 
 - Generate an attribution/report from shared state:

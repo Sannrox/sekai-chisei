@@ -19,7 +19,7 @@ Envelope research: [279-gunshi-auto-allocation-envelope.md](research/279-gunshi-
 2. Collect advisory outcomes and suite evaluations with attributable evidence.
 3. **Promote** a candidate revision when the gate passes (CAS on `expected_revision`).
 4. **Opt in** the namespace to live auto-dispatch.
-5. Call **AuthorizeGunshiAutoDispatch** (or `sekaictl gunshi authorize-auto`) before dispatching; attach returned receipt attributes.
+5. Call **AuthorizeGunshiAutoDispatch** (or `sekaictl admin governance gunshi authorize-auto`) before dispatching; attach returned receipt attributes.
 6. **Kill switch** or **rollback** to return to advisory / prior revision.
 
 Promotion enforces a 60s cooldown per namespace to reduce thrash.
@@ -49,14 +49,14 @@ Denials set `auto_dispatch=false` and `dispatch_denial_reasons`.
 ## CLI
 
 ```text
-sekaictl gunshi install-baseline --namespace <ns> --snapshot <json> --gate <json>
-sekaictl gunshi promote --namespace <ns> --candidate <json> --baseline-eval <json> --candidate-eval <json> --expected-revision <id>
-sekaictl gunshi auto-opt-in --namespace <ns> --expected-revision <id>
-sekaictl gunshi kill-switch --namespace <ns> --reason <text>
-sekaictl gunshi rollback --namespace <ns> --expected-revision <id> --reason <text>
-sekaictl gunshi allocation-status --namespace <ns>
-sekaictl gunshi authorize-auto --namespace <ns> --plan <json> --operation <json> --capacity <json>
-sekaictl gunshi promote-feedback --namespace <ns> --suite-id feedback-<ns>:<class> --issuance-id <id> --allocation-id <id>
+sekaictl admin governance gunshi install-baseline --namespace <ns> --snapshot <json> --gate <json>
+sekaictl admin governance gunshi promote --namespace <ns> --candidate <json> --baseline-eval <json> --candidate-eval <json> --expected-revision <id>
+sekaictl admin governance gunshi auto-opt-in --namespace <ns> --expected-revision <id>
+sekaictl admin governance gunshi kill-switch --namespace <ns> --reason <text>
+sekaictl admin governance gunshi rollback --namespace <ns> --expected-revision <id> --reason <text>
+sekaictl admin governance gunshi allocation-status --namespace <ns>
+sekaictl admin governance gunshi authorize-auto --namespace <ns> --plan <json> --operation <json> --capacity <json>
+sekaictl admin governance gunshi promote-feedback --namespace <ns> --suite-id feedback-<ns>:<class> --issuance-id <id> --allocation-id <id>
 ```
 
 ## Feedback → eval suites (#300)
