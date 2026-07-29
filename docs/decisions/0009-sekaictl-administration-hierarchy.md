@@ -5,7 +5,7 @@
 - Owners: @Sannrox
 - Discussion: https://github.com/Sannrox/sekai-chisei/issues/442
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0010](0010-retire-sekaictl-aliases-at-0.2.0.md) (compatibility window only)
 
 ## Context
 
