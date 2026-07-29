@@ -96,7 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_credentials,
         grpc_tcp_mode,
     );
-    let result = async_runtime.block_on(run_server(server));
+    let result = {
+        let _runtime_guard = async_runtime.enter();
+        async_runtime.block_on(run_server(server))
+    };
     drop(async_runtime);
     drop(backend);
     result
