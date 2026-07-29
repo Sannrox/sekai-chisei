@@ -1,0 +1,9 @@
+{
+  "version": "sekai.replica-conformance/v1",
+  "max_checks": 5,
+  "max_observations_per_check": 4,
+  "outcomes": ["current", "delayed", "unavailable", "unknown", "rejected"],
+  "fields": ["version", "evidence_ref", "passed", "runtime_instances", "checks"],
+  "check_fields": ["id", "passed", "observations"],
+  "prohibited_output": ["database_path", "payload", "credential", "raw_error"]
+}

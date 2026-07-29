@@ -38,6 +38,8 @@ lives in the separate [research index](research/README.md).
   sanitized workload and interpret regression budgets.
 - [Replica safety](replica-safety.md) — durable-authority inventory and the
   two-replica test harness.
+- [Replica conformance adapter](replica-conformance.md) — bounded callable
+  shared-state checks for composed local test harnesses.
 - [PostgreSQL parity: Sekai](postgres-sekai-parity.md) and
   [Chisei](postgres-chisei-parity.md) — supported dual-backend surfaces and
   SQLite-only exceptions.
