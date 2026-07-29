@@ -42,14 +42,15 @@ use crate::provider_profile::{
     update_registry_lifecycle_async, validate_provider_registry_storage,
     validate_registry_lifecycle_update, validate_responses_request_fields,
 };
+#[cfg(test)]
+use sekai_proto::chisei::ResolvePolicyRequest;
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_proto::chisei::{
-    CheckBudgetRequest, CheckBudgetResponse, ClaimGatewayRequestAliasDispatchRequest,
-    CompareRunsRequest, DecideGatewayExecutionRequest, EvalRun, GatewayAuditEvent,
-    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
-    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
-    RecordSampleObservationRequest, RecordUsageRequest, ReserveGatewayRequestAliasRequest,
-    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
+    CheckBudgetRequest, ClaimGatewayRequestAliasDispatchRequest, CompareRunsRequest,
+    DecideGatewayExecutionRequest, EvalRun, GatewayAuditEvent, GetEvalRunRequest,
+    GetEvalSuiteRequest, GetLatestEvalIterationRequest, PipelineRequest as ChiseiPipelineRequest,
+    RecordGatewayAuditRequest, RecordSampleObservationRequest, RecordUsageRequest,
+    ReserveGatewayRequestAliasRequest, RunPipelineRequest, SampleObservation,
 };
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_proto::sekai::{
@@ -81,7 +82,6 @@ const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-c
 const X_CHISEI_ADMISSION: HeaderName = HeaderName::from_static("x-chisei-admission");
 const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
 const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
-const X_CHISEI_MID_TASK: HeaderName = HeaderName::from_static("x-chisei-mid-task");
 const X_CHISEI_ROUTE_OVERRIDE: HeaderName = HeaderName::from_static("x-chisei-route-override");
 const X_CHISEI_OPERATION_ID: HeaderName = HeaderName::from_static("x-chisei-operation-id");
 const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
@@ -98,8 +98,6 @@ const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
 const READINESS_PROBE_CACHE_SECS: u64 = 5;
 const PROVIDER_REGISTRY_REFRESH_TTL_MS: u64 = 250;
-const MAX_BUDGET_CACHE_ENTRIES: usize = 4096;
-const MAX_POLICY_CACHE_ENTRIES: usize = 2048;
 const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
@@ -141,10 +139,6 @@ pub struct GatewayConfig {
     pub pricing: HashMap<String, ModelPricing>,
     pub run_pipeline: bool,
     pub allow_cross_provider: bool,
-    /// When true, use `DecideGatewayExecution` for budget/policy preflight
-    /// (Issue #163 dual-path). Defaults on; set `CHISEI_GATEWAY_FAT_DECIDE=0`
-    /// to force the legacy multi-RPC preflight.
-    pub fat_decide: bool,
 }
 
 impl GatewayConfig {
@@ -196,7 +190,6 @@ impl GatewayConfig {
                 .as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
-        let fat_decide = fat_decide_enabled_from_env();
         let xai_configured =
             std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
         let meta_configured = std::env::var("META_MODEL_API_KEY")
@@ -275,7 +268,6 @@ impl GatewayConfig {
             pricing,
             run_pipeline,
             allow_cross_provider,
-            fat_decide,
         })
     }
 }
@@ -594,8 +586,6 @@ impl CircuitBreakerState {
 
 #[derive(Default)]
 struct GovernanceCache {
-    budgets: HashMap<String, CachedBudgetDecision>,
-    policies: HashMap<String, CachedPolicyDecision>,
     egress: HashMap<String, CachedEgressDecision>,
     pending_budget_usage: HashMap<String, RecordUsageRequest>,
     budget_reconciliation_saturated: bool,
@@ -647,26 +637,6 @@ impl From<PendingBudgetUsage> for RecordUsageRequest {
 }
 
 #[derive(Clone)]
-struct CachedBudgetDecision {
-    response: CheckBudgetResponse,
-    remaining: Option<i32>,
-    cached_at: Instant,
-}
-
-#[derive(Clone)]
-struct CachedPolicyDecision {
-    resolved_model: Option<String>,
-    resolved_provider: ProviderKind,
-    registry_state_version: u64,
-    route_bias: Option<String>,
-    policy_scope: Option<String>,
-    policy_version: Option<String>,
-    fallback_models: Vec<String>,
-    data_class: Option<String>,
-    cached_at: Instant,
-}
-
-#[derive(Clone)]
 struct CachedEgressDecision {
     body: Vec<u8>,
     cached_at: Instant,
@@ -674,18 +644,6 @@ struct CachedEgressDecision {
 
 trait TimedGovernanceDecision {
     fn cached_at(&self) -> Instant;
-}
-
-impl TimedGovernanceDecision for CachedBudgetDecision {
-    fn cached_at(&self) -> Instant {
-        self.cached_at
-    }
-}
-
-impl TimedGovernanceDecision for CachedPolicyDecision {
-    fn cached_at(&self) -> Instant {
-        self.cached_at
-    }
 }
 
 impl TimedGovernanceDecision for CachedEgressDecision {
@@ -1129,8 +1087,7 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
     let cache = state.runtime.governance_cache.read().await;
     let pending_budget_reconciliations = cache.pending_budget_usage.len();
     let budget_reconciliation_saturated = cache.budget_reconciliation_saturated;
-    let cached_governance_decisions =
-        cache.budgets.len() + cache.policies.len() + cache.egress.len();
+    let cached_governance_decisions = cache.egress.len();
     drop(cache);
     let last_degraded_at_ms = state.runtime.last_degraded_at_ms.load(Ordering::Relaxed);
     let recently_degraded = last_degraded_at_ms > 0
@@ -1378,11 +1335,7 @@ async fn refresh_gateway_admin(
     key_cache.clear();
     drop(key_cache);
     let mut governance_cache = state.runtime.governance_cache.write().await;
-    let cleared_governance_entries = governance_cache.budgets.len()
-        + governance_cache.policies.len()
-        + governance_cache.egress.len();
-    governance_cache.budgets.clear();
-    governance_cache.policies.clear();
+    let cleared_governance_entries = governance_cache.egress.len();
     governance_cache.egress.clear();
     let pending_budget_reconciliations = governance_cache.pending_budget_usage.len();
     drop(governance_cache);
@@ -2422,8 +2375,6 @@ async fn proxy_gateway_inner_scoped(
     // even under `no_preflight`, where the routing-only call below is skipped.
     let failure_posture =
         GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
-    let mid_task = header_str(&headers, &X_CHISEI_MID_TASK)
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mut preflight_context = UsageContext {
         request_id: request_id.clone(),
         // The client alias is not owned until durable reservation succeeds.
@@ -2572,27 +2523,80 @@ async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
-    // Issue #163 dual-path: when fat-decide admits, replace CheckBudget +
-    // ResolvePolicy with the PDP response. Soft-unavailable falls through to
-    // legacy multi-RPC preflight. Deny never contacts upstream.
-    let fat_decide_admit = if state.config.fat_decide
-        && !state.config.no_preflight
-        && state.config.chisei_grpc_target.is_some()
-    {
-        match fat_decide_preflight(
+    // A configured gateway has one canonical governance boundary:
+    // DecideGatewayExecution. Any denial or unavailable decision returns
+    // before provider contact.
+    let model_metadata_path = matches!(uri.path(), "/v1/models" | "/models")
+        || uri.path().starts_with("/v1/models/")
+        || uri.path().starts_with("/models/");
+    let model_metadata_request =
+        matches!(method, Method::GET | Method::HEAD) && model_metadata_path && body.is_empty();
+    let capability_requirements_json = capability_surface
+        .map(|surface| match surface {
+            CapabilityRequestSurface::Responses => {
+                CapabilityRequirements::from_responses_body(&body)
+            }
+            CapabilityRequestSurface::OpenAiChat => {
+                CapabilityRequirements::from_openai_chat_body(&body)
+            }
+            CapabilityRequestSurface::AnthropicMessages => {
+                CapabilityRequirements::from_anthropic_messages_body(&body)
+            }
+        })
+        .transpose()
+        .map_err(|reason| {
+            GatewayRejection::json(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("cannot derive request capabilities: {reason}"),
+            )
+        });
+    let capability_requirements_json = match capability_requirements_json {
+        Ok(requirements) => requirements
+            .as_ref()
+            .map(|requirements| {
+                serde_json::to_vec(requirements).expect("capability requirements are serializable")
+            })
+            .unwrap_or_default(),
+        Err(rejection) => {
+            record_refusal_and_append(
+                &state.config,
+                &state.runtime,
+                &identity,
+                &preflight_context,
+                &rejection,
+            )
+            .await;
+            return rejection.response();
+        }
+    };
+    let preferred_runtime = requested_registry_model
+        .as_ref()
+        .map(|model| model.provider.as_str())
+        .unwrap_or_else(|| capability_provider_id(requested_provider));
+    let preferred_model = requested_registry_model
+        .as_ref()
+        .map(|model| model.canonical_model.as_str())
+        .or(requested_model.as_deref())
+        .unwrap_or("");
+    let gateway_admit = if !state.config.no_preflight && state.config.chisei_grpc_target.is_some() {
+        match gateway_decision_preflight(
             &state.config,
             &state.runtime,
             &identity,
-            requested_model.as_deref().unwrap_or(""),
+            preferred_runtime,
+            preferred_model,
             request_bytes,
             work_unit_id.as_deref().unwrap_or(""),
             &task_class,
             &request_id,
-            &failure_posture,
+            route_override.as_deref(),
+            capability_requirements_json,
+            model_metadata_request,
         )
         .await
         {
-            Ok(admit) => admit,
+            Ok(admit) => Some(admit),
             Err(rejection) => {
                 record_refusal_and_append(
                     &state.config,
@@ -2608,297 +2612,79 @@ async fn proxy_gateway_inner_scoped(
     } else {
         None
     };
-    let (mut resolved, mut egress, budget) = if state.config.no_preflight {
-        let resolved = PolicyPreflight {
-            body: body.to_vec(),
-            resolved_model: requested_registry_model
-                .as_ref()
-                .map(|resolved| resolved.canonical_model.clone()),
-            resolved_provider: requested_provider,
-            route_bias: None,
-            policy_scope: None,
-            policy_version: None,
-            fallback_models: Vec::new(),
-            data_class: None,
-        };
-        let egress = ContextEgressPreflight {
-            body: resolved.body.clone(),
-        };
-        (resolved, egress, None)
-    } else if let Some(admit) = fat_decide_admit {
-        match apply_fat_decide_admit(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &mut preflight_context,
-            &registry_snapshot,
-            admit,
-            body.to_vec(),
-            requested_provider,
-            client_provider,
-            capability_surface,
-            context_request.as_ref(),
-            requested_model.as_deref(),
-            &request_id,
-            work_unit_id.as_deref(),
-            &failure_posture,
-        )
-        .await
-        {
-            Ok(triple) => triple,
-            Err(rejection) => {
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        }
-    } else {
-        let budget = match check_budget_preflight(
-            &state.config,
-            &state.runtime,
-            &identity,
-            request_bytes,
-            work_unit_id.as_deref().unwrap_or(""),
-            &task_class,
-            mid_task,
-            &failure_posture,
-        )
-        .await
-        {
-            Ok(budget) => budget,
-            Err(rejection) => {
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        };
-        preflight_context.budget_subject = budget.budget_subject.clone();
-        preflight_context.budget_status = if budget.provisional_local_free {
-            "local_free"
+    let (mut resolved, mut egress, budget) =
+        if state.config.no_preflight || state.config.chisei_grpc_target.is_none() {
+            let resolved = PolicyPreflight {
+                body: body.to_vec(),
+                resolved_model: requested_registry_model
+                    .as_ref()
+                    .map(|resolved| resolved.canonical_model.clone()),
+                resolved_provider: requested_provider,
+                route_bias: None,
+                policy_scope: None,
+                policy_version: None,
+                fallback_models: Vec::new(),
+                data_class: None,
+            };
+            let egress = ContextEgressPreflight {
+                body: resolved.body.clone(),
+            };
+            (resolved, egress, None)
         } else {
-            "allowed"
-        }
-        .into();
-        let resolved = match resolve_policy_preflight(
-            &state.config,
-            &state.runtime,
-            &identity,
-            client_provider,
-            &body,
-            requested_model.as_deref(),
-            route_override.as_deref(),
-            &task_class,
-            &budget,
-            &request_id,
-            work_unit_id.as_deref(),
-            &failure_posture,
-            capability_surface,
-        )
-        .await
-        {
-            Ok(resolved)
-                if !budget.provisional_local_free
-                    || (resolved.route_bias.as_deref() == Some("local_free")
-                        && resolved.resolved_provider
-                            == ProviderKind::OpenAi(OpenAiRuntime::Ollama)) =>
-            {
-                resolved
-            }
-            Ok(_) => {
-                let rejection = GatewayRejection::json(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "budget_exceeded",
-                    "budget exceeded and local-free routing could not be verified",
-                );
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-            Err(rejection) => {
-                if let Some(route) = rejection.rejected_route.as_ref() {
-                    preflight_context.provider = route.provider;
-                    preflight_context.resolved_model = Some(route.resolved_model.clone());
-                    let profile = registry_snapshot.profile(capability_provider_id(route.provider));
-                    preflight_context.profile_version =
-                        profile.map(|profile| profile.profile_version.clone());
-                    preflight_context.governance_metadata_status =
-                        profile.map(|profile| profile.governance.metadata_status.clone());
-                    preflight_context.pricing_snapshot_version = effective_pricing_snapshot_version(
-                        &state.config,
-                        profile,
-                        Some(&route.resolved_model),
-                        requested_model.as_deref(),
-                    );
-                }
-                let rejection = if budget.provisional_local_free {
-                    GatewayRejection::json(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "budget_exceeded",
-                        format!(
-                            "budget exceeded and local-free routing failed: {}",
-                            rejection.reason
-                        ),
-                    )
-                } else {
-                    rejection
-                };
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        };
-        let originally_resolved_model = resolved.resolved_model.clone();
-        let resolved = match select_healthy_policy_fallback(
-            &state.runtime,
-            &registry_snapshot,
-            resolved,
-            capability_surface,
-            client_provider,
-            state.config.allow_cross_provider,
-            budget.provisional_local_free,
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(rejection) => {
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        };
-        if resolved.resolved_model != originally_resolved_model {
-            crate::obs::signals::record_fallback(
-                crate::obs::labels::Subsystem::Gateway,
-                crate::obs::labels::FallbackTrigger::ProviderUnhealthy,
-            );
-            record_gateway_decision(
-                &state.config,
-                &identity,
-                "gateway.health_fallback",
-                "policy-authorized equivalent fallback selected for unhealthy provider",
-                "routed",
-                HashMap::from([
-                    (
-                        "requested_route".into(),
-                        originally_resolved_model.unwrap_or_default(),
-                    ),
-                    (
-                        "fallback_route".into(),
-                        resolved.resolved_model.clone().unwrap_or_default(),
-                    ),
-                ]),
-            )
-            .await;
-        }
-        preflight_context.provider = resolved.resolved_provider;
-        preflight_context.resolved_model = resolved.resolved_model.clone();
-        let effective_profile = resolved
-            .resolved_model
-            .as_deref()
-            .and_then(|model| registry_snapshot.resolve_model(model).ok())
-            .and_then(|model| registry_snapshot.profile(&model.provider));
-        preflight_context.profile_version =
-            effective_profile.map(|profile| profile.profile_version.clone());
-        preflight_context.governance_metadata_status =
-            effective_profile.map(|profile| profile.governance.metadata_status.clone());
-        preflight_context.pricing_snapshot_version = effective_pricing_snapshot_version(
-            &state.config,
-            effective_profile,
-            resolved.resolved_model.as_deref(),
-            requested_model.as_deref(),
-        );
-        preflight_context.route_bias = resolved.route_bias.clone();
-        preflight_context.policy_scope = resolved.policy_scope.clone();
-        preflight_context.policy_version = resolved.policy_version.clone();
-        preflight_context.egress_applied = true;
-        let path = uri.path();
-        let model_metadata_path = matches!(path, "/v1/models" | "/models")
-            || path.starts_with("/v1/models/")
-            || path.starts_with("/models/");
-        let model_metadata_request = matches!(method, Method::GET | Method::HEAD)
-            && model_metadata_path
-            && uri.query().is_none()
-            && body.is_empty();
-        if failure_posture.data_class == "sensitive"
-            && !model_metadata_request
-            && resolved.data_class.as_deref() != Some("sensitive")
-        {
-            let rejection = GatewayRejection::json(
-                StatusCode::FORBIDDEN,
-                "data_class_conflict",
-                "request data classification is stricter than the resolved namespace policy",
-            );
-            record_refusal_and_append(
+            let admit = gateway_admit.expect("configured governance returned an admit");
+            match apply_gateway_decision(
                 &state.config,
                 &state.runtime,
                 &identity,
-                &preflight_context,
-                &rejection,
+                &mut preflight_context,
+                &registry_snapshot,
+                admit,
+                body.to_vec(),
+                requested_provider,
+                client_provider,
+                capability_surface,
+                context_request.as_ref(),
+                requested_model.as_deref(),
+                &request_id,
+                work_unit_id.as_deref(),
+                &failure_posture,
             )
-            .await;
-            return rejection.response();
-        }
-        let egress = match apply_context_egress(
+            .await
+            {
+                Ok(triple) => triple,
+                Err(rejection) => {
+                    record_refusal_and_append(
+                        &state.config,
+                        &state.runtime,
+                        &identity,
+                        &preflight_context,
+                        &rejection,
+                    )
+                    .await;
+                    return rejection.response();
+                }
+            }
+        };
+    let classification_exempt_metadata_request = model_metadata_request && uri.query().is_none();
+    if failure_posture.data_class == "sensitive"
+        && !classification_exempt_metadata_request
+        && resolved.data_class.as_deref() != Some("sensitive")
+    {
+        let rejection = GatewayRejection::json(
+            StatusCode::FORBIDDEN,
+            "data_class_conflict",
+            "request data classification is stricter than the resolved namespace policy",
+        );
+        record_refusal_and_append(
             &state.config,
             &state.runtime,
             &identity,
-            client_provider,
-            resolved.resolved_provider,
-            &resolved.body,
-            context_request.as_ref(),
-            requested_model.as_deref(),
-            resolved.resolved_model.as_deref(),
-            &request_id,
-            work_unit_id.as_deref(),
-            &failure_posture,
+            &preflight_context,
+            &rejection,
         )
-        .await
-        {
-            Ok(egress) => egress,
-            Err(rejection) => {
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        };
-        (resolved, egress, Some(budget))
-    };
+        .await;
+        return rejection.response();
+    }
     if responses_create {
         egress.body = match normalize_responses_request(&egress.body) {
             Ok(body) => body,
@@ -3181,7 +2967,7 @@ async fn proxy_gateway_inner_scoped(
                     ProviderHealth::QuotaExhausted => "upstream_quota_exhausted",
                     _ => "upstream_unavailable",
                 };
-                let mut rejection = GatewayRejection::json(
+                let rejection = GatewayRejection::json(
                     StatusCode::SERVICE_UNAVAILABLE,
                     error_type,
                     format!(
@@ -3191,21 +2977,15 @@ async fn proxy_gateway_inner_scoped(
                     ),
                 )
                 .with_retry_safety("safe");
-                if let Some(model) = resolved.resolved_model.clone() {
-                    rejection = rejection.with_rejected_route(prepared.provider, model);
-                }
                 Some(rejection)
             }
             Err(UpstreamSendError::Request { error: err, .. }) if err.is_connect() => {
-                let mut rejection = GatewayRejection::json(
+                let rejection = GatewayRejection::json(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
                     safe_upstream_error_reason(prepared.provider, "request", err),
                 )
                 .with_retry_safety("safe");
-                if let Some(model) = resolved.resolved_model.clone() {
-                    rejection = rejection.with_rejected_route(prepared.provider, model);
-                }
                 Some(rejection)
             }
             _ => None,
@@ -3484,7 +3264,6 @@ async fn proxy_gateway_inner_scoped(
                         prepared.provider.runtime_name(),
                         health
                     ),
-                    rejected_route: None,
                     retry_safety: Some("safe"),
                 };
                 record_refusal_with_usage_and_append(
@@ -3518,7 +3297,6 @@ async fn proxy_gateway_inner_scoped(
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_error".into(),
                     reason: safe_upstream_error_reason(prepared.provider, "request", &err),
-                    rejected_route: None,
                     retry_safety: Some(retry_safety),
                 };
                 record_refusal_with_usage_and_append(
@@ -3704,42 +3482,13 @@ struct GatewayRejection {
     status: StatusCode,
     error_type: String,
     reason: String,
-    rejected_route: Option<RejectedRoute>,
     retry_safety: Option<&'static str>,
-}
-
-#[derive(Debug, Clone)]
-struct RejectedRoute {
-    provider: ProviderKind,
-    resolved_model: String,
 }
 
 #[derive(Clone, Copy)]
 struct ReceiptRejection<'a> {
     rejection: &'a GatewayRejection,
     model_attempted: bool,
-}
-
-fn audit_budget_subject(req: &CheckBudgetRequest) -> Option<String> {
-    if !req.subject.trim().is_empty() {
-        return Some(req.subject.trim().to_string());
-    }
-    if !req.project.trim().is_empty() {
-        return Some(format!("project:{}", req.project.trim()));
-    }
-    if !req.agent.trim().is_empty() {
-        return Some(format!("agent:{}", req.agent.trim()));
-    }
-    if !req.key_id.trim().is_empty() {
-        return Some(format!("gateway_key:{}", req.key_id.trim()));
-    }
-    if !req.work_unit.trim().is_empty() {
-        return Some(format!("work_unit:{}", req.work_unit.trim()));
-    }
-    if !req.user_id.trim().is_empty() {
-        return Some(req.user_id.trim().to_string());
-    }
-    None
 }
 
 impl GatewayRejection {
@@ -3749,21 +3498,12 @@ impl GatewayRejection {
             status,
             error_type: error_type.to_string(),
             reason,
-            rejected_route: None,
             retry_safety: None,
         }
     }
 
     fn with_retry_safety(mut self, retry_safety: &'static str) -> Self {
         self.retry_safety = Some(retry_safety);
-        self
-    }
-
-    fn with_rejected_route(mut self, provider: ProviderKind, resolved_model: String) -> Self {
-        self.rejected_route = Some(RejectedRoute {
-            provider,
-            resolved_model,
-        });
         self
     }
 
@@ -3815,21 +3555,9 @@ fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
     GatewayRejection::json(http_status, error_type, status.to_string())
 }
 
-/// Default-on fat-decide switch. Explicit opt-out: `0`, `false`, `no`, `off`.
-fn fat_decide_enabled_from_env() -> bool {
-    match std::env::var("CHISEI_GATEWAY_FAT_DECIDE") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-        }
-        Err(_) => true,
-    }
-}
-
-/// Admit payload from `DecideGatewayExecution` used to replace legacy
-/// CheckBudget + ResolvePolicy preflight (Issue #163 dual-path).
+/// Admit payload returned by the gateway's canonical governance decision.
 #[derive(Debug, Clone)]
-struct FatDecideAdmit {
+struct GatewayDecisionAdmit {
     resolved_model: String,
     resolved_runtime: String,
     policy_version: String,
@@ -3839,17 +3567,23 @@ struct FatDecideAdmit {
     budget_grant_id: String,
     route_bias: Option<String>,
     provisional_local_free: bool,
+    policy_scope: Option<String>,
+    data_class: Option<String>,
+    fallback_models: Vec<String>,
+    eval_regressed: bool,
+    eval_regression_reason: String,
+    metadata_operation: bool,
 }
 
-/// Build policy/budget preflight from a fat-decide admit (Issue #163).
+/// Build policy, budget, and egress preflight from a gateway decision.
 #[allow(clippy::too_many_arguments)]
-async fn apply_fat_decide_admit(
+async fn apply_gateway_decision(
     config: &GatewayConfig,
     runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
     preflight_context: &mut UsageContext,
     registry_snapshot: &ProviderRegistry,
-    admit: FatDecideAdmit,
+    admit: GatewayDecisionAdmit,
     body: Vec<u8>,
     requested_provider: ProviderKind,
     client_provider: ProviderKind,
@@ -3867,9 +3601,11 @@ async fn apply_fat_decide_admit(
     ),
     GatewayRejection,
 > {
+    let decision_model = admit.resolved_model.clone();
+    let eval_regressed = admit.eval_regressed;
+    let eval_regression_reason = admit.eval_regression_reason.clone();
     let budget = BudgetPreflight {
         provisional_local_free: admit.provisional_local_free,
-        route_bias: admit.route_bias.clone(),
         budget_subject: Some(admit.budget_scope.clone()),
     };
     preflight_context.budget_subject = budget.budget_subject.clone();
@@ -3879,18 +3615,62 @@ async fn apply_fat_decide_admit(
         "allowed"
     }
     .into();
-    let resolved_provider = ProviderKind::from_runtime(&admit.resolved_runtime)
-        .or_else(|| ProviderKind::from_model(&admit.resolved_model).ok())
-        .unwrap_or(requested_provider);
+    let resolved_provider = if admit.metadata_operation {
+        requested_provider
+    } else {
+        ProviderKind::from_runtime(&admit.resolved_runtime).ok_or_else(|| {
+            GatewayRejection::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "governance_incompatible",
+                format!(
+                    "gateway decision returned an unsupported runtime: {}",
+                    admit.resolved_runtime
+                ),
+            )
+        })?
+    };
+    if !client_provider.same_family(resolved_provider) && !config.allow_cross_provider {
+        return Err(GatewayRejection::json(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            format!(
+                "cross-provider routing from {} to {} is disabled",
+                client_provider.runtime_name(),
+                resolved_provider.runtime_name()
+            ),
+        ));
+    }
+    let canonical_model = if admit.metadata_operation {
+        None
+    } else {
+        Some(
+            registry_snapshot
+                .resolve_model_for_provider(
+                    &admit.resolved_model,
+                    capability_provider_id(resolved_provider),
+                )
+                .map_err(|error| {
+                    GatewayRejection::json(
+                        StatusCode::BAD_REQUEST,
+                        "capability_unsupported",
+                        format!("gateway decision returned an invalid model: {error}"),
+                    )
+                })?
+                .canonical_model,
+        )
+    };
     let resolved = PolicyPreflight {
         body,
-        resolved_model: Some(admit.resolved_model.clone()).filter(|m| !m.is_empty()),
+        resolved_model: canonical_model,
         resolved_provider,
         route_bias: admit.route_bias.clone(),
-        policy_scope: Some(admit.budget_scope.clone()),
+        policy_scope: admit
+            .policy_scope
+            .clone()
+            .or_else(|| Some(admit.budget_scope.clone())),
         policy_version: Some(admit.policy_version.clone()).filter(|v| !v.is_empty()),
-        fallback_models: Vec::new(),
-        data_class: None,
+        fallback_models: admit.fallback_models,
+        data_class: admit.data_class,
     };
     if admit.provisional_local_free
         && resolved.resolved_provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama)
@@ -3918,6 +3698,48 @@ async fn apply_fat_decide_admit(
             crate::obs::labels::FallbackTrigger::ProviderUnhealthy,
         );
     }
+    if !admit.metadata_operation
+        && requested_model.is_some_and(|requested| requested != decision_model)
+    {
+        record_gateway_decision(
+            config,
+            identity,
+            "gateway.model_rewrite",
+            "model rewritten by Chisei policy",
+            "rewritten",
+            HashMap::from([
+                (
+                    "requested_model".to_string(),
+                    requested_model.unwrap_or_default().to_string(),
+                ),
+                ("resolved_model".to_string(), decision_model.clone()),
+                ("project".to_string(), identity.project.clone()),
+            ]),
+        )
+        .await;
+    }
+    if eval_regressed {
+        record_gateway_decision(
+            config,
+            identity,
+            "gateway.eval_regression",
+            if eval_regression_reason.is_empty() {
+                "eval regression signal influenced gateway routing"
+            } else {
+                &eval_regression_reason
+            },
+            "routed",
+            HashMap::from([
+                (
+                    "requested_model".to_string(),
+                    requested_model.unwrap_or_default().to_string(),
+                ),
+                ("resolved_model".to_string(), decision_model),
+                ("project".to_string(), identity.project.clone()),
+            ]),
+        )
+        .await;
+    }
     preflight_context.provider = resolved.resolved_provider;
     preflight_context.resolved_model = resolved.resolved_model.clone();
     preflight_context.route_bias = resolved.route_bias.clone();
@@ -3942,25 +3764,31 @@ async fn apply_fat_decide_admit(
     Ok((resolved, egress, Some(budget)))
 }
 
-/// Fat-decide dual-path (Issue #163).
+/// Request the canonical gateway governance decision.
 ///
-/// - `Ok(Some(admit))` — PDP admitted; skip legacy budget/policy RPCs.
-/// - `Ok(None)` — soft-unavailable; fall through to legacy multi-RPC preflight.
-/// - `Err` — deny or fail-closed; do not contact upstream.
+/// Any denial, invalid response, or control-plane failure is returned as a
+/// rejection so provider contact remains fail-closed.
 #[allow(clippy::too_many_arguments)]
-async fn fat_decide_preflight(
+async fn gateway_decision_preflight(
     config: &GatewayConfig,
     runtime: &GatewayRuntime,
     identity: &GatewayIdentity,
+    preferred_runtime: &str,
     requested_model: &str,
     request_bytes: usize,
     work_unit: &str,
     task_class: &str,
     request_id: &str,
-    failure_posture: &GovernanceFailurePosture,
-) -> Result<Option<FatDecideAdmit>, GatewayRejection> {
+    route_override: Option<&str>,
+    capability_requirements_json: Vec<u8>,
+    model_metadata_request: bool,
+) -> Result<GatewayDecisionAdmit, GatewayRejection> {
     let Some(target) = &config.chisei_grpc_target else {
-        return Ok(None);
+        return Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "control-plane governance is not configured",
+        ));
     };
     let namespace = if identity.project.trim().is_empty() {
         config.default_project.clone()
@@ -3968,10 +3796,15 @@ async fn fat_decide_preflight(
         identity.project.clone()
     };
     let request = DecideGatewayExecutionRequest {
-        contract_version: "gateway.decide/v1".into(),
+        contract_version: "gateway.decide/v2".into(),
         namespace: namespace.clone(),
         requested_model: requested_model.to_string(),
-        operation_class: "gateway.http".into(),
+        operation_class: if model_metadata_request {
+            "gateway.http.metadata"
+        } else {
+            "gateway.http"
+        }
+        .into(),
         estimated_cost_usd_micros: 0,
         correlation_operation_id: if request_id.trim().is_empty() {
             format!("gateway-{}", Utc::now().timestamp_millis())
@@ -3981,26 +3814,58 @@ async fn fat_decide_preflight(
         correlation_attempt: 1,
         estimated_tokens: estimate_tokens_from_bytes(request_bytes),
         task_class: task_class.to_string(),
-        preferred_runtime: String::new(),
+        preferred_runtime: preferred_runtime.to_string(),
         project: namespace,
         agent: identity.agent.clone(),
         key_id: identity.key_id.clone(),
         work_unit: work_unit.to_string(),
         local_free_available: !config.ollama_base_url.trim().is_empty(),
+        user_id: identity.user_id.clone(),
+        route_override: route_override.unwrap_or_default().to_string(),
+        capability_requirements_json,
+        expected_calls: 1,
     };
     match connect_governance(runtime, target).await {
         Ok(channel) => {
             let mut client = ChiseiServiceClient::new(channel);
+            if runtime
+                .governance_cache
+                .read()
+                .await
+                .budget_reconciliation_saturated
+            {
+                return Err(GatewayRejection::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "governance_unavailable",
+                    "budget usage reconciliation is saturated",
+                ));
+            }
+            reconcile_pending_budget_usage(runtime, &mut client)
+                .await
+                .map_err(|error| {
+                    GatewayRejection::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "governance_unavailable",
+                        format!("pending budget usage reconciliation failed: {error}"),
+                    )
+                })?;
             match client
-                .decide_gateway_execution(GrpcRequest::new(request))
+                .decide_gateway_execution(gateway_request(request))
                 .await
             {
                 Ok(response) => {
                     record_control_plane_success(runtime).await;
                     let decision = response.into_inner();
+                    if decision.contract_version != "gateway.decide/v2" {
+                        return Err(GatewayRejection::json(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "governance_unavailable",
+                            "control plane returned an incompatible gateway decision contract",
+                        ));
+                    }
                     if decision.admitted {
                         let route_bias = decision.route_bias.trim();
-                        Ok(Some(FatDecideAdmit {
+                        Ok(GatewayDecisionAdmit {
                             resolved_model: decision.resolved_model,
                             resolved_runtime: decision.resolved_runtime,
                             policy_version: decision.policy_version,
@@ -4009,16 +3874,51 @@ async fn fat_decide_preflight(
                             route_bias: (!route_bias.is_empty()).then(|| route_bias.to_string()),
                             provisional_local_free: decision.degradation_level == "local_free"
                                 || route_bias == "local_free",
-                        }))
+                            policy_scope: Some(decision.policy_scope)
+                                .filter(|scope| !scope.is_empty()),
+                            data_class: Some(decision.data_class).filter(|class| !class.is_empty()),
+                            fallback_models: decision.fallback_models,
+                            eval_regressed: decision.eval_regressed,
+                            eval_regression_reason: decision.eval_regression_reason,
+                            metadata_operation: model_metadata_request,
+                        })
                     } else {
                         let error_type = if decision.deny_reason.is_empty() {
                             "governance_denied"
                         } else {
                             decision.deny_reason.as_str()
                         };
+                        let status = match error_type {
+                            "budget_denied" => StatusCode::TOO_MANY_REQUESTS,
+                            "invalid_request" | "capability_unsupported" => StatusCode::BAD_REQUEST,
+                            _ => StatusCode::FORBIDDEN,
+                        };
+                        let public_error_type = if error_type == "budget_denied" {
+                            "budget_exceeded"
+                        } else {
+                            error_type
+                        };
+                        if error_type == "budget_denied" {
+                            record_gateway_decision(
+                                config,
+                                identity,
+                                "gateway.budget_denied",
+                                if decision.deny_message.is_empty() {
+                                    "gateway budget denied"
+                                } else {
+                                    &decision.deny_message
+                                },
+                                "denied",
+                                HashMap::from([(
+                                    "budget_subject".to_string(),
+                                    decision.budget_scope.clone(),
+                                )]),
+                            )
+                            .await;
+                        }
                         Err(GatewayRejection::json(
-                            StatusCode::FORBIDDEN,
-                            error_type,
+                            status,
+                            public_error_type,
                             if decision.deny_message.is_empty() {
                                 "gateway fat-decide denied".into()
                             } else {
@@ -4029,323 +3929,21 @@ async fn fat_decide_preflight(
                 }
                 Err(err) => {
                     record_control_plane_failure(runtime, &err).await;
-                    if failure_posture.fail_closed || !is_transient_governance_status(&err) {
-                        Err(governance_status_rejection(&err))
-                    } else {
-                        warn!(error = %err, "fat-decide unavailable; falling through to legacy preflight");
-                        Ok(None)
-                    }
+                    Err(governance_status_rejection(&err))
                 }
             }
         }
-        Err(err) => {
-            if failure_posture.fail_closed {
-                Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    format!("fat-decide control plane unavailable: {err}"),
-                ))
-            } else {
-                warn!(error = %err, "fat-decide connect failed; falling through to legacy preflight");
-                Ok(None)
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn check_budget_preflight(
-    config: &GatewayConfig,
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    request_bytes: usize,
-    work_unit: &str,
-    task_class: &str,
-    mid_task: bool,
-    failure_posture: &GovernanceFailurePosture,
-) -> Result<BudgetPreflight, GatewayRejection> {
-    let Some(target) = &config.chisei_grpc_target else {
-        return Ok(BudgetPreflight::default());
-    };
-    if runtime
-        .governance_cache
-        .read()
-        .await
-        .budget_reconciliation_saturated
-    {
-        return Err(GatewayRejection::json(
+        Err(err) => Err(GatewayRejection::json(
             StatusCode::SERVICE_UNAVAILABLE,
-            "budget_reconciliation_required",
-            "budget usage overflow requires operator reconciliation before admission resumes",
-        ));
+            "governance_unavailable",
+            format!("gateway decision control plane unavailable: {err}"),
+        )),
     }
-    let estimated_tokens = estimate_tokens_from_bytes(request_bytes);
-
-    let base_budget_request = CheckBudgetRequest {
-        user_id: identity.user_id.clone(),
-        estimated_tokens,
-        subject: String::new(),
-        project: identity.project.clone(),
-        agent: identity.agent.clone(),
-        key_id: identity.key_id.clone(),
-        work_unit: work_unit.to_string(),
-        metric: String::new(),
-        task_class: task_class.to_string(),
-        mid_task,
-        local_free_available: !config.ollama_base_url.trim().is_empty(),
-    };
-
-    let check_budget = |req: CheckBudgetRequest| async move {
-        let cache_key = budget_cache_key(&req);
-        match connect_governance(runtime, target).await {
-            Ok(channel) => {
-                let mut client = ChiseiServiceClient::new(channel);
-                if let Err(err) = reconcile_cached_budget_usage(runtime, &mut client).await {
-                    if !is_transient_governance_status(&err) {
-                        record_control_plane_success(runtime).await;
-                        runtime
-                            .governance_cache
-                            .write()
-                            .await
-                            .budget_reconciliation_saturated = true;
-                        return Err(GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "budget_reconciliation_required",
-                            format!("budget usage reconciliation failed permanently: {err}"),
-                        ));
-                    }
-                    record_control_plane_failure(runtime, &err).await;
-                    if let Some(reservation) =
-                        reserve_cached_budget(runtime, &cache_key, &req).await
-                    {
-                        if !record_resilience_decision(
-                            config,
-                            runtime,
-                            identity,
-                            "gateway.budget_last_known",
-                            &format!("budget reconciliation unavailable: {err}"),
-                            "reserved",
-                            HashMap::from([("metric".to_string(), req.metric.clone())]),
-                        )
-                        .await
-                        {
-                            rollback_cached_budget_reservation(runtime, &cache_key, &reservation)
-                                .await;
-                            return Err(GatewayRejection::json(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "governance_audit_unavailable",
-                                "cannot use last-known budget without a durable audit record",
-                            ));
-                        }
-                        return Ok(reservation.response);
-                    }
-                    governance_error(
-                        config,
-                        runtime,
-                        identity,
-                        failure_posture,
-                        &format!("budget reconciliation failed: {err}"),
-                    )
-                    .await?;
-                }
-                let estimated_tokens = req.estimated_tokens;
-                let budget_subject = audit_budget_subject(&req);
-                match client.check_budget(GrpcRequest::new(req.clone())).await {
-                    Ok(resp) => {
-                        record_control_plane_success(runtime).await;
-                        let resp = resp.into_inner();
-                        cache_budget_decision(runtime, cache_key, &resp, req.estimated_tokens)
-                            .await;
-                        let provisional_local_free = !resp.allowed
-                            && resp.route_bias == "local_free"
-                            && resp.degradation_level == "local_free";
-                        if resp.allowed || provisional_local_free {
-                            if resp.warning {
-                                // Control plane answered, but degraded the
-                                // route rather than granting the preferred one.
-                                crate::obs::signals::record_fallback(
-                                    crate::obs::labels::Subsystem::Gateway,
-                                    crate::obs::labels::FallbackTrigger::BudgetDegraded,
-                                );
-                                record_gateway_decision(
-                                    config,
-                                    identity,
-                                    "gateway.budget_degraded",
-                                    &format!("budget degradation level {}", resp.degradation_level),
-                                    if provisional_local_free {
-                                        "pending_resolution"
-                                    } else {
-                                        "routed"
-                                    },
-                                    HashMap::from([
-                                        ("route_bias".to_string(), resp.route_bias.clone()),
-                                        (
-                                            "degradation_level".to_string(),
-                                            resp.degradation_level.clone(),
-                                        ),
-                                        ("mid_task".to_string(), mid_task.to_string()),
-                                    ]),
-                                )
-                                .await;
-                            }
-                            Ok(resp)
-                        } else {
-                            let usage = resp.usage;
-                            let message = usage
-                                .map(|usage| {
-                                    format!(
-                                        "budget exceeded for {}: used {} + estimated {} > {}",
-                                        usage.user_id,
-                                        usage.tokens_used,
-                                        estimated_tokens,
-                                        usage.max_tokens
-                                    )
-                                })
-                                .unwrap_or_else(|| "budget exceeded".to_string());
-                            record_gateway_decision(
-                                config,
-                                identity,
-                                "gateway.budget_denied",
-                                &message,
-                                "denied",
-                                {
-                                    let mut evidence = HashMap::from([(
-                                        "estimated_tokens".to_string(),
-                                        estimated_tokens.to_string(),
-                                    )]);
-                                    if let Some(budget_subject) = budget_subject {
-                                        evidence
-                                            .insert("budget_subject".to_string(), budget_subject);
-                                    }
-                                    evidence
-                                },
-                            )
-                            .await;
-                            Err(GatewayRejection::json(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "budget_exceeded",
-                                message,
-                            ))
-                        }
-                    }
-                    Err(err) => {
-                        if !is_transient_governance_status(&err) {
-                            record_control_plane_success(runtime).await;
-                            return Err(governance_status_rejection(&err));
-                        }
-                        record_control_plane_failure(runtime, &err).await;
-                        if let Some(reservation) =
-                            reserve_cached_budget(runtime, &cache_key, &req).await
-                        {
-                            if !record_resilience_decision(
-                                config,
-                                runtime,
-                                identity,
-                                "gateway.budget_last_known",
-                                &format!("CheckBudget unavailable: {err}"),
-                                "reserved",
-                                HashMap::from([("metric".to_string(), req.metric.clone())]),
-                            )
-                            .await
-                            {
-                                rollback_cached_budget_reservation(
-                                    runtime,
-                                    &cache_key,
-                                    &reservation,
-                                )
-                                .await;
-                                return Err(GatewayRejection::json(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "governance_audit_unavailable",
-                                    "cannot use last-known budget without a durable audit record",
-                                ));
-                            }
-                            return Ok(reservation.response);
-                        }
-                        governance_error(
-                            config,
-                            runtime,
-                            identity,
-                            failure_posture,
-                            &format!("CheckBudget failed: {err}"),
-                        )
-                        .await?;
-                        Ok(CheckBudgetResponse {
-                            allowed: true,
-                            usage: None,
-                            route_bias: String::new(),
-                            degradation_level: "capable".to_string(),
-                            warning: false,
-                        })
-                    }
-                }
-            }
-            Err(err) => {
-                if let Some(reservation) = reserve_cached_budget(runtime, &cache_key, &req).await {
-                    if !record_resilience_decision(
-                        config,
-                        runtime,
-                        identity,
-                        "gateway.budget_last_known",
-                        &format!("control plane unavailable: {err}"),
-                        "reserved",
-                        HashMap::from([("metric".to_string(), req.metric.clone())]),
-                    )
-                    .await
-                    {
-                        rollback_cached_budget_reservation(runtime, &cache_key, &reservation).await;
-                        return Err(GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "governance_audit_unavailable",
-                            "cannot use last-known budget without a durable audit record",
-                        ));
-                    }
-                    return Ok(reservation.response);
-                }
-                governance_error(
-                    config,
-                    runtime,
-                    identity,
-                    failure_posture,
-                    &format!("failed to connect to Chisei control plane: {err}"),
-                )
-                .await?;
-                Ok(CheckBudgetResponse {
-                    allowed: true,
-                    usage: None,
-                    route_bias: String::new(),
-                    degradation_level: "capable".to_string(),
-                    warning: false,
-                })
-            }
-        }
-    };
-
-    let budget_subject = audit_budget_subject(&base_budget_request);
-    let token_budget = check_budget(CheckBudgetRequest {
-        metric: String::new(),
-        ..base_budget_request.clone()
-    })
-    .await?;
-    check_budget(CheckBudgetRequest {
-        estimated_tokens: 1,
-        metric: METRIC_REQUESTS.to_string(),
-        ..base_budget_request
-    })
-    .await?;
-    Ok(BudgetPreflight {
-        provisional_local_free: !token_budget.allowed
-            && token_budget.route_bias == "local_free"
-            && token_budget.degradation_level == "local_free",
-        route_bias: Some(token_budget.route_bias).filter(|bias| !bias.is_empty()),
-        budget_subject,
-    })
 }
 
 #[derive(Debug, Clone, Default)]
 struct BudgetPreflight {
     provisional_local_free: bool,
-    route_bias: Option<String>,
     budget_subject: Option<String>,
 }
 
@@ -4537,131 +4135,6 @@ fn governance_cache_key(parts: &[&str]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn budget_cache_key(req: &CheckBudgetRequest) -> String {
-    let mid_task = if req.mid_task { "true" } else { "false" };
-    let local_free_available = if req.local_free_available {
-        "true"
-    } else {
-        "false"
-    };
-    governance_cache_key(&[
-        "budget-v1",
-        &req.subject,
-        &req.project,
-        &req.agent,
-        &req.key_id,
-        &req.work_unit,
-        &req.user_id,
-        &req.metric,
-        &req.task_class,
-        mid_task,
-        local_free_available,
-    ])
-}
-
-async fn cache_budget_decision(
-    runtime: &GatewayRuntime,
-    key: String,
-    response: &CheckBudgetResponse,
-    reserved: i32,
-) {
-    let Some(usage) = response.usage.as_ref() else {
-        return;
-    };
-    if !response.allowed {
-        return;
-    }
-    let mut cache = runtime.governance_cache.write().await;
-    prune_timed_cache(
-        &mut cache.budgets,
-        runtime.governance_cache_ttl,
-        MAX_BUDGET_CACHE_ENTRIES,
-    );
-    cache.budgets.insert(
-        key,
-        CachedBudgetDecision {
-            response: response.clone(),
-            remaining: (usage.max_tokens > 0).then(|| {
-                usage
-                    .max_tokens
-                    .saturating_sub(usage.tokens_used)
-                    .saturating_sub(reserved)
-            }),
-            cached_at: Instant::now(),
-        },
-    );
-}
-
-struct CachedBudgetReservation {
-    response: CheckBudgetResponse,
-    previous_remaining: Option<i32>,
-    reserved: i32,
-    token_single_use: bool,
-}
-
-async fn reserve_cached_budget(
-    runtime: &GatewayRuntime,
-    key: &str,
-    request: &CheckBudgetRequest,
-) -> Option<CachedBudgetReservation> {
-    let mut cache = runtime.governance_cache.write().await;
-    if cache.budget_reconciliation_saturated {
-        return None;
-    }
-    let entry = cache.budgets.get_mut(key)?;
-    if entry.cached_at.elapsed() >= runtime.governance_cache_ttl {
-        return None;
-    }
-    let previous_remaining = entry.remaining;
-    if let Some(remaining) = entry.remaining.as_mut() {
-        if *remaining < request.estimated_tokens {
-            return None;
-        }
-        // Token responses can substantially exceed their prompt estimate. A
-        // finite last-known token decision therefore grants at most one
-        // outage request; request-count decisions remain exactly reservable.
-        if request.metric.is_empty() {
-            *remaining = 0;
-        } else {
-            *remaining -= request.estimated_tokens;
-        }
-    }
-    let mut response = entry.response.clone();
-    response.warning = true;
-    response.degradation_level = "last_known".to_string();
-    // The control plane is unreachable and this request is proceeding on a
-    // cached decision rather than a current one.
-    crate::obs::signals::record_fallback(
-        crate::obs::labels::Subsystem::Gateway,
-        crate::obs::labels::FallbackTrigger::GovernanceUnavailable,
-    );
-    Some(CachedBudgetReservation {
-        response,
-        previous_remaining,
-        reserved: request.estimated_tokens,
-        token_single_use: request.metric.is_empty(),
-    })
-}
-
-async fn rollback_cached_budget_reservation(
-    runtime: &GatewayRuntime,
-    key: &str,
-    reservation: &CachedBudgetReservation,
-) {
-    let mut cache = runtime.governance_cache.write().await;
-    let Some(entry) = cache.budgets.get_mut(key) else {
-        return;
-    };
-    if reservation.token_single_use {
-        entry.remaining = reservation.previous_remaining;
-    } else if let Some(remaining) = entry.remaining.as_mut() {
-        *remaining = remaining.saturating_add(reservation.reserved);
-        if let Some(previous) = reservation.previous_remaining {
-            *remaining = (*remaining).min(previous);
-        }
-    }
-}
-
 async fn queue_pending_budget_usage(
     runtime: &GatewayRuntime,
     requests: impl IntoIterator<Item = RecordUsageRequest>,
@@ -4750,7 +4223,7 @@ fn usage_reconciliation_key(request: &RecordUsageRequest) -> String {
     ])
 }
 
-async fn reconcile_cached_budget_usage(
+async fn reconcile_pending_budget_usage(
     runtime: &GatewayRuntime,
     client: &mut ChiseiServiceClient<GatewayClient>,
 ) -> Result<usize, tonic::Status> {
@@ -4800,98 +4273,6 @@ async fn reconcile_cached_budget_usage(
     // intentionally sticky: only operator reconciliation plus restart can
     // safely restore admissions without silently accepting an undercount.
     Ok(reconciled)
-}
-
-fn policy_cache_key(
-    identity: &GatewayIdentity,
-    provider: ProviderKind,
-    requested_model: &str,
-    task_class: &str,
-    budget: &BudgetPreflight,
-    capability_requirements: &str,
-) -> String {
-    governance_cache_key(&[
-        "policy-v1",
-        &identity.project,
-        &identity.agent,
-        &identity.key_id,
-        provider.runtime_name(),
-        requested_model,
-        task_class,
-        budget.route_bias.as_deref().unwrap_or_default(),
-        capability_requirements,
-    ])
-}
-
-async fn cache_policy_decision(runtime: &GatewayRuntime, key: String, decision: &PolicyPreflight) {
-    let registry = provider_registry_snapshot();
-    let Some(registry_state_version) = policy_registry_state(decision, &registry) else {
-        return;
-    };
-    let mut cache = runtime.governance_cache.write().await;
-    prune_timed_cache(
-        &mut cache.policies,
-        runtime.governance_cache_ttl,
-        MAX_POLICY_CACHE_ENTRIES,
-    );
-    cache.policies.insert(
-        key,
-        CachedPolicyDecision {
-            resolved_model: decision.resolved_model.clone(),
-            resolved_provider: decision.resolved_provider,
-            registry_state_version,
-            route_bias: decision.route_bias.clone(),
-            policy_scope: decision.policy_scope.clone(),
-            policy_version: decision.policy_version.clone(),
-            fallback_models: decision.fallback_models.clone(),
-            data_class: decision.data_class.clone(),
-            cached_at: Instant::now(),
-        },
-    );
-}
-
-fn policy_registry_state(decision: &PolicyPreflight, registry: &ProviderRegistry) -> Option<u64> {
-    let resolved_model = registry
-        .resolve_model(decision.resolved_model.as_deref()?)
-        .ok()?;
-    (resolved_model.provider == capability_provider_id(decision.resolved_provider))
-        .then_some(registry.state_version)
-}
-
-async fn invalidate_cached_policy(runtime: &GatewayRuntime, key: &str) {
-    runtime.governance_cache.write().await.policies.remove(key);
-}
-
-async fn cached_policy_decision(
-    runtime: &GatewayRuntime,
-    key: &str,
-    body: &[u8],
-    requested_model: &str,
-) -> Option<PolicyPreflight> {
-    let cache = runtime.governance_cache.read().await;
-    let cached = cache.policies.get(key)?;
-    if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
-        return None;
-    }
-    if cached.registry_state_version != crate::provider_profile::provider_registry_state_version() {
-        return None;
-    }
-    let body = match cached.resolved_model.as_deref() {
-        Some(resolved) if resolved != requested_model => {
-            rewrite_request_model(body, resolved).ok()?
-        }
-        _ => body.to_vec(),
-    };
-    Some(PolicyPreflight {
-        body,
-        resolved_model: cached.resolved_model.clone(),
-        resolved_provider: cached.resolved_provider,
-        route_bias: cached.route_bias.clone(),
-        policy_scope: cached.policy_scope.clone(),
-        policy_version: cached.policy_version.clone(),
-        fallback_models: cached.fallback_models.clone(),
-        data_class: cached.data_class.clone(),
-    })
 }
 
 fn egress_cache_key(
@@ -5123,609 +4504,6 @@ struct RawGatewayContextRetrieval {
     max_links: i32,
     kinds: Vec<String>,
     fields: Vec<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn resolve_policy_preflight(
-    config: &GatewayConfig,
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    provider: ProviderKind,
-    body: &[u8],
-    requested_model: Option<&str>,
-    route_override: Option<&str>,
-    task_class: &str,
-    budget: &BudgetPreflight,
-    request_id: &str,
-    work_unit_id: Option<&str>,
-    failure_posture: &GovernanceFailurePosture,
-    capability_surface: Option<CapabilityRequestSurface>,
-) -> Result<PolicyPreflight, GatewayRejection> {
-    let Some(requested_model) = requested_model else {
-        if route_override.is_some() {
-            return Err(GatewayRejection::json(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "route overrides require a request body model",
-            ));
-        }
-        return Ok(PolicyPreflight {
-            body: body.to_vec(),
-            resolved_model: None,
-            resolved_provider: provider,
-            route_bias: None,
-            policy_scope: None,
-            policy_version: None,
-            fallback_models: Vec::new(),
-            data_class: None,
-        });
-    };
-    let requested_registry_model = if let Some(route_override) = route_override {
-        Some(
-            crate::provider_resolution::resolve_model(route_override).map_err(|reason| {
-                GatewayRejection::json(
-                    StatusCode::FORBIDDEN,
-                    "policy_denied",
-                    format!("route override denied: {reason}"),
-                )
-            })?,
-        )
-    } else if requested_model == "auto" {
-        None
-    } else {
-        Some(
-            crate::provider_resolution::resolve_model_for_provider(
-                requested_model,
-                capability_provider_id(provider),
-            )
-            .map_err(|reason| {
-                GatewayRejection::json(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    format!("model resolution failed: {reason}"),
-                )
-            })?,
-        )
-    };
-    let requested_provider = requested_registry_model
-        .as_ref()
-        .map(|model| {
-            ProviderKind::from_runtime(&model.provider).ok_or_else(|| {
-                GatewayRejection::json(
-                    StatusCode::BAD_REQUEST,
-                    "capability_unsupported",
-                    format!(
-                        "provider {:?} is not supported by the gateway",
-                        model.provider
-                    ),
-                )
-            })
-        })
-        .transpose()?
-        .unwrap_or(provider);
-    let cache_model = route_override
-        .map(|model| format!("route-override:{model}"))
-        .unwrap_or_else(|| requested_model.to_string());
-    let capability_requirements = capability_surface
-        .map(|surface| match surface {
-            CapabilityRequestSurface::Responses => {
-                CapabilityRequirements::from_responses_body(body)
-            }
-            CapabilityRequestSurface::OpenAiChat => {
-                CapabilityRequirements::from_openai_chat_body(body)
-            }
-            CapabilityRequestSurface::AnthropicMessages => {
-                CapabilityRequirements::from_anthropic_messages_body(body)
-            }
-        })
-        .transpose()
-        .map_err(|reason| {
-            GatewayRejection::json(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("cannot derive request capabilities: {reason}"),
-            )
-        })?;
-    let capability_requirements_json = capability_requirements
-        .as_ref()
-        .map(|requirements| {
-            serde_json::to_vec(requirements).expect("capability requirements are serializable")
-        })
-        .unwrap_or_default();
-    let capability_cache_key = String::from_utf8(capability_requirements_json.clone())
-        .expect("serialized capability requirements are UTF-8 JSON");
-    let cache_key = policy_cache_key(
-        identity,
-        provider,
-        &cache_model,
-        task_class,
-        budget,
-        &capability_cache_key,
-    );
-    let Some(target) = &config.chisei_grpc_target else {
-        if route_override.is_some() {
-            return Err(GatewayRejection::json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                "route overrides require a configured Chisei control plane",
-            ));
-        }
-        if requested_model == "auto" {
-            return Err(GatewayRejection::json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                "the auto model sentinel requires a configured policy control plane",
-            ));
-        }
-        return Ok(PolicyPreflight {
-            body: body.to_vec(),
-            resolved_model: requested_registry_model.map(|model| model.canonical_model),
-            resolved_provider: requested_provider,
-            route_bias: None,
-            policy_scope: None,
-            policy_version: None,
-            fallback_models: Vec::new(),
-            data_class: None,
-        });
-    };
-    match connect_governance(runtime, target).await {
-        Ok(channel) => {
-            let mut client = ChiseiServiceClient::new(channel);
-            let preferred_runtime = requested_registry_model
-                .as_ref()
-                .map(|model| model.provider.clone())
-                .unwrap_or_else(|| capability_provider_id(provider).to_string());
-            let preferred_model = requested_registry_model
-                .as_ref()
-                .map(|model| model.canonical_model.clone())
-                .unwrap_or_else(|| requested_model.to_string());
-            let req = GrpcRequest::new(ResolvePolicyRequest {
-                namespace: identity.project.clone(),
-                preferred_runtime,
-                preferred_model,
-                subject: identity.user_id.clone(),
-                project: identity.project.clone(),
-                agent: identity.agent.clone(),
-                key_id: identity.key_id.clone(),
-                task_class: task_class.to_string(),
-                user_id: String::new(),
-                expected_calls: 1,
-                budget_route_bias: budget.route_bias.clone().unwrap_or_default(),
-                route_override: route_override.unwrap_or_default().to_string(),
-                capability_requirements_json,
-            });
-            match client.resolve_policy(req).await {
-                Ok(resp) => {
-                    record_control_plane_success(runtime).await;
-                    let resolution = resp.into_inner().resolution.ok_or_else(|| {
-                        GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "governance_unavailable",
-                            "Chisei returned an empty policy resolution",
-                        )
-                    })?;
-                    if route_override.is_some()
-                        && (Some(resolution.model.as_str())
-                            != requested_registry_model
-                                .as_ref()
-                                .map(|model| model.canonical_model.as_str())
-                            || !resolution.fallback_models.is_empty())
-                    {
-                        return Err(GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "governance_unavailable",
-                            "Chisei did not preserve the exact route override",
-                        ));
-                    }
-                    let Some(runtime_provider) = ProviderKind::from_runtime(&resolution.runtime)
-                    else {
-                        return policy_denied(
-                            config,
-                            identity,
-                            requested_model,
-                            &resolution.model,
-                            &format!(
-                                "policy resolved unsupported runtime {:?}",
-                                resolution.runtime
-                            ),
-                            request_id,
-                            work_unit_id,
-                        )
-                        .await;
-                    };
-                    let registry_snapshot = provider_registry_snapshot();
-                    let registry_resolution = match registry_snapshot
-                        .resolve_model(&resolution.model)
-                    {
-                        Ok(resolution) => resolution,
-                        Err(reason) => {
-                            if registry_snapshot.model_or_provider_is_disabled(&resolution.model) {
-                                return policy_lifecycle_denied(
-                                    config,
-                                    identity,
-                                    RejectedRoute {
-                                        provider: runtime_provider,
-                                        resolved_model: resolution.model.clone(),
-                                    },
-                                    requested_model,
-                                    &format!("policy resolved disabled model: {reason}"),
-                                    request_id,
-                                    work_unit_id,
-                                )
-                                .await;
-                            }
-                            return policy_denied(
-                                config,
-                                identity,
-                                requested_model,
-                                &resolution.model,
-                                &format!("policy resolved invalid model: {reason}"),
-                                request_id,
-                                work_unit_id,
-                            )
-                            .await;
-                        }
-                    };
-                    let resolved_provider =
-                        ProviderKind::from_runtime(&registry_resolution.provider)
-                            .expect("built-in provider profiles have gateway runtimes");
-                    if capability_provider_id(runtime_provider)
-                        != registry_resolution.provider.as_str()
-                    {
-                        return policy_denied(
-                            config,
-                            identity,
-                            requested_model,
-                            &resolution.model,
-                            "policy runtime does not match the registry model provider",
-                            request_id,
-                            work_unit_id,
-                        )
-                        .await;
-                    }
-                    if !provider.same_family(resolved_provider) && !config.allow_cross_provider {
-                        return policy_denied(
-                            config,
-                            identity,
-                            requested_model,
-                            &resolution.model,
-                            &format!(
-                                "policy resolved unsupported runtime {:?}",
-                                resolution.runtime
-                            ),
-                            request_id,
-                            work_unit_id,
-                        )
-                        .await;
-                    }
-                    if resolution.eval_regressed {
-                        record_gateway_decision(
-                            config,
-                            identity,
-                            "gateway.eval_regression",
-                            "eval regression signal influenced gateway routing",
-                            "routed",
-                            HashMap::from([
-                                ("requested_model".to_string(), requested_model.to_string()),
-                                ("resolved_model".to_string(), resolution.model.clone()),
-                                ("project".to_string(), identity.project.clone()),
-                                (
-                                    "reason".to_string(),
-                                    resolution.eval_regression_reason.clone(),
-                                ),
-                            ]),
-                        )
-                        .await;
-                    }
-                    let next_body = if resolution.model == requested_model {
-                        body.to_vec()
-                    } else {
-                        let rewritten =
-                            rewrite_request_model(body, &resolution.model).map_err(|err| {
-                                GatewayRejection::json(
-                                    StatusCode::BAD_REQUEST,
-                                    "invalid_request_error",
-                                    format!("failed to rewrite request model: {err}"),
-                                )
-                            })?;
-                        record_gateway_decision(
-                            config,
-                            identity,
-                            "gateway.model_rewrite",
-                            "model rewritten by Chisei policy",
-                            "rewritten",
-                            HashMap::from([
-                                ("requested_model".to_string(), requested_model.to_string()),
-                                ("resolved_model".to_string(), resolution.model.clone()),
-                                ("project".to_string(), identity.project.clone()),
-                            ]),
-                        )
-                        .await;
-                        rewritten
-                    };
-                    let decision = PolicyPreflight {
-                        body: next_body,
-                        resolved_model: Some(registry_resolution.canonical_model),
-                        resolved_provider,
-                        route_bias: Some(resolution.route_bias).filter(|bias| !bias.is_empty()),
-                        policy_scope: Some(resolution.policy_scope)
-                            .filter(|scope| !scope.is_empty()),
-                        policy_version: Some(resolution.policy_version)
-                            .filter(|version| !version.is_empty()),
-                        fallback_models: resolution.fallback_models,
-                        data_class: Some(resolution.data_class)
-                            .filter(|data_class| !data_class.is_empty()),
-                    };
-                    cache_policy_decision(runtime, cache_key, &decision).await;
-                    Ok(decision)
-                }
-                Err(err) if err.code() == tonic::Code::InvalidArgument => {
-                    invalidate_cached_policy(runtime, &cache_key).await;
-                    record_control_plane_success(runtime).await;
-                    policy_denied(
-                        config,
-                        identity,
-                        requested_model,
-                        requested_model,
-                        &format!("policy denied request: {err}"),
-                        request_id,
-                        work_unit_id,
-                    )
-                    .await
-                }
-                Err(err) if err.code() == tonic::Code::ResourceExhausted => {
-                    invalidate_cached_policy(runtime, &cache_key).await;
-                    record_control_plane_success(runtime).await;
-                    let reason = format!(
-                        "budget exceeded for {}: {}",
-                        budget.budget_subject.as_deref().unwrap_or("unknown scope"),
-                        err.message()
-                    );
-                    let mut evidence = HashMap::from([
-                        ("requested_model".to_string(), requested_model.to_string()),
-                        (
-                            "budget_route_bias".to_string(),
-                            budget.route_bias.clone().unwrap_or_default(),
-                        ),
-                    ]);
-                    if let Some(subject) = budget.budget_subject.as_deref() {
-                        evidence.insert("budget_subject".to_string(), subject.to_string());
-                    }
-                    record_gateway_decision(
-                        config,
-                        identity,
-                        "gateway.budget_denied",
-                        &reason,
-                        "denied",
-                        evidence,
-                    )
-                    .await;
-                    Err(GatewayRejection::json(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "budget_exceeded",
-                        reason,
-                    ))
-                }
-                Err(err) => {
-                    if !is_transient_governance_status(&err) {
-                        invalidate_cached_policy(runtime, &cache_key).await;
-                        record_control_plane_success(runtime).await;
-                        return Err(governance_status_rejection(&err));
-                    }
-                    record_control_plane_failure(runtime, &err).await;
-                    if let Some(decision) =
-                        cached_policy_decision(runtime, &cache_key, body, requested_model).await
-                    {
-                        if route_override.is_some()
-                            && (decision.resolved_model.as_deref()
-                                != requested_registry_model
-                                    .as_ref()
-                                    .map(|model| model.canonical_model.as_str())
-                                || !decision.fallback_models.is_empty())
-                        {
-                            return Err(GatewayRejection::json(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "governance_unavailable",
-                                "cached route override decision is not exact",
-                            ));
-                        }
-                        if !record_resilience_decision(
-                            config,
-                            runtime,
-                            identity,
-                            "gateway.policy_last_known",
-                            &format!("ResolvePolicy unavailable: {err}"),
-                            "enforced",
-                            HashMap::from([(
-                                "requested_model".to_string(),
-                                requested_model.to_string(),
-                            )]),
-                        )
-                        .await
-                        {
-                            return Err(GatewayRejection::json(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "governance_audit_unavailable",
-                                "cannot use last-known policy without a durable audit record",
-                            ));
-                        }
-                        return Ok(decision);
-                    }
-                    if route_override.is_some() {
-                        return Err(GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "governance_unavailable",
-                            format!("route override governance unavailable: {err}"),
-                        ));
-                    }
-                    governance_error(
-                        config,
-                        runtime,
-                        identity,
-                        failure_posture,
-                        &format!("ResolvePolicy failed: {err}"),
-                    )
-                    .await?;
-                    let Some(requested_registry_model) = requested_registry_model.as_ref() else {
-                        return Err(GatewayRejection::json(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "governance_unavailable",
-                            "the auto model sentinel cannot fail open without a policy resolution",
-                        ));
-                    };
-                    Ok(PolicyPreflight {
-                        body: body.to_vec(),
-                        resolved_model: Some(requested_registry_model.canonical_model.clone()),
-                        resolved_provider: requested_provider,
-                        route_bias: None,
-                        policy_scope: None,
-                        policy_version: None,
-                        fallback_models: Vec::new(),
-                        data_class: None,
-                    })
-                }
-            }
-        }
-        Err(err) => {
-            if let Some(decision) =
-                cached_policy_decision(runtime, &cache_key, body, requested_model).await
-            {
-                if route_override.is_some()
-                    && (decision.resolved_model.as_deref()
-                        != requested_registry_model
-                            .as_ref()
-                            .map(|model| model.canonical_model.as_str())
-                        || !decision.fallback_models.is_empty())
-                {
-                    return Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "governance_unavailable",
-                        "cached route override decision is not exact",
-                    ));
-                }
-                if !record_resilience_decision(
-                    config,
-                    runtime,
-                    identity,
-                    "gateway.policy_last_known",
-                    &format!("control plane unavailable: {err}"),
-                    "enforced",
-                    HashMap::from([("requested_model".to_string(), requested_model.to_string())]),
-                )
-                .await
-                {
-                    return Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "governance_audit_unavailable",
-                        "cannot use last-known policy without a durable audit record",
-                    ));
-                }
-                return Ok(decision);
-            }
-            if route_override.is_some() {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    format!("route override governance unavailable: {err}"),
-                ));
-            }
-            governance_error(
-                config,
-                runtime,
-                identity,
-                failure_posture,
-                &format!("failed to connect to Chisei control plane: {err}"),
-            )
-            .await?;
-            let Some(requested_registry_model) = requested_registry_model else {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    "the auto model sentinel cannot fail open without a policy resolution",
-                ));
-            };
-            Ok(PolicyPreflight {
-                body: body.to_vec(),
-                resolved_model: Some(requested_registry_model.canonical_model),
-                resolved_provider: requested_provider,
-                route_bias: None,
-                policy_scope: None,
-                policy_version: None,
-                fallback_models: Vec::new(),
-                data_class: None,
-            })
-        }
-    }
-}
-
-async fn policy_denied(
-    config: &GatewayConfig,
-    identity: &GatewayIdentity,
-    requested_model: &str,
-    resolved_model: &str,
-    reason: &str,
-    request_id: &str,
-    work_unit_id: Option<&str>,
-) -> Result<PolicyPreflight, GatewayRejection> {
-    let mut evidence = HashMap::from([
-        ("requested_model".to_string(), requested_model.to_string()),
-        ("resolved_model".to_string(), resolved_model.to_string()),
-        ("project".to_string(), identity.project.clone()),
-        ("request_id".to_string(), request_id.to_string()),
-    ]);
-    if let Some(work_unit_id) = work_unit_id.filter(|value| !value.is_empty()) {
-        evidence.insert("work_unit".to_string(), work_unit_id.to_string());
-    }
-    record_gateway_decision(
-        config,
-        identity,
-        "gateway.policy_denied",
-        reason,
-        "denied",
-        evidence,
-    )
-    .await;
-    Err(GatewayRejection::json(
-        StatusCode::FORBIDDEN,
-        "policy_denied",
-        reason,
-    ))
-}
-
-async fn policy_lifecycle_denied(
-    config: &GatewayConfig,
-    identity: &GatewayIdentity,
-    route: RejectedRoute,
-    requested_model: &str,
-    reason: &str,
-    request_id: &str,
-    work_unit_id: Option<&str>,
-) -> Result<PolicyPreflight, GatewayRejection> {
-    let mut evidence = HashMap::from([
-        ("requested_model".to_string(), requested_model.to_string()),
-        ("resolved_model".to_string(), route.resolved_model.clone()),
-        ("project".to_string(), identity.project.clone()),
-        ("request_id".to_string(), request_id.to_string()),
-    ]);
-    if let Some(work_unit_id) = work_unit_id.filter(|value| !value.is_empty()) {
-        evidence.insert("work_unit".to_string(), work_unit_id.to_string());
-    }
-    record_gateway_decision(
-        config,
-        identity,
-        "gateway.lifecycle_denied",
-        reason,
-        "denied",
-        evidence,
-    )
-    .await;
-    let resolved_model = crate::provider_resolution::resolve_model(&route.resolved_model)
-        .map(|model| model.canonical_model)
-        .unwrap_or(route.resolved_model);
-    Err(
-        GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", reason)
-            .with_rejected_route(route.provider, resolved_model),
-    )
 }
 
 fn rewrite_request_model(body: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
@@ -9204,6 +7982,9 @@ async fn record_usage_and_append(
         Ok(channel) => {
             spawn_gateway_recovery_replay(config.clone(), runtime.clone());
             let mut chisei = ChiseiServiceClient::new(channel.clone());
+            if let Err(err) = reconcile_pending_budget_usage(runtime, &mut chisei).await {
+                warn!(error = %err, "chisei-gateway pending usage reconciliation failed");
+            }
             if let Err(err) = chisei
                 .record_usage(GrpcRequest::new(request_usage.clone()))
                 .await
@@ -12331,7 +11112,6 @@ async fn response_from_upstream(
                     status: StatusCode::BAD_GATEWAY,
                     error_type: "upstream_invalid_response".into(),
                     reason,
-                    rejected_route: None,
                     retry_safety: Some("ambiguous"),
                 };
                 record_usage_and_append(
@@ -12744,7 +11524,6 @@ async fn response_from_upstream(
                                 reason: format!(
                                     "failed to translate OpenAI response to Anthropic: {err}"
                                 ),
-                                rejected_route: None,
                                 retry_safety: None,
                             };
                             record_usage_and_append(
@@ -12777,7 +11556,6 @@ async fn response_from_upstream(
                         status: StatusCode::BAD_GATEWAY,
                         error_type: "gateway_response_error".into(),
                         reason: format!("failed to build upstream response: {err}"),
-                        rejected_route: None,
                         retry_safety: None,
                     };
                     record_usage_and_append(
@@ -12830,7 +11608,6 @@ async fn response_from_upstream(
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
                 reason: safe_upstream_error_reason(context.provider, "response", &err),
-                rejected_route: None,
                 retry_safety: Some("ambiguous"),
             };
             record_usage_and_append(
@@ -14148,7 +12925,6 @@ mod tests {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error_type: "upstream_unavailable".into(),
             reason: "provider circuit is open".into(),
-            rejected_route: None,
             retry_safety: Some("safe"),
         };
         let circuit_receipt = build_gateway_operation_receipt(
@@ -14532,43 +13308,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
-        }
-    }
-
-    #[test]
-    fn fat_decide_defaults_on_and_supports_explicit_opt_out() {
-        // Isolate from the process environment for this assertion.
-        let key = "CHISEI_GATEWAY_FAT_DECIDE";
-        let previous = std::env::var(key).ok();
-        // SAFETY: test-only env mutation, restored below.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        assert!(fat_decide_enabled_from_env());
-        for disable in ["0", "false", "FALSE", "no", "off", " Off "] {
-            unsafe {
-                std::env::set_var(key, disable);
-            }
-            assert!(
-                !fat_decide_enabled_from_env(),
-                "expected disable for {disable:?}"
-            );
-        }
-        for enable in ["1", "true", "yes", "on", "anything"] {
-            unsafe {
-                std::env::set_var(key, enable);
-            }
-            assert!(
-                fat_decide_enabled_from_env(),
-                "expected enable for {enable:?}"
-            );
-        }
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
         }
     }
 
@@ -14623,160 +13362,6 @@ mod tests {
         assert!(
             GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
                 .fail_closed
-        );
-    }
-
-    #[tokio::test]
-    async fn last_known_budget_reservations_are_conservative_without_eager_usage() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_governance_cache_ttl(Duration::from_secs(60));
-        let request = CheckBudgetRequest {
-            user_id: "agent:safe-agent".into(),
-            estimated_tokens: 10,
-            subject: String::new(),
-            project: "default".into(),
-            agent: "safe-agent".into(),
-            key_id: "safe-agent".into(),
-            work_unit: String::new(),
-            metric: String::new(),
-            task_class: "primary".into(),
-            mid_task: false,
-            local_free_available: false,
-        };
-        let key = budget_cache_key(&request);
-        cache_budget_decision(
-            &runtime,
-            key.clone(),
-            &CheckBudgetResponse {
-                allowed: true,
-                usage: Some(sekai_proto::chisei::BudgetUsage {
-                    user_id: request.user_id.clone(),
-                    tokens_used: 20,
-                    max_tokens: 100,
-                    period_type: "daily".into(),
-                    period_start: 0,
-                }),
-                route_bias: String::new(),
-                degradation_level: "capable".into(),
-                warning: false,
-            },
-            request.estimated_tokens,
-        )
-        .await;
-
-        // The recorder must exist before the emission: metrics macros are a
-        // no-op with no recorder installed.
-        crate::obs::metrics::handle();
-
-        let mut outage_request = request.clone();
-        outage_request.estimated_tokens = 30;
-        let response = reserve_cached_budget(&runtime, &key, &outage_request)
-            .await
-            .expect("last-known headroom should admit a bounded reservation");
-        assert_eq!(response.response.degradation_level, "last_known");
-        assert!(response.response.warning);
-
-        // Serving a cached decision during a control-plane outage is a
-        // fallback and must be visible as one.
-        let rendered = crate::obs::metrics::handle().render();
-        assert!(
-            rendered.lines().any(|line| {
-                line.starts_with("sekai_fallback_total")
-                    && line.contains(r#"trigger="governance_unavailable""#)
-            }),
-            "last-known budget reservation recorded no fallback:\n{rendered}"
-        );
-
-        outage_request.estimated_tokens = 50;
-        assert!(
-            reserve_cached_budget(&runtime, &key, &outage_request)
-                .await
-                .is_none()
-        );
-        let cache = runtime.governance_cache.read().await;
-        assert_eq!(cache.budgets[&key].remaining, Some(0));
-        assert!(cache.pending_budget_usage.is_empty());
-    }
-
-    #[tokio::test]
-    async fn unlimited_last_known_budget_remains_admissible() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_governance_cache_ttl(Duration::from_secs(60));
-        let request = CheckBudgetRequest {
-            user_id: "agent:safe-agent".into(),
-            estimated_tokens: 1,
-            subject: String::new(),
-            project: "default".into(),
-            agent: "safe-agent".into(),
-            key_id: "safe-agent".into(),
-            work_unit: String::new(),
-            metric: METRIC_REQUESTS.into(),
-            task_class: "primary".into(),
-            mid_task: false,
-            local_free_available: false,
-        };
-        let key = budget_cache_key(&request);
-        cache_budget_decision(
-            &runtime,
-            key.clone(),
-            &CheckBudgetResponse {
-                allowed: true,
-                usage: Some(sekai_proto::chisei::BudgetUsage {
-                    user_id: request.user_id.clone(),
-                    tokens_used: 0,
-                    max_tokens: 0,
-                    period_type: "daily".into(),
-                    period_start: 0,
-                }),
-                route_bias: String::new(),
-                degradation_level: "capable".into(),
-                warning: false,
-            },
-            request.estimated_tokens,
-        )
-        .await;
-
-        assert!(
-            reserve_cached_budget(&runtime, &key, &request)
-                .await
-                .is_some()
-        );
-        assert!(
-            reserve_cached_budget(&runtime, &key, &request)
-                .await
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn budget_cache_key_covers_all_governance_inputs() {
-        let request = CheckBudgetRequest {
-            user_id: "agent:safe-agent".into(),
-            estimated_tokens: 10,
-            subject: String::new(),
-            project: "default".into(),
-            agent: "safe-agent".into(),
-            key_id: "safe-agent".into(),
-            work_unit: String::new(),
-            metric: String::new(),
-            task_class: "primary".into(),
-            mid_task: false,
-            local_free_available: false,
-        };
-        let baseline = budget_cache_key(&request);
-        assert_ne!(
-            baseline,
-            budget_cache_key(&CheckBudgetRequest {
-                mid_task: true,
-                ..request.clone()
-            })
-        );
-        assert_ne!(
-            baseline,
-            budget_cache_key(&CheckBudgetRequest {
-                local_free_available: true,
-                ..request
-            })
         );
     }
 
@@ -14876,97 +13461,6 @@ mod tests {
         assert!(cache.budget_reconciliation_saturated);
 
         std::fs::remove_file(parent).unwrap();
-    }
-
-    #[tokio::test]
-    async fn stale_governance_decisions_are_not_reused() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_governance_cache_ttl(Duration::ZERO);
-        let policy = PolicyPreflight {
-            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
-            resolved_model: Some("gpt-5.5".into()),
-            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            route_bias: None,
-            policy_scope: Some("project:default".into()),
-            policy_version: Some("v1".into()),
-            fallback_models: Vec::new(),
-            data_class: None,
-        };
-        cache_policy_decision(&runtime, "policy".into(), &policy).await;
-        cache_egress_decision(
-            &runtime,
-            "egress".into(),
-            &ContextEgressPreflight {
-                body: b"filtered".to_vec(),
-            },
-        )
-        .await;
-
-        assert!(
-            cached_policy_decision(&runtime, "policy", &policy.body, "gpt-5.5")
-                .await
-                .is_none()
-        );
-        assert!(cached_egress_decision(&runtime, "egress").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn policy_cache_is_invalidated_by_registry_state_changes() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-        let policy = PolicyPreflight {
-            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
-            resolved_model: Some("openai/gpt-5.5".into()),
-            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            route_bias: None,
-            policy_scope: Some("project:default".into()),
-            policy_version: Some("v1".into()),
-            fallback_models: Vec::new(),
-            data_class: None,
-        };
-        cache_policy_decision(&runtime, "policy".into(), &policy).await;
-        runtime
-            .governance_cache
-            .write()
-            .await
-            .policies
-            .get_mut("policy")
-            .unwrap()
-            .registry_state_version += 1;
-
-        assert!(
-            cached_policy_decision(&runtime, "policy", &policy.body, "gpt-4")
-                .await
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn disabled_routes_are_not_admitted_to_policy_cache() {
-        let mut registry = ProviderRegistry::built_in();
-        registry.state_version = 1;
-        registry
-            .lifecycle_overrides
-            .push(crate::provider_profile::RegistryLifecycleOverride {
-                target_kind: "model".into(),
-                target: "openai/gpt-5.5".into(),
-                state: "disabled".into(),
-                version: 1,
-                actor: "operator".into(),
-                reason: "rollback".into(),
-                changed_at: "2026-07-13T00:00:00Z".into(),
-            });
-        let policy = PolicyPreflight {
-            body: br#"{"model":"gpt-5.5"}"#.to_vec(),
-            resolved_model: Some("openai/gpt-5.5".into()),
-            resolved_provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-            route_bias: None,
-            policy_scope: Some("project:default".into()),
-            policy_version: Some("v1".into()),
-            fallback_models: Vec::new(),
-            data_class: None,
-        };
-
-        assert_eq!(policy_registry_state(&policy, &registry), None);
     }
 
     #[test]
@@ -16833,7 +15327,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         };
         spawn_gateway_with_config(config).await
     }
@@ -16869,7 +15362,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         };
         spawn_gateway_with_runtime(
             config,
@@ -17433,7 +15925,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17457,8 +15948,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.text().await.unwrap(), upstream_body);
+        let status = resp.status();
+        let response_body = resp.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{response_body}");
+        assert_eq!(response_body, upstream_body);
 
         let detail = reqwest::Client::new()
             .get(format!("{gateway_base}/models/gpt-5.5"))
@@ -17527,7 +16020,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17541,8 +16033,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), upstream_body);
+        let status = response.status();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{response_body}");
+        assert_eq!(response_body, upstream_body);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, "/v1/models");
@@ -17573,7 +16067,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17627,7 +16120,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17669,7 +16161,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17727,7 +16218,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17803,7 +16293,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17909,7 +16398,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -17965,7 +16453,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18033,7 +16520,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18127,7 +16613,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18195,7 +16680,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18250,7 +16734,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18337,7 +16820,6 @@ mod tests {
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18403,7 +16885,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18447,6 +16928,48 @@ mod tests {
             }))
             .await
             .unwrap();
+        let (denied_upstream_base, denied_requests) =
+            spawn_fake_upstream(r#"{"id":"unexpected"}"#, "application/json").await;
+        let denied_gateway_base = spawn_gateway_with_config(GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: denied_upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            chisei_grpc_target: Some(chisei_target.clone()),
+            fail_closed: true,
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            no_preflight: false,
+            pricing: HashMap::new(),
+            run_pipeline: false,
+            allow_cross_provider: false,
+        })
+        .await;
+        let denied = reqwest::Client::new()
+            .post(format!("{denied_gateway_base}/v1/messages"))
+            .header(X_API_KEY, "sk-chisei-claude-code")
+            .json(&serde_json::json!({
+                "model": "auto",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(
+            denied_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.path != "/v1/chat/completions")
+        );
+
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url: upstream_base,
@@ -18465,7 +16988,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
-            fat_decide: false,
         })
         .await;
 
@@ -18491,6 +17013,10 @@ mod tests {
         assert_eq!(body["usage"]["output_tokens"], 4);
 
         let requests = requests.lock().unwrap();
+        let requests = requests
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .collect::<Vec<_>>();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, "/v1/chat/completions");
         assert_eq!(
@@ -18507,15 +17033,18 @@ mod tests {
         drop(requests);
 
         let rows = db.query_rows("llm_calls", &RowQuery::default()).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("provider").map(String::as_str), Some("openai"));
-        assert_eq!(rows[0].get("model").map(String::as_str), Some("auto"));
+        let row = rows
+            .iter()
+            .find(|row| row.get("resolved_model").map(String::as_str) == Some("openai/gpt-5.5"))
+            .expect("allowed cross-provider call should be recorded");
+        assert_eq!(row.get("provider").map(String::as_str), Some("openai"));
+        assert_eq!(row.get("model").map(String::as_str), Some("auto"));
         assert_eq!(
-            rows[0].get("resolved_model").map(String::as_str),
+            row.get("resolved_model").map(String::as_str),
             Some("openai/gpt-5.5")
         );
-        assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
-        assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("4"));
+        assert_eq!(row.get("input_tokens").map(String::as_str), Some("11"));
+        assert_eq!(row.get("output_tokens").map(String::as_str), Some("4"));
 
         let decisions = db
             .list_decisions(&crate::test_support::audit::DecisionFilter {
@@ -18575,7 +17104,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
-            fat_decide: false,
         })
         .await;
 
@@ -18654,7 +17182,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
-            fat_decide: false,
         })
         .await;
 
@@ -18720,7 +17247,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
-            fat_decide: false,
         })
         .await;
 
@@ -18808,7 +17334,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
-            fat_decide: false,
         })
         .await;
 
@@ -18869,7 +17394,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -18940,7 +17464,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19009,7 +17532,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19062,7 +17584,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19122,7 +17643,6 @@ mod tests {
                 pricing: HashMap::new(),
                 run_pipeline: false,
                 allow_cross_provider: false,
-                fat_decide: false,
             },
             GatewayRuntime::new(
                 Duration::from_secs(60 * 60),
@@ -19282,7 +17802,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19336,7 +17855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_does_not_block_budget_preflight_when_control_plane_is_unavailable() {
+    async fn configured_gateway_fails_closed_when_decision_is_unavailable() {
         let (upstream_base, requests) = spawn_fake_upstream(
             r#"{"id":"resp_1","status":"completed"}"#,
             "application/json",
@@ -19369,7 +17888,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19383,8 +17901,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(requests.lock().unwrap().is_empty());
 
         let classified = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
@@ -19395,7 +17913,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(classified.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(requests.lock().unwrap().is_empty());
 
         let explicit = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
@@ -19411,7 +17929,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(explicit.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -19448,7 +17966,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19521,7 +18038,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19586,7 +18102,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19634,42 +18149,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_denial_records_request_and_work_unit_attribution() {
-        let (chisei_target, db) = spawn_control_plane().await;
-        let mut config = routing_config();
-        config.chisei_grpc_target = Some(chisei_target);
-        let identity = GatewayIdentity {
-            agent: "codex-app".into(),
-            project: "default".into(),
-            user_id: "agent:codex-app".into(),
-            key_id: "codex-app".into(),
-            tier: DEFAULT_GATEWAY_TIER.into(),
-        };
-        let rejection = policy_denied(
-            &config,
-            &identity,
-            "requested-model",
-            "resolved-model",
-            "model denied by policy",
-            "request-policy-denied",
-            Some("work-policy-denied"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(rejection.status, StatusCode::FORBIDDEN);
-
-        let decisions = db
-            .list_decisions(&crate::test_support::audit::DecisionFilter {
-                action: Some("gateway.policy_denied".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].evidence["request_id"], "request-policy-denied");
-        assert_eq!(decisions[0].evidence["work_unit"], "work-policy-denied");
-    }
-
-    #[tokio::test]
     async fn work_unit_budget_threshold_crossing_records_warning() {
         let (upstream_base, _) = spawn_fake_upstream(
             r#"{"id":"resp_1","status":"completed","usage":{"input_tokens":60,"output_tokens":15,"total_tokens":75}}"#,
@@ -19712,7 +18191,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19803,7 +18281,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -19892,7 +18369,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20001,7 +18477,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20115,7 +18590,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20221,7 +18695,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20392,7 +18865,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20599,7 +19071,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20667,7 +19138,6 @@ mod tests {
             pricing,
             run_pipeline: true,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20840,7 +19310,6 @@ mod tests {
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20904,7 +19373,6 @@ mod tests {
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -20959,7 +19427,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -21012,7 +19479,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 
@@ -21069,7 +19535,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
-            fat_decide: false,
         })
         .await;
 

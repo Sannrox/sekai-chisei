@@ -1,13 +1,12 @@
-//! Fat gateway decide contract (Issue #163 research freeze).
+//! Canonical gateway decision contract (Issues #163 and #418).
 //!
 //! Pure types and validation for the single control-plane decision the HTTP
-//! gateway should call once per request. Wire transport (proto/RPC) and gateway
-//! dual-path land in follow-up implementation PRs under
-//! `docs/research/163-gateway-pep-fat-decide.md`.
+//! gateway calls once per request. The control plane owns the decision; the
+//! gateway remains a translating policy-enforcement point.
 
 use serde::{Deserialize, Serialize};
 
-pub const GATEWAY_DECIDE_CONTRACT_VERSION: &str = "gateway.decide/v1";
+pub const GATEWAY_DECIDE_CONTRACT_VERSION: &str = "gateway.decide/v2";
 
 /// Stable deny reasons the edge maps to HTTP/provider errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +85,6 @@ impl GatewayDecideRequest {
         for (name, value) in [
             ("namespace", self.namespace.as_str()),
             ("principal", self.principal.as_str()),
-            ("requested_model", self.requested_model.as_str()),
             ("operation_class", self.operation_class.as_str()),
             (
                 "correlation_operation_id",
@@ -96,6 +94,9 @@ impl GatewayDecideRequest {
             if value.trim().is_empty() || value != value.trim() {
                 return Err(format!("{name} is required"));
             }
+        }
+        if self.requested_model != self.requested_model.trim() {
+            return Err("requested_model must be trimmed".into());
         }
         if self.estimated_cost_usd_micros < 0 {
             return Err("estimated_cost_usd_micros must be non-negative".into());
@@ -156,7 +157,7 @@ pub fn compose_gateway_decide(inputs: GatewayDecideInputs) -> GatewayDecideRespo
         return GatewayDecideResponse::deny(
             GatewayDecideDenyReason::BudgetDenied,
             format!(
-                "budget denied for scope {} (degradation={})",
+                "budget exceeded for scope {} (degradation={})",
                 inputs.budget_scope, inputs.degradation_level
             ),
         );

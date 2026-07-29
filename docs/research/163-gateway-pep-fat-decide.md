@@ -100,14 +100,16 @@ Single decision object:
 1. **This freeze** (done) — option A locked.
 2. **Proto + control-plane decide handler** (landed) — `DecideGatewayExecution`
    RPC + pure compose helpers; deterministic unit tests for admit/deny composition.
-3. **Gateway dual-path** (landed) — fail-closed `DecideGatewayExecution`.
+3. **Gateway dual-path** (landed, later retired by Issue #418) —
+   fail-closed `DecideGatewayExecution`.
    **Deny** refuses upstream; **admit** replaces CheckBudget + ResolvePolicy
    with the PDP response (context egress and health fallback still run at the
-   edge). Soft-unavailable falls through to legacy multi-RPC preflight.
-4. **Default on** (landed) — fat-decide is enabled unless
-   `CHISEI_GATEWAY_FAT_DECIDE=0` (or `false`/`off`/`no`). Gateway smoke and the
-   normal suite exercise the default path. Legacy multi-RPC remains as opt-out
-   until a later cleanup removes it.
+   edge). The temporary soft-unavailable fallback was removed by Issue #418.
+4. **Canonical path** (landed) — configured gateways always use
+   `DecideGatewayExecution`; denial or unavailability fails closed without a
+   legacy multi-RPC fallback. Issue #418 completes the decision as
+   `gateway.decide/v2`; mixed v1/v2 deployments reject admission during a
+   coordinated upgrade.
 5. **Optional cache** (Option C) only after production soak of default-on.
 
 ## Explicit non-goals of the first slice

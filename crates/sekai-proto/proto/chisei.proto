@@ -435,10 +435,12 @@ message CheckBudgetResponse {
   bool warning = 5;
 }
 
-// Fat gateway decide surface (Issue #163). Single PDP call for the HTTP edge.
+// Canonical gateway decision surface (Issues #163 and #418). Single PDP call
+// for the translating HTTP edge.
 // See docs/research/163-gateway-pep-fat-decide.md.
 message DecideGatewayExecutionRequest {
-  // Must be gateway.decide/v1.
+  // Must be gateway.decide/v2. Version 2 makes the policy decision complete
+  // enough for the gateway to remain a translator rather than a policy engine.
   string contract_version = 1;
   string namespace = 2;
   string requested_model = 3;
@@ -456,6 +458,12 @@ message DecideGatewayExecutionRequest {
   string key_id = 13;
   string work_unit = 14;
   bool local_free_available = 15;
+  // Subject and policy-resolution inputs required for the gateway's single
+  // canonical admission decision.
+  string user_id = 16;
+  string route_override = 17;
+  bytes capability_requirements_json = 18;
+  int64 expected_calls = 19;
 }
 
 message DecideGatewayExecutionResponse {
@@ -475,6 +483,13 @@ message DecideGatewayExecutionResponse {
   string route_bias = 10;
   string degradation_level = 11;
   bool budget_warning = 12;
+  // Complete policy provenance and enforcement inputs returned to the thin
+  // gateway PEP so it never reconstructs policy locally.
+  string policy_scope = 13;
+  string data_class = 14;
+  repeated string fallback_models = 15;
+  bool eval_regressed = 16;
+  string eval_regression_reason = 17;
 }
 message RecordUsageRequest {
   string user_id = 1;

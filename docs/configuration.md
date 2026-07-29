@@ -119,7 +119,6 @@ value to stdout.
 | `CHISEI_GATEWAY_AUDIT_SPOOL_PATH` | `data/chisei-gateway-audit.jsonl` | Durable degraded/fail-open JSONL audit spool (process CWD-relative unless absolute) |
 | `CHISEI_GATEWAY_AUDIT_SPOOL_MAX_BYTES` | `67108864` | Audit spool rotation threshold |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
-| `CHISEI_GATEWAY_FAT_DECIDE` | on | Use `DecideGatewayExecution` for budget/policy preflight (deny fail-closed; admit replaces CheckBudget+ResolvePolicy). Set `0`/`false`/`off` for legacy multi-RPC preflight |
 | `CHISEI_GATEWAY_RUN_PIPELINE` | unset | Set `1` to sample completed calls through Chisei |
 | `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table; class rates must be supplied to price provider cache-write premiums |
 
