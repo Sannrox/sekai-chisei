@@ -690,7 +690,7 @@ async fn launch_codex_app(
 
     println!("verify traffic with:");
     println!(
-        "  SEKAI_SOCKET={} sekaictl gateway report --by agent-within-project --since 10m",
+        "  SEKAI_SOCKET={} sekaictl admin gateway report --by agent-within-project --since 10m",
         config.socket
     );
 
@@ -838,7 +838,7 @@ async fn launch_claude_code(
 
     println!("verify traffic with:");
     println!(
-        "  SEKAI_SOCKET={} sekaictl gateway report --by work-unit --since 10m",
+        "  SEKAI_SOCKET={} sekaictl admin gateway report --by work-unit --since 10m",
         config.socket
     );
     Ok(())

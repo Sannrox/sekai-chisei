@@ -27,11 +27,11 @@ enter the control plane.
 ### 1. Register local site identity
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation register-site \
+DB_PATH=data/site-a.db sekaictl admin federation register-site \
   --site-id site-a --key-id k1 --public-key-hex <a-pubkey-hex> \
   --region eu-central --data-class internal
 
-DB_PATH=data/site-b.db sekaictl federation register-site \
+DB_PATH=data/site-b.db sekaictl admin federation register-site \
   --site-id site-b --key-id k1 --public-key-hex <b-pubkey-hex> \
   --region us-east --data-class internal
 ```
@@ -39,25 +39,25 @@ DB_PATH=data/site-b.db sekaictl federation register-site \
 ### 2. Pin trust roots (reuse #290 store)
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation pin-trust-root \
+DB_PATH=data/site-a.db sekaictl admin federation pin-trust-root \
   --site-identity site-b --key-id k1 --public-key-hex <b-pubkey-hex>
 
-DB_PATH=data/site-b.db sekaictl federation pin-trust-root \
+DB_PATH=data/site-b.db sekaictl admin federation pin-trust-root \
   --site-identity site-a --key-id k1 --public-key-hex <a-pubkey-hex>
 ```
 
 Default pin namespace is `federation`. Compliance import can use the same roots
-via `sekaictl compliance trust-root --namespace federation ...` or a shared
+via `sekaictl admin assurance compliance trust-root --namespace federation ...` or a shared
 namespace chosen by operators.
 
 ### 3. Join with policy pack pin
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation join \
+DB_PATH=data/site-a.db sekaictl admin federation join \
   --peer-site-id site-b --peer-key-id k1 --peer-public-key-hex <b-pubkey-hex> \
   --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:...
 
-DB_PATH=data/site-b.db sekaictl federation join \
+DB_PATH=data/site-b.db sekaictl admin federation join \
   --peer-site-id site-a --peer-key-id k1 --peer-public-key-hex <a-pubkey-hex> \
   --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:...
 ```
@@ -66,18 +66,18 @@ Join is audited (`federation.peer_join`). The pack pin is visible on the peer
 record:
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation list-peers
+DB_PATH=data/site-a.db sekaictl admin federation list-peers
 ```
 
 ### 4. Peer health and import availability
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation set-health --peer-site-id site-b --health up
-DB_PATH=data/site-a.db sekaictl federation import-availability --peer-site-id site-b
+DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health up
+DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
 # {"available":true, ...}
 
-DB_PATH=data/site-a.db sekaictl federation set-health --peer-site-id site-b --health down
-DB_PATH=data/site-a.db sekaictl federation import-availability --peer-site-id site-b
+DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health down
+DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
 # {"available":false,"reason":"peer is down; cross-site import unavailable ..."}
 ```
 
@@ -88,7 +88,7 @@ true (and still under #290 verify rules).
 ### 5. Leave (audited)
 
 ```text
-DB_PATH=data/site-a.db sekaictl federation leave --peer-site-id site-b
+DB_PATH=data/site-a.db sekaictl admin federation leave --peer-site-id site-b
 ```
 
 ## Forbidden remote control
@@ -107,15 +107,15 @@ Allowed: `verify`, `import`, `deny`.
 ## CLI surface
 
 ```text
-sekaictl federation register-site ...
-sekaictl federation show-site
-sekaictl federation pin-trust-root ...
-sekaictl federation join ...
-sekaictl federation leave ...
-sekaictl federation set-health ...
-sekaictl federation set-pack-pin ...
-sekaictl federation list-peers
-sekaictl federation import-availability ...
+sekaictl admin federation register-site ...
+sekaictl admin federation show-site
+sekaictl admin federation pin-trust-root ...
+sekaictl admin federation join ...
+sekaictl admin federation leave ...
+sekaictl admin federation set-health ...
+sekaictl admin federation set-pack-pin ...
+sekaictl admin federation list-peers
+sekaictl admin federation import-availability ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as

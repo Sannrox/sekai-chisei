@@ -24,7 +24,7 @@ checks the ed25519 signature.
 ## Export
 
 ```bash
-sekaictl compliance export \
+sekaictl admin assurance compliance export \
   --namespace team-a \
   --from-ms 1700000000000 \
   --to-ms 1700086400000 \
@@ -37,7 +37,7 @@ sekaictl compliance export \
 Optional signing:
 
 ```bash
-sekaictl compliance export ... \
+sekaictl admin assurance compliance export ... \
   --signing-key ./export-seed.hex \
   --identity compliance-export \
   --key-id 2026-07
@@ -49,8 +49,8 @@ namespace, window, redaction mode, request id, content digest, and counts.
 ## Verify offline
 
 ```bash
-sekaictl compliance verify ./audit-week.json
-sekaictl compliance verify ./audit-week.json --trusted-key ./export-public.hex
+sekaictl admin assurance compliance verify ./audit-week.json
+sekaictl admin assurance compliance verify ./audit-week.json --trusted-key ./export-public.hex
 ```
 
 No control-plane database is required for verification.
@@ -69,7 +69,7 @@ prompts, PII, or free-form error text under unexpected field names.
 
 - At most 5,000 receipts and 10,000 decisions per export
 - Window length at most 366 days
-- `sekaictl compliance export` uses the configured runtime backend
+- `sekaictl admin assurance compliance export` uses the configured runtime backend
   (`SEKAI_DB_BACKEND` / `DB_PATH` or `DATABASE_URL`)
 - Host filesystem/DB credentials are the trust boundary for this CLI, as with
   other offline `sekaictl` report tools. A future gRPC export will enforce
@@ -87,9 +87,9 @@ prompts, PII, or free-form error text under unexpected field names.
 Cross-site compliance bundles can be imported after configuring trust roots:
 
 ```text
-sekaictl compliance trust-root --namespace <ns> --site-identity <site> --key-id <id> --public-key-hex <hex>
-sekaictl compliance import-peer --namespace <ns> --bundle <export.json>
-sekaictl compliance list-trust-roots --namespace <ns>
+sekaictl admin assurance compliance trust-root --namespace <ns> --site-identity <site> --key-id <id> --public-key-hex <hex>
+sekaictl admin assurance compliance import-peer --namespace <ns> --bundle <export.json>
+sekaictl admin assurance compliance list-trust-roots --namespace <ns>
 ```
 
 Imported records are verified under enabled roots and stored with

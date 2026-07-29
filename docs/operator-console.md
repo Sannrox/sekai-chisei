@@ -136,7 +136,8 @@ Deep link: `/console/n/{namespace}/policy`.
 - Historical dry-run: same pure engine as `DryRunNamespacePolicy` / docs
   [policy-dry-run.md](policy-dry-run.md); records `policy.dry_run` audit.
 - Promote/rollback: write principals only; explicit confirm; promote requires
-  candidate + evaluation JSON (same contract as `sekaictl gunshi promote`).
+  candidate + evaluation JSON (same contract as
+  `sekaictl admin governance gunshi promote`).
 - Kill switch remains on the Pressure surface; status is visible here when
   auto-dispatch policy is installed.
 

@@ -35,6 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
     let is_admin_path = args[0] == "admin";
+    if !is_admin_path && let Some(warning) = alias_warning(&args[0]) {
+        eprintln!("{warning}");
+    }
     let has_help = args.iter().any(|arg| arg == "--help" || arg == "-h");
     if is_admin_path && has_help && expand_admin_args(args.clone()).is_err() {
         print_admin_usage();
@@ -582,7 +585,7 @@ fn print_admin_usage() {
     );
 }
 
-fn expert_usage(command: &str, canonical_admin_path: bool) -> Option<String> {
+fn expert_usage(command: &str, use_canonical_admin_path: bool) -> Option<String> {
     let usage = match command {
         "credential" => credential_usage().to_string(),
         "gateway" => gateway_usage(),
@@ -602,29 +605,40 @@ fn expert_usage(command: &str, canonical_admin_path: bool) -> Option<String> {
         "federation" => sekai_chisei::federation_cli::usage().to_string(),
         _ => return None,
     };
-    if !canonical_admin_path {
+    if !use_canonical_admin_path {
         return Some(usage);
     }
 
-    let canonical = match command {
-        "credential" => "admin access credential",
-        "team" => "admin access team",
-        "gateway" => "admin gateway",
-        "action" => "admin governance action",
-        "memory" => "admin governance memory",
-        "gunshi" => "admin governance gunshi",
-        "governed-subject" => "admin governance subject",
-        "attest" => "admin assurance attest",
-        "compliance" => "admin assurance compliance",
-        "provenance" => "admin assurance provenance",
-        "replay" => "admin assurance replay",
-        "federation" => "admin federation",
-        _ => unreachable!("expert command mapping is exhaustive"),
-    };
+    let canonical =
+        canonical_admin_path(command).expect("expert command mapping must have a canonical path");
     Some(usage.replace(
         &format!("sekaictl {command}"),
         &format!("sekaictl {canonical}"),
     ))
+}
+
+fn canonical_admin_path(command: &str) -> Option<&'static str> {
+    match command {
+        "credential" => Some("admin access credential"),
+        "team" => Some("admin access team"),
+        "gateway" => Some("admin gateway"),
+        "action" => Some("admin governance action"),
+        "memory" => Some("admin governance memory"),
+        "gunshi" => Some("admin governance gunshi"),
+        "governed-subject" => Some("admin governance subject"),
+        "attest" => Some("admin assurance attest"),
+        "compliance" => Some("admin assurance compliance"),
+        "provenance" => Some("admin assurance provenance"),
+        "replay" => Some("admin assurance replay"),
+        "federation" => Some("admin federation"),
+        _ => None,
+    }
+}
+
+fn alias_warning(command: &str) -> Option<String> {
+    canonical_admin_path(command).map(|canonical| {
+        format!("warning: `sekaictl {command}` is deprecated; use `sekaictl {canonical}`")
+    })
 }
 
 fn print_gateway_usage() {
@@ -642,7 +656,7 @@ fn gateway_usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_admin_args, expert_usage};
+    use super::{alias_warning, canonical_admin_path, expand_admin_args, expert_usage};
 
     #[test]
     fn expands_every_canonical_admin_path_to_the_existing_dispatcher() {
@@ -711,6 +725,37 @@ mod tests {
             let usage = expert_usage(command, true).unwrap();
             assert!(usage.contains("sekaictl admin "));
             assert!(!usage.contains(&format!("sekaictl {command}")));
+        }
+    }
+
+    #[test]
+    fn every_alias_names_its_canonical_replacement_and_core_commands_do_not() {
+        for (alias, canonical) in [
+            ("credential", "admin access credential"),
+            ("team", "admin access team"),
+            ("gateway", "admin gateway"),
+            ("action", "admin governance action"),
+            ("memory", "admin governance memory"),
+            ("gunshi", "admin governance gunshi"),
+            ("governed-subject", "admin governance subject"),
+            ("attest", "admin assurance attest"),
+            ("compliance", "admin assurance compliance"),
+            ("provenance", "admin assurance provenance"),
+            ("replay", "admin assurance replay"),
+            ("federation", "admin federation"),
+        ] {
+            assert_eq!(canonical_admin_path(alias), Some(canonical));
+            assert_eq!(
+                alias_warning(alias).unwrap(),
+                format!("warning: `sekaictl {alias}` is deprecated; use `sekaictl {canonical}`")
+            );
+        }
+        for core in [
+            "ontology", "launch", "doctor", "smoke", "models", "estimate", "receipt", "report",
+            "admin",
+        ] {
+            assert_eq!(canonical_admin_path(core), None);
+            assert_eq!(alias_warning(core), None);
         }
     }
 }

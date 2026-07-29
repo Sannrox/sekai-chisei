@@ -63,4 +63,4 @@ immediately after the correction.
 
 ## Security & Configuration Tips
 
-Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. Prefer that path over the deprecated single-principal `SEKAI_AUTH_TOKEN` bootstrap. Report vulnerabilities through `SECURITY.md`.
+Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. Prefer that path over the deprecated single-principal `SEKAI_AUTH_TOKEN` bootstrap. Report vulnerabilities through `SECURITY.md`.

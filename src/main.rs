@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if config.auth_token.is_some() {
         tracing::warn!(
-            "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl credential create instead"
+            "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl admin access credential create instead"
         );
     }
 

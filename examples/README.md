@@ -121,7 +121,7 @@ The example honors the same environment variables as the server:
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | Port to connect to |
 | `SEKAI_SOCKET` | unset | Unix socket path to connect to instead of TCP |
-| `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request (deprecated fallback to principal `root`; prefer per-principal tokens from `sekaictl credential ...`) |
+| `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request (deprecated fallback to principal `root`; prefer per-principal tokens from `sekaictl admin access credential ...`) |
 | `SEKAI_PRINCIPAL` | `demo-client` | Caller identity (`x-principal`) sent in request metadata |
 | `DEMO_MODEL` | `ollama/llama3.2:latest` | Model used for the live execute step |
 
