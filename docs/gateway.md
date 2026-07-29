@@ -1,6 +1,7 @@
 # Gateway and clients
 
-`chisei-gateway` lets existing model clients use Chisei governance without
+`chisei-gateway` is a protocol translator and thin policy-enforcement point. It
+lets existing model clients use Chisei governance without
 moving their sessions, tool loops, workspace state, or approval UI into the
 control plane.
 
@@ -14,8 +15,16 @@ For each request, the gateway authenticates and attributes the caller,
 preflights policy, budget, and egress decisions, resolves the provider/model,
 streams the response, and records normalized usage and audit evidence. By
 default, budget/policy preflight uses the control-plane
-`DecideGatewayExecution` RPC (Issue #163). Set `CHISEI_GATEWAY_FAT_DECIDE=0`
-to force the legacy multi-RPC CheckBudget + ResolvePolicy path.
+`DecideGatewayExecution` RPC using `gateway.decide/v2` (Issues #163 and #418).
+A configured gateway has no legacy
+multi-RPC fallback: denial or control-plane unavailability stops the request
+before provider contact. The control plane owns policy, budget, lifecycle,
+evaluation, capability, and route decisions; the gateway translates supported
+wire formats and enforces the returned decision.
+
+The v2 contract is a coordinated gateway/control-plane upgrade. Mixed v1/v2
+deployments reject admission rather than silently reconstructing missing policy
+fields at the gateway.
 
 ## Guided launch
 

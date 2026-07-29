@@ -5383,7 +5383,9 @@ impl ChiseiService for ChiseiServiceImpl {
                 ..Default::default()
             }));
         }
-        if let Err(status) = require_namespace_access(&self.db, &actor, namespace) {
+        if let Err(status) =
+            require_execution_namespace_access(&self.db, &self.config, &actor, namespace)
+        {
             let reason = if status.code() == tonic::Code::PermissionDenied {
                 GatewayDecideDenyReason::Unauthorized
             } else {
@@ -5423,38 +5425,21 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             r.project.trim()
         };
-        let preferred_runtime = r.preferred_runtime.trim();
-        let preferred_model = r.requested_model.trim();
-        let route = match self
-            .policy
-            .resolve(namespace, preferred_runtime, preferred_model)
+        let trusted_gateway = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
+        if project != namespace
+            || (!trusted_gateway
+                && ((!r.agent.trim().is_empty() && r.agent.trim() != actor)
+                    || (!r.user_id.trim().is_empty() && r.user_id.trim() != actor)
+                    || !r.key_id.trim().is_empty()))
         {
-            Ok((runtime, model)) => {
-                let policy_version = self
-                    .policy
-                    .effective_policy(namespace)
-                    .map(|policy| policy.version())
-                    .unwrap_or_default();
-                // Residency fail-closed when a policy is configured.
-                if let Err(error) = self
-                    .policy
-                    .enforce_residency(namespace, &runtime, &model, "internal")
-                {
-                    Err((GatewayDecideDenyReason::ResidencyDenied, error))
-                } else {
-                    Ok((runtime, model, policy_version))
-                }
-            }
-            Err(error) => {
-                let reason = if error.to_ascii_lowercase().contains("capabilit") {
-                    GatewayDecideDenyReason::CapabilityUnsupported
-                } else {
-                    GatewayDecideDenyReason::PolicyDenied
-                };
-                Err((reason, error))
-            }
-        };
-
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::Unauthorized.as_str().into(),
+                deny_message: "gateway decision scopes are not authorized for the caller".into(),
+                ..Default::default()
+            }));
+        }
         let budget_subject = budget_subject(
             "",
             project,
@@ -5466,11 +5451,28 @@ impl ChiseiService for ChiseiServiceImpl {
         .unwrap_or_else(|_| format!("project:{project}"));
         let estimated_tokens = r.estimated_tokens.max(0);
         let metric = crate::db::chisei_budget::METRIC_TOKENS;
-        let within_cap = self
-            .budget
-            .check_with_metric(&budget_subject, estimated_tokens, metric)
-            .is_ok();
-        let route_bias = self
+        let token_budget_check =
+            self.budget
+                .check_with_metric(&budget_subject, estimated_tokens, metric);
+        let request_budget_check = self.budget.check_with_metric(
+            &budget_subject,
+            i32::try_from(r.expected_calls.max(1)).unwrap_or(i32::MAX),
+            crate::db::chisei_budget::METRIC_REQUESTS,
+        );
+        let within_cap = token_budget_check.is_ok() && request_budget_check.is_ok();
+        let decision_budget_scope = request_budget_check
+            .as_ref()
+            .err()
+            .or_else(|| token_budget_check.as_ref().err())
+            .as_ref()
+            .and_then(|error| {
+                error
+                    .strip_prefix("budget exceeded at ")
+                    .and_then(|rest| rest.split_once(": used"))
+                    .map(|(scope, _)| scope.to_string())
+            })
+            .unwrap_or_else(|| budget_subject.clone());
+        let mut route_bias = self
             .budget
             .route_bias(
                 &budget_subject,
@@ -5480,6 +5482,23 @@ impl ChiseiService for ChiseiServiceImpl {
             )
             .as_str()
             .to_string();
+        let continuation_started = !r.work_unit.trim().is_empty()
+            && active_continuation_allocation(
+                &self.db,
+                r.work_unit.trim(),
+                &[
+                    actor.as_str(),
+                    r.agent.as_str(),
+                    r.key_id.as_str(),
+                    r.user_id.as_str(),
+                ],
+                chrono::Utc::now().timestamp_millis(),
+            )
+            && self
+                .budget
+                .get_usage_with_metric(&budget_subject, metric)
+                .tokens_used
+                > 0;
         let (budget_allowed, degradation_level, budget_warning) = if within_cap {
             (
                 true,
@@ -5490,13 +5509,81 @@ impl ChiseiService for ChiseiServiceImpl {
                 },
                 false,
             )
-        } else if metric == crate::db::chisei_budget::METRIC_TOKENS
+        } else if request_budget_check.is_ok() && continuation_started {
+            (true, "warn", true)
+        } else if request_budget_check.is_ok()
             && r.local_free_available
             && crate::chisei::model_routing::is_cheap_eligible_task_class(r.task_class.trim())
         {
-            (false, "local_free", true)
+            route_bias = "local_free".to_string();
+            // The canonical decision may admit only after policy resolution
+            // proves that this recommendation resolves to a local-free model.
+            // The gateway independently rejects any non-local result.
+            (true, "local_free", true)
         } else {
             (false, "hard_cap", true)
+        };
+
+        // Keep the gateway decision on the same policy-resolution path as
+        // direct ResolvePolicy clients. The retired edge fallback previously
+        // supplied scoped policies, eval regressions, lifecycle checks, and
+        // canonical live-model resolution; the canonical PDP must preserve
+        // those semantics itself.
+        let mut policy_request = Request::new(ResolvePolicyRequest {
+            namespace: namespace.to_string(),
+            preferred_runtime: r.preferred_runtime.trim().to_string(),
+            preferred_model: r.requested_model.trim().to_string(),
+            subject: String::new(),
+            project: project.to_string(),
+            agent: r.agent.trim().to_string(),
+            key_id: r.key_id.trim().to_string(),
+            task_class: r.task_class.trim().to_string(),
+            user_id: r.user_id.trim().to_string(),
+            expected_calls: r.expected_calls.max(1),
+            budget_route_bias: route_bias.clone(),
+            route_override: r.route_override.trim().to_string(),
+            capability_requirements_json: r.capability_requirements_json.clone(),
+        });
+        if let Ok(principal) = actor.parse() {
+            policy_request
+                .metadata_mut()
+                .insert("x-principal", principal);
+        }
+        let (route, policy_resolution) = match self.resolve_policy(policy_request).await {
+            Ok(response) => match response.into_inner().resolution {
+                Some(resolution) => {
+                    if !resolution.route_bias.trim().is_empty() {
+                        route_bias = resolution.route_bias.clone();
+                    }
+                    (
+                        Ok((
+                            resolution.runtime.clone(),
+                            resolution.model.clone(),
+                            resolution.policy_version.clone(),
+                        )),
+                        Some(resolution),
+                    )
+                }
+                None => (
+                    Err((
+                        GatewayDecideDenyReason::PolicyDenied,
+                        "policy resolution returned no decision".into(),
+                    )),
+                    None,
+                ),
+            },
+            Err(status) => {
+                let reason = match status.code() {
+                    tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
+                    tonic::Code::FailedPrecondition => {
+                        GatewayDecideDenyReason::CapabilityUnsupported
+                    }
+                    tonic::Code::PermissionDenied => GatewayDecideDenyReason::ResidencyDenied,
+                    tonic::Code::InvalidArgument => GatewayDecideDenyReason::PolicyDenied,
+                    _ => GatewayDecideDenyReason::PolicyDenied,
+                };
+                (Err((reason, status.message().to_string())), None)
+            }
         };
 
         let grant = budget_grant_id(
@@ -5508,7 +5595,7 @@ impl ChiseiService for ChiseiServiceImpl {
             request: domain_request.clone(),
             route,
             budget_allowed,
-            budget_scope: budget_subject.clone(),
+            budget_scope: decision_budget_scope.clone(),
             budget_grant_id: grant.clone(),
             route_bias: route_bias.clone(),
             degradation_level: degradation_level.into(),
@@ -5523,11 +5610,30 @@ impl ChiseiService for ChiseiServiceImpl {
             resolved_runtime: String::new(),
             resolved_model: String::new(),
             policy_version: String::new(),
-            budget_scope: budget_subject.clone(),
+            budget_scope: decision_budget_scope.clone(),
             budget_grant_id: grant,
             route_bias,
             degradation_level: degradation_level.into(),
             budget_warning,
+            policy_scope: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.policy_scope.clone())
+                .unwrap_or_default(),
+            data_class: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.data_class.clone())
+                .unwrap_or_default(),
+            fallback_models: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.fallback_models.clone())
+                .unwrap_or_default(),
+            eval_regressed: policy_resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.eval_regressed),
+            eval_regression_reason: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.eval_regression_reason.clone())
+                .unwrap_or_default(),
         };
         match &composed.outcome {
             GatewayDecideOutcome::Admit(admit) => {
@@ -15641,6 +15747,10 @@ mod tests {
             key_id: String::new(),
             work_unit: String::new(),
             local_free_available: false,
+            user_id: "local".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
         });
         admit
             .metadata_mut()
@@ -15653,8 +15763,56 @@ mod tests {
         assert!(admitted.admitted, "{admitted:?}");
         assert_eq!(admitted.resolved_model, "gpt-5.5");
         assert_eq!(admitted.resolved_runtime, "openai");
+        assert_eq!(admitted.policy_scope, "team-a");
+        assert_eq!(admitted.data_class, "unclassified");
+        assert_eq!(
+            admitted.fallback_models,
+            vec!["openai/gpt-5.5", "openai/gpt-5.5-mini"]
+        );
+        assert!(!admitted.eval_regressed);
         assert!(admitted.deny_reason.is_empty());
         assert!(!admitted.budget_grant_id.is_empty());
+
+        svc.budget
+            .set_limit_with_metric(
+                "project:team-a",
+                crate::db::chisei_budget::METRIC_REQUESTS,
+                1,
+                crate::chisei::budget::PeriodType::Daily,
+            )
+            .unwrap();
+        let mut request_budget_denied = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "op-decide-request-budget".into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "local".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: true,
+            user_id: "local".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 2,
+        });
+        request_budget_denied
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let request_budget_denied = svc
+            .decide_gateway_execution(request_budget_denied)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!request_budget_denied.admitted);
+        assert_eq!(request_budget_denied.deny_reason, "budget_denied");
+        assert_eq!(request_budget_denied.budget_scope, "project:team-a");
 
         // Non-bootstrap principal without a grant fails closed (unauthorized).
         let mut denied = Request::new(DecideGatewayExecutionRequest {
@@ -15673,6 +15831,10 @@ mod tests {
             key_id: String::new(),
             work_unit: String::new(),
             local_free_available: false,
+            user_id: "mallory".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
         });
         denied
             .metadata_mut()
