@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&backend),
         active_credentials,
         grpc_tcp_mode,
-    );
+    )?;
     let result = {
         let _runtime_guard = async_runtime.enter();
         async_runtime.block_on(run_server(server))

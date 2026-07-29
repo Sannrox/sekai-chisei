@@ -359,33 +359,34 @@ pub fn run(
     backend: Arc<RuntimeBackend>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
-) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
+) -> Result<
+    impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Box<dyn std::error::Error>,
+> {
     // This setup deliberately executes when `run` is called, before the
     // returned future is polled. The PostgreSQL backend uses synchronous
     // clients, so service construction must not acquire or release them from
     // inside Tokio.
-    let prepared = (|| -> Result<_, std::io::Error> {
-        backend
-            .capabilities()
-            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
-            .map_err(std::io::Error::other)?;
-        let db = backend.database();
-        let provider_registry_state_path =
-            crate::provider_profile::provider_registry_state_path(&config.db_path);
-        let credential_store = Arc::new(PrincipalCredentialStore::new());
-        credential_store.load(&active_credentials);
+    let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
+        (|| -> Result<_, std::io::Error> {
+            backend
+                .capabilities()
+                .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+                .map_err(std::io::Error::other)?;
+            let db = backend.database();
+            let provider_registry_state_path =
+                crate::provider_profile::provider_registry_state_path(&config.db_path);
+            let credential_store = Arc::new(PrincipalCredentialStore::new());
+            credential_store.load(&active_credentials);
 
-        if let Some(socket_path) = config.sekai_socket.as_deref() {
-            ensure_local_gateway_credential(socket_path, &db)?;
-        }
-        let services = build_services(&config, db.clone());
-        Ok((db, provider_registry_state_path, credential_store, services))
-    })();
+            if let Some(socket_path) = config.sekai_socket.as_deref() {
+                ensure_local_gateway_credential(socket_path, &db)?;
+            }
+            let services = build_services(&config, db.clone());
+            Ok((db, provider_registry_state_path, credential_store, services))
+        })()?;
 
-    async move {
-        let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
-            prepared?;
-
+    Ok(async move {
         spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
 
         if let Some(ops_port) = config.ops_port {
@@ -457,7 +458,7 @@ pub fn run(
             health_service,
         )
         .await
-    }
+    })
 }
 
 fn ensure_local_gateway_credential(
@@ -772,6 +773,32 @@ mod tests {
         config.tls_key = None;
         config.allow_plaintext = false;
         config
+    }
+
+    #[test]
+    fn run_returns_setup_errors_before_the_server_future_is_polled() {
+        let parent_file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = base_config();
+        config.sekai_socket = Some(
+            parent_file
+                .path()
+                .join("sekai.sock")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let backend = Arc::new(
+            RuntimeBackend::from_sqlite_with_enterprise_extension(":memory:", None).unwrap(),
+        );
+        let tcp_mode = GrpcTcpMode {
+            bind_addr: "127.0.0.1".into(),
+            token_auth_mode: false,
+            auth_configured: false,
+            bind_inferred_from_active_credentials: false,
+        };
+
+        let result = run(config, backend, Vec::new(), tcp_mode);
+
+        assert!(result.is_err());
     }
 
     #[test]
