@@ -1,0 +1,23 @@
+[package]
+name = "sekai-admin-client"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Provider-neutral administration client for Sekai Chisei."
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sekai-provider = { version = "0.1.0", path = "../sekai-provider" }
+sekai-proto = { version = "0.1.0", path = "../sekai-proto" }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+sekai-chisei = { version = "0.1.0", path = "../..", features = ["gateway-test-support"] }
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
