@@ -233,9 +233,22 @@ impl PostgresDb {
         let manager = PostgresConnectionManager::new(config, tls);
         let pool = Pool::builder()
             .max_size(max_connections)
+            // The synchronous postgres client owns an internal Tokio runtime.
+            // Establish the configured pool before the application runtime
+            // starts so request-time acquisition never initializes a client
+            // from an async executor thread.
+            .min_idle(Some(max_connections))
             .connection_timeout(Duration::from_secs(10))
             .build(manager)
             .map_err(|error| format!("connect to PostgreSQL: {error}"))?;
+        let mut prewarmed = Vec::with_capacity(max_connections as usize);
+        for _ in 0..max_connections {
+            prewarmed.push(
+                pool.get()
+                    .map_err(|error| format!("prewarm PostgreSQL pool: {error}"))?,
+            );
+        }
+        drop(prewarmed);
         let db = Self { pool };
         db.migrate()?;
         Ok(db)
@@ -564,6 +577,13 @@ mod tests {
                 .unwrap_err()
                 .contains("greater than zero")
         );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn prewarms_configured_connections_before_returning() {
+        let database = test_database();
+        assert_eq!(database.pool_state(), (4, 4));
     }
 
     #[test]
