@@ -1,18 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 
-use crate::db::chisei_budget::METRIC_REQUESTS;
+use crate::gateway_support::METRIC_REQUESTS;
 
-use crate::grpc::client::GatewayClient;
+use crate::client::GatewayClient;
 use chrono::Utc;
 use tonic::Request as GrpcRequest;
 
+use crate::client::connect_sekai;
 use crate::gateway_keys::{default_virtual_key, hash_gateway_key};
-use crate::grpc::client::connect_sekai;
-use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::grpc::pb::chisei::{SetBudgetLimitRequest, SetNamespacePolicyRequest};
-use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use crate::grpc::pb::sekai::{
+use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+use sekai_proto::chisei::{SetBudgetLimitRequest, SetNamespacePolicyRequest};
+use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_proto::sekai::{
     ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest, Dataset,
     FindByExternalIdRequest, Link, ListFilter, ListObjectsRequest, Object, UpdateDatasetRequest,
     UpdateObjectRequest,
@@ -878,7 +878,8 @@ async fn ensure_llm_calls_dataset(
         .map(|name| ColumnDef {
             name: name.to_string(),
             r#type: "string".to_string(),
-            classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
+            classification: crate::gateway_support::llm_call_column_classification(name)
+                .to_string(),
         })
         .collect();
 
@@ -978,14 +979,14 @@ pub fn key_usage() -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::db::runtime_db::RuntimeDb;
-    use crate::db::sekai::SekaiDb;
-    use crate::grpc::chisei_service::ChiseiServiceImpl;
-    use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-    use crate::grpc::pb::chisei::chisei_service_server::ChiseiServiceServer;
-    use crate::grpc::pb::chisei::{CheckBudgetRequest, ResolvePolicyRequest};
-    use crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
-    use crate::grpc::sekai_service::SekaiServiceImpl;
+    use crate::test_support::chisei_service::ChiseiServiceImpl;
+    use crate::test_support::runtime_db::RuntimeDb;
+    use crate::test_support::sekai_db::SekaiDb;
+    use crate::test_support::sekai_service::SekaiServiceImpl;
+    use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+    use sekai_proto::chisei::chisei_service_server::ChiseiServiceServer;
+    use sekai_proto::chisei::{CheckBudgetRequest, ResolvePolicyRequest};
+    use sekai_proto::sekai::sekai_service_server::SekaiServiceServer;
     use std::sync::Arc;
     use tonic::transport::Server;
 
