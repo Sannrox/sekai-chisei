@@ -3,8 +3,7 @@ use sekai_chisei::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use std::sync::Arc;
 use tokio::signal;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     sekai_chisei::obs::logging::init();
     let config = Config::from_env();
     if let Some(mode) = std::env::args().nth(1)
@@ -85,6 +84,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "LLM providers configured"
     );
 
+    // PostgreSQL uses the synchronous `postgres` client internally. Keep its
+    // pool construction and final owner outside Tokio so client setup and
+    // teardown never try to block an already-running async runtime.
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = async_runtime.block_on(run_server(
+        config,
+        Arc::clone(&backend),
+        active_credentials,
+        grpc_tcp_mode,
+    ));
+    drop(async_runtime);
+    drop(backend);
+    result
+}
+
+async fn run_server(
+    config: Config,
+    backend: Arc<RuntimeBackend>,
+    active_credentials: Vec<sekai_chisei::db::sekai::PrincipalCredential>,
+    grpc_tcp_mode: sekai_chisei::config::GrpcTcpMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let server = sekai_chisei::grpc::run(config, backend, active_credentials, grpc_tcp_mode);
     let shutdown = async {
         signal::ctrl_c().await.ok();
