@@ -386,6 +386,8 @@ pub fn run(
         let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
             prepared?;
 
+        spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
+
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
                 &config.ops_bind,
@@ -666,6 +668,15 @@ fn build_services(
         budget,
     ));
 
+    (sekai_svc, chisei_svc)
+}
+
+fn spawn_service_background_tasks(
+    config: &Config,
+    db: Arc<RuntimeDb>,
+    sekai_svc: &Arc<sekai_service::SekaiServiceImpl>,
+    chisei_svc: &Arc<chisei_service::ChiseiServiceImpl>,
+) {
     if config.scoring_enabled {
         tracing::info!(
             model = %config.scoring_model,
@@ -681,8 +692,6 @@ fn build_services(
         );
     }
     spawn_execution_evidence_reconciler(db);
-
-    (sekai_svc, chisei_svc)
 }
 
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
