@@ -23,6 +23,7 @@ reference pages.
 | [Parked-work resolution](410-parked-work-resolution.md) | Design for durable continuation input and fenced resumption |
 | [External-action permit lifecycle surface](420-external-permit-lifecycle-surface.md) | Retain explicit lifecycle RPCs; consolidation would widen trust boundaries without removing implementation paths |
 | [Gateway administration single-source boundary](421-gateway-administration-single-source.md) | Extract shared setup and reporting into a leaf administration-client crate after façade cleanup |
+| [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Retain through 0.2.0; earliest removal is 0.3.0 after reviewed TCP administrator bootstrap/recovery and a distinct client token input |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
