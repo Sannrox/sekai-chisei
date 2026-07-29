@@ -1,4 +1,4 @@
-//! sekaictl compliance export/verify commands (#297).
+//! sekaictl admin assurance compliance export/verify commands (#297).
 
 use crate::compliance_export::{
     ComplianceExportBundle, ComplianceExportRequest, RedactionMode, compliance_bundle_bytes,
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl compliance verify <bundle> [--trusted-key <file>]\n  sekaictl compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl compliance list-trust-roots --namespace <ns>"
+    "sekaictl admin assurance compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance verify <bundle> [--trusted-key <file>]\n  sekaictl admin assurance compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin assurance compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin assurance compliance list-trust-roots --namespace <ns>"
 }
 
 pub async fn run_compliance_command(args: Vec<String>) -> Result<(), BoxErr> {

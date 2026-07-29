@@ -317,7 +317,7 @@ pub fn render_operation_workspace(report: &OperationReport) -> String {
     <summary>Show authorized report projection (no raw credential material)</summary>
     <pre class="json-panel">{json}</pre>
   </details>
-  <p class="stub">Export compliance bundles and full attestation via <code>sekaictl report bundle</code> / <code>sekaictl attest</code>.</p>
+  <p class="stub">Export compliance bundles and full attestation via <code>sekaictl report bundle</code> / <code>sekaictl admin assurance attest</code>.</p>
 </section>"#,
         op = escape_html(&report.operation_id),
         ns = escape_html(&report.namespace),

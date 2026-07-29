@@ -283,7 +283,7 @@ pub async fn run_team_join(config: TeamJoinConfig) -> Result<TeamJoinBundle, Str
 }
 
 pub fn usage() -> &'static str {
-    "Usage: sekaictl team join --namespace <name> --principal <name> [--role viewer|editor|admin] [--shared-budget <tokens>] [--delegated-budget <tokens>] [--budget-period day|week|month] [--target <url-or-socket>] [--allow-plaintext] [--rotate-existing]"
+    "Usage: sekaictl admin access team join --namespace <name> --principal <name> [--role viewer|editor|admin] [--shared-budget <tokens>] [--delegated-budget <tokens>] [--budget-period day|week|month] [--target <url-or-socket>] [--allow-plaintext] [--rotate-existing]"
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), String> {

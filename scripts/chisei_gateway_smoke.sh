@@ -275,7 +275,7 @@ ANTHROPIC_API_KEY="control-plane-anthropic-smoke-key" \
 PIDS+=("$!")
 wait_for_file "$SOCKET"
 
-SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" gateway setup \
+SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" admin gateway setup \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key-name codex-app \
@@ -286,7 +286,7 @@ SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" gateway setup \
   --default-model gpt-5.5 \
   --allowed-model gpt-5.5 >"$TMPDIR/setup-codex.log" 2>&1
 
-SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" gateway setup \
+SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" admin gateway setup \
   --agent claude-code \
   --project default \
   --gateway-key-name claude-code \

@@ -1,4 +1,4 @@
-//! `sekaictl action` CLI: manage governed-action policy and approvals (Plan 9).
+//! `sekaictl admin governance action` CLI: manage governed-action policy and approvals (Plan 9).
 //!
 //! Connects to the sekai control plane (via `CHISEI_GRPC_URL` or `SEKAI_SOCKET`,
 //! defaulting to the local UDS) and drives the action-policy and approval RPCs.
@@ -15,14 +15,14 @@ type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> String {
     [
-        "sekaictl action policy set --scope <scope> [--default allow|deny|require_approval]",
+        "sekaictl admin governance action policy set --scope <scope> [--default allow|deny|require_approval]",
         "                           [--action <name>=<decision>]... [--risk <class>=<decision>]...",
         "                           [--max-mutations <n>] [--max-deletes <n>]",
-        "sekaictl action policy get --scope <scope>",
-        "sekaictl action policy list",
-        "sekaictl action approvals list [--status pending|approved|denied|all]",
-        "sekaictl action approvals approve --id <approval_id>",
-        "sekaictl action approvals deny --id <approval_id> [--reason <text>]",
+        "sekaictl admin governance action policy get --scope <scope>",
+        "sekaictl admin governance action policy list",
+        "sekaictl admin governance action approvals list [--status pending|approved|denied|all]",
+        "sekaictl admin governance action approvals approve --id <approval_id>",
+        "sekaictl admin governance action approvals deny --id <approval_id> [--reason <text>]",
     ]
     .join("\n")
 }

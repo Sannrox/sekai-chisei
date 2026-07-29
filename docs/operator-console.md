@@ -25,7 +25,7 @@ V1 console surfaces are complete: shell (#284), Operations (#285), Pressure
 2. Create a principal credential when not using the deprecated root token:
 
    ```bash
-   cargo run --bin sekaictl -- credential create alice
+   cargo run --bin sekaictl -- admin access credential create alice
    # note the printed token; store it like any other API secret
    ```
 

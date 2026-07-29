@@ -24,7 +24,7 @@ receipt**. The CLI implements that loop without raw gRPC:
 SEKAI_INSECURE=1 cargo run
 
 # Optional: create a principal credential when not using insecure mode.
-# cargo run --bin sekaictl -- credential create operator
+# cargo run --bin sekaictl -- admin access credential create operator
 
 # Apply a domain document (classes + relations). Non-builtin mapped_kind values
 # are ensured as ObjectTypes before the ontology class is created.

@@ -12,7 +12,7 @@ Operators use `sekaictl`; agents and SDKs use the same core gRPC and capability
 catalog interfaces. The control plane owns durable facts and the decisions that
 constrain an operation. It does not replace the agent runtime.
 
-> **Project status:** early-stage (`v0.1.0`). The core server, local graph,
+> **Project status:** early-stage (`v0.2.0`). The core server, local graph,
 > ontology-first product loop, policy pipeline, receipts, and native execution
 > APIs work today. Public APIs may change before v1.0.
 
@@ -190,6 +190,7 @@ Start with the [documentation index](docs/README.md), or go directly to:
   for Codex, Claude Code, and provider-compatible clients;
 - [Docker](docs/docker.md) — container quick start and transport choices;
 - [Vision](VISION.md) — product direction and non-goals; and
+- [Changelog](CHANGELOG.md) — release changes and required migrations;
 - [Contributing](CONTRIBUTING.md) — development workflow and review
   expectations;
 - [Support](SUPPORT.md) — questions, bug reports, design proposals, and private

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl governed-subject software-release <candidate.json> --namespace <name> --request-id <id> [--evaluation-profile <profile>] [--target <url-or-socket>]"
+    "sekaictl admin governance subject software-release <candidate.json> --namespace <name> --request-id <id> [--evaluation-profile <profile>] [--target <url-or-socket>]"
 }
 
 pub async fn run(args: Vec<String>) -> Result<(), BoxErr> {
