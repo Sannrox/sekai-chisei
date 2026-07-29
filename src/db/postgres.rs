@@ -241,6 +241,14 @@ impl PostgresDb {
             .connection_timeout(Duration::from_secs(10))
             .build(manager)
             .map_err(|error| format!("connect to PostgreSQL: {error}"))?;
+        let mut prewarmed = Vec::with_capacity(max_connections as usize);
+        for _ in 0..max_connections {
+            prewarmed.push(
+                pool.get()
+                    .map_err(|error| format!("prewarm PostgreSQL pool: {error}"))?,
+            );
+        }
+        drop(prewarmed);
         let db = Self { pool };
         db.migrate()?;
         Ok(db)
