@@ -25,33 +25,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 use tracing::{error, info, warn};
 
-use crate::chisei::receipt::{
-    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
-    ReceiptEventKind, UncoveredSurface,
-};
-use crate::db::chisei_budget::METRIC_REQUESTS;
-use crate::gateway_keys::hash_gateway_key;
 #[cfg(test)]
-use crate::grpc::client::connect_sekai;
-use crate::grpc::client::{
+use crate::client::connect_sekai;
+use crate::client::{
     GatewayClient, connect_sekai_as_gateway_with_timeout, connect_sekai_with_timeout,
 };
-use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::grpc::pb::chisei::{
-    CheckBudgetRequest, CheckBudgetResponse, ClaimGatewayRequestAliasDispatchRequest,
-    CompareRunsRequest, DecideGatewayExecutionRequest, EvalRun, GatewayAuditEvent,
-    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
-    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
-    RecordSampleObservationRequest, RecordUsageRequest, ReserveGatewayRequestAliasRequest,
-    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
-};
-use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use crate::grpc::pb::sekai::{
-    AppendRowsRequest, ColumnDef, ContextRoot as SekaiContextRoot, CreateDatasetRequest,
-    CreateLinkRequest, CreateObjectRequest, Dataset, FindByExternalIdRequest,
-    FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest,
-    RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
-};
+use crate::gateway_keys::hash_gateway_key;
+use crate::gateway_support::METRIC_REQUESTS;
 use crate::llm::HttpTimeouts;
 use crate::pricing::lookup_pricing_entry;
 pub use crate::pricing::{ModelPricing, parse_pricing_table};
@@ -61,6 +41,26 @@ use crate::provider_profile::{
     provider_registry_state_path, refresh_provider_registry, resolve_provider_id,
     update_registry_lifecycle_async, validate_provider_registry_storage,
     validate_registry_lifecycle_update, validate_responses_request_fields,
+};
+use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+use sekai_proto::chisei::{
+    CheckBudgetRequest, CheckBudgetResponse, ClaimGatewayRequestAliasDispatchRequest,
+    CompareRunsRequest, DecideGatewayExecutionRequest, EvalRun, GatewayAuditEvent,
+    GetEvalRunRequest, GetEvalSuiteRequest, GetLatestEvalIterationRequest,
+    PipelineRequest as ChiseiPipelineRequest, RecordGatewayAuditRequest,
+    RecordSampleObservationRequest, RecordUsageRequest, ReserveGatewayRequestAliasRequest,
+    ResolvePolicyRequest, RunPipelineRequest, SampleObservation,
+};
+use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_proto::sekai::{
+    AppendRowsRequest, ColumnDef, ContextRoot as SekaiContextRoot, CreateDatasetRequest,
+    CreateLinkRequest, CreateObjectRequest, Dataset, FindByExternalIdRequest,
+    FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest,
+    RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
+};
+use sekai_provider::receipt::{
+    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    ReceiptEventKind, UncoveredSurface,
 };
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
@@ -2158,7 +2158,7 @@ fn canary_admission_allowed(identity: &IdentityContext, headers: &HeaderMap) -> 
     identity.upstream_auth == UpstreamAuthMode::GatewayKey
         && identity.identity.tier == "low-risk"
         && header_str(headers, &X_CHISEI_TASK_CLASS)
-            .is_some_and(crate::chisei::model_routing::is_cheap_eligible_task_class)
+            .is_some_and(crate::gateway_support::is_cheap_eligible_task_class)
 }
 
 async fn proxy_gateway_inner_scoped(
@@ -2178,7 +2178,7 @@ async fn proxy_gateway_inner_scoped(
                 "capability discovery requires GET",
             );
         }
-        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+        let discovery = sekai_provider::model_availability::ModelDiscoveryConfig {
             openai_base_url: state.config.openai_base_url.clone(),
             openai_api_key: state.config.openai_api_key.clone(),
             anthropic_base_url: state.config.anthropic_base_url.clone(),
@@ -2191,7 +2191,7 @@ async fn proxy_gateway_inner_scoped(
             native_configured: state.config.native_base_url.is_some(),
         };
         let availability =
-            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
+            sekai_provider::model_availability::refresh_model_availability(&discovery, false).await;
         let mut response = json_response(
             StatusCode::OK,
             serde_json::to_value(CapabilityMatrix::with_model_availability(availability))
@@ -2218,7 +2218,7 @@ async fn proxy_gateway_inner_scoped(
                 .find_map(|pair| pair.strip_prefix("provider="))
                 .map(str::to_string)
         });
-        let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
+        let discovery = sekai_provider::model_availability::ModelDiscoveryConfig {
             openai_base_url: state.config.openai_base_url.clone(),
             openai_api_key: state.config.openai_api_key.clone(),
             anthropic_base_url: state.config.anthropic_base_url.clone(),
@@ -2231,7 +2231,7 @@ async fn proxy_gateway_inner_scoped(
             native_configured: state.config.native_base_url.is_some(),
         };
         let availability =
-            crate::chisei::model_availability::refresh_model_availability(&discovery, false).await;
+            sekai_provider::model_availability::refresh_model_availability(&discovery, false).await;
         let mut response = json_response(
             StatusCode::OK,
             serde_json::to_value(availability.public_models(provider.as_deref()))
@@ -6991,7 +6991,7 @@ async fn apply_context_egress(
             .filter(|field| !requested_fields.contains(field))
             .count();
 
-        let mut eligible_record = crate::chisei::egress::new_record(&domain_object);
+        let mut eligible_record = crate::egress::new_record(&domain_object);
         let eligible_values = eligible_fields
             .iter()
             .filter_map(|field| {
@@ -7012,7 +7012,7 @@ async fn apply_context_egress(
             eligible_context_chars += eligible_line.chars().count();
         }
 
-        let mut record = crate::chisei::egress::new_record(&domain_object);
+        let mut record = crate::egress::new_record(&domain_object);
         let mut included_fields = Vec::new();
         for field in requested_fields {
             if let Some(value) = filter_gateway_context_property(
@@ -7234,7 +7234,7 @@ async fn apply_context_egress(
 }
 
 fn restricted_gateway_fields(
-    types: Vec<crate::grpc::pb::sekai::ObjectType>,
+    types: Vec<sekai_proto::sekai::ObjectType>,
 ) -> HashMap<String, std::collections::HashSet<String>> {
     types
         .into_iter()
@@ -7243,7 +7243,7 @@ fn restricted_gateway_fields(
                 .properties
                 .into_iter()
                 .filter(|property| {
-                    crate::sekai::schema::is_restricted_property_classification(
+                    crate::gateway_support::is_restricted_property_classification(
                         &property.classification,
                     )
                 })
@@ -7258,7 +7258,7 @@ fn filter_gateway_context_property(
     object: &crate::domain::Object,
     field: &str,
     restricted_fields: Option<&std::collections::HashSet<String>>,
-    record: &mut crate::chisei::egress::ContextEgressRecord,
+    record: &mut crate::egress::ContextEgressRecord,
 ) -> Option<String> {
     if restricted_fields.is_some_and(|restricted| restricted.contains(field))
         && object.properties.contains_key(field)
@@ -7269,7 +7269,7 @@ fn filter_gateway_context_property(
             .push(format!("{field} denied by schema classification"));
         return None;
     }
-    crate::chisei::egress::filter_property(object, field, record, true)
+    crate::egress::filter_property(object, field, record, true)
 }
 
 fn inject_gateway_context(
@@ -7770,7 +7770,7 @@ fn format_gateway_object_context(
     object: &crate::domain::Object,
     included_fields: &[String],
 ) -> String {
-    if crate::chisei::egress::include_identity(object) {
+    if crate::egress::include_identity(object) {
         format!(
             "object {} ({}) [{}] {}",
             object.kind,
@@ -10325,7 +10325,8 @@ async fn ensure_llm_calls_dataset(
         .map(|name| ColumnDef {
             name: name.to_string(),
             r#type: "string".to_string(),
-            classification: crate::sekai::dataset::llm_call_column_classification(name).to_string(),
+            classification: crate::gateway_support::llm_call_column_classification(name)
+                .to_string(),
         })
         .collect();
 
@@ -14648,7 +14649,7 @@ mod tests {
             key.clone(),
             &CheckBudgetResponse {
                 allowed: true,
-                usage: Some(crate::grpc::pb::chisei::BudgetUsage {
+                usage: Some(sekai_proto::chisei::BudgetUsage {
                     user_id: request.user_id.clone(),
                     tokens_used: 20,
                     max_tokens: 100,
@@ -14720,7 +14721,7 @@ mod tests {
             key.clone(),
             &CheckBudgetResponse {
                 allowed: true,
-                usage: Some(crate::grpc::pb::chisei::BudgetUsage {
+                usage: Some(sekai_proto::chisei::BudgetUsage {
                     user_id: request.user_id.clone(),
                     tokens_used: 0,
                     max_tokens: 0,
@@ -16339,22 +16340,22 @@ mod tests {
     }
 
     use crate::config::Config;
-    use crate::db::runtime_db::RuntimeDb;
-    use crate::db::sekai::SekaiDb;
-    use crate::grpc::chisei_service::ChiseiServiceImpl;
-    use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-    use crate::grpc::pb::chisei::chisei_service_server::ChiseiServiceServer;
-    use crate::grpc::pb::chisei::{
-        CaseResult, CreateEvalRunRequest, CreateEvalSuiteRequest, EvalCase, EvalRun, EvalSuite,
-        SetBudgetLimitRequest, SetNamespacePolicyRequest,
-    };
-    use crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
-    use crate::grpc::sekai_service::SekaiServiceImpl;
-    use crate::sekai::dataset::RowQuery;
+    use crate::test_support::chisei_service::ChiseiServiceImpl;
+    use crate::test_support::dataset::RowQuery;
+    use crate::test_support::runtime_db::RuntimeDb;
+    use crate::test_support::sekai_db::SekaiDb;
+    use crate::test_support::sekai_service::SekaiServiceImpl;
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::any;
+    use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+    use sekai_proto::chisei::chisei_service_server::ChiseiServiceServer;
+    use sekai_proto::chisei::{
+        CaseResult, CreateEvalRunRequest, CreateEvalSuiteRequest, EvalCase, EvalRun, EvalSuite,
+        SetBudgetLimitRequest, SetNamespacePolicyRequest,
+    };
+    use sekai_proto::sekai::sekai_service_server::SekaiServiceServer;
     use std::collections::HashSet;
     use std::sync::Mutex;
     use tonic::transport::Server;
@@ -18052,7 +18053,7 @@ mod tests {
         drop(requests);
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.eval_regression".to_string()),
                 ..Default::default()
             })
@@ -18154,7 +18155,7 @@ mod tests {
         );
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.model_rewrite".to_string()),
                 ..Default::default()
             })
@@ -18517,7 +18518,7 @@ mod tests {
         assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("4"));
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.cross_provider_translate".to_string()),
                 ..Default::default()
             })
@@ -18755,7 +18756,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("provider").map(String::as_str), Some("ollama"));
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.cross_provider_translate".into()),
                 ..Default::default()
             })
@@ -19077,7 +19078,7 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.auth_failed".to_string()),
                 ..Default::default()
             })
@@ -19601,7 +19602,7 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.budget_denied".to_string()),
                 ..Default::default()
             })
@@ -19658,7 +19659,7 @@ mod tests {
         assert_eq!(rejection.status, StatusCode::FORBIDDEN);
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.policy_denied".into()),
                 ..Default::default()
             })
@@ -19728,7 +19729,7 @@ mod tests {
         let decisions = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let decisions = db
-                    .list_decisions(&crate::sekai::audit::DecisionFilter {
+                    .list_decisions(&crate::test_support::audit::DecisionFilter {
                         action: Some("gateway.budget_warning".to_string()),
                         ..Default::default()
                     })
@@ -19818,7 +19819,7 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.budget_denied".to_string()),
                 ..Default::default()
             })
@@ -19864,7 +19865,7 @@ mod tests {
             properties: HashMap::from([
                 ("verdict".to_string(), "bullish".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score".to_string(),
                 ),
                 ("score".to_string(), "0.82".to_string()),
@@ -19918,7 +19919,7 @@ mod tests {
         drop(requests);
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.egress".to_string()),
                 ..Default::default()
             })
@@ -19974,7 +19975,7 @@ mod tests {
                 ("score".to_string(), "0.82".to_string()),
                 ("secret_note".to_string(), "do not forward".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score,verdict".to_string(),
                 ),
             ]),
@@ -20030,7 +20031,7 @@ mod tests {
         drop(requests);
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.egress".to_string()),
                 ..Default::default()
             })
@@ -20088,7 +20089,7 @@ mod tests {
                 ("score".to_string(), "0.82".to_string()),
                 ("verdict".to_string(), "bullish".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score,verdict".to_string(),
                 ),
             ]),
@@ -20161,7 +20162,7 @@ mod tests {
             properties: HashMap::from([
                 ("score".to_string(), "0.82".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score".to_string(),
                 ),
             ]),
@@ -20185,7 +20186,7 @@ mod tests {
                     "Cross-check the filing date".to_string(),
                 ),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "title,prevention".to_string(),
                 ),
             ]),
@@ -20302,7 +20303,7 @@ mod tests {
         }
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.egress".to_string()),
                 ..Default::default()
             })
@@ -20347,7 +20348,7 @@ mod tests {
             properties: HashMap::from([
                 ("score".to_string(), "0.99".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score".to_string(),
                 ),
             ]),
@@ -20355,11 +20356,11 @@ mod tests {
             updated: 0,
         })
         .unwrap();
-        db.create_grant(&crate::sekai::security::Grant {
+        db.create_grant(&crate::test_support::security::Grant {
             id: "private-ticker-grant".to_string(),
             object_id: "private-ticker".to_string(),
             principal: "agent:other".to_string(),
-            role: crate::sekai::security::Role::Viewer,
+            role: crate::test_support::security::Role::Viewer,
             created: 0,
         })
         .unwrap();
@@ -20502,7 +20503,7 @@ mod tests {
             properties: HashMap::from([
                 ("score".into(), "0.82".into()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.into(),
                     "score".into(),
                 ),
             ]),
@@ -20543,7 +20544,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&egress.body).unwrap();
         assert!(body["input"].as_str().unwrap().contains("[Object context]"));
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.egress".into()),
                 ..Default::default()
             })
@@ -20571,7 +20572,7 @@ mod tests {
             properties: HashMap::from([
                 ("verdict".to_string(), "do not forward".to_string()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.to_string(),
                     "score".to_string(),
                 ),
                 ("score".to_string(), "0.91".to_string()),
@@ -20782,7 +20783,7 @@ mod tests {
         assert_eq!(links[0].to_id, llm_call.id);
 
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::test_support::audit::DecisionFilter {
                 action: Some("gateway.sampled".to_string()),
                 ..Default::default()
             })
@@ -21541,23 +21542,23 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             properties: HashMap::from([
                 ("secret_note".into(), "do not forward".into()),
                 (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                    crate::egress::EXTERNAL_PROPERTIES_KEY.into(),
                     "secret_note".into(),
                 ),
             ]),
             created: 0,
             updated: 0,
         };
-        let restricted = restricted_gateway_fields(vec![crate::grpc::pb::sekai::ObjectType {
+        let restricted = restricted_gateway_fields(vec![sekai_proto::sekai::ObjectType {
             kind: "account".into(),
-            properties: vec![crate::grpc::pb::sekai::PropertyDef {
+            properties: vec![sekai_proto::sekai::PropertyDef {
                 name: "secret_note".into(),
                 classification: "sensitive".into(),
                 ..Default::default()
             }],
             ..Default::default()
         }]);
-        let mut record = crate::chisei::egress::new_record(&object);
+        let mut record = crate::egress::new_record(&object);
 
         assert_eq!(
             filter_gateway_context_property(

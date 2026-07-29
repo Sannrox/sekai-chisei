@@ -5,11 +5,11 @@ use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use tonic::Request as GrpcRequest;
 
-use crate::grpc::client::{GatewayClient, connect_sekai};
-use crate::grpc::pb::chisei::CheckBudgetRequest;
-use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use crate::grpc::pb::sekai::{QueryRowsRequest, Row, RowFilter, RowQuery};
+use crate::client::{GatewayClient, connect_sekai};
+use sekai_proto::chisei::CheckBudgetRequest;
+use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_proto::sekai::{QueryRowsRequest, Row, RowFilter, RowQuery};
 
 const LLM_CALLS_DATASET: &str = "llm_calls";
 

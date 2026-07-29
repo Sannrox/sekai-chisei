@@ -71,7 +71,7 @@ pub fn filter_property_with_schema(
                         .find(|property| property.name == field)
                 })
                 .is_none_or(|property| {
-                    !crate::sekai::schema::is_restricted_property_classification(
+                    !crate::gateway_support::is_restricted_property_classification(
                         &property.classification,
                     )
                 }));
