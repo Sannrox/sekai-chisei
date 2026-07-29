@@ -81,7 +81,6 @@ const X_CHISEI_TASK_ID: HeaderName = HeaderName::from_static("x-chisei-task-id")
 const X_CHISEI_TASK_CLASS: HeaderName = HeaderName::from_static("x-chisei-task-class");
 const X_CHISEI_ADMISSION: HeaderName = HeaderName::from_static("x-chisei-admission");
 const X_CHISEI_DATA_CLASS: HeaderName = HeaderName::from_static("x-chisei-data-class");
-const X_CHISEI_ACTION_RISK: HeaderName = HeaderName::from_static("x-chisei-action-risk");
 const X_CHISEI_ROUTE_OVERRIDE: HeaderName = HeaderName::from_static("x-chisei-route-override");
 const X_CHISEI_OPERATION_ID: HeaderName = HeaderName::from_static("x-chisei-operation-id");
 const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
@@ -95,16 +94,12 @@ const X_CHISEI_RETRY_SAFETY: HeaderName = HeaderName::from_static("x-chisei-retr
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
-const DEFAULT_GOVERNANCE_CACHE_TTL_SECS: u64 = 300;
 const READINESS_PROBE_CACHE_SECS: u64 = 5;
 const PROVIDER_REGISTRY_REFRESH_TTL_MS: u64 = 250;
-const MAX_EGRESS_CACHE_ENTRIES: usize = 128;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
 const STREAM_FORWARD_CHANNEL_CAPACITY: usize = 32;
 const STREAM_FORWARD_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_EGRESS_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CACHED_EGRESS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BUDGET_RECONCILIATIONS: usize = 4096;
 const DEFAULT_AUDIT_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_CONTROL_PLANE_RETRIES: u32 = 2;
@@ -130,7 +125,6 @@ pub struct GatewayConfig {
     pub ollama_base_url: String,
     pub native_base_url: Option<String>,
     pub chisei_grpc_target: Option<String>,
-    pub fail_closed: bool,
     pub default_project: String,
     pub gateway_keys: HashMap<String, GatewayIdentity>,
     pub allow_auth_passthrough: bool,
@@ -200,10 +194,6 @@ impl GatewayConfig {
             std::env::var("CHISEI_GRPC_URL").ok(),
             std::env::var("SEKAI_SOCKET").ok(),
         )?;
-        let fail_closed = matches!(
-            std::env::var("GATEWAY_GOVERNANCE_FAILURE").as_deref(),
-            Ok("closed") | Ok("fail-closed") | Ok("1") | Ok("true")
-        );
         let default_project =
             std::env::var("GATEWAY_DEFAULT_PROJECT").unwrap_or_else(|_| "default".to_string());
         let gateway_keys = parse_gateway_keys(
@@ -227,7 +217,6 @@ impl GatewayConfig {
         validate_gateway_security(
             bind_addr,
             &gateway_keys,
-            fail_closed,
             allow_auth_passthrough,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
         )?;
@@ -241,7 +230,6 @@ impl GatewayConfig {
             ollama_base_url,
             native_base_url,
             chisei_grpc_target: Some(chisei_grpc_target),
-            fail_closed,
             default_project,
             gateway_keys,
             allow_auth_passthrough,
@@ -266,7 +254,6 @@ fn required_control_plane_target(
 fn validate_gateway_security(
     bind_addr: SocketAddr,
     gateway_keys: &HashMap<String, GatewayIdentity>,
-    fail_closed: bool,
     allow_auth_passthrough: bool,
     admin_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -284,9 +271,6 @@ fn validate_gateway_security(
             return Err(
                 "an exposed gateway requires at least one authenticated GATEWAY_KEYS entry".into(),
             );
-        }
-        if !fail_closed {
-            return Err("an exposed gateway requires GATEWAY_GOVERNANCE_FAILURE=closed".into());
         }
         if allow_auth_passthrough {
             return Err(
@@ -360,51 +344,6 @@ struct GatewayState {
     runtime: GatewayRuntime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GovernanceFailurePosture {
-    data_class: String,
-    action_risk: String,
-    fail_closed: bool,
-}
-
-impl GovernanceFailurePosture {
-    fn from_request(
-        config: &GatewayConfig,
-        identity: &GatewayIdentity,
-        headers: &HeaderMap,
-    ) -> Self {
-        let data_class = header_str(headers, &X_CHISEI_DATA_CLASS)
-            .map(normalize_governance_label)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
-        let action_risk = header_str(headers, &X_CHISEI_ACTION_RISK)
-            .map(normalize_governance_label)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".to_string());
-        // Only an operator-managed gateway identity can opt into the narrow
-        // availability exception. Caller-provided labels can make that posture
-        // stricter, but can never grant fail-open authority by themselves.
-        let trusted_low_risk_identity = identity.tier == "low-risk";
-        let fail_closed = config.fail_closed
-            || !trusted_low_risk_identity
-            || data_class != "unclassified"
-            || !matches!(action_risk.as_str(), "low" | "read");
-        Self {
-            data_class,
-            action_risk,
-            fail_closed,
-        }
-    }
-
-    fn evidence(&self) -> HashMap<String, String> {
-        HashMap::from([
-            ("data_class".to_string(), self.data_class.clone()),
-            ("action_risk".to_string(), self.action_risk.clone()),
-            ("fail_closed".to_string(), self.fail_closed.to_string()),
-        ])
-    }
-}
-
 fn normalize_governance_label(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
@@ -434,7 +373,6 @@ struct GatewayRuntime {
     rate_limit_window: Duration,
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
     governance_cache: Arc<RwLock<GovernanceCache>>,
-    governance_cache_ttl: Duration,
     budget_reconciliation_path: Option<PathBuf>,
     budget_reconciliation_lock: Arc<Mutex<()>>,
     provider_registry_state_path: Option<PathBuf>,
@@ -451,8 +389,6 @@ struct GatewayRuntime {
     readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
     upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
     resilience: ResilienceConfig,
-    spooled_audit_events: Arc<AtomicU64>,
-    last_degraded_at_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -573,7 +509,6 @@ impl CircuitBreakerState {
 
 #[derive(Default)]
 struct GovernanceCache {
-    egress: HashMap<String, CachedEgressDecision>,
     pending_budget_usage: HashMap<String, RecordUsageRequest>,
     budget_reconciliation_saturated: bool,
 }
@@ -623,40 +558,6 @@ impl From<PendingBudgetUsage> for RecordUsageRequest {
     }
 }
 
-#[derive(Clone)]
-struct CachedEgressDecision {
-    body: Vec<u8>,
-    cached_at: Instant,
-}
-
-trait TimedGovernanceDecision {
-    fn cached_at(&self) -> Instant;
-}
-
-impl TimedGovernanceDecision for CachedEgressDecision {
-    fn cached_at(&self) -> Instant {
-        self.cached_at
-    }
-}
-
-fn prune_timed_cache<T: TimedGovernanceDecision>(
-    cache: &mut HashMap<String, T>,
-    ttl: Duration,
-    max_entries: usize,
-) {
-    cache.retain(|_, entry| entry.cached_at().elapsed() < ttl);
-    while cache.len() >= max_entries {
-        let Some(oldest) = cache
-            .iter()
-            .max_by_key(|(_, entry)| entry.cached_at().elapsed())
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest);
-    }
-}
-
 impl GatewayRuntime {
     fn from_env() -> Self {
         let key_cache_ttl = std::env::var("CHISEI_GATEWAY_KEY_CACHE_TTL_SECS")
@@ -664,11 +565,6 @@ impl GatewayRuntime {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS));
-        let governance_cache_ttl = std::env::var("CHISEI_GATEWAY_GOVERNANCE_CACHE_TTL_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS));
         let resilience = ResilienceConfig {
             control_plane_retries: env_u32(
                 "CHISEI_GATEWAY_CONTROL_PLANE_RETRIES",
@@ -699,7 +595,6 @@ impl GatewayRuntime {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
         )
-        .with_governance_cache_ttl(governance_cache_ttl)
         .with_resilience(resilience)
         .with_budget_reconciliation_path(Some(PathBuf::from(
             std::env::var("CHISEI_GATEWAY_BUDGET_RECONCILIATION_PATH")
@@ -745,7 +640,6 @@ impl GatewayRuntime {
             rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             governance_cache: Arc::new(RwLock::new(GovernanceCache::default())),
-            governance_cache_ttl: Duration::from_secs(DEFAULT_GOVERNANCE_CACHE_TTL_SECS),
             budget_reconciliation_path: None,
             budget_reconciliation_lock: Arc::new(Mutex::new(())),
             provider_registry_state_path: None,
@@ -764,14 +658,7 @@ impl GatewayRuntime {
             readiness_probe: Arc::new(Mutex::new(None)),
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
             resilience: ResilienceConfig::default(),
-            spooled_audit_events: Arc::new(AtomicU64::new(0)),
-            last_degraded_at_ms: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    fn with_governance_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.governance_cache_ttl = ttl;
-        self
     }
 
     fn with_http_timeouts(mut self, http_timeouts: HttpTimeouts) -> Self {
@@ -881,12 +768,6 @@ impl GatewayRuntime {
     }
     fn with_audit_spool_path(mut self, path: Option<PathBuf>) -> Self {
         self.audit_spool_path = path;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_audit_spool_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.audit_spool_max_bytes = max_bytes.max(1);
         self
     }
 }
@@ -1074,14 +955,7 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
     let cache = state.runtime.governance_cache.read().await;
     let pending_budget_reconciliations = cache.pending_budget_usage.len();
     let budget_reconciliation_saturated = cache.budget_reconciliation_saturated;
-    let cached_governance_decisions = cache.egress.len();
     drop(cache);
-    let last_degraded_at_ms = state.runtime.last_degraded_at_ms.load(Ordering::Relaxed);
-    let recently_degraded = last_degraded_at_ms > 0
-        && Utc::now()
-            .timestamp_millis()
-            .saturating_sub(last_degraded_at_ms as i64)
-            <= state.runtime.governance_cache_ttl.as_millis() as i64;
     let provider_health = {
         let mut circuits = state.runtime.upstream_circuits.write().await;
         circuits
@@ -1105,7 +979,6 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
         serde_json::json!({
             "status": if circuit_open
                 || provider_circuit_open
-                || recently_degraded
                 || pending_budget_reconciliations > 0
                 || budget_reconciliation_saturated
             {
@@ -1114,11 +987,8 @@ async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
                 "live"
             },
             "control_plane_circuit_open": circuit_open,
-            "cached_governance_decisions": cached_governance_decisions,
             "pending_budget_reconciliations": pending_budget_reconciliations,
             "budget_reconciliation_saturated": budget_reconciliation_saturated,
-            "spooled_audit_events": state.runtime.spooled_audit_events.load(Ordering::Relaxed),
-            "last_degraded_at_ms": last_degraded_at_ms,
             "provider_health": provider_health
         }),
     )
@@ -1206,7 +1076,6 @@ pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Erro
     validate_gateway_security(
         config.bind_addr,
         &config.gateway_keys,
-        config.fail_closed,
         config.allow_auth_passthrough,
         runtime.admin_token.as_deref(),
     )?;
@@ -1248,9 +1117,7 @@ async fn refresh_gateway_admin(
     let cleared_entries = key_cache.len();
     key_cache.clear();
     drop(key_cache);
-    let mut governance_cache = state.runtime.governance_cache.write().await;
-    let cleared_governance_entries = governance_cache.egress.len();
-    governance_cache.egress.clear();
+    let governance_cache = state.runtime.governance_cache.read().await;
     let pending_budget_reconciliations = governance_cache.pending_budget_usage.len();
     drop(governance_cache);
     record_gateway_event(
@@ -1259,16 +1126,10 @@ async fn refresh_gateway_admin(
         "gateway.admin_refresh",
         "gateway key cache refreshed",
         "allowed",
-        HashMap::from([
-            (
-                "cleared_key_cache_entries".to_string(),
-                cleared_entries.to_string(),
-            ),
-            (
-                "cleared_governance_cache_entries".to_string(),
-                cleared_governance_entries.to_string(),
-            ),
-        ]),
+        HashMap::from([(
+            "cleared_key_cache_entries".to_string(),
+            cleared_entries.to_string(),
+        )]),
     )
     .await;
     json_response(
@@ -1276,7 +1137,6 @@ async fn refresh_gateway_admin(
         serde_json::json!({
             "refreshed": true,
             "cleared_key_cache_entries": cleared_entries,
-            "cleared_governance_cache_entries": cleared_governance_entries,
             "pending_budget_reconciliations": pending_budget_reconciliations
         }),
     )
@@ -2278,8 +2138,10 @@ async fn proxy_gateway_inner_scoped(
     let requested_profile = requested_registry_model
         .as_ref()
         .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
-    let failure_posture =
-        GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
+    let caller_data_class = header_str(&headers, &X_CHISEI_DATA_CLASS)
+        .map(normalize_governance_label)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
     let mut preflight_context = UsageContext {
         request_id: request_id.clone(),
         // The client alias is not owned until durable reservation succeeds.
@@ -2323,7 +2185,7 @@ async fn proxy_gateway_inner_scoped(
         policy_scope: None,
         policy_version: None,
         task_class: task_class.clone(),
-        data_class: failure_posture.data_class.clone(),
+        data_class: caller_data_class.clone(),
         request_hash: request_hash.clone(),
         budget_subject: None,
         budget_status: "not_evaluated".into(),
@@ -2450,7 +2312,6 @@ async fn proxy_gateway_inner_scoped(
         requested_model.as_deref(),
         &request_id,
         work_unit_id.as_deref(),
-        &failure_posture,
     )
     .await
     {
@@ -2468,7 +2329,7 @@ async fn proxy_gateway_inner_scoped(
         }
     };
     let classification_exempt_metadata_request = model_metadata_request && uri.query().is_none();
-    if failure_posture.data_class == "sensitive"
+    if caller_data_class == "sensitive"
         && !classification_exempt_metadata_request
         && resolved.data_class.as_deref() != Some("sensitive")
     {
@@ -2726,10 +2587,7 @@ async fn proxy_gateway_inner_scoped(
             policy_scope: resolved.policy_scope.clone(),
             policy_version: resolved.policy_version.clone(),
             task_class,
-            data_class: effective_data_class(
-                &failure_posture.data_class,
-                resolved.data_class.as_deref(),
-            ),
+            data_class: effective_data_class(&caller_data_class, resolved.data_class.as_deref()),
             request_hash,
             budget_subject: budget
                 .as_ref()
@@ -3394,7 +3252,6 @@ async fn apply_gateway_decision(
     requested_model: Option<&str>,
     request_id: &str,
     work_unit_id: Option<&str>,
-    failure_posture: &GovernanceFailurePosture,
 ) -> Result<
     (
         PolicyPreflight,
@@ -3560,7 +3417,6 @@ async fn apply_gateway_decision(
         resolved.resolved_model.as_deref(),
         request_id,
         work_unit_id,
-        failure_posture,
     )
     .await?;
     Ok((resolved, egress, Some(budget)))
@@ -4075,127 +3931,6 @@ async fn reconcile_pending_budget_usage(
     // intentionally sticky: only operator reconciliation plus restart can
     // safely restore admissions without silently accepting an undercount.
     Ok(reconciled)
-}
-
-fn egress_cache_key(
-    identity: &GatewayIdentity,
-    provider: ProviderKind,
-    body: &[u8],
-    context_request: Option<&GatewayContextRequest>,
-) -> String {
-    let context = context_request
-        .map(|request| format!("{request:?}"))
-        .unwrap_or_default();
-    let body_digest = format!("{:x}", Sha256::digest(body));
-    governance_cache_key(&[
-        "egress-v1",
-        &identity.project,
-        identity.context_principal(),
-        &identity.user_id,
-        &identity.agent,
-        &identity.key_id,
-        provider.runtime_name(),
-        &body_digest,
-        &context,
-    ])
-}
-
-async fn cache_egress_decision(
-    runtime: &GatewayRuntime,
-    key: String,
-    decision: &ContextEgressPreflight,
-) {
-    if decision.body.len() > MAX_CACHED_EGRESS_BODY_BYTES {
-        return;
-    }
-    let mut cache = runtime.governance_cache.write().await;
-    prune_timed_cache(
-        &mut cache.egress,
-        runtime.governance_cache_ttl,
-        MAX_EGRESS_CACHE_ENTRIES,
-    );
-    let mut cached_bytes = cache
-        .egress
-        .values()
-        .map(|entry| entry.body.len())
-        .sum::<usize>();
-    while !cache.egress.is_empty()
-        && cached_bytes.saturating_add(decision.body.len()) > MAX_EGRESS_CACHE_BYTES
-    {
-        let Some(oldest) = cache
-            .egress
-            .iter()
-            .max_by_key(|(_, entry)| entry.cached_at.elapsed())
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        if let Some(removed) = cache.egress.remove(&oldest) {
-            cached_bytes = cached_bytes.saturating_sub(removed.body.len());
-        }
-    }
-    cache.egress.insert(
-        key,
-        CachedEgressDecision {
-            body: decision.body.clone(),
-            cached_at: Instant::now(),
-        },
-    );
-}
-
-async fn cached_egress_decision(
-    runtime: &GatewayRuntime,
-    key: &str,
-) -> Option<ContextEgressPreflight> {
-    use crate::obs::labels::{Cache, CacheOutcome};
-
-    let cache = runtime.governance_cache.read().await;
-    let Some(cached) = cache.egress.get(key) else {
-        crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Miss);
-        return None;
-    };
-    if cached.cached_at.elapsed() >= runtime.governance_cache_ttl {
-        crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Evicted);
-        return None;
-    }
-    crate::obs::signals::record_cache_event(Cache::GatewayGovernance, CacheOutcome::Hit);
-    Some(ContextEgressPreflight {
-        body: cached.body.clone(),
-    })
-}
-
-async fn invalidate_cached_egress(runtime: &GatewayRuntime, key: &str) {
-    runtime.governance_cache.write().await.egress.remove(key);
-}
-
-async fn fail_open_egress(
-    config: &GatewayConfig,
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    body: &[u8],
-    reason: &str,
-    failure_posture: &GovernanceFailurePosture,
-) -> Result<ContextEgressPreflight, GatewayRejection> {
-    if !record_resilience_decision(
-        config,
-        runtime,
-        identity,
-        "gateway.egress_unavailable",
-        reason,
-        "fail_open",
-        failure_posture.evidence(),
-    )
-    .await
-    {
-        return Err(GatewayRejection::json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_audit_unavailable",
-            "cannot forward without a durable governance audit record",
-        ));
-    }
-    Ok(ContextEgressPreflight {
-        body: body.to_vec(),
-    })
 }
 
 const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
@@ -5270,46 +5005,13 @@ async fn apply_context_egress(
     resolved_model: Option<&str>,
     request_id: &str,
     work_unit_id: Option<&str>,
-    failure_posture: &GovernanceFailurePosture,
 ) -> Result<ContextEgressPreflight, GatewayRejection> {
-    let cache_key = egress_cache_key(identity, provider, body, context_request);
     let Some(target) = &config.chisei_grpc_target else {
-        if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-            if !record_resilience_decision(
-                config,
-                runtime,
-                identity,
-                "gateway.egress_last_known",
-                "control-plane governance is not configured",
-                "enforced",
-                HashMap::new(),
-            )
-            .await
-            {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_audit_unavailable",
-                    "cannot use last-known egress without a durable audit record",
-                ));
-            }
-            return Ok(decision);
-        }
-        if context_request.is_some() {
-            return Err(GatewayRejection::json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "governance_unavailable",
-                "explicit governed context requires a configured control plane",
-            ));
-        }
-        return fail_open_egress(
-            config,
-            runtime,
-            identity,
-            body,
-            "control-plane governance is not configured",
-            failure_posture,
-        )
-        .await;
+        return Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            "context egress requires a configured control plane",
+        ));
     };
     let selections = context_request
         .map(|request| request.objects.clone())
@@ -5327,47 +5029,13 @@ async fn apply_context_egress(
             body: body.to_vec(),
         });
     }
-    let channel = match connect_governance(runtime, target).await {
-        Ok(channel) => channel,
-        Err(error) => {
-            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                if !record_resilience_decision(
-                    config,
-                    runtime,
-                    identity,
-                    "gateway.egress_last_known",
-                    &format!("control plane unavailable: {error}"),
-                    "enforced",
-                    HashMap::new(),
-                )
-                .await
-                {
-                    return Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "governance_audit_unavailable",
-                        "cannot use last-known egress without a durable audit record",
-                    ));
-                }
-                return Ok(decision);
-            }
-            if context_request.is_some() || failure_posture.fail_closed {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    format!("failed to resolve governed context: {error}"),
-                ));
-            }
-            return fail_open_egress(
-                config,
-                runtime,
-                identity,
-                body,
-                &format!("control plane unavailable: {error}"),
-                failure_posture,
-            )
-            .await;
-        }
-    };
+    let channel = connect_governance(runtime, target).await.map_err(|error| {
+        GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "governance_unavailable",
+            format!("failed to resolve governed context: {error}"),
+        )
+    })?;
     let mut chisei = ChiseiServiceClient::new(channel.clone());
     let mut sekai = SekaiServiceClient::new(channel);
     let requested_retrieval = context_request.and_then(|request| request.retrieval.as_ref());
@@ -5386,48 +5054,12 @@ async fn apply_context_egress(
     {
         Ok(response) => restricted_gateway_fields(response.into_inner().types),
         Err(status) => {
-            if !is_transient_governance_status(&status) {
-                invalidate_cached_egress(runtime, &cache_key).await;
+            if is_transient_governance_status(&status) {
+                record_control_plane_failure(runtime, &status).await;
+            } else {
                 record_control_plane_success(runtime).await;
-                return Err(governance_status_rejection(&status));
             }
-            record_control_plane_failure(runtime, &status).await;
-            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                if !record_resilience_decision(
-                    config,
-                    runtime,
-                    identity,
-                    "gateway.egress_last_known",
-                    &format!("context schema unavailable: {status}"),
-                    "enforced",
-                    HashMap::new(),
-                )
-                .await
-                {
-                    return Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "governance_audit_unavailable",
-                        "cannot use last-known egress without a durable audit record",
-                    ));
-                }
-                return Ok(decision);
-            }
-            if context_request.is_some() || failure_posture.fail_closed {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    format!("failed to resolve context schema: {status}"),
-                ));
-            }
-            return fail_open_egress(
-                config,
-                runtime,
-                identity,
-                body,
-                &format!("context schema unavailable: {status}"),
-                failure_posture,
-            )
-            .await;
+            return Err(governance_status_rejection(&status));
         }
     };
     let resolution = match resolve_gateway_context(
@@ -5444,7 +5076,6 @@ async fn apply_context_egress(
             resolution
         }
         Err(status) if status.code() == tonic::Code::InvalidArgument => {
-            invalidate_cached_egress(runtime, &cache_key).await;
             record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::BAD_REQUEST,
@@ -5455,7 +5086,6 @@ async fn apply_context_egress(
         Err(status)
             if context_request.is_some() && status.code() == tonic::Code::PermissionDenied =>
         {
-            invalidate_cached_egress(runtime, &cache_key).await;
             record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::FORBIDDEN,
@@ -5464,7 +5094,6 @@ async fn apply_context_egress(
             ));
         }
         Err(status) if context_request.is_some() && status.code() == tonic::Code::NotFound => {
-            invalidate_cached_egress(runtime, &cache_key).await;
             record_control_plane_success(runtime).await;
             return Err(GatewayRejection::json(
                 StatusCode::NOT_FOUND,
@@ -5473,48 +5102,12 @@ async fn apply_context_egress(
             ));
         }
         Err(status) => {
-            if !is_transient_governance_status(&status) {
-                invalidate_cached_egress(runtime, &cache_key).await;
+            if is_transient_governance_status(&status) {
+                record_control_plane_failure(runtime, &status).await;
+            } else {
                 record_control_plane_success(runtime).await;
-                return Err(governance_status_rejection(&status));
             }
-            record_control_plane_failure(runtime, &status).await;
-            if let Some(decision) = cached_egress_decision(runtime, &cache_key).await {
-                if !record_resilience_decision(
-                    config,
-                    runtime,
-                    identity,
-                    "gateway.egress_last_known",
-                    &format!("context resolution unavailable: {status}"),
-                    "enforced",
-                    HashMap::new(),
-                )
-                .await
-                {
-                    return Err(GatewayRejection::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "governance_audit_unavailable",
-                        "cannot use last-known egress without a durable audit record",
-                    ));
-                }
-                return Ok(decision);
-            }
-            if context_request.is_some() || failure_posture.fail_closed {
-                return Err(GatewayRejection::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "governance_unavailable",
-                    format!("failed to resolve governed context: {status}"),
-                ));
-            }
-            return fail_open_egress(
-                config,
-                runtime,
-                identity,
-                body,
-                &format!("context resolution unavailable: {status}"),
-                failure_posture,
-            )
-            .await;
+            return Err(governance_status_rejection(&status));
         }
     };
     if context_request.is_some() && resolution.unresolved_roots > 0 {
@@ -5629,11 +5222,9 @@ async fn apply_context_egress(
         && truncated_links == 0
         && missing_field_count == 0
     {
-        let decision = ContextEgressPreflight {
+        return Ok(ContextEgressPreflight {
             body: body.to_vec(),
-        };
-        cache_egress_decision(runtime, cache_key, &decision).await;
-        return Ok(decision);
+        });
     }
     let mut rewritten = false;
     // Bound the injected object context so precision-injection never balloons
@@ -5808,9 +5399,7 @@ async fn apply_context_egress(
         ]),
     )
     .await;
-    let decision = ContextEgressPreflight { body: next_body };
-    cache_egress_decision(runtime, cache_key, &decision).await;
-    Ok(decision)
+    Ok(ContextEgressPreflight { body: next_body })
 }
 
 fn restricted_gateway_fields(
@@ -9463,17 +9052,6 @@ fn sanitize_audit_evidence(evidence: HashMap<String, String>) -> HashMap<String,
         .collect()
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct LocalGatewayAuditEvent {
-    id: String,
-    timestamp: i64,
-    actor: String,
-    action: String,
-    reason: String,
-    outcome: String,
-    evidence: HashMap<String, String>,
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum GatewayRecoveryRecord {
@@ -9753,10 +9331,6 @@ async fn replay_gateway_recovery(
     (pending, progressed, had_deferred)
 }
 
-fn bounded_audit_text(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
 fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -9767,140 +9341,6 @@ fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-async fn append_resilience_audit(
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    action: &str,
-    reason: &str,
-    outcome: &str,
-    evidence: HashMap<String, String>,
-) -> bool {
-    let Some(path) = runtime.audit_spool_path.clone() else {
-        return false;
-    };
-    let evidence = sanitize_audit_evidence(evidence)
-        .into_iter()
-        .take(32)
-        .map(|(key, value)| {
-            (
-                bounded_audit_text(&key, 128),
-                bounded_audit_text(&value, 512),
-            )
-        })
-        .collect();
-    let event = LocalGatewayAuditEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: Utc::now().timestamp_millis(),
-        actor: bounded_audit_text(&identity.agent, 256),
-        action: bounded_audit_text(action, 256),
-        reason: bounded_audit_text(reason, 1024),
-        outcome: bounded_audit_text(outcome, 128),
-        evidence,
-    };
-    let Ok(mut line) = serde_json::to_vec(&event) else {
-        return false;
-    };
-    line.push(b'\n');
-    if line.len() as u64 > runtime.audit_spool_max_bytes {
-        error!("chisei-gateway resilience audit event exceeds spool limit");
-        return false;
-    }
-    let _spool_guard = runtime.audit_spool_lock.lock().await;
-    let max_bytes = runtime.audit_spool_max_bytes;
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let current_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        if current_bytes > 0 && current_bytes.saturating_add(line.len() as u64) > max_bytes {
-            let rotated = PathBuf::from(format!("{}.1", path.display()));
-            match std::fs::remove_file(&rotated) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            std::fs::rename(&path, rotated)?;
-            sync_parent_directory(&path)?;
-        }
-        let created = !path.exists();
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&path)?;
-        file.write_all(&line)?;
-        file.sync_all()?;
-        if created {
-            sync_parent_directory(&path)?;
-        }
-        Ok(())
-    })
-    .await;
-    if matches!(result, Ok(Ok(()))) {
-        runtime.spooled_audit_events.fetch_add(1, Ordering::Relaxed);
-        runtime.last_degraded_at_ms.store(
-            Utc::now().timestamp_millis().max(0) as u64,
-            Ordering::Relaxed,
-        );
-        true
-    } else {
-        error!("chisei-gateway resilience audit spool write failed");
-        false
-    }
-}
-
-async fn record_resilience_decision(
-    config: &GatewayConfig,
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    action: &str,
-    reason: &str,
-    outcome: &str,
-    evidence: HashMap<String, String>,
-) -> bool {
-    let mut local_evidence = evidence.clone();
-    local_evidence.insert("user_id".to_string(), identity.user_id.clone());
-    local_evidence.insert("project".to_string(), identity.project.clone());
-    local_evidence.insert("tier".to_string(), identity.tier.clone());
-    if !identity.key_id.is_empty() {
-        local_evidence.insert("key_id".to_string(), identity.key_id.clone());
-    }
-    let recorded =
-        append_resilience_audit(runtime, identity, action, reason, outcome, local_evidence).await;
-    let config = config.clone();
-    let identity = identity.clone();
-    let action = action.to_string();
-    if recorded {
-        let reason = reason.to_string();
-        let outcome = outcome.to_string();
-        tokio::spawn(async move {
-            record_gateway_decision(&config, &identity, &action, &reason, &outcome, evidence).await;
-        });
-    } else {
-        let mut refusal_evidence = evidence;
-        refusal_evidence.insert("intended_outcome".to_string(), outcome.to_string());
-        refusal_evidence.insert("refusal_cause".to_string(), "audit_unavailable".to_string());
-        tokio::spawn(async move {
-            record_gateway_decision(
-                &config,
-                &identity,
-                &action,
-                "durable resilience audit unavailable; request refused",
-                "refused",
-                refusal_evidence,
-            )
-            .await;
-        });
-    }
-    recorded
 }
 
 fn gateway_request<T>(message: T) -> GrpcRequest<T> {
@@ -12482,13 +11922,12 @@ mod tests {
     fn rejects_weak_admin_tokens() {
         let bind = "127.0.0.1:8788".parse().unwrap();
         let keys = HashMap::new();
-        assert!(validate_gateway_security(bind, &keys, false, false, Some("change-me")).is_err());
-        assert!(validate_gateway_security(bind, &keys, false, false, Some("too-short")).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, Some("change-me")).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, Some("too-short")).is_err());
         assert!(
             validate_gateway_security(
                 bind,
                 &keys,
-                false,
                 false,
                 Some("0123456789abcdef0123456789abcdef"),
             )
@@ -12523,10 +11962,10 @@ mod tests {
     }
 
     #[test]
-    fn exposed_gateway_requires_keys_fail_closed_and_no_auth_passthrough() {
+    fn exposed_gateway_requires_keys_and_no_auth_passthrough() {
         let bind = "0.0.0.0:8788".parse().unwrap();
         let mut keys = HashMap::new();
-        assert!(validate_gateway_security(bind, &keys, true, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, None).is_err());
         keys.insert(
             "hash".to_string(),
             GatewayIdentity {
@@ -12537,9 +11976,8 @@ mod tests {
                 tier: DEFAULT_GATEWAY_TIER.to_string(),
             },
         );
-        assert!(validate_gateway_security(bind, &keys, false, false, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, true, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, false, None).is_ok());
+        assert!(validate_gateway_security(bind, &keys, true, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, None).is_ok());
     }
 
     #[test]
@@ -13088,7 +12526,6 @@ mod tests {
             ollama_base_url: "http://localhost:11434/v1".to_string(),
             native_base_url: Some("http://localhost:9999/v1".to_string()),
             chisei_grpc_target: None,
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
@@ -13097,60 +12534,6 @@ mod tests {
             run_pipeline: false,
             allow_cross_provider: false,
         }
-    }
-
-    #[test]
-    fn governance_failure_posture_closes_risky_classes_by_default() {
-        let config = routing_config();
-        let mut identity = GatewayIdentity {
-            agent: "safe-agent".into(),
-            project: "default".into(),
-            user_id: "agent:safe-agent".into(),
-            key_id: "safe-agent".into(),
-            tier: "low-risk".into(),
-        };
-        let mut safe_headers = HeaderMap::new();
-        safe_headers.insert(
-            &X_CHISEI_DATA_CLASS,
-            HeaderValue::from_static("unclassified"),
-        );
-        safe_headers.insert(&X_CHISEI_ACTION_RISK, HeaderValue::from_static("low"));
-        let safe = GovernanceFailurePosture::from_request(&config, &identity, &safe_headers);
-        assert_eq!(safe.data_class, "unclassified");
-        assert_eq!(safe.action_risk, "low");
-        assert!(!safe.fail_closed);
-
-        let mut classified_headers = HeaderMap::new();
-        classified_headers.insert(&X_CHISEI_DATA_CLASS, HeaderValue::from_static("sensitive"));
-        assert!(
-            GovernanceFailurePosture::from_request(&config, &identity, &classified_headers)
-                .fail_closed
-        );
-
-        let mut risky_headers = HeaderMap::new();
-        risky_headers.insert(
-            &X_CHISEI_ACTION_RISK,
-            HeaderValue::from_static("destructive"),
-        );
-        assert!(
-            GovernanceFailurePosture::from_request(&config, &identity, &risky_headers).fail_closed
-        );
-
-        assert!(
-            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
-                .fail_closed
-        );
-
-        identity.tier = DEFAULT_GATEWAY_TIER.into();
-        assert!(
-            GovernanceFailurePosture::from_request(&config, &identity, &safe_headers).fail_closed
-        );
-
-        identity.tier = "untrusted".into();
-        assert!(
-            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new())
-                .fail_closed
-        );
     }
 
     #[tokio::test]
@@ -13309,46 +12692,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_egress_bodies_are_not_cached() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-        cache_egress_decision(
-            &runtime,
-            "oversized".into(),
-            &ContextEgressPreflight {
-                body: vec![b'x'; MAX_CACHED_EGRESS_BODY_BYTES + 1],
-            },
-        )
-        .await;
-        assert!(runtime.governance_cache.read().await.egress.is_empty());
-    }
-
-    #[test]
-    fn egress_cache_is_scoped_to_the_authorized_principal() {
-        let identity = |agent: &str| GatewayIdentity {
-            agent: agent.into(),
-            project: "default".into(),
-            user_id: format!("agent:{agent}"),
-            key_id: String::new(),
-            tier: "low-risk".into(),
-        };
-        let body = br#"{"model":"gpt-5.5","input":"ticker:AAPL"}"#;
-        assert_ne!(
-            egress_cache_key(
-                &identity("agent-a"),
-                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-                body,
-                None,
-            ),
-            egress_cache_key(
-                &identity("agent-b"),
-                ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
-                body,
-                None,
-            )
-        );
-    }
-
-    #[tokio::test]
     async fn gateway_recovery_spool_replays_llm_rows() {
         let directory =
             std::env::temp_dir().join(format!("chisei-recovery-{}", uuid::Uuid::new_v4()));
@@ -13436,115 +12779,6 @@ mod tests {
         );
         assert!(!recovery_path.exists());
         let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[tokio::test]
-    async fn resilience_audit_spool_is_durable_bounded_and_sanitized() {
-        let path = std::env::temp_dir().join(format!(
-            "chisei-gateway-audit-test-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_audit_spool_path(Some(path.clone()))
-            .with_audit_spool_max_bytes(4_000);
-        let identity = GatewayIdentity {
-            agent: "safe-agent".into(),
-            project: "default".into(),
-            user_id: "agent:safe-agent".into(),
-            key_id: "safe-agent".into(),
-            tier: "low-risk".into(),
-        };
-        assert!(
-            append_resilience_audit(
-                &runtime,
-                &identity,
-                "gateway.governance_unavailable",
-                &"x".repeat(2_000),
-                "fail_open",
-                HashMap::from([
-                    ("authorization".into(), "Bearer secret".into()),
-                    ("data_class".into(), "unclassified".into()),
-                ]),
-            )
-            .await
-        );
-        let contents = tokio::fs::read_to_string(&path).await.unwrap();
-        let event: LocalGatewayAuditEvent = serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(event.reason.chars().count(), 1_024);
-        assert_eq!(event.evidence.get("data_class").unwrap(), "unclassified");
-        assert!(!event.evidence.contains_key("authorization"));
-        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 1);
-        for _ in 0..5 {
-            assert!(
-                append_resilience_audit(
-                    &runtime,
-                    &identity,
-                    "gateway.governance_unavailable",
-                    &"x".repeat(2_000),
-                    "fail_open",
-                    HashMap::new(),
-                )
-                .await
-            );
-        }
-        let rotated = PathBuf::from(format!("{}.1", path.display()));
-        assert!(tokio::fs::metadata(&path).await.unwrap().len() <= 4_000);
-        assert!(tokio::fs::metadata(&rotated).await.unwrap().len() <= 4_000);
-        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 6);
-        tokio::fs::remove_file(path).await.unwrap();
-        tokio::fs::remove_file(rotated).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn durable_resilience_audit_does_not_wait_for_central_replication() {
-        // Hang the control-plane accept path so a blocking remote audit would
-        // never complete. Durable spool success must still return without
-        // waiting on that hang (fire-and-forget remote fan-out).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = routing_config();
-        config.chisei_grpc_target = Some(format!("http://{}", listener.local_addr().unwrap()));
-        let hang = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let path = std::env::temp_dir().join(format!(
-            "chisei-gateway-audit-nonblocking-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_audit_spool_path(Some(path.clone()));
-        let identity = GatewayIdentity {
-            agent: "safe-agent".into(),
-            project: "default".into(),
-            user_id: "agent:safe-agent".into(),
-            key_id: "safe-agent".into(),
-            tier: "low-risk".into(),
-        };
-
-        assert!(
-            record_resilience_decision(
-                &config,
-                &runtime,
-                &identity,
-                "gateway.governance_degraded",
-                "control-plane governance unavailable",
-                "fail_open",
-                HashMap::new(),
-            )
-            .await,
-            "spool-backed resilience audit must succeed without remote completion"
-        );
-        // Behavioral non-blocking contract: local durable evidence exists and
-        // the hang task is still outstanding (remote fan-out did not need to
-        // finish). Avoid wall-clock budgets that flake under CI load.
-        assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 1);
-        let contents = tokio::fs::read_to_string(&path).await.unwrap();
-        let event: LocalGatewayAuditEvent = serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(event.action, "gateway.governance_degraded");
-        assert_eq!(event.outcome, "fail_open");
-        assert!(!hang.is_finished());
-        hang.abort();
-        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[test]
@@ -14338,25 +13572,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_status_surfaces_recent_degraded_mode() {
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-        runtime
-            .last_degraded_at_ms
-            .store(Utc::now().timestamp_millis() as u64, Ordering::Relaxed);
-        runtime.spooled_audit_events.store(2, Ordering::Relaxed);
-        let gateway_base = spawn_gateway_with_runtime(routing_config(), runtime).await;
-        let response = reqwest::Client::new()
-            .get(format!("{gateway_base}/statusz"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["status"], "degraded");
-        assert_eq!(body["spooled_audit_events"], 2);
-    }
-
-    #[tokio::test]
     async fn gateway_status_surfaces_sticky_reconciliation_saturation() {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
         runtime
@@ -15013,7 +14228,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
                 "sk-chisei-codex-app".to_string(),
@@ -15048,7 +14262,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
                 "sk-chisei-codex-app".to_string(),
@@ -15617,7 +14830,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -15711,7 +14923,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -15758,7 +14969,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
@@ -15775,7 +14985,6 @@ mod tests {
             .header(X_CHISEI_AGENT.as_str(), "codex-app")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
             .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
-            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -15810,7 +15019,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: None,
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
@@ -15851,7 +15059,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
@@ -15868,7 +15075,6 @@ mod tests {
             .header(X_CHISEI_AGENT.as_str(), "codex-app")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
             .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
-            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .json(&serde_json::json!({
                 "model": "gpt-5.5",
                 "input": "hello"
@@ -15908,7 +15114,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: None,
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
@@ -15925,7 +15130,6 @@ mod tests {
             .header(X_CHISEI_AGENT.as_str(), "claude-code")
             .header(X_CHISEI_PROJECT.as_str(), "sekai-chisei")
             .header(X_CHISEI_DATA_CLASS.as_str(), "unclassified")
-            .header(X_CHISEI_ACTION_RISK.as_str(), "low")
             .header("anthropic-version", "2023-06-01")
             .json(&serde_json::json!({
                 "model": "claude-sonnet-4-6",
@@ -15982,7 +15186,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16086,7 +15289,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16140,7 +15342,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16206,7 +15407,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16298,7 +15498,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16364,7 +15563,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16417,7 +15615,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16502,7 +15699,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16566,7 +15762,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: None,
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16628,7 +15823,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16667,7 +15861,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16782,7 +15975,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16859,7 +16051,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -16923,7 +16114,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17007,7 +16197,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             // Passthrough mode, no OpenAI rewrite: the client credential would be
@@ -17068,7 +16257,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17137,7 +16325,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17204,7 +16391,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: None,
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys,
             allow_auth_passthrough: false,
@@ -17255,7 +16441,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys,
             allow_auth_passthrough: false,
@@ -17313,7 +16498,6 @@ mod tests {
                 native_base_url: None,
                 anthropic_api_key: Some("real-anthropic-key".to_string()),
                 chisei_grpc_target: Some(chisei_target),
-                fail_closed: true,
                 default_project: "default".to_string(),
                 gateway_keys: HashMap::new(),
                 allow_auth_passthrough: false,
@@ -17471,7 +16655,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17547,7 +16730,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-            fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
                 "sk-chisei-codex-app".to_string(),
@@ -17642,7 +16824,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17730,7 +16911,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17819,7 +16999,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -17906,7 +17085,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "sekai-chisei".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18013,7 +17191,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "sekai-chisei".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18125,7 +17302,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "sekai-chisei".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18229,7 +17405,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "sekai-chisei".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18389,7 +17564,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "sekai-chisei".to_string(),
             gateway_keys: HashMap::from([(
                 "caller-key".to_string(),
@@ -18432,7 +17606,6 @@ mod tests {
         let (chisei_target, _) = spawn_control_plane().await;
         let mut config = routing_config();
         config.chisei_grpc_target = Some(chisei_target);
-        config.fail_closed = true;
         let identity = GatewayIdentity {
             agent: "codex-app".into(),
             project: "default".into(),
@@ -18440,8 +17613,6 @@ mod tests {
             key_id: "codex-app".into(),
             tier: DEFAULT_GATEWAY_TIER.into(),
         };
-        let failure_posture =
-            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new());
         let runtime = GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None);
         let request = GatewayContextRequest {
             objects: vec![GatewayContextObject {
@@ -18463,7 +17634,6 @@ mod tests {
             Some("gpt-5.5"),
             "request-missing-context",
             None,
-            &failure_posture,
         )
         .await
         .unwrap_err();
@@ -18497,7 +17667,6 @@ mod tests {
             Some("gpt-5.5"),
             "request-missing-retrieval",
             None,
-            &failure_posture,
         )
         .await
         .unwrap_err();
@@ -18534,8 +17703,6 @@ mod tests {
             key_id: "codex-app".into(),
             tier: DEFAULT_GATEWAY_TIER.into(),
         };
-        let failure_posture =
-            GovernanceFailurePosture::from_request(&config, &identity, &HeaderMap::new());
 
         let egress = apply_context_egress(
             &config,
@@ -18549,7 +17716,6 @@ mod tests {
             Some("ollama/qwen:14b"),
             "request-split-provider-egress",
             None,
-            &failure_posture,
         )
         .await
         .unwrap();
@@ -18603,7 +17769,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18669,7 +17834,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18840,7 +18004,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target.clone()),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18902,7 +18065,6 @@ mod tests {
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -18955,7 +18117,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -19006,7 +18167,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
@@ -19061,7 +18221,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
             chisei_grpc_target: Some(chisei_target),
-            fail_closed: true,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,

@@ -29,8 +29,6 @@ services:
       - "8080:8080"
     environment:
       - GATEWAY_BIND=0.0.0.0:8080
-      # Non-loopback binds require fail-closed governance (startup hard-fails otherwise).
-      - GATEWAY_GOVERNANCE_FAILURE=closed
       - GATEWAY_KEYS=${GATEWAY_KEYS:?Set GATEWAY_KEYS to `key=agent:project` before running gateway in production and local Docker workflows}
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
@@ -48,7 +46,6 @@ services:
       # On gateway:
       #   SEKAI_AUTH_TOKEN: ${SEKAI_AUTH_TOKEN:?}
       #   GATEWAY_BIND: 0.0.0.0:8080
-      #   GATEWAY_GOVERNANCE_FAILURE: closed
       # Expose server gRPC:
       #   ports:
       #     - "50051:50051"
