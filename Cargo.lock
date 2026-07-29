@@ -229,6 +229,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "reqwest",
+ "sekai-admin-client",
  "sekai-chisei",
  "sekai-proto",
  "sekai-provider",
@@ -2171,6 +2172,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sekai-admin-client"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "hyper-util",
+ "reqwest",
+ "sekai-chisei",
+ "sekai-proto",
+ "sekai-provider",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "sekai-chisei"
 version = "0.1.0"
 dependencies = [
@@ -2203,6 +2223,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "same-file",
+ "sekai-admin-client",
  "sekai-proto",
  "sekai-provider",
  "serde",
