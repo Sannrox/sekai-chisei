@@ -16,9 +16,40 @@ use sekai_chisei::launch::{LaunchConfig, run_launch, usage as launch_usage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
         print_root_usage();
+        return Ok(());
+    }
+    if args[0] == "admin"
+        && (args.len() == 1
+            || args
+                .get(1)
+                .is_some_and(|arg| arg == "--help" || arg == "-h"))
+    {
+        print_admin_usage();
+        return Ok(());
+    }
+    if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
+        print_root_usage();
+        return Ok(());
+    }
+    let is_admin_path = args[0] == "admin";
+    let has_help = args.iter().any(|arg| arg == "--help" || arg == "-h");
+    if is_admin_path && has_help && expand_admin_args(args.clone()).is_err() {
+        print_admin_usage();
+        return Ok(());
+    }
+    args = expand_admin_args(args).map_err(|error| {
+        print_admin_usage();
+        std::io::Error::other(error)
+    })?;
+    if has_help || (is_admin_path && args.len() == 1) {
+        if let Some(usage) = expert_usage(&args[0], is_admin_path) {
+            println!("{usage}");
+        } else {
+            print_root_usage();
+        }
         return Ok(());
     }
 
@@ -359,6 +390,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
+fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
+    if args.first().map(String::as_str) != Some("admin") {
+        return Ok(args);
+    }
+
+    let replacement = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("access"), Some("credential")) => ("credential", 3),
+        (Some("access"), Some("team")) => ("team", 3),
+        (Some("gateway"), _) => ("gateway", 2),
+        (Some("governance"), Some("action")) => ("action", 3),
+        (Some("governance"), Some("memory")) => ("memory", 3),
+        (Some("governance"), Some("gunshi")) => ("gunshi", 3),
+        (Some("governance"), Some("subject")) => ("governed-subject", 3),
+        (Some("assurance"), Some("attest")) => ("attest", 3),
+        (Some("assurance"), Some("compliance")) => ("compliance", 3),
+        (Some("assurance"), Some("provenance")) => ("provenance", 3),
+        (Some("assurance"), Some("replay")) => ("replay", 3),
+        (Some("federation"), _) => ("federation", 2),
+        _ => return Err("unknown admin command".to_string()),
+    };
+
+    let mut expanded = vec![replacement.0.to_string()];
+    expanded.extend(args.drain(replacement.1..));
+    Ok(expanded)
+}
+
 async fn run_credential_command(
     args: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -475,69 +535,182 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <credential|gateway|launch|doctor|smoke|action|attest|compliance|federation|estimate|provenance|ontology|receipt|replay|report|memory|models|team|gunshi|governed-subject> ...\n"
+        "Usage: sekaictl <ontology|launch|doctor|smoke|models|estimate|receipt|report|admin> ...\n"
     );
     println!("Product loop (ontology-first):");
     println!("  {}", sekai_chisei::ontology_product_cli::usage());
     println!("  {}", sekai_chisei::ontology_inspect::usage());
-    println!("\nCredential commands:");
-    println!("  {}", credential_usage());
-    println!("\nGateway commands:");
-    println!("  sekaictl gateway setup [...]");
-    println!("  sekaictl gateway key [create|list|rotate|revoke] [...]");
-    println!("  sekaictl gateway report [...]");
     println!("\nLaunch commands:");
     println!("  {}", launch_usage());
     println!("\nDiagnostics:\n  sekaictl doctor [codex-app|claude-code]");
     println!("\nFirst governed operation (model smoke):\n  sekaictl smoke [model]");
     println!("\nCost estimate:");
     println!("  {}", estimate_usage());
-    println!("\nTeam operations:");
-    println!("  {}", sekai_chisei::team_cli::usage());
-    println!("  {}", sekai_chisei::weekly_report_cli::usage());
-    println!("\nGoverned action commands:");
-    println!("{}", sekai_chisei::action_cli::usage());
-    println!("\nReplay export:\n  {}", sekai_chisei::replay_cli::usage());
-    println!(
-        "\nAttestation commands:\n  {}",
-        sekai_chisei::attest_cli::usage()
-    );
-    println!(
-        "\nCompliance export:\n  {}",
-        sekai_chisei::compliance_cli::usage()
-    );
-    println!(
-        "\nFederation profile:\n  {}",
-        sekai_chisei::federation_cli::usage()
-    );
-    println!("\nProvenance report:\n  sekaictl provenance <work-unit>");
     println!(
         "\nOperation receipt:\n  {}",
         sekai_chisei::receipt_cli::usage()
     );
     println!(
-        "\nGoverned subject evaluation:\n  {}",
-        sekai_chisei::governed_subject_cli::usage()
-    );
-    println!(
         "\nOperation report:\n  {}",
         sekai_chisei::report_cli::usage()
     );
-    println!(
-        "\nMemory commands:\n  {}",
-        sekai_chisei::memory_cli::usage()
-    );
     println!("\nModel commands:\n  {}", sekai_chisei::models_cli::USAGE);
+    println!("\nExpert administration:\n  sekaictl admin --help");
+}
+
+fn print_admin_usage() {
     println!(
-        "\nGunshi recommendations:\n  {}",
-        sekai_chisei::gunshi_cli::usage()
+        "Usage: sekaictl admin <access|gateway|governance|assurance|federation> ...\n\
+         \n\
+         Access:\n\
+           sekaictl admin access credential ...\n\
+           sekaictl admin access team ...\n\
+         \n\
+         Gateway:\n\
+           sekaictl admin gateway ...\n\
+         \n\
+         Governance:\n\
+           sekaictl admin governance <action|memory|gunshi|subject> ...\n\
+         \n\
+         Assurance:\n\
+           sekaictl admin assurance <attest|compliance|provenance|replay> ...\n\
+         \n\
+         Federation:\n\
+           sekaictl admin federation ...\n\
+         \n\
+         Existing top-level expert commands remain exact aliases throughout 0.1.x."
     );
-    println!("\nTeam commands:\n  {}", sekai_chisei::team_cli::usage());
+}
+
+fn expert_usage(command: &str, canonical_admin_path: bool) -> Option<String> {
+    let usage = match command {
+        "credential" => credential_usage().to_string(),
+        "gateway" => gateway_usage(),
+        "action" => sekai_chisei::action_cli::usage().to_string(),
+        "memory" => sekai_chisei::memory_cli::usage().to_string(),
+        "gunshi" => sekai_chisei::gunshi_cli::usage().to_string(),
+        "governed-subject" => sekai_chisei::governed_subject_cli::usage().to_string(),
+        "attest" => sekai_chisei::attest_cli::usage().to_string(),
+        "compliance" => sekai_chisei::compliance_cli::usage().to_string(),
+        "provenance" => "usage: sekaictl provenance <work-unit>".to_string(),
+        "replay" => sekai_chisei::replay_cli::usage().to_string(),
+        "team" => format!(
+            "{}\n  {}",
+            sekai_chisei::team_cli::usage(),
+            sekai_chisei::weekly_report_cli::usage()
+        ),
+        "federation" => sekai_chisei::federation_cli::usage().to_string(),
+        _ => return None,
+    };
+    if !canonical_admin_path {
+        return Some(usage);
+    }
+
+    let canonical = match command {
+        "credential" => "admin access credential",
+        "team" => "admin access team",
+        "gateway" => "admin gateway",
+        "action" => "admin governance action",
+        "memory" => "admin governance memory",
+        "gunshi" => "admin governance gunshi",
+        "governed-subject" => "admin governance subject",
+        "attest" => "admin assurance attest",
+        "compliance" => "admin assurance compliance",
+        "provenance" => "admin assurance provenance",
+        "replay" => "admin assurance replay",
+        "federation" => "admin federation",
+        _ => unreachable!("expert command mapping is exhaustive"),
+    };
+    Some(usage.replace(
+        &format!("sekaictl {command}"),
+        &format!("sekaictl {canonical}"),
+    ))
 }
 
 fn print_gateway_usage() {
-    println!("Usage: sekaictl gateway setup|key|report ...");
-    println!("\n{}", setup_usage());
-    println!("\n{}", key_usage());
-    println!("\n{}", report_usage());
+    println!("{}", gateway_usage());
+}
+
+fn gateway_usage() -> String {
+    format!(
+        "Usage: sekaictl gateway setup|key|report ...\n\n{}\n\n{}\n\n{}",
+        setup_usage(),
+        key_usage(),
+        report_usage()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_admin_args, expert_usage};
+
+    #[test]
+    fn expands_every_canonical_admin_path_to_the_existing_dispatcher() {
+        for (canonical, expected) in [
+            (vec!["access", "credential"], "credential"),
+            (vec!["access", "team"], "team"),
+            (vec!["gateway"], "gateway"),
+            (vec!["governance", "action"], "action"),
+            (vec!["governance", "memory"], "memory"),
+            (vec!["governance", "gunshi"], "gunshi"),
+            (vec!["governance", "subject"], "governed-subject"),
+            (vec!["assurance", "attest"], "attest"),
+            (vec!["assurance", "compliance"], "compliance"),
+            (vec!["assurance", "provenance"], "provenance"),
+            (vec!["assurance", "replay"], "replay"),
+            (vec!["federation"], "federation"),
+        ] {
+            let mut args = vec!["admin".to_string()];
+            args.extend(canonical.into_iter().map(str::to_string));
+            args.push("sentinel".to_string());
+            assert_eq!(
+                expand_admin_args(args).unwrap(),
+                vec![expected.to_string(), "sentinel".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_existing_top_level_aliases_exactly() {
+        let args = vec![
+            "credential".to_string(),
+            "list".to_string(),
+            "--json".to_string(),
+        ];
+        assert_eq!(expand_admin_args(args.clone()).unwrap(), args);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unknown_admin_paths() {
+        for args in [
+            vec!["admin"],
+            vec!["admin", "access"],
+            vec!["admin", "governance", "unknown"],
+            vec!["admin", "assurance", "unknown"],
+        ] {
+            assert!(expand_admin_args(args.into_iter().map(str::to_string).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn every_admin_target_has_command_specific_help() {
+        for command in [
+            "credential",
+            "team",
+            "gateway",
+            "action",
+            "memory",
+            "gunshi",
+            "governed-subject",
+            "attest",
+            "compliance",
+            "provenance",
+            "replay",
+            "federation",
+        ] {
+            let usage = expert_usage(command, true).unwrap();
+            assert!(usage.contains("sekaictl admin "));
+            assert!(!usage.contains(&format!("sekaictl {command}")));
+        }
+    }
 }
