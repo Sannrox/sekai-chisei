@@ -96,9 +96,8 @@
     },
     {
       "id": "gateway.governance",
-      "class": "cache_allowed",
-      "max_stale_ms": 300000,
-      "notes": "Gateway may cache last-known governance with TTL; fail-open requires durable local audit spool.",
+      "class": "shared_store_required",
+      "notes": "Gateway requires live governance before provider contact; durable recovery records do not grant authorization.",
       "evidence": [
         "crates/chisei-gateway/src/gateway.rs"
       ]

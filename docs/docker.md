@@ -14,9 +14,9 @@ The exported `GATEWAY_KEYS` value must be a gateway allowlist map (`key=agent:pr
 A client request must include one of these keys via `Authorization: Bearer <key>` or
 `x-api-key: <key>`.
 
-Compose publishes the gateway on a non-loopback bind (`0.0.0.0:8080`) and therefore
-sets `GATEWAY_GOVERNANCE_FAILURE=closed`. Without fail-closed governance and at least
-one `GATEWAY_KEYS` entry, gateway startup refuses an exposed bind.
+Compose publishes the gateway on a non-loopback bind (`0.0.0.0:8080`). The gateway
+always fails closed when live governance is unavailable, and startup refuses an
+exposed bind without at least one `GATEWAY_KEYS` entry.
 
 `CHISEI_GATEWAY_ADMIN_TOKEN` protects the admin refresh endpoint (`/_chisei/admin/refresh`).
 
@@ -77,8 +77,7 @@ require TLS; the optional CA path only extends trust for a private test CA.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SEKAI_AUTH_TOKEN` | unset | Enables token auth for gRPC clients. With authenticated mode and unset `SEKAI_BIND`, TCP binds `0.0.0.0:50051` and requires TLS (`SEKAI_TLS_CERT`/`SEKAI_TLS_KEY`) or explicit `SEKAI_ALLOW_PLAINTEXT=1` |
-| `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` and `GATEWAY_GOVERNANCE_FAILURE=closed` |
-| `GATEWAY_GOVERNANCE_FAILURE` | `open` (local default); compose sets `closed` | Failure posture. Exposed (non-loopback) binds must use `closed` |
+| `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` |
 | `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume. File databases use SQLite WAL mode, so volume backups must include `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
 | `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
 | `CHISEI_GRPC_URL` | unset | Optional TCP override; when unset, the gateway uses the image's explicit `SEKAI_SOCKET=/data/sekai.sock` setting |
@@ -101,8 +100,7 @@ For TCP transport, set `SEKAI_AUTH_TOKEN` on server and gateway, point the gatew
 `CHISEI_GRPC_URL=http://server:50051`, and publish `50051` in compose (see comments in
 `docker-compose.yml`). Public `0.0.0.0` TCP also requires `SEKAI_TLS_CERT` and
 `SEKAI_TLS_KEY`, or an explicit `SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext
-deployment, or an explicit loopback `SEKAI_BIND`. Keep
-`GATEWAY_GOVERNANCE_FAILURE=closed` whenever the gateway bind is non-loopback.
+deployment, or an explicit loopback `SEKAI_BIND`.
 
 ## Container tasks on shared state
 

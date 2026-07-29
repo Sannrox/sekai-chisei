@@ -87,8 +87,8 @@ readinessProbe:
 ```
 
 The gateway has separate `/healthz`, `/readyz`, and `/statusz` endpoints.
-`/statusz` exposes live/degraded posture and aggregate cache, circuit,
-reconciliation, and spool counts.
+`/statusz` exposes live/degraded posture and aggregate circuit and usage
+reconciliation state.
 
 ## Persistence and backups
 
@@ -97,8 +97,8 @@ includes the database plus its `-wal` and `-shm` sidecars from one consistent
 snapshot. Prefer SQLite's `VACUUM INTO` for an online logical backup.
 
 Also preserve state files configured for provider registry lifecycle, gateway
-budget reconciliation, and degraded audit spooling. Test restore procedures,
-not only backup creation.
+usage reconciliation, and durable receipt, usage, and refusal recovery. Test
+restore procedures, not only backup creation.
 
 Audit history is not purged automatically. High-churn deployments should define
 a retention policy and invoke `purge_old_records` with an explicit cutoff.
@@ -110,18 +110,17 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
   `sekaictl gateway key create`. Control-plane `sekaictl credential create`
   tokens are for gRPC principals, not gateway HTTP keys.
 - Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
-  `GATEWAY_KEYS` entry, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable
-  `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
+  `GATEWAY_KEYS` entry and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
   Startup fails closed if those gates are missing.
 - Set `CHISEI_GRPC_URL` or `SEKAI_SOCKET`; gateway startup fails without a
   control-plane target and every provider request requires live admission.
-- Set `GATEWAY_GOVERNANCE_FAILURE=closed` on loopback when availability must
-  never override governance.
 - Protect the admin refresh endpoint with a random
   `CHISEI_GATEWAY_ADMIN_TOKEN` of at least 32 bytes; it is disabled when unset.
-- Keep the durable audit spool writable (default
-  `data/chisei-gateway-audit.jsonl` relative to process CWD). A fail-open
-  decision is refused when it cannot be recorded.
+- Keep the durable recovery spool writable. Its default base path is
+  `data/chisei-gateway-audit.jsonl` relative to process CWD, and records are
+  stored in the sibling `.recovery` file. The configured byte limit is a hard
+  capacity rather than rotation: replay or safely archive processed records
+  before it fills, because new recovery records are refused at capacity.
 - Treat cross-provider routing as opt-in because request/response translation
   can be lossy. Tool-call streams remain denied where semantics cannot be
   preserved.

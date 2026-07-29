@@ -161,17 +161,14 @@ impl WaitKind {
 pub enum Cache {
     /// Gateway identity key cache, TTL from `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS`.
     GatewayKey,
-    /// Gateway governance cache holding budget, policy, and egress decisions.
-    GatewayGovernance,
 }
 
 impl Cache {
-    pub const ALL: &'static [Cache] = &[Cache::GatewayKey, Cache::GatewayGovernance];
+    pub const ALL: &'static [Cache] = &[Cache::GatewayKey];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Cache::GatewayKey => "gateway_key",
-            Cache::GatewayGovernance => "gateway_governance",
         }
     }
 }
@@ -258,26 +255,18 @@ impl DeduplicationEvent {
 /// decision they implied (`harness::retry_disposition`) has no production
 /// caller either — only its own tests and a benchmark.
 ///
-/// The fallbacks that do run are both about the control plane: serving a
-/// last-known budget while it is unreachable, and accepting a degraded route
-/// when it responds with one.
+/// Fallbacks are admitted by a live control-plane decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FallbackTrigger {
-    /// Control plane unreachable; a cached last-known budget was used.
-    GovernanceUnavailable,
     /// Control plane responded but degraded the route.
     BudgetDegraded,
 }
 
 impl FallbackTrigger {
-    pub const ALL: &'static [FallbackTrigger] = &[
-        FallbackTrigger::GovernanceUnavailable,
-        FallbackTrigger::BudgetDegraded,
-    ];
+    pub const ALL: &'static [FallbackTrigger] = &[FallbackTrigger::BudgetDegraded];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            FallbackTrigger::GovernanceUnavailable => "governance_unavailable",
             FallbackTrigger::BudgetDegraded => "budget_degraded",
         }
     }
@@ -366,10 +355,10 @@ mod tests {
         assert_eq!(Outcome::ALL.len(), 4);
         assert_eq!(RejectionReason::ALL.len(), 6);
         assert_eq!(WaitKind::ALL.len(), 5);
-        assert_eq!(Cache::ALL.len(), 2);
+        assert_eq!(Cache::ALL.len(), 1);
         assert_eq!(CacheOutcome::ALL.len(), 3);
         assert_eq!(LagSurface::ALL.len(), 3);
-        assert_eq!(FallbackTrigger::ALL.len(), 2);
+        assert_eq!(FallbackTrigger::ALL.len(), 1);
         assert_eq!(DeduplicationEvent::ALL.len(), 2);
         assert_eq!(LookupFirstPath::ALL.len(), 2);
     }
