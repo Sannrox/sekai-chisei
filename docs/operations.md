@@ -88,7 +88,8 @@ readinessProbe:
 
 The gateway has separate `/healthz`, `/readyz`, and `/statusz` endpoints.
 `/statusz` exposes live/degraded posture and aggregate circuit and usage
-reconciliation state.
+recovery state. The old budget-reconciliation field names remain temporary
+compatibility aliases for the equivalent usage-recovery values.
 
 ## Persistence and backups
 
@@ -97,7 +98,7 @@ includes the database plus its `-wal` and `-shm` sidecars from one consistent
 snapshot. Prefer SQLite's `VACUUM INTO` for an online logical backup.
 
 Also preserve state files configured for provider registry lifecycle, gateway
-usage reconciliation, and durable receipt, usage, and refusal recovery. Test
+usage recovery, and durable receipt, usage, and refusal recovery. Test
 restore procedures, not only backup creation.
 
 Audit history is not purged automatically. High-churn deployments should define
@@ -116,11 +117,11 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
   control-plane target and every provider request requires live admission.
 - Protect the admin refresh endpoint with a random
   `CHISEI_GATEWAY_ADMIN_TOKEN` of at least 32 bytes; it is disabled when unset.
-- Keep the durable recovery spool writable. Its default base path is
-  `data/chisei-gateway-audit.jsonl` relative to process CWD, and records are
-  stored in the sibling `.recovery` file. The configured byte limit is a hard
-  capacity rather than rotation: replay or safely archive processed records
-  before it fills, because new recovery records are refused at capacity.
+- Keep the durable recovery spool writable. Its default path is
+  `data/chisei-gateway-recovery.jsonl` relative to process CWD. The configured
+  byte limit is a hard capacity rather than rotation: replay or safely archive
+  processed records before it fills, because new recovery records are refused
+  at capacity.
 - Treat cross-provider routing as opt-in because request/response translation
   can be lossy. Tool-call streams remain denied where semantics cannot be
   preserved.

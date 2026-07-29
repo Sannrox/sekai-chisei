@@ -904,8 +904,12 @@ fn restore_codex_config(
 /// pristine marker file signals that a managed revert is still pending.
 fn recover_stale_codex_config() {
     let config_path = codex_config_path();
-    let pristine = pristine_backup_path(&config_path);
-    if pristine.exists() && restore_codex_config(&config_path, &pristine).is_ok() {
+    recover_stale_codex_config_at(&config_path);
+}
+
+fn recover_stale_codex_config_at(config_path: &Path) {
+    let pristine = pristine_backup_path(config_path);
+    if pristine.exists() && restore_codex_config(config_path, &pristine).is_ok() {
         println!(
             "reverted {} left routed by an earlier launch",
             config_path.display()
@@ -1520,6 +1524,36 @@ mod tests {
             pristine_backup_path(Path::new("/home/u/.codex/config.toml")),
             PathBuf::from("/home/u/.codex/config.toml.chisei-pristine")
         );
+    }
+
+    #[test]
+    fn stale_codex_launch_is_recovered_without_losing_app_edits() {
+        let directory =
+            std::env::temp_dir().join(format!("chisei-launch-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let pristine = pristine_backup_path(&config_path);
+        let routed = apply_chisei_config(
+            "model = \"gpt-5.5\"\n",
+            "http://127.0.0.1:8788/v1",
+            "codex-app",
+            "sekai-chisei",
+        );
+        std::fs::write(
+            &config_path,
+            format!("{routed}\n[projects.\"/kept\"]\ntrust_level = \"trusted\"\n"),
+        )
+        .unwrap();
+        std::fs::write(&pristine, "crash recovery marker").unwrap();
+
+        recover_stale_codex_config_at(&config_path);
+
+        let recovered = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!chisei_routed(&recovered));
+        assert!(recovered.contains("model = \"gpt-5.5\""));
+        assert!(recovered.contains("[projects.\"/kept\"]"));
+        assert!(!pristine.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
