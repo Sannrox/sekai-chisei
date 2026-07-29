@@ -5,7 +5,7 @@ use crate::grpc::pb::chisei::{ListKiokuCandidatesRequest, ReviewKiokuMemoryReque
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl memory candidates --namespace <name> [--operation-class <class>] [--limit <n>]\n  sekaictl memory review <id> <version> <promote|reject|supersede|disable> --reason <text>"
+    "sekaictl admin governance memory candidates --namespace <name> [--operation-class <class>] [--limit <n>]\n  sekaictl admin governance memory review <id> <version> <promote|reject|supersede|disable> --reason <text>"
 }
 
 pub async fn run_memory_command(args: Vec<String>) -> Result<(), BoxErr> {

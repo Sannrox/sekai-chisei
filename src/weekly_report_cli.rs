@@ -12,7 +12,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl team weekly-report <report.json>... --namespace <name> --since-ms <time> --until-ms <time> --output <file>"
+    "sekaictl admin access team weekly-report <report.json>... --namespace <name> --since-ms <time> --until-ms <time> --output <file>"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

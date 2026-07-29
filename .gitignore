@@ -21,6 +21,7 @@ data/chisei-gateway-audit.jsonl*
 data/provider-registry-state.json*
 /provider-registry-state.json*
 data/chisei-gateway-budget-reconciliation.json*
+data/chisei-gateway-usage-recovery.json*
 .env
 .env.*
 !.env.example

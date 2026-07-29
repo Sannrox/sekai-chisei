@@ -17,7 +17,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const FORMAT: &str = "sekai.replay.v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl replay export <root-object-id> --output <file> [--terminal <file>] [--max-depth <1-10>]"
+    "sekaictl admin assurance replay export <root-object-id> --output <file> [--terminal <file>] [--max-depth <1-10>]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

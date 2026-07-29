@@ -186,17 +186,17 @@ gateway availability mode.
 Manage hashed gateway keys through the CLI:
 
 ```bash
-cargo run --bin sekaictl -- gateway key create codex-app \
+cargo run --bin sekaictl -- admin gateway key create codex-app \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key <generated-secret> \
   --budget 500000 \
   --allowed-model gpt-5.5
-cargo run --bin sekaictl -- gateway key list
-cargo run --bin sekaictl -- gateway key rotate \
+cargo run --bin sekaictl -- admin gateway key list
+cargo run --bin sekaictl -- admin gateway key rotate \
   --gateway-key-name codex-app \
   --gateway-key <new-generated-secret>
-cargo run --bin sekaictl -- gateway key revoke \
+cargo run --bin sekaictl -- admin gateway key revoke \
   --gateway-key-name codex-app
 ```
 

@@ -18,13 +18,13 @@ pub enum CredentialCommand {
 
 pub fn usage() -> &'static str {
     concat!(
-        "Usage: sekaictl credential create <principal>\n",
-        "       sekaictl credential rotate <principal>\n",
-        "       sekaictl credential revoke <principal>\n",
-        "       sekaictl credential bulk create <principal...>\n",
-        "       sekaictl credential bulk rotate <principal...>\n",
-        "       sekaictl credential bulk revoke <principal...>\n",
-        "       sekaictl credential list"
+        "Usage: sekaictl admin access credential create <principal>\n",
+        "       sekaictl admin access credential rotate <principal>\n",
+        "       sekaictl admin access credential revoke <principal>\n",
+        "       sekaictl admin access credential bulk create <principal...>\n",
+        "       sekaictl admin access credential bulk rotate <principal...>\n",
+        "       sekaictl admin access credential bulk revoke <principal...>\n",
+        "       sekaictl admin access credential list"
     )
 }
 

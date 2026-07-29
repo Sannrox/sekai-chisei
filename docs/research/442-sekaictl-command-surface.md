@@ -4,6 +4,10 @@ Issue: [#442](https://github.com/Sannrox/sekai-chisei/issues/442)
 Date: 2026-07-29
 Status: recommendation complete
 
+> Compatibility timing was amended by
+> [ADR 0010](../decisions/0010-retire-sekaictl-aliases-at-0.2.0.md): the
+> deprecated aliases are removed in `0.2.0` without a separate 90-day minimum.
+
 ## Recommendation
 
 Keep the ontology-first product loop at the root and group expert operations

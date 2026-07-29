@@ -1,4 +1,4 @@
-//! sekaictl federation profile commands (#291).
+//! sekaictl admin federation profile commands (#291).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
@@ -11,7 +11,7 @@ use chrono::Utc;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl federation show-site\n  sekaictl federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl federation list-peers\n  sekaictl federation import-availability --peer-site-id <id>"
+    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>"
 }
 
 pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {

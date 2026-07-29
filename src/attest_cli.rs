@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl attest export <operation-id> --output <bundle> [--attempt <number>] [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
+    "sekaictl admin assurance attest export <operation-id> --output <bundle> [--attempt <number>] [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl admin assurance attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

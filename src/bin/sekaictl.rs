@@ -35,8 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
     let is_admin_path = args[0] == "admin";
-    if !is_admin_path && let Some(warning) = alias_warning(&args[0]) {
-        eprintln!("{warning}");
+    if !is_admin_path && let Some(help) = removed_alias_help(&args[0]) {
+        eprintln!("{help}");
+        std::process::exit(2);
     }
     let has_help = args.iter().any(|arg| arg == "--help" || arg == "-h");
     if is_admin_path && has_help && expand_admin_args(args.clone()).is_err() {
@@ -48,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::io::Error::other(error)
     })?;
     if has_help || (is_admin_path && args.len() == 1) {
-        if let Some(usage) = expert_usage(&args[0], is_admin_path) {
+        if let Some(usage) = expert_usage(&args[0]) {
             println!("{usage}");
         } else {
             print_root_usage();
@@ -348,9 +349,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         "provenance" => {
             sekai_chisei::launch::load_local_env();
-            let work_unit = args
-                .get(1)
-                .ok_or_else(|| std::io::Error::other("usage: sekaictl provenance <work-unit>"))?;
+            let work_unit = args.get(1).ok_or_else(|| {
+                std::io::Error::other("usage: sekaictl admin assurance provenance <work-unit>")
+            })?;
             let target = std::env::var("CHISEI_GRPC_URL")
                 .or_else(|_| std::env::var("SEKAI_SOCKET"))
                 .unwrap_or_else(|_| "./data/sekai.sock".into());
@@ -579,42 +580,30 @@ fn print_admin_usage() {
            sekaictl admin assurance <attest|compliance|provenance|replay> ...\n\
          \n\
          Federation:\n\
-           sekaictl admin federation ...\n\
-         \n\
-         Existing top-level expert commands remain exact aliases throughout 0.1.x."
+           sekaictl admin federation ..."
     );
 }
 
-fn expert_usage(command: &str, use_canonical_admin_path: bool) -> Option<String> {
-    let usage = match command {
-        "credential" => credential_usage().to_string(),
-        "gateway" => gateway_usage(),
-        "action" => sekai_chisei::action_cli::usage().to_string(),
-        "memory" => sekai_chisei::memory_cli::usage().to_string(),
-        "gunshi" => sekai_chisei::gunshi_cli::usage().to_string(),
-        "governed-subject" => sekai_chisei::governed_subject_cli::usage().to_string(),
-        "attest" => sekai_chisei::attest_cli::usage().to_string(),
-        "compliance" => sekai_chisei::compliance_cli::usage().to_string(),
-        "provenance" => "usage: sekaictl provenance <work-unit>".to_string(),
-        "replay" => sekai_chisei::replay_cli::usage().to_string(),
-        "team" => format!(
+fn expert_usage(command: &str) -> Option<String> {
+    match command {
+        "credential" => Some(credential_usage().to_string()),
+        "gateway" => Some(gateway_usage()),
+        "action" => Some(sekai_chisei::action_cli::usage().to_string()),
+        "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
+        "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
+        "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
+        "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
+        "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
+        "provenance" => Some("usage: sekaictl admin assurance provenance <work-unit>".to_string()),
+        "replay" => Some(sekai_chisei::replay_cli::usage().to_string()),
+        "team" => Some(format!(
             "{}\n  {}",
             sekai_chisei::team_cli::usage(),
             sekai_chisei::weekly_report_cli::usage()
-        ),
-        "federation" => sekai_chisei::federation_cli::usage().to_string(),
-        _ => return None,
-    };
-    if !use_canonical_admin_path {
-        return Some(usage);
+        )),
+        "federation" => Some(sekai_chisei::federation_cli::usage().to_string()),
+        _ => None,
     }
-
-    let canonical =
-        canonical_admin_path(command).expect("expert command mapping must have a canonical path");
-    Some(usage.replace(
-        &format!("sekaictl {command}"),
-        &format!("sekaictl {canonical}"),
-    ))
 }
 
 fn canonical_admin_path(command: &str) -> Option<&'static str> {
@@ -635,9 +624,9 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
     }
 }
 
-fn alias_warning(command: &str) -> Option<String> {
+fn removed_alias_help(command: &str) -> Option<String> {
     canonical_admin_path(command).map(|canonical| {
-        format!("warning: `sekaictl {command}` is deprecated; use `sekaictl {canonical}`")
+        format!("`sekaictl {command}` was removed in 0.2.0; use `sekaictl {canonical}`")
     })
 }
 
@@ -647,7 +636,7 @@ fn print_gateway_usage() {
 
 fn gateway_usage() -> String {
     format!(
-        "Usage: sekaictl gateway setup|key|report ...\n\n{}\n\n{}\n\n{}",
+        "Usage: sekaictl admin gateway setup|key|report ...\n\n{}\n\n{}\n\n{}",
         setup_usage(),
         key_usage(),
         report_usage()
@@ -656,7 +645,7 @@ fn gateway_usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{alias_warning, canonical_admin_path, expand_admin_args, expert_usage};
+    use super::{canonical_admin_path, expand_admin_args, expert_usage, removed_alias_help};
 
     #[test]
     fn expands_every_canonical_admin_path_to_the_existing_dispatcher() {
@@ -682,16 +671,6 @@ mod tests {
                 vec![expected.to_string(), "sentinel".to_string()]
             );
         }
-    }
-
-    #[test]
-    fn preserves_existing_top_level_aliases_exactly() {
-        let args = vec![
-            "credential".to_string(),
-            "list".to_string(),
-            "--json".to_string(),
-        ];
-        assert_eq!(expand_admin_args(args.clone()).unwrap(), args);
     }
 
     #[test]
@@ -722,14 +701,14 @@ mod tests {
             "replay",
             "federation",
         ] {
-            let usage = expert_usage(command, true).unwrap();
+            let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));
             assert!(!usage.contains(&format!("sekaictl {command}")));
         }
     }
 
     #[test]
-    fn every_alias_names_its_canonical_replacement_and_core_commands_do_not() {
+    fn every_removed_alias_names_its_canonical_replacement_and_core_commands_do_not() {
         for (alias, canonical) in [
             ("credential", "admin access credential"),
             ("team", "admin access team"),
@@ -746,8 +725,8 @@ mod tests {
         ] {
             assert_eq!(canonical_admin_path(alias), Some(canonical));
             assert_eq!(
-                alias_warning(alias).unwrap(),
-                format!("warning: `sekaictl {alias}` is deprecated; use `sekaictl {canonical}`")
+                removed_alias_help(alias).unwrap(),
+                format!("`sekaictl {alias}` was removed in 0.2.0; use `sekaictl {canonical}`")
             );
         }
         for core in [
@@ -755,7 +734,7 @@ mod tests {
             "admin",
         ] {
             assert_eq!(canonical_admin_path(core), None);
-            assert_eq!(alias_warning(core), None);
+            assert_eq!(removed_alias_help(core), None);
         }
     }
 }
