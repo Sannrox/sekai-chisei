@@ -238,7 +238,23 @@ impl PostgresDb {
             .map_err(|error| format!("connect to PostgreSQL: {error}"))?;
         let db = Self { pool };
         db.migrate()?;
+        db.prewarm(max_connections)?;
         Ok(db)
+    }
+
+    fn prewarm(&self, max_connections: u32) -> Result<(), String> {
+        let mut connections = Vec::with_capacity(max_connections as usize);
+        for connection_index in 0..max_connections {
+            connections.push(self.pool.get().map_err(|error| {
+                format!(
+                    "prewarm PostgreSQL connection {}/{}: {error}",
+                    connection_index + 1,
+                    max_connections
+                )
+            })?);
+        }
+        drop(connections);
+        Ok(())
     }
 
     pub fn ping(&self) -> Result<(), String> {
@@ -784,7 +800,8 @@ mod tests {
         }
         barrier.wait();
         for handle in handles {
-            handle.join().unwrap().unwrap();
+            let replica = handle.join().unwrap().unwrap();
+            assert_eq!(replica.pool_state(), (2, 2));
         }
         assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
     }
