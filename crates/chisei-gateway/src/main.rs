@@ -23,27 +23,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         return run_refresh(args).await;
     }
-    let no_preflight = args.iter().any(|arg| arg == "--no-preflight");
-    args.retain(|arg| arg != "--no-preflight");
-
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: chisei-gateway [--no-preflight] [report ...|refresh ...]");
+        println!("Usage: chisei-gateway [report ...|refresh ...]");
         println!("       chisei-gateway report --help");
         println!("       chisei-gateway refresh --help");
-        println!(
-            "       --no-preflight skips CheckBudget, ResolvePolicy, and context-egress preflight"
-        );
         return Ok(());
     }
     if let Some(arg) = args.first() {
         return Err(format!("unknown chisei-gateway command {arg:?}").into());
     }
 
-    if no_preflight {
-        unsafe {
-            std::env::set_var("CHISEI_GATEWAY_NO_PREFLIGHT", "1");
-        }
-    }
     let config = GatewayConfig::from_env().map_err(|err| std::io::Error::other(err.to_string()))?;
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),

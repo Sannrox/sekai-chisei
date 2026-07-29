@@ -135,7 +135,6 @@ pub struct GatewayConfig {
     pub gateway_keys: HashMap<String, GatewayIdentity>,
     pub allow_auth_passthrough: bool,
     pub rewrite_openai_passthrough_auth: bool,
-    pub no_preflight: bool,
     pub pricing: HashMap<String, ModelPricing>,
     pub run_pipeline: bool,
     pub allow_cross_provider: bool,
@@ -184,12 +183,6 @@ impl GatewayConfig {
             std::env::var("CHISEI_GATEWAY_REWRITE_OPENAI_PASSTHROUGH_AUTH").as_deref(),
             Ok("1") | Ok("true") | Ok("yes") | Ok("on")
         );
-        let no_preflight = matches!(
-            std::env::var("CHISEI_GATEWAY_NO_PREFLIGHT")
-                .or_else(|_| std::env::var("GATEWAY_NO_PREFLIGHT"))
-                .as_deref(),
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-        );
         let xai_configured =
             std::env::var("XAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
         let meta_configured = std::env::var("META_MODEL_API_KEY")
@@ -203,24 +196,14 @@ impl GatewayConfig {
         {
             return Err("a configured provider API key is required for chisei-gateway".into());
         }
-        let chisei_grpc_target = std::env::var("CHISEI_GRPC_URL")
-            .or_else(|_| std::env::var("SEKAI_SOCKET"))
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let chisei_grpc_target = required_control_plane_target(
+            std::env::var("CHISEI_GRPC_URL").ok(),
+            std::env::var("SEKAI_SOCKET").ok(),
+        )?;
         let fail_closed = matches!(
             std::env::var("GATEWAY_GOVERNANCE_FAILURE").as_deref(),
             Ok("closed") | Ok("fail-closed") | Ok("1") | Ok("true")
         );
-        if fail_closed && chisei_grpc_target.is_none() {
-            return Err(
-                "GATEWAY_GOVERNANCE_FAILURE is enabled, but CHISEI_GRPC_URL/SEKAI_SOCKET is not set".into(),
-            );
-        }
-        if chisei_grpc_target.is_none() {
-            warn!(
-                "CHISEI_GRPC_URL/SEKAI_SOCKET is unset; running without control-plane governance"
-            );
-        }
         let default_project =
             std::env::var("GATEWAY_DEFAULT_PROJECT").unwrap_or_else(|_| "default".to_string());
         let gateway_keys = parse_gateway_keys(
@@ -245,7 +228,6 @@ impl GatewayConfig {
             bind_addr,
             &gateway_keys,
             fail_closed,
-            no_preflight,
             allow_auth_passthrough,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
         )?;
@@ -258,13 +240,12 @@ impl GatewayConfig {
             anthropic_api_key,
             ollama_base_url,
             native_base_url,
-            chisei_grpc_target,
+            chisei_grpc_target: Some(chisei_grpc_target),
             fail_closed,
             default_project,
             gateway_keys,
             allow_auth_passthrough,
             rewrite_openai_passthrough_auth,
-            no_preflight,
             pricing,
             run_pipeline,
             allow_cross_provider,
@@ -272,11 +253,20 @@ impl GatewayConfig {
     }
 }
 
+fn required_control_plane_target(
+    chisei_grpc_url: Option<String>,
+    sekai_socket: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    chisei_grpc_url
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| sekai_socket.filter(|value| !value.trim().is_empty()))
+        .ok_or_else(|| "CHISEI_GRPC_URL or SEKAI_SOCKET is required for chisei-gateway".into())
+}
+
 fn validate_gateway_security(
     bind_addr: SocketAddr,
     gateway_keys: &HashMap<String, GatewayIdentity>,
     fail_closed: bool,
-    no_preflight: bool,
     allow_auth_passthrough: bool,
     admin_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -297,9 +287,6 @@ fn validate_gateway_security(
         }
         if !fail_closed {
             return Err("an exposed gateway requires GATEWAY_GOVERNANCE_FAILURE=closed".into());
-        }
-        if no_preflight {
-            return Err("CHISEI_GATEWAY_NO_PREFLIGHT cannot be used on an exposed gateway".into());
         }
         if allow_auth_passthrough {
             return Err(
@@ -1148,33 +1135,6 @@ async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> 
             }),
         );
     }
-    if state.config.no_preflight {
-        let mut cached_probe = state.runtime.readiness_probe.lock().await;
-        let ready = if let Some((checked_at, ready)) = *cached_probe
-            && checked_at.elapsed() < Duration::from_secs(READINESS_PROBE_CACHE_SECS)
-        {
-            ready
-        } else {
-            let ready = audit_spool_writable(&state.runtime).await;
-            *cached_probe = Some((Instant::now(), ready));
-            ready
-        };
-        return if ready {
-            json_response(
-                StatusCode::OK,
-                serde_json::json!({"status": "ready", "governance": "disabled"}),
-            )
-        } else {
-            json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "status": "not_ready",
-                    "governance": "disabled",
-                    "reason": "audit_spool_unavailable"
-                }),
-            )
-        };
-    }
     let Some(target) = state.config.chisei_grpc_target.as_deref() else {
         return json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1237,51 +1197,6 @@ async fn gateway_readiness(State(state): State<GatewayState>) -> Response<Body> 
     }
 }
 
-async fn audit_spool_writable(runtime: &GatewayRuntime) -> bool {
-    let Some(path) = runtime.audit_spool_path.clone() else {
-        return false;
-    };
-    let _spool_guard = runtime.audit_spool_lock.lock().await;
-    matches!(
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::io::Write;
-            #[cfg(unix)]
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            std::fs::create_dir_all(parent)?;
-            let created = !path.exists();
-            let mut spool_options = std::fs::OpenOptions::new();
-            spool_options.create(true).append(true);
-            #[cfg(unix)]
-            spool_options.mode(0o600);
-            spool_options.open(&path)?.sync_all()?;
-            if created {
-                sync_parent_directory(&path)?;
-            }
-            let probe = parent.join(format!(".chisei-audit-readiness-{}", uuid::Uuid::new_v4()));
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let operation = (|| -> std::io::Result<()> {
-                let mut file = options.open(&probe)?;
-                file.write_all(b"ready")?;
-                file.sync_all()
-            })();
-            let removal = std::fs::remove_file(&probe);
-            operation?;
-            removal?;
-            sync_parent_directory(&path)
-        })
-        .await,
-        Ok(Ok(()))
-    )
-}
-
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = GatewayRuntime::from_env();
     if let Some(state_path) = runtime.provider_registry_state_path.as_deref() {
@@ -1292,7 +1207,6 @@ pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Erro
         config.bind_addr,
         &config.gateway_keys,
         config.fail_closed,
-        config.no_preflight,
         config.allow_auth_passthrough,
         runtime.admin_token.as_deref(),
     )?;
@@ -2290,13 +2204,6 @@ async fn proxy_gateway_inner_scoped(
             "x-chisei-route-override requires a request body model",
         );
     }
-    if route_override.is_some() && state.config.no_preflight {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_unavailable",
-            "x-chisei-route-override requires governed availability preflight",
-        );
-    }
     let request_id = correlation.request_id.clone();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
     let pipeline_spec = extract_gateway_pipeline_spec(&body);
@@ -2371,8 +2278,6 @@ async fn proxy_gateway_inner_scoped(
     let requested_profile = requested_registry_model
         .as_ref()
         .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
-    // Computed unconditionally (cheap, pure) so it's available for the sample-observation record
-    // even under `no_preflight`, where the routing-only call below is skipped.
     let failure_posture =
         GovernanceFailurePosture::from_request(&state.config, &identity, &headers);
     let mut preflight_context = UsageContext {
@@ -2445,84 +2350,6 @@ async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
-    if state.config.no_preflight && context_request.is_some() {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_unavailable",
-            "explicit governed context is unavailable while preflight is disabled",
-        );
-    }
-    if state.config.no_preflight && policy_model_sentinel {
-        let rejection = GatewayRejection::json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_unavailable",
-            "the auto model sentinel requires policy preflight",
-        );
-        record_refusal_and_append(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &preflight_context,
-            &rejection,
-        )
-        .await;
-        return rejection.response();
-    }
-    if state.config.no_preflight && failure_posture.fail_closed {
-        let rejection = GatewayRejection::json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_unavailable",
-            "preflight cannot be disabled for classified or elevated-risk traffic",
-        );
-        record_refusal_and_append(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &preflight_context,
-            &rejection,
-        )
-        .await;
-        return rejection.response();
-    }
-    if state.config.no_preflight
-        && !record_resilience_decision(
-            &state.config,
-            &state.runtime,
-            &identity,
-            "gateway.preflight_disabled",
-            "governance preflight disabled by operator configuration",
-            "fail_open",
-            failure_posture.evidence(),
-        )
-        .await
-    {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_audit_unavailable",
-            "cannot forward without a durable governance audit record",
-        );
-    }
-    if !state.config.no_preflight
-        && state.config.chisei_grpc_target.is_none()
-        && let Err(rejection) = governance_error(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &failure_posture,
-            "control-plane governance is not configured",
-        )
-        .await
-    {
-        record_refusal_and_append(
-            &state.config,
-            &state.runtime,
-            &identity,
-            &preflight_context,
-            &rejection,
-        )
-        .await;
-        return rejection.response();
-    }
     // A configured gateway has one canonical governance boundary:
     // DecideGatewayExecution. Any denial or unavailable decision returns
     // before provider contact.
@@ -2579,92 +2406,67 @@ async fn proxy_gateway_inner_scoped(
         .map(|model| model.canonical_model.as_str())
         .or(requested_model.as_deref())
         .unwrap_or("");
-    let gateway_admit = if !state.config.no_preflight && state.config.chisei_grpc_target.is_some() {
-        match gateway_decision_preflight(
-            &state.config,
-            &state.runtime,
-            &identity,
-            preferred_runtime,
-            preferred_model,
-            request_bytes,
-            work_unit_id.as_deref().unwrap_or(""),
-            &task_class,
-            &request_id,
-            route_override.as_deref(),
-            capability_requirements_json,
-            model_metadata_request,
-        )
-        .await
-        {
-            Ok(admit) => Some(admit),
-            Err(rejection) => {
-                record_refusal_and_append(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &preflight_context,
-                    &rejection,
-                )
-                .await;
-                return rejection.response();
-            }
-        }
-    } else {
-        None
-    };
-    let (mut resolved, mut egress, budget) =
-        if state.config.no_preflight || state.config.chisei_grpc_target.is_none() {
-            let resolved = PolicyPreflight {
-                body: body.to_vec(),
-                resolved_model: requested_registry_model
-                    .as_ref()
-                    .map(|resolved| resolved.canonical_model.clone()),
-                resolved_provider: requested_provider,
-                route_bias: None,
-                policy_scope: None,
-                policy_version: None,
-                fallback_models: Vec::new(),
-                data_class: None,
-            };
-            let egress = ContextEgressPreflight {
-                body: resolved.body.clone(),
-            };
-            (resolved, egress, None)
-        } else {
-            let admit = gateway_admit.expect("configured governance returned an admit");
-            match apply_gateway_decision(
+    let gateway_admit = match gateway_decision_preflight(
+        &state.config,
+        &state.runtime,
+        &identity,
+        preferred_runtime,
+        preferred_model,
+        request_bytes,
+        work_unit_id.as_deref().unwrap_or(""),
+        &task_class,
+        &request_id,
+        route_override.as_deref(),
+        capability_requirements_json,
+        model_metadata_request,
+    )
+    .await
+    {
+        Ok(admit) => admit,
+        Err(rejection) => {
+            record_refusal_and_append(
                 &state.config,
                 &state.runtime,
                 &identity,
-                &mut preflight_context,
-                &registry_snapshot,
-                admit,
-                body.to_vec(),
-                requested_provider,
-                client_provider,
-                capability_surface,
-                context_request.as_ref(),
-                requested_model.as_deref(),
-                &request_id,
-                work_unit_id.as_deref(),
-                &failure_posture,
+                &preflight_context,
+                &rejection,
             )
-            .await
-            {
-                Ok(triple) => triple,
-                Err(rejection) => {
-                    record_refusal_and_append(
-                        &state.config,
-                        &state.runtime,
-                        &identity,
-                        &preflight_context,
-                        &rejection,
-                    )
-                    .await;
-                    return rejection.response();
-                }
-            }
-        };
+            .await;
+            return rejection.response();
+        }
+    };
+    let (mut resolved, mut egress, budget) = match apply_gateway_decision(
+        &state.config,
+        &state.runtime,
+        &identity,
+        &mut preflight_context,
+        &registry_snapshot,
+        gateway_admit,
+        body.to_vec(),
+        requested_provider,
+        client_provider,
+        capability_surface,
+        context_request.as_ref(),
+        requested_model.as_deref(),
+        &request_id,
+        work_unit_id.as_deref(),
+        &failure_posture,
+    )
+    .await
+    {
+        Ok(triple) => triple,
+        Err(rejection) => {
+            record_refusal_and_append(
+                &state.config,
+                &state.runtime,
+                &identity,
+                &preflight_context,
+                &rejection,
+            )
+            .await;
+            return rejection.response();
+        }
+    };
     let classification_exempt_metadata_request = model_metadata_request && uri.query().is_none();
     if failure_posture.data_class == "sensitive"
         && !classification_exempt_metadata_request
@@ -2943,7 +2745,7 @@ async fn proxy_gateway_inner_scoped(
                 })
                 .unwrap_or("not_evaluated")
                 .into(),
-            egress_applied: !state.config.no_preflight,
+            egress_applied: true,
             cache_requested: cache_requested || automatic_cache_requested,
         }
     };
@@ -6571,39 +6373,6 @@ fn domain_object_from_proto(object: &SekaiObject) -> crate::domain::Object {
         properties: object.properties.clone(),
         created: object.created,
         updated: object.updated,
-    }
-}
-
-async fn governance_error(
-    config: &GatewayConfig,
-    runtime: &GatewayRuntime,
-    identity: &GatewayIdentity,
-    failure_posture: &GovernanceFailurePosture,
-    message: &str,
-) -> Result<(), GatewayRejection> {
-    let recorded = record_resilience_decision(
-        config,
-        runtime,
-        identity,
-        "gateway.governance_unavailable",
-        message,
-        if failure_posture.fail_closed {
-            "fail_closed"
-        } else {
-            "fail_open"
-        },
-        failure_posture.evidence(),
-    )
-    .await;
-    if failure_posture.fail_closed || !recorded {
-        Err(GatewayRejection::json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "governance_unavailable",
-            message,
-        ))
-    } else {
-        warn!(message, "chisei-gateway governance fail-open");
-        Ok(())
     }
 }
 
@@ -12713,17 +12482,12 @@ mod tests {
     fn rejects_weak_admin_tokens() {
         let bind = "127.0.0.1:8788".parse().unwrap();
         let keys = HashMap::new();
-        assert!(
-            validate_gateway_security(bind, &keys, false, false, false, Some("change-me")).is_err()
-        );
-        assert!(
-            validate_gateway_security(bind, &keys, false, false, false, Some("too-short")).is_err()
-        );
+        assert!(validate_gateway_security(bind, &keys, false, false, Some("change-me")).is_err());
+        assert!(validate_gateway_security(bind, &keys, false, false, Some("too-short")).is_err());
         assert!(
             validate_gateway_security(
                 bind,
                 &keys,
-                false,
                 false,
                 false,
                 Some("0123456789abcdef0123456789abcdef"),
@@ -12733,10 +12497,36 @@ mod tests {
     }
 
     #[test]
-    fn exposed_gateway_requires_keys_fail_closed_and_preflight() {
+    fn gateway_requires_an_explicit_control_plane_target() {
+        assert!(required_control_plane_target(None, None).is_err());
+        assert!(required_control_plane_target(Some("  ".into()), None).is_err());
+        assert_eq!(
+            required_control_plane_target(None, Some("/tmp/sekai.sock".into())).unwrap(),
+            "/tmp/sekai.sock"
+        );
+        assert_eq!(
+            required_control_plane_target(
+                Some("  ".into()),
+                Some("/tmp/sekai-fallback.sock".into())
+            )
+            .unwrap(),
+            "/tmp/sekai-fallback.sock"
+        );
+        assert_eq!(
+            required_control_plane_target(
+                Some("http://127.0.0.1:50051".into()),
+                Some("/tmp/sekai.sock".into())
+            )
+            .unwrap(),
+            "http://127.0.0.1:50051"
+        );
+    }
+
+    #[test]
+    fn exposed_gateway_requires_keys_fail_closed_and_no_auth_passthrough() {
         let bind = "0.0.0.0:8788".parse().unwrap();
         let mut keys = HashMap::new();
-        assert!(validate_gateway_security(bind, &keys, true, false, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, None).is_err());
         keys.insert(
             "hash".to_string(),
             GatewayIdentity {
@@ -12747,10 +12537,9 @@ mod tests {
                 tier: DEFAULT_GATEWAY_TIER.to_string(),
             },
         );
-        assert!(validate_gateway_security(bind, &keys, false, false, false, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, true, false, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, false, true, None).is_err());
-        assert!(validate_gateway_security(bind, &keys, true, false, false, None).is_ok());
+        assert!(validate_gateway_security(bind, &keys, false, false, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, true, None).is_err());
+        assert!(validate_gateway_security(bind, &keys, true, false, None).is_ok());
     }
 
     #[test]
@@ -13304,7 +13093,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -13708,29 +13496,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_open_is_refused_without_durable_audit_storage() {
-        let config = routing_config();
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-        let identity = GatewayIdentity {
-            agent: "safe-agent".into(),
-            project: "default".into(),
-            user_id: "agent:safe-agent".into(),
-            key_id: "safe-agent".into(),
-            tier: "low-risk".into(),
-        };
-        let posture = GovernanceFailurePosture {
-            data_class: "unclassified".into(),
-            action_risk: "low".into(),
-            fail_closed: false,
-        };
-        assert!(
-            governance_error(&config, &runtime, &identity, &posture, "control plane down")
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn durable_resilience_audit_does_not_wait_for_central_replication() {
         // Hang the control-plane accept path so a blocking remote audit would
         // never complete. Durable spool success must still return without
@@ -13761,8 +13526,8 @@ mod tests {
                 &config,
                 &runtime,
                 &identity,
-                "gateway.no_preflight",
-                "explicit no-preflight mode",
+                "gateway.governance_degraded",
+                "control-plane governance unavailable",
                 "fail_open",
                 HashMap::new(),
             )
@@ -13775,7 +13540,7 @@ mod tests {
         assert_eq!(runtime.spooled_audit_events.load(Ordering::Relaxed), 1);
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
         let event: LocalGatewayAuditEvent = serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(event.action, "gateway.no_preflight");
+        assert_eq!(event.action, "gateway.governance_degraded");
         assert_eq!(event.outcome, "fail_open");
         assert!(!hang.is_finished());
         hang.abort();
@@ -14267,7 +14032,10 @@ mod tests {
             "application/json",
         )
         .await;
-        let gateway_base = spawn_gateway(upstream_base.clone()).await;
+        let mut unavailable_config = routing_config();
+        unavailable_config.openai_base_url = upstream_base.clone();
+        unavailable_config.chisei_grpc_target = None;
+        let gateway_base = spawn_gateway_with_config(unavailable_config).await;
         let client = reqwest::Client::new();
         assert_eq!(
             client
@@ -14296,19 +14064,6 @@ mod tests {
         assert_eq!(
             client
                 .get(format!("{ready_gateway}/readyz"))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-
-        let mut no_preflight_config = routing_config();
-        no_preflight_config.no_preflight = true;
-        let no_preflight_gateway = spawn_gateway_with_config(no_preflight_config).await;
-        assert_eq!(
-            client
-                .get(format!("{no_preflight_gateway}/readyz"))
                 .send()
                 .await
                 .unwrap()
@@ -14345,28 +14100,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_preflight_readiness_requires_writable_audit_spool() {
-        let parent =
-            std::env::temp_dir().join(format!("chisei-audit-not-dir-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&parent, b"file").unwrap();
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_audit_spool_path(Some(parent.join("audit.jsonl")));
-        let mut config = routing_config();
-        config.no_preflight = true;
-        let state = GatewayState {
-            client: runtime.http_timeouts.client(),
-            config: Arc::new(config),
-            runtime,
-        };
-
-        assert_eq!(
-            gateway_readiness(State(state)).await.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        std::fs::remove_file(parent).unwrap();
-    }
-
-    #[tokio::test]
     async fn readiness_fails_when_provider_registry_disappears() {
         let directory = std::env::temp_dir().join(format!(
             "chisei-readiness-provider-registry-{}",
@@ -14381,8 +14114,7 @@ mod tests {
         let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
             .with_provider_registry_state_path(Some(registry_path))
             .with_audit_spool_path(Some(audit_path));
-        let mut config = routing_config();
-        config.no_preflight = true;
+        let config = routing_config();
         let state = GatewayState {
             client: runtime.http_timeouts.client(),
             config: Arc::new(config),
@@ -14603,35 +14335,6 @@ mod tests {
         assert_eq!(after.state_version, 1);
         assert!(after.resolve_model("openai/gpt-5.5").is_err());
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn no_preflight_readiness_rejects_read_only_audit_spool() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = std::env::temp_dir().join(format!(
-            "chisei-audit-read-only-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, b"existing\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-            .with_audit_spool_path(Some(path.clone()));
-        let mut config = routing_config();
-        config.no_preflight = true;
-        let state = GatewayState {
-            client: runtime.http_timeouts.client(),
-            config: Arc::new(config),
-            runtime,
-        };
-
-        assert_eq!(
-            gateway_readiness(State(state)).await.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -15296,10 +14999,11 @@ mod tests {
     }
 
     async fn spawn_gateway(openai_base_url: String) -> String {
-        spawn_gateway_with_preflight(openai_base_url, false).await
+        spawn_gateway_with_preflight(openai_base_url).await
     }
 
-    async fn spawn_gateway_with_preflight(openai_base_url: String, no_preflight: bool) -> String {
+    async fn spawn_gateway_with_preflight(openai_base_url: String) -> String {
+        let (chisei_target, _) = spawn_control_plane().await;
         let config = GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url,
@@ -15308,7 +15012,7 @@ mod tests {
             ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
-            chisei_grpc_target: None,
+            chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
@@ -15323,7 +15027,6 @@ mod tests {
             )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -15335,6 +15038,7 @@ mod tests {
         openai_base_url: String,
         http_timeouts: HttpTimeouts,
     ) -> String {
+        let (chisei_target, _) = spawn_control_plane().await;
         let config = GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url,
@@ -15343,7 +15047,7 @@ mod tests {
             ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
             native_base_url: None,
             anthropic_api_key: Some("real-anthropic-key".to_string()),
-            chisei_grpc_target: None,
+            chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::from([(
@@ -15358,7 +15062,6 @@ mod tests {
             )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -15722,7 +15425,6 @@ mod tests {
         let (chisei_target, db) = spawn_control_plane().await;
         let mut config = routing_config();
         config.chisei_grpc_target = Some(chisei_target);
-        config.no_preflight = true;
         let gateway_base = spawn_gateway_with_config(config).await;
         let client = reqwest::Client::new();
         let send = || {
@@ -15754,7 +15456,6 @@ mod tests {
         let (chisei_target, db) = spawn_control_plane().await;
         let mut config = routing_config();
         config.chisei_grpc_target = Some(chisei_target);
-        config.no_preflight = true;
         let gateway_base = spawn_gateway_with_config(config).await;
         let client = reqwest::Client::new();
         let send = || {
@@ -15773,7 +15474,7 @@ mod tests {
 
         for _ in 0..2 {
             let response = send().send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_ne!(response.status(), StatusCode::CONFLICT);
         }
         assert!(
@@ -15921,7 +15622,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16016,7 +15716,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16049,6 +15748,7 @@ mod tests {
         let upstream_body = r#"{"id":"resp_1","object":"response","status":"completed"}"#;
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _) = spawn_control_plane().await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url: upstream_base,
@@ -16057,13 +15757,12 @@ mod tests {
             ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
             native_base_url: None,
             anthropic_api_key: None,
-            chisei_grpc_target: None,
+            chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16116,7 +15815,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16143,6 +15841,7 @@ mod tests {
         let upstream_body = r#"{"id":"resp_1","object":"response","status":"completed"}"#;
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _) = spawn_control_plane().await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url: upstream_base,
@@ -16151,13 +15850,12 @@ mod tests {
             ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
             native_base_url: None,
             anthropic_api_key: None,
-            chisei_grpc_target: None,
+            chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: true,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16200,6 +15898,7 @@ mod tests {
         }"#;
         let (upstream_base, requests) =
             spawn_fake_upstream(upstream_body, "application/json").await;
+        let (chisei_target, _) = spawn_control_plane().await;
         let gateway_base = spawn_gateway_with_config(GatewayConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             openai_base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -16208,13 +15907,12 @@ mod tests {
             ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
             native_base_url: None,
             anthropic_api_key: None,
-            chisei_grpc_target: None,
+            chisei_grpc_target: Some(chisei_target),
             fail_closed: false,
             default_project: "default".to_string(),
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16289,7 +15987,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16394,7 +16091,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16449,7 +16145,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16516,7 +16211,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16609,7 +16303,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16676,7 +16369,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16730,7 +16422,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16816,7 +16507,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16881,7 +16571,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: true,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16944,7 +16633,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -16984,7 +16672,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
@@ -17100,7 +16787,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
@@ -17178,7 +16864,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
@@ -17243,7 +16928,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
@@ -17330,7 +17014,6 @@ mod tests {
             // forwarded verbatim if not for the cross-provider stripping.
             allow_auth_passthrough: true,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: true,
@@ -17390,7 +17073,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17460,7 +17142,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17528,7 +17209,6 @@ mod tests {
             gateway_keys,
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17580,7 +17260,6 @@ mod tests {
             gateway_keys,
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17639,7 +17318,6 @@ mod tests {
                 gateway_keys: HashMap::new(),
                 allow_auth_passthrough: false,
                 rewrite_openai_passthrough_auth: false,
-                no_preflight: false,
                 pricing: HashMap::new(),
                 run_pipeline: false,
                 allow_cross_provider: false,
@@ -17798,7 +17476,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17884,7 +17561,6 @@ mod tests {
             )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -17933,133 +17609,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_preflight_still_forwards_requests_without_governed_context() {
-        let (upstream_base, requests) = spawn_fake_upstream(
-            r#"{"id":"resp_1","status":"completed"}"#,
-            "application/json",
-        )
-        .await;
-        let gateway_base = spawn_gateway_with_config(GatewayConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            openai_base_url: upstream_base,
-            openai_api_key: Some("real-openai-key".to_string()),
-            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
-            native_base_url: None,
-            anthropic_api_key: Some("real-anthropic-key".to_string()),
-            chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-            fail_closed: false,
-            default_project: "default".to_string(),
-            gateway_keys: HashMap::from([(
-                "sk-chisei-codex-app".to_string(),
-                GatewayIdentity {
-                    agent: "codex-app".to_string(),
-                    project: "default".to_string(),
-                    user_id: "agent:codex-app".to_string(),
-                    key_id: "codex-app".to_string(),
-                    tier: "low-risk".to_string(),
-                },
-            )]),
-            allow_auth_passthrough: false,
-            rewrite_openai_passthrough_auth: false,
-            no_preflight: true,
-            pricing: HashMap::new(),
-            run_pipeline: false,
-            allow_cross_provider: false,
-        })
-        .await;
-
-        let resp = reqwest::Client::new()
-            .post(format!("{gateway_base}/v1/responses"))
-            .bearer_auth("sk-chisei-codex-app")
-            .header("x-chisei-data-class", "unclassified")
-            .header("x-chisei-action-risk", "low")
-            .json(&serde_json::json!({
-                "model": "gpt-5.5",
-                "input": "hello"
-            }))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        {
-            let captured = requests.lock().unwrap();
-            assert_eq!(captured.len(), 1);
-            assert_eq!(
-                captured[0].authorization.as_deref(),
-                Some("Bearer real-openai-key")
-            );
-        }
-
-        let elevated_risk = reqwest::Client::new()
-            .post(format!("{gateway_base}/v1/responses"))
-            .bearer_auth("sk-chisei-codex-app")
-            .header("x-chisei-action-risk", "write")
-            .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(elevated_risk.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(requests.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn no_preflight_rejects_explicit_governed_context() {
-        let (upstream_base, requests) = spawn_fake_upstream(
-            r#"{"id":"resp_1","status":"completed"}"#,
-            "application/json",
-        )
-        .await;
-        let gateway_base = spawn_gateway_with_config(GatewayConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            openai_base_url: upstream_base,
-            openai_api_key: Some("real-openai-key".to_string()),
-            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
-            native_base_url: None,
-            anthropic_api_key: Some("real-anthropic-key".to_string()),
-            chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-            fail_closed: true,
-            default_project: "default".to_string(),
-            gateway_keys: HashMap::from([(
-                "sk-chisei-codex-app".to_string(),
-                GatewayIdentity {
-                    agent: "codex-app".to_string(),
-                    project: "default".to_string(),
-                    user_id: "agent:codex-app".to_string(),
-                    key_id: "codex-app".to_string(),
-                    tier: DEFAULT_GATEWAY_TIER.to_string(),
-                },
-            )]),
-            allow_auth_passthrough: false,
-            rewrite_openai_passthrough_auth: false,
-            no_preflight: true,
-            pricing: HashMap::new(),
-            run_pipeline: false,
-            allow_cross_provider: false,
-        })
-        .await;
-
-        let response = reqwest::Client::new()
-            .post(format!("{gateway_base}/v1/responses"))
-            .bearer_auth("sk-chisei-codex-app")
-            .json(&serde_json::json!({
-                "model": "gpt-5.5",
-                "input": "hello",
-                "chisei_context": {
-                    "objects": [{"ref": "ticker:AAPL", "fields": ["score"]}]
-                }
-            }))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn budget_denial_records_audit_decision() {
         let (upstream_base, requests) = spawn_fake_upstream(
             r#"{"id":"resp_1","status":"completed"}"#,
@@ -18098,7 +17647,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18187,7 +17735,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18277,7 +17824,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18365,7 +17911,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18473,7 +18018,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18586,7 +18130,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18691,7 +18234,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -18861,7 +18403,6 @@ mod tests {
             )]),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19067,7 +18608,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19134,7 +18674,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing,
             run_pipeline: true,
             allow_cross_provider: false,
@@ -19306,7 +18845,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing,
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19369,7 +18907,6 @@ mod tests {
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19423,7 +18960,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19475,7 +19011,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19531,7 +19066,6 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             gateway_keys: HashMap::new(),
             allow_auth_passthrough: false,
             rewrite_openai_passthrough_auth: false,
-            no_preflight: false,
             pricing: HashMap::new(),
             run_pipeline: false,
             allow_cross_provider: false,
@@ -19567,7 +19101,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             let (upstream_base, _requests) =
                 spawn_fake_upstream_with_status(upstream_body, "", StatusCode::BAD_REQUEST, None)
                     .await;
-            let gateway_base = spawn_gateway_with_preflight(upstream_base, true).await;
+            let gateway_base = spawn_gateway_with_preflight(upstream_base).await;
 
             let resp = reqwest::Client::new()
                 .post(format!("{gateway_base}/v1/responses"))
@@ -19602,7 +19136,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
                 None,
             )
             .await;
-            let gateway_base = spawn_gateway_with_preflight(upstream_base, true).await;
+            let gateway_base = spawn_gateway_with_preflight(upstream_base).await;
 
             let resp = reqwest::Client::new()
                 .post(format!("{gateway_base}/v1/responses"))
@@ -19633,7 +19167,7 @@ data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\
             None,
         )
         .await;
-        let gateway_base = spawn_gateway_with_preflight(upstream_base, true).await;
+        let gateway_base = spawn_gateway_with_preflight(upstream_base).await;
         let resp = reqwest::Client::new()
             .post(format!("{gateway_base}/v1/responses"))
             .bearer_auth("sk-chisei-codex-app")

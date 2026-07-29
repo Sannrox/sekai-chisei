@@ -111,8 +111,10 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
   tokens are for gRPC principals, not gateway HTTP keys.
 - Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
   `GATEWAY_KEYS` entry, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable
-  `CHISEI_GATEWAY_NO_PREFLIGHT` or `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
+  `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
   Startup fails closed if those gates are missing.
+- Set `CHISEI_GRPC_URL` or `SEKAI_SOCKET`; gateway startup fails without a
+  control-plane target and every provider request requires live admission.
 - Set `GATEWAY_GOVERNANCE_FAILURE=closed` on loopback when availability must
   never override governance.
 - Protect the admin refresh endpoint with a random
@@ -123,7 +125,6 @@ a retention policy and invoke `purge_old_records` with an explicit cutoff.
 - Treat cross-provider routing as opt-in because request/response translation
   can be lossy. Tool-call streams remain denied where semantics cannot be
   preserved.
-- Keep `CHISEI_GATEWAY_NO_PREFLIGHT` for controlled debugging only.
 
 ## Deployment checklist
 

@@ -99,8 +99,8 @@ value to stdout.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS`, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable `CHISEI_GATEWAY_NO_PREFLIGHT` or `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
-| `CHISEI_GRPC_URL` | unset | Control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
+| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS`, `GATEWAY_GOVERNANCE_FAILURE=closed`, and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
+| `CHISEI_GRPC_URL` | unset | Required control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
 | `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |
 | `CHISEI_ANTHROPIC_BASE_URL` | Anthropic API | Anthropic-compatible upstream; include `/v1` |
@@ -132,16 +132,11 @@ unknown instead of being billed at a misleading ordinary-input rate.
 
 When starting `chisei-gateway` directly, set either `CHISEI_GRPC_URL` or
 `SEKAI_SOCKET`. The gateway does not inherit the control plane's built-in
-`./data/sekai.sock` default. With neither variable set, it has no control-plane
-governance target; fail-closed mode rejects that configuration, while the
-default fail-open posture can proxy without policy or budget preflight.
+`./data/sekai.sock` default. Startup fails when neither variable supplies a
+non-empty target. Every provider request requires a live control-plane
+admission before provider contact.
 `sekaictl launch` and the Docker image set the socket target for their managed
 topologies.
-
-`CHISEI_GATEWAY_NO_PREFLIGHT=1` is a debugging escape hatch. It skips budget,
-policy, and context-egress preflight, is restricted to explicitly labelled
-low-risk requests, and records a durable fail-open audit. Do not use it as the
-normal deployment mode.
 
 See [the gateway guide](gateway.md) for authentication and routing semantics.
 
