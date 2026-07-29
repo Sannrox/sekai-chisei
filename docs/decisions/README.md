@@ -31,3 +31,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0006: Capability package ed25519 trust](0006-capability-package-ed25519-trust.md)
 - [ADR 0007: Provisional classification markings and purpose gates](0007-provisional-classification-markings.md)
 - [ADR 0008: Keep the gateway a fail-closed protocol translator](0008-gateway-is-a-fail-closed-translator.md)
+- [ADR 0009: Group expert `sekaictl` operations under `admin`](0009-sekaictl-administration-hierarchy.md)
