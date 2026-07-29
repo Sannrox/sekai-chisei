@@ -359,33 +359,30 @@ pub fn run(
     backend: Arc<RuntimeBackend>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
-) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> {
+) -> Result<
+    impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Box<dyn std::error::Error>,
+> {
     // This setup deliberately executes when `run` is called, before the
     // returned future is polled. The PostgreSQL backend uses synchronous
     // clients, so service construction must not acquire or release them from
     // inside Tokio.
-    let prepared = (|| -> Result<_, std::io::Error> {
-        backend
-            .capabilities()
-            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
-            .map_err(std::io::Error::other)?;
-        let db = backend.database();
-        let provider_registry_state_path =
-            crate::provider_profile::provider_registry_state_path(&config.db_path);
-        let credential_store = Arc::new(PrincipalCredentialStore::new());
-        credential_store.load(&active_credentials);
+    backend
+        .capabilities()
+        .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+        .map_err(std::io::Error::other)?;
+    let db = backend.database();
+    let provider_registry_state_path =
+        crate::provider_profile::provider_registry_state_path(&config.db_path);
+    let credential_store = Arc::new(PrincipalCredentialStore::new());
+    credential_store.load(&active_credentials);
 
-        if let Some(socket_path) = config.sekai_socket.as_deref() {
-            ensure_local_gateway_credential(socket_path, &db)?;
-        }
-        let services = build_services(&config, db.clone());
-        Ok((db, provider_registry_state_path, credential_store, services))
-    })();
+    if let Some(socket_path) = config.sekai_socket.as_deref() {
+        ensure_local_gateway_credential(socket_path, &db)?;
+    }
+    let (sekai_svc, chisei_svc) = build_services(&config, db.clone());
 
-    async move {
-        let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
-            prepared?;
-
+    Ok(async move {
         spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
 
         if let Some(ops_port) = config.ops_port {
@@ -457,7 +454,7 @@ pub fn run(
             health_service,
         )
         .await
-    }
+    })
 }
 
 fn ensure_local_gateway_credential(
