@@ -40,6 +40,7 @@ Evidence is checked in as:
 | #252 | RPC inventory and complete-Sekai capability evidence |
 | #259 | Action policy and approval |
 | #261–#265 | Capability packages, guarded mutations, definition lifecycle, decisions, team namespaces |
+| #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
 
 ## Still outside this parent
 

@@ -610,6 +610,82 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ApplyGovernedFactProfile",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutGovernedFactVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetGovernedFactVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PutGovernedWaiverVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetGovernedWaiverVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ResolveInvariantSet",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/governed_fact_backend_conformance.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.authorization"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ListSchemaTypes",
       "kind": "persistent",
       "surfaces": [

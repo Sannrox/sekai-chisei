@@ -26,6 +26,20 @@ Evidence adapter examples (`evidence_*`) and the batch Responses harness live
 under `examples/` as thin runners and are documented in
 [adapters/README.md](../adapters/README.md).
 
+## governed_fact_profile
+
+[governed_fact_profile.rs](governed_fact_profile.rs) shows an external software
+adapter applying the fixed `sekai.governed-facts/v1` profile, then representing
+API compatibility and data-migration safety through the same domain-neutral
+requirement and invariant structures:
+
+```bash
+cargo run --example governed_fact_profile
+```
+
+The example is local and deterministic. It makes no network or model calls and
+adds no software-specific field to the core contract.
+
 ## demo_client
 
 [demo_client.rs](demo_client.rs) is an end-to-end client that walks through a

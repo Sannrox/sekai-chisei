@@ -20,6 +20,7 @@ pub mod deduplication;
 pub mod evidence;
 mod federation_store;
 pub mod function;
+mod governed_facts;
 pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;
