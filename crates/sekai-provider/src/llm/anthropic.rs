@@ -1,6 +1,7 @@
 use super::{
-    ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts, Provider, ToolCall,
-    classify_reqwest_error,
+    ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts,
+    MAX_PROVIDER_RESPONSE_BYTES, Provider, ToolCall, classify_reqwest_error,
+    ensure_declared_response_size, read_bounded_response,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -55,10 +56,9 @@ impl Provider for Anthropic {
             .map_err(|err| classify_reqwest_error("anthropic chat request", err))?;
 
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| classify_reqwest_error("anthropic chat response", err))?;
+        ensure_declared_response_size(resp.content_length(), "anthropic chat response")?;
+        let body = read_bounded_response(resp, "anthropic chat response").await?;
+        let text = String::from_utf8_lossy(&body);
         if !status.is_success() {
             return Err(format!("anthropic {}: {}", status, text));
         }
@@ -110,11 +110,10 @@ impl Provider for Anthropic {
             .map_err(|err| classify_reqwest_error("anthropic stream request", err))?;
 
         let status = resp.status();
+        ensure_declared_response_size(resp.content_length(), "anthropic stream response")?;
         if !status.is_success() {
-            let text = resp
-                .text()
-                .await
-                .map_err(|err| classify_reqwest_error("anthropic stream response", err))?;
+            let body = read_bounded_response(resp, "anthropic stream response").await?;
+            let text = String::from_utf8_lossy(&body);
             return Err(format!("anthropic {}: {}", status, text));
         }
 
@@ -128,6 +127,7 @@ impl Provider for Anthropic {
             let mut cache_creation_input_tokens = 0;
             let mut stop_reason = String::new();
             let mut emitted_done = false;
+            let mut received_bytes = 0usize;
 
             futures_util::pin_mut!(stream);
             while let Some(next) = stream.next().await {
@@ -138,6 +138,14 @@ impl Provider for Anthropic {
                         return;
                     }
                 };
+                received_bytes = received_bytes.saturating_add(bytes.len());
+                if received_bytes > MAX_PROVIDER_RESPONSE_BYTES {
+                    yield Err(format!(
+                        "anthropic stream response exceeded the {} byte response limit",
+                        MAX_PROVIDER_RESPONSE_BYTES
+                    ));
+                    return;
+                }
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                 while let Some(index) = buffer.find("\n\n") {
                     let event = buffer[..index].to_string();

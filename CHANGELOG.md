@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+### Security
+
+- Enforce namespace authorization for egress checks, model affinity, and
+  request-selected evolution analytics and writes.
+- Restrict global evolution reports, patterns, variance, A/B results,
+  templates, and unscoped enhancement to control-plane administrators.
+- Bound OpenAI-compatible, Anthropic, and buffered gateway responses to
+  32 MiB before parsing or continued accumulation.
+
 ## 0.2.0
 
 ### Migration

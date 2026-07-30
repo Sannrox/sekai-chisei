@@ -1,6 +1,6 @@
 [package]
 name = "sekai-provider"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Provider contracts and adapters shared by Sekai Chisei transports."

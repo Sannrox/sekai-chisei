@@ -9,12 +9,67 @@ use std::pin::Pin;
 use std::time::Duration;
 use tracing::warn;
 
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+pub(super) fn ensure_declared_response_size(
+    content_length: Option<u64>,
+    context: &str,
+) -> Result<(), String> {
+    if content_length.is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64) {
+        Err(format!(
+            "{context} exceeded the {} byte response limit",
+            MAX_PROVIDER_RESPONSE_BYTES
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) async fn read_bounded_response(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    ensure_declared_response_size(response.content_length(), context)?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| classify_reqwest_error(context, error))?;
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(format!(
+                "{context} exceeded the {} byte response limit",
+                MAX_PROVIDER_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::{MAX_PROVIDER_RESPONSE_BYTES, ensure_declared_response_size};
+
+    #[test]
+    fn rejects_declared_provider_responses_above_the_limit() {
+        let error = ensure_declared_response_size(
+            Some(MAX_PROVIDER_RESPONSE_BYTES as u64 + 1),
+            "provider response",
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeded"));
+        ensure_declared_response_size(
+            Some(MAX_PROVIDER_RESPONSE_BYTES as u64),
+            "provider response",
+        )
+        .unwrap();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpTimeouts {

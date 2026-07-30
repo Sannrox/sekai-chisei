@@ -12,7 +12,7 @@ Operators use `sekaictl`; agents and SDKs use the same core gRPC and capability
 catalog interfaces. The control plane owns durable facts and the decisions that
 constrain an operation. It does not replace the agent runtime.
 
-> **Project status:** early-stage (`v0.2.0`). The core server, local graph,
+> **Project status:** early-stage (`v0.2.1`). The core server, local graph,
 > ontology-first product loop, policy pipeline, receipts, and native execution
 > APIs work today. Public APIs may change before v1.0.
 

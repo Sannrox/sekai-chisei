@@ -6925,6 +6925,8 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<CheckEgressRequest>,
     ) -> Result<Response<CheckEgressResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
         let r = req.into_inner();
         let effective_policy = self.policy.effective_policy(&r.namespace);
         let policy_version = effective_policy
@@ -9339,6 +9341,8 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetAffinityRequest>,
     ) -> Result<Response<GetAffinityResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
         let r = req.into_inner();
         let a = crate::chisei::affinity::get_affinity(&self.db, &r.namespace);
         Ok(Response::new(GetAffinityResponse {
@@ -9731,12 +9735,14 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_suggest(
         &self,
-        r: Request<EvolveSuggestRequest>,
+        req: Request<EvolveSuggestRequest>,
     ) -> Result<Response<EvolveSuggestResponse>, Status> {
-        let request_id = r.into_inner().request_id;
+        let actor = authenticated_actor(&req);
+        let request_id = req.into_inner().request_id;
         let task = self
             .evolve_task(&request_id)
             .ok_or(Status::not_found("task not found"))?;
+        require_namespace_access(&self.db, &actor, &task.namespace)?;
         let tasks = self.evolve_tasks();
         let namespace_tasks: Vec<_> = tasks
             .into_iter()
@@ -9760,17 +9766,26 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<EvolveEnhanceRequest>,
     ) -> Result<Response<EvolveEnhanceResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let r = req.into_inner();
         let tasks = self.evolve_tasks();
-        let patterns = self
-            .evolve_task(&r.request_id)
-            .map(|task| {
-                tasks
-                    .into_iter()
-                    .filter(|candidate| candidate.namespace == task.namespace)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| self.evolve_tasks());
+        let patterns = if r.request_id.is_empty() {
+            if !matches!(actor.as_str(), "root" | "local") {
+                return Err(Status::permission_denied(
+                    "global evolution enhancement requires control-plane administration",
+                ));
+            }
+            tasks
+        } else {
+            let task = self
+                .evolve_task(&r.request_id)
+                .ok_or(Status::not_found("task not found"))?;
+            require_namespace_write_access(&self.db, &actor, &task.namespace)?;
+            tasks
+                .into_iter()
+                .filter(|candidate| candidate.namespace == task.namespace)
+                .collect()
+        };
         let mined_patterns = crate::chisei::evolve::mine_patterns(&patterns);
         let (enhanced, modified) = crate::chisei::evolve::enhance_spec(&r.spec, &mined_patterns);
         if modified && !r.request_id.is_empty() {
@@ -9792,9 +9807,11 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<EvolveRecommendRequest>,
     ) -> Result<Response<EvolveRecommendResponse>, Status> {
+        let actor = authenticated_actor(&req);
         let task = self
             .evolve_task(&req.into_inner().request_id)
             .ok_or(Status::not_found("task not found"))?;
+        require_namespace_access(&self.db, &actor, &task.namespace)?;
         let recommendation = crate::chisei::evolve::recommend(&task).ok_or(
             Status::failed_precondition("task does not need a recommendation"),
         )?;
@@ -9808,8 +9825,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_report(
         &self,
-        _r: Request<EvolveReportRequest>,
+        req: Request<EvolveReportRequest>,
     ) -> Result<Response<EvolveReportResponse>, Status> {
+        require_control_plane_admin(&req, "global evolution reporting")?;
         let summary = crate::chisei::evolve::report(&self.evolve_tasks());
         Ok(Response::new(EvolveReportResponse {
             report: Some(EvolveReport {
@@ -9833,8 +9851,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_patterns(
         &self,
-        _r: Request<EvolvePatternsRequest>,
+        req: Request<EvolvePatternsRequest>,
     ) -> Result<Response<EvolvePatternsResponse>, Status> {
+        require_control_plane_admin(&req, "global evolution pattern mining")?;
         let patterns = crate::chisei::evolve::mine_patterns(&self.evolve_tasks());
         Ok(Response::new(EvolvePatternsResponse {
             patterns: patterns
@@ -9851,8 +9870,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_variance(
         &self,
-        _r: Request<EvolveVarianceRequest>,
+        req: Request<EvolveVarianceRequest>,
     ) -> Result<Response<EvolveVarianceResponse>, Status> {
+        require_control_plane_admin(&req, "global evolution variance analysis")?;
         let report = crate::chisei::evolve::analyze_variance(
             &self.evolve_tasks(),
             chrono::Utc::now().timestamp(),
@@ -9890,8 +9910,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_ab_results(
         &self,
-        _r: Request<EvolveAbResultsRequest>,
+        req: Request<EvolveAbResultsRequest>,
     ) -> Result<Response<EvolveAbResultsResponse>, Status> {
+        require_control_plane_admin(&req, "global evolution A/B reporting")?;
         let report = crate::chisei::evolve::compute_ab_results(&self.evolve_tasks());
         Ok(Response::new(EvolveAbResultsResponse {
             report: Some(EvolveAbReport {
@@ -9911,8 +9932,9 @@ impl ChiseiService for ChiseiServiceImpl {
 
     async fn evolve_templates(
         &self,
-        _r: Request<EvolveTemplatesRequest>,
+        req: Request<EvolveTemplatesRequest>,
     ) -> Result<Response<EvolveTemplatesResponse>, Status> {
+        require_control_plane_admin(&req, "global evolution template generation")?;
         let templates = crate::chisei::evolve::generate_templates(&self.evolve_tasks());
         Ok(Response::new(EvolveTemplatesResponse {
             templates: templates
@@ -15203,6 +15225,148 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("privacy gate"))
         }));
+    }
+
+    fn request_as<T>(message: T, principal: &'static str) -> Request<T> {
+        let mut request = Request::new(message);
+        request
+            .metadata_mut()
+            .insert("x-principal", principal.parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn namespace_scoped_analytics_deny_ungranted_principals() {
+        let svc = memory_service();
+
+        let check_egress = svc
+            .check_egress(request_as(
+                CheckEgressRequest {
+                    namespace: "private".into(),
+                    ..Default::default()
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(check_egress.code(), tonic::Code::PermissionDenied);
+
+        let affinity = svc
+            .get_affinity(request_as(
+                GetAffinityRequest {
+                    namespace: "private".into(),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(affinity.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn evolution_reads_and_writes_deny_cross_namespace_principals() {
+        let svc = memory_service();
+        svc.record_evolve_task(
+            "private-task",
+            "private",
+            "sensitive specification",
+            None,
+            "failed",
+            10,
+        )
+        .unwrap();
+
+        let suggest = svc
+            .evolve_suggest(request_as(
+                EvolveSuggestRequest {
+                    request_id: "private-task".into(),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(suggest.code(), tonic::Code::PermissionDenied);
+
+        let recommend = svc
+            .evolve_recommend(request_as(
+                EvolveRecommendRequest {
+                    request_id: "private-task".into(),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(recommend.code(), tonic::Code::PermissionDenied);
+
+        let enhance = svc
+            .evolve_enhance(request_as(
+                EvolveEnhanceRequest {
+                    request_id: "private-task".into(),
+                    spec: "attacker input".into(),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(enhance.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !svc.db
+                .list_evolve_enhancements()
+                .unwrap()
+                .contains_key("private-task")
+        );
+    }
+
+    #[tokio::test]
+    async fn global_evolution_analytics_require_control_plane_admin() {
+        let svc = memory_service();
+
+        assert_eq!(
+            svc.evolve_report(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.evolve_patterns(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.evolve_variance(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.evolve_ab_results(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.evolve_templates(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            svc.evolve_enhance(request_as(Default::default(), "mallory"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        svc.evolve_report(request_as(Default::default(), "root"))
+            .await
+            .expect("root retains global evolution reporting access");
     }
 
     #[tokio::test]

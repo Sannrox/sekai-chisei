@@ -69,6 +69,7 @@ const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_REQUESTS: u64 = 120;
 const DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS: u64 = 1_200;
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -10742,7 +10743,7 @@ async fn response_from_upstream(
             });
     }
 
-    match upstream.bytes().await {
+    match read_bounded_upstream_response(upstream).await {
         Ok(bytes) => {
             let (usage, observation) = extract_buffered_body_usage(&bytes);
             let buffered_terminal = context
@@ -10855,10 +10856,19 @@ async fn response_from_upstream(
             response
         }
         Err(err) => {
+            let reason = match &err {
+                BoundedResponseError::Transfer(error) => {
+                    safe_upstream_error_reason(context.provider, "response", error)
+                }
+                BoundedResponseError::TooLarge => format!(
+                    "{} upstream response exceeded the {DEFAULT_MAX_RESPONSE_BYTES} byte response limit",
+                    context.provider.runtime_name()
+                ),
+            };
             let rejection = GatewayRejection {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error".into(),
-                reason: safe_upstream_error_reason(context.provider, "response", &err),
+                reason,
                 retry_safety: Some("ambiguous"),
             };
             record_usage_and_append(
@@ -10878,6 +10888,36 @@ async fn response_from_upstream(
             json_error(rejection.status, &rejection.error_type, &rejection.reason)
         }
     }
+}
+
+enum BoundedResponseError {
+    Transfer(reqwest::Error),
+    TooLarge,
+}
+
+async fn read_bounded_upstream_response(
+    upstream: reqwest::Response,
+) -> Result<Bytes, BoundedResponseError> {
+    if upstream
+        .content_length()
+        .is_some_and(|length| length > DEFAULT_MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(BoundedResponseError::TooLarge);
+    }
+    let mut body = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BoundedResponseError::Transfer)?;
+        if buffered_response_exceeds_limit(body.len(), chunk.len()) {
+            return Err(BoundedResponseError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn buffered_response_exceeds_limit(buffered: usize, next_chunk: usize) -> bool {
+    buffered.saturating_add(next_chunk) > DEFAULT_MAX_RESPONSE_BYTES
 }
 
 #[cfg(test)]
@@ -14083,6 +14123,19 @@ mod tests {
         }
         assert_eq!(baseline["break_even_hits"]["5m"], 1);
         assert_eq!(baseline["break_even_hits"]["1h"], 2);
+    }
+
+    #[test]
+    fn buffered_upstream_response_limit_rejects_oversized_chunks() {
+        assert!(!buffered_response_exceeds_limit(
+            DEFAULT_MAX_RESPONSE_BYTES - 1,
+            1
+        ));
+        assert!(buffered_response_exceeds_limit(
+            DEFAULT_MAX_RESPONSE_BYTES,
+            1
+        ));
+        assert!(buffered_response_exceeds_limit(usize::MAX, 1));
     }
 
     #[derive(Clone)]

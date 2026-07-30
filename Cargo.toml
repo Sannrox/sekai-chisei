@@ -1,6 +1,6 @@
 [package]
 name = "sekai-chisei"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 readme = "README.md"
@@ -79,12 +79,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-sekai-provider = { version = "0.2.0", path = "crates/sekai-provider" }
-sekai-admin-client = { version = "0.2.0", path = "crates/sekai-admin-client" }
-sekai-proto = { version = "0.2.0", path = "crates/sekai-proto" }
+sekai-provider = { version = "0.2.1", path = "crates/sekai-provider" }
+sekai-admin-client = { version = "0.2.1", path = "crates/sekai-admin-client" }
+sekai-proto = { version = "0.2.1", path = "crates/sekai-proto" }
 
 [dev-dependencies]
-chisei-gateway = { version = "0.2.0", path = "crates/chisei-gateway" }
+chisei-gateway = { version = "0.2.1", path = "crates/chisei-gateway" }
 tempfile = "3"
 
 [[bench]]
