@@ -269,6 +269,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetLinkedObjects"
             | "Traverse"
             | "ListObjectChanges"
+            | "ApplyGovernedFactProfile"
+            | "PutGovernedFactVersion"
+            | "GetGovernedFactVersion"
+            | "PutGovernedWaiverVersion"
+            | "GetGovernedWaiverVersion"
+            | "ResolveInvariantSet"
     )
 }
 
@@ -943,11 +949,17 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_allowlist_includes_lease_guarded_mutations() {
+    fn enterprise_allowlist_includes_guarded_mutations_and_governed_facts() {
         for method in [
             "GuardedCreateObject",
             "GuardedUpdateObject",
             "GuardedDeleteObject",
+            "ApplyGovernedFactProfile",
+            "PutGovernedFactVersion",
+            "GetGovernedFactVersion",
+            "PutGovernedWaiverVersion",
+            "GetGovernedWaiverVersion",
+            "ResolveInvariantSet",
         ] {
             assert!(enterprise_namespace_method(method));
         }

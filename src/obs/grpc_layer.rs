@@ -230,6 +230,12 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "GetLinks"
                 | "GetLinkedObjects"
                 | "Traverse"
+                | "ApplyGovernedFactProfile"
+                | "PutGovernedFactVersion"
+                | "GetGovernedFactVersion"
+                | "PutGovernedWaiverVersion"
+                | "GetGovernedWaiverVersion"
+                | "ResolveInvariantSet"
                 | "ListSchemaTypes"
                 | "CreateFunction"
                 | "ListFunctions"
@@ -419,6 +425,23 @@ mod tests {
             assert_eq!(
                 parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
                 ("chisei.ChiseiService".into(), method.into())
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_governed_fact_rpc_paths() {
+        for method in [
+            "ApplyGovernedFactProfile",
+            "PutGovernedFactVersion",
+            "GetGovernedFactVersion",
+            "PutGovernedWaiverVersion",
+            "GetGovernedWaiverVersion",
+            "ResolveInvariantSet",
+        ] {
+            assert_eq!(
+                parse_grpc_path(&format!("/sekai.SekaiService/{method}")),
+                ("sekai.SekaiService".into(), method.into())
             );
         }
     }

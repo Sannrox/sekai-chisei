@@ -355,6 +355,16 @@ links, and evidence observations are rebuildable projections. Conflicting
 submissions remain separately attributable instead of being collapsed into a
 single asserted truth.
 
+The fixed `sekai.governed-facts/v1` profile stores immutable requirement,
+invariant, and waiver versions as reserved graph objects. It reuses graph ACLs,
+classification markings, transactional object-change audit, and the shared
+SQLite/PostgreSQL graph backend rather than creating a requirements database.
+An authorization-filtered resolver returns a content-addressed invariant set
+for one opaque subject and explicit evaluation time. Hidden reference closure
+is omitted before canonicalization, and generic graph CRUD cannot mutate or
+disclose these governance objects. Chisei later binds the returned exact
+invariant versions to situation-specific evaluator definitions and plans.
+
 `GetEvidenceSubmissionContent` is the governed, single-record read path for an
 admitted envelope. It resolves the submission's projected `external_evidence`
 object and rechecks that object's live ACL before returning the immutable

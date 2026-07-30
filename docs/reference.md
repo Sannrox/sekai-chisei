@@ -87,6 +87,8 @@ lives in the separate [research index](research/README.md).
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,
   content-bound evaluation through registered profiles.
+- [Governed requirement and invariant facts](governed-facts.md) — versioned
+  normative facts, exact supersession, governed waivers, and set resolution.
 - [Host-executor permit conformance](host-executor-permit-conformance.md) —
   enforcement requirements for permit-consuming hosts.
 - [Generation-fenced leases](leases.md) — object-bound coordination.

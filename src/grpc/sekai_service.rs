@@ -33,6 +33,7 @@ use crate::sekai::evidence_store::{
     EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition, EvidenceSubmissionFilter,
     EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
 };
+use crate::sekai::governed_facts as governed_fact_domain;
 use crate::sekai::handoff as handoff_domain;
 use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
@@ -4357,6 +4358,9 @@ const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     action_approval::ACTION_APPROVAL_KIND,
     crate::domain::KIND_CAPABILITY,
     crate::domain::KIND_EXTERNAL_EVIDENCE,
+    governed_fact_domain::PROFILE_KIND,
+    governed_fact_domain::FACT_KIND,
+    governed_fact_domain::WAIVER_KIND,
 ];
 const ERASED_NAMESPACE: &str = "[erased]";
 
@@ -5712,6 +5716,503 @@ fn authorize_package_mutation(
         .first()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("principal required"))
+}
+
+fn from_proto_governed_fact(
+    fact: GovernedFactVersion,
+) -> Result<governed_fact_domain::GovernedFactInput, Status> {
+    if !fact.object_id.is_empty()
+        || !fact.content_digest.is_empty()
+        || !fact.created_by.is_empty()
+        || fact.created_at_ms != 0
+    {
+        return Err(Status::invalid_argument(
+            "server-owned governed fact output fields must be empty",
+        ));
+    }
+    let applicability = fact
+        .applicability
+        .ok_or_else(|| Status::invalid_argument("fact applicability required"))?;
+    let verification = fact.verification.unwrap_or_default();
+    Ok(governed_fact_domain::GovernedFactInput {
+        contract_version: fact.contract_version,
+        namespace: fact.namespace,
+        fact_id: fact.fact_id,
+        version: fact.version,
+        fact_type: governed_fact_domain::GovernedFactType::parse(&fact.fact_type)
+            .map_err(Status::invalid_argument)?,
+        status: fact.status,
+        statement: fact.statement,
+        applicability: governed_fact_domain::FactApplicability {
+            subject_profiles: applicability.subject_profiles,
+            subject_refs: applicability.subject_refs,
+        },
+        verification: governed_fact_domain::VerificationContract {
+            predicate_kind: verification.predicate_kind,
+            input_schema: verification.input_schema,
+            result_schema: verification.result_schema,
+            evidence_types: verification.evidence_types,
+        },
+        requirement_version_ids: fact.requirement_version_ids,
+        evidence_refs: fact.evidence_refs,
+        source_ref: fact.source_ref,
+        effective_from_ms: fact.effective_from_ms,
+        supersedes_object_id: fact.supersedes_object_id,
+        access_marking: fact.access_marking,
+    })
+}
+
+fn to_proto_governed_fact(fact: &governed_fact_domain::GovernedFactVersion) -> GovernedFactVersion {
+    GovernedFactVersion {
+        contract_version: fact.input.contract_version.clone(),
+        object_id: fact.object_id.clone(),
+        namespace: fact.input.namespace.clone(),
+        fact_id: fact.input.fact_id.clone(),
+        version: fact.input.version.clone(),
+        fact_type: fact.input.fact_type.as_str().into(),
+        statement: fact.input.statement.clone(),
+        applicability: Some(GovernedFactApplicability {
+            subject_profiles: fact.input.applicability.subject_profiles.clone(),
+            subject_refs: fact.input.applicability.subject_refs.clone(),
+        }),
+        verification: Some(InvariantVerificationContract {
+            predicate_kind: fact.input.verification.predicate_kind.clone(),
+            input_schema: fact.input.verification.input_schema.clone(),
+            result_schema: fact.input.verification.result_schema.clone(),
+            evidence_types: fact.input.verification.evidence_types.clone(),
+        }),
+        requirement_version_ids: fact.input.requirement_version_ids.clone(),
+        evidence_refs: fact.input.evidence_refs.clone(),
+        source_ref: fact.input.source_ref.clone(),
+        effective_from_ms: fact.input.effective_from_ms,
+        supersedes_object_id: fact.input.supersedes_object_id.clone(),
+        content_digest: fact.content_digest.clone(),
+        created_by: fact.created_by.clone(),
+        created_at_ms: fact.created_at_ms,
+        access_marking: fact.input.access_marking.clone(),
+        status: fact.input.status.clone(),
+    }
+}
+
+fn from_proto_governed_waiver(
+    waiver: GovernedWaiverVersion,
+) -> Result<governed_fact_domain::GovernedWaiverInput, Status> {
+    if !waiver.object_id.is_empty()
+        || !waiver.content_digest.is_empty()
+        || !waiver.created_by.is_empty()
+        || waiver.created_at_ms != 0
+    {
+        return Err(Status::invalid_argument(
+            "server-owned governed waiver output fields must be empty",
+        ));
+    }
+    let applicability = waiver
+        .applicability
+        .ok_or_else(|| Status::invalid_argument("waiver applicability required"))?;
+    Ok(governed_fact_domain::GovernedWaiverInput {
+        contract_version: waiver.contract_version,
+        namespace: waiver.namespace,
+        waiver_id: waiver.waiver_id,
+        version: waiver.version,
+        invariant_version_ids: waiver.invariant_version_ids,
+        applicability: governed_fact_domain::FactApplicability {
+            subject_profiles: applicability.subject_profiles,
+            subject_refs: applicability.subject_refs,
+        },
+        reason: waiver.reason,
+        evidence_refs: waiver.evidence_refs,
+        source_ref: waiver.source_ref,
+        valid_from_ms: waiver.valid_from_ms,
+        expires_at_ms: waiver.expires_at_ms,
+        supersedes_object_id: waiver.supersedes_object_id,
+        access_marking: waiver.access_marking,
+    })
+}
+
+fn to_proto_governed_waiver(
+    waiver: &governed_fact_domain::GovernedWaiverVersion,
+) -> GovernedWaiverVersion {
+    GovernedWaiverVersion {
+        contract_version: waiver.input.contract_version.clone(),
+        object_id: waiver.object_id.clone(),
+        namespace: waiver.input.namespace.clone(),
+        waiver_id: waiver.input.waiver_id.clone(),
+        version: waiver.input.version.clone(),
+        invariant_version_ids: waiver.input.invariant_version_ids.clone(),
+        applicability: Some(GovernedFactApplicability {
+            subject_profiles: waiver.input.applicability.subject_profiles.clone(),
+            subject_refs: waiver.input.applicability.subject_refs.clone(),
+        }),
+        reason: waiver.input.reason.clone(),
+        evidence_refs: waiver.input.evidence_refs.clone(),
+        source_ref: waiver.input.source_ref.clone(),
+        valid_from_ms: waiver.input.valid_from_ms,
+        expires_at_ms: waiver.input.expires_at_ms,
+        supersedes_object_id: waiver.input.supersedes_object_id.clone(),
+        content_digest: waiver.content_digest.clone(),
+        created_by: waiver.created_by.clone(),
+        created_at_ms: waiver.created_at_ms,
+        access_marking: waiver.input.access_marking.clone(),
+    }
+}
+
+fn to_proto_governed_fact_profile(
+    profile: &governed_fact_domain::GovernedFactProfile,
+) -> GovernedFactProfile {
+    GovernedFactProfile {
+        object_id: profile.object_id.clone(),
+        contract_version: profile.contract_version.clone(),
+        namespace: profile.namespace.clone(),
+        content_digest: profile.content_digest.clone(),
+        applied_by: profile.applied_by.clone(),
+        applied_at_ms: profile.applied_at_ms,
+    }
+}
+
+fn to_proto_invariant_set(
+    invariant_set: &governed_fact_domain::ResolvedInvariantSet,
+) -> ResolvedInvariantSet {
+    ResolvedInvariantSet {
+        contract_version: invariant_set.contract_version.clone(),
+        set_id: invariant_set.set_id.clone(),
+        set_digest: invariant_set.set_digest.clone(),
+        profile_digest: invariant_set.profile_digest.clone(),
+        namespace: invariant_set.namespace.clone(),
+        subject_profile: invariant_set.subject_profile.clone(),
+        subject_ref: invariant_set.subject_ref.clone(),
+        evaluation_time_ms: invariant_set.evaluation_time_ms,
+        requirements: invariant_set
+            .requirements
+            .iter()
+            .map(to_proto_governed_fact)
+            .collect(),
+        invariants: invariant_set
+            .invariants
+            .iter()
+            .map(to_proto_governed_fact)
+            .collect(),
+        waivers: invariant_set
+            .waivers
+            .iter()
+            .map(to_proto_governed_waiver)
+            .collect(),
+    }
+}
+
+fn map_governed_fact_mutation_error(error: String) -> Status {
+    if error.contains("already exists") || error.contains("identity conflicts") {
+        Status::already_exists(error)
+    } else if error.contains("capacity") || error.contains("governed namespace exceeds") {
+        Status::resource_exhausted(error)
+    } else if error.contains("not applied")
+        || error.contains("reference unavailable")
+        || error.contains("superseded")
+        || error.contains("successor")
+        || error.contains("must supersede")
+        || error.contains("history is ambiguous")
+    {
+        Status::failed_precondition(error)
+    } else {
+        Status::invalid_argument(error)
+    }
+}
+
+const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
+
+fn enforce_governed_write_marking(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    object_id: &str,
+    access_marking: &str,
+) -> Result<(), Status> {
+    let mut properties = HashMap::new();
+    if !access_marking.is_empty() {
+        properties.insert(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            access_marking.into(),
+        );
+    }
+    enforce_object_marking_access(
+        &service.db,
+        &domain::Object {
+            id: object_id.into(),
+            kind: governed_fact_domain::FACT_KIND.into(),
+            name: String::new(),
+            namespace: namespace.into(),
+            external_id: String::new(),
+            properties,
+            created: 0,
+            updated: 0,
+        },
+        principals,
+        &format!("governed_fact_write:{object_id}"),
+    )
+    .map(|_| ())
+}
+
+fn governed_reference_tree_visible(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    object_id: &str,
+    visibility_cache: &mut HashMap<String, bool>,
+    work: &mut usize,
+) -> Result<bool, Status> {
+    struct Frame {
+        id: String,
+        references: Option<Vec<String>>,
+        next_reference: usize,
+    }
+
+    if let Some(visible) = visibility_cache.get(object_id) {
+        return Ok(*visible);
+    }
+    let mut stack = vec![Frame {
+        id: object_id.into(),
+        references: None,
+        next_reference: 0,
+    }];
+    let mut active = std::collections::BTreeSet::new();
+    while !stack.is_empty() {
+        let frame_index = stack.len() - 1;
+        let id = stack[frame_index].id.clone();
+        if stack[frame_index].references.is_none() {
+            if *work >= MAX_GOVERNED_VISIBILITY_WORK {
+                return Err(Status::resource_exhausted(
+                    "governed reference visibility work exceeds its bound",
+                ));
+            }
+            *work += 1;
+            if !active.insert(id.clone()) {
+                return Ok(false);
+            }
+            let object = service.db.get_object(&id).map_err(Status::internal)?;
+            let visible = object.as_ref().is_some_and(|object| {
+                object.namespace == namespace
+                    && check_team_namespace(&service.db, principals, namespace, false).is_ok()
+                    && check_read(&service.security, &id, principals).is_ok()
+                    && object_passes_marking(&service.db, object, principals).unwrap_or(false)
+            });
+            if !visible {
+                active.remove(&id);
+                visibility_cache.insert(id, false);
+                stack.pop();
+                continue;
+            }
+            stack[frame_index].references =
+                Some(governed_object_references(object.as_ref().unwrap())?);
+        }
+        let next_reference = stack[frame_index]
+            .references
+            .as_ref()
+            .and_then(|references| references.get(stack[frame_index].next_reference).cloned());
+        let Some(reference) = next_reference else {
+            active.remove(&id);
+            visibility_cache.insert(id, true);
+            stack.pop();
+            continue;
+        };
+        match visibility_cache.get(&reference).copied() {
+            Some(true) => stack[frame_index].next_reference += 1,
+            Some(false) => {
+                active.remove(&id);
+                visibility_cache.insert(id, false);
+                stack.pop();
+            }
+            None if active.contains(&reference) => return Ok(false),
+            None => stack.push(Frame {
+                id: reference,
+                references: None,
+                next_reference: 0,
+            }),
+        }
+    }
+    Ok(visibility_cache.get(object_id).copied().unwrap_or(false))
+}
+
+fn governed_object_references(object: &domain::Object) -> Result<Vec<String>, Status> {
+    if object.kind == governed_fact_domain::FACT_KIND {
+        let fact = governed_fact_domain::fact_from_object(object).map_err(Status::data_loss)?;
+        Ok(fact
+            .input
+            .requirement_version_ids
+            .iter()
+            .chain(fact.input.evidence_refs.iter())
+            .chain(
+                (!fact.input.supersedes_object_id.is_empty())
+                    .then_some(&fact.input.supersedes_object_id),
+            )
+            .cloned()
+            .collect())
+    } else if object.kind == governed_fact_domain::WAIVER_KIND {
+        let waiver = governed_fact_domain::waiver_from_object(object).map_err(Status::data_loss)?;
+        Ok(waiver
+            .input
+            .invariant_version_ids
+            .iter()
+            .chain(waiver.input.evidence_refs.iter())
+            .chain(
+                (!waiver.input.supersedes_object_id.is_empty())
+                    .then_some(&waiver.input.supersedes_object_id),
+            )
+            .cloned()
+            .collect())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn authorize_governed_fact_references(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    input: &governed_fact_domain::GovernedFactInput,
+) -> Result<(), Status> {
+    let mut visibility_cache = HashMap::new();
+    let mut visibility_work = 0;
+    for object_id in input
+        .requirement_version_ids
+        .iter()
+        .chain(input.evidence_refs.iter())
+        .chain((!input.supersedes_object_id.is_empty()).then_some(&input.supersedes_object_id))
+    {
+        if !governed_reference_tree_visible(
+            service,
+            principals,
+            &input.namespace,
+            object_id,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )? {
+            return Err(Status::failed_precondition(
+                "governed reference unavailable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authorize_governed_waiver_references(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    input: &governed_fact_domain::GovernedWaiverInput,
+) -> Result<(), Status> {
+    let mut visibility_cache = HashMap::new();
+    let mut visibility_work = 0;
+    for object_id in input
+        .invariant_version_ids
+        .iter()
+        .chain(input.evidence_refs.iter())
+        .chain((!input.supersedes_object_id.is_empty()).then_some(&input.supersedes_object_id))
+    {
+        if !governed_reference_tree_visible(
+            service,
+            principals,
+            &input.namespace,
+            object_id,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )? {
+            return Err(Status::failed_precondition(
+                "governed reference unavailable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn governed_object_for_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    object_id: &str,
+    expected_kind: &str,
+) -> Result<domain::Object, Status> {
+    let object = service
+        .db
+        .get_object(object_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("governed fact not found"))?;
+    if object.kind != expected_kind
+        || enforce_namespace_tenant_context(&service.db, tenant_context, &object.namespace, false)
+            .is_err()
+        || check_team_namespace(&service.db, principals, &object.namespace, false).is_err()
+        || check_read(&service.security, object_id, principals).is_err()
+        || !object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+    {
+        return Err(Status::not_found("governed fact not found"));
+    }
+    if matches!(
+        object.kind.as_str(),
+        governed_fact_domain::FACT_KIND | governed_fact_domain::WAIVER_KIND
+    ) {
+        let mut visibility_cache = HashMap::new();
+        let mut visibility_work = 0;
+        if !governed_reference_tree_visible(
+            service,
+            principals,
+            &object.namespace,
+            object_id,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )? {
+            return Err(Status::not_found("governed fact not found"));
+        }
+    }
+    Ok(object)
+}
+
+fn list_visible_governed_objects(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    kind: &str,
+    visibility_cache: &mut HashMap<String, bool>,
+    visibility_work: &mut usize,
+) -> Result<Vec<domain::Object>, Status> {
+    let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut offset = 0i32;
+    let mut visible = Vec::new();
+    loop {
+        let filter = domain::ListFilter {
+            kind: Some(kind.into()),
+            namespace: Some(namespace.into()),
+            limit: domain::MAX_LIST_LIMIT,
+            offset,
+            ..domain::ListFilter::default()
+        };
+        let (page, total) = service
+            .db
+            .list_objects_with_total_for_principals(&filter, &principal_refs, &[])
+            .map_err(Status::internal)?;
+        if page.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(page.len() as i32);
+        for object in page {
+            if object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+                && governed_reference_tree_visible(
+                    service,
+                    principals,
+                    namespace,
+                    &object.id,
+                    visibility_cache,
+                    visibility_work,
+                )?
+            {
+                visible.push(object);
+                if visible.len() > governed_fact_domain::MAX_FACTS_PER_NAMESPACE {
+                    return Err(Status::resource_exhausted(
+                        "authorized governed-fact inventory exceeds its bound",
+                    ));
+                }
+            }
+        }
+        if offset >= total {
+            break;
+        }
+    }
+    Ok(visible)
 }
 
 fn from_proto_governed_action_type(
@@ -8652,6 +9153,267 @@ impl SekaiService for SekaiServiceImpl {
                     created_at_ms: signer.created_at_ms,
                 })
                 .collect(),
+        }))
+    }
+
+    async fn apply_governed_fact_profile(
+        &self,
+        req: Request<ApplyGovernedFactProfileRequest>,
+    ) -> Result<Response<ApplyGovernedFactProfileResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let inner = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &inner.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &inner.namespace, true)?;
+        let object_id = governed_fact_domain::profile_object_id(&inner.namespace);
+        check_write(&self.security, &object_id, &principals)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let profile = governed_fact_domain::apply_profile(
+            self.db.as_ref(),
+            &inner.namespace,
+            &inner.contract_version,
+            &actor,
+            now_millis(),
+        )
+        .map_err(map_governed_fact_mutation_error)?;
+        Ok(Response::new(ApplyGovernedFactProfileResponse {
+            profile: Some(to_proto_governed_fact_profile(&profile)),
+        }))
+    }
+
+    async fn put_governed_fact_version(
+        &self,
+        req: Request<PutGovernedFactVersionRequest>,
+    ) -> Result<Response<PutGovernedFactVersionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = from_proto_governed_fact(
+            req.into_inner()
+                .fact
+                .ok_or_else(|| Status::invalid_argument("governed fact required"))?,
+        )?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let object_id = governed_fact_domain::fact_object_id(
+            &input.namespace,
+            input.fact_type,
+            &input.fact_id,
+            &input.version,
+        );
+        check_write(&self.security, &object_id, &principals)?;
+        if self
+            .db
+            .get_object(&object_id)
+            .map_err(Status::internal)?
+            .is_some()
+        {
+            governed_object_for_read(
+                self,
+                &principals,
+                tenant_context.as_ref(),
+                &object_id,
+                governed_fact_domain::FACT_KIND,
+            )?;
+        } else {
+            enforce_governed_write_marking(
+                self,
+                &principals,
+                &input.namespace,
+                &object_id,
+                &input.access_marking,
+            )?;
+            authorize_governed_fact_references(self, &principals, &input)?;
+        }
+        let actor = principals.first().cloned().unwrap_or_default();
+        let fact = governed_fact_domain::put_fact(self.db.as_ref(), input, &actor, now_millis())
+            .map_err(map_governed_fact_mutation_error)?;
+        Ok(Response::new(PutGovernedFactVersionResponse {
+            fact: Some(to_proto_governed_fact(&fact)),
+        }))
+    }
+
+    async fn get_governed_fact_version(
+        &self,
+        req: Request<GetGovernedFactVersionRequest>,
+    ) -> Result<Response<GetGovernedFactVersionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let object_id = req.into_inner().object_id;
+        let object = governed_object_for_read(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &object_id,
+            governed_fact_domain::FACT_KIND,
+        )?;
+        let fact = governed_fact_domain::fact_from_object(&object).map_err(Status::data_loss)?;
+        Ok(Response::new(GetGovernedFactVersionResponse {
+            fact: Some(to_proto_governed_fact(&fact)),
+        }))
+    }
+
+    async fn put_governed_waiver_version(
+        &self,
+        req: Request<PutGovernedWaiverVersionRequest>,
+    ) -> Result<Response<PutGovernedWaiverVersionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = from_proto_governed_waiver(
+            req.into_inner()
+                .waiver
+                .ok_or_else(|| Status::invalid_argument("governed waiver required"))?,
+        )?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let object_id = governed_fact_domain::waiver_object_id(
+            &input.namespace,
+            &input.waiver_id,
+            &input.version,
+        );
+        check_write(&self.security, &object_id, &principals)?;
+        if self
+            .db
+            .get_object(&object_id)
+            .map_err(Status::internal)?
+            .is_some()
+        {
+            governed_object_for_read(
+                self,
+                &principals,
+                tenant_context.as_ref(),
+                &object_id,
+                governed_fact_domain::WAIVER_KIND,
+            )?;
+        } else {
+            enforce_governed_write_marking(
+                self,
+                &principals,
+                &input.namespace,
+                &object_id,
+                &input.access_marking,
+            )?;
+            authorize_governed_waiver_references(self, &principals, &input)?;
+        }
+        let actor = principals.first().cloned().unwrap_or_default();
+        let waiver =
+            governed_fact_domain::put_waiver(self.db.as_ref(), input, &actor, now_millis())
+                .map_err(map_governed_fact_mutation_error)?;
+        Ok(Response::new(PutGovernedWaiverVersionResponse {
+            waiver: Some(to_proto_governed_waiver(&waiver)),
+        }))
+    }
+
+    async fn get_governed_waiver_version(
+        &self,
+        req: Request<GetGovernedWaiverVersionRequest>,
+    ) -> Result<Response<GetGovernedWaiverVersionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let object_id = req.into_inner().object_id;
+        let object = governed_object_for_read(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &object_id,
+            governed_fact_domain::WAIVER_KIND,
+        )?;
+        let waiver =
+            governed_fact_domain::waiver_from_object(&object).map_err(Status::data_loss)?;
+        Ok(Response::new(GetGovernedWaiverVersionResponse {
+            waiver: Some(to_proto_governed_waiver(&waiver)),
+        }))
+    }
+
+    async fn resolve_invariant_set(
+        &self,
+        req: Request<ResolveInvariantSetRequest>,
+    ) -> Result<Response<ResolveInvariantSetResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let inner = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &inner.namespace,
+            false,
+        )?;
+        check_team_namespace(&self.db, &principals, &inner.namespace, false)?;
+        let profile_object = governed_object_for_read(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &governed_fact_domain::profile_object_id(&inner.namespace),
+            governed_fact_domain::PROFILE_KIND,
+        )?;
+        let profile = governed_fact_domain::profile_from_object(&profile_object)
+            .map_err(Status::data_loss)?;
+        let mut visibility_cache = HashMap::new();
+        let mut visibility_work = 0;
+        let facts = list_visible_governed_objects(
+            self,
+            &principals,
+            &inner.namespace,
+            governed_fact_domain::FACT_KIND,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )?
+        .iter()
+        .map(governed_fact_domain::fact_from_object)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Status::data_loss)?;
+        let waivers = list_visible_governed_objects(
+            self,
+            &principals,
+            &inner.namespace,
+            governed_fact_domain::WAIVER_KIND,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )?
+        .iter()
+        .map(governed_fact_domain::waiver_from_object)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Status::data_loss)?;
+        let invariant_set = governed_fact_domain::resolve_invariant_set(
+            &profile,
+            facts,
+            waivers,
+            &inner.subject_profile,
+            &inner.subject_ref,
+            inner.evaluation_time_ms,
+            inner.max_items as usize,
+        )
+        .map_err(|error| {
+            if error.contains("exceeds") {
+                Status::resource_exhausted(error)
+            } else if error.contains("history is ambiguous") {
+                Status::failed_precondition("governed fact resolution unavailable")
+            } else {
+                Status::invalid_argument(error)
+            }
+        })?;
+        Ok(Response::new(ResolveInvariantSetResponse {
+            invariant_set: Some(to_proto_invariant_set(&invariant_set)),
         }))
     }
 
@@ -15704,6 +16466,415 @@ mod tests {
         };
         svc.db.create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
+    }
+
+    fn governed_requirement(
+        namespace: &str,
+        fact_id: &str,
+        subject_profile: &str,
+    ) -> GovernedFactVersion {
+        GovernedFactVersion {
+            contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            fact_id: fact_id.into(),
+            version: "1.0.0".into(),
+            fact_type: "requirement".into(),
+            status: "active".into(),
+            statement: "The subject preserves its declared compatibility contract.".into(),
+            applicability: Some(GovernedFactApplicability {
+                subject_profiles: vec![subject_profile.into()],
+                subject_refs: Vec::new(),
+            }),
+            ..GovernedFactVersion::default()
+        }
+    }
+
+    fn governed_invariant(
+        namespace: &str,
+        fact_id: &str,
+        subject_profile: &str,
+        requirement_id: &str,
+        evidence_id: &str,
+    ) -> GovernedFactVersion {
+        GovernedFactVersion {
+            contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            namespace: namespace.into(),
+            fact_id: fact_id.into(),
+            version: "1.0.0".into(),
+            fact_type: "invariant".into(),
+            status: "active".into(),
+            statement: "The evidence conforms to the declared schema.".into(),
+            applicability: Some(GovernedFactApplicability {
+                subject_profiles: vec![subject_profile.into()],
+                subject_refs: Vec::new(),
+            }),
+            verification: Some(InvariantVerificationContract {
+                predicate_kind: "schema_conformance".into(),
+                input_schema: "example.input/v1".into(),
+                result_schema: "example.result/v1".into(),
+                evidence_types: vec!["verification.result".into()],
+            }),
+            requirement_version_ids: vec![requirement_id.into()],
+            evidence_refs: vec![evidence_id.into()],
+            source_ref: format!("policy:{fact_id}"),
+            effective_from_ms: 100,
+            ..GovernedFactVersion::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_facts_are_immutable_reserved_and_historically_resolvable() {
+        let svc = service();
+        let namespace = "governed";
+        svc.apply_governed_fact_profile(with_named_principal(
+            ApplyGovernedFactProfileRequest {
+                namespace: namespace.into(),
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let evidence_id = "governed-evidence";
+        svc.db
+            .create_object_with_audit(
+                &domain::Object {
+                    id: evidence_id.into(),
+                    kind: domain::KIND_EXTERNAL_EVIDENCE.into(),
+                    name: "evidence".into(),
+                    namespace: namespace.into(),
+                    external_id: "evidence:governed".into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                },
+                "local",
+            )
+            .unwrap();
+        let mut requirement = governed_requirement(
+            namespace,
+            "api-compatibility",
+            "example.release-candidate/v1",
+        );
+        requirement.source_ref = "policy:api-compatibility".into();
+        requirement.effective_from_ms = 100;
+        let requirement = svc
+            .put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(requirement),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .fact
+            .unwrap();
+        let invariant = svc
+            .put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(governed_invariant(
+                        namespace,
+                        "api-schema-compatible",
+                        "example.release-candidate/v1",
+                        &requirement.object_id,
+                        evidence_id,
+                    )),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .fact
+            .unwrap();
+        let at_150 = svc
+            .resolve_invariant_set(with_named_principal(
+                ResolveInvariantSetRequest {
+                    namespace: namespace.into(),
+                    subject_profile: "example.release-candidate/v1".into(),
+                    subject_ref: "release:one".into(),
+                    evaluation_time_ms: 150,
+                    max_items: 0,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .invariant_set
+            .unwrap();
+        assert_eq!(at_150.requirements[0].object_id, requirement.object_id);
+        assert_eq!(at_150.invariants[0].object_id, invariant.object_id);
+        assert!(at_150.set_digest.starts_with("sha256:"));
+
+        let mut successor = governed_invariant(
+            namespace,
+            "api-schema-compatible",
+            "example.release-candidate/v1",
+            &requirement.object_id,
+            evidence_id,
+        );
+        successor.version = "2.0.0".into();
+        successor.statement = "The evidence conforms to the v2 declared schema.".into();
+        successor.effective_from_ms = 200;
+        successor.supersedes_object_id = invariant.object_id.clone();
+        let successor = svc
+            .put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(successor),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .fact
+            .unwrap();
+        let at_250 = svc
+            .resolve_invariant_set(with_named_principal(
+                ResolveInvariantSetRequest {
+                    namespace: namespace.into(),
+                    subject_profile: "example.release-candidate/v1".into(),
+                    subject_ref: "release:one".into(),
+                    evaluation_time_ms: 250,
+                    max_items: 0,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .invariant_set
+            .unwrap();
+        assert_eq!(at_250.invariants[0].object_id, successor.object_id);
+        assert_ne!(at_150.set_digest, at_250.set_digest);
+        assert!(
+            svc.get_governed_fact_version(with_named_principal(
+                GetGovernedFactVersionRequest {
+                    object_id: invariant.object_id.clone(),
+                },
+                "local",
+            ))
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            svc.get_object(with_named_principal(
+                GetObjectRequest {
+                    id: invariant.object_id.clone(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            svc.delete_object(with_named_principal(
+                DeleteObjectRequest {
+                    id: invariant.object_id,
+                    lease_precondition: None,
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_governed_facts_do_not_affect_the_callers_set_projection() {
+        let svc = service();
+        let namespace = "protected-governed";
+        svc.apply_governed_fact_profile(with_named_principal(
+            ApplyGovernedFactProfileRequest {
+                namespace: namespace.into(),
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut unauthorized =
+            governed_requirement(namespace, "unauthorized-marking", "example.protected/v1");
+        unauthorized.source_ref = "policy:unauthorized-marking".into();
+        unauthorized.effective_from_ms = 100;
+        unauthorized.access_marking = "confidential".into();
+        assert_eq!(
+            svc.put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(unauthorized),
+                },
+                "reader",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut requirement = governed_requirement(namespace, "protected", "example.protected/v1");
+        requirement.source_ref = "policy:protected".into();
+        requirement.effective_from_ms = 100;
+        requirement.access_marking = "confidential".into();
+        let protected = svc
+            .put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(requirement),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .fact
+            .unwrap();
+        let evidence_id = "protected-governed-evidence";
+        svc.db
+            .create_object_with_audit(
+                &domain::Object {
+                    id: evidence_id.into(),
+                    kind: domain::KIND_EXTERNAL_EVIDENCE.into(),
+                    name: "protected evidence".into(),
+                    namespace: namespace.into(),
+                    external_id: "evidence:protected".into(),
+                    properties: HashMap::new(),
+                    created: 100,
+                    updated: 100,
+                },
+                "local",
+            )
+            .unwrap();
+        let visible_invariant = svc
+            .put_governed_fact_version(with_named_principal(
+                PutGovernedFactVersionRequest {
+                    fact: Some(governed_invariant(
+                        namespace,
+                        "visible-but-dependency-protected",
+                        "example.protected/v1",
+                        &protected.object_id,
+                        evidence_id,
+                    )),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .fact
+            .unwrap();
+
+        assert_eq!(
+            svc.get_governed_fact_version(with_named_principal(
+                GetGovernedFactVersionRequest {
+                    object_id: protected.object_id.clone(),
+                },
+                "reader",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            svc.get_governed_fact_version(with_named_principal(
+                GetGovernedFactVersionRequest {
+                    object_id: visible_invariant.object_id,
+                },
+                "reader",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::NotFound
+        );
+        let projected = svc
+            .resolve_invariant_set(with_named_principal(
+                ResolveInvariantSetRequest {
+                    namespace: namespace.into(),
+                    subject_profile: "example.protected/v1".into(),
+                    subject_ref: "subject:protected".into(),
+                    evaluation_time_ms: 150,
+                    max_items: 0,
+                },
+                "reader",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .invariant_set
+            .unwrap();
+        assert!(projected.requirements.is_empty());
+        assert!(projected.invariants.is_empty());
+        assert!(projected.waivers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn governed_history_visibility_matches_the_persisted_history_bound() {
+        let svc = service();
+        let namespace = "long-governed-history";
+        svc.apply_governed_fact_profile(with_named_principal(
+            ApplyGovernedFactProfileRequest {
+                namespace: namespace.into(),
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut predecessor = String::new();
+        for version in 1..=12 {
+            let mut requirement =
+                governed_requirement(namespace, "long-lived", "example.long-lived/v1");
+            requirement.version = format!("{version}.0.0");
+            requirement.source_ref = "policy:long-lived".into();
+            requirement.effective_from_ms = 100 + version;
+            requirement.supersedes_object_id = predecessor;
+            predecessor = svc
+                .put_governed_fact_version(with_named_principal(
+                    PutGovernedFactVersionRequest {
+                        fact: Some(requirement),
+                    },
+                    "local",
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .fact
+                .unwrap()
+                .object_id;
+        }
+
+        assert!(
+            svc.get_governed_fact_version(with_named_principal(
+                GetGovernedFactVersionRequest {
+                    object_id: predecessor.clone(),
+                },
+                "local",
+            ))
+            .await
+            .is_ok()
+        );
+        let projected = svc
+            .resolve_invariant_set(with_named_principal(
+                ResolveInvariantSetRequest {
+                    namespace: namespace.into(),
+                    subject_profile: "example.long-lived/v1".into(),
+                    subject_ref: "subject:long-lived".into(),
+                    evaluation_time_ms: 200,
+                    max_items: 0,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .invariant_set
+            .unwrap();
+        assert_eq!(projected.requirements[0].object_id, predecessor);
     }
 
     fn widget_schema_type() -> ObjectType {

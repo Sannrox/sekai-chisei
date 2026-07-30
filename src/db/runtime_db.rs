@@ -876,6 +876,38 @@ impl RuntimeDb {
         }
     }
 
+    pub fn create_governed_object_with_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        history_identity_property: &str,
+        history_identity: &str,
+        predecessor_property: &str,
+        predecessor_id: &str,
+        max_objects: usize,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.create_governed_object_with_audit(
+                object,
+                actor,
+                history_identity_property,
+                history_identity,
+                predecessor_property,
+                predecessor_id,
+                max_objects,
+            ),
+            Self::Postgres(db) => db.create_governed_object_with_audit(
+                object,
+                actor,
+                history_identity_property,
+                history_identity,
+                predecessor_property,
+                predecessor_id,
+                max_objects,
+            ),
+        }
+    }
+
     pub fn create_virtual_table(&self, vt: &VirtualTable) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.create_virtual_table(vt),
