@@ -7,6 +7,9 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
+const SUPPORTED_ASSERTION_TYPES: [&str; 4] = ["status", "contains", "not_contains", "min_score"];
+const MAX_REPORTED_ASSERTION_TYPE_CHARS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VarianceCaseResult {
     pub case_id: String,
@@ -739,6 +742,42 @@ fn stddev(values: Vec<f64>) -> f64 {
     variance.sqrt()
 }
 
+fn unsupported_assertion_type_error(assert_type: &str) -> String {
+    let mut chars = assert_type.chars();
+    let mut reported: String = chars
+        .by_ref()
+        .take(MAX_REPORTED_ASSERTION_TYPE_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if chars.next().is_some() {
+        reported.push('…');
+    }
+    format!("unsupported eval assertion type \"{reported}\"")
+}
+
+fn validate_assertion_type(assert_type: &str) -> Result<(), String> {
+    if SUPPORTED_ASSERTION_TYPES.contains(&assert_type) {
+        Ok(())
+    } else {
+        Err(unsupported_assertion_type_error(assert_type))
+    }
+}
+
+pub fn validate_builtin_suite_assertions(suite: &Suite) -> Result<(), String> {
+    for case in &suite.cases {
+        for assertion in &case.assertions {
+            validate_assertion_type(&assertion.assert_type)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn check_assertions(
     assertions: &[Assertion],
     status: &str,
@@ -751,7 +790,7 @@ pub fn check_assertions(
             "contains" => result.contains(&a.value),
             "not_contains" => !result.contains(&a.value),
             "min_score" => score >= a.value.parse().unwrap_or(0),
-            _ => true,
+            _ => return (false, unsupported_assertion_type_error(&a.assert_type)),
         };
         if !ok {
             return (
@@ -994,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assertions() {
+    fn supported_assertions_keep_their_existing_behavior() {
         let (ok, _) = check_assertions(
             &[Assertion {
                 assert_type: "status".into(),
@@ -1025,6 +1064,111 @@ mod tests {
             50,
         );
         assert!(!ok);
+
+        let (ok, _) = check_assertions(
+            &[Assertion {
+                assert_type: "not_contains".into(),
+                value: "failure".into(),
+            }],
+            "",
+            "task success",
+            0,
+        );
+        assert!(ok);
+    }
+
+    #[test]
+    fn unsupported_assertions_and_supported_type_typos_fail_closed() {
+        for assert_type in ["unknown", "statu", "contain", "not_contain", "min_socre"] {
+            let (ok, reason) = check_assertions(
+                &[Assertion {
+                    assert_type: assert_type.into(),
+                    value: "sensitive-expected-value".into(),
+                }],
+                "done",
+                "sensitive-result-content",
+                100,
+            );
+
+            assert!(!ok, "{assert_type} passed");
+            assert_eq!(
+                reason,
+                format!("unsupported eval assertion type \"{assert_type}\"")
+            );
+            assert!(!reason.contains("sensitive-expected-value"));
+            assert!(!reason.contains("sensitive-result-content"));
+        }
+    }
+
+    #[test]
+    fn suite_validation_rejects_unknown_assertions_with_a_bounded_reason() {
+        let assert_type = format!("unknown\n{}", "x".repeat(1_000));
+        let suite = Suite {
+            id: "invalid-suite".into(),
+            name: "invalid".into(),
+            description: String::new(),
+            cases: vec![Case {
+                id: "case-1".into(),
+                name: "case".into(),
+                namespace: "acme".into(),
+                spec: String::new(),
+                assertions: vec![Assertion {
+                    assert_type,
+                    value: "sensitive-expected-value".into(),
+                }],
+            }],
+        };
+
+        let error = validate_builtin_suite_assertions(&suite).unwrap_err();
+        assert!(error.starts_with("unsupported eval assertion type \"unknown?"));
+        assert!(error.len() <= 300, "{error}");
+        assert!(!error.contains("sensitive-expected-value"));
+    }
+
+    #[test]
+    fn legacy_persisted_unknown_assertions_fail_closed_when_evaluated() {
+        let path =
+            std::env::temp_dir().join(format!("sekai-legacy-eval-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        let cases = vec![Case {
+            id: "legacy-case".into(),
+            name: "legacy".into(),
+            namespace: "acme".into(),
+            spec: String::new(),
+            assertions: vec![Assertion {
+                assert_type: "min_socre".into(),
+                value: "sensitive-expected-value".into(),
+            }],
+        }];
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO chisei_eval_suites (id, name, description, cases_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "legacy-invalid-suite",
+                    "legacy",
+                    "",
+                    serde_json::to_string(&cases).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let store = EvalStore::with_db(db);
+        let suite = store.get_suite("legacy-invalid-suite").unwrap();
+        let (ok, reason) = check_assertions(
+            &suite.cases[0].assertions,
+            "done",
+            "sensitive-result-content",
+            100,
+        );
+
+        assert!(!ok);
+        assert_eq!(reason, "unsupported eval assertion type \"min_socre\"");
+        assert!(!reason.contains("sensitive-expected-value"));
+        assert!(!reason.contains("sensitive-result-content"));
     }
 
     #[test]

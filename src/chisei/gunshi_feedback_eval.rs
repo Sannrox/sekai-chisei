@@ -58,6 +58,38 @@ pub fn is_feedback_suite_id(suite_id: &str) -> bool {
     suite_id.starts_with(FEEDBACK_SUITE_PREFIX)
 }
 
+/// Distinguish trusted, generated feedback labels from ordinary authored
+/// assertions without relying on the caller-controlled suite id alone.
+pub fn is_generated_feedback_case(case: &Case) -> bool {
+    let Ok(payload) = serde_json::from_str::<FeedbackEvalCasePayload>(&case.spec) else {
+        return false;
+    };
+    if payload.contract_version != PROMOTED_CASE_VERSION
+        || payload.feedback_contract_version != FEEDBACK_RECORD_VERSION
+        || payload.namespace != case.namespace
+        || feedback_case_id(&payload.issuance_id, &payload.allocation_id) != case.id
+    {
+        return false;
+    }
+
+    let response_value = match payload.operator_response {
+        OperatorResponse::Accepted => "accepted",
+        OperatorResponse::Modified => "modified",
+        OperatorResponse::Rejected => "rejected",
+    };
+    let mut expected = vec![Assertion {
+        assert_type: "gunshi_operator_response".into(),
+        value: response_value.into(),
+    }];
+    if let Some(outcome_accepted) = payload.outcome_accepted {
+        expected.push(Assertion {
+            assert_type: "gunshi_outcome_accepted".into(),
+            value: outcome_accepted.to_string(),
+        });
+    }
+    case.assertions == expected
+}
+
 pub fn redact_rationale(rationale: &str) -> String {
     let trimmed = rationale.trim();
     if trimmed.is_empty() {
@@ -400,6 +432,24 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.suite.cases.len(), 1);
         assert_eq!(first.case_id, second.case_id);
+    }
+
+    #[test]
+    fn generated_feedback_case_requires_exact_content_identity_and_labels() {
+        let record = seed_feedback(&RuntimeDb::memory());
+        let case = case_from_feedback(&record).unwrap();
+        assert!(is_generated_feedback_case(&case));
+
+        let mut forged = case.clone();
+        forged.assertions.push(Assertion {
+            assert_type: "status".into(),
+            value: "ok".into(),
+        });
+        assert!(!is_generated_feedback_case(&forged));
+
+        let mut wrong_namespace = case;
+        wrong_namespace.namespace = "other".into();
+        assert!(!is_generated_feedback_case(&wrong_namespace));
     }
 
     #[test]

@@ -9386,6 +9386,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 })
                 .collect(),
         };
+        crate::chisei::eval::validate_builtin_suite_assertions(&suite)
+            .map_err(Status::invalid_argument)?;
         self.eval.put_suite(suite).map_err(Status::internal)?;
         Ok(Response::new(CreateEvalSuiteResponse { suite: Some(s) }))
     }
@@ -12042,6 +12044,39 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn create_eval_suite_rejects_unknown_assertion_types() {
+        let svc = memory_service();
+        let error = svc
+            .create_eval_suite(Request::new(CreateEvalSuiteRequest {
+                suite: Some(EvalSuite {
+                    id: "invalid-assertion-suite".into(),
+                    name: "invalid".into(),
+                    description: String::new(),
+                    cases: vec![EvalCase {
+                        id: "case-1".into(),
+                        name: "case".into(),
+                        namespace: "acme".into(),
+                        spec: String::new(),
+                        assertions: vec![EvalAssertion {
+                            r#type: "min_socre".into(),
+                            value: "sensitive-expected-value".into(),
+                        }],
+                    }],
+                }),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "unsupported eval assertion type \"min_socre\""
+        );
+        assert!(!error.message().contains("sensitive-expected-value"));
+        assert!(svc.eval.get_suite("invalid-assertion-suite").is_none());
     }
 
     #[tokio::test]
