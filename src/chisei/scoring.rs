@@ -27,6 +27,7 @@ use tracing::{error, info, warn};
 
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::eval::{self, EvalStore};
+use crate::chisei::gunshi_feedback_eval::{is_feedback_suite_id, is_generated_feedback_case};
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
@@ -687,7 +688,11 @@ impl ScoringJob {
         Ok(())
     }
 
-    /// Union of assertions from any authored (non-sampling) suite whose cases target this namespace.
+    /// Union of built-in assertions from authored suites whose cases target this namespace.
+    ///
+    /// Gunshi feedback suites carry situation-specific outcome labels in the same wire envelope.
+    /// Those labels inform the judge rubric but are not inputs to the built-in deterministic
+    /// assertion checker.
     fn reference_assertions(&self, namespace: &str) -> Vec<eval::Assertion> {
         if namespace.is_empty() {
             return vec![];
@@ -698,6 +703,9 @@ impl ScoringJob {
                 continue;
             }
             for case in suite.cases.iter().filter(|c| c.namespace == namespace) {
+                if is_feedback_suite_id(&suite.id) && is_generated_feedback_case(case) {
+                    continue;
+                }
                 assertions.extend(case.assertions.iter().cloned());
             }
         }
@@ -1147,6 +1155,87 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
         (db.clone(), Arc::new(EvalStore::with_db(db)))
+    }
+
+    #[test]
+    fn situation_specific_feedback_labels_do_not_enter_the_builtin_assertion_gate() {
+        let (db, eval) = setup();
+        let issuance_id = "issuance-1";
+        let allocation_id = "allocation-1";
+        let feedback_payload = crate::chisei::gunshi_feedback_eval::FeedbackEvalCasePayload {
+            contract_version: crate::chisei::gunshi_feedback_eval::PROMOTED_CASE_VERSION.into(),
+            feedback_contract_version: crate::chisei::gunshi_feedback::FEEDBACK_RECORD_VERSION
+                .into(),
+            issuance_id: issuance_id.into(),
+            allocation_id: allocation_id.into(),
+            operation_id: "operation-1".into(),
+            namespace: "acme".into(),
+            operation_class: "triage".into(),
+            operator_response: crate::chisei::gunshi::OperatorResponse::Accepted,
+            operator_rationale_redacted: "[redacted]".into(),
+            selected_resources: None,
+            outcome_accepted: None,
+            outcome_quality: None,
+            outcome_receipt_reference: None,
+            source_actor: "reviewer".into(),
+        };
+        eval.put_suite(eval::Suite {
+            id: "feedback-acme:triage".into(),
+            name: "feedback".into(),
+            description: String::new(),
+            cases: vec![eval::Case {
+                id: crate::chisei::gunshi_feedback_eval::feedback_case_id(
+                    issuance_id,
+                    allocation_id,
+                ),
+                name: "operator accepted".into(),
+                namespace: "acme".into(),
+                spec: serde_json::to_string(&feedback_payload).unwrap(),
+                assertions: vec![eval::Assertion {
+                    assert_type: "gunshi_operator_response".into(),
+                    value: "accepted".into(),
+                }],
+            }],
+        })
+        .unwrap();
+        eval.put_suite(eval::Suite {
+            id: "feedback-user-authored".into(),
+            name: "authored".into(),
+            description: String::new(),
+            cases: vec![eval::Case {
+                id: "authored-case".into(),
+                name: "must complete".into(),
+                namespace: "acme".into(),
+                spec: String::new(),
+                assertions: vec![eval::Assertion {
+                    assert_type: "status".into(),
+                    value: "ok".into(),
+                }],
+            }],
+        })
+        .unwrap();
+        let job = ScoringJob::with_judge(
+            db,
+            eval,
+            Arc::new(StubJudge {
+                score: 90,
+                passed: true,
+            }),
+            16,
+            "test-model",
+        );
+
+        assert_eq!(
+            job.reference_assertions("acme"),
+            vec![eval::Assertion {
+                assert_type: "status".into(),
+                value: "ok".into(),
+            }]
+        );
+        assert!(
+            job.build_rubric("acme")
+                .contains("\"contract_version\":\"gunshi.feedback-eval-case/v1\"")
+        );
     }
 
     fn observe(db: &RuntimeDb, request_id: &str, namespace: &str, ts: i64) {

@@ -1,6 +1,8 @@
 //! Shared SQLite/PostgreSQL conformance for eval suites/runs/iterations and samples.
 
-use sekai_chisei::chisei::eval::{CaseResult, Iteration, Run, Suite};
+use sekai_chisei::chisei::eval::{
+    Assertion, Case, CaseResult, Iteration, Run, Suite, check_assertions,
+};
 use sekai_chisei::chisei::scoring::SampleObservation;
 use sekai_chisei::db::chisei_eval_backend::ChiseiEvalBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
@@ -30,6 +32,36 @@ fn exercise(db: &dyn EvalHarness, prefix: &str) {
             .unwrap_err()
             .contains("immutable")
     );
+
+    let invalid_suite = Suite {
+        id: format!("{prefix}-invalid-suite"),
+        name: "invalid".into(),
+        description: String::new(),
+        cases: vec![Case {
+            id: "invalid-case".into(),
+            name: "invalid".into(),
+            namespace: format!("{prefix}-ns"),
+            spec: String::new(),
+            assertions: vec![Assertion {
+                assert_type: "min_socre".into(),
+                value: "90".into(),
+            }],
+        }],
+    };
+    db.put_eval_suite(&invalid_suite).unwrap();
+    let persisted_invalid = db
+        .get_eval_suite_record(&invalid_suite.id)
+        .unwrap()
+        .unwrap();
+    let (passed, reason) = check_assertions(
+        &persisted_invalid.cases[0].assertions,
+        "done",
+        "sensitive-result-content",
+        100,
+    );
+    assert!(!passed);
+    assert_eq!(reason, "unsupported eval assertion type \"min_socre\"");
+    assert!(!reason.contains("sensitive-result-content"));
 
     let run_id = format!("{prefix}-run");
     let run = Run {
