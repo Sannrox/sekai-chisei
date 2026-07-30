@@ -33,3 +33,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0008: Keep the gateway a fail-closed protocol translator](0008-gateway-is-a-fail-closed-translator.md)
 - [ADR 0009: Group expert `sekaictl` operations under `admin`](0009-sekaictl-administration-hierarchy.md)
 - [ADR 0010: Retire deprecated `sekaictl` aliases at `0.2.0`](0010-retire-sekaictl-aliases-at-0.2.0.md)
+- [ADR 0011: Separate invariant facts from configurable evaluation plans](0011-separate-invariant-facts-and-evaluation-plans.md)
