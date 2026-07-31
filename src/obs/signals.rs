@@ -28,6 +28,8 @@ pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
 pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
 pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
 pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
+pub const EVALUATION_STEP_TOTAL: &str = "sekai_evaluation_step_total";
+pub const EVALUATION_STEP_DURATION: &str = "sekai_evaluation_step_duration_seconds";
 
 /// Register descriptions for every signal family.
 ///
@@ -64,6 +66,15 @@ pub fn describe_all() {
     describe_counter!(
         LOOKUP_FIRST_TOTAL,
         "Lookup-first answer path decisions (hit vs model)"
+    );
+    describe_counter!(
+        EVALUATION_STEP_TOTAL,
+        "Deterministic evaluation steps by compiled static evaluator label, version, and closed status"
+    );
+    describe_histogram!(
+        EVALUATION_STEP_DURATION,
+        Unit::Seconds,
+        "Deterministic evaluation step latency by compiled static evaluator label, version, and closed status"
     );
 }
 
@@ -156,6 +167,37 @@ pub fn record_lookup_first(path: LookupFirstPath) {
     counter!(LOOKUP_FIRST_TOTAL, "path" => path.as_str()).increment(1);
 }
 
+pub fn record_evaluation_step(
+    evaluator: &'static str,
+    version: &'static str,
+    status: &str,
+    elapsed: Duration,
+) {
+    let status = match status {
+        "pass" => "pass",
+        "fail" => "fail",
+        "unknown" => "unknown",
+        "unavailable" => "unavailable",
+        "error" => "error",
+        "skipped" => "skipped",
+        _ => "invalid",
+    };
+    counter!(
+        EVALUATION_STEP_TOTAL,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .increment(1);
+    histogram!(
+        EVALUATION_STEP_DURATION,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +219,8 @@ mod tests {
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
             LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
+            EVALUATION_STEP_DURATION,
         ] {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
@@ -195,6 +239,7 @@ mod tests {
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
             LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
         ] {
             assert!(
                 name.ends_with("_total"),
@@ -205,7 +250,12 @@ mod tests {
 
     #[test]
     fn duration_families_end_in_seconds() {
-        for name in [CONTROL_PLANE_OVERHEAD, DB_WAIT, DURABILITY_LAG] {
+        for name in [
+            CONTROL_PLANE_OVERHEAD,
+            DB_WAIT,
+            DURABILITY_LAG,
+            EVALUATION_STEP_DURATION,
+        ] {
             assert!(
                 name.ends_with("_seconds"),
                 "{name} records a duration but is not suffixed _seconds"

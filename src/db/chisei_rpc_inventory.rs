@@ -339,12 +339,15 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 85);
+        assert_eq!(inventory.entries.len(), 88);
         assert!(inventory.entry("EvaluateGovernedSubject").is_some());
         assert!(inventory.by_kind()["persistent"] >= 30);
         assert!(inventory.entry("GetOperationReceipt").is_some());
         assert!(inventory.entry("ReserveGatewayRequestAlias").is_some());
         assert!(inventory.entry("ResolveEvaluationPlan").is_some());
+        assert!(inventory.entry("ExecuteEvaluationManifest").is_some());
+        assert!(inventory.entry("GetEvaluationExecution").is_some());
+        assert!(inventory.entry("CancelEvaluationExecution").is_some());
         assert!(inventory.entry("Chat").is_some());
         assert_eq!(
             inventory.entry("ResolvePolicy").unwrap().kind,

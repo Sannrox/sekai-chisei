@@ -123,3 +123,6 @@ deletion is not part of the v1 public API.
 
 Existing evaluation-plan, `EvalSuite`, governed-subject, evidence-admission,
 and operation-receipt APIs are unchanged.
+
+Resolved manifests are executed through the separate
+[deterministic evaluation execution](evaluation-execution.md) boundary.

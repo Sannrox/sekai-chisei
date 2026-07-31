@@ -383,6 +383,14 @@ lifecycle. Exact successful request replay remains available after evaluator
 disablement or supersession; new requests fail closed against current
 availability. See [Resolved evaluation manifests](evaluation-manifests.md).
 
+The deterministic executor selects only compiled implementations whose exact
+digest matches the manifest, runs ready nodes in stable topological order, and
+applies one fixed fail-closed reducer. Step and terminal truth are appended to
+the canonical operation receipt; the execution table is only a
+manifest-to-receipt index and query projections are reconstructed from receipt
+events. Evaluator output content is hashed and discarded. See
+[Deterministic evaluation execution](evaluation-execution.md).
+
 `GetEvidenceSubmissionContent` is the governed, single-record read path for an
 admitted envelope. It resolves the submission's projected `external_evidence`
 object and rechecks that object's live ACL before returning the immutable

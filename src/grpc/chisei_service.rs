@@ -2,10 +2,15 @@ use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use sha2::Digest;
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
 use super::llm_service::{
@@ -16,6 +21,7 @@ use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
+use crate::chisei::evaluation_execution as evaluation_execution_domain;
 use crate::chisei::evaluation_manifest as evaluation_manifest_domain;
 use crate::chisei::evaluation_plan as evaluation_plan_domain;
 use crate::chisei::external_action as external;
@@ -57,6 +63,9 @@ pub struct ChiseiServiceImpl {
     evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
+    evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+    evaluation_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    evaluation_execution_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     db: Arc<RuntimeDb>,
     config: Config,
     provider_registry_state_path: Option<PathBuf>,
@@ -2130,6 +2139,407 @@ fn to_proto_evaluation_resolution(
     }
 }
 
+fn from_proto_evaluation_execution(
+    value: EvaluationExecutionRequest,
+) -> evaluation_execution_domain::EvaluationExecutionRequest {
+    evaluation_execution_domain::EvaluationExecutionRequest {
+        contract_version: value.contract_version,
+        executor_version: value.executor_version,
+        namespace: value.namespace,
+        manifest_digest: value.manifest_digest,
+        max_total_duration_ms: value.max_total_duration_ms,
+    }
+}
+
+fn to_proto_evaluation_step(
+    value: &evaluation_execution_domain::EvaluationStepReceipt,
+) -> EvaluationStepReceipt {
+    EvaluationStepReceipt {
+        contract_version: value.contract_version.clone(),
+        manifest_digest: value.manifest_digest.clone(),
+        node_id: value.node_id.clone(),
+        classification: value.classification.clone(),
+        status: value.status.clone(),
+        reason_code: value.reason_code.clone(),
+        input_digest: value.input_digest.clone(),
+        parameters_digest: value.parameters_digest.clone(),
+        evaluator_definition_digest: value.evaluator_definition_digest.clone(),
+        implementation_digest: value.implementation_digest.clone(),
+        evidence_digests: value.evidence_digests.clone(),
+        dependency_result_digests: value.dependency_result_digests.clone(),
+        result_digest: value.result_digest.clone(),
+        step_receipt_digest: value.step_receipt_digest.clone(),
+    }
+}
+
+fn to_proto_evaluation_gate(
+    value: &evaluation_execution_domain::EvaluationGateDecision,
+) -> EvaluationGateDecision {
+    EvaluationGateDecision {
+        contract_version: value.contract_version.clone(),
+        manifest_digest: value.manifest_digest.clone(),
+        reducer: value.reducer.clone(),
+        verdict: value.verdict.clone(),
+        reason_code: value.reason_code.clone(),
+        step_receipt_digests: value.step_receipt_digests.clone(),
+        invariant_coverage: value
+            .invariant_coverage
+            .iter()
+            .map(|coverage| InvariantCoverageDecision {
+                invariant_version_id: coverage.invariant_version_id.clone(),
+                covered_by_node_ids: coverage.covered_by_node_ids.clone(),
+                waiver_version_ids: coverage.waiver_version_ids.clone(),
+                satisfied: coverage.satisfied,
+            })
+            .collect(),
+        decision_digest: value.decision_digest.clone(),
+    }
+}
+
+fn to_proto_evaluation_execution_projection(
+    value: &evaluation_execution_domain::EvaluationExecutionProjection,
+) -> EvaluationExecutionProjection {
+    EvaluationExecutionProjection {
+        manifest_digest: value.manifest_digest.clone(),
+        operation_id: value.operation_id.clone(),
+        namespace: value.namespace.clone(),
+        status: value.status.clone(),
+        steps: value.steps.iter().map(to_proto_evaluation_step).collect(),
+        decision: value.decision.as_ref().map(to_proto_evaluation_gate),
+    }
+}
+
+fn evaluation_operation_id(manifest_digest: &str) -> String {
+    format!(
+        "evaluation-execution:{}",
+        manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_digest)
+    )
+}
+
+fn evaluation_manifest_reference(manifest_digest: &str) -> GovernedReference {
+    GovernedReference {
+        kind: "evaluation_manifest".into(),
+        reference: manifest_digest.into(),
+        content_hash: Some(manifest_digest.into()),
+        disclosed_fields: vec!["manifest_digest".into()],
+        omitted: false,
+        omission_reason: None,
+    }
+}
+
+fn initial_evaluation_receipt(
+    manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+    actor: &str,
+    now_ms: i64,
+    max_total_duration_ms: u64,
+    topological_order: &[String],
+) -> Result<OperationReceipt, Status> {
+    let operation_id = evaluation_operation_id(&manifest.manifest_digest);
+    let manifest_reference = evaluation_manifest_reference(&manifest.manifest_digest);
+    let intent_id = format!("{operation_id}:intent");
+    let policy_id = format!("{operation_id}:policy");
+    let routing_id = format!("{operation_id}:routing");
+    let budget_id = format!("{operation_id}:budget");
+    let events = vec![
+        OperationReceiptEvent {
+            event_id: intent_id.clone(),
+            operation_id: operation_id.clone(),
+            parent_event_id: None,
+            timestamp_ms: now_ms,
+            kind: ReceiptEventKind::IntentRecorded,
+            surface: ReceiptSurface::Intent,
+            actor: actor.into(),
+            references: vec![manifest_reference.clone()],
+            attributes: BTreeMap::from([
+                ("manifest_digest".into(), manifest.manifest_digest.clone()),
+                (
+                    "executor_version".into(),
+                    evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                ),
+            ]),
+        },
+        OperationReceiptEvent {
+            event_id: policy_id.clone(),
+            operation_id: operation_id.clone(),
+            parent_event_id: Some(intent_id),
+            timestamp_ms: now_ms,
+            kind: ReceiptEventKind::PolicyDecided,
+            surface: ReceiptSurface::Policy,
+            actor: "chisei.evaluation-executor".into(),
+            references: vec![manifest_reference.clone()],
+            attributes: BTreeMap::from([(
+                "reducer".into(),
+                evaluation_plan_domain::FIXED_REDUCER.into(),
+            )]),
+        },
+        OperationReceiptEvent {
+            event_id: routing_id.clone(),
+            operation_id: operation_id.clone(),
+            parent_event_id: Some(policy_id),
+            timestamp_ms: now_ms,
+            kind: ReceiptEventKind::RouteSelected,
+            surface: ReceiptSurface::Routing,
+            actor: "chisei.evaluation-executor".into(),
+            references: vec![manifest_reference.clone()],
+            attributes: BTreeMap::from([(
+                "topological_order_json".into(),
+                serde_json::to_string(topological_order)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            )]),
+        },
+        OperationReceiptEvent {
+            event_id: budget_id,
+            operation_id: operation_id.clone(),
+            parent_event_id: Some(routing_id),
+            timestamp_ms: now_ms,
+            kind: ReceiptEventKind::BudgetDecided,
+            surface: ReceiptSurface::Budget,
+            actor: "chisei.evaluation-executor".into(),
+            references: vec![manifest_reference],
+            attributes: BTreeMap::from([
+                (
+                    "max_total_duration_ms".into(),
+                    max_total_duration_ms.to_string(),
+                ),
+                ("node_count".into(), manifest.nodes.len().to_string()),
+            ]),
+        },
+    ];
+    Ok(OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id,
+        parent_operation_id: None,
+        namespace: manifest.namespace.clone(),
+        operation_class: evaluation_execution_domain::EXECUTION_OPERATION_CLASS.into(),
+        initiating_actor: actor.into(),
+        schema_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+        policy_version: evaluation_plan_domain::FIXED_REDUCER.into(),
+        started_at_ms: now_ms,
+        completed_at_ms: None,
+        events,
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+    })
+}
+
+fn evaluation_total_budget_ms(receipt: &OperationReceipt) -> Result<u64, Status> {
+    let mut budgets = receipt.events.iter().filter(|event| {
+        event.kind == ReceiptEventKind::BudgetDecided
+            && event.surface == ReceiptSurface::Budget
+            && event.actor == "chisei.evaluation-executor"
+    });
+    let budget = budgets
+        .next()
+        .and_then(|event| event.attributes.get("max_total_duration_ms"))
+        .ok_or_else(|| Status::data_loss("evaluation execution budget is missing"))?
+        .parse::<u64>()
+        .map_err(|_| Status::data_loss("evaluation execution budget is invalid"))?;
+    if budgets.next().is_some()
+        || budget == 0
+        || budget > evaluation_execution_domain::MAX_TOTAL_DURATION_MS
+    {
+        return Err(Status::data_loss(
+            "evaluation execution budget is not canonical",
+        ));
+    }
+    Ok(budget)
+}
+
+fn evaluation_step_event(
+    operation_id: &str,
+    node: &evaluation_manifest_domain::ResolvedEvaluationNode,
+    step: &evaluation_execution_domain::EvaluationStepReceipt,
+    now_ms: i64,
+) -> Result<OperationReceiptEvent, Status> {
+    let parent_event_id = node
+        .depends_on_node_ids
+        .iter()
+        .max()
+        .map(|dependency| format!("{operation_id}:step:{dependency}"))
+        .unwrap_or_else(|| format!("{operation_id}:budget"));
+    Ok(OperationReceiptEvent {
+        event_id: format!("{operation_id}:step:{}", node.node_id),
+        operation_id: operation_id.into(),
+        parent_event_id: Some(parent_event_id),
+        timestamp_ms: now_ms,
+        kind: ReceiptEventKind::VerificationRecorded,
+        surface: ReceiptSurface::Verification,
+        actor: "chisei.evaluation-executor".into(),
+        references: vec![
+            evaluation_manifest_reference(&step.manifest_digest),
+            GovernedReference {
+                kind: "evaluator_definition".into(),
+                reference: node.evaluator.definition_id.clone(),
+                content_hash: Some(node.evaluator.definition_digest.clone()),
+                disclosed_fields: vec![
+                    "definition_id".into(),
+                    "definition_digest".into(),
+                    "implementation_digest".into(),
+                ],
+                omitted: false,
+                omission_reason: None,
+            },
+        ],
+        attributes: BTreeMap::from([
+            (
+                "evaluation_step_receipt".into(),
+                serde_json::to_string(step).map_err(|error| Status::internal(error.to_string()))?,
+            ),
+            ("node_id".into(), step.node_id.clone()),
+            ("status".into(), step.status.clone()),
+            ("reason_code".into(), step.reason_code.clone()),
+            ("result_digest".into(), step.result_digest.clone()),
+            (
+                "step_receipt_digest".into(),
+                step.step_receipt_digest.clone(),
+            ),
+        ]),
+    })
+}
+
+fn evaluation_gate_event(
+    operation_id: &str,
+    parent_event_id: String,
+    decision: &evaluation_execution_domain::EvaluationGateDecision,
+    now_ms: i64,
+) -> Result<OperationReceiptEvent, Status> {
+    Ok(OperationReceiptEvent {
+        event_id: format!("{operation_id}:gate"),
+        operation_id: operation_id.into(),
+        parent_event_id: Some(parent_event_id),
+        timestamp_ms: now_ms,
+        kind: ReceiptEventKind::OutcomeRecorded,
+        surface: ReceiptSurface::Outcome,
+        actor: "chisei.evaluation-executor".into(),
+        references: vec![evaluation_manifest_reference(&decision.manifest_digest)],
+        attributes: BTreeMap::from([
+            (
+                "evaluation_gate_decision".into(),
+                serde_json::to_string(decision)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            ),
+            ("verdict".into(), decision.verdict.clone()),
+            ("reason_code".into(), decision.reason_code.clone()),
+            ("decision_digest".into(), decision.decision_digest.clone()),
+        ]),
+    })
+}
+
+fn evaluation_cancellation_event(
+    receipt: &OperationReceipt,
+    actor: &str,
+    now_ms: i64,
+) -> OperationReceiptEvent {
+    let parent_event_id = receipt
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == ReceiptEventKind::VerificationRecorded)
+        .map(|event| event.event_id.clone())
+        .unwrap_or_else(|| format!("{}:budget", receipt.operation_id));
+    OperationReceiptEvent {
+        event_id: format!("{}:cancel", receipt.operation_id),
+        operation_id: receipt.operation_id.clone(),
+        parent_event_id: Some(parent_event_id),
+        timestamp_ms: now_ms,
+        kind: ReceiptEventKind::HumanIntervened,
+        surface: ReceiptSurface::Intervention,
+        actor: actor.into(),
+        references: Vec::new(),
+        attributes: BTreeMap::from([("evaluation_cancel_requested".into(), "true".into())]),
+    }
+}
+
+fn evaluation_cancellation_requested(receipt: &OperationReceipt) -> bool {
+    receipt.events.iter().any(|event| {
+        event
+            .attributes
+            .get("evaluation_cancel_requested")
+            .is_some_and(|value| value == "true")
+    })
+}
+
+fn order_parent_event_id(
+    manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+    operation_id: &str,
+) -> String {
+    evaluation_execution_domain::deterministic_topological_order(manifest)
+        .ok()
+        .and_then(|order| order.last().cloned())
+        .map(|node_id| format!("{operation_id}:step:{node_id}"))
+        .unwrap_or_else(|| format!("{operation_id}:budget"))
+}
+
+fn evaluation_projection_from_receipt(
+    manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+    index: &evaluation_execution_domain::EvaluationExecutionIndex,
+    receipt: &OperationReceipt,
+) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, String> {
+    if receipt.operation_id != index.operation_id
+        || receipt.namespace != index.namespace
+        || receipt.operation_class != evaluation_execution_domain::EXECUTION_OPERATION_CLASS
+    {
+        return Err("evaluation execution receipt binding is invalid".into());
+    }
+    let mut steps = receipt
+        .events
+        .iter()
+        .filter_map(|event| event.attributes.get("evaluation_step_receipt"))
+        .map(|json| {
+            serde_json::from_str::<evaluation_execution_domain::EvaluationStepReceipt>(json)
+                .map_err(|error| format!("invalid evaluation step receipt: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    steps.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let decision = receipt
+        .events
+        .iter()
+        .find_map(|event| event.attributes.get("evaluation_gate_decision"))
+        .map(|json| {
+            serde_json::from_str::<evaluation_execution_domain::EvaluationGateDecision>(json)
+                .map_err(|error| format!("invalid evaluation gate decision: {error}"))
+        })
+        .transpose()?;
+    let cancellation_requested = evaluation_cancellation_requested(receipt);
+    if let Some(decision) = &decision
+        && (decision.reason_code == evaluation_execution_domain::REASON_EXECUTION_CANCELLED)
+            != cancellation_requested
+    {
+        return Err("evaluation cancellation and terminal decision are inconsistent".into());
+    }
+    let status = decision
+        .as_ref()
+        .map(|decision| decision.verdict.clone())
+        .unwrap_or_else(|| {
+            if cancellation_requested {
+                evaluation_execution_domain::STATUS_CANCELLED.into()
+            } else {
+                evaluation_execution_domain::STATUS_RUNNING.into()
+            }
+        });
+    let projection = evaluation_execution_domain::EvaluationExecutionProjection {
+        manifest_digest: manifest.manifest_digest.clone(),
+        operation_id: index.operation_id.clone(),
+        namespace: index.namespace.clone(),
+        status,
+        steps,
+        decision,
+    };
+    evaluation_execution_domain::validate_projection(manifest, &projection)?;
+    if projection.decision.is_some() {
+        let completeness = receipt.completeness();
+        if !completeness.complete {
+            return Err(format!(
+                "terminal evaluation receipt is incomplete: {:?}",
+                completeness.errors
+            ));
+        }
+    }
+    Ok(projection)
+}
+
 fn map_evaluation_resource_error(error: String) -> Status {
     if error.contains("already exists") {
         Status::already_exists(error)
@@ -3025,6 +3435,21 @@ fn resolve_evaluation_manifest_live(
 
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
+        Self::new_with_evaluator_registry(
+            db,
+            config,
+            Arc::new(
+                evaluation_execution_domain::production_evaluator_registry()
+                    .expect("compiled production evaluator registry must be valid"),
+            ),
+        )
+    }
+
+    pub fn new_with_evaluator_registry(
+        db: Arc<RuntimeDb>,
+        config: Config,
+        evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+    ) -> Self {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -3053,10 +3478,435 @@ impl ChiseiServiceImpl {
             evolve_enhancements,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
+            evaluator_registry,
+            evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
             db,
             config,
             provider_registry_state_path,
         }
+    }
+
+    fn get_evaluation_projection(
+        db: &RuntimeDb,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        index: &evaluation_execution_domain::EvaluationExecutionIndex,
+    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
+        let receipt = db
+            .get_operation_receipt(&index.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
+        evaluation_total_budget_ms(&receipt)?;
+        evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
+    }
+
+    fn ensure_evaluation_execution(
+        &self,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        actor: &str,
+        max_total_duration_ms: u64,
+    ) -> Result<evaluation_execution_domain::EvaluationExecutionIndex, Status> {
+        if let Some(index) = self
+            .db
+            .get_evaluation_execution_index(&manifest.manifest_digest)
+            .map_err(Status::internal)?
+        {
+            if index.namespace != manifest.namespace
+                || index.executor_version != evaluation_execution_domain::EXECUTOR_VERSION
+                || index.operation_id != evaluation_operation_id(&manifest.manifest_digest)
+            {
+                return Err(Status::data_loss(
+                    "evaluation execution index binding is invalid",
+                ));
+            }
+            return Ok(index);
+        }
+        let topological_order =
+            evaluation_execution_domain::deterministic_topological_order(manifest)
+                .map_err(Status::data_loss)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let receipt = initial_evaluation_receipt(
+            manifest,
+            actor,
+            now_ms,
+            max_total_duration_ms,
+            &topological_order,
+        )?;
+        let index = evaluation_execution_domain::EvaluationExecutionIndex {
+            manifest_digest: manifest.manifest_digest.clone(),
+            operation_id: receipt.operation_id.clone(),
+            namespace: manifest.namespace.clone(),
+            executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+            started_by: actor.into(),
+            created_at_ms: now_ms,
+        };
+        self.db
+            .create_evaluation_execution(&index, &receipt)
+            .map_err(Status::internal)
+    }
+
+    fn request_evaluation_cancellation(
+        &self,
+        index: &evaluation_execution_domain::EvaluationExecutionIndex,
+        receipt: &OperationReceipt,
+        actor: &str,
+    ) -> Result<(), Status> {
+        let append = self.db.append_operation_receipt_event(
+            &index.operation_id,
+            evaluation_cancellation_event(receipt, actor, chrono::Utc::now().timestamp_millis()),
+        );
+        if let Err(error) = append {
+            let reconciled = self
+                .db
+                .get_operation_receipt(&index.operation_id)
+                .map_err(Status::internal)?
+                .is_some_and(|receipt| {
+                    receipt.completed_at_ms.is_some() || evaluation_cancellation_requested(&receipt)
+                });
+            if !reconciled {
+                return Err(Status::internal(error));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_evaluation_node_evidence(
+        db: &RuntimeDb,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
+    ) -> Result<Vec<evaluation_execution_domain::EvaluationEvidenceInput>, String> {
+        let by_object = manifest
+            .evidence
+            .iter()
+            .map(|evidence| (evidence.evidence_object_id.as_str(), evidence))
+            .collect::<BTreeMap<_, _>>();
+        let mut inputs = Vec::with_capacity(node.evidence_object_ids.len());
+        for object_id in &node.evidence_object_ids {
+            let binding = by_object
+                .get(object_id.as_str())
+                .ok_or_else(|| "manifest node evidence binding is missing".to_string())?;
+            let submission = db
+                .get_evidence_submission(&binding.submission_id)?
+                .ok_or_else(|| {
+                    evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string()
+                })?;
+            let envelope = submission.envelope.ok_or_else(|| {
+                evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string()
+            })?;
+            let retained_content_digest = crate::sekai::evidence_store::canonical_content_digest(
+                &envelope.content,
+            )
+            .map_err(|_| evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string())?;
+            if submission.id != binding.submission_id
+                || submission.namespace != manifest.namespace
+                || submission.content_digest != binding.content_digest
+                || submission.schema_id != binding.schema_id
+                || submission.schema_version != binding.schema_version
+                || envelope.content_digest != binding.content_digest
+                || retained_content_digest != binding.content_digest
+                || envelope.schema_id != binding.schema_id
+                || envelope.schema_version != binding.schema_version
+            {
+                return Err(evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.into());
+            }
+            inputs.push(evaluation_execution_domain::EvaluationEvidenceInput {
+                evidence_object_id: binding.evidence_object_id.clone(),
+                submission_id: binding.submission_id.clone(),
+                content_digest: binding.content_digest.clone(),
+                schema_id: binding.schema_id.clone(),
+                schema_version: binding.schema_version.clone(),
+                content: envelope.content,
+            });
+        }
+        Ok(inputs)
+    }
+
+    fn unavailable_evaluation_node_evidence(
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
+    ) -> Result<Vec<evaluation_execution_domain::EvaluationEvidenceInput>, String> {
+        let by_object = manifest
+            .evidence
+            .iter()
+            .map(|evidence| (evidence.evidence_object_id.as_str(), evidence))
+            .collect::<BTreeMap<_, _>>();
+        node.evidence_object_ids
+            .iter()
+            .map(|object_id| {
+                let binding = by_object
+                    .get(object_id.as_str())
+                    .ok_or_else(|| "manifest node evidence binding is missing".to_string())?;
+                Ok(evaluation_execution_domain::EvaluationEvidenceInput {
+                    evidence_object_id: binding.evidence_object_id.clone(),
+                    submission_id: binding.submission_id.clone(),
+                    content_digest: binding.content_digest.clone(),
+                    schema_id: binding.schema_id.clone(),
+                    schema_version: binding.schema_version.clone(),
+                    content: serde_json::Value::Null,
+                })
+            })
+            .collect()
+    }
+
+    fn run_evaluation_execution(
+        db: &RuntimeDb,
+        evaluator_registry: &evaluation_execution_domain::DeterministicEvaluatorRegistry,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        index: &evaluation_execution_domain::EvaluationExecutionIndex,
+        max_total_duration_ms: u64,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
+        let existing = Self::get_evaluation_projection(db, manifest, index)?;
+        if existing.decision.is_some() {
+            return Ok(existing);
+        }
+        let invocation_started = Instant::now();
+        let total_budget = Duration::from_millis(max_total_duration_ms);
+        let elapsed_before_invocation_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(index.created_at_ms)
+            .max(0) as u64;
+        let elapsed_before_invocation = Duration::from_millis(elapsed_before_invocation_ms);
+        let order = evaluation_execution_domain::deterministic_topological_order(manifest)
+            .map_err(Status::data_loss)?;
+        let nodes = manifest
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut prior_steps = existing
+            .steps
+            .into_iter()
+            .map(|step| (step.node_id.clone(), step))
+            .collect::<BTreeMap<_, _>>();
+
+        for node_id in order {
+            if prior_steps.contains_key(&node_id) {
+                continue;
+            }
+            if db
+                .get_operation_receipt(&index.operation_id)
+                .map_err(Status::internal)?
+                .is_some_and(|receipt| evaluation_cancellation_requested(&receipt))
+            {
+                cancelled.store(true, Ordering::Release);
+            }
+            let node = nodes
+                .get(node_id.as_str())
+                .ok_or_else(|| Status::data_loss("evaluation node is missing"))?;
+            let evidence = Self::load_evaluation_node_evidence(db, manifest, node);
+            let evaluator_evidence = match &evidence {
+                Ok(evidence) => evidence.clone(),
+                Err(_) => Self::unavailable_evaluation_node_evidence(manifest, node)
+                    .map_err(Status::data_loss)?,
+            };
+            let input = evaluation_execution_domain::build_evaluator_input(
+                manifest,
+                node,
+                evaluator_evidence,
+                &prior_steps,
+            )
+            .map_err(Status::data_loss)?;
+            let mut execution = if cancelled.load(Ordering::Acquire) {
+                evaluation_execution_domain::make_nonexecuted_node(
+                    manifest,
+                    node,
+                    &input,
+                    evaluation_execution_domain::STATUS_SKIPPED,
+                    evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
+                )
+            } else if let Some((status, reason)) =
+                evaluation_execution_domain::dependency_blocking_status(node, &prior_steps)
+            {
+                evaluation_execution_domain::make_nonexecuted_node(
+                    manifest, node, &input, status, reason,
+                )
+            } else if evidence.is_err() {
+                evaluation_execution_domain::make_nonexecuted_node(
+                    manifest,
+                    node,
+                    &input,
+                    evaluation_execution_domain::STATUS_UNKNOWN,
+                    evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE,
+                )
+            } else {
+                let definition = db
+                    .get_evaluator_definition(&node.evaluator.definition_id)
+                    .map_err(Status::internal)?;
+                let definition = definition.and_then(|definition| {
+                    let canonical = evaluation_plan_domain::prepare_definition(
+                        definition.clone(),
+                        &definition.created_by,
+                        definition.created_at_ms,
+                    )
+                    .ok()?;
+                    (canonical == definition
+                        && definition.content_digest == node.evaluator.definition_digest
+                        && definition.implementation_digest == node.evaluator.implementation_digest)
+                        .then_some(definition)
+                });
+                if let Some(definition) = definition {
+                    let remaining = total_budget
+                        .saturating_sub(elapsed_before_invocation)
+                        .saturating_sub(invocation_started.elapsed());
+                    evaluation_execution_domain::execute_registered_node(
+                        evaluator_registry,
+                        manifest,
+                        node,
+                        input.clone(),
+                        &definition.resource_limits,
+                        remaining,
+                        cancelled.clone(),
+                    )
+                } else {
+                    evaluation_execution_domain::make_nonexecuted_node(
+                        manifest,
+                        node,
+                        &input,
+                        evaluation_execution_domain::STATUS_UNAVAILABLE,
+                        evaluation_execution_domain::REASON_EVALUATOR_UNAVAILABLE,
+                    )
+                }
+            }
+            .map_err(Status::internal)?;
+            if db
+                .get_operation_receipt(&index.operation_id)
+                .map_err(Status::internal)?
+                .is_some_and(|receipt| evaluation_cancellation_requested(&receipt))
+                && execution.receipt.reason_code
+                    != evaluation_execution_domain::REASON_EXECUTION_CANCELLED
+            {
+                cancelled.store(true, Ordering::Release);
+                execution = evaluation_execution_domain::make_nonexecuted_node(
+                    manifest,
+                    node,
+                    &input,
+                    evaluation_execution_domain::STATUS_SKIPPED,
+                    evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
+                )
+                .map_err(Status::internal)?;
+            }
+            let event = evaluation_step_event(
+                &index.operation_id,
+                node,
+                &execution.receipt,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            let (receipt, recorded) = match db
+                .append_operation_receipt_event(&index.operation_id, event)
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let receipt = db
+                        .get_operation_receipt(&index.operation_id)
+                        .map_err(Status::internal)?
+                        .ok_or_else(|| {
+                            Status::data_loss("evaluation execution receipt is missing")
+                        })?;
+                    let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
+                        .map_err(Status::data_loss)?;
+                    let durable_step = projection
+                        .steps
+                        .iter()
+                        .find(|step| step.node_id == node.node_id);
+                    let durable_step_matches =
+                        durable_step.is_some_and(|step| step == &execution.receipt);
+                    let durable_cancellation_won =
+                        evaluation_cancellation_requested(&receipt) && durable_step.is_some();
+                    if projection.decision.is_some()
+                        || durable_step_matches
+                        || durable_cancellation_won
+                    {
+                        (receipt, false)
+                    } else if evaluation_cancellation_requested(&receipt) {
+                        cancelled.store(true, Ordering::Release);
+                        execution = evaluation_execution_domain::make_nonexecuted_node(
+                            manifest,
+                            node,
+                            &input,
+                            evaluation_execution_domain::STATUS_SKIPPED,
+                            evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
+                        )
+                        .map_err(Status::internal)?;
+                        let cancellation_event = evaluation_step_event(
+                            &index.operation_id,
+                            node,
+                            &execution.receipt,
+                            chrono::Utc::now().timestamp_millis(),
+                        )?;
+                        db.append_operation_receipt_event(&index.operation_id, cancellation_event)
+                            .map_err(Status::internal)?
+                    } else {
+                        return Err(Status::internal(error));
+                    }
+                }
+            };
+            let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
+                .map_err(Status::data_loss)?;
+            if recorded {
+                let durable_step = projection
+                    .steps
+                    .iter()
+                    .find(|step| step.node_id == node.node_id)
+                    .ok_or_else(|| Status::data_loss("durable evaluation step is missing"))?;
+                let (metrics_evaluator, metrics_version) =
+                    evaluator_registry.metric_labels(&node.evaluator.implementation_digest);
+                crate::obs::signals::record_evaluation_step(
+                    metrics_evaluator,
+                    metrics_version,
+                    &durable_step.status,
+                    execution.elapsed,
+                );
+            }
+            prior_steps = projection
+                .steps
+                .into_iter()
+                .map(|step| (step.node_id.clone(), step))
+                .collect();
+        }
+
+        let steps = prior_steps.values().cloned().collect::<Vec<_>>();
+        let decision = evaluation_execution_domain::reduce_gate(manifest, &steps)
+            .map_err(Status::data_loss)?;
+        let parent_event_id = order_parent_event_id(manifest, &index.operation_id);
+        let event = evaluation_gate_event(
+            &index.operation_id,
+            parent_event_id.clone(),
+            &decision,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        let receipt = match db.append_operation_receipt_event(&index.operation_id, event) {
+            Ok((receipt, _)) => receipt,
+            Err(error) => {
+                let receipt = db
+                    .get_operation_receipt(&index.operation_id)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
+                let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
+                    .map_err(Status::data_loss)?;
+                if projection.decision.is_some() {
+                    receipt
+                } else {
+                    if !evaluation_cancellation_requested(&receipt) {
+                        return Err(Status::internal(error));
+                    }
+                    cancelled.store(true, Ordering::Release);
+                    let cancellation_decision =
+                        evaluation_execution_domain::reduce_cancelled_gate(manifest, &steps)
+                            .map_err(Status::data_loss)?;
+                    let cancellation_event = evaluation_gate_event(
+                        &index.operation_id,
+                        parent_event_id,
+                        &cancellation_decision,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    db.append_operation_receipt_event(&index.operation_id, cancellation_event)
+                        .map_err(Status::internal)?
+                        .0
+                }
+            }
+        };
+        evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
     }
 
     fn pipeline_context_expansion_gate(
@@ -3360,6 +4210,11 @@ impl ChiseiServiceImpl {
             evolve_enhancements,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
+            evaluator_registry: Arc::new(
+                evaluation_execution_domain::DeterministicEvaluatorRegistry::default(),
+            ),
+            evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
             db,
             config,
             provider_registry_state_path,
@@ -9292,6 +10147,11 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
+        if receipt.operation_class == evaluation_execution_domain::EXECUTION_OPERATION_CLASS {
+            return Err(Status::permission_denied(
+                "evaluation execution receipts do not accept external reporters",
+            ));
+        }
         if actor != receipt.initiating_actor && actor != "root" {
             return Err(Status::permission_denied(
                 "only the initiating actor or root may authorize reporters",
@@ -9878,6 +10738,11 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
+        if receipt.operation_class == evaluation_execution_domain::EXECUTION_OPERATION_CLASS {
+            return Err(Status::permission_denied(
+                "evaluation execution receipts accept only executor-owned internal events",
+            ));
+        }
         let receipt_was_complete = receipt.completeness().complete;
         let kind = ReceiptEventKind::parse(&request.kind)
             .ok_or(Status::invalid_argument("unsupported operation event kind"))?;
@@ -10798,6 +11663,225 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
     }
 
+    async fn execute_evaluation_manifest(
+        &self,
+        req: Request<ExecuteEvaluationManifestRequest>,
+    ) -> Result<Response<ExecuteEvaluationManifestResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = evaluation_execution_domain::prepare_execution_request(
+            from_proto_evaluation_execution(
+                req.into_inner()
+                    .execution
+                    .ok_or_else(|| Status::invalid_argument("evaluation execution required"))?,
+            ),
+        )
+        .map_err(map_evaluation_resource_error)?;
+        require_namespace_write_access(&self.db, &actor, &request.namespace)?;
+        let manifest = self
+            .db
+            .get_evaluation_manifest(&request.manifest_digest)
+            .map_err(Status::internal)?
+            .filter(|manifest| manifest.namespace == request.namespace)
+            .ok_or_else(|| Status::not_found("evaluation manifest not found"))?;
+        let index =
+            self.ensure_evaluation_execution(&manifest, &actor, request.max_total_duration_ms)?;
+        let receipt = self
+            .db
+            .get_operation_receipt(&index.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
+        let max_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
+        let cancelled = {
+            let mut cancellations = self
+                .evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
+            cancellations
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+        let execution_lock = {
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            locks
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _guard = execution_lock.lock().await;
+        let worker_db = self.db.clone();
+        let worker_registry = self.evaluator_registry.clone();
+        let worker_manifest = manifest.clone();
+        let worker_index = index.clone();
+        let projection = tokio::task::spawn_blocking(move || {
+            Self::run_evaluation_execution(
+                &worker_db,
+                &worker_registry,
+                &worker_manifest,
+                &worker_index,
+                max_total_duration_ms,
+                cancelled,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
+        if projection.decision.is_some() {
+            self.evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
+                .remove(&manifest.manifest_digest);
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            if locks
+                .get(&manifest.manifest_digest)
+                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
+            {
+                locks.remove(&manifest.manifest_digest);
+            }
+        }
+        Ok(Response::new(ExecuteEvaluationManifestResponse {
+            execution: Some(to_proto_evaluation_execution_projection(&projection)),
+        }))
+    }
+
+    async fn get_evaluation_execution(
+        &self,
+        req: Request<GetEvaluationExecutionRequest>,
+    ) -> Result<Response<GetEvaluationExecutionResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        let validated = evaluation_execution_domain::prepare_execution_request(
+            evaluation_execution_domain::EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: request.namespace,
+                manifest_digest: request.manifest_digest,
+                max_total_duration_ms: evaluation_execution_domain::DEFAULT_TOTAL_DURATION_MS,
+            },
+        )
+        .map_err(map_evaluation_resource_error)?;
+        require_namespace_access(&self.db, &actor, &validated.namespace)?;
+        let manifest = self
+            .db
+            .get_evaluation_manifest(&validated.manifest_digest)
+            .map_err(Status::internal)?
+            .filter(|manifest| manifest.namespace == validated.namespace)
+            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
+        let index = self
+            .db
+            .get_evaluation_execution_index(&validated.manifest_digest)
+            .map_err(Status::internal)?
+            .filter(|index| index.namespace == validated.namespace)
+            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
+        let projection = Self::get_evaluation_projection(&self.db, &manifest, &index)?;
+        Ok(Response::new(GetEvaluationExecutionResponse {
+            execution: Some(to_proto_evaluation_execution_projection(&projection)),
+        }))
+    }
+
+    async fn cancel_evaluation_execution(
+        &self,
+        req: Request<CancelEvaluationExecutionRequest>,
+    ) -> Result<Response<CancelEvaluationExecutionResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        let validated = evaluation_execution_domain::prepare_execution_request(
+            evaluation_execution_domain::EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: request.namespace,
+                manifest_digest: request.manifest_digest,
+                max_total_duration_ms: evaluation_execution_domain::DEFAULT_TOTAL_DURATION_MS,
+            },
+        )
+        .map_err(map_evaluation_resource_error)?;
+        require_namespace_write_access(&self.db, &actor, &validated.namespace)?;
+        let manifest = self
+            .db
+            .get_evaluation_manifest(&validated.manifest_digest)
+            .map_err(Status::internal)?
+            .filter(|manifest| manifest.namespace == validated.namespace)
+            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
+        let index = self
+            .db
+            .get_evaluation_execution_index(&validated.manifest_digest)
+            .map_err(Status::internal)?
+            .filter(|index| index.namespace == validated.namespace)
+            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
+        let cancelled = {
+            let mut cancellations = self
+                .evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
+            let cancelled = cancellations
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            cancelled.store(true, Ordering::Release);
+            cancelled
+        };
+        let receipt = self
+            .db
+            .get_operation_receipt(&index.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
+        let max_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
+        if receipt.completed_at_ms.is_none() && !evaluation_cancellation_requested(&receipt) {
+            self.request_evaluation_cancellation(&index, &receipt, &actor)?;
+        }
+        let execution_lock = {
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            locks
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _guard = execution_lock.lock().await;
+        let worker_db = self.db.clone();
+        let worker_registry = self.evaluator_registry.clone();
+        let worker_manifest = manifest.clone();
+        let worker_index = index.clone();
+        let projection = tokio::task::spawn_blocking(move || {
+            Self::run_evaluation_execution(
+                &worker_db,
+                &worker_registry,
+                &worker_manifest,
+                &worker_index,
+                max_total_duration_ms,
+                cancelled,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
+        if projection.decision.is_some() {
+            self.evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
+                .remove(&manifest.manifest_digest);
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            if locks
+                .get(&manifest.manifest_digest)
+                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
+            {
+                locks.remove(&manifest.manifest_digest);
+            }
+        }
+        Ok(Response::new(CancelEvaluationExecutionResponse {
+            execution: Some(to_proto_evaluation_execution_projection(&projection)),
+        }))
+    }
+
     async fn create_eval_suite(
         &self,
         req: Request<CreateEvalSuiteRequest>,
@@ -11399,6 +12483,10 @@ impl ChiseiService for ChiseiServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::evaluation_execution::{
+        DeterministicEvaluator, DeterministicEvaluatorOutput, EVALUATOR_RESULT_CONTRACT,
+        STATUS_PASS,
+    };
     use crate::domain::Object;
     use crate::sekai::security::{Grant, Role};
     use std::fs;
@@ -12442,6 +13530,53 @@ mod tests {
         ChiseiServiceImpl::new(db, config(":memory:"))
     }
 
+    #[derive(Debug)]
+    struct SchemaFixtureEvaluator {
+        delay_ms: u64,
+    }
+
+    impl DeterministicEvaluator for SchemaFixtureEvaluator {
+        fn evaluate(
+            &self,
+            input: &evaluation_execution_domain::DeterministicEvaluatorInput,
+        ) -> Result<DeterministicEvaluatorOutput, String> {
+            if self.delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.delay_ms));
+            }
+            let strict = input
+                .parameters
+                .get("strict")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Ok(DeterministicEvaluatorOutput {
+                contract_version: EVALUATOR_RESULT_CONTRACT.into(),
+                status: if strict { STATUS_PASS } else { "fail" }.into(),
+                reason_code: if strict {
+                    "schema_conforms"
+                } else {
+                    "strict_mode_required"
+                }
+                .into(),
+                result: serde_json::json!({"conforms": strict}),
+            })
+        }
+    }
+
+    fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let registry =
+            Arc::new(evaluation_execution_domain::DeterministicEvaluatorRegistry::default());
+        registry
+            .register(
+                &format!("sha256:{}", "a".repeat(64)),
+                Arc::new(SchemaFixtureEvaluator { delay_ms }),
+            )
+            .unwrap();
+        ChiseiServiceImpl::new_with_evaluator_registry(db, config(":memory:"), registry)
+    }
+
     fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
         PutEvaluatorDefinitionRequest {
             definition: Some(EvaluatorDefinition {
@@ -12762,6 +13897,45 @@ mod tests {
                 evaluation_time_ms,
             }),
         }
+    }
+
+    async fn resolved_execution_fixture(
+        svc: &ChiseiServiceImpl,
+        request_id: &str,
+    ) -> ResolvedEvaluationManifest {
+        let invariant_id = install_invariant(svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        svc.resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+            "acme",
+            request_id,
+            &plan.plan_version_id,
+            10,
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .manifest
+        .unwrap()
     }
 
     #[tokio::test]
@@ -13190,6 +14364,248 @@ mod tests {
         );
         assert!(unavailable.manifest.is_none());
         assert_eq!(unavailable.findings[0].code, "evaluator_unavailable");
+    }
+
+    #[tokio::test]
+    async fn deterministic_manifest_execution_is_receipt_authoritative_and_idempotent() {
+        let svc = evaluation_execution_service(0);
+        let manifest = resolved_execution_fixture(&svc, "execute-resolve").await;
+        let definition_id = manifest.nodes[0]
+            .evaluator
+            .as_ref()
+            .unwrap()
+            .definition_id
+            .clone();
+        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+            definition_id,
+            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+            reason: "disabled after manifest resolution".into(),
+            request_id: "disable-before-historical-execution".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let request = ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest.clone(),
+                max_total_duration_ms: 1_000,
+            }),
+        };
+        let first = svc
+            .execute_evaluation_manifest(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        let mut forged_report = Request::new(ReportOperationEventRequest {
+            operation_id: first.operation_id.clone(),
+            event_id: format!("report:{}:forged-step", first.operation_id),
+            parent_event_id: format!("{}:budget", first.operation_id),
+            timestamp_ms: 0,
+            kind: "verification_recorded".into(),
+            attributes: HashMap::from([("evaluation_step_receipt".into(), "{}".into())]),
+            references: vec![],
+        });
+        forged_report
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        forged_report
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
+        assert_eq!(
+            svc.report_operation_event(forged_report)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(first.status, evaluation_execution_domain::VERDICT_ALLOW);
+        assert_eq!(first.steps.len(), 1);
+        assert_eq!(
+            first.steps[0].status,
+            evaluation_execution_domain::STATUS_PASS
+        );
+        assert!(
+            first
+                .decision
+                .as_ref()
+                .unwrap()
+                .decision_digest
+                .starts_with("sha256:")
+        );
+
+        let mut replay_request = request;
+        replay_request
+            .execution
+            .as_mut()
+            .unwrap()
+            .max_total_duration_ms = 2_000;
+        let replay = svc
+            .execute_evaluation_manifest(Request::new(replay_request))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        assert_eq!(replay, first);
+        let queried = svc
+            .get_evaluation_execution(Request::new(GetEvaluationExecutionRequest {
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        assert_eq!(queried, first);
+        let receipt = svc
+            .db
+            .get_operation_receipt(&first.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evaluation_total_budget_ms(&receipt).unwrap(), 1_000);
+        assert_eq!(
+            evaluation_cancellation_event(&receipt, "different-writer", 42).actor,
+            "different-writer"
+        );
+        assert!(receipt.completeness().complete);
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::VerificationRecorded
+                && event.attributes.contains_key("evaluation_step_receipt")
+        }));
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.contains_key("evaluation_gate_decision")
+        }));
+    }
+
+    #[tokio::test]
+    async fn evaluation_execution_authorizes_namespace_before_manifest_lookup() {
+        let svc = evaluation_execution_service(0);
+        let mut request = Request::new(ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "secret".into(),
+                manifest_digest: format!("sha256:{}", "9".repeat(64)),
+                max_total_duration_ms: 1_000,
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        let error = svc.execute_evaluation_manifest(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(!error.message().contains("manifest"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
+        let svc = evaluation_execution_service(0);
+        let manifest = resolved_execution_fixture(&svc, "cancel-race-resolve").await;
+        let manifest = svc
+            .db
+            .get_evaluation_manifest(&manifest.manifest_digest)
+            .unwrap()
+            .unwrap();
+        let index = svc
+            .ensure_evaluation_execution(&manifest, "starter", 1_000)
+            .unwrap();
+        let stale_receipt = svc
+            .db
+            .get_operation_receipt(&index.operation_id)
+            .unwrap()
+            .unwrap();
+
+        svc.request_evaluation_cancellation(&index, &stale_receipt, "first-writer")
+            .unwrap();
+        svc.request_evaluation_cancellation(&index, &stale_receipt, "second-writer")
+            .unwrap();
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(&index.operation_id)
+            .unwrap()
+            .unwrap();
+        let cancellation = receipt
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .attributes
+                    .get("evaluation_cancel_requested")
+                    .is_some_and(|value| value == "true")
+            })
+            .unwrap();
+        assert_eq!(cancellation.actor, "first-writer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cancellation_is_durable_and_reduces_fail_closed() {
+        let svc = Arc::new(evaluation_execution_service(250));
+        let cancellation_replica = Arc::new(ChiseiServiceImpl::new_with_evaluator_registry(
+            svc.db.clone(),
+            svc.config.clone(),
+            svc.evaluator_registry.clone(),
+        ));
+        let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
+        let execute_request = ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest.clone(),
+                max_total_duration_ms: 2_000,
+            }),
+        };
+        let executor = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.execute_evaluation_manifest(Request::new(execute_request))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .execution
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let cancelled = cancellation_replica
+            .cancel_evaluation_execution(Request::new(CancelEvaluationExecutionRequest {
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .execution
+            .unwrap();
+        let executed = executor.await.unwrap();
+        assert_eq!(cancelled, executed);
+        assert_eq!(
+            cancelled.status,
+            evaluation_execution_domain::VERDICT_UNAVAILABLE
+        );
+        assert_eq!(
+            cancelled.decision.as_ref().unwrap().reason_code,
+            evaluation_execution_domain::REASON_EXECUTION_CANCELLED
+        );
+        assert_eq!(
+            cancelled.steps[0].reason_code,
+            evaluation_execution_domain::REASON_EXECUTION_CANCELLED
+        );
+        let receipt = svc
+            .db
+            .get_operation_receipt(&cancelled.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(evaluation_cancellation_requested(&receipt));
+        assert!(receipt.completeness().complete);
     }
 
     #[tokio::test]

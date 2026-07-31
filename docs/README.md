@@ -50,6 +50,8 @@ If you want to deploy or operate the control plane:
   situation-specific deterministic production evaluation contracts.
 - [Resolved evaluation manifests](evaluation-manifests.md) — immutable,
   content-bound pre-execution inputs and historical replay.
+- [Deterministic evaluation execution](evaluation-execution.md) — bounded,
+  receipt-authoritative execution and fixed fail-closed reduction.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 

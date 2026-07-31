@@ -7,6 +7,7 @@ use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind},
 };
+use crate::db::chisei_receipt::validate_evaluation_receipt_event_order;
 
 fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, bool)>, String> {
     if !matches!(
@@ -796,6 +797,7 @@ impl SekaiDb {
                 event.event_id
             ));
         }
+        validate_evaluation_receipt_event_order(&receipt, &event)?;
         if let Some((metric, value, passed)) = outcome_evidence(&event)? {
             for existing in &receipt.events {
                 let Some((existing_metric, existing_value, existing_passed)) =

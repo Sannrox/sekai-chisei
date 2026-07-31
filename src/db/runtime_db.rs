@@ -7,6 +7,7 @@ use postgres::GenericClient;
 use std::sync::Arc;
 
 use crate::chisei::eval;
+use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
 use crate::chisei::evolve;
 use crate::chisei::external_action::{
     AuthorizationClaim, AuthorizationRecord, ExternalActionRequest,
@@ -298,6 +299,27 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_operation_receipt(operation_id),
             Self::Postgres(db) => db.get_operation_receipt(operation_id),
+        }
+    }
+
+    pub fn get_evaluation_execution_index(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<EvaluationExecutionIndex>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_evaluation_execution_index(manifest_digest),
+            Self::Postgres(db) => db.get_evaluation_execution_index(manifest_digest),
+        }
+    }
+
+    pub fn create_evaluation_execution(
+        &self,
+        index: &EvaluationExecutionIndex,
+        receipt: &OperationReceipt,
+    ) -> Result<EvaluationExecutionIndex, String> {
+        match self {
+            Self::Sqlite(db) => db.create_evaluation_execution(index, receipt),
+            Self::Postgres(db) => db.create_evaluation_execution(index, receipt),
         }
     }
 
