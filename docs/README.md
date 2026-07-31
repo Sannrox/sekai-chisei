@@ -46,6 +46,8 @@ If you want to deploy or operate the control plane:
   execution observations, and reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free
   evaluation of externally owned immutable subjects.
+- [Evaluation plans and evaluator definitions](evaluation-plans.md) —
+  situation-specific deterministic production evaluation contracts.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 

@@ -279,6 +279,111 @@ message EvalRun {
   int64 timestamp = 5;
 }
 
+// Immutable, operator-controlled deterministic evaluator metadata. This
+// registers deployed implementation identity; it never uploads executable code.
+message EvaluatorResourceLimits {
+  uint64 timeout_ms = 1;
+  uint64 max_input_bytes = 2;
+  uint64 max_output_bytes = 3;
+  uint32 max_evidence_items = 4;
+}
+message EvaluatorDefinition {
+  string contract_version = 1; // chisei.evaluator-definition/v1
+  string definition_id = 2;
+  string namespace = 3;
+  string evaluator_id = 4;
+  string version = 5;
+  string implementation_digest = 6;
+  string execution_class = 7; // deterministic_builtin/v1
+  repeated string supported_predicate_kinds = 8;
+  repeated string supported_input_schemas = 9;
+  repeated string supported_result_schemas = 10;
+  // Closed v1 JSON-Schema subset: a flat object of typed scalar parameters.
+  string parameter_schema_json = 11;
+  repeated string evidence_classifications = 12;
+  EvaluatorResourceLimits resource_limits = 13;
+  string source_ref = 14;
+  string content_digest = 15;
+  string created_by = 16;
+  int64 created_at_ms = 17;
+}
+message EvaluatorAvailability {
+  string definition_id = 1;
+  string state = 2; // enabled | disabled | superseded
+  string superseded_by_definition_id = 3;
+  string reason = 4;
+  string request_id = 5;
+  string request_digest = 6;
+  string changed_by = 7;
+  int64 changed_at_ms = 8;
+}
+message EvaluatorDefinitionRecord {
+  EvaluatorDefinition definition = 1;
+  EvaluatorAvailability availability = 2;
+}
+message PutEvaluatorDefinitionRequest { EvaluatorDefinition definition = 1; }
+message PutEvaluatorDefinitionResponse { EvaluatorDefinitionRecord record = 1; }
+message GetEvaluatorDefinitionRequest { string definition_id = 1; }
+message GetEvaluatorDefinitionResponse { EvaluatorDefinitionRecord record = 1; }
+message ListEvaluatorDefinitionsRequest {
+  string namespace = 1;
+  string evaluator_id = 2;
+}
+message ListEvaluatorDefinitionsResponse {
+  repeated EvaluatorDefinitionRecord records = 1;
+}
+message SetEvaluatorAvailabilityRequest {
+  string definition_id = 1;
+  string state = 2;
+  string superseded_by_definition_id = 3;
+  string reason = 4;
+  string request_id = 5;
+}
+message SetEvaluatorAvailabilityResponse {
+  EvaluatorDefinitionRecord record = 1;
+}
+
+// A situation-specific immutable plan over exact evaluator and invariant
+// versions. Nodes are deterministic evaluation only; they cannot execute
+// actions, scripts, deployments, or caller-defined reducers.
+message EvaluationInputBinding {
+  string name = 1;
+  string source_kind = 2; // subject | invariant | evidence
+  string schema_id = 3;
+}
+message EvaluationPlanNode {
+  string node_id = 1;
+  string evaluator_definition_id = 2;
+  repeated string depends_on_node_ids = 3;
+  repeated EvaluationInputBinding input_bindings = 4;
+  string parameters_json = 5;
+  repeated string invariant_version_ids = 6;
+  string classification = 7; // required | advisory
+}
+message EvaluationPlan {
+  string contract_version = 1; // chisei.evaluation-plan/v1
+  string plan_version_id = 2;
+  string namespace = 3;
+  string plan_id = 4;
+  string version = 5;
+  repeated string accepted_subject_profiles = 6;
+  repeated EvaluationPlanNode nodes = 7;
+  string reducer = 8; // required_all_pass_advisory_observed/v1
+  string source_ref = 9;
+  string content_digest = 10;
+  string created_by = 11;
+  int64 created_at_ms = 12;
+}
+message PutEvaluationPlanRequest { EvaluationPlan plan = 1; }
+message PutEvaluationPlanResponse { EvaluationPlan plan = 1; }
+message GetEvaluationPlanRequest { string plan_version_id = 1; }
+message GetEvaluationPlanResponse { EvaluationPlan plan = 1; }
+message ListEvaluationPlansRequest {
+  string namespace = 1;
+  string plan_id = 2;
+}
+message ListEvaluationPlansResponse { repeated EvaluationPlan plans = 1; }
+
 message GateDecision {
   string verdict = 1;
   string reason = 2;
@@ -1400,6 +1505,13 @@ service ChiseiService {
   rpc GetAffinity(GetAffinityRequest) returns (GetAffinityResponse);
 
   // Eval
+  rpc PutEvaluatorDefinition(PutEvaluatorDefinitionRequest) returns (PutEvaluatorDefinitionResponse);
+  rpc GetEvaluatorDefinition(GetEvaluatorDefinitionRequest) returns (GetEvaluatorDefinitionResponse);
+  rpc ListEvaluatorDefinitions(ListEvaluatorDefinitionsRequest) returns (ListEvaluatorDefinitionsResponse);
+  rpc SetEvaluatorAvailability(SetEvaluatorAvailabilityRequest) returns (SetEvaluatorAvailabilityResponse);
+  rpc PutEvaluationPlan(PutEvaluationPlanRequest) returns (PutEvaluationPlanResponse);
+  rpc GetEvaluationPlan(GetEvaluationPlanRequest) returns (GetEvaluationPlanResponse);
+  rpc ListEvaluationPlans(ListEvaluationPlansRequest) returns (ListEvaluationPlansResponse);
   rpc CreateEvalSuite(CreateEvalSuiteRequest) returns (CreateEvalSuiteResponse);
   rpc ListEvalSuites(ListEvalSuitesRequest) returns (ListEvalSuitesResponse);
   rpc GetEvalSuite(GetEvalSuiteRequest) returns (GetEvalSuiteResponse);

@@ -364,6 +364,14 @@ for one opaque subject and explicit evaluation time. Hidden reference closure
 is omitted before canonicalization, and generic graph CRUD cannot mutate or
 disclose these governance objects. Chisei later binds the returned exact
 invariant versions to situation-specific evaluator definitions and plans.
+Those `chisei.evaluator-definition/v1` and `chisei.evaluation-plan/v1`
+resources are immutable and namespace scoped. Definitions identify deployed
+deterministic implementations and their typed contracts; plans form a bounded
+acyclic evaluation graph with exact invariant coverage and one fixed
+fail-closed reducer. Mutable, audited evaluator availability blocks future
+selection without rewriting historical plans. `EvalSuite` remains test data
+and does not gain production gate authority. See
+[Evaluation plans and evaluator definitions](evaluation-plans.md).
 
 `GetEvidenceSubmissionContent` is the governed, single-record read path for an
 admitted envelope. It resolves the submission's projected `external_evidence`
