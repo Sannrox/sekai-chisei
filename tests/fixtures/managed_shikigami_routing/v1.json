@@ -1,0 +1,70 @@
+{
+  "contract_version": "sekai.managed-shikigami-routing-conformance/v1",
+  "parent_issue": 471,
+  "consumer": "Sannrox/shikigami",
+  "minimum_consumer": {
+    "released_version": null,
+    "intended_version": "v1.0.5",
+    "required_commit": "eab167d3e0b55e603bd1e5a0d4214a637ba63a32"
+  },
+  "synthetic_context": {
+    "principal": "service:shikigami-managed",
+    "credential_id": "credential:synthetic-managed",
+    "namespace": "managed-conformance",
+    "logical_model": "managed-default",
+    "route_override": "",
+    "provider_credential_ref": "credential:provider:synthetic"
+  },
+  "required_cases": [
+    {
+      "id": "service_principal_authenticates",
+      "class": "positive",
+      "summary": "A valid machine credential reaches PlanExecution, ExecutePlan, and ExecutePlanStream as the authenticated service principal."
+    },
+    {
+      "id": "caller_cannot_select_authority",
+      "class": "negative",
+      "summary": "Caller-supplied principal or tenant metadata cannot replace the authenticated context."
+    },
+    {
+      "id": "invalid_identity_fails_closed",
+      "class": "negative",
+      "summary": "Missing, invalid, expired, wrong-resource, and insufficient-scope credentials are refused before provider contact."
+    },
+    {
+      "id": "policy_selects_physical_route",
+      "class": "positive",
+      "summary": "The request carries an operator-approved logical model with no route override; policy resolves the canonical provider and model."
+    },
+    {
+      "id": "provider_secret_stays_server_side",
+      "class": "negative",
+      "summary": "Provider credentials resolve from authenticated context and never appear in requests, events, errors, receipts, or diagnostics."
+    },
+    {
+      "id": "tool_call_stream_round_trip",
+      "class": "positive",
+      "summary": "A provider tool-call stream is normalized without losing call id, tool name, or fragmented arguments."
+    },
+    {
+      "id": "usage_and_receipt_are_normalized",
+      "class": "positive",
+      "summary": "Terminal execution exposes normalized usage and a receipt reference without raw provider response or credential material."
+    },
+    {
+      "id": "provider_failure_fails_closed",
+      "class": "negative",
+      "summary": "Provider failure records a bounded failed receipt and does not silently switch physical route."
+    },
+    {
+      "id": "explicit_retry_is_new_attempt",
+      "class": "positive",
+      "summary": "A host retry is a distinct attempt under the same logical operation; automatic ambiguous replay is forbidden."
+    },
+    {
+      "id": "community_runtime_remains_tenant_free",
+      "class": "negative",
+      "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets."
+    }
+  ]
+}
