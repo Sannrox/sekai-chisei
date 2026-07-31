@@ -43,6 +43,7 @@ const ACTION_EFFECTS_SCHEMA: &str = include_str!("postgres/0022_action_effects.s
 const PARKED_WORK_CONTINUATION_SCHEMA: &str =
     include_str!("postgres/0023_parked_work_continuation.sql");
 const EVALUATION_PLANS_SCHEMA: &str = include_str!("postgres/0024_evaluation_plans.sql");
+const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation_manifests.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -172,6 +173,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "evaluation_plans",
         sql: EVALUATION_PLANS_SCHEMA,
     },
+    Migration {
+        version: 25,
+        name: "evaluation_manifests",
+        sql: EVALUATION_MANIFESTS_SCHEMA,
+    },
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -270,6 +276,10 @@ impl PostgresDb {
     pub fn pool_state(&self) -> (u32, u32) {
         let state = self.pool.state();
         (state.connections, state.idle_connections)
+    }
+
+    pub(crate) fn max_connections(&self) -> u32 {
+        self.pool.max_size()
     }
 
     /// Highest applied forward migration version for capability advertisement.

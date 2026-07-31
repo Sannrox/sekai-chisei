@@ -845,6 +845,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ResolveEvaluationPlan",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_manifest_backend_conformance.rs",
+        "src/db/postgres_evaluation_manifest.rs",
+        "src/chisei/evaluation_manifest.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "CreateEvalSuite",
       "kind": "persistent",
       "surfaces": [

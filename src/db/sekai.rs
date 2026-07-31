@@ -18,6 +18,7 @@ use crate::domain::{
 pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
     enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    persistent: bool,
 }
 
 #[derive(Debug)]
@@ -101,6 +102,7 @@ impl SekaiDb {
         let db = Self {
             pool,
             enterprise_extension,
+            persistent,
         };
         db.migrate_all()?;
         Ok(db)
@@ -132,6 +134,10 @@ impl SekaiDb {
                 }
             }
         }
+    }
+
+    pub(crate) fn is_persistent(&self) -> bool {
+        self.persistent
     }
 
     #[cfg(feature = "gateway-test-support")]
@@ -185,6 +191,7 @@ impl SekaiDb {
         self.migrate_capability_packages()?;
         self.migrate_chisei()?;
         self.migrate_evaluation_plans()?;
+        self.migrate_evaluation_manifests()?;
         self.migrate_kioku()?;
         self.migrate_action_types()?;
         self.migrate_governed_action_types()?;

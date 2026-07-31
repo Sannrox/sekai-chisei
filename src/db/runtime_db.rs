@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::{PrincipalCredential, SekaiDb};
+use postgres::GenericClient;
 use std::sync::Arc;
 
 use crate::chisei::eval;
@@ -48,6 +49,23 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Instant;
 
+fn verify_evaluation_manifest(
+    manifest: crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
+) -> Result<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest, String> {
+    let canonical = crate::chisei::evaluation_manifest::prepare_manifest(manifest.clone())
+        .map_err(|error| format!("invalid persisted evaluation manifest: {error}"))?;
+    if canonical != manifest {
+        return Err("persisted evaluation manifest content binding is invalid".into());
+    }
+    Ok(manifest)
+}
+
+pub(crate) struct EvaluationManifestWrite {
+    pub manifest: crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
+    pub request_id: String,
+    pub request_digest: String,
+}
+
 #[derive(Clone)]
 pub enum RuntimeDb {
     Sqlite(Arc<SekaiDb>),
@@ -64,6 +82,116 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    pub(crate) fn with_evaluation_resolution_snapshot<T, E, F, M>(
+        &self,
+        operation: F,
+        map_db_error: M,
+    ) -> Result<
+        (
+            T,
+            Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>,
+        ),
+        E,
+    >
+    where
+        F: FnOnce() -> Result<(T, Option<EvaluationManifestWrite>), E>,
+        M: Fn(String) -> E,
+    {
+        match self {
+            Self::Sqlite(db) if db.is_persistent() => {
+                let mut connection = db.conn();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| map_db_error(error.to_string()))?;
+                let (value, write) = operation()?;
+                let stored = write
+                    .map(|write| {
+                        verify_evaluation_manifest(write.manifest.clone())
+                            .map_err(&map_db_error)?;
+                        let stored =
+                            crate::db::evaluation_manifest::put_evaluation_manifest_in_transaction(
+                                &transaction,
+                                &write.manifest,
+                                &write.request_id,
+                                &write.request_digest,
+                            )
+                            .map_err(&map_db_error)?;
+                        verify_evaluation_manifest(stored).map_err(&map_db_error)
+                    })
+                    .transpose()?;
+                transaction
+                    .commit()
+                    .map_err(|error| map_db_error(error.to_string()))?;
+                Ok((value, stored))
+            }
+            Self::Sqlite(_) => {
+                // The single-connection in-memory backend is a test fixture;
+                // holding its only connection while calling the normal read
+                // APIs would deadlock. Production SQLite uses the locked path.
+                let (value, write) = operation()?;
+                let stored = write
+                    .map(|write| {
+                        self.put_evaluation_manifest(
+                            &write.manifest,
+                            &write.request_id,
+                            &write.request_digest,
+                        )
+                        .map_err(&map_db_error)
+                    })
+                    .transpose()?;
+                Ok((value, stored))
+            }
+            Self::Postgres(db) => {
+                if db.max_connections() < 2 {
+                    return Err(map_db_error(
+                        "evaluation resolution requires at least two PostgreSQL connections".into(),
+                    ));
+                }
+                let mut connection = db.connection().map_err(&map_db_error)?;
+                let mut transaction = connection
+                    .transaction()
+                    .map_err(|error| map_db_error(error.to_string()))?;
+                // These are every mutable community table consulted by live
+                // resolution. SHARE blocks concurrent INSERT/UPDATE/DELETE
+                // while allowing the existing read APIs to use pooled
+                // connections. The manifest/request tables remain governed by
+                // their advisory idempotency locks.
+                transaction
+                    .batch_execute(
+                        "LOCK TABLE
+                            sekai_objects,
+                            sekai_links,
+                            sekai_grants,
+                            sekai_evidence_submissions,
+                            chisei_evaluator_definitions,
+                            chisei_evaluator_availability,
+                            chisei_evaluation_plans
+                         IN SHARE MODE",
+                    )
+                    .map_err(|error| map_db_error(error.to_string()))?;
+                let (value, write) = operation()?;
+                let stored = write
+                    .map(|write| {
+                        verify_evaluation_manifest(write.manifest.clone())
+                            .map_err(&map_db_error)?;
+                        let stored = crate::db::postgres_evaluation_manifest::put_evaluation_manifest_in_transaction(
+                            &mut transaction,
+                            &write.manifest,
+                            &write.request_id,
+                            &write.request_digest,
+                        )
+                        .map_err(&map_db_error)?;
+                        verify_evaluation_manifest(stored).map_err(&map_db_error)
+                    })
+                    .transpose()?;
+                transaction
+                    .commit()
+                    .map_err(|error| map_db_error(error.to_string()))?;
+                Ok((value, stored))
+            }
+        }
+    }
+
     /// In-memory SQLite store for tests.
     pub fn memory() -> Self {
         Self::Sqlite(Arc::new(SekaiDb::new(":memory:").expect("memory sqlite")))
@@ -1794,6 +1922,68 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.put_evaluation_plan(plan, actor, now_ms),
             Self::Postgres(db) => db.put_evaluation_plan(plan, actor, now_ms),
         }
+    }
+
+    pub fn get_evaluation_manifest(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>, String>
+    {
+        let manifest = match self {
+            Self::Sqlite(db) => db.get_evaluation_manifest(manifest_digest),
+            Self::Postgres(db) => db.get_evaluation_manifest(manifest_digest),
+        }?;
+        manifest
+            .map(|manifest| {
+                if manifest.manifest_digest != manifest_digest {
+                    return Err(
+                        "persisted evaluation manifest digest does not match its storage key"
+                            .into(),
+                    );
+                }
+                verify_evaluation_manifest(manifest)
+            })
+            .transpose()
+    }
+
+    pub fn get_evaluation_manifest_for_request(
+        &self,
+        namespace: &str,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_manifest::EvaluationManifestReplay>, String> {
+        let replay = match self {
+            Self::Sqlite(db) => {
+                db.get_evaluation_manifest_for_request(namespace, actor, request_id)
+            }
+            Self::Postgres(db) => {
+                db.get_evaluation_manifest_for_request(namespace, actor, request_id)
+            }
+        }?;
+        replay
+            .map(|mut replay| {
+                replay.manifest = verify_evaluation_manifest(replay.manifest)?;
+                Ok(replay)
+            })
+            .transpose()
+    }
+
+    pub fn put_evaluation_manifest(
+        &self,
+        manifest: &crate::chisei::evaluation_manifest::ResolvedEvaluationManifest,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest, String> {
+        verify_evaluation_manifest(manifest.clone())?;
+        let stored = match self {
+            Self::Sqlite(db) => db.put_evaluation_manifest(manifest, request_id, request_digest),
+            Self::Postgres(db) => db.put_evaluation_manifest(manifest, request_id, request_digest),
+        }?;
+        let stored = verify_evaluation_manifest(stored)?;
+        if stored.manifest_digest != manifest.manifest_digest {
+            return Err("evaluation manifest digest conflicts with stored content".into());
+        }
+        Ok(stored)
     }
 
     pub fn get_evaluation_plan(
@@ -4313,5 +4503,62 @@ impl RuntimeDb {
                     .into(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod evaluation_resolution_snapshot_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn persistent_sqlite_snapshot_excludes_concurrent_prerequisite_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-evaluation-snapshot-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path_string).unwrap()));
+        let resolver_db = db.clone();
+        let writer_db = db.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let resolver = std::thread::spawn(move || {
+            resolver_db
+                .with_evaluation_resolution_snapshot(
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, String>(((), None))
+                    },
+                    |error| error,
+                )
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_db
+                .create_object(&Object {
+                    id: "concurrent-prerequisite".into(),
+                    kind: "document".into(),
+                    name: "Concurrent prerequisite".into(),
+                    namespace: "acme".into(),
+                    external_id: "document:concurrent".into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+            written_tx.send(()).unwrap();
+        });
+        assert!(written_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release_tx.send(()).unwrap();
+        written_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        resolver.join().unwrap();
+        writer.join().unwrap();
+        drop(db);
+        std::fs::remove_file(path).ok();
     }
 }

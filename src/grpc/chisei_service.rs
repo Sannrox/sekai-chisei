@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
+use crate::chisei::evaluation_manifest as evaluation_manifest_domain;
 use crate::chisei::evaluation_plan as evaluation_plan_domain;
 use crate::chisei::external_action as external;
 use crate::chisei::external_permit as permit;
@@ -1994,6 +1995,141 @@ fn to_proto_evaluation_plan(value: &evaluation_plan_domain::EvaluationPlan) -> E
     }
 }
 
+fn from_proto_evaluation_resolution(
+    value: EvaluationResolutionRequest,
+) -> evaluation_manifest_domain::EvaluationResolutionRequest {
+    evaluation_manifest_domain::EvaluationResolutionRequest {
+        contract_version: value.contract_version,
+        resolver_version: value.resolver_version,
+        namespace: value.namespace,
+        request_id: value.request_id,
+        plan_version_id: value.plan_version_id,
+        subject_profile: value.subject_profile,
+        subject_identity: value.subject_identity,
+        subject_content_digest: value.subject_content_digest,
+        evidence_object_ids: value.evidence_object_ids,
+        evaluation_time_ms: value.evaluation_time_ms,
+    }
+}
+
+fn to_proto_evaluation_manifest(
+    value: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+) -> ResolvedEvaluationManifest {
+    ResolvedEvaluationManifest {
+        contract_version: value.contract_version.clone(),
+        resolver_version: value.resolver_version.clone(),
+        manifest_id: value.manifest_id.clone(),
+        manifest_digest: value.manifest_digest.clone(),
+        namespace: value.namespace.clone(),
+        plan_version_id: value.plan_version_id.clone(),
+        plan_digest: value.plan_digest.clone(),
+        subject_profile: value.subject_profile.clone(),
+        subject_identity: value.subject_identity.clone(),
+        subject_content_digest: value.subject_content_digest.clone(),
+        invariant_set_id: value.invariant_set_id.clone(),
+        invariant_set_digest: value.invariant_set_digest.clone(),
+        invariant_profile_digest: value.invariant_profile_digest.clone(),
+        evaluation_time_ms: value.evaluation_time_ms,
+        resolved_by: value.resolved_by.clone(),
+        requirements: value
+            .requirements
+            .iter()
+            .map(|requirement| ResolvedRequirementBinding {
+                requirement_version_id: requirement.requirement_version_id.clone(),
+                content_digest: requirement.content_digest.clone(),
+                provenance_evidence_object_ids: requirement.provenance_evidence_object_ids.clone(),
+            })
+            .collect(),
+        nodes: value
+            .nodes
+            .iter()
+            .map(|node| ResolvedEvaluationNode {
+                node_id: node.node_id.clone(),
+                evaluator: Some(ResolvedEvaluatorBinding {
+                    definition_id: node.evaluator.definition_id.clone(),
+                    definition_digest: node.evaluator.definition_digest.clone(),
+                    implementation_digest: node.evaluator.implementation_digest.clone(),
+                }),
+                depends_on_node_ids: node.depends_on_node_ids.clone(),
+                input_bindings: node
+                    .input_bindings
+                    .iter()
+                    .map(|binding| ResolvedInputBinding {
+                        name: binding.name.clone(),
+                        source_kind: binding.source_kind.clone(),
+                        schema_id: binding.schema_id.clone(),
+                    })
+                    .collect(),
+                parameters_json: node.parameters_json.clone(),
+                invariants: node
+                    .invariants
+                    .iter()
+                    .map(|invariant| ResolvedInvariantBinding {
+                        invariant_version_id: invariant.invariant_version_id.clone(),
+                        content_digest: invariant.content_digest.clone(),
+                        predicate_kind: invariant.predicate_kind.clone(),
+                        input_schema: invariant.input_schema.clone(),
+                        result_schema: invariant.result_schema.clone(),
+                        evidence_types: invariant.evidence_types.clone(),
+                        provenance_evidence_object_ids: invariant
+                            .provenance_evidence_object_ids
+                            .clone(),
+                        waiver_version_ids: invariant.waiver_version_ids.clone(),
+                    })
+                    .collect(),
+                evidence_object_ids: node.evidence_object_ids.clone(),
+                classification: node.classification.clone(),
+            })
+            .collect(),
+        evidence: value
+            .evidence
+            .iter()
+            .map(|evidence| ResolvedEvidenceBinding {
+                evidence_object_id: evidence.evidence_object_id.clone(),
+                submission_id: evidence.submission_id.clone(),
+                content_digest: evidence.content_digest.clone(),
+                evidence_type: evidence.evidence_type.clone(),
+                schema_id: evidence.schema_id.clone(),
+                schema_version: evidence.schema_version.clone(),
+                classification: evidence.classification.clone(),
+                observed_at_ms: evidence.observed_at_ms,
+                expires_at_ms: evidence.expires_at_ms,
+                source_identity_digest: evidence.source_identity_digest.clone(),
+            })
+            .collect(),
+        waivers: value
+            .waivers
+            .iter()
+            .map(|waiver| ResolvedWaiverBinding {
+                waiver_version_id: waiver.waiver_version_id.clone(),
+                content_digest: waiver.content_digest.clone(),
+                evidence_object_ids: waiver.evidence_object_ids.clone(),
+                invariant_version_ids: waiver.invariant_version_ids.clone(),
+            })
+            .collect(),
+        created_at_ms: value.created_at_ms,
+    }
+}
+
+fn to_proto_evaluation_resolution(
+    outcome: &evaluation_manifest_domain::EvaluationResolutionOutcome,
+) -> ResolveEvaluationPlanResponse {
+    ResolveEvaluationPlanResponse {
+        status: outcome.status.clone(),
+        manifest: outcome.manifest.as_ref().map(to_proto_evaluation_manifest),
+        findings: outcome
+            .findings
+            .iter()
+            .map(|finding| EvaluationResolutionFinding {
+                code: finding.code.clone(),
+                severity: finding.severity.clone(),
+                node_id: finding.node_id.clone(),
+                invariant_version_id: finding.invariant_version_id.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn map_evaluation_resource_error(error: String) -> Status {
     if error.contains("already exists") {
         Status::already_exists(error)
@@ -2008,6 +2144,18 @@ fn map_evaluation_resource_error(error: String) -> Status {
         Status::resource_exhausted(error)
     } else {
         Status::invalid_argument(error)
+    }
+}
+
+fn map_evaluation_manifest_storage_error(error: String) -> Status {
+    if error.contains("already exists") {
+        Status::already_exists(error)
+    } else if error.contains("persisted evaluation manifest")
+        || error.contains("manifest digest conflicts")
+    {
+        Status::data_loss(error)
+    } else {
+        Status::internal(error)
     }
 }
 
@@ -2074,6 +2222,13 @@ fn invariant_reference_visible(
             pending.extend(fact.input.evidence_refs);
             if !fact.input.supersedes_object_id.is_empty() {
                 pending.push(fact.input.supersedes_object_id);
+            }
+        } else if object.kind == governed_fact_domain::WAIVER_KIND {
+            let waiver = governed_fact_domain::waiver_from_object(&object)?;
+            pending.extend(waiver.input.invariant_version_ids);
+            pending.extend(waiver.input.evidence_refs);
+            if !waiver.input.supersedes_object_id.is_empty() {
+                pending.push(waiver.input.supersedes_object_id);
             }
         }
     }
@@ -2336,6 +2491,536 @@ fn validate_evaluation_plan_references(
         }
     }
     Ok(())
+}
+
+fn resolution_outcome(
+    status: &str,
+    code: &str,
+) -> evaluation_manifest_domain::EvaluationResolutionOutcome {
+    evaluation_manifest_domain::blocked_outcome(status, code)
+}
+
+fn resolve_invariant_set_for_manifest(
+    db: &RuntimeDb,
+    request: &evaluation_manifest_domain::PreparedResolutionRequest,
+) -> Result<
+    (
+        governed_fact_domain::ResolvedInvariantSet,
+        Vec<governed_fact_domain::GovernedFactVersion>,
+        Vec<governed_fact_domain::GovernedWaiverVersion>,
+        bool,
+    ),
+    Status,
+> {
+    let profile_object = db
+        .get_object(&governed_fact_domain::profile_object_id(
+            &request.request.namespace,
+        ))
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::failed_precondition("governed fact resolution unavailable"))?;
+    if !object_visible_to_actor(db, &profile_object, &request.actor).map_err(Status::internal)? {
+        return Err(Status::failed_precondition(
+            "governed fact resolution unavailable",
+        ));
+    }
+    let profile =
+        governed_fact_domain::profile_from_object(&profile_object).map_err(Status::data_loss)?;
+    let all_facts = governed_fact_domain::list_facts(db, &request.request.namespace)
+        .map_err(Status::internal)?;
+    let all_waivers = governed_fact_domain::list_waivers(db, &request.request.namespace)
+        .map_err(Status::internal)?;
+    let all_set = governed_fact_domain::resolve_invariant_set(
+        &profile,
+        all_facts.clone(),
+        all_waivers.clone(),
+        &request.request.subject_profile,
+        &request.request.subject_identity,
+        request.request.evaluation_time_ms,
+        governed_fact_domain::MAX_RESOLUTION_LIMIT,
+    )
+    .map_err(map_invariant_resolution_error)?;
+    let mut visibility_cache = HashMap::new();
+    let mut visibility_work = 0;
+    let mut visible_facts = Vec::new();
+    for fact in all_facts {
+        if invariant_reference_visible(
+            db,
+            &request.request.namespace,
+            &fact.object_id,
+            &request.actor,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )
+        .map_err(Status::internal)?
+        {
+            visible_facts.push(fact);
+        }
+    }
+    let mut visible_waivers = Vec::new();
+    for waiver in all_waivers {
+        if invariant_reference_visible(
+            db,
+            &request.request.namespace,
+            &waiver.object_id,
+            &request.actor,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )
+        .map_err(Status::internal)?
+        {
+            visible_waivers.push(waiver);
+        }
+    }
+    let visible_set = governed_fact_domain::resolve_invariant_set(
+        &profile,
+        visible_facts.clone(),
+        visible_waivers.clone(),
+        &request.request.subject_profile,
+        &request.request.subject_identity,
+        request.request.evaluation_time_ms,
+        governed_fact_domain::MAX_RESOLUTION_LIMIT,
+    )
+    .map_err(map_invariant_resolution_error)?;
+    let resolution_incomplete = all_set.set_digest != visible_set.set_digest;
+    Ok((
+        visible_set,
+        visible_facts,
+        visible_waivers,
+        resolution_incomplete,
+    ))
+}
+
+fn map_invariant_resolution_error(error: String) -> Status {
+    if error.contains("exceeds") {
+        Status::resource_exhausted(error)
+    } else if error.contains("invalid") || error.contains("must") {
+        Status::invalid_argument(error)
+    } else {
+        Status::failed_precondition("governed fact resolution unavailable")
+    }
+}
+
+fn resolve_manifest_evidence(
+    db: &RuntimeDb,
+    namespace: &str,
+    actor: &str,
+    evidence_object_id: &str,
+    subject_identity: &str,
+    require_subject_binding: bool,
+    evaluation_time_ms: i64,
+) -> Result<Result<evaluation_manifest_domain::ResolvedEvidenceBinding, &'static str>, Status> {
+    let Some(object) = db
+        .get_object(evidence_object_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(Err("evidence_unavailable"));
+    };
+    if object.namespace != namespace
+        || object.kind != crate::domain::KIND_EXTERNAL_EVIDENCE
+        || !object_visible_to_actor(db, &object, actor).map_err(Status::internal)?
+    {
+        return Ok(Err("evidence_unavailable"));
+    }
+    let Some(submission_id) = object.properties.get("submission_id") else {
+        return Ok(Err("evidence_unavailable"));
+    };
+    let Some(submission) = db
+        .get_evidence_submission(submission_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(Err("evidence_unavailable"));
+    };
+    if submission.namespace != namespace {
+        return Ok(Err("evidence_unavailable"));
+    }
+    if submission.lifecycle_state != crate::sekai::evidence::EvidenceLifecycleState::Available
+        || submission.observed_at_ms > evaluation_time_ms
+        || submission
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= evaluation_time_ms)
+    {
+        return Ok(Err("evidence_stale"));
+    }
+    if require_subject_binding && submission.target_external_id != subject_identity {
+        return Ok(Err("evidence_subject_mismatch"));
+    }
+    let envelope = submission
+        .envelope
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("admitted evidence envelope is missing"))?;
+    let computed_digest = crate::sekai::evidence_store::canonical_content_digest(&envelope.content)
+        .map_err(Status::data_loss)?;
+    if computed_digest != submission.content_digest
+        || envelope.content_digest != submission.content_digest
+        || object
+            .properties
+            .get("content_digest")
+            .is_none_or(|digest| digest != &submission.content_digest)
+        || object
+            .properties
+            .get("classification")
+            .is_none_or(|classification| classification != submission.classification.as_str())
+    {
+        return Err(Status::data_loss(
+            "admitted evidence content binding is invalid",
+        ));
+    }
+    let source_identity_digest = evaluation_manifest_domain::digest_json(&(
+        submission.producer_identity.as_str(),
+        submission.source_type.as_str(),
+        submission.source_instance.as_str(),
+        submission.source_record_id.as_str(),
+        submission.source_version.as_str(),
+        submission.source_sequence,
+        submission.target_external_id.as_str(),
+        submission.target_kind.as_str(),
+    ))
+    .map_err(Status::internal)?;
+    Ok(Ok(evaluation_manifest_domain::ResolvedEvidenceBinding {
+        evidence_object_id: evidence_object_id.into(),
+        submission_id: submission.id,
+        // Evidence admission stores canonical SHA-256 as lowercase hex. The
+        // manifest qualifies the algorithm for unambiguous later binding.
+        content_digest: format!("sha256:{}", submission.content_digest),
+        evidence_type: submission.evidence_type,
+        schema_id: submission.schema_id,
+        schema_version: submission.schema_version,
+        classification: submission.classification.as_str().into(),
+        observed_at_ms: submission.observed_at_ms,
+        expires_at_ms: submission.expires_at_ms.unwrap_or(0),
+        source_identity_digest,
+    }))
+}
+
+fn resolve_evaluation_manifest_live(
+    db: &RuntimeDb,
+    request: &evaluation_manifest_domain::PreparedResolutionRequest,
+    now_ms: i64,
+) -> Result<evaluation_manifest_domain::EvaluationResolutionOutcome, Status> {
+    let Some(plan) = db
+        .get_evaluation_plan(&request.request.plan_version_id)
+        .map_err(Status::internal)?
+    else {
+        return Err(Status::not_found("evaluation plan not found"));
+    };
+    if plan.namespace != request.request.namespace
+        || !evaluation_plan_visible(db, &plan, &request.actor).map_err(Status::internal)?
+    {
+        return Err(Status::not_found("evaluation plan not found"));
+    }
+    let canonical_plan =
+        evaluation_plan_domain::prepare_plan(plan.clone(), &plan.created_by, plan.created_at_ms)
+            .map_err(Status::data_loss)?;
+    if canonical_plan != plan {
+        return Err(Status::data_loss(
+            "persisted evaluation plan content binding is invalid",
+        ));
+    }
+    if !plan
+        .accepted_subject_profiles
+        .contains(&request.request.subject_profile)
+    {
+        return Ok(resolution_outcome(
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+            "subject_profile_unsupported",
+        ));
+    }
+    let (invariant_set, _, _, hidden_applicable_invariant) =
+        match resolve_invariant_set_for_manifest(db, request) {
+            Ok(resolved) => resolved,
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::NotFound
+                ) =>
+            {
+                return Ok(resolution_outcome(
+                    evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+                    "invariant_resolution_unavailable",
+                ));
+            }
+            Err(status) => return Err(status),
+        };
+    if hidden_applicable_invariant {
+        return Ok(resolution_outcome(
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+            "invariant_resolution_incomplete",
+        ));
+    }
+    let invariants = invariant_set
+        .invariants
+        .iter()
+        .map(|invariant| (invariant.object_id.clone(), invariant))
+        .collect::<HashMap<_, _>>();
+    let plan_coverage = plan
+        .nodes
+        .iter()
+        .flat_map(|node| node.invariant_version_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if plan_coverage
+        .iter()
+        .any(|invariant_id| !invariants.contains_key(invariant_id))
+    {
+        return Ok(resolution_outcome(
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+            "plan_invariant_unavailable",
+        ));
+    }
+    let required_coverage = plan
+        .nodes
+        .iter()
+        .filter(|node| node.classification == evaluation_plan_domain::NODE_REQUIRED)
+        .flat_map(|node| node.invariant_version_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut waivers_by_invariant: HashMap<String, Vec<String>> = HashMap::new();
+    for waiver in &invariant_set.waivers {
+        for invariant_id in &waiver.input.invariant_version_ids {
+            if invariants.contains_key(invariant_id) {
+                waivers_by_invariant
+                    .entry(invariant_id.clone())
+                    .or_default()
+                    .push(waiver.object_id.clone());
+            }
+        }
+    }
+    if invariants.keys().any(|invariant_id| {
+        !required_coverage.contains(invariant_id)
+            && !waivers_by_invariant.contains_key(invariant_id)
+    }) {
+        return Ok(resolution_outcome(
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+            "invariant_uncovered",
+        ));
+    }
+
+    let requested_evidence = request
+        .request
+        .evidence_object_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut all_evidence_ids = requested_evidence.clone();
+    for fact in invariant_set
+        .requirements
+        .iter()
+        .chain(invariant_set.invariants.iter())
+    {
+        all_evidence_ids.extend(fact.input.evidence_refs.iter().cloned());
+    }
+    for waiver in &invariant_set.waivers {
+        all_evidence_ids.extend(waiver.input.evidence_refs.iter().cloned());
+    }
+    if all_evidence_ids.len() > evaluation_manifest_domain::MAX_MANIFEST_EVIDENCE {
+        return Err(Status::resource_exhausted(
+            "resolved evidence exceeds the manifest bound",
+        ));
+    }
+    let mut admitted_evidence = Vec::with_capacity(all_evidence_ids.len());
+    for evidence_id in &all_evidence_ids {
+        match resolve_manifest_evidence(
+            db,
+            &request.request.namespace,
+            &request.actor,
+            evidence_id,
+            &request.request.subject_identity,
+            requested_evidence.contains(evidence_id),
+            request.request.evaluation_time_ms,
+        )? {
+            Ok(evidence) => admitted_evidence.push(evidence),
+            Err(code) => {
+                return Ok(resolution_outcome(
+                    evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+                    code,
+                ));
+            }
+        }
+    }
+    let evidence_by_id = admitted_evidence
+        .iter()
+        .map(|evidence| (evidence.evidence_object_id.clone(), evidence))
+        .collect::<HashMap<_, _>>();
+    let mut consumed_requested_evidence = BTreeSet::new();
+    let mut resolved_nodes = Vec::with_capacity(plan.nodes.len());
+    for node in &plan.nodes {
+        let Some(definition) = db
+            .get_evaluator_definition(&node.evaluator_definition_id)
+            .map_err(Status::internal)?
+        else {
+            return Ok(resolution_outcome(
+                evaluation_manifest_domain::RESOLUTION_UNAVAILABLE,
+                "evaluator_unavailable",
+            ));
+        };
+        if definition.namespace != request.request.namespace {
+            return Ok(resolution_outcome(
+                evaluation_manifest_domain::RESOLUTION_UNAVAILABLE,
+                "evaluator_unavailable",
+            ));
+        }
+        let canonical_definition = evaluation_plan_domain::prepare_definition(
+            definition.clone(),
+            &definition.created_by,
+            definition.created_at_ms,
+        )
+        .map_err(Status::data_loss)?;
+        if canonical_definition != definition {
+            return Err(Status::data_loss(
+                "persisted evaluator definition content binding is invalid",
+            ));
+        }
+        let availability = db
+            .get_evaluator_availability(&definition.definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluator availability is missing"))?;
+        if availability.state != evaluation_plan_domain::AVAILABILITY_ENABLED {
+            return Ok(resolution_outcome(
+                evaluation_manifest_domain::RESOLUTION_UNAVAILABLE,
+                "evaluator_unavailable",
+            ));
+        }
+        evaluation_plan_domain::validate_parameters(
+            &definition.parameter_schema_json,
+            &node.parameters_json,
+        )
+        .map_err(Status::data_loss)?;
+        let evidence_binding_schemas = node
+            .input_bindings
+            .iter()
+            .filter(|binding| binding.source_kind == evaluation_plan_domain::INPUT_EVIDENCE)
+            .map(|binding| binding.schema_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut node_evidence_ids = BTreeSet::new();
+        let mut resolved_invariants = Vec::with_capacity(node.invariant_version_ids.len());
+        for invariant_id in &node.invariant_version_ids {
+            let invariant = invariants
+                .get(invariant_id)
+                .ok_or_else(|| Status::data_loss("plan invariant binding disappeared"))?;
+            for evidence_type in &invariant.input.verification.evidence_types {
+                let matching = requested_evidence
+                    .iter()
+                    .filter_map(|evidence_id| evidence_by_id.get(evidence_id))
+                    .filter(|evidence| {
+                        evidence.evidence_type == *evidence_type
+                            && evidence_binding_schemas.contains(evidence.schema_id.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                if matching.is_empty() {
+                    return Ok(resolution_outcome(
+                        evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+                        "evidence_missing",
+                    ));
+                }
+                for evidence in matching {
+                    if !definition
+                        .evidence_classifications
+                        .contains(&evidence.classification)
+                    {
+                        return Ok(resolution_outcome(
+                            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+                            "evidence_classification_mismatch",
+                        ));
+                    }
+                    node_evidence_ids.insert(evidence.evidence_object_id.clone());
+                    consumed_requested_evidence.insert(evidence.evidence_object_id.clone());
+                }
+            }
+            let mut waiver_ids = waivers_by_invariant
+                .get(invariant_id)
+                .cloned()
+                .unwrap_or_default();
+            waiver_ids.sort();
+            resolved_invariants.push(evaluation_manifest_domain::ResolvedInvariantBinding {
+                invariant_version_id: invariant.object_id.clone(),
+                content_digest: invariant.content_digest.clone(),
+                predicate_kind: invariant.input.verification.predicate_kind.clone(),
+                input_schema: invariant.input.verification.input_schema.clone(),
+                result_schema: invariant.input.verification.result_schema.clone(),
+                evidence_types: invariant.input.verification.evidence_types.clone(),
+                provenance_evidence_object_ids: invariant.input.evidence_refs.clone(),
+                waiver_version_ids: waiver_ids,
+            });
+        }
+        if node_evidence_ids.len() > definition.resource_limits.max_evidence_items as usize {
+            return Err(Status::resource_exhausted(
+                "resolved node evidence exceeds evaluator resource limits",
+            ));
+        }
+        resolved_nodes.push(evaluation_manifest_domain::ResolvedEvaluationNode {
+            node_id: node.node_id.clone(),
+            evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                definition_id: definition.definition_id,
+                definition_digest: definition.content_digest,
+                implementation_digest: definition.implementation_digest,
+            },
+            depends_on_node_ids: node.depends_on_node_ids.clone(),
+            input_bindings: node
+                .input_bindings
+                .iter()
+                .map(|binding| evaluation_manifest_domain::ResolvedInputBinding {
+                    name: binding.name.clone(),
+                    source_kind: binding.source_kind.clone(),
+                    schema_id: binding.schema_id.clone(),
+                })
+                .collect(),
+            parameters_json: node.parameters_json.clone(),
+            invariants: resolved_invariants,
+            evidence_object_ids: node_evidence_ids.into_iter().collect(),
+            classification: node.classification.clone(),
+        });
+    }
+    if consumed_requested_evidence != requested_evidence {
+        return Ok(resolution_outcome(
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
+            "evidence_unbound",
+        ));
+    }
+    let waivers = invariant_set
+        .waivers
+        .iter()
+        .map(|waiver| evaluation_manifest_domain::ResolvedWaiverBinding {
+            waiver_version_id: waiver.object_id.clone(),
+            content_digest: waiver.content_digest.clone(),
+            evidence_object_ids: waiver.input.evidence_refs.clone(),
+            invariant_version_ids: waiver.input.invariant_version_ids.clone(),
+        })
+        .collect();
+    let requirements = invariant_set
+        .requirements
+        .iter()
+        .map(
+            |requirement| evaluation_manifest_domain::ResolvedRequirementBinding {
+                requirement_version_id: requirement.object_id.clone(),
+                content_digest: requirement.content_digest.clone(),
+                provenance_evidence_object_ids: requirement.input.evidence_refs.clone(),
+            },
+        )
+        .collect();
+    let manifest = evaluation_manifest_domain::prepare_manifest(
+        evaluation_manifest_domain::ResolvedEvaluationManifest {
+            contract_version: evaluation_manifest_domain::MANIFEST_CONTRACT.into(),
+            resolver_version: request.request.resolver_version.clone(),
+            manifest_id: String::new(),
+            manifest_digest: String::new(),
+            namespace: request.request.namespace.clone(),
+            plan_version_id: plan.plan_version_id,
+            plan_digest: plan.content_digest,
+            subject_profile: request.request.subject_profile.clone(),
+            subject_identity: request.request.subject_identity.clone(),
+            subject_content_digest: request.request.subject_content_digest.clone(),
+            invariant_set_id: invariant_set.set_id,
+            invariant_set_digest: invariant_set.set_digest,
+            invariant_profile_digest: invariant_set.profile_digest,
+            evaluation_time_ms: request.request.evaluation_time_ms,
+            resolved_by: request.actor.clone(),
+            requirements,
+            nodes: resolved_nodes,
+            evidence: admitted_evidence,
+            waivers,
+            created_at_ms: now_ms,
+        },
+    )
+    .map_err(map_evaluation_resource_error)?;
+    Ok(evaluation_manifest_domain::resolved_outcome(manifest))
 }
 
 impl ChiseiServiceImpl {
@@ -10051,6 +10736,68 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(ListEvaluationPlansResponse { plans }))
     }
 
+    async fn resolve_evaluation_plan(
+        &self,
+        req: Request<ResolveEvaluationPlanRequest>,
+    ) -> Result<Response<ResolveEvaluationPlanResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = from_proto_evaluation_resolution(
+            req.into_inner()
+                .resolution
+                .ok_or_else(|| Status::invalid_argument("evaluation resolution required"))?,
+        );
+        let prepared = evaluation_manifest_domain::prepare_resolution_request(request, &actor)
+            .map_err(map_evaluation_resource_error)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if prepared.request.evaluation_time_ms > now_ms {
+            return Err(Status::invalid_argument(
+                "evaluation_time_ms cannot be in the future",
+            ));
+        }
+        let (mut outcome, stored) = self.db.with_evaluation_resolution_snapshot(
+            || {
+                require_namespace_write_access(
+                    &self.db,
+                    &prepared.actor,
+                    &prepared.request.namespace,
+                )?;
+                if let Some(replay) = self
+                    .db
+                    .get_evaluation_manifest_for_request(
+                        &prepared.request.namespace,
+                        &prepared.actor,
+                        &prepared.request.request_id,
+                    )
+                    .map_err(Status::internal)?
+                {
+                    if replay.request_digest != prepared.request_digest {
+                        return Err(Status::already_exists(
+                            "evaluation resolution request already exists with different content",
+                        ));
+                    }
+                    let outcome = evaluation_manifest_domain::resolved_outcome(replay.manifest);
+                    return Ok((outcome, None));
+                }
+                let resolution_time_ms = chrono::Utc::now().timestamp_millis();
+                let outcome =
+                    resolve_evaluation_manifest_live(&self.db, &prepared, resolution_time_ms)?;
+                let write = outcome.manifest.as_ref().map(|manifest| {
+                    crate::db::runtime_db::EvaluationManifestWrite {
+                        manifest: manifest.clone(),
+                        request_id: prepared.request.request_id.clone(),
+                        request_digest: prepared.request_digest.clone(),
+                    }
+                });
+                Ok((outcome, write))
+            },
+            map_evaluation_manifest_storage_error,
+        )?;
+        if let Some(stored) = stored {
+            outcome.manifest = Some(stored);
+        }
+        Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
+    }
+
     async fn create_eval_suite(
         &self,
         req: Request<CreateEvalSuiteRequest>,
@@ -11741,6 +12488,26 @@ mod tests {
         subject_refs: Vec<String>,
         evidence_refs: Vec<String>,
     ) -> String {
+        install_invariant_with_contract(
+            svc,
+            namespace,
+            fact_id,
+            subject_refs,
+            evidence_refs,
+            vec![],
+            vec![],
+        )
+    }
+
+    fn install_invariant_with_contract(
+        svc: &ChiseiServiceImpl,
+        namespace: &str,
+        fact_id: &str,
+        subject_refs: Vec<String>,
+        evidence_refs: Vec<String>,
+        evidence_types: Vec<String>,
+        requirement_version_ids: Vec<String>,
+    ) -> String {
         governed_fact_domain::apply_profile(
             &svc.db,
             namespace,
@@ -11767,9 +12534,9 @@ mod tests {
                     predicate_kind: "schema_conforms".into(),
                     input_schema: "schema://document/v1".into(),
                     result_schema: "schema://pass-fail/v1".into(),
-                    evidence_types: vec![],
+                    evidence_types,
                 },
-                requirement_version_ids: vec![],
+                requirement_version_ids,
                 evidence_refs,
                 source_ref: "repo://requirements/document-schema@1".into(),
                 effective_from_ms: 1,
@@ -11781,6 +12548,165 @@ mod tests {
         )
         .unwrap()
         .object_id
+    }
+
+    fn install_requirement_with_evidence(
+        svc: &ChiseiServiceImpl,
+        namespace: &str,
+        fact_id: &str,
+        evidence_refs: Vec<String>,
+    ) -> String {
+        governed_fact_domain::apply_profile(
+            &svc.db,
+            namespace,
+            governed_fact_domain::PROFILE_CONTRACT_VERSION,
+            "root",
+            1,
+        )
+        .unwrap();
+        governed_fact_domain::put_fact(
+            &svc.db,
+            governed_fact_domain::GovernedFactInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                fact_id: fact_id.into(),
+                version: "1.0.0".into(),
+                fact_type: GovernedFactType::Requirement,
+                status: "active".into(),
+                statement: "The document has attributable schema verification provenance.".into(),
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec!["document/v1".into()],
+                    subject_refs: vec![],
+                },
+                verification: governed_fact_domain::VerificationContract::default(),
+                requirement_version_ids: vec![],
+                evidence_refs,
+                source_ref: "repo://requirements/schema-provenance@1".into(),
+                effective_from_ms: 1,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            2,
+        )
+        .unwrap()
+        .object_id
+    }
+
+    fn project_evaluation_evidence(
+        svc: &ChiseiServiceImpl,
+        target_external_id: &str,
+        classification: crate::sekai::evidence::EvidenceClassification,
+        expires_at_ms: i64,
+        idempotency_key: &str,
+    ) -> String {
+        use crate::sekai::evidence::{
+            EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
+            EvidenceTarget, SchemaCompatibility,
+        };
+        use crate::sekai::evidence_store::{
+            EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
+        };
+
+        let producer_identity = format!("producer:evaluation:{idempotency_key}");
+        let source_instance = format!("evaluation-fixture:{idempotency_key}");
+        let target_id = format!("target:{}", target_external_id.replace(':', "-"));
+        if svc
+            .db
+            .find_by_external_id(target_external_id)
+            .unwrap()
+            .is_none()
+        {
+            svc.db
+                .create_object(&Object {
+                    id: target_id,
+                    kind: "document".into(),
+                    name: target_external_id.into(),
+                    namespace: "acme".into(),
+                    external_id: target_external_id.into(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        svc.db
+            .upsert_evidence_producer(
+                &EvidenceProducerCapability {
+                    producer_identity: producer_identity.clone(),
+                    config_version: 1,
+                    source_types: vec!["verification_system".into()],
+                    source_instances: vec![source_instance.clone()],
+                    namespaces: vec!["acme".into()],
+                    evidence_types: vec!["schema-check.record".into()],
+                    target_kinds: vec!["document".into()],
+                    classification_ceiling: classification,
+                    allowed_intents: vec![EvidenceIntent::Upsert],
+                    allow_operation_attachment: false,
+                    replay_window_ms: 60_000,
+                    max_clock_skew_ms: 1_000,
+                    max_payload_bytes: 1_024,
+                    max_relationships: 4,
+                    rate_limit_per_minute: 20,
+                    max_retained_submissions: 100_000,
+                    revoked: false,
+                },
+                1,
+            )
+            .unwrap();
+        svc.db
+            .register_evidence_schema(
+                &EvidenceSchemaDefinition {
+                    schema_id: "schema://evidence/schema-check/v1".into(),
+                    schema_version: "1.0.0".into(),
+                    evidence_type: "schema-check.record".into(),
+                    compatible_versions: vec![],
+                },
+                1,
+            )
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let content = serde_json::json!({"result": "passed"});
+        let envelope = EvidenceEnvelope {
+            contract_version: EVIDENCE_ENVELOPE_VERSION.into(),
+            source_type: "verification_system".into(),
+            source_instance,
+            source_record_id: idempotency_key.into(),
+            source_version: "1".into(),
+            source_sequence: 1,
+            target: EvidenceTarget {
+                namespace: "acme".into(),
+                object_external_id: target_external_id.into(),
+                object_kind: "document".into(),
+            },
+            evidence_type: "schema-check.record".into(),
+            signal: EvidenceSignal::Verification,
+            schema_id: "schema://evidence/schema-check/v1".into(),
+            schema_version: "1.0.0".into(),
+            schema_compatibility: SchemaCompatibility::Exact,
+            observed_at_ms: now - 1,
+            collected_at_ms: now,
+            expires_at_ms: Some(expires_at_ms),
+            content_digest: canonical_content_digest(&content).unwrap(),
+            content,
+            relationships: vec![],
+            producer_identity: producer_identity.clone(),
+            confidence_bps: 10_000,
+            classification,
+            provenance: BTreeMap::new(),
+            idempotency_key: idempotency_key.into(),
+            intent: EvidenceIntent::Upsert,
+            causality: None,
+        };
+        let admission = svc
+            .db
+            .submit_evidence(&envelope, &producer_identity, now)
+            .unwrap();
+        svc.db
+            .project_evidence_submission(&admission.submission.id, now)
+            .unwrap()
+            .evidence_object_id
+            .unwrap()
     }
 
     fn evaluation_plan_request(
@@ -11812,6 +12738,28 @@ mod tests {
                 reducer: evaluation_plan_domain::FIXED_REDUCER.into(),
                 source_ref: "repo://plans/document-review@1".into(),
                 ..Default::default()
+            }),
+        }
+    }
+
+    fn evaluation_resolution_request(
+        namespace: &str,
+        request_id: &str,
+        plan_version_id: &str,
+        evaluation_time_ms: i64,
+    ) -> ResolveEvaluationPlanRequest {
+        ResolveEvaluationPlanRequest {
+            resolution: Some(EvaluationResolutionRequest {
+                contract_version: evaluation_manifest_domain::RESOLUTION_REQUEST_CONTRACT.into(),
+                resolver_version: evaluation_manifest_domain::RESOLVER_VERSION.into(),
+                namespace: namespace.into(),
+                request_id: request_id.into(),
+                plan_version_id: plan_version_id.into(),
+                subject_profile: "document/v1".into(),
+                subject_identity: "document:42".into(),
+                subject_content_digest: format!("sha256:{}", "b".repeat(64)),
+                evidence_object_ids: vec![],
+                evaluation_time_ms,
             }),
         }
     }
@@ -12135,6 +13083,564 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_freezes_exact_inputs_and_replays_history() {
+        let svc = memory_service();
+        let invariant_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let request = evaluation_resolution_request("acme", "resolve-1", &plan.plan_version_id, 10);
+        let first = svc
+            .resolve_evaluation_plan(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            first.status,
+            evaluation_manifest_domain::RESOLUTION_RESOLVED
+        );
+        assert!(first.findings.is_empty());
+        let manifest = first.manifest.unwrap();
+        assert_eq!(manifest.plan_version_id, plan.plan_version_id);
+        assert_eq!(manifest.plan_digest, plan.content_digest);
+        assert_eq!(manifest.subject_identity, "document:42");
+        assert_eq!(manifest.resolved_by, "local");
+        assert_eq!(manifest.nodes.len(), 1);
+        assert_eq!(
+            manifest.nodes[0]
+                .evaluator
+                .as_ref()
+                .unwrap()
+                .implementation_digest,
+            definition.implementation_digest
+        );
+        assert_eq!(
+            manifest.nodes[0].invariants[0].invariant_version_id,
+            invariant_id
+        );
+
+        let replay = svc
+            .resolve_evaluation_plan(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        assert_eq!(replay.manifest_digest, manifest.manifest_digest);
+        assert_eq!(replay.created_at_ms, manifest.created_at_ms);
+
+        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+            definition_id: definition.definition_id,
+            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+            reason: "maintenance".into(),
+            request_id: "disable-after-resolution".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let historical = svc
+            .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+                "acme",
+                "resolve-1",
+                &plan.plan_version_id,
+                10,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            historical.manifest.unwrap().manifest_digest,
+            manifest.manifest_digest
+        );
+        let unavailable = svc
+            .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+                "acme",
+                "resolve-2",
+                &plan.plan_version_id,
+                10,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            unavailable.status,
+            evaluation_manifest_domain::RESOLUTION_UNAVAILABLE
+        );
+        assert!(unavailable.manifest.is_none());
+        assert_eq!(unavailable.findings[0].code, "evaluator_unavailable");
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_fails_closed_for_uncovered_invariants() {
+        let svc = memory_service();
+        let covered_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &covered_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let uncovered_id = install_invariant_with_subject_refs(&svc, "acme", "added-later", vec![]);
+
+        let outcome = svc
+            .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+                "acme",
+                "resolve-uncovered",
+                &plan.plan_version_id,
+                10,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            outcome.status,
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN
+        );
+        assert!(outcome.manifest.is_none());
+        assert_eq!(outcome.findings[0].code, "invariant_uncovered");
+        assert!(outcome.findings[0].invariant_version_id.is_empty());
+
+        let waiver = governed_fact_domain::put_waiver(
+            &svc.db,
+            governed_fact_domain::GovernedWaiverInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: "acme".into(),
+                waiver_id: "added-later-exception".into(),
+                version: "1.0.0".into(),
+                invariant_version_ids: vec![uncovered_id.clone()],
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec!["document/v1".into()],
+                    subject_refs: vec![],
+                },
+                reason: "Bounded test exception.".into(),
+                evidence_refs: vec![],
+                source_ref: "decision:test-waiver".into(),
+                valid_from_ms: 3,
+                expires_at_ms: 20,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            3,
+        )
+        .unwrap();
+        let resolved = svc
+            .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+                "acme",
+                "resolve-waived",
+                &plan.plan_version_id,
+                10,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            resolved.status,
+            evaluation_manifest_domain::RESOLUTION_RESOLVED
+        );
+        let waiver_binding = resolved
+            .manifest
+            .unwrap()
+            .waivers
+            .into_iter()
+            .find(|binding| binding.waiver_version_id == waiver.object_id)
+            .unwrap();
+        assert_eq!(waiver_binding.invariant_version_ids, vec![uncovered_id]);
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_authorizes_before_resource_lookup() {
+        let svc = memory_service();
+        let mut request = Request::new(evaluation_resolution_request(
+            "acme",
+            "resolve-denied",
+            "evaluation-plan:secret",
+            10,
+        ));
+        request
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        let error = svc.resolve_evaluation_plan(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(!error.message().contains("plan"));
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_binds_only_fresh_subject_matched_evidence() {
+        use crate::sekai::evidence::EvidenceClassification;
+
+        let svc = memory_service();
+        let invariant_id = install_invariant_with_contract(
+            &svc,
+            "acme",
+            "document-schema-with-evidence",
+            vec![],
+            vec![],
+            vec!["schema-check.record".into()],
+            vec![],
+        );
+        let mut definition_request = evaluator_definition_request("acme");
+        definition_request
+            .definition
+            .as_mut()
+            .unwrap()
+            .supported_input_schemas
+            .push("schema://evidence/schema-check/v1".into());
+        let definition = svc
+            .put_evaluator_definition(Request::new(definition_request))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let mut plan_request =
+            evaluation_plan_request("acme", &definition.definition_id, &invariant_id, "1.0.0");
+        plan_request.plan.as_mut().unwrap().nodes[0]
+            .input_bindings
+            .push(EvaluationInputBinding {
+                name: "verification".into(),
+                source_kind: evaluation_plan_domain::INPUT_EVIDENCE.into(),
+                schema_id: "schema://evidence/schema-check/v1".into(),
+            });
+        let plan = svc
+            .put_evaluation_plan(Request::new(plan_request))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        let base_time = chrono::Utc::now().timestamp_millis();
+        let evidence_id = project_evaluation_evidence(
+            &svc,
+            "document:42",
+            EvidenceClassification::Internal,
+            base_time + 60_000,
+            "evaluation-evidence-1",
+        );
+        let evaluation_time = chrono::Utc::now().timestamp_millis();
+        let mut request = evaluation_resolution_request(
+            "acme",
+            "resolve-evidence",
+            &plan.plan_version_id,
+            evaluation_time,
+        );
+        request.resolution.as_mut().unwrap().evidence_object_ids = vec![evidence_id.clone()];
+        let resolved = svc
+            .resolve_evaluation_plan(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            resolved.status,
+            evaluation_manifest_domain::RESOLUTION_RESOLVED
+        );
+        let manifest = resolved.manifest.unwrap();
+        assert_eq!(manifest.evidence.len(), 1);
+        assert_eq!(manifest.evidence[0].evidence_object_id, evidence_id);
+        assert_eq!(manifest.evidence[0].evidence_type, "schema-check.record");
+        assert_eq!(
+            manifest.nodes[0].evidence_object_ids,
+            vec![evidence_id.clone()]
+        );
+
+        let stale_base_time = chrono::Utc::now().timestamp_millis();
+        let stale_evidence_id = project_evaluation_evidence(
+            &svc,
+            "document:42",
+            EvidenceClassification::Internal,
+            stale_base_time + 250,
+            "evaluation-evidence-stale",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut stale_request = evaluation_resolution_request(
+            "acme",
+            "resolve-stale-evidence",
+            &plan.plan_version_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        stale_request
+            .resolution
+            .as_mut()
+            .unwrap()
+            .evidence_object_ids = vec![stale_evidence_id];
+        let stale = svc
+            .resolve_evaluation_plan(Request::new(stale_request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stale.status, evaluation_manifest_domain::RESOLUTION_UNKNOWN);
+        assert_eq!(stale.findings[0].code, "evidence_stale");
+
+        let mismatched_id = project_evaluation_evidence(
+            &svc,
+            "document:other",
+            EvidenceClassification::Internal,
+            base_time + 60_000,
+            "evaluation-evidence-2",
+        );
+        let mut mismatched_request = evaluation_resolution_request(
+            "acme",
+            "resolve-mismatched-evidence",
+            &plan.plan_version_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        mismatched_request
+            .resolution
+            .as_mut()
+            .unwrap()
+            .evidence_object_ids = vec![mismatched_id];
+        let mismatched = svc
+            .resolve_evaluation_plan(Request::new(mismatched_request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            mismatched.status,
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN
+        );
+        assert_eq!(mismatched.findings[0].code, "evidence_subject_mismatch");
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_rejects_future_evaluation_time() {
+        let svc = memory_service();
+        let mut request = evaluation_resolution_request(
+            "acme",
+            "resolve-future",
+            "evaluation-plan:future",
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        );
+        request.resolution.as_mut().unwrap().subject_content_digest =
+            format!("sha256:{}", "c".repeat(64));
+        let error = svc
+            .resolve_evaluation_plan(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "evaluation_time_ms cannot be in the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_binds_requirement_provenance_evidence() {
+        use crate::sekai::evidence::EvidenceClassification;
+
+        let svc = memory_service();
+        let base_time = chrono::Utc::now().timestamp_millis();
+        let evidence_id = project_evaluation_evidence(
+            &svc,
+            "document:42",
+            EvidenceClassification::Internal,
+            base_time + 60_000,
+            "requirement-evidence-1",
+        );
+        let requirement_id = install_requirement_with_evidence(
+            &svc,
+            "acme",
+            "schema-provenance",
+            vec![evidence_id.clone()],
+        );
+        let invariant_id = install_invariant_with_contract(
+            &svc,
+            "acme",
+            "document-schema",
+            vec![],
+            vec![],
+            vec![],
+            vec![requirement_id.clone()],
+        );
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        let resolved = svc
+            .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+                "acme",
+                "resolve-requirement-evidence",
+                &plan.plan_version_id,
+                chrono::Utc::now().timestamp_millis(),
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            resolved.status,
+            evaluation_manifest_domain::RESOLUTION_RESOLVED
+        );
+        let manifest = resolved.manifest.unwrap();
+        assert_eq!(manifest.evidence.len(), 1);
+        assert_eq!(manifest.evidence[0].evidence_object_id, evidence_id);
+        assert_eq!(manifest.requirements.len(), 1);
+        assert_eq!(
+            manifest.requirements[0].requirement_version_id,
+            requirement_id
+        );
+        assert_eq!(
+            manifest.requirements[0].provenance_evidence_object_ids,
+            vec![evidence_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluation_resolution_detects_hidden_applicable_waivers() {
+        let svc = memory_service();
+        let invariant_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let waiver = governed_fact_domain::put_waiver(
+            &svc.db,
+            governed_fact_domain::GovernedWaiverInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: "acme".into(),
+                waiver_id: "root-only-exception".into(),
+                version: "1.0.0".into(),
+                invariant_version_ids: vec![invariant_id],
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec!["document/v1".into()],
+                    subject_refs: vec![],
+                },
+                reason: "Visible only to a different principal.".into(),
+                evidence_refs: vec![],
+                source_ref: "decision:root-only-waiver".into(),
+                valid_from_ms: 3,
+                expires_at_ms: 20,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            3,
+        )
+        .unwrap();
+        svc.db
+            .create_grant(&Grant {
+                id: "root-only-manifest-waiver".into(),
+                object_id: waiver.object_id,
+                principal: "root".into(),
+                role: Role::Viewer,
+                created: 3,
+            })
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "evaluation-resolution-namespace-acme".into(),
+                kind: "namespace".into(),
+                name: "Acme".into(),
+                namespace: String::new(),
+                external_id: "namespace:acme".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&Grant {
+                id: "alice-evaluation-resolution-acme".into(),
+                object_id: "evaluation-resolution-namespace-acme".into(),
+                principal: "alice".into(),
+                role: Role::Admin,
+                created: 1,
+            })
+            .unwrap();
+
+        let mut request = Request::new(evaluation_resolution_request(
+            "acme",
+            "resolve-hidden-waiver",
+            &plan.plan_version_id,
+            10,
+        ));
+        request
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        let outcome = svc
+            .resolve_evaluation_plan(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            outcome.status,
+            evaluation_manifest_domain::RESOLUTION_UNKNOWN
+        );
+        assert!(outcome.manifest.is_none());
+        assert_eq!(outcome.findings[0].code, "invariant_resolution_incomplete");
     }
 
     fn governed_subject_request(

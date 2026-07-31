@@ -11,6 +11,10 @@ The v1 API adds:
 - `SetEvaluatorAvailability`; and
 - `Put`, `Get`, and `ListEvaluationPlan`.
 
+`ResolveEvaluationPlan` is the separate authorized pre-execution boundary that
+freezes an exact plan and its situation-specific inputs. See
+[Resolved evaluation manifests](evaluation-manifests.md).
+
 All resources are namespace scoped. Definition and plan mutations require a
 control-plane administrator with namespace write access. Reads require
 namespace access. A plan is hidden rather than partially returned when the
