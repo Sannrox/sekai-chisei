@@ -373,6 +373,16 @@ selection without rewriting historical plans. `EvalSuite` remains test data
 and does not gain production gate authority. See
 [Evaluation plans and evaluator definitions](evaluation-plans.md).
 
+`ResolveEvaluationPlan` combines one exact plan with an opaque subject, the
+content-addressed authorized invariant set for an explicit evaluation time,
+current exact evaluator definitions, valid waivers, and admitted evidence. It
+persists the result as an immutable `chisei.resolved-evaluation-manifest/v1`
+document whose digest binds every semantic input. Resolution performs no
+evaluator execution and has no independently managed public resource
+lifecycle. Exact successful request replay remains available after evaluator
+disablement or supersession; new requests fail closed against current
+availability. See [Resolved evaluation manifests](evaluation-manifests.md).
+
 `GetEvidenceSubmissionContent` is the governed, single-record read path for an
 admitted envelope. It resolves the submission's projected `external_evidence`
 object and rechecks that object's live ACL before returning the immutable

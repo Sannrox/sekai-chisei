@@ -302,6 +302,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "PutEvaluationPlan"
                 | "GetEvaluationPlan"
                 | "ListEvaluationPlans"
+                | "ResolveEvaluationPlan"
                 | "CreateEvalSuite"
                 | "ListEvalSuites"
                 | "GetEvalSuite"

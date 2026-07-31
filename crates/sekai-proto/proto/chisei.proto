@@ -384,6 +384,111 @@ message ListEvaluationPlansRequest {
 }
 message ListEvaluationPlansResponse { repeated EvaluationPlan plans = 1; }
 
+// Resolves immutable plan, subject, invariant, waiver, evaluator, and evidence
+// inputs into durable content-bound execution evidence. Resolution performs no
+// evaluator execution and grants no action authority.
+message EvaluationResolutionRequest {
+  string contract_version = 1; // chisei.evaluation-resolution-request/v1
+  string resolver_version = 2; // chisei.evaluation-resolver/v1
+  string namespace = 3;
+  string request_id = 4;
+  string plan_version_id = 5;
+  string subject_profile = 6;
+  string subject_identity = 7;
+  string subject_content_digest = 8;
+  repeated string evidence_object_ids = 9;
+  int64 evaluation_time_ms = 10;
+}
+message ResolvedEvaluatorBinding {
+  string definition_id = 1;
+  string definition_digest = 2;
+  string implementation_digest = 3;
+}
+message ResolvedEvidenceBinding {
+  string evidence_object_id = 1;
+  string submission_id = 2;
+  string content_digest = 3;
+  string evidence_type = 4;
+  string schema_id = 5;
+  string schema_version = 6;
+  string classification = 7;
+  int64 observed_at_ms = 8;
+  int64 expires_at_ms = 9; // zero means the admitted envelope has no expiry
+  string source_identity_digest = 10;
+}
+message ResolvedWaiverBinding {
+  string waiver_version_id = 1;
+  string content_digest = 2;
+  repeated string evidence_object_ids = 3;
+  repeated string invariant_version_ids = 4;
+}
+message ResolvedRequirementBinding {
+  string requirement_version_id = 1;
+  string content_digest = 2;
+  repeated string provenance_evidence_object_ids = 3;
+}
+message ResolvedInvariantBinding {
+  string invariant_version_id = 1;
+  string content_digest = 2;
+  string predicate_kind = 3;
+  string input_schema = 4;
+  string result_schema = 5;
+  repeated string evidence_types = 6;
+  repeated string provenance_evidence_object_ids = 7;
+  repeated string waiver_version_ids = 8;
+}
+message ResolvedInputBinding {
+  string name = 1;
+  string source_kind = 2;
+  string schema_id = 3;
+}
+message ResolvedEvaluationNode {
+  string node_id = 1;
+  ResolvedEvaluatorBinding evaluator = 2;
+  repeated string depends_on_node_ids = 3;
+  repeated ResolvedInputBinding input_bindings = 4;
+  string parameters_json = 5;
+  repeated ResolvedInvariantBinding invariants = 6;
+  repeated string evidence_object_ids = 7;
+  string classification = 8;
+}
+message ResolvedEvaluationManifest {
+  string contract_version = 1; // chisei.resolved-evaluation-manifest/v1
+  string resolver_version = 2;
+  string manifest_id = 3;
+  string manifest_digest = 4;
+  string namespace = 5;
+  string plan_version_id = 6;
+  string plan_digest = 7;
+  string subject_profile = 8;
+  string subject_identity = 9;
+  string subject_content_digest = 10;
+  string invariant_set_id = 11;
+  string invariant_set_digest = 12;
+  string invariant_profile_digest = 13;
+  int64 evaluation_time_ms = 14;
+  string resolved_by = 15;
+  repeated ResolvedEvaluationNode nodes = 16;
+  repeated ResolvedEvidenceBinding evidence = 17;
+  repeated ResolvedWaiverBinding waivers = 18;
+  int64 created_at_ms = 19;
+  repeated ResolvedRequirementBinding requirements = 20;
+}
+message EvaluationResolutionFinding {
+  string code = 1;
+  string severity = 2; // blocking | advisory
+  string node_id = 3; // empty when disclosure would be unsafe
+  string invariant_version_id = 4; // empty when disclosure would be unsafe
+}
+message ResolveEvaluationPlanRequest {
+  EvaluationResolutionRequest resolution = 1;
+}
+message ResolveEvaluationPlanResponse {
+  string status = 1; // resolved | unknown | unavailable
+  ResolvedEvaluationManifest manifest = 2;
+  repeated EvaluationResolutionFinding findings = 3;
+}
+
 message GateDecision {
   string verdict = 1;
   string reason = 2;
@@ -1512,6 +1617,7 @@ service ChiseiService {
   rpc PutEvaluationPlan(PutEvaluationPlanRequest) returns (PutEvaluationPlanResponse);
   rpc GetEvaluationPlan(GetEvaluationPlanRequest) returns (GetEvaluationPlanResponse);
   rpc ListEvaluationPlans(ListEvaluationPlansRequest) returns (ListEvaluationPlansResponse);
+  rpc ResolveEvaluationPlan(ResolveEvaluationPlanRequest) returns (ResolveEvaluationPlanResponse);
   rpc CreateEvalSuite(CreateEvalSuiteRequest) returns (CreateEvalSuiteResponse);
   rpc ListEvalSuites(ListEvalSuitesRequest) returns (ListEvalSuitesResponse);
   rpc GetEvalSuite(GetEvalSuiteRequest) returns (GetEvalSuiteResponse);

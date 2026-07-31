@@ -48,6 +48,8 @@ If you want to deploy or operate the control plane:
   evaluation of externally owned immutable subjects.
 - [Evaluation plans and evaluator definitions](evaluation-plans.md) —
   situation-specific deterministic production evaluation contracts.
+- [Resolved evaluation manifests](evaluation-manifests.md) — immutable,
+  content-bound pre-execution inputs and historical replay.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 
