@@ -19,52 +19,95 @@
     {
       "id": "service_principal_authenticates",
       "class": "positive",
-      "summary": "A valid machine credential reaches PlanExecution, ExecutePlan, and ExecutePlanStream as the authenticated service principal."
+      "summary": "A valid machine credential reaches PlanExecution, ExecutePlan, and ExecutePlanStream as the authenticated service principal.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#enterprise_execution_marker_without_context_fails_closed",
+        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service.rs#managed_unary_execution_accepts_machine_context_and_normalizes_receipt",
+        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+      ]
     },
     {
       "id": "caller_cannot_select_authority",
       "class": "negative",
-      "summary": "Caller-supplied principal or tenant metadata cannot replace the authenticated context."
+      "summary": "Caller-supplied principal or tenant metadata cannot replace the authenticated context.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service.rs#managed_cached_plan_is_bound_to_authenticated_tenant",
+        "src/grpc/mod.rs#token_auth_interceptor_overwrites_client_principal",
+        "src/grpc/mod.rs#token_auth_interceptor_derives_tenant_from_credential_and_overwrites_forgery"
+      ]
     },
     {
       "id": "invalid_identity_fails_closed",
       "class": "negative",
-      "summary": "Missing, invalid, expired, wrong-resource, and insufficient-scope credentials are refused before provider contact."
+      "summary": "Missing, invalid, expired, wrong-resource, and insufficient-scope credentials are refused before provider contact.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service.rs#managed_context_without_enterprise_extension_fails_closed",
+        "src/grpc/mod.rs#token_auth_interceptor_rejects_unsupported_or_expired_enterprise_context"
+      ]
     },
     {
       "id": "policy_selects_physical_route",
       "class": "positive",
-      "summary": "The request carries an operator-approved logical model with no route override; policy resolves the canonical provider and model."
+      "summary": "The request carries an operator-approved logical model with no route override; policy resolves the canonical provider and model.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority"
+      ]
     },
     {
       "id": "provider_secret_stays_server_side",
       "class": "negative",
-      "summary": "Provider credentials resolve from authenticated context and never appear in requests, events, errors, receipts, or diagnostics."
+      "summary": "Provider credentials resolve from authenticated context and never appear in requests, events, errors, receipts, or diagnostics.",
+      "evidence_tests": [
+        "src/grpc/llm_service.rs#execution_provider_credentials_are_selected_by_authenticated_tenant",
+        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+      ]
     },
     {
       "id": "tool_call_stream_round_trip",
       "class": "positive",
-      "summary": "A provider tool-call stream is normalized without losing call id, tool name, or fragmented arguments."
+      "summary": "A provider tool-call stream is normalized without losing call id, tool name, or fragmented arguments.",
+      "evidence_tests": [
+        "crates/sekai-provider/src/llm/openai.rs#preserves_fragmented_interleaved_tool_calls",
+        "crates/sekai-provider/src/llm/anthropic.rs#preserves_fragmented_interleaved_tool_uses",
+        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+      ]
     },
     {
       "id": "usage_and_receipt_are_normalized",
       "class": "positive",
-      "summary": "Terminal execution exposes normalized usage and a receipt reference without raw provider response or credential material."
+      "summary": "Terminal execution exposes normalized usage and a receipt reference without raw provider response or credential material.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+      ]
     },
     {
       "id": "provider_failure_fails_closed",
       "class": "negative",
-      "summary": "Provider failure records a bounded failed receipt and does not silently switch physical route."
+      "summary": "Provider failure records a bounded failed receipt and does not silently switch physical route.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_provider_failure_records_failed_receipt_without_route_switch",
+        "src/grpc/chisei_service.rs#managed_stream_read_failure_records_failed_receipt_without_route_switch"
+      ]
     },
     {
       "id": "explicit_retry_is_new_attempt",
       "class": "positive",
-      "summary": "A host retry is a distinct attempt under the same logical operation; automatic ambiguous replay is forbidden."
+      "summary": "A host retry is a distinct attempt under the same logical operation; automatic ambiguous replay is forbidden.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#managed_explicit_retry_creates_distinct_correlated_attempts"
+      ]
     },
     {
       "id": "community_runtime_remains_tenant_free",
       "class": "negative",
-      "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets."
+      "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets.",
+      "evidence_tests": [
+        "src/grpc/chisei_service.rs#community_machine_context_keeps_legacy_execution_authorization",
+        "src/provider_credentials.rs#community_env_resolver_rejects_tenant_scoped_requests"
+      ]
     }
   ]
 }

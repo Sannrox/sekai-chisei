@@ -6,6 +6,7 @@ use super::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub struct Anthropic {
     api_key: String,
@@ -135,6 +136,7 @@ impl Provider for Anthropic {
             let mut cache_read_input_tokens = 0;
             let mut cache_creation_input_tokens = 0;
             let mut stop_reason = String::new();
+            let mut tool_calls = BTreeMap::new();
             let mut emitted_done = false;
             let mut received_bytes = 0usize;
 
@@ -159,7 +161,7 @@ impl Provider for Anthropic {
                 while let Some(index) = buffer.find("\n\n") {
                     let event = buffer[..index].to_string();
                     buffer = buffer[index + 2..].to_string();
-                    for chunk in parse_anthropic_sse_event(
+                    let parsed = parse_anthropic_sse_event(
                         &event,
                         &mut content,
                         &mut input_tokens,
@@ -167,14 +169,23 @@ impl Provider for Anthropic {
                         &mut cache_read_input_tokens,
                         &mut cache_creation_input_tokens,
                         &mut stop_reason,
+                        &mut tool_calls,
                         &mut emitted_done,
-                    ) {
+                    );
+                    let chunks = match parsed {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    for chunk in chunks {
                         yield Ok(chunk);
                     }
                 }
             }
             if !buffer.trim().is_empty() {
-                for chunk in parse_anthropic_sse_event(
+                let parsed = parse_anthropic_sse_event(
                     &buffer,
                     &mut content,
                     &mut input_tokens,
@@ -182,16 +193,32 @@ impl Provider for Anthropic {
                     &mut cache_read_input_tokens,
                     &mut cache_creation_input_tokens,
                     &mut stop_reason,
+                    &mut tool_calls,
                     &mut emitted_done,
-                ) {
+                );
+                let chunks = match parsed {
+                    Ok(chunks) => chunks,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                for chunk in chunks {
                     yield Ok(chunk);
                 }
             }
             if !emitted_done {
+                let tool_calls = match completed_anthropic_tool_calls(&tool_calls) {
+                    Ok(tool_calls) => tool_calls,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 yield Ok(ChatStreamChunk {
                     content_delta: String::new(),
                     content,
-                    tool_calls: Vec::new(),
+                    tool_calls,
                     input_tokens,
                     output_tokens,
                     stop_reason,
@@ -341,6 +368,13 @@ fn usage_tokens(usage: &Value, field: &str) -> i32 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Default)]
+struct AnthropicToolCallAssembly {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_anthropic_sse_event(
     event: &str,
@@ -350,8 +384,9 @@ fn parse_anthropic_sse_event(
     cache_read_input_tokens: &mut i32,
     cache_creation_input_tokens: &mut i32,
     stop_reason: &mut String,
+    tool_calls: &mut BTreeMap<u64, AnthropicToolCallAssembly>,
     emitted_done: &mut bool,
-) -> Vec<ChatStreamChunk> {
+) -> Result<Vec<ChatStreamChunk>, String> {
     let mut chunks = Vec::new();
     for data in event_data_values(event) {
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
@@ -367,7 +402,39 @@ fn parse_anthropic_sse_event(
                 *cache_creation_input_tokens =
                     usage_tokens(&value["message"]["usage"], "cache_creation_input_tokens");
             }
+            "content_block_start" if value["content_block"]["type"] == "tool_use" => {
+                let index = value["index"]
+                    .as_u64()
+                    .ok_or_else(|| "anthropic tool-use block omitted index".to_string())?;
+                let assembly = tool_calls.entry(index).or_default();
+                merge_anthropic_tool_call_field(
+                    &mut assembly.id,
+                    &value["content_block"]["id"],
+                    "id",
+                )?;
+                merge_anthropic_tool_call_field(
+                    &mut assembly.name,
+                    &value["content_block"]["name"],
+                    "name",
+                )?;
+                let input = &value["content_block"]["input"];
+                if !input.is_null() && input.as_object().is_none_or(|object| !object.is_empty()) {
+                    assembly.arguments.push_str(&input.to_string());
+                }
+            }
             "content_block_delta" => {
+                if value["delta"]["type"] == "input_json_delta" {
+                    let index = value["index"]
+                        .as_u64()
+                        .ok_or_else(|| "anthropic tool-use delta omitted index".to_string())?;
+                    let assembly = tool_calls.get_mut(&index).ok_or_else(|| {
+                        "anthropic tool-use delta preceded its start block".to_string()
+                    })?;
+                    let partial = value["delta"]["partial_json"].as_str().ok_or_else(|| {
+                        "anthropic tool-use delta omitted partial_json".to_string()
+                    })?;
+                    assembly.arguments.push_str(partial);
+                }
                 if let Some(delta) = value["delta"]["text"]
                     .as_str()
                     .filter(|delta| !delta.is_empty())
@@ -394,10 +461,11 @@ fn parse_anthropic_sse_event(
             }
             "message_stop" if !*emitted_done => {
                 *emitted_done = true;
+                let completed_tool_calls = completed_anthropic_tool_calls(tool_calls)?;
                 chunks.push(ChatStreamChunk {
                     content_delta: String::new(),
                     content: content.clone(),
-                    tool_calls: Vec::new(),
+                    tool_calls: completed_tool_calls,
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
                     stop_reason: stop_reason.clone(),
@@ -409,7 +477,48 @@ fn parse_anthropic_sse_event(
             _ => {}
         }
     }
-    chunks
+    Ok(chunks)
+}
+
+fn merge_anthropic_tool_call_field(
+    current: &mut String,
+    value: &Value,
+    field: &str,
+) -> Result<(), String> {
+    let value = value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("anthropic tool-use block omitted {field}"))?;
+    if !current.is_empty() && current != value {
+        return Err(format!("anthropic tool-use {field} changed during stream"));
+    }
+    current.clear();
+    current.push_str(value);
+    Ok(())
+}
+
+fn completed_anthropic_tool_calls(
+    tool_calls: &BTreeMap<u64, AnthropicToolCallAssembly>,
+) -> Result<Vec<ToolCall>, String> {
+    tool_calls
+        .values()
+        .map(|call| {
+            if call.id.is_empty() || call.name.is_empty() {
+                return Err("anthropic stream ended with incomplete tool-use identity".into());
+            }
+            let args = serde_json::from_str(if call.arguments.is_empty() {
+                "{}"
+            } else {
+                &call.arguments
+            })
+            .map_err(|_| "anthropic stream ended with invalid tool-use arguments".to_string())?;
+            Ok(ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args,
+            })
+        })
+        .collect()
 }
 
 fn event_data_values(event: &str) -> Vec<String> {
@@ -431,6 +540,8 @@ mod tests {
     };
     use axum::Router;
     use axum::routing::post;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn test_timeouts() -> HttpTimeouts {
@@ -498,6 +609,7 @@ mod tests {
         let mut cache_read_input_tokens = 0;
         let mut cache_creation_input_tokens = 0;
         let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
         let mut emitted_done = false;
 
         parse_anthropic_sse_event(
@@ -509,8 +621,10 @@ mod tests {
             &mut cache_read_input_tokens,
             &mut cache_creation_input_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(input_tokens, 11);
 
         let chunks = parse_anthropic_sse_event(
@@ -522,8 +636,10 @@ mod tests {
             &mut cache_read_input_tokens,
             &mut cache_creation_input_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content_delta, "hi");
         assert_eq!(chunks[0].content, "hi");
@@ -538,8 +654,10 @@ mod tests {
             &mut cache_read_input_tokens,
             &mut cache_creation_input_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(output_tokens, 3);
         assert_eq!(stop_reason, "end_turn");
 
@@ -552,14 +670,62 @@ mod tests {
             &mut cache_read_input_tokens,
             &mut cache_creation_input_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].done);
         assert_eq!(chunks[0].content, "hi");
         assert_eq!(chunks[0].input_tokens, 11);
         assert_eq!(chunks[0].output_tokens, 3);
         assert_eq!(chunks[0].stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn preserves_fragmented_interleaved_tool_uses() {
+        let mut content = String::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut cache_read_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
+        let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
+        let mut emitted_done = false;
+
+        for event in [
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_b","name":"write","input":{}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_a","name":"read","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"b.txt\"}"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.txt\"}"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ] {
+            let chunks = parse_anthropic_sse_event(
+                event,
+                &mut content,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut cache_read_input_tokens,
+                &mut cache_creation_input_tokens,
+                &mut stop_reason,
+                &mut tool_calls,
+                &mut emitted_done,
+            )
+            .unwrap();
+            if event.contains("message_stop") {
+                let terminal = chunks.into_iter().next().unwrap();
+                assert!(terminal.done);
+                assert_eq!(terminal.tool_calls.len(), 2);
+                assert_eq!(terminal.tool_calls[0].id, "call_a");
+                assert_eq!(terminal.tool_calls[0].name, "read");
+                assert_eq!(terminal.tool_calls[0].args, json!({"path":"a.txt"}));
+                assert_eq!(terminal.tool_calls[1].id, "call_b");
+                assert_eq!(terminal.tool_calls[1].name, "write");
+                assert_eq!(terminal.tool_calls[1].args, json!({"path":"b.txt"}));
+            }
+        }
     }
 
     #[test]

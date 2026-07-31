@@ -397,11 +397,6 @@ fn enforce_chat_capabilities(
         max_output_tokens: (request.max_tokens > 0).then_some(request.max_tokens as u64),
         ..Default::default()
     };
-    if streaming && !request.tools.is_empty() {
-        return Err(
-            "provider adapter cannot preserve tool calls in streaming responses".to_string(),
-        );
-    }
     let missing = requirements.unsupported_by(capabilities);
     if missing.is_empty() {
         Ok(())
@@ -443,14 +438,47 @@ pub fn resolve_with_registry(
     ollama_url: &str,
     native_url: Option<&str>,
 ) -> Result<Box<dyn Provider>, String> {
+    resolve_with_registry_and_provider_credential(
+        model,
+        registry,
+        registry_state_path,
+        anthropic_key,
+        openai_key,
+        ollama_url,
+        native_url,
+        None,
+    )
+}
+
+/// Resolve a provider while allowing a credential already selected by an
+/// authenticated server-side resolver to override process-wide provider keys.
+///
+/// The override is deliberately untyped secret material scoped to the provider
+/// selected by `model`; it is never returned by this module or attached to
+/// receipts and diagnostics.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_with_registry_and_provider_credential(
+    model: &str,
+    registry: &crate::provider_profile::ProviderRegistry,
+    registry_state_path: Option<&std::path::Path>,
+    anthropic_key: Option<&str>,
+    openai_key: Option<&str>,
+    ollama_url: &str,
+    native_url: Option<&str>,
+    provider_credential: Option<&str>,
+) -> Result<Box<dyn Provider>, String> {
     let resolved = registry.resolve_model(model)?;
     let inner: Box<dyn Provider> = match resolved.provider.as_str() {
         "anthropic" => {
-            let key = anthropic_key.ok_or("ANTHROPIC_API_KEY not set")?;
+            let key = provider_credential
+                .or(anthropic_key)
+                .ok_or("ANTHROPIC_API_KEY not set")?;
             Box::new(anthropic::Anthropic::new(key))
         }
         "openai" => {
-            let key = openai_key.ok_or("OPENAI_API_KEY not set")?;
+            let key = provider_credential
+                .or(openai_key)
+                .ok_or("OPENAI_API_KEY not set")?;
             Box::new(openai::OpenAI::new(key, None))
         }
         "ollama" => Box::new(openai::OpenAI::new("", Some(ollama_url))),
@@ -479,12 +507,14 @@ pub fn resolve_with_registry(
                 .endpoint
                 .api_key_env
                 .ok_or_else(|| format!("provider {:?} has no API key source", resolved.provider))?;
-            let key = std::env::var(&key_env)
+            let process_key = std::env::var(&key_env)
                 .ok()
-                .filter(|value| !value.trim().is_empty())
+                .filter(|value| !value.trim().is_empty());
+            let key = provider_credential
+                .or(process_key.as_deref())
                 .ok_or_else(|| format!("{key_env} not set"))?;
             let api_root = openai_compatible_api_root(&base_url);
-            Box::new(openai::OpenAI::new(&key, Some(api_root)))
+            Box::new(openai::OpenAI::new(key, Some(api_root)))
         }
         provider => return Err(format!("unsupported provider {provider:?}")),
     };
@@ -532,6 +562,38 @@ mod tests {
             openai_compatible_api_root("https://example.test/openai"),
             "https://example.test/openai"
         );
+    }
+
+    #[test]
+    fn authenticated_provider_credential_replaces_missing_process_key() {
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let provider = resolve_with_registry_and_provider_credential(
+            "openai/gpt-5.5",
+            &registry,
+            None,
+            None,
+            None,
+            "http://127.0.0.1:11434",
+            None,
+            Some("synthetic-tenant-key"),
+        );
+        assert!(provider.is_ok());
+
+        let missing = resolve_with_registry_and_provider_credential(
+            "openai/gpt-5.5",
+            &registry,
+            None,
+            None,
+            None,
+            "http://127.0.0.1:11434",
+            None,
+            None,
+        );
+        let missing = match missing {
+            Ok(_) => panic!("provider resolved without any credential"),
+            Err(error) => error,
+        };
+        assert_eq!(missing, "OPENAI_API_KEY not set");
     }
 
     struct CapturingProvider(Arc<Mutex<String>>);
@@ -605,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_provider_blocks_streaming_tools_before_contact() {
+    async fn resolved_provider_preserves_streaming_tools_through_default_adapter() {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
@@ -613,7 +675,7 @@ mod tests {
             canonical_model: "openai/gpt-5.5".into(),
             registry_state_path: None,
         };
-        let result = provider
+        let mut stream = provider
             .chat_stream(&ChatRequest {
                 model: "openai/gpt-5.5".into(),
                 system: String::new(),
@@ -626,14 +688,16 @@ mod tests {
                 max_tokens: 1,
                 prompt_cache: Default::default(),
             })
-            .await;
-        let error = match result {
-            Ok(_) => panic!("streaming tool call reached the provider"),
-            Err(error) => error,
-        };
+            .await
+            .expect("provider supports streaming tools");
+        let terminal = stream
+            .next()
+            .await
+            .expect("terminal chunk")
+            .expect("successful terminal chunk");
 
-        assert!(error.to_string().contains("tool calls"));
-        assert!(captured.lock().unwrap().is_empty());
+        assert!(terminal.done);
+        assert_eq!(*captured.lock().unwrap(), "gpt-5.5");
     }
 
     #[test]

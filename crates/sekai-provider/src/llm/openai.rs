@@ -6,6 +6,7 @@ use super::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub struct OpenAI {
     api_key: String,
@@ -134,6 +135,7 @@ impl Provider for OpenAI {
             let mut input_tokens = 0;
             let mut output_tokens = 0;
             let mut stop_reason = String::new();
+            let mut tool_calls = BTreeMap::new();
             let mut emitted_done = false;
             let mut received_bytes = 0usize;
 
@@ -158,35 +160,60 @@ impl Provider for OpenAI {
                 while let Some(index) = buffer.find("\n\n") {
                     let event = buffer[..index].to_string();
                     buffer = buffer[index + 2..].to_string();
-                    for chunk in parse_openai_sse_event(
+                    let parsed = parse_openai_sse_event(
                         &event,
                         &mut content,
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut stop_reason,
+                        &mut tool_calls,
                         &mut emitted_done,
-                    ) {
+                    );
+                    let chunks = match parsed {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    for chunk in chunks {
                         yield Ok(chunk);
                     }
                 }
             }
             if !buffer.trim().is_empty() {
-                for chunk in parse_openai_sse_event(
+                let parsed = parse_openai_sse_event(
                     &buffer,
                     &mut content,
                     &mut input_tokens,
                     &mut output_tokens,
                     &mut stop_reason,
+                    &mut tool_calls,
                     &mut emitted_done,
-                ) {
+                );
+                let chunks = match parsed {
+                    Ok(chunks) => chunks,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                for chunk in chunks {
                     yield Ok(chunk);
                 }
             }
             if !emitted_done {
+                let tool_calls = match completed_openai_tool_calls(&tool_calls) {
+                    Ok(tool_calls) => tool_calls,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 yield Ok(ChatStreamChunk {
                     content_delta: String::new(),
                     content,
-                    tool_calls: Vec::new(),
+                    tool_calls,
                     input_tokens,
                     output_tokens,
                     stop_reason,
@@ -276,23 +303,32 @@ fn chat_completions_body_with_sampling(
     body
 }
 
+#[derive(Debug, Default)]
+struct OpenAiToolCallAssembly {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 fn parse_openai_sse_event(
     event: &str,
     content: &mut String,
     input_tokens: &mut i32,
     output_tokens: &mut i32,
     stop_reason: &mut String,
+    tool_calls: &mut BTreeMap<u64, OpenAiToolCallAssembly>,
     emitted_done: &mut bool,
-) -> Vec<ChatStreamChunk> {
+) -> Result<Vec<ChatStreamChunk>, String> {
     let mut chunks = Vec::new();
     for data in event_data_values(event) {
         if data == "[DONE]" {
             if !*emitted_done {
                 *emitted_done = true;
+                let completed_tool_calls = completed_openai_tool_calls(tool_calls)?;
                 chunks.push(ChatStreamChunk {
                     content_delta: String::new(),
                     content: content.clone(),
-                    tool_calls: Vec::new(),
+                    tool_calls: completed_tool_calls,
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
                     stop_reason: stop_reason.clone(),
@@ -314,6 +350,23 @@ fn parse_openai_sse_event(
             if let Some(reason) = choice["finish_reason"].as_str() {
                 *stop_reason = reason.to_string();
             }
+            if let Some(deltas) = choice["delta"]["tool_calls"].as_array() {
+                for delta in deltas {
+                    let index = delta["index"]
+                        .as_u64()
+                        .ok_or_else(|| "openai tool-call delta omitted index".to_string())?;
+                    let assembly = tool_calls.entry(index).or_default();
+                    merge_openai_tool_call_field(&mut assembly.id, &delta["id"], "id")?;
+                    merge_openai_tool_call_field(
+                        &mut assembly.name,
+                        &delta["function"]["name"],
+                        "name",
+                    )?;
+                    if let Some(arguments) = delta["function"]["arguments"].as_str() {
+                        assembly.arguments.push_str(arguments);
+                    }
+                }
+            }
             if let Some(delta) = choice["delta"]["content"]
                 .as_str()
                 .filter(|delta| !delta.is_empty())
@@ -333,7 +386,47 @@ fn parse_openai_sse_event(
             }
         }
     }
-    chunks
+    Ok(chunks)
+}
+
+fn merge_openai_tool_call_field(
+    current: &mut String,
+    value: &Value,
+    field: &str,
+) -> Result<(), String> {
+    let Some(value) = value.as_str().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if !current.is_empty() && current != value {
+        return Err(format!("openai tool-call {field} changed during stream"));
+    }
+    current.clear();
+    current.push_str(value);
+    Ok(())
+}
+
+fn completed_openai_tool_calls(
+    tool_calls: &BTreeMap<u64, OpenAiToolCallAssembly>,
+) -> Result<Vec<ToolCall>, String> {
+    tool_calls
+        .values()
+        .map(|call| {
+            if call.id.is_empty() || call.name.is_empty() {
+                return Err("openai stream ended with incomplete tool-call identity".into());
+            }
+            let args = serde_json::from_str(if call.arguments.is_empty() {
+                "{}"
+            } else {
+                &call.arguments
+            })
+            .map_err(|_| "openai stream ended with invalid tool-call arguments".to_string())?;
+            Ok(ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args,
+            })
+        })
+        .collect()
 }
 
 fn event_data_values(event: &str) -> Vec<String> {
@@ -359,6 +452,8 @@ mod tests {
     use crate::llm::{ChatRequest, HttpTimeouts, Provider, SamplingOptions};
     use axum::Router;
     use axum::routing::post;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn test_timeouts() -> HttpTimeouts {
@@ -433,6 +528,7 @@ mod tests {
         let mut input_tokens = 0;
         let mut output_tokens = 0;
         let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
         let mut emitted_done = false;
 
         let chunks = parse_openai_sse_event(
@@ -441,8 +537,10 @@ mod tests {
             &mut input_tokens,
             &mut output_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content_delta, "hel");
         assert_eq!(chunks[0].content, "hel");
@@ -454,8 +552,10 @@ mod tests {
             &mut input_tokens,
             &mut output_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(chunks[0].content_delta, "lo");
         assert_eq!(chunks[0].content, "hello");
         assert_eq!(input_tokens, 7);
@@ -468,13 +568,53 @@ mod tests {
             &mut input_tokens,
             &mut output_tokens,
             &mut stop_reason,
+            &mut tool_calls,
             &mut emitted_done,
-        );
+        )
+        .unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].done);
         assert_eq!(chunks[0].content, "hello");
         assert_eq!(chunks[0].input_tokens, 7);
         assert_eq!(chunks[0].output_tokens, 5);
+    }
+
+    #[test]
+    fn preserves_fragmented_interleaved_tool_calls() {
+        let mut content = String::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
+        let mut emitted_done = false;
+
+        for event in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"write","arguments":"{\"path\":"}},{"index":0,"id":"call_a","function":{"name":"read","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}},{"index":1,"function":{"arguments":"\"b.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            let chunks = parse_openai_sse_event(
+                event,
+                &mut content,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut stop_reason,
+                &mut tool_calls,
+                &mut emitted_done,
+            )
+            .unwrap();
+            if event == "data: [DONE]" {
+                let terminal = chunks.into_iter().next().unwrap();
+                assert!(terminal.done);
+                assert_eq!(terminal.tool_calls.len(), 2);
+                assert_eq!(terminal.tool_calls[0].id, "call_a");
+                assert_eq!(terminal.tool_calls[0].name, "read");
+                assert_eq!(terminal.tool_calls[0].args, json!({"path":"a.txt"}));
+                assert_eq!(terminal.tool_calls[1].id, "call_b");
+                assert_eq!(terminal.tool_calls[1].name, "write");
+                assert_eq!(terminal.tool_calls[1].args, json!({"path":"b.txt"}));
+            }
+        }
     }
 
     #[tokio::test]
