@@ -1841,50 +1841,54 @@ async fn proxy_gateway(
     let span = tracing::info_span!("gateway.http", stage = "operation", otel.kind = "server",);
     crate::obs::otel::set_parent_from_headers(&span, &headers);
 
-    async move {
-        let identity_context = match resolve_identity(&headers, &state).await {
-            Ok(identity) => identity,
-            Err(err) => {
-                record_gateway_event(
-                    &state.config,
-                    "chisei-gateway",
-                    "gateway.auth_failed",
-                    err.reason(),
-                    "denied",
-                    err.evidence(&state.config),
-                )
-                .await;
-                let correlation = GatewayCorrelation::generated("unauthenticated");
-                let mut response = err.response();
-                correlation.apply_response_headers(&mut response);
-                return response;
-            }
-        };
-        let correlation_scope = gateway_correlation_scope(&identity_context.identity);
-        let correlation = match GatewayCorrelation::from_headers(&headers, &correlation_scope) {
-            Ok(correlation) => correlation,
-            Err(reason) => {
-                let correlation = GatewayCorrelation::generated(&correlation_scope);
-                let mut response =
-                    json_error(StatusCode::BAD_REQUEST, "invalid_correlation", &reason);
-                correlation.apply_response_headers(&mut response);
-                return response;
-            }
-        };
-        let mut response = proxy_gateway_inner(
-            state,
-            uri,
-            method,
-            headers,
-            request,
-            correlation.clone(),
-            identity_context,
-        )
-        .await;
-        correlation.apply_response_headers(&mut response);
-        response
-    }
-    .instrument(span)
+    // Keep the large operation future off the runtime stack before adding the
+    // tracing wrapper; otherwise the default Tokio stack can overflow.
+    Box::pin(
+        async move {
+            let identity_context = match resolve_identity(&headers, &state).await {
+                Ok(identity) => identity,
+                Err(err) => {
+                    record_gateway_event(
+                        &state.config,
+                        "chisei-gateway",
+                        "gateway.auth_failed",
+                        err.reason(),
+                        "denied",
+                        err.evidence(&state.config),
+                    )
+                    .await;
+                    let correlation = GatewayCorrelation::generated("unauthenticated");
+                    let mut response = err.response();
+                    correlation.apply_response_headers(&mut response);
+                    return response;
+                }
+            };
+            let correlation_scope = gateway_correlation_scope(&identity_context.identity);
+            let correlation = match GatewayCorrelation::from_headers(&headers, &correlation_scope) {
+                Ok(correlation) => correlation,
+                Err(reason) => {
+                    let correlation = GatewayCorrelation::generated(&correlation_scope);
+                    let mut response =
+                        json_error(StatusCode::BAD_REQUEST, "invalid_correlation", &reason);
+                    correlation.apply_response_headers(&mut response);
+                    return response;
+                }
+            };
+            let mut response = proxy_gateway_inner(
+                state,
+                uri,
+                method,
+                headers,
+                request,
+                correlation.clone(),
+                identity_context,
+            )
+            .await;
+            correlation.apply_response_headers(&mut response);
+            response
+        }
+        .instrument(span),
+    )
     .await
 }
 
