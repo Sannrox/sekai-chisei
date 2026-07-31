@@ -34,3 +34,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0009: Group expert `sekaictl` operations under `admin`](0009-sekaictl-administration-hierarchy.md)
 - [ADR 0010: Retire deprecated `sekaictl` aliases at `0.2.0`](0010-retire-sekaictl-aliases-at-0.2.0.md)
 - [ADR 0011: Separate invariant facts from configurable evaluation plans](0011-separate-invariant-facts-and-evaluation-plans.md)
+- [ADR 0012: Bound stochastic evaluation by situation](0012-bound-stochastic-evaluation-by-situation.md)

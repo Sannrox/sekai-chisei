@@ -380,21 +380,28 @@ fn require_enabled_plan_definitions_tx(
     transaction: &Transaction<'_>,
     plan: &EvaluationPlan,
 ) -> Result<(), String> {
-    let definition_ids = plan
-        .nodes
-        .iter()
-        .map(|node| node.evaluator_definition_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    for definition_id in definition_ids {
+    let mut definitions = std::collections::BTreeMap::new();
+    for node in &plan.nodes {
+        let definition_id = node.evaluator_definition_id.as_str();
+        if let Some(definition) = definitions.get(definition_id) {
+            require_stochastic_gate_eligibility(node, definition)?;
+            continue;
+        }
         let row = transaction
             .query_row(
-                "SELECT d.namespace, a.state
+                "SELECT d.namespace, a.state, d.body_json
                  FROM chisei_evaluator_definitions d
                  JOIN chisei_evaluator_availability a
                    ON a.definition_id=d.definition_id
                  WHERE d.definition_id=?1",
                 params![definition_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| error.to_string())?
@@ -405,6 +412,27 @@ fn require_enabled_plan_definitions_tx(
         if row.1 != AVAILABILITY_ENABLED {
             return Err("evaluator definition is unavailable for new plans".into());
         }
+        let definition = decode_definition(&row.2)?;
+        require_stochastic_gate_eligibility(node, &definition)?;
+        definitions.insert(definition_id, definition);
+    }
+    Ok(())
+}
+
+fn require_stochastic_gate_eligibility(
+    node: &crate::chisei::evaluation_plan::EvaluationPlanNode,
+    definition: &EvaluatorDefinition,
+) -> Result<(), String> {
+    if node.classification == crate::chisei::evaluation_plan::NODE_REQUIRED
+        && definition.execution_class == crate::chisei::evaluation_plan::STOCHASTIC_EXECUTION_CLASS
+        && !definition
+            .stochastic_policy
+            .as_ref()
+            .is_some_and(|policy| policy.gate_eligible)
+    {
+        return Err(
+            "required stochastic node needs an evaluator with explicit gate eligibility".into(),
+        );
     }
     Ok(())
 }
@@ -536,6 +564,7 @@ mod tests {
                 max_output_bytes: 100,
                 max_evidence_items: 1,
             },
+            stochastic_policy: None,
             source_ref: "repo://schema-check".into(),
             content_digest: String::new(),
             created_by: String::new(),

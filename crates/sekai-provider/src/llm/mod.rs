@@ -190,6 +190,13 @@ pub struct ChatRequest {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SamplingOptions {
+    pub temperature_millis: Option<u32>,
+    pub top_p_millionths: Option<u32>,
+    pub seed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PromptCacheIntent {
     pub enabled: bool,
     /// Messages before this index are stable conversation history. The
@@ -289,6 +296,19 @@ impl From<String> for ProviderError {
 pub trait Provider: Send + Sync {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String>;
 
+    /// Additive provider-neutral sampling path used by governed stochastic
+    /// evaluation. Existing callers and providers retain `chat` unchanged.
+    async fn chat_with_sampling(
+        &self,
+        req: &ChatRequest,
+        sampling: SamplingOptions,
+    ) -> Result<ChatResponse, String> {
+        if sampling != SamplingOptions::default() {
+            return Err("provider does not implement explicit sampling controls".into());
+        }
+        self.chat(req).await
+    }
+
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
         let resp = self.chat(req).await?;
         Ok(Box::pin(stream::once(async move {
@@ -307,12 +327,21 @@ struct ResolvedModelProvider {
 #[async_trait::async_trait]
 impl Provider for ResolvedModelProvider {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
+        self.chat_with_sampling(req, SamplingOptions::default())
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        req: &ChatRequest,
+        sampling: SamplingOptions,
+    ) -> Result<ChatResponse, String> {
         self.enforce_current_capabilities(req, false)
             .await
             .map_err(encode_provider_error)?;
         let mut request = req.clone();
         request.model.clone_from(&self.upstream_model);
-        self.inner.chat(&request).await
+        self.inner.chat_with_sampling(&request, sampling).await
     }
 
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
@@ -524,17 +553,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_provider_strips_canonical_namespace_before_upstream() {
+    async fn resolved_provider_strips_anthropic_route_prefix_before_upstream() {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
-            upstream_model: "gpt-5.5".into(),
-            canonical_model: "openai/gpt-5.5".into(),
+            upstream_model: "claude-sonnet-4-5".into(),
+            canonical_model: "anthropic/claude-sonnet-4-5".into(),
             registry_state_path: None,
         };
         provider
             .chat(&ChatRequest {
-                model: "openai/gpt-5.5".into(),
+                model: "anthropic/claude-sonnet-4-5".into(),
                 system: String::new(),
                 messages: Vec::new(),
                 tools: Vec::new(),
@@ -543,7 +572,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(*captured.lock().unwrap(), "gpt-5.5");
+        assert_eq!(*captured.lock().unwrap(), "claude-sonnet-4-5");
     }
 
     #[tokio::test]

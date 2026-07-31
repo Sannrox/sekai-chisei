@@ -1,14 +1,18 @@
-//! Deterministic execution contracts for resolved evaluation manifests.
+//! Bounded execution contracts for resolved evaluation manifests.
 //!
-//! Evaluators are compiled, operator-controlled implementations selected by
-//! exact digest. They receive a closed canonical input document and no ambient
-//! runtime capability object. This module performs no persistence, network,
-//! filesystem, clock, random, model, or action access.
+//! Deterministic evaluators are compiled, operator-controlled implementations
+//! selected by exact digest. Stochastic evaluators use a separate registry and
+//! only receive a frozen policy plus stable trial slot. Provider access remains
+//! behind that registered implementation; the execution engine itself receives
+//! no ambient provider, persistence, filesystem, or action capability.
 
 use crate::chisei::evaluation_manifest::{
     ResolvedEvaluationManifest, ResolvedEvaluationNode, ResolvedInvariantBinding,
 };
-use crate::chisei::evaluation_plan::{EvaluatorResourceLimits, FIXED_REDUCER, NODE_REQUIRED};
+use crate::chisei::evaluation_plan::{
+    EvaluatorResourceLimits, FIXED_REDUCER, NODE_REQUIRED, StochasticEvaluatorPolicy,
+};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,6 +29,10 @@ pub const EXECUTION_REQUEST_CONTRACT: &str = "chisei.evaluation-execution-reques
 pub const EXECUTOR_VERSION: &str = "chisei.deterministic-evaluation-executor/v1";
 pub const EVALUATOR_INPUT_CONTRACT: &str = "chisei.deterministic-evaluator-input/v1";
 pub const EVALUATOR_RESULT_CONTRACT: &str = "chisei.deterministic-evaluator-result/v1";
+pub const STOCHASTIC_TRIAL_INPUT_CONTRACT: &str = "chisei.stochastic-trial-input/v1";
+pub const STOCHASTIC_TRIAL_RESULT_CONTRACT: &str =
+    crate::chisei::evaluation_plan::STOCHASTIC_RESULT_SCHEMA;
+pub const STOCHASTIC_STEP_EVIDENCE_CONTRACT: &str = "chisei.stochastic-step-evidence/v1";
 pub const STEP_RECEIPT_CONTRACT: &str = "chisei.evaluation-step-receipt/v1";
 pub const GATE_DECISION_CONTRACT: &str = "chisei.evaluation-gate-decision/v1";
 pub const EXECUTION_OPERATION_CLASS: &str = "evaluation_manifest_execution";
@@ -62,6 +70,14 @@ pub const REASON_EVIDENCE_UNAVAILABLE: &str = "evidence_unavailable";
 pub const REASON_DEPENDENCY_BLOCKED: &str = "dependency_blocked";
 pub const REASON_EXECUTION_CANCELLED: &str = "execution_cancelled";
 pub const REASON_TOTAL_BUDGET: &str = "total_budget_exhausted";
+pub const REASON_STOCHASTIC_PROVIDER_UNAVAILABLE: &str = "stochastic_provider_unavailable";
+pub const REASON_STOCHASTIC_REFUSAL: &str = "stochastic_provider_refusal";
+pub const REASON_STOCHASTIC_SCHEMA_INVALID: &str = "stochastic_result_schema_invalid";
+pub const REASON_STOCHASTIC_POPULATION_INCOMPLETE: &str = "stochastic_population_incomplete";
+pub const REASON_STOCHASTIC_ACCEPTED: &str = "stochastic_acceptance_rule_satisfied";
+pub const REASON_STOCHASTIC_REJECTED: &str = "stochastic_acceptance_rule_not_satisfied";
+pub const REASON_STOCHASTIC_TOKEN_BUDGET: &str = "stochastic_token_budget_exhausted";
+pub const REASON_STOCHASTIC_EGRESS_DENIED: &str = "stochastic_egress_denied";
 
 pub const DEFAULT_TOTAL_DURATION_MS: u64 = 60_000;
 pub const MAX_TOTAL_DURATION_MS: u64 = 300_000;
@@ -120,11 +136,93 @@ pub struct DeterministicEvaluatorOutput {
     pub result: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StochasticTrialInput {
+    pub contract_version: String,
+    pub base: DeterministicEvaluatorInput,
+    pub policy: StochasticEvaluatorPolicy,
+    pub trial_index: u32,
+    pub seed: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StochasticTrialOutput {
+    pub contract_version: String,
+    pub passed: bool,
+    pub score_micros: u32,
+    pub reason_code: String,
+    pub result: Value,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StochasticTrialError {
+    Retryable,
+    ProviderUnavailable,
+    TokenBudgetExceeded,
+    Refusal {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    SchemaInvalid {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+}
+
+#[async_trait::async_trait]
+pub trait StochasticEvaluator: Send + Sync + 'static {
+    async fn evaluate_trial(
+        &self,
+        input: &StochasticTrialInput,
+    ) -> Result<StochasticTrialOutput, StochasticTrialError>;
+}
+
 pub trait DeterministicEvaluator: Send + Sync + 'static {
     fn evaluate(
         &self,
         input: &DeterministicEvaluatorInput,
     ) -> Result<DeterministicEvaluatorOutput, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StochasticTrialEvidence {
+    pub trial_index: u32,
+    pub seed: i64,
+    pub attempt_count: u32,
+    pub status: String,
+    pub reason_code: String,
+    pub score_micros: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub retry_accounted_tokens: u32,
+    pub result_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StochasticStepEvidence {
+    pub contract_version: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_profile: String,
+    pub prompt_profile_digest: String,
+    pub result_schema: String,
+    pub trial_count: u32,
+    pub aggregation_rule: String,
+    pub minimum_mean_score_micros: u32,
+    pub minimum_pass_rate_basis_points: u32,
+    pub maximum_score_variance_micros_squared: u64,
+    pub gate_eligible: bool,
+    pub completed_trial_count: u32,
+    pub mean_score_micros: u32,
+    pub pass_rate_basis_points: u32,
+    pub score_variance_micros_squared: u64,
+    pub total_input_tokens: u32,
+    pub total_output_tokens: u32,
+    pub total_retry_accounted_tokens: u32,
+    pub trials: Vec<StochasticTrialEvidence>,
+    pub aggregate_digest: String,
 }
 
 #[derive(Debug)]
@@ -320,6 +418,133 @@ impl DeterministicEvaluatorRegistry {
     }
 }
 
+#[derive(Clone)]
+pub struct StochasticEvaluatorRegistry {
+    implementations: Arc<RwLock<BTreeMap<String, RegisteredStochasticEvaluator>>>,
+    thread_capacity: Arc<EvaluatorThreadCapacity>,
+}
+
+#[derive(Clone)]
+struct RegisteredStochasticEvaluator {
+    evaluator: Arc<dyn StochasticEvaluator>,
+    metrics_evaluator: &'static str,
+    metrics_version: &'static str,
+}
+
+impl Default for StochasticEvaluatorRegistry {
+    fn default() -> Self {
+        Self::with_thread_capacity(DEFAULT_EVALUATOR_THREAD_CAPACITY)
+            .expect("default stochastic evaluator thread capacity is valid")
+    }
+}
+
+impl std::fmt::Debug for StochasticEvaluatorRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .implementations
+            .read()
+            .map(|implementations| implementations.len())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("StochasticEvaluatorRegistry")
+            .field("implementation_count", &count)
+            .finish()
+    }
+}
+
+impl StochasticEvaluatorRegistry {
+    pub fn with_thread_capacity(thread_capacity: usize) -> Result<Self, String> {
+        if thread_capacity == 0 || thread_capacity > MAX_EVALUATOR_THREAD_CAPACITY {
+            return Err(format!(
+                "stochastic evaluator thread capacity must be between 1 and {MAX_EVALUATOR_THREAD_CAPACITY}"
+            ));
+        }
+        Ok(Self {
+            implementations: Arc::new(RwLock::new(BTreeMap::new())),
+            thread_capacity: Arc::new(EvaluatorThreadCapacity {
+                limit: thread_capacity,
+                active: Mutex::new(0),
+            }),
+        })
+    }
+
+    pub fn register(
+        &self,
+        implementation_digest: &str,
+        evaluator: Arc<dyn StochasticEvaluator>,
+    ) -> Result<(), String> {
+        self.register_with_metrics(implementation_digest, "custom_stochastic", "v1", evaluator)
+    }
+
+    pub fn register_with_metrics(
+        &self,
+        implementation_digest: &str,
+        metrics_evaluator: &'static str,
+        metrics_version: &'static str,
+        evaluator: Arc<dyn StochasticEvaluator>,
+    ) -> Result<(), String> {
+        validate_digest("implementation_digest", implementation_digest)?;
+        validate_metrics_label("metrics_evaluator", metrics_evaluator)?;
+        validate_metrics_label("metrics_version", metrics_version)?;
+        let mut implementations = self
+            .implementations
+            .write()
+            .map_err(|_| "stochastic evaluator registry lock poisoned".to_string())?;
+        if implementations.contains_key(implementation_digest) {
+            return Err("stochastic evaluator implementation digest already registered".into());
+        }
+        implementations.insert(
+            implementation_digest.to_string(),
+            RegisteredStochasticEvaluator {
+                evaluator,
+                metrics_evaluator,
+                metrics_version,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn contains(&self, implementation_digest: &str) -> bool {
+        self.implementations
+            .read()
+            .is_ok_and(|implementations| implementations.contains_key(implementation_digest))
+    }
+
+    pub fn metric_labels(&self, implementation_digest: &str) -> (&'static str, &'static str) {
+        self.implementations
+            .read()
+            .ok()
+            .and_then(|implementations| {
+                implementations
+                    .get(implementation_digest)
+                    .map(|entry| (entry.metrics_evaluator, entry.metrics_version))
+            })
+            .unwrap_or(("unregistered_stochastic", "unknown"))
+    }
+
+    fn get(&self, implementation_digest: &str) -> Option<Arc<dyn StochasticEvaluator>> {
+        self.implementations
+            .read()
+            .ok()
+            .and_then(|implementations| {
+                implementations
+                    .get(implementation_digest)
+                    .map(|entry| entry.evaluator.clone())
+            })
+    }
+
+    fn try_acquire_thread(&self) -> Option<EvaluatorThreadPermit> {
+        let mut active = self.thread_capacity.active.lock().ok()?;
+        if *active >= self.thread_capacity.limit {
+            return None;
+        }
+        *active += 1;
+        Some(EvaluatorThreadPermit {
+            capacity: self.thread_capacity.clone(),
+        })
+    }
+}
+
 pub fn production_evaluator_registry() -> Result<DeterministicEvaluatorRegistry, String> {
     let registry = DeterministicEvaluatorRegistry::default();
     registry.register_with_metrics(
@@ -356,6 +581,8 @@ pub struct EvaluationStepReceipt {
     pub evidence_digests: Vec<String>,
     pub dependency_result_digests: Vec<String>,
     pub result_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stochastic_evidence: Option<StochasticStepEvidence>,
     pub step_receipt_digest: String,
 }
 
@@ -546,6 +773,9 @@ pub fn execute_registered_node(
     remaining_total: Duration,
     cancelled: Arc<AtomicBool>,
 ) -> Result<NodeExecution, String> {
+    if node.evaluator.stochastic_policy.is_some() {
+        return Err("stochastic node cannot execute through the deterministic registry".into());
+    }
     let input_validation = validate_input(manifest, node, &input, limits);
     let input_digest = digest_json(&input)?;
     let parameters_digest = digest_json(&input.parameters)?;
@@ -763,6 +993,738 @@ pub fn execute_registered_node(
     }
 }
 
+pub fn execute_stochastic_node(
+    registry: &StochasticEvaluatorRegistry,
+    manifest: &ResolvedEvaluationManifest,
+    node: &ResolvedEvaluationNode,
+    input: DeterministicEvaluatorInput,
+    limits: &EvaluatorResourceLimits,
+    remaining_total: Duration,
+    cancelled: Arc<AtomicBool>,
+) -> Result<NodeExecution, String> {
+    let policy = node
+        .evaluator
+        .stochastic_policy
+        .as_ref()
+        .ok_or_else(|| "stochastic node lacks frozen policy".to_string())?;
+    crate::chisei::evaluation_plan::validate_stochastic_policy(
+        policy,
+        std::slice::from_ref(&policy.result_schema),
+    )?;
+    let input_validation = validate_input(manifest, node, &input, limits);
+    let input_digest = digest_json(&input)?;
+    let parameters_digest = digest_json(&input.parameters)?;
+    let evidence_digests = input
+        .evidence
+        .iter()
+        .map(|evidence| evidence.content_digest.clone())
+        .collect::<Vec<_>>();
+    let dependency_result_digests = input
+        .dependency_results
+        .iter()
+        .map(|dependency| dependency.result_digest.clone())
+        .collect::<Vec<_>>();
+    if let Err(reason) = input_validation {
+        return make_framework_step(
+            manifest,
+            node,
+            STATUS_ERROR,
+            &reason,
+            input_digest,
+            parameters_digest,
+            evidence_digests,
+            dependency_result_digests,
+            Value::Null,
+            Duration::ZERO,
+        );
+    }
+    let Some(evaluator) = registry.get(&node.evaluator.implementation_digest) else {
+        return make_framework_step(
+            manifest,
+            node,
+            STATUS_UNAVAILABLE,
+            REASON_EVALUATOR_UNAVAILABLE,
+            input_digest,
+            parameters_digest,
+            evidence_digests,
+            dependency_result_digests,
+            Value::Null,
+            Duration::ZERO,
+        );
+    };
+    if remaining_total.is_zero() {
+        return make_framework_step(
+            manifest,
+            node,
+            STATUS_UNAVAILABLE,
+            REASON_TOTAL_BUDGET,
+            input_digest,
+            parameters_digest,
+            evidence_digests,
+            dependency_result_digests,
+            Value::Null,
+            Duration::ZERO,
+        );
+    }
+
+    let started = Instant::now();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("start stochastic evaluator runtime: {error}"))?;
+    let mut trials = Vec::with_capacity(policy.trial_count as usize);
+    let mut terminal_failure = false;
+    let mut total_tokens = 0u64;
+    for trial_index in 0..policy.trial_count {
+        let seed = stochastic_seed(policy, trial_index)?;
+        if terminal_failure {
+            trials.push(stochastic_failure_evidence(
+                trial_index,
+                seed,
+                0,
+                STATUS_SKIPPED,
+                REASON_STOCHASTIC_POPULATION_INCOMPLETE,
+                0,
+            )?);
+            continue;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            terminal_failure = true;
+            trials.push(stochastic_failure_evidence(
+                trial_index,
+                seed,
+                0,
+                STATUS_SKIPPED,
+                REASON_EXECUTION_CANCELLED,
+                0,
+            )?);
+            continue;
+        }
+        let mut final_trial = None;
+        let mut retry_accounted_tokens = 0u32;
+        for attempt in 1..=(policy.max_retries_per_trial + 1) {
+            let elapsed = started.elapsed();
+            let remaining = remaining_total.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                final_trial = Some(stochastic_failure_evidence(
+                    trial_index,
+                    seed,
+                    attempt,
+                    STATUS_UNAVAILABLE,
+                    REASON_TOTAL_BUDGET,
+                    retry_accounted_tokens,
+                )?);
+                break;
+            }
+            let Some(evaluator_permit) = registry.try_acquire_thread() else {
+                final_trial = Some(stochastic_failure_evidence(
+                    trial_index,
+                    seed,
+                    attempt,
+                    STATUS_UNAVAILABLE,
+                    REASON_EVALUATOR_CAPACITY,
+                    retry_accounted_tokens,
+                )?);
+                break;
+            };
+            let trial_input = StochasticTrialInput {
+                contract_version: STOCHASTIC_TRIAL_INPUT_CONTRACT.into(),
+                base: input.clone(),
+                policy: policy.clone(),
+                trial_index,
+                seed,
+            };
+            let evaluator = evaluator.clone();
+            let attempt_budget = remaining.min(Duration::from_millis(limits.timeout_ms.max(1)));
+            let evaluation =
+                AssertUnwindSafe(evaluator.evaluate_trial(&trial_input)).catch_unwind();
+            let received = runtime.block_on(async {
+                tokio::select! {
+                    result = evaluation => Some(Some(result)),
+                    _ = tokio::time::sleep(attempt_budget) => Some(None),
+                    _ = async {
+                        while !cancelled.load(Ordering::Acquire) {
+                            tokio::time::sleep(Duration::from_millis(CANCELLATION_POLL_MS)).await;
+                        }
+                    } => None,
+                }
+            });
+            drop(evaluator_permit);
+            match received {
+                None => {
+                    final_trial = Some(stochastic_failure_evidence(
+                        trial_index,
+                        seed,
+                        attempt,
+                        STATUS_SKIPPED,
+                        REASON_EXECUTION_CANCELLED,
+                        retry_accounted_tokens,
+                    )?);
+                    break;
+                }
+                Some(None) => {
+                    final_trial = Some(stochastic_failure_evidence(
+                        trial_index,
+                        seed,
+                        attempt,
+                        STATUS_UNAVAILABLE,
+                        REASON_EVALUATOR_TIMEOUT,
+                        retry_accounted_tokens,
+                    )?);
+                    break;
+                }
+                Some(Some(Err(_))) => {
+                    final_trial = Some(stochastic_failure_evidence(
+                        trial_index,
+                        seed,
+                        attempt,
+                        STATUS_ERROR,
+                        REASON_EVALUATOR_PANIC,
+                        retry_accounted_tokens,
+                    )?);
+                    break;
+                }
+                Some(Some(Ok(Err(StochasticTrialError::Retryable)))) => {
+                    retry_accounted_tokens =
+                        retry_accounted_tokens.saturating_add(policy.max_tokens_per_trial);
+                    total_tokens =
+                        total_tokens.saturating_add(u64::from(policy.max_tokens_per_trial));
+                    if total_tokens > u64::from(policy.max_total_tokens) {
+                        final_trial = Some(stochastic_failure_evidence(
+                            trial_index,
+                            seed,
+                            attempt,
+                            STATUS_UNAVAILABLE,
+                            REASON_STOCHASTIC_TOKEN_BUDGET,
+                            retry_accounted_tokens,
+                        )?);
+                        break;
+                    }
+                    if attempt <= policy.max_retries_per_trial {
+                        continue;
+                    }
+                    final_trial = Some(stochastic_failure_evidence(
+                        trial_index,
+                        seed,
+                        attempt,
+                        STATUS_UNAVAILABLE,
+                        REASON_STOCHASTIC_PROVIDER_UNAVAILABLE,
+                        retry_accounted_tokens,
+                    )?);
+                    break;
+                }
+                Some(Some(Ok(Err(error)))) => {
+                    let (status, reason) = stochastic_error_status(&error);
+                    let (input_tokens, output_tokens) = stochastic_error_tokens(&error);
+                    total_tokens = total_tokens
+                        .saturating_add(u64::from(input_tokens))
+                        .saturating_add(u64::from(output_tokens));
+                    if total_tokens > u64::from(policy.max_total_tokens) {
+                        final_trial = Some(stochastic_failure_evidence_with_usage(
+                            trial_index,
+                            seed,
+                            attempt,
+                            STATUS_UNAVAILABLE,
+                            REASON_STOCHASTIC_TOKEN_BUDGET,
+                            input_tokens,
+                            output_tokens,
+                            retry_accounted_tokens,
+                        )?);
+                        break;
+                    }
+                    final_trial = Some(stochastic_failure_evidence_with_usage(
+                        trial_index,
+                        seed,
+                        attempt,
+                        status,
+                        reason,
+                        input_tokens,
+                        output_tokens,
+                        retry_accounted_tokens,
+                    )?);
+                    break;
+                }
+                Some(Some(Ok(Ok(output)))) => {
+                    let output_input_tokens = output.input_tokens;
+                    let output_output_tokens = output.output_tokens;
+                    let output = match validate_stochastic_output(output, policy, limits) {
+                        Ok(output) => output,
+                        Err(reason) => {
+                            total_tokens = total_tokens
+                                .saturating_add(u64::from(output_input_tokens))
+                                .saturating_add(u64::from(output_output_tokens));
+                            let (status, reason) =
+                                if total_tokens > u64::from(policy.max_total_tokens) {
+                                    (STATUS_UNAVAILABLE, REASON_STOCHASTIC_TOKEN_BUDGET)
+                                } else {
+                                    (STATUS_ERROR, reason)
+                                };
+                            final_trial = Some(stochastic_failure_evidence_with_usage(
+                                trial_index,
+                                seed,
+                                attempt,
+                                status,
+                                reason,
+                                output_input_tokens,
+                                output_output_tokens,
+                                retry_accounted_tokens,
+                            )?);
+                            break;
+                        }
+                    };
+                    total_tokens = total_tokens
+                        .saturating_add(u64::from(output.input_tokens))
+                        .saturating_add(u64::from(output.output_tokens));
+                    if total_tokens > u64::from(policy.max_total_tokens) {
+                        final_trial = Some(stochastic_failure_evidence(
+                            trial_index,
+                            seed,
+                            attempt,
+                            STATUS_UNAVAILABLE,
+                            REASON_STOCHASTIC_TOKEN_BUDGET,
+                            retry_accounted_tokens,
+                        )?);
+                        break;
+                    }
+                    final_trial = Some(stochastic_success_evidence(
+                        trial_index,
+                        seed,
+                        attempt,
+                        retry_accounted_tokens,
+                        output,
+                    )?);
+                    break;
+                }
+            }
+        }
+        let trial = final_trial.ok_or_else(|| "stochastic trial did not terminate".to_string())?;
+        if !matches!(trial.status.as_str(), STATUS_PASS | STATUS_FAIL) {
+            terminal_failure = true;
+        }
+        trials.push(trial);
+    }
+
+    let aggregate = derive_stochastic_aggregate(policy, &trials);
+    let mut stochastic = StochasticStepEvidence {
+        contract_version: STOCHASTIC_STEP_EVIDENCE_CONTRACT.into(),
+        provider: policy.provider.clone(),
+        model: policy.model.clone(),
+        prompt_profile: policy.prompt_profile.clone(),
+        prompt_profile_digest: policy.prompt_profile_digest.clone(),
+        result_schema: policy.result_schema.clone(),
+        trial_count: policy.trial_count,
+        aggregation_rule: policy.aggregation_rule.clone(),
+        minimum_mean_score_micros: policy.minimum_mean_score_micros,
+        minimum_pass_rate_basis_points: policy.minimum_pass_rate_basis_points,
+        maximum_score_variance_micros_squared: policy.maximum_score_variance_micros_squared,
+        gate_eligible: policy.gate_eligible,
+        completed_trial_count: aggregate.completed_trial_count,
+        mean_score_micros: aggregate.mean_score_micros,
+        pass_rate_basis_points: aggregate.pass_rate_basis_points,
+        score_variance_micros_squared: aggregate.score_variance_micros_squared,
+        total_input_tokens: aggregate.total_input_tokens,
+        total_output_tokens: aggregate.total_output_tokens,
+        total_retry_accounted_tokens: aggregate.total_retry_accounted_tokens,
+        trials,
+        aggregate_digest: String::new(),
+    };
+    stochastic.aggregate_digest = stochastic_aggregate_digest(&stochastic)?;
+    let aggregate_result = serde_json::json!({
+        "aggregate_digest": stochastic.aggregate_digest,
+        "accepted": aggregate.accepted,
+        "completed_trial_count": aggregate.completed_trial_count,
+        "mean_score_micros": aggregate.mean_score_micros,
+        "pass_rate_basis_points": aggregate.pass_rate_basis_points,
+        "score_variance_micros_squared": aggregate.score_variance_micros_squared,
+    });
+    let mut execution = make_framework_step(
+        manifest,
+        node,
+        &aggregate.status,
+        &aggregate.reason_code,
+        input_digest,
+        parameters_digest,
+        evidence_digests,
+        dependency_result_digests,
+        aggregate_result,
+        started.elapsed(),
+    )?;
+    execution.receipt.stochastic_evidence = Some(stochastic);
+    execution.receipt.step_receipt_digest = step_receipt_digest(&execution.receipt)?;
+    ensure_document_size(
+        &execution.receipt,
+        "stochastic evaluation step receipt",
+        MAX_EXECUTION_DOCUMENT_BYTES,
+    )?;
+    Ok(execution)
+}
+
+fn stochastic_seed(policy: &StochasticEvaluatorPolicy, trial_index: u32) -> Result<i64, String> {
+    if policy.seed_supported {
+        policy
+            .base_seed
+            .checked_add(i64::from(trial_index))
+            .ok_or_else(|| "stochastic seed range overflowed".to_string())
+    } else {
+        Ok(0)
+    }
+}
+
+fn stochastic_error_status(error: &StochasticTrialError) -> (&'static str, &'static str) {
+    match error {
+        StochasticTrialError::Retryable | StochasticTrialError::ProviderUnavailable => {
+            (STATUS_UNAVAILABLE, REASON_STOCHASTIC_PROVIDER_UNAVAILABLE)
+        }
+        StochasticTrialError::TokenBudgetExceeded => {
+            (STATUS_UNAVAILABLE, REASON_STOCHASTIC_TOKEN_BUDGET)
+        }
+        StochasticTrialError::Refusal { .. } => (STATUS_UNKNOWN, REASON_STOCHASTIC_REFUSAL),
+        StochasticTrialError::SchemaInvalid { .. } => {
+            (STATUS_ERROR, REASON_STOCHASTIC_SCHEMA_INVALID)
+        }
+    }
+}
+
+fn stochastic_error_tokens(error: &StochasticTrialError) -> (u32, u32) {
+    match error {
+        StochasticTrialError::Refusal {
+            input_tokens,
+            output_tokens,
+        }
+        | StochasticTrialError::SchemaInvalid {
+            input_tokens,
+            output_tokens,
+        } => (*input_tokens, *output_tokens),
+        _ => (0, 0),
+    }
+}
+
+fn stochastic_failure_evidence(
+    trial_index: u32,
+    seed: i64,
+    attempt_count: u32,
+    status: &str,
+    reason_code: &str,
+    retry_accounted_tokens: u32,
+) -> Result<StochasticTrialEvidence, String> {
+    stochastic_failure_evidence_with_usage(
+        trial_index,
+        seed,
+        attempt_count,
+        status,
+        reason_code,
+        0,
+        0,
+        retry_accounted_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stochastic_failure_evidence_with_usage(
+    trial_index: u32,
+    seed: i64,
+    attempt_count: u32,
+    status: &str,
+    reason_code: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    retry_accounted_tokens: u32,
+) -> Result<StochasticTrialEvidence, String> {
+    let result_digest = digest_json(&(
+        STOCHASTIC_TRIAL_RESULT_CONTRACT,
+        trial_index,
+        seed,
+        attempt_count,
+        status,
+        reason_code,
+        0u32,
+        input_tokens,
+        output_tokens,
+        retry_accounted_tokens,
+    ))?;
+    Ok(StochasticTrialEvidence {
+        trial_index,
+        seed,
+        attempt_count,
+        status: status.into(),
+        reason_code: reason_code.into(),
+        score_micros: 0,
+        input_tokens,
+        output_tokens,
+        retry_accounted_tokens,
+        result_digest,
+    })
+}
+
+fn stochastic_success_evidence(
+    trial_index: u32,
+    seed: i64,
+    attempt_count: u32,
+    retry_accounted_tokens: u32,
+    output: StochasticTrialOutput,
+) -> Result<StochasticTrialEvidence, String> {
+    let status = if output.passed {
+        STATUS_PASS
+    } else {
+        STATUS_FAIL
+    };
+    let result_digest = digest_json(&(
+        STOCHASTIC_TRIAL_RESULT_CONTRACT,
+        trial_index,
+        seed,
+        attempt_count,
+        status,
+        output.reason_code.as_str(),
+        output.score_micros,
+        output.input_tokens,
+        output.output_tokens,
+        retry_accounted_tokens,
+        &output.result,
+    ))?;
+    Ok(StochasticTrialEvidence {
+        trial_index,
+        seed,
+        attempt_count,
+        status: status.into(),
+        reason_code: output.reason_code,
+        score_micros: output.score_micros,
+        input_tokens: output.input_tokens,
+        output_tokens: output.output_tokens,
+        retry_accounted_tokens,
+        result_digest,
+    })
+}
+
+fn validate_stochastic_output(
+    mut output: StochasticTrialOutput,
+    policy: &StochasticEvaluatorPolicy,
+    limits: &EvaluatorResourceLimits,
+) -> Result<StochasticTrialOutput, &'static str> {
+    if output.contract_version != STOCHASTIC_TRIAL_RESULT_CONTRACT
+        || output.score_micros > 1_000_000
+        || validate_reason_code(&output.reason_code).is_err()
+        || output.input_tokens.saturating_add(output.output_tokens) > policy.max_tokens_per_trial
+    {
+        return Err(REASON_STOCHASTIC_SCHEMA_INVALID);
+    }
+    canonicalize_value(&mut output.result);
+    let bytes = serde_json::to_vec(&output).map_err(|_| REASON_STOCHASTIC_SCHEMA_INVALID)?;
+    let limit = usize::try_from(limits.max_output_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_RESULT_BYTES);
+    if bytes.len() > limit {
+        return Err(REASON_OUTPUT_LIMIT);
+    }
+    Ok(output)
+}
+
+fn stochastic_aggregate_digest(evidence: &StochasticStepEvidence) -> Result<String, String> {
+    let mut canonical = evidence.clone();
+    canonical.aggregate_digest.clear();
+    digest_json(&canonical)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DerivedStochasticAggregate {
+    completed_trial_count: u32,
+    mean_score_micros: u32,
+    pass_rate_basis_points: u32,
+    score_variance_micros_squared: u64,
+    total_input_tokens: u32,
+    total_output_tokens: u32,
+    total_retry_accounted_tokens: u32,
+    accepted: bool,
+    status: String,
+    reason_code: String,
+}
+
+fn derive_stochastic_aggregate(
+    policy: &StochasticEvaluatorPolicy,
+    trials: &[StochasticTrialEvidence],
+) -> DerivedStochasticAggregate {
+    let completed = trials
+        .iter()
+        .filter(|trial| matches!(trial.status.as_str(), STATUS_PASS | STATUS_FAIL))
+        .collect::<Vec<_>>();
+    let completed_trial_count = completed.len() as u32;
+    let score_sum = completed
+        .iter()
+        .map(|trial| u128::from(trial.score_micros))
+        .sum::<u128>();
+    let mean_score_micros = if completed.is_empty() {
+        0
+    } else {
+        (score_sum / completed.len() as u128) as u32
+    };
+    let pass_count = completed
+        .iter()
+        .filter(|trial| trial.status == STATUS_PASS)
+        .count() as u128;
+    let pass_rate_basis_points = if completed.is_empty() {
+        0
+    } else {
+        ((pass_count * 10_000) / completed.len() as u128) as u32
+    };
+    let variance = if completed.is_empty() {
+        0
+    } else {
+        completed
+            .iter()
+            .map(|trial| {
+                let delta = i128::from(trial.score_micros) - i128::from(mean_score_micros);
+                (delta * delta) as u128
+            })
+            .sum::<u128>()
+            / completed.len() as u128
+    };
+    let score_variance_micros_squared = u64::try_from(variance).unwrap_or(u64::MAX);
+    let total_input_tokens = trials
+        .iter()
+        .map(|trial| u64::from(trial.input_tokens))
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32;
+    let total_output_tokens = trials
+        .iter()
+        .map(|trial| u64::from(trial.output_tokens))
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32;
+    let total_retry_accounted_tokens = trials
+        .iter()
+        .map(|trial| u64::from(trial.retry_accounted_tokens))
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32;
+    let complete_population = completed_trial_count == policy.trial_count;
+    let accepted = complete_population
+        && mean_score_micros >= policy.minimum_mean_score_micros
+        && pass_rate_basis_points >= policy.minimum_pass_rate_basis_points
+        && score_variance_micros_squared <= policy.maximum_score_variance_micros_squared;
+    let (status, reason_code) = if complete_population && accepted {
+        (STATUS_PASS, REASON_STOCHASTIC_ACCEPTED)
+    } else if complete_population {
+        (STATUS_FAIL, REASON_STOCHASTIC_REJECTED)
+    } else {
+        trials
+            .iter()
+            .find(|trial| !matches!(trial.status.as_str(), STATUS_PASS | STATUS_FAIL))
+            .map(|trial| (trial.status.as_str(), trial.reason_code.as_str()))
+            .unwrap_or((STATUS_UNAVAILABLE, REASON_STOCHASTIC_POPULATION_INCOMPLETE))
+    };
+    DerivedStochasticAggregate {
+        completed_trial_count,
+        mean_score_micros,
+        pass_rate_basis_points,
+        score_variance_micros_squared,
+        total_input_tokens,
+        total_output_tokens,
+        total_retry_accounted_tokens,
+        accepted,
+        status: status.into(),
+        reason_code: reason_code.into(),
+    }
+}
+
+fn validate_stochastic_step_evidence(
+    node: &ResolvedEvaluationNode,
+    evidence: &StochasticStepEvidence,
+    step_status: &str,
+    step_reason_code: &str,
+    step_result_digest: &str,
+) -> Result<(), String> {
+    let policy = node
+        .evaluator
+        .stochastic_policy
+        .as_ref()
+        .ok_or_else(|| "stochastic evidence has no frozen policy".to_string())?;
+    if evidence.contract_version != STOCHASTIC_STEP_EVIDENCE_CONTRACT
+        || evidence.provider != policy.provider
+        || evidence.model != policy.model
+        || evidence.prompt_profile != policy.prompt_profile
+        || evidence.prompt_profile_digest != policy.prompt_profile_digest
+        || evidence.result_schema != policy.result_schema
+        || evidence.trial_count != policy.trial_count
+        || evidence.aggregation_rule != policy.aggregation_rule
+        || evidence.minimum_mean_score_micros != policy.minimum_mean_score_micros
+        || evidence.minimum_pass_rate_basis_points != policy.minimum_pass_rate_basis_points
+        || evidence.maximum_score_variance_micros_squared
+            != policy.maximum_score_variance_micros_squared
+        || evidence.gate_eligible != policy.gate_eligible
+        || evidence.trials.len() != policy.trial_count as usize
+    {
+        return Err("stochastic step evidence does not match the frozen policy".into());
+    }
+    for (expected, trial) in evidence.trials.iter().enumerate() {
+        if trial.trial_index != expected as u32
+            || trial.seed != stochastic_seed(policy, expected as u32)?
+            || trial.attempt_count > policy.max_retries_per_trial + 1
+            || !matches!(
+                trial.status.as_str(),
+                STATUS_PASS
+                    | STATUS_FAIL
+                    | STATUS_UNKNOWN
+                    | STATUS_UNAVAILABLE
+                    | STATUS_ERROR
+                    | STATUS_SKIPPED
+            )
+        {
+            return Err("stochastic trial evidence is invalid".into());
+        }
+        let completed = matches!(trial.status.as_str(), STATUS_PASS | STATUS_FAIL);
+        if (completed && trial.attempt_count == 0)
+            || trial.score_micros > 1_000_000
+            || trial.input_tokens.saturating_add(trial.output_tokens) > policy.max_tokens_per_trial
+            || trial.retry_accounted_tokens % policy.max_tokens_per_trial != 0
+            || trial.retry_accounted_tokens
+                > trial
+                    .attempt_count
+                    .saturating_sub(u32::from(completed))
+                    .saturating_mul(policy.max_tokens_per_trial)
+            || (!completed && trial.score_micros != 0)
+        {
+            return Err("stochastic trial evidence values are invalid".into());
+        }
+        validate_reason_code(&trial.reason_code)?;
+        validate_digest("stochastic trial result_digest", &trial.result_digest)?;
+    }
+    let aggregate = derive_stochastic_aggregate(policy, &evidence.trials);
+    if evidence.completed_trial_count != aggregate.completed_trial_count
+        || evidence.mean_score_micros != aggregate.mean_score_micros
+        || evidence.pass_rate_basis_points != aggregate.pass_rate_basis_points
+        || evidence.score_variance_micros_squared != aggregate.score_variance_micros_squared
+        || evidence.total_input_tokens != aggregate.total_input_tokens
+        || evidence.total_output_tokens != aggregate.total_output_tokens
+        || evidence.total_retry_accounted_tokens != aggregate.total_retry_accounted_tokens
+        || u64::from(aggregate.total_input_tokens)
+            + u64::from(aggregate.total_output_tokens)
+            + u64::from(aggregate.total_retry_accounted_tokens)
+            > u64::from(policy.max_total_tokens)
+        || step_status != aggregate.status
+        || step_reason_code != aggregate.reason_code
+    {
+        return Err("stochastic aggregate evidence is inconsistent with its trials".into());
+    }
+    if stochastic_aggregate_digest(evidence)? != evidence.aggregate_digest {
+        return Err("stochastic aggregate digest is invalid".into());
+    }
+    let aggregate_result = serde_json::json!({
+        "aggregate_digest": evidence.aggregate_digest,
+        "accepted": aggregate.accepted,
+        "completed_trial_count": aggregate.completed_trial_count,
+        "mean_score_micros": aggregate.mean_score_micros,
+        "pass_rate_basis_points": aggregate.pass_rate_basis_points,
+        "score_variance_micros_squared": aggregate.score_variance_micros_squared,
+    });
+    let expected_result_digest = digest_json(&(
+        EVALUATOR_RESULT_CONTRACT,
+        aggregate.status.as_str(),
+        aggregate.reason_code.as_str(),
+        aggregate_result,
+    ))?;
+    if step_result_digest != expected_result_digest {
+        return Err("stochastic aggregate result digest is invalid".into());
+    }
+    Ok(())
+}
+
 pub fn make_nonexecuted_node(
     manifest: &ResolvedEvaluationManifest,
     node: &ResolvedEvaluationNode,
@@ -824,29 +1786,54 @@ pub fn make_framework_step(
         evidence_digests,
         dependency_result_digests,
         result_digest,
+        stochastic_evidence: None,
         step_receipt_digest: String::new(),
     };
-    receipt.step_receipt_digest = digest_json(&(
-        receipt.contract_version.as_str(),
-        receipt.manifest_digest.as_str(),
-        receipt.node_id.as_str(),
-        receipt.classification.as_str(),
-        receipt.status.as_str(),
-        receipt.reason_code.as_str(),
-        receipt.input_digest.as_str(),
-        receipt.parameters_digest.as_str(),
-        receipt.evaluator_definition_digest.as_str(),
-        receipt.implementation_digest.as_str(),
-        receipt.evidence_digests.as_slice(),
-        receipt.dependency_result_digests.as_slice(),
-        receipt.result_digest.as_str(),
-    ))?;
+    receipt.step_receipt_digest = step_receipt_digest(&receipt)?;
     ensure_document_size(
         &receipt,
         "evaluation step receipt",
         MAX_EXECUTION_DOCUMENT_BYTES,
     )?;
     Ok(NodeExecution { receipt, elapsed })
+}
+
+fn step_receipt_digest(receipt: &EvaluationStepReceipt) -> Result<String, String> {
+    if let Some(stochastic) = &receipt.stochastic_evidence {
+        digest_json(&(
+            receipt.contract_version.as_str(),
+            receipt.manifest_digest.as_str(),
+            receipt.node_id.as_str(),
+            receipt.classification.as_str(),
+            receipt.status.as_str(),
+            receipt.reason_code.as_str(),
+            receipt.input_digest.as_str(),
+            receipt.parameters_digest.as_str(),
+            receipt.evaluator_definition_digest.as_str(),
+            receipt.implementation_digest.as_str(),
+            receipt.evidence_digests.as_slice(),
+            receipt.dependency_result_digests.as_slice(),
+            receipt.result_digest.as_str(),
+            stochastic,
+        ))
+    } else {
+        // Preserve the shipped deterministic v1 digest contract exactly.
+        digest_json(&(
+            receipt.contract_version.as_str(),
+            receipt.manifest_digest.as_str(),
+            receipt.node_id.as_str(),
+            receipt.classification.as_str(),
+            receipt.status.as_str(),
+            receipt.reason_code.as_str(),
+            receipt.input_digest.as_str(),
+            receipt.parameters_digest.as_str(),
+            receipt.evaluator_definition_digest.as_str(),
+            receipt.implementation_digest.as_str(),
+            receipt.evidence_digests.as_slice(),
+            receipt.dependency_result_digests.as_slice(),
+            receipt.result_digest.as_str(),
+        ))
+    }
 }
 
 pub fn reduce_gate(
@@ -1130,21 +2117,25 @@ fn validate_step_for_node(
     validate_status(&step.status)?;
     validate_reason_code(&step.reason_code)?;
     validate_digest("evaluation step result_digest", &step.result_digest)?;
-    let digest = digest_json(&(
-        step.contract_version.as_str(),
-        step.manifest_digest.as_str(),
-        step.node_id.as_str(),
-        step.classification.as_str(),
-        step.status.as_str(),
-        step.reason_code.as_str(),
-        step.input_digest.as_str(),
-        step.parameters_digest.as_str(),
-        step.evaluator_definition_digest.as_str(),
-        step.implementation_digest.as_str(),
-        step.evidence_digests.as_slice(),
-        step.dependency_result_digests.as_slice(),
-        step.result_digest.as_str(),
-    ))?;
+    if matches!(step.status.as_str(), STATUS_PASS | STATUS_FAIL)
+        && node.evaluator.stochastic_policy.is_some()
+        && step.stochastic_evidence.is_none()
+    {
+        return Err("completed stochastic step lacks statistical evidence".into());
+    }
+    if node.evaluator.stochastic_policy.is_none() && step.stochastic_evidence.is_some() {
+        return Err("deterministic step cannot contain stochastic evidence".into());
+    }
+    if let Some(evidence) = &step.stochastic_evidence {
+        validate_stochastic_step_evidence(
+            node,
+            evidence,
+            &step.status,
+            &step.reason_code,
+            &step.result_digest,
+        )?;
+    }
+    let digest = step_receipt_digest(step)?;
     if digest != step.step_receipt_digest {
         return Err("evaluation step receipt digest is invalid".into());
     }
@@ -1243,6 +2234,7 @@ mod tests {
         MANIFEST_CONTRACT, RESOLVER_VERSION, ResolvedEvaluatorBinding, ResolvedWaiverBinding,
     };
     use crate::chisei::evaluation_plan::NODE_ADVISORY;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
@@ -1269,6 +2261,27 @@ mod tests {
         }
     }
 
+    struct ScriptedStochasticEvaluator {
+        calls: Arc<Mutex<Vec<(u32, i64)>>>,
+        results: Mutex<VecDeque<Result<StochasticTrialOutput, StochasticTrialError>>>,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl StochasticEvaluator for ScriptedStochasticEvaluator {
+        async fn evaluate_trial(
+            &self,
+            input: &StochasticTrialInput,
+        ) -> Result<StochasticTrialOutput, StochasticTrialError> {
+            tokio::time::sleep(self.delay).await;
+            self.calls
+                .lock()
+                .unwrap()
+                .push((input.trial_index, input.seed));
+            self.results.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
@@ -1280,6 +2293,7 @@ mod tests {
                 definition_id: format!("definition:{id}"),
                 definition_digest: digest('d'),
                 implementation_digest: digest('e'),
+                stochastic_policy: None,
             },
             depends_on_node_ids: dependencies.iter().map(|value| value.to_string()).collect(),
             input_bindings: Vec::new(),
@@ -1296,6 +2310,61 @@ mod tests {
             }],
             evidence_object_ids: Vec::new(),
             classification: classification.into(),
+        }
+    }
+
+    fn stochastic_policy() -> StochasticEvaluatorPolicy {
+        StochasticEvaluatorPolicy {
+            provider: "openai".into(),
+            model: "openai/fixture-model".into(),
+            prompt_profile: "fixture.rubric/v1".into(),
+            prompt_profile_digest: digest('9'),
+            result_schema: STOCHASTIC_TRIAL_RESULT_CONTRACT.into(),
+            trial_count: 3,
+            temperature_millis: 200,
+            top_p_millionths: 900_000,
+            seed_supported: true,
+            base_seed: 40,
+            aggregation_rule: crate::chisei::evaluation_plan::STOCHASTIC_AGGREGATION_MEAN_VARIANCE
+                .into(),
+            minimum_mean_score_micros: 800_000,
+            minimum_pass_rate_basis_points: 6_666,
+            maximum_score_variance_micros_squared: 7_000_000_000,
+            gate_eligible: true,
+            max_retries_per_trial: 1,
+            max_tokens_per_trial: 100,
+            max_total_tokens: 600,
+            egress_policy: crate::chisei::evaluation_plan::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL
+                .into(),
+            raw_response_retention: crate::chisei::evaluation_plan::STOCHASTIC_RAW_RETENTION_NONE
+                .into(),
+        }
+    }
+
+    fn stochastic_node() -> ResolvedEvaluationNode {
+        let mut node = node("model-review", NODE_REQUIRED, &[]);
+        node.evaluator.stochastic_policy = Some(stochastic_policy());
+        node
+    }
+
+    fn stochastic_output(
+        passed: bool,
+        score_micros: u32,
+        raw_marker: &str,
+    ) -> StochasticTrialOutput {
+        StochasticTrialOutput {
+            contract_version: STOCHASTIC_TRIAL_RESULT_CONTRACT.into(),
+            passed,
+            score_micros,
+            reason_code: if passed {
+                "fixture_pass"
+            } else {
+                "fixture_fail"
+            }
+            .into(),
+            result: serde_json::json!({"private_model_text": raw_marker}),
+            input_tokens: 10,
+            output_tokens: 5,
         }
     }
 
@@ -1419,6 +2488,293 @@ mod tests {
                 .to_string()
         };
         assert_eq!(run("UTC", "C"), run("Pacific/Chatham", "C.UTF-8"));
+    }
+
+    #[test]
+    fn stochastic_trials_retry_the_same_slot_and_persist_only_normalized_evidence() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = StochasticEvaluatorRegistry::default();
+        registry
+            .register(
+                &digest('e'),
+                Arc::new(ScriptedStochasticEvaluator {
+                    calls: calls.clone(),
+                    results: Mutex::new(VecDeque::from([
+                        Err(StochasticTrialError::Retryable),
+                        Ok(stochastic_output(true, 900_000, "raw-secret-one")),
+                        Ok(stochastic_output(true, 700_000, "raw-secret-two")),
+                        Ok(stochastic_output(false, 800_000, "raw-secret-three")),
+                    ])),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .unwrap();
+        let manifest = manifest(vec![stochastic_node()]);
+        let execution = execute_stochastic_node(
+            &registry,
+            &manifest,
+            &manifest.nodes[0],
+            input(&manifest, &manifest.nodes[0]),
+            &limits(),
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(execution.receipt.status, STATUS_PASS);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, 40), (0, 40), (1, 41), (2, 42)]
+        );
+        let evidence = execution.receipt.stochastic_evidence.as_ref().unwrap();
+        assert_eq!(evidence.completed_trial_count, 3);
+        assert_eq!(evidence.mean_score_micros, 800_000);
+        assert_eq!(evidence.pass_rate_basis_points, 6_666);
+        assert_eq!(evidence.score_variance_micros_squared, 6_666_666_666);
+        assert_eq!(evidence.trials[0].attempt_count, 2);
+        assert_eq!(evidence.trials[0].retry_accounted_tokens, 100);
+        assert_eq!(evidence.total_input_tokens, 30);
+        assert_eq!(evidence.total_output_tokens, 15);
+        assert_eq!(evidence.total_retry_accounted_tokens, 100);
+        let persisted = serde_json::to_string(&execution.receipt).unwrap();
+        assert!(!persisted.contains("raw-secret"));
+        assert!(!persisted.contains("private_model_text"));
+        validate_step_for_node(&manifest, &manifest.nodes[0], &execution.receipt).unwrap();
+    }
+
+    #[test]
+    fn stochastic_receipt_validation_recomputes_aggregate_evidence() {
+        let registry = StochasticEvaluatorRegistry::default();
+        registry
+            .register(
+                &digest('e'),
+                Arc::new(ScriptedStochasticEvaluator {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    results: Mutex::new(VecDeque::from([
+                        Ok(stochastic_output(true, 900_000, "one")),
+                        Ok(stochastic_output(true, 800_000, "two")),
+                        Ok(stochastic_output(true, 700_000, "three")),
+                    ])),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .unwrap();
+        let manifest = manifest(vec![stochastic_node()]);
+        let mut receipt = execute_stochastic_node(
+            &registry,
+            &manifest,
+            &manifest.nodes[0],
+            input(&manifest, &manifest.nodes[0]),
+            &limits(),
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .receipt;
+        let evidence = receipt.stochastic_evidence.as_mut().unwrap();
+        evidence.completed_trial_count = 0;
+        evidence.aggregate_digest = stochastic_aggregate_digest(evidence).unwrap();
+        receipt.step_receipt_digest = step_receipt_digest(&receipt).unwrap();
+
+        assert!(
+            validate_step_for_node(&manifest, &manifest.nodes[0], &receipt)
+                .unwrap_err()
+                .contains("inconsistent with its trials")
+        );
+    }
+
+    #[test]
+    fn stochastic_node_cannot_execute_through_deterministic_registry() {
+        let registry = DeterministicEvaluatorRegistry::default();
+        registry
+            .register(
+                &digest('e'),
+                Arc::new(FixedEvaluator {
+                    status: STATUS_PASS,
+                    result: Value::Null,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .unwrap();
+        let manifest = manifest(vec![stochastic_node()]);
+        let error = execute_registered_node(
+            &registry,
+            &manifest,
+            &manifest.nodes[0],
+            input(&manifest, &manifest.nodes[0]),
+            &limits(),
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot execute through the deterministic registry"));
+    }
+
+    #[test]
+    fn incomplete_stochastic_population_is_typed_non_pass() {
+        let registry = StochasticEvaluatorRegistry::default();
+        registry
+            .register(
+                &digest('e'),
+                Arc::new(ScriptedStochasticEvaluator {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    results: Mutex::new(VecDeque::from([Err(
+                        StochasticTrialError::ProviderUnavailable,
+                    )])),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .unwrap();
+        let manifest = manifest(vec![stochastic_node()]);
+        let execution = execute_stochastic_node(
+            &registry,
+            &manifest,
+            &manifest.nodes[0],
+            input(&manifest, &manifest.nodes[0]),
+            &limits(),
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(execution.receipt.status, STATUS_UNAVAILABLE);
+        assert_eq!(
+            execution.receipt.reason_code,
+            REASON_STOCHASTIC_PROVIDER_UNAVAILABLE
+        );
+        let evidence = execution.receipt.stochastic_evidence.unwrap();
+        assert_eq!(evidence.completed_trial_count, 0);
+        assert_eq!(evidence.trials.len(), 3);
+        assert_eq!(evidence.trials[1].status, STATUS_SKIPPED);
+        assert_ne!(execution.receipt.status, STATUS_PASS);
+    }
+
+    #[test]
+    fn stochastic_refusal_schema_error_and_timeout_remain_typed_non_pass() {
+        let cases = [
+            (
+                Err(StochasticTrialError::Refusal {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                }),
+                Duration::ZERO,
+                STATUS_UNKNOWN,
+                REASON_STOCHASTIC_REFUSAL,
+                11,
+                7,
+            ),
+            (
+                Err(StochasticTrialError::SchemaInvalid {
+                    input_tokens: 12,
+                    output_tokens: 8,
+                }),
+                Duration::ZERO,
+                STATUS_ERROR,
+                REASON_STOCHASTIC_SCHEMA_INVALID,
+                12,
+                8,
+            ),
+            (
+                Err(StochasticTrialError::TokenBudgetExceeded),
+                Duration::ZERO,
+                STATUS_UNAVAILABLE,
+                REASON_STOCHASTIC_TOKEN_BUDGET,
+                0,
+                0,
+            ),
+            (
+                Ok(stochastic_output(true, 900_000, "late-raw-secret")),
+                Duration::from_millis(30),
+                STATUS_UNAVAILABLE,
+                REASON_EVALUATOR_TIMEOUT,
+                0,
+                0,
+            ),
+        ];
+        for (
+            result,
+            delay,
+            expected_status,
+            expected_reason,
+            expected_input_tokens,
+            expected_output_tokens,
+        ) in cases
+        {
+            let registry = StochasticEvaluatorRegistry::default();
+            registry
+                .register(
+                    &digest('e'),
+                    Arc::new(ScriptedStochasticEvaluator {
+                        calls: Arc::new(Mutex::new(Vec::new())),
+                        results: Mutex::new(VecDeque::from([result])),
+                        delay,
+                    }),
+                )
+                .unwrap();
+            let manifest = manifest(vec![stochastic_node()]);
+            let mut resource_limits = limits();
+            if !delay.is_zero() {
+                resource_limits.timeout_ms = 5;
+            }
+            let execution = execute_stochastic_node(
+                &registry,
+                &manifest,
+                &manifest.nodes[0],
+                input(&manifest, &manifest.nodes[0]),
+                &resource_limits,
+                Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+
+            assert_eq!(execution.receipt.status, expected_status);
+            assert_eq!(execution.receipt.reason_code, expected_reason);
+            let evidence = execution.receipt.stochastic_evidence.as_ref().unwrap();
+            assert_eq!(evidence.total_input_tokens, expected_input_tokens);
+            assert_eq!(evidence.total_output_tokens, expected_output_tokens);
+            assert_ne!(execution.receipt.status, STATUS_PASS);
+        }
+    }
+
+    #[test]
+    fn stochastic_timeout_drops_provider_work_and_releases_capacity() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = StochasticEvaluatorRegistry::with_thread_capacity(1).unwrap();
+        registry
+            .register(
+                &digest('e'),
+                Arc::new(ScriptedStochasticEvaluator {
+                    calls: calls.clone(),
+                    results: Mutex::new(VecDeque::from([Ok(stochastic_output(
+                        true,
+                        900_000,
+                        "late-raw-secret",
+                    ))])),
+                    delay: Duration::from_millis(100),
+                }),
+            )
+            .unwrap();
+        let manifest = manifest(vec![stochastic_node()]);
+        let mut resource_limits = limits();
+        resource_limits.timeout_ms = 5;
+
+        let execution = execute_stochastic_node(
+            &registry,
+            &manifest,
+            &manifest.nodes[0],
+            input(&manifest, &manifest.nodes[0]),
+            &resource_limits,
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(execution.receipt.reason_code, REASON_EVALUATOR_TIMEOUT);
+        assert!(registry.try_acquire_thread().is_some());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]

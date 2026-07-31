@@ -31,7 +31,9 @@ A resolved manifest binds:
   profile digest used to resolve it;
 - every applicable requirement version, content digest, and
   provenance-evidence reference;
-- every selected evaluator-definition and implementation digest;
+- every selected evaluator-definition and implementation digest, including
+  its complete stochastic policy when the selected class is
+  `stochastic_model/v1`;
 - exact node dependencies, typed inputs, canonical parameters, invariant
   contracts, and required/advisory classification;
 - every valid waiver, its exact target invariant-version IDs, and its
@@ -125,4 +127,8 @@ Existing evaluation-plan, `EvalSuite`, governed-subject, evidence-admission,
 and operation-receipt APIs are unchanged.
 
 Resolved manifests are executed through the separate
-[deterministic evaluation execution](evaluation-execution.md) boundary.
+[evaluation execution](evaluation-execution.md) boundary. A stochastic
+binding freezes provider, model, prompt/profile digest, result schema,
+sampling, fixed trial and retry population, aggregation thresholds, budget,
+egress, retention, and gate eligibility. Re-execution must find that exact
+definition; it cannot substitute a route or policy.

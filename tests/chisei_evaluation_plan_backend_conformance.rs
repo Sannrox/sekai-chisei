@@ -25,11 +25,51 @@ fn definition(namespace: &str, suffix: &str) -> EvaluatorDefinition {
             max_output_bytes: 1_024,
             max_evidence_items: 8,
         },
+        stochastic_policy: None,
         source_ref: "repo://evaluators/schema-check@1".into(),
         content_digest: String::new(),
         created_by: String::new(),
         created_at_ms: 0,
     }
+}
+
+fn stochastic_definition(
+    namespace: &str,
+    suffix: &str,
+    gate_eligible: bool,
+) -> EvaluatorDefinition {
+    let mut definition = definition(
+        namespace,
+        &format!(
+            "{suffix}-stochastic-{}",
+            if gate_eligible { "gated" } else { "advisory" }
+        ),
+    );
+    definition.execution_class = STOCHASTIC_EXECUTION_CLASS.into();
+    definition.supported_result_schemas = vec![STOCHASTIC_RESULT_SCHEMA.into()];
+    definition.stochastic_policy = Some(StochasticEvaluatorPolicy {
+        provider: "openai".into(),
+        model: "openai/gpt-fixture".into(),
+        prompt_profile: "chisei.fixture-rubric/v1".into(),
+        prompt_profile_digest: format!("sha256:{}", "b".repeat(64)),
+        result_schema: STOCHASTIC_RESULT_SCHEMA.into(),
+        trial_count: 3,
+        temperature_millis: 200,
+        top_p_millionths: 900_000,
+        seed_supported: true,
+        base_seed: 17,
+        aggregation_rule: STOCHASTIC_AGGREGATION_MEAN_VARIANCE.into(),
+        minimum_mean_score_micros: 800_000,
+        minimum_pass_rate_basis_points: 6_667,
+        maximum_score_variance_micros_squared: 10_000_000_000,
+        gate_eligible,
+        max_retries_per_trial: 1,
+        max_tokens_per_trial: 100,
+        max_total_tokens: 600,
+        egress_policy: STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL.into(),
+        raw_response_retention: STOCHASTIC_RAW_RETENTION_NONE.into(),
+    });
+    definition
 }
 
 fn plan(namespace: &str, suffix: &str, definition_id: &str) -> EvaluationPlan {
@@ -128,6 +168,44 @@ fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].plan_version_id, stored_plan.plan_version_id);
+
+    let advisory_definition = db
+        .put_evaluator_definition(
+            stochastic_definition(namespace, suffix, false),
+            "operator",
+            80,
+        )
+        .unwrap();
+    assert!(
+        db.put_evaluation_plan(
+            plan(
+                namespace,
+                &format!("{suffix}-stochastic-advisory"),
+                &advisory_definition.definition_id,
+            ),
+            "operator",
+            90,
+        )
+        .unwrap_err()
+        .contains("gate eligibility")
+    );
+    let gated_definition = db
+        .put_evaluator_definition(
+            stochastic_definition(namespace, suffix, true),
+            "operator",
+            100,
+        )
+        .unwrap();
+    db.put_evaluation_plan(
+        plan(
+            namespace,
+            &format!("{suffix}-stochastic-gated"),
+            &gated_definition.definition_id,
+        ),
+        "operator",
+        110,
+    )
+    .unwrap();
     (stored_definition.definition_id, stored_plan.plan_version_id)
 }
 

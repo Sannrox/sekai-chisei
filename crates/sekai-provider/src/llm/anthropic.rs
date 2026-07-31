@@ -1,6 +1,6 @@
 use super::{
     ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts,
-    MAX_PROVIDER_RESPONSE_BYTES, Provider, ToolCall, classify_reqwest_error,
+    MAX_PROVIDER_RESPONSE_BYTES, Provider, SamplingOptions, ToolCall, classify_reqwest_error,
     ensure_declared_response_size, read_bounded_response,
 };
 use futures_util::StreamExt;
@@ -40,7 +40,16 @@ impl Anthropic {
 #[async_trait::async_trait]
 impl Provider for Anthropic {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
-        let body = messages_body(req, false);
+        self.chat_with_sampling(req, SamplingOptions::default())
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        req: &ChatRequest,
+        sampling: SamplingOptions,
+    ) -> Result<ChatResponse, String> {
+        let body = messages_body_with_sampling(req, false, sampling);
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -196,6 +205,14 @@ impl Provider for Anthropic {
 }
 
 fn messages_body(req: &ChatRequest, stream: bool) -> Value {
+    messages_body_with_sampling(req, stream, SamplingOptions::default())
+}
+
+fn messages_body_with_sampling(
+    req: &ChatRequest,
+    stream: bool,
+    sampling: SamplingOptions,
+) -> Value {
     let mut messages: Vec<Value> = req
         .messages
         .iter()
@@ -247,6 +264,12 @@ fn messages_body(req: &ChatRequest, stream: bool) -> Value {
         "max_tokens": if req.max_tokens > 0 { req.max_tokens } else { 4096 },
         "messages": messages,
     });
+    if let Some(value) = sampling.temperature_millis {
+        body["temperature"] = json!(f64::from(value) / 1_000.0);
+    }
+    if let Some(value) = sampling.top_p_millionths {
+        body["top_p"] = json!(f64::from(value) / 1_000_000.0);
+    }
     if !req.system.is_empty() {
         body["system"] = if req.prompt_cache.enabled {
             json!([{"type": "text", "text": req.system, "cache_control": {"type": "ephemeral"}}])
@@ -402,8 +425,10 @@ fn event_data_values(event: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anthropic, messages_body, parse_anthropic_sse_event};
-    use crate::llm::{ChatRequest, HttpTimeouts, Message, PromptCacheIntent, Provider, ToolDef};
+    use super::{Anthropic, messages_body, messages_body_with_sampling, parse_anthropic_sse_event};
+    use crate::llm::{
+        ChatRequest, HttpTimeouts, Message, PromptCacheIntent, Provider, SamplingOptions, ToolDef,
+    };
     use axum::Router;
     use axum::routing::post;
     use std::time::Duration;
@@ -426,6 +451,24 @@ mod tests {
             max_tokens: 16,
             prompt_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn messages_body_forwards_supported_sampling_controls() {
+        let request = test_chat_request();
+        let body = messages_body_with_sampling(
+            &request,
+            false,
+            SamplingOptions {
+                temperature_millis: Some(400),
+                top_p_millionths: Some(750_000),
+                seed: None,
+            },
+        );
+
+        assert_eq!(body["temperature"], 0.4);
+        assert_eq!(body["top_p"], 0.75);
+        assert!(body.get("seed").is_none());
     }
 
     async fn delayed_messages_response() -> axum::Json<serde_json::Value> {

@@ -366,11 +366,11 @@ disclose these governance objects. Chisei later binds the returned exact
 invariant versions to situation-specific evaluator definitions and plans.
 Those `chisei.evaluator-definition/v1` and `chisei.evaluation-plan/v1`
 resources are immutable and namespace scoped. Definitions identify deployed
-deterministic implementations and their typed contracts; plans form a bounded
-acyclic evaluation graph with exact invariant coverage and one fixed
-fail-closed reducer. Mutable, audited evaluator availability blocks future
-selection without rewriting historical plans. `EvalSuite` remains test data
-and does not gain production gate authority. See
+deterministic implementations or bounded stochastic policies and their typed
+contracts; plans form a bounded acyclic evaluation graph with exact invariant
+coverage and one fixed fail-closed reducer. Mutable, audited evaluator
+availability blocks future selection without rewriting historical plans.
+`EvalSuite` remains test data and does not gain production gate authority. See
 [Evaluation plans and evaluator definitions](evaluation-plans.md).
 
 `ResolveEvaluationPlan` combines one exact plan with an opaque subject, the
@@ -383,13 +383,16 @@ lifecycle. Exact successful request replay remains available after evaluator
 disablement or supersession; new requests fail closed against current
 availability. See [Resolved evaluation manifests](evaluation-manifests.md).
 
-The deterministic executor selects only compiled implementations whose exact
-digest matches the manifest, runs ready nodes in stable topological order, and
+The evaluation executor selects only compiled implementations whose exact
+digest matches the manifest. Deterministic and stochastic nodes use separate
+registries; stochastic policies additionally freeze exact routing, sampling,
+fixed trials, aggregation, variance, budget, egress, retention, and gate
+eligibility. The executor runs ready nodes in stable topological order and
 applies one fixed fail-closed reducer. Step and terminal truth are appended to
 the canonical operation receipt; the execution table is only a
 manifest-to-receipt index and query projections are reconstructed from receipt
 events. Evaluator output content is hashed and discarded. See
-[Deterministic evaluation execution](evaluation-execution.md).
+[Evaluation execution](evaluation-execution.md).
 
 `GetEvidenceSubmissionContent` is the governed, single-record read path for an
 admitted envelope. It resolves the submission's projected `external_evidence`

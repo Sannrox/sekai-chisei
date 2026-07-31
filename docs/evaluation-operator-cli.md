@@ -2,7 +2,7 @@
 
 `sekaictl admin evaluation plan` is the operator surface for authoring,
 publishing, inspecting, and dry-running situation-specific evaluation plans.
-It uses the existing Chisei plan, manifest, and deterministic-execution APIs;
+It uses the existing Chisei plan, manifest, and bounded-execution APIs;
 it does not introduce a generic evaluator or workflow language.
 
 The authority boundaries are explicit:
@@ -47,6 +47,8 @@ Live validation checks:
 - exact content-addressed evaluator and invariant references rather than
   aliases;
 - evaluator namespace and current availability;
+- explicit gate eligibility when a required node selects a stochastic
+  definition;
 - closed evaluator parameter schemas and supported input schemas; and
 - invariant status, profile-wide applicability, verification contract, and
   typed evaluator compatibility.
@@ -136,7 +138,7 @@ must still inspect the process exit status.
 | `4` | resolution or execution is unknown |
 | `5` | service, evaluator, resolution, or execution is unavailable |
 | `6` | client/server evaluation-plan contract mismatch |
-| `7` | deterministic gate denied |
+| `7` | fixed evaluation gate denied |
 
 An older server returns exit `6` when it does not implement the additive plan
 RPCs. Existing commands and older clients are unchanged because this CLI only

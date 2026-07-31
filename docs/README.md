@@ -47,13 +47,13 @@ If you want to deploy or operate the control plane:
 - [Governed subject evaluation](governed-subjects.md) — payload-free
   evaluation of externally owned immutable subjects.
 - [Evaluation plans and evaluator definitions](evaluation-plans.md) —
-  situation-specific deterministic production evaluation contracts.
+  situation-specific deterministic and bounded stochastic contracts.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — author,
   validate, publish, inspect, dry-run, and explicitly execute exact plans.
 - [Resolved evaluation manifests](evaluation-manifests.md) — immutable,
   content-bound pre-execution inputs and historical replay.
-- [Deterministic evaluation execution](evaluation-execution.md) — bounded,
-  receipt-authoritative execution and fixed fail-closed reduction.
+- [Evaluation execution](evaluation-execution.md) — bounded,
+  receipt-authoritative deterministic and stochastic execution.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 
