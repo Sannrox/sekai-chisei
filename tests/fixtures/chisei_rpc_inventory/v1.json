@@ -752,6 +752,99 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutEvaluatorDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs",
+        "src/chisei/evaluation_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "GetEvaluatorDefinition",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "ListEvaluatorDefinitions",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "SetEvaluatorAvailability",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "PutEvaluationPlan",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs",
+        "src/chisei/evaluation_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "GetEvaluationPlan",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "ListEvaluationPlans",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "core"
+    },
+    {
       "rpc": "CreateEvalSuite",
       "kind": "persistent",
       "surfaces": [
@@ -1107,6 +1200,7 @@
     "src/db/postgres_kioku.rs",
     "src/db/postgres_portfolio.rs",
     "tests/chisei_budget_backend_conformance.rs",
+    "tests/chisei_evaluation_plan_backend_conformance.rs",
     "tests/chisei_eval_backend_conformance.rs",
     "tests/chisei_execution_backend_conformance.rs",
     "tests/chisei_external_action_backend_conformance.rs",
@@ -1141,7 +1235,9 @@
       "surface": "chisei.evaluation",
       "evidence": [
         "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_eval.rs",
+        "src/db/postgres_evaluation_plan.rs"
       ],
       "note": "dual-backend harness proven"
     },

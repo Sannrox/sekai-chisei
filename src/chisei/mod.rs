@@ -7,6 +7,7 @@ pub mod controller;
 pub mod egress;
 pub mod entitlements;
 pub mod eval;
+pub mod evaluation_plan;
 pub mod evolve;
 pub mod external_action;
 pub mod external_permit;

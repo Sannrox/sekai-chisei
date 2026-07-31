@@ -16,6 +16,7 @@ use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
 use crate::chisei::eval::EvalStore;
+use crate::chisei::evaluation_plan as evaluation_plan_domain;
 use crate::chisei::external_action as external;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
@@ -41,6 +42,8 @@ use crate::sekai::action_policy::ActionDecision;
 use crate::sekai::coordination::{
     RESERVATION_STATUS_ACTIVE, ReservationFilter, WORK_UNIT_STATUS_RUNNING,
 };
+use crate::sekai::governed_facts::{self as governed_fact_domain, GovernedFactType};
+use crate::sekai::markings;
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -1815,6 +1818,524 @@ fn persist_namespace_worker_policy(
             updated: now,
         })
     }
+}
+
+fn from_proto_evaluator_definition(
+    value: EvaluatorDefinition,
+) -> Result<evaluation_plan_domain::EvaluatorDefinition, Status> {
+    let limits = value
+        .resource_limits
+        .ok_or_else(|| Status::invalid_argument("evaluator resource_limits required"))?;
+    Ok(evaluation_plan_domain::EvaluatorDefinition {
+        contract_version: value.contract_version,
+        definition_id: value.definition_id,
+        namespace: value.namespace,
+        evaluator_id: value.evaluator_id,
+        version: value.version,
+        implementation_digest: value.implementation_digest,
+        execution_class: value.execution_class,
+        supported_predicate_kinds: value.supported_predicate_kinds,
+        supported_input_schemas: value.supported_input_schemas,
+        supported_result_schemas: value.supported_result_schemas,
+        parameter_schema_json: value.parameter_schema_json,
+        evidence_classifications: value.evidence_classifications,
+        resource_limits: evaluation_plan_domain::EvaluatorResourceLimits {
+            timeout_ms: limits.timeout_ms,
+            max_input_bytes: limits.max_input_bytes,
+            max_output_bytes: limits.max_output_bytes,
+            max_evidence_items: limits.max_evidence_items,
+        },
+        source_ref: value.source_ref,
+        content_digest: value.content_digest,
+        created_by: value.created_by,
+        created_at_ms: value.created_at_ms,
+    })
+}
+
+fn to_proto_evaluator_definition(
+    value: &evaluation_plan_domain::EvaluatorDefinition,
+) -> EvaluatorDefinition {
+    EvaluatorDefinition {
+        contract_version: value.contract_version.clone(),
+        definition_id: value.definition_id.clone(),
+        namespace: value.namespace.clone(),
+        evaluator_id: value.evaluator_id.clone(),
+        version: value.version.clone(),
+        implementation_digest: value.implementation_digest.clone(),
+        execution_class: value.execution_class.clone(),
+        supported_predicate_kinds: value.supported_predicate_kinds.clone(),
+        supported_input_schemas: value.supported_input_schemas.clone(),
+        supported_result_schemas: value.supported_result_schemas.clone(),
+        parameter_schema_json: value.parameter_schema_json.clone(),
+        evidence_classifications: value.evidence_classifications.clone(),
+        resource_limits: Some(EvaluatorResourceLimits {
+            timeout_ms: value.resource_limits.timeout_ms,
+            max_input_bytes: value.resource_limits.max_input_bytes,
+            max_output_bytes: value.resource_limits.max_output_bytes,
+            max_evidence_items: value.resource_limits.max_evidence_items,
+        }),
+        source_ref: value.source_ref.clone(),
+        content_digest: value.content_digest.clone(),
+        created_by: value.created_by.clone(),
+        created_at_ms: value.created_at_ms,
+    }
+}
+
+fn to_proto_evaluator_availability(
+    value: &evaluation_plan_domain::EvaluatorAvailability,
+) -> EvaluatorAvailability {
+    EvaluatorAvailability {
+        definition_id: value.definition_id.clone(),
+        state: value.state.clone(),
+        superseded_by_definition_id: value.superseded_by_definition_id.clone(),
+        reason: value.reason.clone(),
+        request_id: value.request_id.clone(),
+        request_digest: value.request_digest.clone(),
+        changed_by: value.changed_by.clone(),
+        changed_at_ms: value.changed_at_ms,
+    }
+}
+
+fn evaluator_record(
+    db: &RuntimeDb,
+    definition: &evaluation_plan_domain::EvaluatorDefinition,
+) -> Result<EvaluatorDefinitionRecord, Status> {
+    let availability = db
+        .get_evaluator_availability(&definition.definition_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::data_loss("evaluator availability is missing"))?;
+    Ok(evaluator_record_with_availability(
+        definition,
+        &availability,
+    ))
+}
+
+fn evaluator_record_with_availability(
+    definition: &evaluation_plan_domain::EvaluatorDefinition,
+    availability: &evaluation_plan_domain::EvaluatorAvailability,
+) -> EvaluatorDefinitionRecord {
+    EvaluatorDefinitionRecord {
+        definition: Some(to_proto_evaluator_definition(definition)),
+        availability: Some(to_proto_evaluator_availability(availability)),
+    }
+}
+
+fn from_proto_evaluation_plan(value: EvaluationPlan) -> evaluation_plan_domain::EvaluationPlan {
+    evaluation_plan_domain::EvaluationPlan {
+        contract_version: value.contract_version,
+        plan_version_id: value.plan_version_id,
+        namespace: value.namespace,
+        plan_id: value.plan_id,
+        version: value.version,
+        accepted_subject_profiles: value.accepted_subject_profiles,
+        nodes: value
+            .nodes
+            .into_iter()
+            .map(|node| evaluation_plan_domain::EvaluationPlanNode {
+                node_id: node.node_id,
+                evaluator_definition_id: node.evaluator_definition_id,
+                depends_on_node_ids: node.depends_on_node_ids,
+                input_bindings: node
+                    .input_bindings
+                    .into_iter()
+                    .map(|binding| evaluation_plan_domain::EvaluationInputBinding {
+                        name: binding.name,
+                        source_kind: binding.source_kind,
+                        schema_id: binding.schema_id,
+                    })
+                    .collect(),
+                parameters_json: node.parameters_json,
+                invariant_version_ids: node.invariant_version_ids,
+                classification: node.classification,
+            })
+            .collect(),
+        reducer: value.reducer,
+        source_ref: value.source_ref,
+        content_digest: value.content_digest,
+        created_by: value.created_by,
+        created_at_ms: value.created_at_ms,
+    }
+}
+
+fn to_proto_evaluation_plan(value: &evaluation_plan_domain::EvaluationPlan) -> EvaluationPlan {
+    EvaluationPlan {
+        contract_version: value.contract_version.clone(),
+        plan_version_id: value.plan_version_id.clone(),
+        namespace: value.namespace.clone(),
+        plan_id: value.plan_id.clone(),
+        version: value.version.clone(),
+        accepted_subject_profiles: value.accepted_subject_profiles.clone(),
+        nodes: value
+            .nodes
+            .iter()
+            .map(|node| EvaluationPlanNode {
+                node_id: node.node_id.clone(),
+                evaluator_definition_id: node.evaluator_definition_id.clone(),
+                depends_on_node_ids: node.depends_on_node_ids.clone(),
+                input_bindings: node
+                    .input_bindings
+                    .iter()
+                    .map(|binding| EvaluationInputBinding {
+                        name: binding.name.clone(),
+                        source_kind: binding.source_kind.clone(),
+                        schema_id: binding.schema_id.clone(),
+                    })
+                    .collect(),
+                parameters_json: node.parameters_json.clone(),
+                invariant_version_ids: node.invariant_version_ids.clone(),
+                classification: node.classification.clone(),
+            })
+            .collect(),
+        reducer: value.reducer.clone(),
+        source_ref: value.source_ref.clone(),
+        content_digest: value.content_digest.clone(),
+        created_by: value.created_by.clone(),
+        created_at_ms: value.created_at_ms,
+    }
+}
+
+fn map_evaluation_resource_error(error: String) -> Status {
+    if error.contains("already exists") {
+        Status::already_exists(error)
+    } else if error.contains("not found")
+        || error.contains("disabled")
+        || error.contains("superseded")
+        || error.contains("incompatible")
+        || error.contains("unavailable")
+    {
+        Status::failed_precondition(error)
+    } else if error.contains("exceeds") {
+        Status::resource_exhausted(error)
+    } else {
+        Status::invalid_argument(error)
+    }
+}
+
+fn principal_authority(
+    db: &RuntimeDb,
+    actor: &str,
+) -> Result<markings::PrincipalAuthority, String> {
+    if let Some(authority) = markings::trusted_service_authority(actor) {
+        return Ok(authority);
+    }
+    let profile = db.find_by_external_id(&markings::principal_profile_external_id(actor))?;
+    markings::principal_authority_from_profile(actor, profile.as_ref())
+}
+
+fn object_visible_to_actor(db: &RuntimeDb, object: &Object, actor: &str) -> Result<bool, String> {
+    if matches!(actor, "root" | "local") {
+        return Ok(true);
+    }
+    let grants = db.list_grants(&object.id)?;
+    if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+        return Ok(false);
+    }
+    let marking = markings::object_classification(object)?;
+    let authority = principal_authority(db, actor)?;
+    Ok(
+        markings::evaluate_marking_access("evaluation-plan-read", marking, &authority).decision
+            != markings::MarkingDecision::Deny,
+    )
+}
+
+fn invariant_reference_visible(
+    db: &RuntimeDb,
+    namespace: &str,
+    invariant_id: &str,
+    actor: &str,
+    visibility_cache: &mut HashMap<String, bool>,
+    visibility_work: &mut usize,
+) -> Result<bool, String> {
+    const MAX_VISIBILITY_OBJECTS: usize = 4_096;
+    let mut pending = vec![invariant_id.to_string()];
+    while let Some(object_id) = pending.pop() {
+        if let Some(visible) = visibility_cache.get(&object_id) {
+            if !visible {
+                return Ok(false);
+            }
+            continue;
+        }
+        *visibility_work += 1;
+        if *visibility_work > MAX_VISIBILITY_OBJECTS {
+            return Ok(false);
+        }
+        let Some(object) = db.get_object(&object_id)? else {
+            visibility_cache.insert(object_id, false);
+            return Ok(false);
+        };
+        if object.namespace != namespace || !object_visible_to_actor(db, &object, actor)? {
+            visibility_cache.insert(object_id, false);
+            return Ok(false);
+        }
+        visibility_cache.insert(object_id, true);
+        if object.kind == governed_fact_domain::FACT_KIND {
+            let fact = governed_fact_domain::fact_from_object(&object)?;
+            pending.extend(fact.input.requirement_version_ids);
+            pending.extend(fact.input.evidence_refs);
+            if !fact.input.supersedes_object_id.is_empty() {
+                pending.push(fact.input.supersedes_object_id);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn evaluation_plan_visible(
+    db: &RuntimeDb,
+    plan: &evaluation_plan_domain::EvaluationPlan,
+    actor: &str,
+) -> Result<bool, String> {
+    let mut visibility_cache = HashMap::new();
+    let mut visibility_work = 0;
+    for invariant_id in plan
+        .nodes
+        .iter()
+        .flat_map(|node| node.invariant_version_ids.iter())
+    {
+        if !invariant_reference_visible(
+            db,
+            &plan.namespace,
+            invariant_id,
+            actor,
+            &mut visibility_cache,
+            &mut visibility_work,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fact_evidence_classifications(
+    db: &RuntimeDb,
+    namespace: &str,
+    fact_id: &str,
+    fact_cache: &mut HashMap<String, HashSet<String>>,
+    evidence_cache: &mut HashMap<String, String>,
+    visiting: &mut HashSet<String>,
+    work: &mut usize,
+) -> Result<HashSet<String>, Status> {
+    const MAX_CLASSIFICATION_OBJECTS: usize = 4_096;
+    if let Some(classifications) = fact_cache.get(fact_id) {
+        return Ok(classifications.clone());
+    }
+    if !visiting.insert(fact_id.to_string()) {
+        return Err(Status::failed_precondition(
+            "governed fact evidence closure contains a cycle",
+        ));
+    }
+    *work += 1;
+    if *work > MAX_CLASSIFICATION_OBJECTS {
+        return Err(Status::resource_exhausted(
+            "governed fact evidence closure exceeds the validation bound",
+        ));
+    }
+    let object = db
+        .get_object(fact_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::failed_precondition("governed fact reference unavailable"))?;
+    if object.namespace != namespace || object.kind != governed_fact_domain::FACT_KIND {
+        return Err(Status::failed_precondition(
+            "governed fact reference unavailable",
+        ));
+    }
+    let fact = governed_fact_domain::fact_from_object(&object).map_err(Status::data_loss)?;
+    let mut classifications = HashSet::new();
+    for evidence_id in &fact.input.evidence_refs {
+        let classification = if let Some(classification) = evidence_cache.get(evidence_id) {
+            classification.clone()
+        } else {
+            *work += 1;
+            if *work > MAX_CLASSIFICATION_OBJECTS {
+                return Err(Status::resource_exhausted(
+                    "governed fact evidence closure exceeds the validation bound",
+                ));
+            }
+            let evidence = db
+                .get_object(evidence_id)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::failed_precondition("evidence reference unavailable"))?;
+            if evidence.namespace != namespace
+                || evidence.kind != crate::domain::KIND_EXTERNAL_EVIDENCE
+            {
+                return Err(Status::failed_precondition(
+                    "evidence reference unavailable",
+                ));
+            }
+            let classification = evidence
+                .properties
+                .get("classification")
+                .ok_or_else(|| {
+                    Status::failed_precondition("evidence reference lacks a valid classification")
+                })
+                .and_then(|value| {
+                    markings::parse_classification(value).map_err(|_| {
+                        Status::failed_precondition(
+                            "evidence reference lacks a valid classification",
+                        )
+                    })
+                })?
+                .as_str()
+                .to_string();
+            evidence_cache.insert(evidence_id.clone(), classification.clone());
+            classification
+        };
+        classifications.insert(classification);
+    }
+    for requirement_id in &fact.input.requirement_version_ids {
+        classifications.extend(fact_evidence_classifications(
+            db,
+            namespace,
+            requirement_id,
+            fact_cache,
+            evidence_cache,
+            visiting,
+            work,
+        )?);
+    }
+    visiting.remove(fact_id);
+    fact_cache.insert(fact_id.to_string(), classifications.clone());
+    Ok(classifications)
+}
+
+fn validate_evaluation_plan_references(
+    db: &RuntimeDb,
+    plan: &evaluation_plan_domain::EvaluationPlan,
+    actor: &str,
+) -> Result<(), Status> {
+    let mut visibility_cache = HashMap::new();
+    let mut visibility_work = 0;
+    let mut fact_classification_cache = HashMap::new();
+    let mut evidence_classification_cache = HashMap::new();
+    let mut classification_work = 0;
+    for node in &plan.nodes {
+        let definition = db
+            .get_evaluator_definition(&node.evaluator_definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::failed_precondition("unknown evaluator definition"))?;
+        if definition.namespace != plan.namespace {
+            return Err(Status::failed_precondition(
+                "evaluator definition is in a different namespace",
+            ));
+        }
+        let availability = db
+            .get_evaluator_availability(&definition.definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluator availability is missing"))?;
+        if availability.state != evaluation_plan_domain::AVAILABILITY_ENABLED {
+            return Err(Status::failed_precondition(
+                "evaluator definition is unavailable for new plans",
+            ));
+        }
+        evaluation_plan_domain::validate_parameters(
+            &definition.parameter_schema_json,
+            &node.parameters_json,
+        )
+        .map_err(Status::invalid_argument)?;
+        for binding in &node.input_bindings {
+            if !definition
+                .supported_input_schemas
+                .contains(&binding.schema_id)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "node {:?} binds unsupported input schema {:?}",
+                    node.node_id, binding.schema_id
+                )));
+            }
+        }
+        for invariant_id in &node.invariant_version_ids {
+            if !invariant_reference_visible(
+                db,
+                &plan.namespace,
+                invariant_id,
+                actor,
+                &mut visibility_cache,
+                &mut visibility_work,
+            )
+            .map_err(Status::internal)?
+            {
+                return Err(Status::failed_precondition(
+                    "governed invariant reference unavailable",
+                ));
+            }
+            let object = db
+                .get_object(invariant_id)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::failed_precondition("unknown invariant version"))?;
+            if object.kind != governed_fact_domain::FACT_KIND {
+                return Err(Status::failed_precondition(
+                    "evaluation plans may cover only governed invariant versions",
+                ));
+            }
+            let invariant =
+                governed_fact_domain::fact_from_object(&object).map_err(Status::data_loss)?;
+            if invariant.input.fact_type != GovernedFactType::Invariant
+                || invariant.input.status != "active"
+            {
+                return Err(Status::failed_precondition(
+                    "evaluation plans require active invariant versions",
+                ));
+            }
+            if !invariant.input.applicability.subject_refs.is_empty() {
+                return Err(Status::failed_precondition(
+                    "profile-wide evaluation plans cannot cover subject-specific invariants",
+                ));
+            }
+            if !plan.accepted_subject_profiles.iter().all(|profile| {
+                invariant
+                    .input
+                    .applicability
+                    .subject_profiles
+                    .contains(profile)
+            }) {
+                return Err(Status::failed_precondition(
+                    "invariant applicability does not cover every accepted subject profile",
+                ));
+            }
+            let verification = &invariant.input.verification;
+            if !definition
+                .supported_predicate_kinds
+                .contains(&verification.predicate_kind)
+                || !definition
+                    .supported_input_schemas
+                    .contains(&verification.input_schema)
+                || !definition
+                    .supported_result_schemas
+                    .contains(&verification.result_schema)
+            {
+                return Err(Status::failed_precondition(
+                    "evaluator definition is incompatible with invariant verification contract",
+                ));
+            }
+            if !node.input_bindings.iter().any(|binding| {
+                binding.source_kind == evaluation_plan_domain::INPUT_INVARIANT
+                    && binding.schema_id == verification.input_schema
+            }) {
+                return Err(Status::failed_precondition(
+                    "node lacks a typed invariant binding for its covered input schema",
+                ));
+            }
+            let evidence_classifications = fact_evidence_classifications(
+                db,
+                &plan.namespace,
+                invariant_id,
+                &mut fact_classification_cache,
+                &mut evidence_classification_cache,
+                &mut HashSet::new(),
+                &mut classification_work,
+            )?;
+            if evidence_classifications
+                .iter()
+                .any(|classification| !definition.evidence_classifications.contains(classification))
+            {
+                return Err(Status::failed_precondition(
+                    "evaluator definition does not admit the invariant evidence classification",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ChiseiServiceImpl {
@@ -9354,6 +9875,182 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn put_evaluator_definition(
+        &self,
+        req: Request<PutEvaluatorDefinitionRequest>,
+    ) -> Result<Response<PutEvaluatorDefinitionResponse>, Status> {
+        require_eval_admin(&req)?;
+        let actor = authenticated_actor(&req);
+        let definition = from_proto_evaluator_definition(
+            req.into_inner()
+                .definition
+                .ok_or_else(|| Status::invalid_argument("evaluator definition required"))?,
+        )?;
+        require_namespace_write_access(&self.db, &actor, &definition.namespace)?;
+        let definition = self
+            .db
+            .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
+            .map_err(map_evaluation_resource_error)?;
+        Ok(Response::new(PutEvaluatorDefinitionResponse {
+            record: Some(evaluator_record(&self.db, &definition)?),
+        }))
+    }
+
+    async fn get_evaluator_definition(
+        &self,
+        req: Request<GetEvaluatorDefinitionRequest>,
+    ) -> Result<Response<GetEvaluatorDefinitionResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let definition = self
+            .db
+            .get_evaluator_definition(&req.into_inner().definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("evaluator definition not found"))?;
+        if require_namespace_access(&self.db, &actor, &definition.namespace).is_err() {
+            return Err(Status::not_found("evaluator definition not found"));
+        }
+        Ok(Response::new(GetEvaluatorDefinitionResponse {
+            record: Some(evaluator_record(&self.db, &definition)?),
+        }))
+    }
+
+    async fn list_evaluator_definitions(
+        &self,
+        req: Request<ListEvaluatorDefinitionsRequest>,
+    ) -> Result<Response<ListEvaluatorDefinitionsResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        require_namespace_access(&self.db, &actor, &request.namespace)?;
+        let evaluator_id = (!request.evaluator_id.is_empty()).then_some(request.evaluator_id);
+        let definitions = self
+            .db
+            .list_evaluator_definitions(&request.namespace, evaluator_id.as_deref())
+            .map_err(Status::internal)?;
+        let records = definitions
+            .iter()
+            .map(|definition| evaluator_record(&self.db, definition))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(ListEvaluatorDefinitionsResponse { records }))
+    }
+
+    async fn set_evaluator_availability(
+        &self,
+        req: Request<SetEvaluatorAvailabilityRequest>,
+    ) -> Result<Response<SetEvaluatorAvailabilityResponse>, Status> {
+        require_eval_admin(&req)?;
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        let definition = self
+            .db
+            .get_evaluator_definition(&request.definition_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
+        require_namespace_write_access(&self.db, &actor, &definition.namespace)?;
+        let availability = self
+            .db
+            .set_evaluator_availability(
+                &request.definition_id,
+                &request.state,
+                &request.superseded_by_definition_id,
+                &request.reason,
+                &request.request_id,
+                &actor,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(map_evaluation_resource_error)?;
+        Ok(Response::new(SetEvaluatorAvailabilityResponse {
+            record: Some(evaluator_record_with_availability(
+                &definition,
+                &availability,
+            )),
+        }))
+    }
+
+    async fn put_evaluation_plan(
+        &self,
+        req: Request<PutEvaluationPlanRequest>,
+    ) -> Result<Response<PutEvaluationPlanResponse>, Status> {
+        require_eval_admin(&req)?;
+        let actor = authenticated_actor(&req);
+        let plan = from_proto_evaluation_plan(
+            req.into_inner()
+                .plan
+                .ok_or_else(|| Status::invalid_argument("evaluation plan required"))?,
+        );
+        require_namespace_write_access(&self.db, &actor, &plan.namespace)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let plan = evaluation_plan_domain::prepare_plan(plan, &actor, now_ms)
+            .map_err(map_evaluation_resource_error)?;
+        if let Some(existing) = self
+            .db
+            .get_evaluation_plan(&plan.plan_version_id)
+            .map_err(Status::internal)?
+        {
+            if existing.content_digest != plan.content_digest {
+                return Err(Status::already_exists(
+                    "evaluation plan version already exists with different content",
+                ));
+            }
+            if !evaluation_plan_visible(&self.db, &existing, &actor).map_err(Status::internal)? {
+                return Err(Status::failed_precondition(
+                    "governed invariant reference unavailable",
+                ));
+            }
+            return Ok(Response::new(PutEvaluationPlanResponse {
+                plan: Some(to_proto_evaluation_plan(&existing)),
+            }));
+        }
+        validate_evaluation_plan_references(&self.db, &plan, &actor)?;
+        let plan = self
+            .db
+            .put_evaluation_plan(plan, &actor, now_ms)
+            .map_err(map_evaluation_resource_error)?;
+        Ok(Response::new(PutEvaluationPlanResponse {
+            plan: Some(to_proto_evaluation_plan(&plan)),
+        }))
+    }
+
+    async fn get_evaluation_plan(
+        &self,
+        req: Request<GetEvaluationPlanRequest>,
+    ) -> Result<Response<GetEvaluationPlanResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let plan = self
+            .db
+            .get_evaluation_plan(&req.into_inner().plan_version_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("evaluation plan not found"))?;
+        if require_namespace_access(&self.db, &actor, &plan.namespace).is_err()
+            || !evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)?
+        {
+            return Err(Status::not_found("evaluation plan not found"));
+        }
+        Ok(Response::new(GetEvaluationPlanResponse {
+            plan: Some(to_proto_evaluation_plan(&plan)),
+        }))
+    }
+
+    async fn list_evaluation_plans(
+        &self,
+        req: Request<ListEvaluationPlansRequest>,
+    ) -> Result<Response<ListEvaluationPlansResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        require_namespace_access(&self.db, &actor, &request.namespace)?;
+        let plan_id = (!request.plan_id.is_empty()).then_some(request.plan_id);
+        let stored_plans = self
+            .db
+            .list_evaluation_plans(&request.namespace, plan_id.as_deref())
+            .map_err(Status::internal)?;
+        let mut plans = Vec::new();
+        for plan in stored_plans {
+            if evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)? {
+                plans.push(to_proto_evaluation_plan(&plan));
+            }
+        }
+        Ok(Response::new(ListEvaluationPlansResponse { plans }))
+    }
+
     async fn create_eval_suite(
         &self,
         req: Request<CreateEvalSuiteRequest>,
@@ -10996,6 +11693,448 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
         ChiseiServiceImpl::new(db, config(":memory:"))
+    }
+
+    fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
+        PutEvaluatorDefinitionRequest {
+            definition: Some(EvaluatorDefinition {
+                contract_version: evaluation_plan_domain::EVALUATOR_DEFINITION_CONTRACT.into(),
+                namespace: namespace.into(),
+                evaluator_id: "schema-check".into(),
+                version: "1.0.0".into(),
+                implementation_digest: format!("sha256:{}", "a".repeat(64)),
+                execution_class: evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS.into(),
+                supported_predicate_kinds: vec!["schema_conforms".into()],
+                supported_input_schemas: vec!["schema://document/v1".into()],
+                supported_result_schemas: vec!["schema://pass-fail/v1".into()],
+                parameter_schema_json: r#"{"type":"object","properties":{"strict":{"type":"boolean"}},"required":["strict"],"additionalProperties":false}"#.into(),
+                evidence_classifications: vec!["internal".into()],
+                resource_limits: Some(EvaluatorResourceLimits {
+                    timeout_ms: 1_000,
+                    max_input_bytes: 4_096,
+                    max_output_bytes: 1_024,
+                    max_evidence_items: 8,
+                }),
+                source_ref: "repo://evaluators/schema-check@1".into(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn install_invariant(svc: &ChiseiServiceImpl, namespace: &str) -> String {
+        install_invariant_with_subject_refs(svc, namespace, "document-schema", vec![])
+    }
+
+    fn install_invariant_with_subject_refs(
+        svc: &ChiseiServiceImpl,
+        namespace: &str,
+        fact_id: &str,
+        subject_refs: Vec<String>,
+    ) -> String {
+        install_invariant_with_references(svc, namespace, fact_id, subject_refs, vec![])
+    }
+
+    fn install_invariant_with_references(
+        svc: &ChiseiServiceImpl,
+        namespace: &str,
+        fact_id: &str,
+        subject_refs: Vec<String>,
+        evidence_refs: Vec<String>,
+    ) -> String {
+        governed_fact_domain::apply_profile(
+            &svc.db,
+            namespace,
+            governed_fact_domain::PROFILE_CONTRACT_VERSION,
+            "root",
+            1,
+        )
+        .unwrap();
+        governed_fact_domain::put_fact(
+            &svc.db,
+            governed_fact_domain::GovernedFactInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                fact_id: fact_id.into(),
+                version: "1.0.0".into(),
+                fact_type: GovernedFactType::Invariant,
+                status: "active".into(),
+                statement: "The document conforms to the declared schema.".into(),
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec!["document/v1".into()],
+                    subject_refs,
+                },
+                verification: governed_fact_domain::VerificationContract {
+                    predicate_kind: "schema_conforms".into(),
+                    input_schema: "schema://document/v1".into(),
+                    result_schema: "schema://pass-fail/v1".into(),
+                    evidence_types: vec![],
+                },
+                requirement_version_ids: vec![],
+                evidence_refs,
+                source_ref: "repo://requirements/document-schema@1".into(),
+                effective_from_ms: 1,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            2,
+        )
+        .unwrap()
+        .object_id
+    }
+
+    fn evaluation_plan_request(
+        namespace: &str,
+        definition_id: &str,
+        invariant_id: &str,
+        version: &str,
+    ) -> PutEvaluationPlanRequest {
+        PutEvaluationPlanRequest {
+            plan: Some(EvaluationPlan {
+                contract_version: evaluation_plan_domain::EVALUATION_PLAN_CONTRACT.into(),
+                namespace: namespace.into(),
+                plan_id: "document-review".into(),
+                version: version.into(),
+                accepted_subject_profiles: vec!["document/v1".into()],
+                nodes: vec![EvaluationPlanNode {
+                    node_id: "schema".into(),
+                    evaluator_definition_id: definition_id.into(),
+                    input_bindings: vec![EvaluationInputBinding {
+                        name: "document".into(),
+                        source_kind: evaluation_plan_domain::INPUT_INVARIANT.into(),
+                        schema_id: "schema://document/v1".into(),
+                    }],
+                    parameters_json: r#"{"strict":true}"#.into(),
+                    invariant_version_ids: vec![invariant_id.into()],
+                    classification: evaluation_plan_domain::NODE_REQUIRED.into(),
+                    ..Default::default()
+                }],
+                reducer: evaluation_plan_domain::FIXED_REDUCER.into(),
+                source_ref: "repo://plans/document-review@1".into(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluation_plans_bind_exact_compatible_resources_and_preserve_history() {
+        let svc = memory_service();
+        let invariant_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let stored = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let replay = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert_eq!(stored.content_digest, replay.content_digest);
+
+        let disabled = svc
+            .set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+                definition_id: definition.definition_id.clone(),
+                state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+                reason: "maintenance".into(),
+                request_id: "disable-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .availability
+            .unwrap();
+        assert_eq!(
+            disabled.state,
+            evaluation_plan_domain::AVAILABILITY_DISABLED
+        );
+        assert_eq!(disabled.request_id, "disable-1");
+        assert_eq!(disabled.reason, "maintenance");
+        let historical = svc
+            .get_evaluation_plan(Request::new(GetEvaluationPlanRequest {
+                plan_version_id: stored.plan_version_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert_eq!(historical.plan_version_id, stored.plan_version_id);
+        let historical_replay = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert_eq!(historical_replay.plan_version_id, stored.plan_version_id);
+        let error = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "2.0.0",
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn evaluation_plan_rejects_evidence_outside_evaluator_classifications() {
+        let svc = memory_service();
+        let evidence_id = "evidence-confidential";
+        svc.db
+            .create_object(&Object {
+                id: evidence_id.into(),
+                kind: crate::domain::KIND_EXTERNAL_EVIDENCE.into(),
+                name: "confidential evidence".into(),
+                namespace: "acme".into(),
+                external_id: "evidence:confidential".into(),
+                properties: HashMap::from([("classification".into(), "confidential".into())]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let invariant_id = install_invariant_with_references(
+            &svc,
+            "acme",
+            "document-schema",
+            vec![],
+            vec![evidence_id.into()],
+        );
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+
+        let mut request =
+            evaluation_plan_request("acme", &definition.definition_id, &invariant_id, "1.0.0");
+        request.plan.as_mut().unwrap().nodes[0]
+            .input_bindings
+            .push(EvaluationInputBinding {
+                name: "evidence".into(),
+                source_kind: evaluation_plan_domain::INPUT_EVIDENCE.into(),
+                schema_id: "schema://document/v1".into(),
+            });
+        let error = svc
+            .put_evaluation_plan(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "evaluator definition does not admit the invariant evidence classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluation_plan_validation_rejects_unknown_reducers_and_bad_parameters() {
+        let svc = memory_service();
+        let invariant_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let mut unknown =
+            evaluation_plan_request("acme", &definition.definition_id, &invariant_id, "1.0.0");
+        unknown.plan.as_mut().unwrap().reducer = "custom-expression".into();
+        assert_eq!(
+            svc.put_evaluation_plan(Request::new(unknown))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut bad_parameters =
+            evaluation_plan_request("acme", &definition.definition_id, &invariant_id, "1.0.0");
+        bad_parameters.plan.as_mut().unwrap().nodes[0].parameters_json =
+            r#"{"strict":"yes"}"#.into();
+        assert_eq!(
+            svc.put_evaluation_plan(Request::new(bad_parameters))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let unknown = evaluation_plan_request(
+            "acme",
+            "evaluator-definition:unknown",
+            &invariant_id,
+            "1.0.0",
+        );
+        assert_eq!(
+            svc.put_evaluation_plan(Request::new(unknown))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let subject_specific = install_invariant_with_subject_refs(
+            &svc,
+            "acme",
+            "subject-specific-schema",
+            vec!["document:one".into()],
+        );
+        let subject_specific_plan = evaluation_plan_request(
+            "acme",
+            &definition.definition_id,
+            &subject_specific,
+            "1.0.0",
+        );
+        let error = svc
+            .put_evaluation_plan(Request::new(subject_specific_plan))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("subject-specific"));
+    }
+
+    #[tokio::test]
+    async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
+        let svc = memory_service();
+        let invariant_id = install_invariant(&svc, "acme");
+        let definition = svc
+            .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(evaluation_plan_request(
+                "acme",
+                &definition.definition_id,
+                &invariant_id,
+                "1.0.0",
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        svc.db
+            .create_object(&Object {
+                id: "evaluation-namespace-acme".into(),
+                kind: "namespace".into(),
+                name: "Acme".into(),
+                namespace: String::new(),
+                external_id: "namespace:acme".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_grant(&Grant {
+                id: "alice-evaluation-acme".into(),
+                object_id: "evaluation-namespace-acme".into(),
+                principal: "alice".into(),
+                role: Role::Admin,
+                created: 1,
+            })
+            .unwrap();
+
+        let mut alice_definition = Request::new(GetEvaluatorDefinitionRequest {
+            definition_id: definition.definition_id.clone(),
+        });
+        alice_definition
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        svc.get_evaluator_definition(alice_definition)
+            .await
+            .unwrap();
+        let mut mallory_plan = Request::new(GetEvaluationPlanRequest {
+            plan_version_id: plan.plan_version_id.clone(),
+        });
+        mallory_plan
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        assert_eq!(
+            svc.get_evaluation_plan(mallory_plan)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+
+        svc.db
+            .create_grant(&Grant {
+                id: "root-only-invariant".into(),
+                object_id: invariant_id,
+                principal: "root".into(),
+                role: Role::Viewer,
+                created: 2,
+            })
+            .unwrap();
+        let mut alice_plan = Request::new(GetEvaluationPlanRequest {
+            plan_version_id: plan.plan_version_id,
+        });
+        alice_plan
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.get_evaluation_plan(alice_plan)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+
+        let mut alice_put = Request::new(evaluator_definition_request("acme"));
+        alice_put
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.put_evaluator_definition(alice_put)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 
     fn governed_subject_request(

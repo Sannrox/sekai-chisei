@@ -184,6 +184,7 @@ impl SekaiDb {
         self.migrate_handoffs()?;
         self.migrate_capability_packages()?;
         self.migrate_chisei()?;
+        self.migrate_evaluation_plans()?;
         self.migrate_kioku()?;
         self.migrate_action_types()?;
         self.migrate_governed_action_types()?;

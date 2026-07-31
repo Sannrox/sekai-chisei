@@ -1708,6 +1708,115 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_evaluator_definition(
+        &self,
+        definition: crate::chisei::evaluation_plan::EvaluatorDefinition,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluatorDefinition, String> {
+        match self {
+            Self::Sqlite(db) => db.put_evaluator_definition(definition, actor, now_ms),
+            Self::Postgres(db) => db.put_evaluator_definition(definition, actor, now_ms),
+        }
+    }
+
+    pub fn get_evaluator_definition(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorDefinition>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_evaluator_definition(definition_id),
+            Self::Postgres(db) => db.get_evaluator_definition(definition_id),
+        }
+    }
+
+    pub fn list_evaluator_definitions(
+        &self,
+        namespace: &str,
+        evaluator_id: Option<&str>,
+    ) -> Result<Vec<crate::chisei::evaluation_plan::EvaluatorDefinition>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_evaluator_definitions(namespace, evaluator_id),
+            Self::Postgres(db) => db.list_evaluator_definitions(namespace, evaluator_id),
+        }
+    }
+
+    pub fn get_evaluator_availability(
+        &self,
+        definition_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorAvailability>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_evaluator_availability(definition_id),
+            Self::Postgres(db) => db.get_evaluator_availability(definition_id),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_evaluator_availability(
+        &self,
+        definition_id: &str,
+        state: &str,
+        superseded_by_definition_id: &str,
+        reason: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluatorAvailability, String> {
+        match self {
+            Self::Sqlite(db) => db.set_evaluator_availability(
+                definition_id,
+                state,
+                superseded_by_definition_id,
+                reason,
+                request_id,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.set_evaluator_availability(
+                definition_id,
+                state,
+                superseded_by_definition_id,
+                reason,
+                request_id,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn put_evaluation_plan(
+        &self,
+        plan: crate::chisei::evaluation_plan::EvaluationPlan,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::chisei::evaluation_plan::EvaluationPlan, String> {
+        match self {
+            Self::Sqlite(db) => db.put_evaluation_plan(plan, actor, now_ms),
+            Self::Postgres(db) => db.put_evaluation_plan(plan, actor, now_ms),
+        }
+    }
+
+    pub fn get_evaluation_plan(
+        &self,
+        plan_version_id: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_evaluation_plan(plan_version_id),
+            Self::Postgres(db) => db.get_evaluation_plan(plan_version_id),
+        }
+    }
+
+    pub fn list_evaluation_plans(
+        &self,
+        namespace: &str,
+        plan_id: Option<&str>,
+    ) -> Result<Vec<crate::chisei::evaluation_plan::EvaluationPlan>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_evaluation_plans(namespace, plan_id),
+            Self::Postgres(db) => db.list_evaluation_plans(namespace, plan_id),
+        }
+    }
+
     pub fn put_governed_action_type(
         &self,
         type_def: crate::sekai::governed_action_type::GovernedActionType,
