@@ -3,6 +3,41 @@
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 
+pub(crate) fn validate_evaluation_receipt_event_order(
+    receipt: &OperationReceipt,
+    event: &OperationReceiptEvent,
+) -> Result<(), String> {
+    if receipt.operation_class != "evaluation_manifest_execution" {
+        return Ok(());
+    }
+    let is_cancellation = event
+        .attributes
+        .get("evaluation_cancel_requested")
+        .is_some_and(|value| value == "true");
+    if is_cancellation && receipt.completed_at_ms.is_some() {
+        return Err("evaluation execution already has a terminal outcome".into());
+    }
+    let cancellation_preempts = receipt.events.iter().any(|existing| {
+        existing
+            .attributes
+            .get("evaluation_cancel_requested")
+            .is_some_and(|value| value == "true")
+    });
+    if event.attributes.contains_key("evaluation_step_receipt")
+        && cancellation_preempts
+        && event.attributes.get("reason_code").map(String::as_str) != Some("execution_cancelled")
+    {
+        return Err("evaluation execution cancellation preempts step result".into());
+    }
+    if event.attributes.contains_key("evaluation_gate_decision")
+        && cancellation_preempts
+        && event.attributes.get("reason_code").map(String::as_str) != Some("execution_cancelled")
+    {
+        return Err("evaluation execution cancellation preempts terminal outcome".into());
+    }
+    Ok(())
+}
+
 pub trait ChiseiReceiptBackend: Send + Sync {
     fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
     fn get_operation_receipt(&self, operation_id: &str)
@@ -142,4 +177,92 @@ impl ChiseiReceiptBackend for SekaiDb {
 }
 impl ChiseiReceiptBackend for PostgresDb {
     forward!(PostgresDb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, ReceiptEventKind, ReceiptSurface};
+    use std::collections::BTreeMap;
+
+    fn receipt() -> OperationReceipt {
+        OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: "evaluation-execution:test".into(),
+            parent_operation_id: None,
+            namespace: "test".into(),
+            operation_class: "evaluation_manifest_execution".into(),
+            initiating_actor: "starter".into(),
+            schema_version: "executor/v1".into(),
+            policy_version: "reducer/v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: None,
+            events: vec![],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+        }
+    }
+
+    fn event(attributes: BTreeMap<String, String>) -> OperationReceiptEvent {
+        OperationReceiptEvent {
+            event_id: "event".into(),
+            operation_id: "evaluation-execution:test".into(),
+            parent_event_id: Some("parent".into()),
+            timestamp_ms: 2,
+            kind: ReceiptEventKind::OutcomeRecorded,
+            surface: ReceiptSurface::Outcome,
+            actor: "executor".into(),
+            references: vec![],
+            attributes,
+        }
+    }
+
+    #[test]
+    fn serialized_receipt_order_makes_cancellation_and_terminal_outcome_exclusive() {
+        let cancellation = event(BTreeMap::from([(
+            "evaluation_cancel_requested".into(),
+            "true".into(),
+        )]));
+        let mut cancelled_receipt = receipt();
+        cancelled_receipt.events.push(cancellation);
+        let allow_gate = event(BTreeMap::from([
+            ("evaluation_gate_decision".into(), "{}".into()),
+            ("reason_code".into(), "all_required_nodes_passed".into()),
+        ]));
+        assert!(validate_evaluation_receipt_event_order(&cancelled_receipt, &allow_gate).is_err());
+        let stale_step = event(BTreeMap::from([
+            ("evaluation_step_receipt".into(), "{}".into()),
+            ("reason_code".into(), "fixture_pass".into()),
+        ]));
+        assert!(validate_evaluation_receipt_event_order(&cancelled_receipt, &stale_step).is_err());
+        let cancelled_step = event(BTreeMap::from([
+            ("evaluation_step_receipt".into(), "{}".into()),
+            ("reason_code".into(), "execution_cancelled".into()),
+        ]));
+        assert!(
+            validate_evaluation_receipt_event_order(&cancelled_receipt, &cancelled_step).is_ok()
+        );
+        let cancelled_gate = event(BTreeMap::from([
+            ("evaluation_gate_decision".into(), "{}".into()),
+            ("reason_code".into(), "execution_cancelled".into()),
+        ]));
+        assert!(
+            validate_evaluation_receipt_event_order(&cancelled_receipt, &cancelled_gate).is_ok()
+        );
+
+        let mut completed_receipt = receipt();
+        completed_receipt.completed_at_ms = Some(2);
+        let late_cancellation = event(BTreeMap::from([(
+            "evaluation_cancel_requested".into(),
+            "true".into(),
+        )]));
+        assert!(
+            validate_evaluation_receipt_event_order(&completed_receipt, &late_cancellation)
+                .is_err()
+        );
+        completed_receipt.operation_class = "unrelated_operation".into();
+        assert!(
+            validate_evaluation_receipt_event_order(&completed_receipt, &late_cancellation).is_ok()
+        );
+    }
 }

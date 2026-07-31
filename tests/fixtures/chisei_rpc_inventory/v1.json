@@ -859,6 +859,46 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExecuteEvaluationManifest",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_execution_backend_conformance.rs",
+        "src/db/postgres_evaluation_execution.rs",
+        "src/chisei/evaluation_execution.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "GetEvaluationExecution",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_execution_backend_conformance.rs",
+        "src/db/postgres_evaluation_execution.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "CancelEvaluationExecution",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_execution_backend_conformance.rs",
+        "src/db/postgres_evaluation_execution.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "CreateEvalSuite",
       "kind": "persistent",
       "surfaces": [

@@ -89,6 +89,8 @@ lives in the separate [research index](research/README.md).
   content-bound evaluation through registered profiles.
 - [Resolved evaluation manifests](evaluation-manifests.md) — authorized,
   content-bound evaluation-plan resolution without evaluator execution.
+- [Deterministic evaluation execution](evaluation-execution.md) — exact-digest
+  compiled evaluators, step receipts, recovery, cancellation, and fixed gates.
 - [Governed requirement and invariant facts](governed-facts.md) — versioned
   normative facts, exact supersession, governed waivers, and set resolution.
 - [Host-executor permit conformance](host-executor-permit-conformance.md) —

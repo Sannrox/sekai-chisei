@@ -489,6 +489,77 @@ message ResolveEvaluationPlanResponse {
   repeated EvaluationResolutionFinding findings = 3;
 }
 
+// Executes one exact resolved manifest through compiled deterministic
+// implementations. The manifest digest is the execution idempotency key.
+message EvaluationExecutionRequest {
+  string contract_version = 1; // chisei.evaluation-execution-request/v1
+  string executor_version = 2; // chisei.deterministic-evaluation-executor/v1
+  string namespace = 3;
+  string manifest_digest = 4;
+  uint64 max_total_duration_ms = 5; // zero selects the bounded server default
+}
+message EvaluationStepReceipt {
+  string contract_version = 1; // chisei.evaluation-step-receipt/v1
+  string manifest_digest = 2;
+  string node_id = 3;
+  string classification = 4; // required | advisory
+  string status = 5; // pass | fail | unknown | unavailable | error | skipped
+  string reason_code = 6;
+  string input_digest = 7;
+  string parameters_digest = 8;
+  string evaluator_definition_digest = 9;
+  string implementation_digest = 10;
+  repeated string evidence_digests = 11;
+  repeated string dependency_result_digests = 12;
+  reserved 13; // evaluator output content is never persisted or disclosed
+  string result_digest = 14;
+  string step_receipt_digest = 15;
+}
+message InvariantCoverageDecision {
+  string invariant_version_id = 1;
+  repeated string covered_by_node_ids = 2;
+  repeated string waiver_version_ids = 3;
+  bool satisfied = 4;
+}
+message EvaluationGateDecision {
+  string contract_version = 1; // chisei.evaluation-gate-decision/v1
+  string manifest_digest = 2;
+  string reducer = 3;
+  string verdict = 4; // allow | deny | unknown | unavailable
+  string reason_code = 5;
+  repeated string step_receipt_digests = 6;
+  repeated InvariantCoverageDecision invariant_coverage = 7;
+  string decision_digest = 8;
+}
+message EvaluationExecutionProjection {
+  string manifest_digest = 1;
+  string operation_id = 2;
+  string namespace = 3;
+  string status = 4; // running | cancelled | allow | deny | unknown | unavailable
+  repeated EvaluationStepReceipt steps = 5;
+  EvaluationGateDecision decision = 6;
+}
+message ExecuteEvaluationManifestRequest {
+  EvaluationExecutionRequest execution = 1;
+}
+message ExecuteEvaluationManifestResponse {
+  EvaluationExecutionProjection execution = 1;
+}
+message GetEvaluationExecutionRequest {
+  string namespace = 1;
+  string manifest_digest = 2;
+}
+message GetEvaluationExecutionResponse {
+  EvaluationExecutionProjection execution = 1;
+}
+message CancelEvaluationExecutionRequest {
+  string namespace = 1;
+  string manifest_digest = 2;
+}
+message CancelEvaluationExecutionResponse {
+  EvaluationExecutionProjection execution = 1;
+}
+
 message GateDecision {
   string verdict = 1;
   string reason = 2;
@@ -1540,6 +1611,9 @@ message EvaluateGovernedSubjectResponse { GovernedSubjectResult result = 1; }
 // clients of this service.
 service ChiseiService {
   rpc EvaluateGovernedSubject(EvaluateGovernedSubjectRequest) returns (EvaluateGovernedSubjectResponse);
+  rpc ExecuteEvaluationManifest(ExecuteEvaluationManifestRequest) returns (ExecuteEvaluationManifestResponse);
+  rpc GetEvaluationExecution(GetEvaluationExecutionRequest) returns (GetEvaluationExecutionResponse);
+  rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc ResolveExternalActionApproval(ResolveExternalActionApprovalRequest) returns (ResolveExternalActionApprovalResponse);
   rpc CancelExternalActionAuthorization(CancelExternalActionAuthorizationRequest) returns (CancelExternalActionAuthorizationResponse);

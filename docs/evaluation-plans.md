@@ -128,3 +128,6 @@ part of the v1 public API.
 
 `EvalSuite`, `EvalRun`, governed-subject v1 profiles, and operation-receipt
 authority are unchanged by these resources.
+
+Execution and recovery semantics are documented in
+[Deterministic evaluation execution](evaluation-execution.md).
