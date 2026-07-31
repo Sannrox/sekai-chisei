@@ -514,6 +514,38 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExportGovernedSubjectProvenance",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "src/chisei/governed_subject_provenance.rs",
+        "src/grpc/chisei_service.rs",
+        "tests/chisei_governed_subject_provenance_backend_conformance.rs",
+        "src/db/governed_subject_provenance.rs",
+        "src/db/postgres_governed_subject_provenance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetGovernedSubjectProvenanceTrustRoot",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/governed_subject_provenance.rs",
+        "src/grpc/chisei_service.rs",
+        "tests/chisei_governed_subject_provenance_backend_conformance.rs",
+        "src/db/governed_subject_provenance.rs",
+        "src/db/postgres_governed_subject_provenance.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.execution"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "EvaluateGovernedSubjectWithPlan",
       "kind": "persistent",
       "surfaces": [

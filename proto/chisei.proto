@@ -1604,6 +1604,54 @@ message GovernedSubjectResult {
 }
 message EvaluateGovernedSubjectResponse { GovernedSubjectResult result = 1; }
 
+// Authenticated evidence export for Tenkai's single compiled governed-subject
+// admission profile. This is not an arbitrary receipt-signing API.
+message ExportGovernedSubjectProvenanceRequest {
+  string export_id = 1;
+  string operation_id = 2;
+  string expected_subject_identity = 3;
+  string expected_manifest_digest = 4;
+  string expected_artifact_digest = 5;
+  string expected_receipt_digest = 6;
+  string expected_subject_content_digest = 7;
+}
+message GovernedSubjectProvenanceReference {
+  string kind = 1;
+  string id = 2;
+  string digest = 3;
+}
+message GovernedSubjectProvenanceEnvelope {
+  string profile = 1; // example.governed-subject-receipt/v1
+  string issuer = 2; // sekai-chisei
+  string issuer_key_id = 3;
+  string subject = 4;
+  string content_digest = 5;
+  string decision = 6; // allow
+  string receipt_schema = 7; // chisei.governed-subject-receipt/v1
+  string receipt_digest = 8;
+  repeated GovernedSubjectProvenanceReference governed_references = 9;
+  int64 observed_at_unix_ms = 10;
+  int64 expires_at_unix_ms = 11;
+  string signature = 12;
+}
+message ExportGovernedSubjectProvenanceResponse {
+  GovernedSubjectProvenanceEnvelope envelope = 1;
+  string envelope_digest = 2;
+  bool replayed = 3;
+}
+message GetGovernedSubjectProvenanceTrustRootRequest {
+  string export_id = 1;
+}
+message GovernedSubjectProvenanceTrustRoot {
+  uint32 version = 1;
+  string key_id = 2;
+  string identity = 3;
+  string public_key = 4;
+}
+message GetGovernedSubjectProvenanceTrustRootResponse {
+  GovernedSubjectProvenanceTrustRoot trust_root = 1;
+}
+
 // Additive plan-backed path for software release candidates. The exact
 // subject profile selects situation-specific plan and evaluator semantics;
 // existing governed-subject/v1 profile strings are never reinterpreted.
@@ -1653,6 +1701,8 @@ message EvaluateGovernedSubjectWithPlanResponse {
 // clients of this service.
 service ChiseiService {
   rpc EvaluateGovernedSubject(EvaluateGovernedSubjectRequest) returns (EvaluateGovernedSubjectResponse);
+  rpc ExportGovernedSubjectProvenance(ExportGovernedSubjectProvenanceRequest) returns (ExportGovernedSubjectProvenanceResponse);
+  rpc GetGovernedSubjectProvenanceTrustRoot(GetGovernedSubjectProvenanceTrustRootRequest) returns (GetGovernedSubjectProvenanceTrustRootResponse);
   rpc EvaluateGovernedSubjectWithPlan(EvaluateGovernedSubjectWithPlanRequest) returns (EvaluateGovernedSubjectWithPlanResponse);
   rpc ExecuteEvaluationManifest(ExecuteEvaluationManifestRequest) returns (ExecuteEvaluationManifestResponse);
   rpc GetEvaluationExecution(GetEvaluationExecutionRequest) returns (GetEvaluationExecutionResponse);

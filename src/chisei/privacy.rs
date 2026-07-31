@@ -228,6 +228,10 @@ mod tests {
             permit_signing_key: None,
             permit_issuer: "chisei.local".into(),
             permit_key_id: "permit-key-1".into(),
+            governed_subject_provenance_signing_key: None,
+            governed_subject_provenance_key_not_before_ms: 0,
+            governed_subject_provenance_key_expires_at_ms: i64::MAX,
+            governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
             site_id: "local".into(),
             budget_topology: Default::default(),
         };

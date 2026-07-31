@@ -39,6 +39,12 @@ pub struct Config {
     pub permit_signing_key: Option<String>,
     pub permit_issuer: String,
     pub permit_key_id: String,
+    /// Hex-encoded Ed25519 seed used only for Tenkai-compatible governed-subject
+    /// provenance. The key is never projected through an API.
+    pub governed_subject_provenance_signing_key: Option<String>,
+    pub governed_subject_provenance_key_not_before_ms: i64,
+    pub governed_subject_provenance_key_expires_at_ms: i64,
+    pub governed_subject_provenance_ttl_ms: i64,
     /// Stable region/site pin for leases and online permit redemption (#293).
     /// Default `"local"` keeps single-region deployments unchanged.
     pub site_id: String,
@@ -94,6 +100,24 @@ impl Config {
             permit_signing_key: optional_env("CHISEI_PERMIT_SIGNING_KEY"),
             permit_issuer: env("CHISEI_PERMIT_ISSUER", "chisei.local"),
             permit_key_id: env("CHISEI_PERMIT_KEY_ID", "permit-key-1"),
+            governed_subject_provenance_signing_key: optional_env(
+                "CHISEI_GOVERNED_SUBJECT_PROVENANCE_SIGNING_KEY",
+            ),
+            governed_subject_provenance_key_not_before_ms: security_i64_env(
+                "CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_NOT_BEFORE_MS",
+                0,
+                i64::MAX,
+            ),
+            governed_subject_provenance_key_expires_at_ms: security_i64_env(
+                "CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_EXPIRES_AT_MS",
+                i64::MAX,
+                i64::MIN,
+            ),
+            governed_subject_provenance_ttl_ms: security_i64_env(
+                "CHISEI_GOVERNED_SUBJECT_PROVENANCE_TTL_MS",
+                24 * 60 * 60 * 1_000,
+                0,
+            ),
             site_id: site_id_env("SEKAI_SITE_ID", "local"),
             budget_topology: BudgetTopologyConfig::from_env().unwrap_or_else(|err| {
                 warn!(error = %err, "invalid budget topology config; using single_region");
@@ -122,6 +146,31 @@ impl Config {
             token_auth_mode,
             auth_configured,
             bind_inferred_from_active_credentials,
+        }
+    }
+}
+
+fn security_i64_env(name: &str, default: i64, invalid: i64) -> i64 {
+    match std::env::var(name) {
+        Ok(value) => match value.parse() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    variable = name,
+                    error = %error,
+                    "invalid security-sensitive configuration; dependent issuance is disabled"
+                );
+                invalid
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            warn!(
+                variable = name,
+                error = %error,
+                "unreadable security-sensitive configuration; dependent issuance is disabled"
+            );
+            invalid
         }
     }
 }

@@ -29,12 +29,19 @@ template.
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
 | `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
 | `CHISEI_PERMIT_KEY_ID` | `permit-key-1` | Key id embedded in signed permits for rotation |
+| `CHISEI_GOVERNED_SUBJECT_PROVENANCE_SIGNING_KEY` | unset | Separate Ed25519 seed (64 hexadecimal chars) for authenticated Tenkai-compatible governed-subject provenance; never returned by an API |
+| `CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_NOT_BEFORE_MS` | `0` | Earliest Unix millisecond at which the configured provenance key may issue an envelope |
+| `CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_EXPIRES_AT_MS` | `i64::MAX` | Exclusive Unix-millisecond retirement time for new envelopes; envelope expiry is capped to this value |
+| `CHISEI_GOVERNED_SUBJECT_PROVENANCE_TTL_MS` | `86400000` | Issued envelope lifetime; must be positive and no more than 31 days |
 | `RUST_LOG` | `info` | Tracing filter |
 | `LOG_FORMAT` | `pretty` | Use `json` for structured logs |
 
 When authenticated mode is active and `SEKAI_BIND` is unset, TCP binds to
 `0.0.0.0`. A public bind requires TLS unless `SEKAI_ALLOW_PLAINTEXT=1` is an
 explicit operator decision.
+
+Malformed governed-subject provenance key-window or TTL values disable new
+provenance issuance; they never fall back to a wider activation window.
 
 Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public

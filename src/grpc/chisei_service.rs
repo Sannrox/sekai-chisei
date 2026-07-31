@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ use crate::chisei::evaluation_plan as evaluation_plan_domain;
 use crate::chisei::external_action as external;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
+use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{
@@ -6616,6 +6618,138 @@ fn governed_subject_result_from_receipt(
     })
 }
 
+fn subject_provenance_envelope_to_proto(
+    value: &subject_provenance::ProvenanceEnvelope,
+) -> GovernedSubjectProvenanceEnvelope {
+    GovernedSubjectProvenanceEnvelope {
+        profile: value.profile.clone(),
+        issuer: value.issuer.clone(),
+        issuer_key_id: value.issuer_key_id.clone(),
+        subject: value.subject.clone(),
+        content_digest: value.content_digest.clone(),
+        decision: value.decision.clone(),
+        receipt_schema: value.receipt_schema.clone(),
+        receipt_digest: value.receipt_digest.clone(),
+        governed_references: value
+            .governed_references
+            .iter()
+            .map(|reference| GovernedSubjectProvenanceReference {
+                kind: reference.kind.clone(),
+                id: reference.id.clone(),
+                digest: reference.digest.clone(),
+            })
+            .collect(),
+        observed_at_unix_ms: value.observed_at_unix_ms,
+        expires_at_unix_ms: value.expires_at_unix_ms,
+        signature: value.signature.clone(),
+    }
+}
+
+fn subject_provenance_response(
+    record: &subject_provenance::ExportRecord,
+    replayed: bool,
+    now_ms: i64,
+) -> Result<ExportGovernedSubjectProvenanceResponse, Status> {
+    record
+        .envelope
+        .validate(now_ms)
+        .map_err(Status::failed_precondition)?;
+    Ok(ExportGovernedSubjectProvenanceResponse {
+        envelope: Some(subject_provenance_envelope_to_proto(&record.envelope)),
+        envelope_digest: record.envelope.digest().map_err(Status::data_loss)?,
+        replayed,
+    })
+}
+
+fn load_subject_provenance_record(
+    db: &RuntimeDb,
+    actor: &str,
+    export_id: &str,
+) -> Result<Option<subject_provenance::ExportRecord>, Status> {
+    db.get_governed_subject_provenance_export(actor, export_id)
+        .map_err(Status::internal)
+}
+
+fn reconcile_subject_provenance_receipt(
+    receipt: &OperationReceipt,
+    binding: &subject_provenance::ExportRequestBinding,
+    now_ms: i64,
+) -> Result<(String, String), Status> {
+    if receipt.operation_id != binding.operation_id
+        || receipt.operation_class != "governed_subject_evaluation"
+        || receipt.schema_version != subject::RECEIPT_SCHEMA_VERSION
+        || receipt.completed_at_ms.is_none()
+    {
+        return Err(Status::failed_precondition(
+            "operation is not a complete governed-subject receipt",
+        ));
+    }
+    let result = governed_subject_result_from_receipt(receipt).map_err(|_| {
+        Status::data_loss("governed-subject receipt is incomplete or internally inconsistent")
+    })?;
+    if result.decision != "allow" || !result.fresh {
+        return Err(Status::failed_precondition(
+            "governed-subject receipt is not an authoritative allow",
+        ));
+    }
+    let receipt_bytes = serde_json::to_vec(receipt)
+        .map_err(|_| Status::data_loss("governed-subject receipt cannot be reconciled"))?;
+    let receipt_digest = format!("sha256:{:x}", sha2::Sha256::digest(receipt_bytes));
+    if receipt_digest != binding.expected_receipt_digest {
+        return Err(Status::failed_precondition(
+            "governed-subject receipt digest does not match the requested export",
+        ));
+    }
+    let intent = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+        .ok_or_else(|| Status::data_loss("governed-subject receipt intent is missing"))?;
+    if intent.attributes.get("subject_identity") != Some(&binding.expected_subject_identity)
+        || intent.attributes.get("content_digest") != Some(&binding.expected_subject_content_digest)
+        || intent.attributes.get("subject_profile").map(String::as_str)
+            != Some(subject::SOFTWARE_RELEASE_PROFILE)
+    {
+        return Err(Status::failed_precondition(
+            "governed-subject identity does not match the requested software release",
+        ));
+    }
+    let reference = |kind: &str| {
+        intent
+            .references
+            .iter()
+            .find(|reference| reference.kind == kind)
+            .ok_or_else(|| {
+                Status::data_loss("governed-subject receipt lacks required release evidence")
+            })
+    };
+    let manifest = reference("manifest")?;
+    let artifact = reference("artifact")?;
+    if manifest.content_hash.as_deref() != Some(&binding.expected_manifest_digest)
+        || artifact.content_hash.as_deref() != Some(&binding.expected_artifact_digest)
+    {
+        return Err(Status::failed_precondition(
+            "governed-subject release evidence does not match the requested export",
+        ));
+    }
+    for governed_reference in &result.references {
+        if governed_reference.observed_at_ms <= 0
+            || governed_reference.observed_at_ms > now_ms
+            || now_ms - governed_reference.observed_at_ms > subject::MAX_EVIDENCE_AGE_MS
+        {
+            return Err(Status::failed_precondition(
+                "governed-subject release evidence is stale",
+            ));
+        }
+    }
+    let content_digest = subject_provenance::release_content_digest(
+        &binding.expected_manifest_digest,
+        &binding.expected_artifact_digest,
+    )
+    .map_err(Status::invalid_argument)?;
+    Ok((receipt.namespace.clone(), content_digest))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PlanBackedDecisionEvidence {
     decision: String,
@@ -7153,6 +7287,146 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(EvaluateGovernedSubjectResponse {
             result: Some(governed_subject_result_from_receipt(&receipt)?),
         }))
+    }
+
+    async fn export_governed_subject_provenance(
+        &self,
+        req: Request<ExportGovernedSubjectProvenanceRequest>,
+    ) -> Result<Response<ExportGovernedSubjectProvenanceResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let request = req.into_inner();
+        let binding = subject_provenance::ExportRequestBinding {
+            actor: actor.clone(),
+            export_id: request.export_id,
+            operation_id: request.operation_id,
+            expected_subject_identity: request.expected_subject_identity,
+            expected_subject_content_digest: request.expected_subject_content_digest,
+            expected_manifest_digest: request.expected_manifest_digest,
+            expected_artifact_digest: request.expected_artifact_digest,
+            expected_receipt_digest: request.expected_receipt_digest,
+        };
+        let binding_digest =
+            subject_provenance::binding_digest(&binding).map_err(Status::invalid_argument)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(existing) =
+            load_subject_provenance_record(&self.db, &binding.actor, &binding.export_id)?
+        {
+            if existing.binding_digest != binding_digest {
+                return Err(Status::already_exists(
+                    "export_id is already bound to different governed-subject evidence",
+                ));
+            }
+            require_namespace_access(&self.db, &actor, &existing.namespace)?;
+            return Ok(Response::new(subject_provenance_response(
+                &existing, true, now_ms,
+            )?));
+        }
+
+        let receipt = self
+            .db
+            .get_operation_receipt(&binding.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
+        require_namespace_write_access(&self.db, &actor, &receipt.namespace)?;
+        let (namespace, content_digest) =
+            reconcile_subject_provenance_receipt(&receipt, &binding, now_ms)?;
+        let key_hex = self
+            .config
+            .governed_subject_provenance_signing_key
+            .as_deref()
+            .ok_or_else(|| {
+                Status::failed_precondition("governed-subject provenance signing is not configured")
+            })?;
+        let signing_key = subject_provenance::signing_key_from_hex(key_hex)
+            .map_err(Status::failed_precondition)?;
+        if now_ms < self.config.governed_subject_provenance_key_not_before_ms
+            || now_ms >= self.config.governed_subject_provenance_key_expires_at_ms
+        {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance signing key is not active",
+            ));
+        }
+        let ttl_ms = self.config.governed_subject_provenance_ttl_ms;
+        if ttl_ms <= 0 || ttl_ms > subject_provenance::MAX_ENVELOPE_TTL_MS {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance TTL is invalid",
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .unwrap_or(i64::MAX)
+            .min(self.config.governed_subject_provenance_key_expires_at_ms);
+        if expires_at_ms <= now_ms {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance signing key expires too soon",
+            ));
+        }
+        let envelope = subject_provenance::ProvenanceEnvelope::issue(
+            &signing_key,
+            binding.expected_subject_identity.clone(),
+            content_digest,
+            binding.expected_receipt_digest.clone(),
+            binding.operation_id.clone(),
+            now_ms,
+            expires_at_ms,
+        )
+        .map_err(Status::internal)?;
+        envelope
+            .verify(&signing_key.verifying_key().to_bytes(), now_ms)
+            .map_err(Status::internal)?;
+        let record = subject_provenance::ExportRecord {
+            binding_digest,
+            namespace,
+            envelope,
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().to_bytes()),
+            created_at_ms: now_ms,
+        };
+        let (stored, inserted) = self
+            .db
+            .put_governed_subject_provenance_export(
+                &binding.actor,
+                &binding.export_id,
+                &record,
+            )
+            .map_err(|error| {
+                if error.contains("already bound") {
+                    Status::already_exists(
+                        "export_id is already bound to different governed-subject evidence",
+                    )
+                } else {
+                    tracing::warn!(error = %error, "governed-subject provenance export persistence failed");
+                    Status::aborted(
+                        "governed-subject provenance export could not be committed",
+                    )
+                }
+            })?;
+        Ok(Response::new(subject_provenance_response(
+            &stored, !inserted, now_ms,
+        )?))
+    }
+
+    async fn get_governed_subject_provenance_trust_root(
+        &self,
+        req: Request<GetGovernedSubjectProvenanceTrustRootRequest>,
+    ) -> Result<Response<GetGovernedSubjectProvenanceTrustRootResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let request = req.into_inner();
+        subject_provenance::validate_export_id(&request.export_id)
+            .map_err(Status::invalid_argument)?;
+        let record = load_subject_provenance_record(&self.db, &actor, &request.export_id)?
+            .ok_or_else(|| Status::not_found("governed-subject provenance export not found"))?;
+        require_namespace_access(&self.db, &actor, &record.namespace)?;
+        Ok(Response::new(
+            GetGovernedSubjectProvenanceTrustRootResponse {
+                trust_root: Some(GovernedSubjectProvenanceTrustRoot {
+                    version: subject_provenance::TRUST_ROOT_VERSION,
+                    key_id: record.envelope.issuer_key_id,
+                    identity: subject_provenance::ISSUER.into(),
+                    public_key: record.public_key,
+                }),
+            },
+        ))
     }
 
     async fn evaluate_governed_subject_with_plan(
@@ -14056,6 +14330,10 @@ mod tests {
             permit_signing_key: Some("07".repeat(32)),
             permit_issuer: "issuer:test".into(),
             permit_key_id: "key-1".into(),
+            governed_subject_provenance_signing_key: Some("09".repeat(32)),
+            governed_subject_provenance_key_not_before_ms: 0,
+            governed_subject_provenance_key_expires_at_ms: i64::MAX,
+            governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
             site_id: "local".into(),
             budget_topology: Default::default(),
         }
@@ -16281,6 +16559,309 @@ mod tests {
         assert_eq!(stale.decision, "unknown");
         assert_eq!(stale.failure_code, "stale_evidence");
         assert!(!stale.fresh);
+    }
+
+    fn governed_subject_provenance_request(
+        export_id: &str,
+        result: &GovernedSubjectResult,
+    ) -> Request<ExportGovernedSubjectProvenanceRequest> {
+        let mut request = Request::new(ExportGovernedSubjectProvenanceRequest {
+            export_id: export_id.into(),
+            operation_id: result.operation_id.clone(),
+            expected_subject_identity: "subject-1".into(),
+            expected_subject_content_digest: format!("sha256:{}", "a".repeat(64)),
+            expected_manifest_digest: format!("sha256:{}", "a".repeat(64)),
+            expected_artifact_digest: format!("sha256:{}", "a".repeat(64)),
+            expected_receipt_digest: result.receipt_digest.clone(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn governed_subject_provenance_is_tenkai_compatible_and_replay_safe() {
+        let svc = memory_service();
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = svc
+            .evaluate_governed_subject(governed_subject_request(
+                "provenance-release",
+                subject::SOFTWARE_RELEASE_PROFILE,
+                subject::ALLOW_PROFILE,
+                now,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+
+        let first = svc
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "publish-1",
+                &result,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!first.replayed);
+        let envelope = first.envelope.clone().unwrap();
+        assert_eq!(envelope.profile, subject_provenance::PROFILE);
+        assert_eq!(envelope.issuer, subject_provenance::ISSUER);
+        assert_eq!(envelope.decision, "allow");
+        assert_eq!(envelope.receipt_schema, subject::RECEIPT_SCHEMA_VERSION);
+        assert_eq!(envelope.receipt_digest, result.receipt_digest);
+        assert_eq!(envelope.governed_references.len(), 1);
+        assert_eq!(envelope.governed_references[0].kind, "operation");
+        assert_eq!(
+            envelope.content_digest,
+            subject_provenance::release_content_digest(
+                &format!("sha256:{}", "a".repeat(64)),
+                &format!("sha256:{}", "a".repeat(64))
+            )
+            .unwrap()
+        );
+
+        let replay = svc
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "publish-1",
+                &result,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(replay.replayed);
+        assert_eq!(replay.envelope, first.envelope);
+        assert_eq!(replay.envelope_digest, first.envelope_digest);
+
+        let mut trust_request = Request::new(GetGovernedSubjectProvenanceTrustRootRequest {
+            export_id: "publish-1".into(),
+        });
+        trust_request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        let root = svc
+            .get_governed_subject_provenance_trust_root(trust_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .trust_root
+            .unwrap();
+        assert_eq!(root.version, subject_provenance::TRUST_ROOT_VERSION);
+        assert_eq!(root.identity, subject_provenance::ISSUER);
+        assert_eq!(root.key_id, envelope.issuer_key_id);
+        let public_key = base64::engine::general_purpose::STANDARD
+            .decode(root.public_key)
+            .unwrap();
+        let domain_envelope = subject_provenance::ProvenanceEnvelope {
+            profile: envelope.profile,
+            issuer: envelope.issuer,
+            issuer_key_id: envelope.issuer_key_id,
+            subject: envelope.subject,
+            content_digest: envelope.content_digest,
+            decision: envelope.decision,
+            receipt_schema: envelope.receipt_schema,
+            receipt_digest: envelope.receipt_digest,
+            governed_references: envelope
+                .governed_references
+                .into_iter()
+                .map(|reference| subject_provenance::GovernedReference {
+                    kind: reference.kind,
+                    id: reference.id,
+                    digest: reference.digest,
+                })
+                .collect(),
+            observed_at_unix_ms: envelope.observed_at_unix_ms,
+            expires_at_unix_ms: envelope.expires_at_unix_ms,
+            signature: envelope.signature,
+        };
+        domain_envelope
+            .verify(
+                public_key.as_slice().try_into().unwrap(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+
+        svc.db
+            .ensure_team_namespace("team-a", "alice", Role::Editor, "root")
+            .unwrap();
+        let mut delegated = governed_subject_provenance_request("publish-delegated", &result);
+        delegated
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert!(
+            svc.export_governed_subject_provenance(delegated)
+                .await
+                .unwrap()
+                .into_inner()
+                .envelope
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_subject_provenance_fails_closed_and_preserves_rotated_roots() {
+        let svc = memory_service();
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = svc
+            .evaluate_governed_subject(governed_subject_request(
+                "provenance-failures",
+                subject::SOFTWARE_RELEASE_PROFILE,
+                subject::ALLOW_PROFILE,
+                now,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let first = svc
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "rotation-old",
+                &result,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .envelope
+            .unwrap();
+
+        let mut conflict = governed_subject_provenance_request("rotation-old", &result);
+        conflict.get_mut().expected_artifact_digest = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(
+            svc.export_governed_subject_provenance(conflict)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::AlreadyExists
+        );
+        for (index, export_id) in [
+            "mismatch-subject",
+            "mismatch-subject-content",
+            "mismatch-receipt",
+            "mismatch-content",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = governed_subject_provenance_request(export_id, &result);
+            match index {
+                0 => request.get_mut().expected_subject_identity = "other-subject".into(),
+                1 => {
+                    request.get_mut().expected_subject_content_digest =
+                        format!("sha256:{}", "b".repeat(64))
+                }
+                2 => {
+                    request.get_mut().expected_receipt_digest = format!("sha256:{}", "b".repeat(64))
+                }
+                3 => {
+                    request.get_mut().expected_manifest_digest =
+                        format!("sha256:{}", "b".repeat(64))
+                }
+                _ => unreachable!("fixed mismatch cases"),
+            }
+            assert_eq!(
+                svc.export_governed_subject_provenance(request)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+
+        let mut rotated_config = config(":memory:");
+        rotated_config.governed_subject_provenance_signing_key = Some("0a".repeat(32));
+        let rotated = ChiseiServiceImpl::new(svc.db.clone(), rotated_config);
+        let second = rotated
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "rotation-new",
+                &result,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .envelope
+            .unwrap();
+        assert_ne!(first.issuer_key_id, second.issuer_key_id);
+        let interrupted_replay = rotated
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "rotation-old",
+                &result,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(interrupted_replay.replayed);
+        assert_eq!(
+            interrupted_replay.envelope.unwrap().issuer_key_id,
+            first.issuer_key_id
+        );
+
+        let mut old_root_request = Request::new(GetGovernedSubjectProvenanceTrustRootRequest {
+            export_id: "rotation-old".into(),
+        });
+        old_root_request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        let old_root = rotated
+            .get_governed_subject_provenance_trust_root(old_root_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .trust_root
+            .unwrap();
+        assert_eq!(old_root.key_id, first.issuer_key_id);
+
+        let mut short_lived_config = config(":memory:");
+        short_lived_config.governed_subject_provenance_ttl_ms = 1;
+        let short_lived = ChiseiServiceImpl::new(svc.db.clone(), short_lived_config);
+        short_lived
+            .export_governed_subject_provenance(governed_subject_provenance_request(
+                "short-lived",
+                &result,
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            short_lived
+                .export_governed_subject_provenance(governed_subject_provenance_request(
+                    "short-lived",
+                    &result,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let mut expired_config = config(":memory:");
+        expired_config.governed_subject_provenance_key_expires_at_ms = now;
+        let expired = ChiseiServiceImpl::new(svc.db.clone(), expired_config);
+        assert_eq!(
+            expired
+                .export_governed_subject_provenance(governed_subject_provenance_request(
+                    "expired-key",
+                    &result,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let unauthenticated = Request::new(
+            governed_subject_provenance_request("unauthenticated", &result).into_inner(),
+        );
+        assert_eq!(
+            rotated
+                .export_governed_subject_provenance(unauthenticated)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     fn external_action_request(
