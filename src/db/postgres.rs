@@ -45,6 +45,8 @@ const PARKED_WORK_CONTINUATION_SCHEMA: &str =
 const EVALUATION_PLANS_SCHEMA: &str = include_str!("postgres/0024_evaluation_plans.sql");
 const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation_manifests.sql");
 const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluation_executions.sql");
+const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
+    include_str!("postgres/0027_governed_subject_provenance.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -183,6 +185,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 26,
         name: "evaluation_executions",
         sql: EVALUATION_EXECUTIONS_SCHEMA,
+    },
+    Migration {
+        version: 27,
+        name: "governed_subject_provenance",
+        sql: GOVERNED_SUBJECT_PROVENANCE_SCHEMA,
     },
 ];
 

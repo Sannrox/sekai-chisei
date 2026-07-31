@@ -15,6 +15,7 @@ use crate::chisei::external_action::{
 use crate::chisei::external_permit::{
     ExternalPermitPolicy, HostContext, Permit, Redemption, RedemptionTiming,
 };
+use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::chisei::kioku::*;
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
@@ -83,6 +84,31 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    pub fn put_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+        record: &ExportRecord,
+    ) -> Result<(ExportRecord, bool), String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_subject_provenance_export(actor, export_id, record),
+            Self::Postgres(db) => {
+                db.put_governed_subject_provenance_export(actor, export_id, record)
+            }
+        }
+    }
+
+    pub fn get_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+    ) -> Result<Option<ExportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_subject_provenance_export(actor, export_id),
+            Self::Postgres(db) => db.get_governed_subject_provenance_export(actor, export_id),
+        }
+    }
+
     pub(crate) fn with_evaluation_resolution_snapshot<T, E, F, M>(
         &self,
         operation: F,
