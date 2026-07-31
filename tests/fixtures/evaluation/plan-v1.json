@@ -1,0 +1,37 @@
+{
+  "contract_version": "chisei.evaluation-plan/v1",
+  "namespace": "acme",
+  "plan_id": "software-release",
+  "version": "1.0.0",
+  "accepted_subject_profiles": [
+    "example.software-release-candidate/v2"
+  ],
+  "nodes": [
+    {
+      "node_id": "artifact-digest",
+      "evaluator_definition_id": "evaluator-definition:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "depends_on_node_ids": [],
+      "input_bindings": [
+        {
+          "name": "release",
+          "source_kind": "subject",
+          "schema_id": "schema://example/software-release-candidate/v2"
+        },
+        {
+          "name": "expected-digest",
+          "source_kind": "invariant",
+          "schema_id": "schema://example/subject-content-digest/v1"
+        }
+      ],
+      "parameters": {
+        "expected_content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "invariant_version_ids": [
+        "governed-fact-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      ],
+      "classification": "required"
+    }
+  ],
+  "reducer": "required_all_pass_advisory_observed/v1",
+  "source_ref": "repo://evaluation-plans/software-release@1.0.0"
+}

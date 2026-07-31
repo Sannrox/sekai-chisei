@@ -1,0 +1,51 @@
+{
+  "command": "validate",
+  "plan": {
+    "accepted_subject_profiles": [
+      "example.software-release-candidate/v2"
+    ],
+    "content_digest": "sha256:cbb0f2438041a48c15e3ff05913a68fecb69286bf80492afcfc196fce806a622",
+    "contract_version": "chisei.evaluation-plan/v1",
+    "invariant_coverage": [
+      {
+        "advisory_node_ids": [],
+        "invariant_version_id": "governed-fact-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "required_node_ids": [
+          "artifact-digest"
+        ]
+      }
+    ],
+    "namespace": "acme",
+    "nodes": [
+      {
+        "classification": "required",
+        "depends_on_node_ids": [],
+        "evaluator_definition_id": "evaluator-definition:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "input_bindings": [
+          {
+            "name": "expected-digest",
+            "schema_id": "schema://example/subject-content-digest/v1",
+            "source_kind": "invariant"
+          },
+          {
+            "name": "release",
+            "schema_id": "schema://example/software-release-candidate/v2",
+            "source_kind": "subject"
+          }
+        ],
+        "invariant_version_ids": [
+          "governed-fact-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "node_id": "artifact-digest",
+        "parameters_digest": "sha256:cd75dc4f8db790c714dba6fb521eb86f7205618b0066f49915caeba9aead96aa"
+      }
+    ],
+    "plan_id": "software-release",
+    "plan_version_id": "evaluation-plan:cea932f215a8b86d7aba7ea5484b8f4d501d39830582bf9aea3e2e9a88661651",
+    "reducer": "required_all_pass_advisory_observed/v1",
+    "version": "1.0.0"
+  },
+  "schema_version": "sekaictl.evaluation-plan-output/v1",
+  "status": "valid",
+  "validation_mode": "offline"
+}

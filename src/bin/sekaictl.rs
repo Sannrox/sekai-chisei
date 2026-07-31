@@ -270,6 +270,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "governed-subject" => {
             sekai_chisei::governed_subject_cli::run(args.into_iter().skip(1).collect()).await
         }
+        "evaluation-plan" => {
+            match sekai_chisei::evaluation_plan_cli::run(args.into_iter().skip(1).collect()).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
         "team" => match args.get(1).map(String::as_str) {
             Some("join") => {
                 let config = sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(
@@ -410,6 +419,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("governance"), Some("memory")) => ("memory", 3),
         (Some("governance"), Some("gunshi")) => ("gunshi", 3),
         (Some("governance"), Some("subject")) => ("governed-subject", 3),
+        (Some("evaluation"), Some("plan")) => ("evaluation-plan", 3),
         (Some("assurance"), Some("attest")) => ("attest", 3),
         (Some("assurance"), Some("compliance")) => ("compliance", 3),
         (Some("assurance"), Some("provenance")) => ("provenance", 3),
@@ -564,7 +574,7 @@ fn print_root_usage() {
 
 fn print_admin_usage() {
     println!(
-        "Usage: sekaictl admin <access|gateway|governance|assurance|federation> ...\n\
+        "Usage: sekaictl admin <access|gateway|governance|evaluation|assurance|federation> ...\n\
          \n\
          Access:\n\
            sekaictl admin access credential ...\n\
@@ -575,6 +585,9 @@ fn print_admin_usage() {
          \n\
          Governance:\n\
            sekaictl admin governance <action|memory|gunshi|subject> ...\n\
+         \n\
+         Evaluation:\n\
+           sekaictl admin evaluation plan ...\n\
          \n\
          Assurance:\n\
            sekaictl admin assurance <attest|compliance|provenance|replay> ...\n\
@@ -592,6 +605,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
         "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
         "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
+        "evaluation-plan" => Some(sekai_chisei::evaluation_plan_cli::usage().to_string()),
         "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
         "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
         "provenance" => Some("usage: sekaictl admin assurance provenance <work-unit>".to_string()),
@@ -615,6 +629,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "memory" => Some("admin governance memory"),
         "gunshi" => Some("admin governance gunshi"),
         "governed-subject" => Some("admin governance subject"),
+        "evaluation-plan" => Some("admin evaluation plan"),
         "attest" => Some("admin assurance attest"),
         "compliance" => Some("admin assurance compliance"),
         "provenance" => Some("admin assurance provenance"),
@@ -657,6 +672,7 @@ mod tests {
             (vec!["governance", "memory"], "memory"),
             (vec!["governance", "gunshi"], "gunshi"),
             (vec!["governance", "subject"], "governed-subject"),
+            (vec!["evaluation", "plan"], "evaluation-plan"),
             (vec!["assurance", "attest"], "attest"),
             (vec!["assurance", "compliance"], "compliance"),
             (vec!["assurance", "provenance"], "provenance"),
@@ -695,6 +711,7 @@ mod tests {
             "memory",
             "gunshi",
             "governed-subject",
+            "evaluation-plan",
             "attest",
             "compliance",
             "provenance",
@@ -717,6 +734,7 @@ mod tests {
             ("memory", "admin governance memory"),
             ("gunshi", "admin governance gunshi"),
             ("governed-subject", "admin governance subject"),
+            ("evaluation-plan", "admin evaluation plan"),
             ("attest", "admin assurance attest"),
             ("compliance", "admin assurance compliance"),
             ("provenance", "admin assurance provenance"),

@@ -32,6 +32,8 @@ lives in the separate [research index](research/README.md).
 - [Docker](docker.md) — container quick start and transport choices.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.
+- [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan
+  authoring, publication, inspection, dry-run resolution, and execution.
 - [Team operations](team-operations.md) — namespace bootstrap and operator
   workflows.
 - [Performance benchmarks](performance-benchmarks.md) — reproduce the
