@@ -28,9 +28,13 @@ pub const EVALUATOR_RESULT_CONTRACT: &str = "chisei.deterministic-evaluator-resu
 pub const STEP_RECEIPT_CONTRACT: &str = "chisei.evaluation-step-receipt/v1";
 pub const GATE_DECISION_CONTRACT: &str = "chisei.evaluation-gate-decision/v1";
 pub const EXECUTION_OPERATION_CLASS: &str = "evaluation_manifest_execution";
-pub const SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE: &str = "subject_content_digest_equals/v1";
-pub const SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST: &str =
+pub const LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE: &str =
+    "subject_content_digest_equals/v1";
+pub const LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST: &str =
     "sha256:83df0fa4577447ecf2a7817c49d637ab48a018fb2d72a9fd631ce76d89f6e475";
+pub const SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE: &str = "subject_content_digest_equals.v1";
+pub const SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST: &str =
+    "sha256:fb7617ab821a130efe66c43a22df2923e4648c1cb58ae2d793b958a31e94f155";
 
 pub const STATUS_PASS: &str = "pass";
 pub const STATUS_FAIL: &str = "fail";
@@ -123,8 +127,10 @@ pub trait DeterministicEvaluator: Send + Sync + 'static {
     ) -> Result<DeterministicEvaluatorOutput, String>;
 }
 
-#[derive(Debug, Default)]
-pub struct SubjectContentDigestEqualityEvaluator;
+#[derive(Debug)]
+pub struct SubjectContentDigestEqualityEvaluator {
+    predicate_kind: &'static str,
+}
 
 impl DeterministicEvaluator for SubjectContentDigestEqualityEvaluator {
     fn evaluate(
@@ -132,9 +138,10 @@ impl DeterministicEvaluator for SubjectContentDigestEqualityEvaluator {
         input: &DeterministicEvaluatorInput,
     ) -> Result<DeterministicEvaluatorOutput, String> {
         if input.invariants.is_empty()
-            || input.invariants.iter().any(|invariant| {
-                invariant.predicate_kind != SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE
-            })
+            || input
+                .invariants
+                .iter()
+                .any(|invariant| invariant.predicate_kind != self.predicate_kind)
         {
             return Err(
                 "subject digest equality evaluator received an unsupported invariant".into(),
@@ -316,10 +323,20 @@ impl DeterministicEvaluatorRegistry {
 pub fn production_evaluator_registry() -> Result<DeterministicEvaluatorRegistry, String> {
     let registry = DeterministicEvaluatorRegistry::default();
     registry.register_with_metrics(
+        LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST,
+        "subject_digest_equality",
+        "legacy_v1",
+        Arc::new(SubjectContentDigestEqualityEvaluator {
+            predicate_kind: LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE,
+        }),
+    )?;
+    registry.register_with_metrics(
         SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST,
         "subject_digest_equality",
         "v1",
-        Arc::new(SubjectContentDigestEqualityEvaluator),
+        Arc::new(SubjectContentDigestEqualityEvaluator {
+            predicate_kind: SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE,
+        }),
     )?;
     Ok(registry)
 }
@@ -1482,6 +1499,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(failed.receipt.status, STATUS_FAIL);
+
+        let mut legacy_node = digest_manifest.nodes[0].clone();
+        legacy_node.evaluator.implementation_digest =
+            LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST.into();
+        legacy_node.invariants[0].predicate_kind =
+            LEGACY_SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE.into();
+        let legacy_manifest = manifest(vec![legacy_node]);
+        let legacy = execute_registered_node(
+            &registry,
+            &legacy_manifest,
+            &legacy_manifest.nodes[0],
+            input(&legacy_manifest, &legacy_manifest.nodes[0]),
+            &limits(),
+            Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(legacy.receipt.status, STATUS_PASS);
     }
 
     #[test]

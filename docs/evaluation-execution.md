@@ -20,13 +20,18 @@ they never upload code. A deployable evaluator is a compiled Rust
 contains only implementations compiled into the server or installed by its
 embedding product integration. The shipped server registers one deliberately
 narrow implementation:
+`subject_content_digest_equals.v1`
+(`sha256:fb7617ab821a130efe66c43a22df2923e4648c1cb58ae2d793b958a31e94f155`).
+The registry also retains the previously published
 `subject_content_digest_equals/v1`
-(`sha256:83df0fa4577447ecf2a7817c49d637ab48a018fb2d72a9fd631ce76d89f6e475`).
+(`sha256:83df0fa4577447ecf2a7817c49d637ab48a018fb2d72a9fd631ce76d89f6e475`)
+registration solely so immutable historical manifests remain executable.
 It accepts only that invariant predicate and exactly one
 `expected_content_digest` parameter, then compares it with the manifest-bound
 subject content digest. It is not a fallback and cannot evaluate other
-situations. An unmatched digest produces `unavailable`; the executor never
-chooses a fallback or a newer definition.
+situations. An unregistered implementation digest produces `unavailable`; a
+subject content mismatch produces `fail` and therefore a `deny` gate. The
+executor never chooses a fallback or a newer definition.
 
 Each implementation receives one canonical input document containing:
 
@@ -74,7 +79,10 @@ Definition limits bound each node's timeout, canonical input bytes, ephemeral
 output bytes, and evidence-item count. The first request may lower total
 duration; zero selects 60 seconds and the hard maximum is 300 seconds. That
 budget is frozen in the initial receipt, includes time across disconnects and
-restarts, and cannot be reset by replaying the request. A timed-out compiled
+restarts, and cannot be reset by replaying the request. Zero is normalized
+before persistence. A reuse request with a tighter bound fails closed when the
+existing manifest execution froze a larger bound; the response never
+misrepresents the actual execution limit. A timed-out compiled
 evaluator runs on an isolated thread with no supplied effects or capabilities;
 its result is ignored if it returns later. Because Rust threads cannot be
 force-killed safely, the registry has a hard global evaluator-thread capacity
