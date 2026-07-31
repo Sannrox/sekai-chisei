@@ -1604,6 +1604,48 @@ message GovernedSubjectResult {
 }
 message EvaluateGovernedSubjectResponse { GovernedSubjectResult result = 1; }
 
+// Additive plan-backed path for software release candidates. The exact
+// subject profile selects situation-specific plan and evaluator semantics;
+// existing governed-subject/v1 profile strings are never reinterpreted.
+message PlanBackedGovernedSubjectEvaluation {
+  string contract_version = 1; // chisei.plan-backed-governed-subject-evaluation/v1
+  string namespace = 2;
+  string request_id = 3;
+  string subject_profile = 4; // example.software-release-candidate/v2
+  string subject_identity = 5;
+  string subject_content_digest = 6;
+  string plan_version_id = 7;
+  repeated string evidence_object_ids = 8;
+  int64 evaluation_time_ms = 9;
+  uint64 max_total_duration_ms = 10;
+}
+message EvaluateGovernedSubjectWithPlanRequest {
+  PlanBackedGovernedSubjectEvaluation evaluation = 1;
+}
+message PlanBackedGovernedSubjectDecision {
+  string contract_version = 1; // chisei.plan-backed-governed-subject-decision/v1
+  string decision = 2; // allow | deny | unavailable | unknown
+  string operation_id = 3;
+  string receipt_schema = 4;
+  string receipt_digest = 5;
+  string plan_version_id = 6;
+  string plan_digest = 7;
+  string manifest_id = 8;
+  string manifest_digest = 9;
+  string invariant_set_id = 10;
+  string invariant_set_digest = 11;
+  string execution_operation_id = 12;
+  string gate_decision_digest = 13;
+  repeated string covered_invariant_version_ids = 14;
+  repeated string waived_invariant_version_ids = 15;
+  repeated string uncovered_invariant_version_ids = 16;
+  repeated string step_receipt_digests = 17;
+  string failure_code = 18;
+}
+message EvaluateGovernedSubjectWithPlanResponse {
+  PlanBackedGovernedSubjectDecision decision = 1;
+}
+
 // --- Service ---
 
 // Governed decisions for agent operations: context, policy, budgets, routing,
@@ -1611,6 +1653,7 @@ message EvaluateGovernedSubjectResponse { GovernedSubjectResult result = 1; }
 // clients of this service.
 service ChiseiService {
   rpc EvaluateGovernedSubject(EvaluateGovernedSubjectRequest) returns (EvaluateGovernedSubjectResponse);
+  rpc EvaluateGovernedSubjectWithPlan(EvaluateGovernedSubjectWithPlanRequest) returns (EvaluateGovernedSubjectWithPlanResponse);
   rpc ExecuteEvaluationManifest(ExecuteEvaluationManifestRequest) returns (ExecuteEvaluationManifestResponse);
   rpc GetEvaluationExecution(GetEvaluationExecutionRequest) returns (GetEvaluationExecutionResponse);
   rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);

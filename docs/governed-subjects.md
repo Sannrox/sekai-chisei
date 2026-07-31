@@ -41,6 +41,78 @@ than encode a desired decision in caller input. Callers cannot upload
 validators, add receipt attributes, grant execution authority, or turn a
 subject decision into an external-action permit.
 
+## Plan-backed software release evaluation
+
+`EvaluateGovernedSubjectWithPlan` is a separate additive entry point for
+`example.software-release-candidate/v2`. It does not reinterpret the existing
+v1 subject or fixed conformance evaluation profiles. The request binds an
+opaque release-candidate identity, its canonical content digest, one exact
+immutable `plan_version_id`, authorized evidence-object identities, an explicit
+evaluation time, and a bounded total execution duration. The RPC requires an
+authenticated namespace writer.
+
+This is a software-release situation adapter, not a generic evaluation
+workflow. Its selected plan may use only the already governed bounded DAG,
+typed inputs, exact immutable evaluator implementations, required/advisory
+classification, and the fixed fail-closed reducer. Other subject families must
+introduce their own versioned profile contract, invariant vocabulary, evidence
+schemas, plans, and compiled evaluators. They do not inherit release semantics.
+
+The complete decision trace is:
+
+1. Authenticate and authorize the namespace before looking up the plan.
+2. Validate the v2 release profile and bind the subject identity/content
+   digest plus the exact request inputs.
+3. Resolve the exact plan against the authorized Sekai invariant-set snapshot
+   at `evaluation_time_ms`. There is no `latest` plan or invariant fallback.
+4. Freeze the plan digest, invariant-set digest, exact invariant and waiver
+   versions, evaluator definition and implementation digests, and admitted
+   evidence into a resolved manifest.
+5. Execute that manifest through the exact compiled deterministic evaluators.
+   The manifest digest is the execution idempotency identity.
+6. Reduce step receipts with the fixed reducer and map the terminal gate
+   verdict into a plan-backed governed-subject decision.
+7. Persist the decision on a canonical operation receipt whose parent is the
+   evaluation-execution operation. The receipt, not the RPC response, is the
+   reconciliation authority.
+
+The returned decision contains bounded identity-only explainability: plan,
+manifest, invariant-set, execution, gate-decision, step-receipt, and
+covered/waived/uncovered invariant identities or digests. It contains no
+subject payload or protected evidence content. The governed receipt references
+the subject, plan, invariant set, manifest, execution, and every step digest;
+the manifest and execution receipt provide the forward trace to exact
+invariants, waivers, evaluators, evidence digests, step results, and the gate
+decision. The governed receipt's `parent_operation_id` points back to the
+execution receipt. `GetOperationReceipt` reads both receipts with normal
+namespace authorization.
+
+Required evaluator failure maps to `deny`. Missing, stale, inaccessible,
+subject-mismatched, or unbound evidence; an incomplete or uncovered invariant
+set; and insufficient information map to `unknown`. Disabled, absent,
+unsupported, timed-out, capacity-exhausted, or failed evaluator execution maps
+to `unavailable` unless a required failure already requires `deny`. Only a
+complete invariant set where every gate-blocking invariant passed through a
+required node or has an exact valid waiver can produce `allow`.
+
+Retries with the same actor, namespace, and request ID return the first durable
+governed decision; changed bindings conflict. Requests that independently
+resolve to the same manifest reuse its execution operation and gate decision,
+so they cannot produce a conflicting deterministic verdict. External reporter
+APIs cannot append to either execution receipts or plan-backed governed
+decision receipts.
+
+SQLite and PostgreSQL use the same manifest, execution-index, and canonical
+receipt contracts. No plan-backed-only decision table exists: the operation
+receipt remains authority, avoiding a second mutable decision record.
+
+Operational rollback disables this one additive RPC at the server/gateway or
+disables the affected evaluator definitions for future resolution. Existing
+v1 calls continue unchanged. Immutable plans, manifests, execution receipts,
+and governed decision receipts remain readable; rollback must not delete their
+tables or referenced Sekai facts/evidence. Restoring a backup must preserve
+their exact content digests and operation identities.
+
 ## Local typed adapter
 
 The fixed software-release adapter accepts only the fields in the checked-in

@@ -3193,14 +3193,30 @@ fn resolve_evaluation_manifest_live(
             }
         }
     }
-    if invariants.keys().any(|invariant_id| {
-        !required_coverage.contains(invariant_id)
-            && !waivers_by_invariant.contains_key(invariant_id)
-    }) {
-        return Ok(resolution_outcome(
-            evaluation_manifest_domain::RESOLUTION_UNKNOWN,
-            "invariant_uncovered",
-        ));
+    let uncovered_invariants = invariants
+        .keys()
+        .filter(|invariant_id| {
+            !required_coverage.contains(*invariant_id)
+                && !waivers_by_invariant.contains_key(*invariant_id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !uncovered_invariants.is_empty() {
+        return Ok(evaluation_manifest_domain::EvaluationResolutionOutcome {
+            status: evaluation_manifest_domain::RESOLUTION_UNKNOWN.into(),
+            manifest: None,
+            findings: uncovered_invariants
+                .into_iter()
+                .map(|invariant_version_id| {
+                    evaluation_manifest_domain::EvaluationResolutionFinding {
+                        code: "invariant_uncovered".into(),
+                        severity: evaluation_manifest_domain::FINDING_BLOCKING.into(),
+                        node_id: String::new(),
+                        invariant_version_id,
+                    }
+                })
+                .collect(),
+        });
     }
 
     let requested_evidence = request
@@ -3907,6 +3923,130 @@ impl ChiseiServiceImpl {
             }
         };
         evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
+    }
+
+    fn resolve_evaluation_plan_internal(
+        &self,
+        prepared: &evaluation_manifest_domain::PreparedResolutionRequest,
+    ) -> Result<evaluation_manifest_domain::EvaluationResolutionOutcome, Status> {
+        let (mut outcome, stored) = self.db.with_evaluation_resolution_snapshot(
+            || {
+                require_namespace_write_access(
+                    &self.db,
+                    &prepared.actor,
+                    &prepared.request.namespace,
+                )?;
+                if let Some(replay) = self
+                    .db
+                    .get_evaluation_manifest_for_request(
+                        &prepared.request.namespace,
+                        &prepared.actor,
+                        &prepared.request.request_id,
+                    )
+                    .map_err(Status::internal)?
+                {
+                    if replay.request_digest != prepared.request_digest {
+                        return Err(Status::already_exists(
+                            "evaluation resolution request already exists with different content",
+                        ));
+                    }
+                    return Ok((
+                        evaluation_manifest_domain::resolved_outcome(replay.manifest),
+                        None,
+                    ));
+                }
+                let resolution_time_ms = chrono::Utc::now().timestamp_millis();
+                let outcome =
+                    resolve_evaluation_manifest_live(&self.db, prepared, resolution_time_ms)?;
+                let write = outcome.manifest.as_ref().map(|manifest| {
+                    crate::db::runtime_db::EvaluationManifestWrite {
+                        manifest: manifest.clone(),
+                        request_id: prepared.request.request_id.clone(),
+                        request_digest: prepared.request_digest.clone(),
+                    }
+                });
+                Ok((outcome, write))
+            },
+            map_evaluation_manifest_storage_error,
+        )?;
+        if let Some(stored) = stored {
+            outcome.manifest = Some(stored);
+        }
+        Ok(outcome)
+    }
+
+    async fn execute_evaluation_manifest_internal(
+        &self,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        actor: &str,
+        max_total_duration_ms: u64,
+    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
+        let index = self.ensure_evaluation_execution(manifest, actor, max_total_duration_ms)?;
+        let receipt = self
+            .db
+            .get_operation_receipt(&index.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
+        let frozen_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
+        if frozen_total_duration_ms > max_total_duration_ms {
+            return Err(Status::failed_precondition(
+                "existing evaluation execution budget exceeds the requested bound",
+            ));
+        }
+        let cancelled = {
+            let mut cancellations = self
+                .evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
+            cancellations
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+        let execution_lock = {
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            locks
+                .entry(manifest.manifest_digest.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _guard = execution_lock.lock().await;
+        let worker_db = self.db.clone();
+        let worker_registry = self.evaluator_registry.clone();
+        let worker_manifest = manifest.clone();
+        let worker_index = index;
+        let projection = tokio::task::spawn_blocking(move || {
+            Self::run_evaluation_execution(
+                &worker_db,
+                &worker_registry,
+                &worker_manifest,
+                &worker_index,
+                frozen_total_duration_ms,
+                cancelled,
+            )
+        })
+        .await
+        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
+        if projection.decision.is_some() {
+            self.evaluation_cancellations
+                .lock()
+                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
+                .remove(&manifest.manifest_digest);
+            let mut locks = self
+                .evaluation_execution_locks
+                .lock()
+                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
+            if locks
+                .get(&manifest.manifest_digest)
+                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
+            {
+                locks.remove(&manifest.manifest_digest);
+            }
+        }
+        Ok(projection)
     }
 
     fn pipeline_context_expansion_gate(
@@ -6476,6 +6616,325 @@ fn governed_subject_result_from_receipt(
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PlanBackedDecisionEvidence {
+    decision: String,
+    failure_code: String,
+    plan_version_id: String,
+    plan_digest: String,
+    manifest_id: String,
+    manifest_digest: String,
+    invariant_set_id: String,
+    invariant_set_digest: String,
+    execution_operation_id: String,
+    gate_decision_digest: String,
+    covered_invariant_version_ids: Vec<String>,
+    waived_invariant_version_ids: Vec<String>,
+    uncovered_invariant_version_ids: Vec<String>,
+    step_receipt_digests: Vec<String>,
+}
+
+fn plan_backed_decision_from_receipt(
+    receipt: &OperationReceipt,
+) -> Result<PlanBackedGovernedSubjectDecision, Status> {
+    if receipt.operation_class != subject::PLAN_BACKED_OPERATION_CLASS
+        || receipt.schema_version != subject::PLAN_BACKED_RECEIPT_SCHEMA_VERSION
+    {
+        return Err(Status::data_loss(
+            "plan-backed governed-subject receipt has an invalid binding",
+        ));
+    }
+    let outcome = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        .ok_or_else(|| Status::data_loss("governed-subject decision outcome is missing"))?;
+    let evidence = outcome
+        .attributes
+        .get("plan_backed_decision")
+        .ok_or_else(|| Status::data_loss("governed-subject decision evidence is missing"))
+        .and_then(|json| {
+            serde_json::from_str::<PlanBackedDecisionEvidence>(json)
+                .map_err(|_| Status::data_loss("governed-subject decision evidence is invalid"))
+        })?;
+    let receipt_bytes =
+        serde_json::to_vec(receipt).map_err(|error| Status::internal(error.to_string()))?;
+    Ok(PlanBackedGovernedSubjectDecision {
+        contract_version: subject::PLAN_BACKED_RESULT_VERSION.into(),
+        decision: evidence.decision,
+        operation_id: receipt.operation_id.clone(),
+        receipt_schema: receipt.schema_version.clone(),
+        receipt_digest: format!("sha256:{:x}", sha2::Sha256::digest(receipt_bytes)),
+        plan_version_id: evidence.plan_version_id,
+        plan_digest: evidence.plan_digest,
+        manifest_id: evidence.manifest_id,
+        manifest_digest: evidence.manifest_digest,
+        invariant_set_id: evidence.invariant_set_id,
+        invariant_set_digest: evidence.invariant_set_digest,
+        execution_operation_id: evidence.execution_operation_id,
+        gate_decision_digest: evidence.gate_decision_digest,
+        covered_invariant_version_ids: evidence.covered_invariant_version_ids,
+        waived_invariant_version_ids: evidence.waived_invariant_version_ids,
+        uncovered_invariant_version_ids: evidence.uncovered_invariant_version_ids,
+        step_receipt_digests: evidence.step_receipt_digests,
+        failure_code: evidence.failure_code,
+    })
+}
+
+struct PlanBackedDecisionReceiptInput<'a> {
+    prepared: &'a subject::PreparedPlanBackedSubjectEvaluation,
+    plan_digest: &'a str,
+    manifest: Option<&'a evaluation_manifest_domain::ResolvedEvaluationManifest>,
+    execution: Option<&'a evaluation_execution_domain::EvaluationExecutionProjection>,
+    unresolved_invariant_version_ids: &'a [String],
+    decision: &'a str,
+    failure_code: &'a str,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+}
+
+fn plan_backed_decision_receipt(
+    input: PlanBackedDecisionReceiptInput<'_>,
+) -> Result<OperationReceipt, Status> {
+    let PlanBackedDecisionReceiptInput {
+        prepared,
+        plan_digest,
+        manifest,
+        execution,
+        unresolved_invariant_version_ids,
+        decision,
+        failure_code,
+        started_at_ms,
+        completed_at_ms,
+    } = input;
+    let gate = execution.and_then(|execution| execution.decision.as_ref());
+    let mut covered = BTreeSet::new();
+    let mut waived = BTreeSet::new();
+    let uncovered = unresolved_invariant_version_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(manifest) = manifest {
+        for node in &manifest.nodes {
+            for invariant in &node.invariants {
+                covered.insert(invariant.invariant_version_id.clone());
+            }
+        }
+        for waiver in &manifest.waivers {
+            for invariant_version_id in &waiver.invariant_version_ids {
+                waived.insert(invariant_version_id.clone());
+            }
+        }
+    }
+    let evidence = PlanBackedDecisionEvidence {
+        decision: decision.into(),
+        failure_code: failure_code.into(),
+        plan_version_id: prepared.request.plan_version_id.clone(),
+        plan_digest: plan_digest.into(),
+        manifest_id: manifest
+            .map(|manifest| manifest.manifest_id.clone())
+            .unwrap_or_default(),
+        manifest_digest: manifest
+            .map(|manifest| manifest.manifest_digest.clone())
+            .unwrap_or_default(),
+        invariant_set_id: manifest
+            .map(|manifest| manifest.invariant_set_id.clone())
+            .unwrap_or_default(),
+        invariant_set_digest: manifest
+            .map(|manifest| manifest.invariant_set_digest.clone())
+            .unwrap_or_default(),
+        execution_operation_id: execution
+            .map(|execution| execution.operation_id.clone())
+            .unwrap_or_default(),
+        gate_decision_digest: gate
+            .map(|gate| gate.decision_digest.clone())
+            .unwrap_or_default(),
+        covered_invariant_version_ids: covered.into_iter().collect(),
+        waived_invariant_version_ids: waived.into_iter().collect(),
+        uncovered_invariant_version_ids: uncovered.into_iter().collect(),
+        step_receipt_digests: execution
+            .map(|execution| {
+                execution
+                    .steps
+                    .iter()
+                    .map(|step| step.step_receipt_digest.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let decision_json =
+        serde_json::to_string(&evidence).map_err(|error| Status::internal(error.to_string()))?;
+    let operation_id = &prepared.operation_id;
+    let event = |suffix: &str,
+                 parent: Option<&str>,
+                 kind: ReceiptEventKind,
+                 attributes: BTreeMap<String, String>,
+                 references: Vec<GovernedReference>| {
+        OperationReceiptEvent {
+            event_id: format!("{operation_id}:{suffix}"),
+            operation_id: operation_id.clone(),
+            parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
+            timestamp_ms: completed_at_ms,
+            kind,
+            surface: kind.surface(),
+            actor: prepared.actor.clone(),
+            references,
+            attributes,
+        }
+    };
+    let mut policy_references = vec![GovernedReference {
+        kind: "evaluation_plan".into(),
+        reference: prepared.request.plan_version_id.clone(),
+        content_hash: (!plan_digest.is_empty()).then(|| plan_digest.into()),
+        disclosed_fields: Vec::new(),
+        omitted: false,
+        omission_reason: None,
+    }];
+    if let Some(manifest) = manifest {
+        policy_references.extend([
+            GovernedReference {
+                kind: "resolved_invariant_set".into(),
+                reference: manifest.invariant_set_id.clone(),
+                content_hash: Some(manifest.invariant_set_digest.clone()),
+                disclosed_fields: Vec::new(),
+                omitted: false,
+                omission_reason: None,
+            },
+            GovernedReference {
+                kind: "resolved_evaluation_manifest".into(),
+                reference: manifest.manifest_id.clone(),
+                content_hash: Some(manifest.manifest_digest.clone()),
+                disclosed_fields: Vec::new(),
+                omitted: false,
+                omission_reason: None,
+            },
+        ]);
+    }
+    let mut outcome_references = Vec::new();
+    if let Some(execution) = execution {
+        outcome_references.push(GovernedReference {
+            kind: "evaluation_execution".into(),
+            reference: execution.operation_id.clone(),
+            content_hash: gate.map(|gate| gate.decision_digest.clone()),
+            disclosed_fields: Vec::new(),
+            omitted: false,
+            omission_reason: None,
+        });
+        outcome_references.extend(execution.steps.iter().map(|step| GovernedReference {
+            kind: "evaluation_step_receipt".into(),
+            reference: step.node_id.clone(),
+            content_hash: Some(step.step_receipt_digest.clone()),
+            disclosed_fields: Vec::new(),
+            omitted: false,
+            omission_reason: None,
+        }));
+    }
+    Ok(OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id: operation_id.clone(),
+        parent_operation_id: execution.map(|execution| execution.operation_id.clone()),
+        namespace: prepared.request.namespace.clone(),
+        operation_class: subject::PLAN_BACKED_OPERATION_CLASS.into(),
+        initiating_actor: prepared.actor.clone(),
+        schema_version: subject::PLAN_BACKED_RECEIPT_SCHEMA_VERSION.into(),
+        policy_version: prepared.request.subject_profile.clone(),
+        started_at_ms,
+        completed_at_ms: Some(completed_at_ms),
+        events: vec![
+            event(
+                "intent",
+                None,
+                ReceiptEventKind::IntentRecorded,
+                BTreeMap::from([
+                    ("request_id".into(), operation_id.clone()),
+                    (
+                        "lookup_request_id".into(),
+                        prepared.request.request_id.clone(),
+                    ),
+                    (
+                        "caller_scope".into(),
+                        subject::plan_backed_caller_scope(
+                            &prepared.request.namespace,
+                            &prepared.actor,
+                        ),
+                    ),
+                    ("binding_digest".into(), prepared.binding_digest.clone()),
+                    (
+                        "subject_profile".into(),
+                        prepared.request.subject_profile.clone(),
+                    ),
+                    (
+                        "subject_identity".into(),
+                        prepared.request.subject_identity.clone(),
+                    ),
+                    (
+                        "subject_content_digest".into(),
+                        prepared.request.subject_content_digest.clone(),
+                    ),
+                ]),
+                vec![GovernedReference {
+                    kind: "governed_subject".into(),
+                    reference: prepared.request.subject_identity.clone(),
+                    content_hash: Some(prepared.request.subject_content_digest.clone()),
+                    disclosed_fields: Vec::new(),
+                    omitted: true,
+                    omission_reason: Some("subject payload remains externally owned".into()),
+                }],
+            ),
+            event(
+                "policy",
+                Some("intent"),
+                ReceiptEventKind::PolicyDecided,
+                BTreeMap::from([
+                    ("decision".into(), decision.into()),
+                    (
+                        "resolution_request_id".into(),
+                        prepared.resolution_request_id.clone(),
+                    ),
+                ]),
+                policy_references,
+            ),
+            event(
+                "route",
+                Some("policy"),
+                ReceiptEventKind::RouteSelected,
+                BTreeMap::from([(
+                    "route".into(),
+                    if manifest.is_some() {
+                        "exact_plan_deterministic_execution".into()
+                    } else {
+                        "resolution_failed_closed".into()
+                    },
+                )]),
+                Vec::new(),
+            ),
+            event(
+                "budget",
+                Some("route"),
+                ReceiptEventKind::BudgetDecided,
+                BTreeMap::from([(
+                    "max_total_duration_ms".into(),
+                    prepared.request.max_total_duration_ms.to_string(),
+                )]),
+                Vec::new(),
+            ),
+            event(
+                "outcome",
+                Some("budget"),
+                ReceiptEventKind::OutcomeRecorded,
+                BTreeMap::from([
+                    ("decision".into(), decision.into()),
+                    ("failure_code".into(), failure_code.into()),
+                    ("plan_backed_decision".into(), decision_json),
+                ]),
+                outcome_references,
+            ),
+        ],
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+    })
+}
+
 #[tonic::async_trait]
 impl ChiseiService for ChiseiServiceImpl {
     type ExecutePlanStreamStream =
@@ -6693,6 +7152,175 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         Ok(Response::new(EvaluateGovernedSubjectResponse {
             result: Some(governed_subject_result_from_receipt(&receipt)?),
+        }))
+    }
+
+    async fn evaluate_governed_subject_with_plan(
+        &self,
+        req: Request<EvaluateGovernedSubjectWithPlanRequest>,
+    ) -> Result<Response<EvaluateGovernedSubjectWithPlanResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let value = req
+            .into_inner()
+            .evaluation
+            .ok_or_else(|| Status::invalid_argument("plan-backed evaluation required"))?;
+        let prepared = subject::prepare_plan_backed_evaluation(
+            subject::PlanBackedSubjectEvaluationRequest {
+                contract_version: value.contract_version,
+                namespace: value.namespace,
+                request_id: value.request_id,
+                subject_profile: value.subject_profile,
+                subject_identity: value.subject_identity,
+                subject_content_digest: value.subject_content_digest,
+                plan_version_id: value.plan_version_id,
+                evidence_object_ids: value.evidence_object_ids,
+                evaluation_time_ms: value.evaluation_time_ms,
+                max_total_duration_ms: value.max_total_duration_ms,
+            },
+            &actor,
+        )
+        .map_err(Status::invalid_argument)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if prepared.request.evaluation_time_ms > now_ms {
+            return Err(Status::invalid_argument(
+                "evaluation_time_ms cannot be in the future",
+            ));
+        }
+        require_namespace_write_access(&self.db, &actor, &prepared.request.namespace)?;
+        if let Some(existing) = self
+            .db
+            .get_operation_receipt(&prepared.operation_id)
+            .map_err(Status::internal)?
+        {
+            let existing_binding = existing
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                .and_then(|event| event.attributes.get("binding_digest"));
+            if existing_binding != Some(&prepared.binding_digest) {
+                return Err(Status::already_exists(
+                    "request_id is already bound to a different plan-backed evaluation",
+                ));
+            }
+            return Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
+                decision: Some(plan_backed_decision_from_receipt(&existing)?),
+            }));
+        }
+        let Some(plan) = self
+            .db
+            .get_evaluation_plan(&prepared.request.plan_version_id)
+            .map_err(Status::internal)?
+        else {
+            return Err(Status::not_found("evaluation plan not found"));
+        };
+        if plan.namespace != prepared.request.namespace
+            || !evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)?
+        {
+            return Err(Status::not_found("evaluation plan not found"));
+        }
+        let resolution = evaluation_manifest_domain::prepare_resolution_request(
+            evaluation_manifest_domain::EvaluationResolutionRequest {
+                contract_version: evaluation_manifest_domain::RESOLUTION_REQUEST_CONTRACT.into(),
+                resolver_version: evaluation_manifest_domain::RESOLVER_VERSION.into(),
+                namespace: prepared.request.namespace.clone(),
+                request_id: prepared.resolution_request_id.clone(),
+                plan_version_id: prepared.request.plan_version_id.clone(),
+                subject_profile: prepared.request.subject_profile.clone(),
+                subject_identity: prepared.request.subject_identity.clone(),
+                subject_content_digest: prepared.request.subject_content_digest.clone(),
+                evidence_object_ids: prepared.request.evidence_object_ids.clone(),
+                evaluation_time_ms: prepared.request.evaluation_time_ms,
+            },
+            &actor,
+        )
+        .map_err(map_evaluation_resource_error)?;
+        let outcome = self.resolve_evaluation_plan_internal(&resolution)?;
+        let unresolved_invariant_version_ids = outcome
+            .findings
+            .iter()
+            .filter(|finding| !finding.invariant_version_id.is_empty())
+            .map(|finding| finding.invariant_version_id.clone())
+            .collect::<Vec<_>>();
+        let (manifest, execution, decision, failure_code) = if let Some(manifest) = outcome.manifest
+        {
+            let execution = self
+                .execute_evaluation_manifest_internal(
+                    &manifest,
+                    &actor,
+                    prepared.request.max_total_duration_ms,
+                )
+                .await?;
+            let gate = execution
+                .decision
+                .as_ref()
+                .ok_or_else(|| Status::data_loss("evaluation gate decision is missing"))?;
+            let decision = gate.verdict.clone();
+            let failure_code = if decision != evaluation_execution_domain::VERDICT_ALLOW {
+                gate.reason_code.clone()
+            } else {
+                String::new()
+            };
+            (Some(manifest), Some(execution), decision, failure_code)
+        } else {
+            let decision = match outcome.status.as_str() {
+                evaluation_manifest_domain::RESOLUTION_UNAVAILABLE => {
+                    evaluation_execution_domain::VERDICT_UNAVAILABLE
+                }
+                _ => evaluation_execution_domain::VERDICT_UNKNOWN,
+            };
+            let failure_code = outcome
+                .findings
+                .first()
+                .map(|finding| finding.code.clone())
+                .unwrap_or_else(|| "evaluation_resolution_incomplete".into());
+            (None, None, decision.into(), failure_code)
+        };
+        let completed_at_ms = chrono::Utc::now().timestamp_millis();
+        let receipt = plan_backed_decision_receipt(PlanBackedDecisionReceiptInput {
+            prepared: &prepared,
+            plan_digest: &plan.content_digest,
+            manifest: manifest.as_ref(),
+            execution: execution.as_ref(),
+            unresolved_invariant_version_ids: &unresolved_invariant_version_ids,
+            decision: &decision,
+            failure_code: &failure_code,
+            started_at_ms: now_ms,
+            completed_at_ms,
+        })?;
+        let completeness = receipt.completeness();
+        if !completeness.complete {
+            return Err(Status::internal(format!(
+                "plan-backed governed-subject receipt is incomplete: {:?}",
+                completeness.errors
+            )));
+        }
+        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
+            if let Some(existing) = self
+                .db
+                .get_operation_receipt(&prepared.operation_id)
+                .map_err(Status::internal)?
+            {
+                let same_binding = existing
+                    .events
+                    .iter()
+                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                    .and_then(|event| event.attributes.get("binding_digest"))
+                    == Some(&prepared.binding_digest);
+                if same_binding {
+                    return Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
+                        decision: Some(plan_backed_decision_from_receipt(&existing)?),
+                    }));
+                }
+                return Err(Status::already_exists(
+                    "request_id is already bound to a different plan-backed evaluation",
+                ));
+            }
+            return Err(Status::aborted(format!(
+                "plan-backed governed-subject receipt could not be committed: {error}"
+            )));
+        }
+        Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
+            decision: Some(plan_backed_decision_from_receipt(&receipt)?),
         }))
     }
 
@@ -10147,9 +10775,13 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
-        if receipt.operation_class == evaluation_execution_domain::EXECUTION_OPERATION_CLASS {
+        if matches!(
+            receipt.operation_class.as_str(),
+            evaluation_execution_domain::EXECUTION_OPERATION_CLASS
+                | subject::PLAN_BACKED_OPERATION_CLASS
+        ) {
             return Err(Status::permission_denied(
-                "evaluation execution receipts do not accept external reporters",
+                "evaluation authority receipts do not accept external reporters",
             ));
         }
         if actor != receipt.initiating_actor && actor != "root" {
@@ -10738,9 +11370,13 @@ impl ChiseiService for ChiseiServiceImpl {
             .get_operation_receipt(&request.operation_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("operation receipt not found"))?;
-        if receipt.operation_class == evaluation_execution_domain::EXECUTION_OPERATION_CLASS {
+        if matches!(
+            receipt.operation_class.as_str(),
+            evaluation_execution_domain::EXECUTION_OPERATION_CLASS
+                | subject::PLAN_BACKED_OPERATION_CLASS
+        ) {
             return Err(Status::permission_denied(
-                "evaluation execution receipts accept only executor-owned internal events",
+                "evaluation authority receipts accept only internal events",
             ));
         }
         let receipt_was_complete = receipt.completeness().complete;
@@ -11619,47 +12255,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 "evaluation_time_ms cannot be in the future",
             ));
         }
-        let (mut outcome, stored) = self.db.with_evaluation_resolution_snapshot(
-            || {
-                require_namespace_write_access(
-                    &self.db,
-                    &prepared.actor,
-                    &prepared.request.namespace,
-                )?;
-                if let Some(replay) = self
-                    .db
-                    .get_evaluation_manifest_for_request(
-                        &prepared.request.namespace,
-                        &prepared.actor,
-                        &prepared.request.request_id,
-                    )
-                    .map_err(Status::internal)?
-                {
-                    if replay.request_digest != prepared.request_digest {
-                        return Err(Status::already_exists(
-                            "evaluation resolution request already exists with different content",
-                        ));
-                    }
-                    let outcome = evaluation_manifest_domain::resolved_outcome(replay.manifest);
-                    return Ok((outcome, None));
-                }
-                let resolution_time_ms = chrono::Utc::now().timestamp_millis();
-                let outcome =
-                    resolve_evaluation_manifest_live(&self.db, &prepared, resolution_time_ms)?;
-                let write = outcome.manifest.as_ref().map(|manifest| {
-                    crate::db::runtime_db::EvaluationManifestWrite {
-                        manifest: manifest.clone(),
-                        request_id: prepared.request.request_id.clone(),
-                        request_digest: prepared.request_digest.clone(),
-                    }
-                });
-                Ok((outcome, write))
-            },
-            map_evaluation_manifest_storage_error,
-        )?;
-        if let Some(stored) = stored {
-            outcome.manifest = Some(stored);
-        }
+        let outcome = self.resolve_evaluation_plan_internal(&prepared)?;
         Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
     }
 
@@ -11683,67 +12279,9 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::internal)?
             .filter(|manifest| manifest.namespace == request.namespace)
             .ok_or_else(|| Status::not_found("evaluation manifest not found"))?;
-        let index =
-            self.ensure_evaluation_execution(&manifest, &actor, request.max_total_duration_ms)?;
-        let receipt = self
-            .db
-            .get_operation_receipt(&index.operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
-        let max_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
-        let cancelled = {
-            let mut cancellations = self
-                .evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
-            cancellations
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone()
-        };
-        let execution_lock = {
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            locks
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let _guard = execution_lock.lock().await;
-        let worker_db = self.db.clone();
-        let worker_registry = self.evaluator_registry.clone();
-        let worker_manifest = manifest.clone();
-        let worker_index = index.clone();
-        let projection = tokio::task::spawn_blocking(move || {
-            Self::run_evaluation_execution(
-                &worker_db,
-                &worker_registry,
-                &worker_manifest,
-                &worker_index,
-                max_total_duration_ms,
-                cancelled,
-            )
-        })
-        .await
-        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
-        if projection.decision.is_some() {
-            self.evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
-                .remove(&manifest.manifest_digest);
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            if locks
-                .get(&manifest.manifest_digest)
-                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
-            {
-                locks.remove(&manifest.manifest_digest);
-            }
-        }
+        let projection = self
+            .execute_evaluation_manifest_internal(&manifest, &actor, request.max_total_duration_ms)
+            .await?;
         Ok(Response::new(ExecuteEvaluationManifestResponse {
             execution: Some(to_proto_evaluation_execution_projection(&projection)),
         }))
@@ -14452,6 +14990,20 @@ mod tests {
             .execution
             .unwrap();
         assert_eq!(replay, first);
+        let tighter = svc
+            .execute_evaluation_manifest(Request::new(ExecuteEvaluationManifestRequest {
+                execution: Some(EvaluationExecutionRequest {
+                    contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT
+                        .into(),
+                    executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                    namespace: "acme".into(),
+                    manifest_digest: manifest.manifest_digest.clone(),
+                    max_total_duration_ms: 500,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(tighter.code(), tonic::Code::FailedPrecondition);
         let queried = svc
             .get_evaluation_execution(Request::new(GetEvaluationExecutionRequest {
                 namespace: "acme".into(),
@@ -14651,7 +15203,7 @@ mod tests {
         );
         assert!(outcome.manifest.is_none());
         assert_eq!(outcome.findings[0].code, "invariant_uncovered");
-        assert!(outcome.findings[0].invariant_version_id.is_empty());
+        assert_eq!(outcome.findings[0].invariant_version_id, uncovered_id);
 
         let waiver = governed_fact_domain::put_waiver(
             &svc.db,
@@ -15057,6 +15609,464 @@ mod tests {
         );
         assert!(outcome.manifest.is_none());
         assert_eq!(outcome.findings[0].code, "invariant_resolution_incomplete");
+    }
+
+    async fn install_plan_backed_release_fixture(
+        svc: &ChiseiServiceImpl,
+        expected_content_digest: &str,
+    ) -> (String, String, String) {
+        let namespace = "release";
+        governed_fact_domain::apply_profile(
+            &svc.db,
+            namespace,
+            governed_fact_domain::PROFILE_CONTRACT_VERSION,
+            "root",
+            1,
+        )
+        .unwrap();
+        let invariant_id = governed_fact_domain::put_fact(
+            &svc.db,
+            governed_fact_domain::GovernedFactInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                fact_id: "release-content-approved".into(),
+                version: "1.0.0".into(),
+                fact_type: GovernedFactType::Invariant,
+                status: "active".into(),
+                statement: "The release candidate binds the approved immutable content.".into(),
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
+                    subject_refs: vec![],
+                },
+                verification: governed_fact_domain::VerificationContract {
+                    predicate_kind:
+                        evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE
+                            .into(),
+                    input_schema: "schema://software-release-candidate/v2".into(),
+                    result_schema: "schema://digest-equality-result/v1".into(),
+                    evidence_types: vec![],
+                },
+                requirement_version_ids: vec![],
+                evidence_refs: vec![],
+                source_ref: "repo://release-policy/content@1".into(),
+                effective_from_ms: 1,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            2,
+        )
+        .unwrap()
+        .object_id;
+        let definition = svc
+            .put_evaluator_definition(Request::new(PutEvaluatorDefinitionRequest {
+                definition: Some(EvaluatorDefinition {
+                    contract_version: evaluation_plan_domain::EVALUATOR_DEFINITION_CONTRACT.into(),
+                    namespace: namespace.into(),
+                    evaluator_id: "software-release-content-digest".into(),
+                    version: "1.0.0".into(),
+                    implementation_digest: evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST.into(),
+                    execution_class: evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS.into(),
+                    supported_predicate_kinds: vec![evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE.into()],
+                    supported_input_schemas: vec!["schema://software-release-candidate/v2".into()],
+                    supported_result_schemas: vec!["schema://digest-equality-result/v1".into()],
+                    parameter_schema_json: r#"{"type":"object","properties":{"expected_content_digest":{"type":"string"}},"required":["expected_content_digest"],"additionalProperties":false}"#.into(),
+                    evidence_classifications: vec!["internal".into()],
+                    resource_limits: Some(EvaluatorResourceLimits {
+                        timeout_ms: 1_000,
+                        max_input_bytes: 8_192,
+                        max_output_bytes: 1_024,
+                        max_evidence_items: 1,
+                    }),
+                    source_ref: "builtin://software-release-content-digest/v1".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap();
+        let plan = svc
+            .put_evaluation_plan(Request::new(PutEvaluationPlanRequest {
+                plan: Some(EvaluationPlan {
+                    contract_version: evaluation_plan_domain::EVALUATION_PLAN_CONTRACT.into(),
+                    namespace: namespace.into(),
+                    plan_id: "software-release/default".into(),
+                    version: "1.0.0".into(),
+                    accepted_subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
+                    nodes: vec![EvaluationPlanNode {
+                        node_id: "release-content".into(),
+                        evaluator_definition_id: definition.definition_id.clone(),
+                        input_bindings: vec![EvaluationInputBinding {
+                            name: "release".into(),
+                            source_kind: evaluation_plan_domain::INPUT_INVARIANT.into(),
+                            schema_id: "schema://software-release-candidate/v2".into(),
+                        }],
+                        parameters_json: serde_json::json!({
+                            "expected_content_digest": expected_content_digest,
+                        })
+                        .to_string(),
+                        invariant_version_ids: vec![invariant_id.clone()],
+                        classification: evaluation_plan_domain::NODE_REQUIRED.into(),
+                        ..Default::default()
+                    }],
+                    reducer: evaluation_plan_domain::FIXED_REDUCER.into(),
+                    source_ref: "repo://release-policy/default@1".into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        (plan.plan_version_id, definition.definition_id, invariant_id)
+    }
+
+    fn plan_backed_release_request(
+        request_id: &str,
+        plan_version_id: &str,
+        subject_content_digest: &str,
+        evaluation_time_ms: i64,
+    ) -> Request<EvaluateGovernedSubjectWithPlanRequest> {
+        let mut request = Request::new(EvaluateGovernedSubjectWithPlanRequest {
+            evaluation: Some(PlanBackedGovernedSubjectEvaluation {
+                contract_version: subject::PLAN_BACKED_REQUEST_VERSION.into(),
+                namespace: "release".into(),
+                request_id: request_id.into(),
+                subject_profile: subject::SOFTWARE_RELEASE_PLAN_PROFILE.into(),
+                subject_identity: "release-candidate:42".into(),
+                subject_content_digest: subject_content_digest.into(),
+                plan_version_id: plan_version_id.into(),
+                evidence_object_ids: vec![],
+                evaluation_time_ms,
+                max_total_duration_ms: 1_000,
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn plan_backed_release_evaluation_composes_exact_resources_and_replays() {
+        let svc = memory_service();
+        let expected_digest = format!("sha256:{}", "b".repeat(64));
+        let (plan_version_id, _, invariant_id) =
+            install_plan_backed_release_fixture(&svc, &expected_digest).await;
+        let mut first_request =
+            plan_backed_release_request("release-42", &plan_version_id, &expected_digest, 10);
+        first_request
+            .get_mut()
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .max_total_duration_ms = 0;
+        let first = svc
+            .evaluate_governed_subject_with_plan(first_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(first.decision, evaluation_execution_domain::VERDICT_ALLOW);
+        assert_eq!(first.plan_version_id, plan_version_id);
+        assert!(first.plan_digest.starts_with("sha256:"));
+        assert!(first.manifest_id.starts_with("evaluation-manifest:"));
+        assert!(first.manifest_digest.starts_with("sha256:"));
+        assert!(!first.invariant_set_id.is_empty());
+        assert!(first.invariant_set_digest.starts_with("sha256:"));
+        assert!(first.execution_operation_id.starts_with("evaluation-"));
+        assert!(first.gate_decision_digest.starts_with("sha256:"));
+        assert_eq!(first.covered_invariant_version_ids, vec![invariant_id]);
+        assert!(first.waived_invariant_version_ids.is_empty());
+        assert!(first.uncovered_invariant_version_ids.is_empty());
+        assert_eq!(first.step_receipt_digests.len(), 1);
+
+        let mut replay_request =
+            plan_backed_release_request("release-42", &plan_version_id, &expected_digest, 10);
+        replay_request
+            .get_mut()
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .max_total_duration_ms = 0;
+        let replay = svc
+            .evaluate_governed_subject_with_plan(replay_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(replay, first);
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(&first.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(receipt.completeness().complete);
+        assert_eq!(
+            receipt.parent_operation_id.as_deref(),
+            Some(first.execution_operation_id.as_str())
+        );
+        let execution_receipt = svc
+            .db
+            .get_operation_receipt(&first.execution_operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evaluation_total_budget_ms(&execution_receipt).unwrap(),
+            evaluation_execution_domain::DEFAULT_TOTAL_DURATION_MS
+        );
+        assert!(receipt.events.iter().any(|event| {
+            event.references.iter().any(|reference| {
+                reference.kind == "resolved_evaluation_manifest"
+                    && reference.content_hash.as_deref() == Some(first.manifest_digest.as_str())
+            })
+        }));
+        let mut reporter = Request::new(AuthorizeOperationReporterRequest {
+            operation_id: first.operation_id.clone(),
+            principal: "reporter".into(),
+            event_kinds: vec!["outcome_recorded".into()],
+        });
+        reporter
+            .metadata_mut()
+            .insert("x-principal", "root".parse().unwrap());
+        reporter
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+        assert_eq!(
+            svc.authorize_operation_reporter(reporter)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut same_manifest_request = plan_backed_release_request(
+            "release-42-retry-id",
+            &plan_version_id,
+            &expected_digest,
+            10,
+        );
+        same_manifest_request
+            .get_mut()
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .max_total_duration_ms = 0;
+        let same_manifest = svc
+            .evaluate_governed_subject_with_plan(same_manifest_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(same_manifest.manifest_digest, first.manifest_digest);
+        assert_eq!(
+            same_manifest.execution_operation_id,
+            first.execution_operation_id
+        );
+        assert_eq!(
+            same_manifest.gate_decision_digest,
+            first.gate_decision_digest
+        );
+        assert_eq!(same_manifest.decision, first.decision);
+
+        assert_eq!(
+            svc.evaluate_governed_subject_with_plan(plan_backed_release_request(
+                "release-42-tighter-budget",
+                &plan_version_id,
+                &expected_digest,
+                10,
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_backed_release_evaluation_fails_closed_and_preserves_v1() {
+        let svc = memory_service();
+        let expected_digest = format!("sha256:{}", "b".repeat(64));
+        let other_digest = format!("sha256:{}", "c".repeat(64));
+        let (plan_version_id, definition_id, _) =
+            install_plan_backed_release_fixture(&svc, &expected_digest).await;
+        let denied = svc
+            .evaluate_governed_subject_with_plan(plan_backed_release_request(
+                "release-mismatch",
+                &plan_version_id,
+                &other_digest,
+                10,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(denied.decision, evaluation_execution_domain::VERDICT_DENY);
+        assert_eq!(denied.failure_code, "required_node_failed");
+        assert_eq!(denied.covered_invariant_version_ids.len(), 1);
+        assert!(denied.uncovered_invariant_version_ids.is_empty());
+        assert_eq!(
+            svc.evaluate_governed_subject_with_plan(plan_backed_release_request(
+                "release-mismatch",
+                &plan_version_id,
+                &expected_digest,
+                10,
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::AlreadyExists
+        );
+
+        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+            definition_id,
+            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+            reason: "maintenance".into(),
+            request_id: "disable-release-evaluator".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let unavailable = svc
+            .evaluate_governed_subject_with_plan(plan_backed_release_request(
+                "release-unavailable",
+                &plan_version_id,
+                &expected_digest,
+                10,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(
+            unavailable.decision,
+            evaluation_execution_domain::VERDICT_UNAVAILABLE
+        );
+        assert_eq!(unavailable.failure_code, "evaluator_unavailable");
+        assert!(unavailable.manifest_digest.is_empty());
+
+        let uncovered_id = governed_fact_domain::put_fact(
+            &svc.db,
+            governed_fact_domain::GovernedFactInput {
+                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+                namespace: "release".into(),
+                fact_id: "release-additional-review".into(),
+                version: "1.0.0".into(),
+                fact_type: GovernedFactType::Invariant,
+                status: "active".into(),
+                statement: "The release candidate has additional governed review.".into(),
+                applicability: governed_fact_domain::FactApplicability {
+                    subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
+                    subject_refs: vec![],
+                },
+                verification: governed_fact_domain::VerificationContract {
+                    predicate_kind:
+                        evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE
+                            .into(),
+                    input_schema: "schema://software-release-candidate/v2".into(),
+                    result_schema: "schema://digest-equality-result/v1".into(),
+                    evidence_types: vec![],
+                },
+                requirement_version_ids: vec![],
+                evidence_refs: vec![],
+                source_ref: "repo://release-policy/additional-review@1".into(),
+                effective_from_ms: 1,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            3,
+        )
+        .unwrap()
+        .object_id;
+        let uncovered = svc
+            .evaluate_governed_subject_with_plan(plan_backed_release_request(
+                "release-uncovered",
+                &plan_version_id,
+                &expected_digest,
+                10,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .decision
+            .unwrap();
+        assert_eq!(
+            uncovered.decision,
+            evaluation_execution_domain::VERDICT_UNKNOWN
+        );
+        assert_eq!(uncovered.failure_code, "invariant_uncovered");
+        assert_eq!(
+            uncovered.uncovered_invariant_version_ids,
+            vec![uncovered_id]
+        );
+
+        let mut old_profile = plan_backed_release_request(
+            "release-old-profile",
+            &plan_version_id,
+            &expected_digest,
+            10,
+        );
+        old_profile
+            .get_mut()
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .subject_profile = subject::SOFTWARE_RELEASE_PROFILE.into();
+        assert_eq!(
+            svc.evaluate_governed_subject_with_plan(old_profile)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let old_v1 = svc
+            .evaluate_governed_subject(governed_subject_request(
+                "release-v1-still-fixed",
+                subject::SOFTWARE_RELEASE_PROFILE,
+                subject::ALLOW_PROFILE,
+                chrono::Utc::now().timestamp_millis(),
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(old_v1.decision, "allow");
+
+        let unauthenticated = Request::new(EvaluateGovernedSubjectWithPlanRequest {
+            evaluation: Some(PlanBackedGovernedSubjectEvaluation {
+                contract_version: subject::PLAN_BACKED_REQUEST_VERSION.into(),
+                namespace: "release".into(),
+                request_id: "release-unauthenticated".into(),
+                subject_profile: subject::SOFTWARE_RELEASE_PLAN_PROFILE.into(),
+                subject_identity: "release-candidate:42".into(),
+                subject_content_digest: expected_digest,
+                plan_version_id,
+                evidence_object_ids: vec![],
+                evaluation_time_ms: 10,
+                max_total_duration_ms: 1_000,
+            }),
+        });
+        assert_eq!(
+            svc.evaluate_governed_subject_with_plan(unauthenticated)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     fn governed_subject_request(
