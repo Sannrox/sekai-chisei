@@ -69,6 +69,23 @@ curl --fail http://127.0.0.1:9464/metrics
   valid session. See [operator-console.md](operator-console.md) for local and
   TLS run paths.
 
+Trace export is optional and disabled unless an OTLP endpoint is configured:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+The control plane and gateway export tracing spans through the standard
+`tracing` subscriber. The `/metrics` endpoint remains the Prometheus metrics
+surface; OpenTelemetry does not replace it. W3C `traceparent`/`tracestate`
+context is accepted at trusted HTTP and gRPC boundaries and propagated to the
+control plane, but is stripped before requests reach model providers. OTLP
+headers, provider credentials, request content, and other credential-bearing
+values must not be placed in spans or logs. The durable operation receipt and
+its digest remain the authoritative operation record; exported traces are
+diagnostic only.
+
 The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
 

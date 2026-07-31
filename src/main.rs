@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::signal;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    sekai_chisei::obs::logging::init();
+    let mut telemetry = sekai_chisei::obs::logging::init();
     let config = Config::from_env();
     if let Some(mode) = std::env::args().nth(1)
         && mode == "gateway-report"
@@ -100,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _runtime_guard = async_runtime.enter();
         async_runtime.block_on(run_server(server))
     };
+    telemetry.shutdown();
     drop(async_runtime);
     drop(backend);
     result

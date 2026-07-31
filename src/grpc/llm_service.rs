@@ -12,6 +12,8 @@ use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
 use crate::llm;
+use crate::obs::correlation::Stage;
+use tracing::{Instrument, info_span};
 
 pub struct LlmServiceImpl {
     config: Config,
@@ -81,6 +83,10 @@ async fn execute_chat_request_with_cache(
 ) -> Result<ChatResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
+    let provider_name = registry
+        .resolve_model(&r.model)
+        .map(|resolved| resolved.provider)
+        .unwrap_or_else(|_| "unknown".to_string());
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.as_deref().unwrap_or("default");
@@ -142,7 +148,14 @@ async fn execute_chat_request_with_cache(
         max_tokens: r.max_tokens,
         prompt_cache,
     };
-    let resp = match provider.chat(&chat_req).await {
+    let provider_span = info_span!(
+        "stage",
+        stage = Stage::ProviderRequest.as_str(),
+        provider = %provider_name,
+        streaming = false,
+        otel.kind = "client",
+    );
+    let resp = match provider.chat(&chat_req).instrument(provider_span).await {
         Ok(r) => r,
         Err(e) => {
             budget.adjust(user_id, estimated, 0);
@@ -226,6 +239,10 @@ async fn execute_chat_request_stream_with_cache(
 ) -> Result<ChatStreamResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
+    let provider_name = registry
+        .resolve_model(&r.model)
+        .map(|resolved| resolved.provider)
+        .unwrap_or_else(|_| "unknown".to_string());
     let registry_state_path =
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
@@ -254,7 +271,18 @@ async fn execute_chat_request_stream_with_cache(
         }
     };
     let chat_req = pb_chat_to_domain(r, prompt_cache);
-    let stream = match provider.chat_stream(&chat_req).await {
+    let provider_span = info_span!(
+        "stage",
+        stage = Stage::ProviderRequest.as_str(),
+        provider = %provider_name,
+        streaming = true,
+        otel.kind = "client",
+    );
+    let stream = match provider
+        .chat_stream(&chat_req)
+        .instrument(provider_span)
+        .await
+    {
         Ok(stream) => stream,
         Err(e) => {
             budget.adjust(&user_id, estimated, 0);
@@ -264,40 +292,51 @@ async fn execute_chat_request_stream_with_cache(
     let budget_for_stream = budget.clone();
     let (tx, rx) = mpsc::channel::<Result<ChatStreamChunk, Status>>(16);
     let user_id_for_stream = user_id.clone();
+    let stream_span = info_span!(
+        "stage",
+        stage = Stage::ProviderRequest.as_str(),
+        provider = %provider_name,
+        streaming = true,
+        stream_consume = true,
+        otel.kind = "client",
+    );
 
-    tokio::spawn(async move {
-        let mut stream = stream;
-        let mut last_tokens = 0;
-        while let Some(next) = stream.next().await {
-            match next {
-                Ok(chunk) => {
-                    let actual_tokens = chunk
-                        .input_tokens
-                        .saturating_add(chunk.output_tokens)
-                        .saturating_add(chunk.cache_read_input_tokens)
-                        .saturating_add(chunk.cache_creation_input_tokens);
-                    if actual_tokens > 0 {
-                        last_tokens = actual_tokens;
+    tokio::spawn(
+        async move {
+            let mut stream = stream;
+            let mut last_tokens = 0;
+            while let Some(next) = stream.next().await {
+                match next {
+                    Ok(chunk) => {
+                        let actual_tokens = chunk
+                            .input_tokens
+                            .saturating_add(chunk.output_tokens)
+                            .saturating_add(chunk.cache_read_input_tokens)
+                            .saturating_add(chunk.cache_creation_input_tokens);
+                        if actual_tokens > 0 {
+                            last_tokens = actual_tokens;
+                        }
+                        let done = chunk.done;
+                        let pb_chunk = domain_chunk_to_pb(chunk);
+                        if tx.send(Ok(pb_chunk)).await.is_err() {
+                            continue;
+                        }
+                        if done {
+                            budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
+                            return;
+                        }
                     }
-                    let done = chunk.done;
-                    let pb_chunk = domain_chunk_to_pb(chunk);
-                    if tx.send(Ok(pb_chunk)).await.is_err() {
-                        continue;
-                    }
-                    if done {
-                        budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
+                    Err(err) => {
+                        budget_for_stream.adjust(&user_id_for_stream, estimated, 0);
+                        let _ = tx.send(Err(Status::internal(err))).await;
                         return;
                     }
                 }
-                Err(err) => {
-                    budget_for_stream.adjust(&user_id_for_stream, estimated, 0);
-                    let _ = tx.send(Err(Status::internal(err))).await;
-                    return;
-                }
             }
+            budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
         }
-        budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
-    });
+        .instrument(stream_span),
+    );
 
     Ok(Box::pin(ReceiverStream::new(rx)))
 }

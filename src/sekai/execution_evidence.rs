@@ -222,6 +222,11 @@ impl SekaiDb {
     /// Project one already-admitted Sekai envelope into the external-action
     /// lifecycle. The source envelope remains the authoritative evidence.
     pub fn record_execution_evidence(&self, submission_id: &str) -> Result<bool, String> {
+        let _span = tracing::info_span!(
+            "stage",
+            stage = crate::obs::correlation::Stage::EvidenceProjection.as_str(),
+        )
+        .entered();
         self.ensure_execution_evidence_tables()?;
         let submission = self
             .get_evidence_submission(submission_id)?

@@ -35,6 +35,11 @@ template.
 | `CHISEI_GOVERNED_SUBJECT_PROVENANCE_TTL_MS` | `86400000` | Issued envelope lifetime; must be positive and no more than 31 days |
 | `RUST_LOG` | `info` | Tracing filter |
 | `LOG_FORMAT` | `pretty` | Use `json` for structured logs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OTLP HTTP/protobuf trace export when set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | OTLP trace transport; use `http/protobuf` for this build |
+| `OTEL_SERVICE_NAME` | process-specific | OpenTelemetry resource service name |
+| `OTEL_TRACES_SAMPLER` | SDK default | Standard OpenTelemetry trace sampling configuration |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | Optional collector headers; treat values as secrets and never log or commit them |
 
 When authenticated mode is active and `SEKAI_BIND` is unset, TCP binds to
 `0.0.0.0`. A public bind requires TLS unless `SEKAI_ALLOW_PLAINTEXT=1` is an

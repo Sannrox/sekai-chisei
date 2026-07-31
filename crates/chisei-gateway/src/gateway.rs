@@ -23,7 +23,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 #[cfg(test)]
 use crate::client::connect_sekai;
@@ -93,6 +93,7 @@ const X_CHISEI_ATTEMPT: HeaderName = HeaderName::from_static("x-chisei-attempt")
 const X_CHISEI_CYCLE_ID: HeaderName = HeaderName::from_static("x-chisei-cycle-id");
 const X_CHISEI_RETRY_SAFETY: HeaderName = HeaderName::from_static("x-chisei-retry-safety");
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
 const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
 const READINESS_PROBE_CACHE_SECS: u64 = 5;
@@ -1837,46 +1838,54 @@ async fn proxy_gateway(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Response<Body> {
-    let identity_context = match resolve_identity(&headers, &state).await {
-        Ok(identity) => identity,
-        Err(err) => {
-            record_gateway_event(
-                &state.config,
-                "chisei-gateway",
-                "gateway.auth_failed",
-                err.reason(),
-                "denied",
-                err.evidence(&state.config),
-            )
-            .await;
-            let correlation = GatewayCorrelation::generated("unauthenticated");
-            let mut response = err.response();
-            correlation.apply_response_headers(&mut response);
-            return response;
-        }
-    };
-    let correlation_scope = gateway_correlation_scope(&identity_context.identity);
-    let correlation = match GatewayCorrelation::from_headers(&headers, &correlation_scope) {
-        Ok(correlation) => correlation,
-        Err(reason) => {
-            let correlation = GatewayCorrelation::generated(&correlation_scope);
-            let mut response = json_error(StatusCode::BAD_REQUEST, "invalid_correlation", &reason);
-            correlation.apply_response_headers(&mut response);
-            return response;
-        }
-    };
-    let mut response = proxy_gateway_inner(
-        state,
-        uri,
-        method,
-        headers,
-        request,
-        correlation.clone(),
-        identity_context,
-    )
-    .await;
-    correlation.apply_response_headers(&mut response);
-    response
+    let span = tracing::info_span!("gateway.http", stage = "operation", otel.kind = "server",);
+    crate::obs::otel::set_parent_from_headers(&span, &headers);
+
+    async move {
+        let identity_context = match resolve_identity(&headers, &state).await {
+            Ok(identity) => identity,
+            Err(err) => {
+                record_gateway_event(
+                    &state.config,
+                    "chisei-gateway",
+                    "gateway.auth_failed",
+                    err.reason(),
+                    "denied",
+                    err.evidence(&state.config),
+                )
+                .await;
+                let correlation = GatewayCorrelation::generated("unauthenticated");
+                let mut response = err.response();
+                correlation.apply_response_headers(&mut response);
+                return response;
+            }
+        };
+        let correlation_scope = gateway_correlation_scope(&identity_context.identity);
+        let correlation = match GatewayCorrelation::from_headers(&headers, &correlation_scope) {
+            Ok(correlation) => correlation,
+            Err(reason) => {
+                let correlation = GatewayCorrelation::generated(&correlation_scope);
+                let mut response =
+                    json_error(StatusCode::BAD_REQUEST, "invalid_correlation", &reason);
+                correlation.apply_response_headers(&mut response);
+                return response;
+            }
+        };
+        let mut response = proxy_gateway_inner(
+            state,
+            uri,
+            method,
+            headers,
+            request,
+            correlation.clone(),
+            identity_context,
+        )
+        .await;
+        correlation.apply_response_headers(&mut response);
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 async fn proxy_gateway_inner(
@@ -7390,7 +7399,7 @@ async fn record_usage_and_append(
                 warn!(error = %err, "chisei-gateway pending usage reconciliation failed");
             }
             if let Err(err) = chisei
-                .record_usage(GrpcRequest::new(request_usage.clone()))
+                .record_usage(gateway_request(request_usage.clone()))
                 .await
             {
                 warn!(error = %err, "chisei-gateway request-count usage record failed");
@@ -7403,7 +7412,7 @@ async fn record_usage_and_append(
                 // project -> agent -> work_unit chain as the preflight check
                 // and deduct at every ancestor level in one call.
                 if let Err(err) = chisei
-                    .record_usage(GrpcRequest::new(token_usage.clone()))
+                    .record_usage(gateway_request(token_usage.clone()))
                     .await
                 {
                     warn!(error = %err, "chisei-gateway usage record failed");
@@ -7750,7 +7759,7 @@ async fn emit_budget_threshold_warnings(
 
     for (scope_kind, scope_id) in scopes {
         let response = chisei
-            .check_budget(GrpcRequest::new(CheckBudgetRequest {
+            .check_budget(gateway_request(CheckBudgetRequest {
                 subject: scope_id.clone(),
                 estimated_tokens: 0,
                 project: String::new(),
@@ -8628,7 +8637,7 @@ async fn record_sample_observation_if_needed(
     }
     let usage = usage.unwrap_or_default();
     match chisei
-        .record_sample_observation(GrpcRequest::new(RecordSampleObservationRequest {
+        .record_sample_observation(gateway_request(RecordSampleObservationRequest {
             observation: Some(SampleObservation {
                 request_id: context.request_id.clone(),
                 namespace: identity.project.clone(),
@@ -9391,6 +9400,7 @@ fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     request
         .metadata_mut()
         .insert("x-principal", "chisei-gateway".parse().unwrap());
+    crate::obs::otel::inject_current_context(request.metadata_mut());
     request
 }
 
@@ -9399,6 +9409,7 @@ fn principal_request<T>(message: T, principal: &str) -> Result<GrpcRequest<T>, t
     let principal = tonic::metadata::MetadataValue::try_from(principal)
         .map_err(|_| tonic::Status::internal("invalid authenticated gateway principal"))?;
     request.metadata_mut().insert("x-principal", principal);
+    crate::obs::otel::inject_current_context(request.metadata_mut());
     Ok(request)
 }
 
@@ -11017,6 +11028,8 @@ fn should_forward_request_header(name: &HeaderName, auth_mode: UpstreamAuthMode)
         || name == HOST
         || name == CONTENT_LENGTH
         || name == ACCEPT_ENCODING
+        || name == TRACEPARENT
+        || name == TRACESTATE
         || is_chisei_header(name)
     {
         // Strip Accept-Encoding so upstreams return identity-encoded bodies the
@@ -11040,7 +11053,11 @@ fn is_chisei_header(name: &HeaderName) -> bool {
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
-    !is_hop_by_hop(name) && name != CONTENT_LENGTH && !is_chisei_header(name) && name != TRACEPARENT
+    !is_hop_by_hop(name)
+        && name != CONTENT_LENGTH
+        && !is_chisei_header(name)
+        && name != TRACEPARENT
+        && name != TRACESTATE
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -11555,6 +11572,7 @@ mod tests {
             &X_CHISEI_PARENT_OPERATION_ID
         ));
         assert!(!should_forward_response_header(&TRACEPARENT));
+        assert!(!should_forward_response_header(&TRACESTATE));
         assert!(should_forward_response_header(&CONTENT_TYPE));
     }
 
@@ -13729,6 +13747,14 @@ mod tests {
                 should_forward_request_header(&CONTENT_TYPE, mode),
                 "Content-Type should forward in {mode:?} mode"
             );
+        }
+    }
+
+    #[test]
+    fn strips_trace_context_on_upstream_requests() {
+        for mode in [UpstreamAuthMode::GatewayKey, UpstreamAuthMode::Passthrough] {
+            assert!(!should_forward_request_header(&TRACEPARENT, mode));
+            assert!(!should_forward_request_header(&TRACESTATE, mode));
         }
     }
 
