@@ -66,11 +66,19 @@ pub struct ChiseiServiceImpl {
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+    stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
     evaluation_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     evaluation_execution_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     db: Arc<RuntimeDb>,
     config: Config,
     provider_registry_state_path: Option<PathBuf>,
+}
+
+struct EvaluationExecutionRuntime<'a> {
+    deterministic_registry: &'a evaluation_execution_domain::DeterministicEvaluatorRegistry,
+    stochastic_registry: &'a evaluation_execution_domain::StochasticEvaluatorRegistry,
+    stochastic_egress_reasons: &'a BTreeMap<String, String>,
+    budget: &'a BudgetTracker,
 }
 
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
@@ -1857,6 +1865,9 @@ fn from_proto_evaluator_definition(
             max_output_bytes: limits.max_output_bytes,
             max_evidence_items: limits.max_evidence_items,
         },
+        stochastic_policy: value
+            .stochastic_policy
+            .map(from_proto_stochastic_evaluator_policy),
         source_ref: value.source_ref,
         content_digest: value.content_digest,
         created_by: value.created_by,
@@ -1886,10 +1897,68 @@ fn to_proto_evaluator_definition(
             max_output_bytes: value.resource_limits.max_output_bytes,
             max_evidence_items: value.resource_limits.max_evidence_items,
         }),
+        stochastic_policy: value
+            .stochastic_policy
+            .as_ref()
+            .map(to_proto_stochastic_evaluator_policy),
         source_ref: value.source_ref.clone(),
         content_digest: value.content_digest.clone(),
         created_by: value.created_by.clone(),
         created_at_ms: value.created_at_ms,
+    }
+}
+
+fn from_proto_stochastic_evaluator_policy(
+    value: StochasticEvaluatorPolicy,
+) -> evaluation_plan_domain::StochasticEvaluatorPolicy {
+    evaluation_plan_domain::StochasticEvaluatorPolicy {
+        provider: value.provider,
+        model: value.model,
+        prompt_profile: value.prompt_profile,
+        prompt_profile_digest: value.prompt_profile_digest,
+        result_schema: value.result_schema,
+        trial_count: value.trial_count,
+        temperature_millis: value.temperature_millis,
+        top_p_millionths: value.top_p_millionths,
+        seed_supported: value.seed_supported,
+        base_seed: value.base_seed,
+        aggregation_rule: value.aggregation_rule,
+        minimum_mean_score_micros: value.minimum_mean_score_micros,
+        minimum_pass_rate_basis_points: value.minimum_pass_rate_basis_points,
+        maximum_score_variance_micros_squared: value.maximum_score_variance_micros_squared,
+        gate_eligible: value.gate_eligible,
+        max_retries_per_trial: value.max_retries_per_trial,
+        max_tokens_per_trial: value.max_tokens_per_trial,
+        max_total_tokens: value.max_total_tokens,
+        egress_policy: value.egress_policy,
+        raw_response_retention: value.raw_response_retention,
+    }
+}
+
+fn to_proto_stochastic_evaluator_policy(
+    value: &evaluation_plan_domain::StochasticEvaluatorPolicy,
+) -> StochasticEvaluatorPolicy {
+    StochasticEvaluatorPolicy {
+        provider: value.provider.clone(),
+        model: value.model.clone(),
+        prompt_profile: value.prompt_profile.clone(),
+        prompt_profile_digest: value.prompt_profile_digest.clone(),
+        result_schema: value.result_schema.clone(),
+        trial_count: value.trial_count,
+        temperature_millis: value.temperature_millis,
+        top_p_millionths: value.top_p_millionths,
+        seed_supported: value.seed_supported,
+        base_seed: value.base_seed,
+        aggregation_rule: value.aggregation_rule.clone(),
+        minimum_mean_score_micros: value.minimum_mean_score_micros,
+        minimum_pass_rate_basis_points: value.minimum_pass_rate_basis_points,
+        maximum_score_variance_micros_squared: value.maximum_score_variance_micros_squared,
+        gate_eligible: value.gate_eligible,
+        max_retries_per_trial: value.max_retries_per_trial,
+        max_tokens_per_trial: value.max_tokens_per_trial,
+        max_total_tokens: value.max_total_tokens,
+        egress_policy: value.egress_policy.clone(),
+        raw_response_retention: value.raw_response_retention.clone(),
     }
 }
 
@@ -2060,6 +2129,11 @@ fn to_proto_evaluation_manifest(
                     definition_id: node.evaluator.definition_id.clone(),
                     definition_digest: node.evaluator.definition_digest.clone(),
                     implementation_digest: node.evaluator.implementation_digest.clone(),
+                    stochastic_policy: node
+                        .evaluator
+                        .stochastic_policy
+                        .as_ref()
+                        .map(to_proto_stochastic_evaluator_policy),
                 }),
                 depends_on_node_ids: node.depends_on_node_ids.clone(),
                 input_bindings: node
@@ -2171,6 +2245,47 @@ fn to_proto_evaluation_step(
         dependency_result_digests: value.dependency_result_digests.clone(),
         result_digest: value.result_digest.clone(),
         step_receipt_digest: value.step_receipt_digest.clone(),
+        stochastic_evidence: value.stochastic_evidence.as_ref().map(|evidence| {
+            StochasticStepEvidence {
+                contract_version: evidence.contract_version.clone(),
+                provider: evidence.provider.clone(),
+                model: evidence.model.clone(),
+                prompt_profile: evidence.prompt_profile.clone(),
+                prompt_profile_digest: evidence.prompt_profile_digest.clone(),
+                result_schema: evidence.result_schema.clone(),
+                trial_count: evidence.trial_count,
+                aggregation_rule: evidence.aggregation_rule.clone(),
+                minimum_mean_score_micros: evidence.minimum_mean_score_micros,
+                minimum_pass_rate_basis_points: evidence.minimum_pass_rate_basis_points,
+                maximum_score_variance_micros_squared: evidence
+                    .maximum_score_variance_micros_squared,
+                gate_eligible: evidence.gate_eligible,
+                completed_trial_count: evidence.completed_trial_count,
+                mean_score_micros: evidence.mean_score_micros,
+                pass_rate_basis_points: evidence.pass_rate_basis_points,
+                score_variance_micros_squared: evidence.score_variance_micros_squared,
+                total_input_tokens: evidence.total_input_tokens,
+                total_output_tokens: evidence.total_output_tokens,
+                total_retry_accounted_tokens: evidence.total_retry_accounted_tokens,
+                trials: evidence
+                    .trials
+                    .iter()
+                    .map(|trial| StochasticTrialEvidence {
+                        trial_index: trial.trial_index,
+                        seed: trial.seed,
+                        attempt_count: trial.attempt_count,
+                        status: trial.status.clone(),
+                        reason_code: trial.reason_code.clone(),
+                        score_micros: trial.score_micros,
+                        input_tokens: trial.input_tokens,
+                        output_tokens: trial.output_tokens,
+                        retry_accounted_tokens: trial.retry_accounted_tokens,
+                        result_digest: trial.result_digest.clone(),
+                    })
+                    .collect(),
+                aggregate_digest: evidence.aggregate_digest.clone(),
+            }
+        }),
     }
 }
 
@@ -3306,6 +3421,17 @@ fn resolve_evaluation_manifest_live(
                 "evaluator_unavailable",
             ));
         }
+        if node.classification == evaluation_plan_domain::NODE_REQUIRED
+            && definition.execution_class == evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
+            && !definition
+                .stochastic_policy
+                .as_ref()
+                .is_some_and(|policy| policy.gate_eligible)
+        {
+            return Err(Status::data_loss(
+                "required stochastic plan node lacks explicit gate eligibility",
+            ));
+        }
         evaluation_plan_domain::validate_parameters(
             &definition.parameter_schema_json,
             &node.parameters_json,
@@ -3379,6 +3505,7 @@ fn resolve_evaluation_manifest_live(
                 definition_id: definition.definition_id,
                 definition_digest: definition.content_digest,
                 implementation_digest: definition.implementation_digest,
+                stochastic_policy: definition.stochastic_policy,
             },
             depends_on_node_ids: node.depends_on_node_ids.clone(),
             input_bindings: node
@@ -3453,12 +3580,18 @@ fn resolve_evaluation_manifest_live(
 
 impl ChiseiServiceImpl {
     pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
-        Self::new_with_evaluator_registry(
+        Self::new_with_evaluator_registries(
             db,
-            config,
+            config.clone(),
             Arc::new(
                 evaluation_execution_domain::production_evaluator_registry()
                     .expect("compiled production evaluator registry must be valid"),
+            ),
+            Arc::new(
+                crate::chisei::stochastic_evaluation::production_stochastic_evaluator_registry(
+                    config,
+                )
+                .expect("compiled stochastic evaluator registry must be valid"),
             ),
         )
     }
@@ -3467,6 +3600,22 @@ impl ChiseiServiceImpl {
         db: Arc<RuntimeDb>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+    ) -> Self {
+        Self::new_with_evaluator_registries(
+            db,
+            config,
+            evaluator_registry,
+            Arc::new(evaluation_execution_domain::StochasticEvaluatorRegistry::default()),
+        )
+    }
+
+    pub fn new_with_evaluator_registries(
+        db: Arc<RuntimeDb>,
+        config: Config,
+        evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
+        stochastic_evaluator_registry: Arc<
+            evaluation_execution_domain::StochasticEvaluatorRegistry,
+        >,
     ) -> Self {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
@@ -3497,6 +3646,7 @@ impl ChiseiServiceImpl {
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
             evaluator_registry,
+            stochastic_evaluator_registry,
             evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
             evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
             db,
@@ -3666,9 +3816,55 @@ impl ChiseiServiceImpl {
             .collect()
     }
 
+    fn stochastic_egress_reasons(
+        &self,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+    ) -> BTreeMap<String, String> {
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let mut reasons = BTreeMap::new();
+        for node in &manifest.nodes {
+            let Some(policy) = &node.evaluator.stochastic_policy else {
+                continue;
+            };
+            if policy.egress_policy
+                == evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL
+                && !crate::chisei::privacy::provider_safe_to_send(&policy.provider, &safe_providers)
+            {
+                reasons.insert(
+                    node.node_id.clone(),
+                    evaluation_execution_domain::REASON_STOCHASTIC_EGRESS_DENIED.into(),
+                );
+            }
+        }
+        reasons
+    }
+
+    fn stochastic_budget_reason(
+        budget: &BudgetTracker,
+        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
+    ) -> Option<String> {
+        let policy = node.evaluator.stochastic_policy.as_ref()?;
+        let Ok(amount) = i32::try_from(policy.max_total_tokens) else {
+            return Some(evaluation_execution_domain::REASON_STOCHASTIC_TOKEN_BUDGET.into());
+        };
+        let scope = format!(
+            "project:{}/stochastic-evaluation:{}",
+            manifest.namespace, node.node_id
+        );
+        let idempotency_key = format!(
+            "stochastic-evaluation-reserve:{}:{}",
+            manifest.manifest_digest, node.node_id
+        );
+        budget
+            .check_and_reserve_idempotent(&scope, amount, &idempotency_key)
+            .err()
+            .map(|_| evaluation_execution_domain::REASON_STOCHASTIC_TOKEN_BUDGET.into())
+    }
+
     fn run_evaluation_execution(
         db: &RuntimeDb,
-        evaluator_registry: &evaluation_execution_domain::DeterministicEvaluatorRegistry,
+        runtime: EvaluationExecutionRuntime<'_>,
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
         index: &evaluation_execution_domain::EvaluationExecutionIndex,
         max_total_duration_ms: u64,
@@ -3760,22 +3956,70 @@ impl ChiseiServiceImpl {
                     .ok()?;
                     (canonical == definition
                         && definition.content_digest == node.evaluator.definition_digest
-                        && definition.implementation_digest == node.evaluator.implementation_digest)
+                        && definition.implementation_digest == node.evaluator.implementation_digest
+                        && definition.stochastic_policy == node.evaluator.stochastic_policy)
                         .then_some(definition)
                 });
                 if let Some(definition) = definition {
                     let remaining = total_budget
                         .saturating_sub(elapsed_before_invocation)
                         .saturating_sub(invocation_started.elapsed());
-                    evaluation_execution_domain::execute_registered_node(
-                        evaluator_registry,
-                        manifest,
-                        node,
-                        input.clone(),
-                        &definition.resource_limits,
-                        remaining,
-                        cancelled.clone(),
-                    )
+                    if definition.execution_class
+                        == evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
+                    {
+                        if let Some(reason) = runtime.stochastic_egress_reasons.get(&node.node_id) {
+                            evaluation_execution_domain::make_nonexecuted_node(
+                                manifest,
+                                node,
+                                &input,
+                                evaluation_execution_domain::STATUS_UNAVAILABLE,
+                                reason,
+                            )
+                        } else if !runtime
+                            .stochastic_registry
+                            .contains(&definition.implementation_digest)
+                        {
+                            evaluation_execution_domain::execute_stochastic_node(
+                                runtime.stochastic_registry,
+                                manifest,
+                                node,
+                                input.clone(),
+                                &definition.resource_limits,
+                                remaining,
+                                cancelled.clone(),
+                            )
+                        } else if let Some(reason) =
+                            Self::stochastic_budget_reason(runtime.budget, manifest, node)
+                        {
+                            evaluation_execution_domain::make_nonexecuted_node(
+                                manifest,
+                                node,
+                                &input,
+                                evaluation_execution_domain::STATUS_UNAVAILABLE,
+                                &reason,
+                            )
+                        } else {
+                            evaluation_execution_domain::execute_stochastic_node(
+                                runtime.stochastic_registry,
+                                manifest,
+                                node,
+                                input.clone(),
+                                &definition.resource_limits,
+                                remaining,
+                                cancelled.clone(),
+                            )
+                        }
+                    } else {
+                        evaluation_execution_domain::execute_registered_node(
+                            runtime.deterministic_registry,
+                            manifest,
+                            node,
+                            input.clone(),
+                            &definition.resource_limits,
+                            remaining,
+                            cancelled.clone(),
+                        )
+                    }
                 } else {
                     evaluation_execution_domain::make_nonexecuted_node(
                         manifest,
@@ -3868,7 +4112,15 @@ impl ChiseiServiceImpl {
                     .find(|step| step.node_id == node.node_id)
                     .ok_or_else(|| Status::data_loss("durable evaluation step is missing"))?;
                 let (metrics_evaluator, metrics_version) =
-                    evaluator_registry.metric_labels(&node.evaluator.implementation_digest);
+                    if node.evaluator.stochastic_policy.is_some() {
+                        runtime
+                            .stochastic_registry
+                            .metric_labels(&node.evaluator.implementation_digest)
+                    } else {
+                        runtime
+                            .deterministic_registry
+                            .metric_labels(&node.evaluator.implementation_digest)
+                    };
                 crate::obs::signals::record_evaluation_step(
                     metrics_evaluator,
                     metrics_version,
@@ -4017,13 +4269,21 @@ impl ChiseiServiceImpl {
         };
         let _guard = execution_lock.lock().await;
         let worker_db = self.db.clone();
+        let worker_budget = self.budget.clone();
         let worker_registry = self.evaluator_registry.clone();
+        let worker_stochastic_registry = self.stochastic_evaluator_registry.clone();
+        let stochastic_egress_reasons = self.stochastic_egress_reasons(manifest);
         let worker_manifest = manifest.clone();
         let worker_index = index;
         let projection = tokio::task::spawn_blocking(move || {
             Self::run_evaluation_execution(
                 &worker_db,
-                &worker_registry,
+                EvaluationExecutionRuntime {
+                    deterministic_registry: &worker_registry,
+                    stochastic_registry: &worker_stochastic_registry,
+                    stochastic_egress_reasons: &stochastic_egress_reasons,
+                    budget: &worker_budget,
+                },
                 &worker_manifest,
                 &worker_index,
                 frozen_total_duration_ms,
@@ -4354,6 +4614,12 @@ impl ChiseiServiceImpl {
             active_promotions: Arc::new(ActivePromotions::new()),
             evaluator_registry: Arc::new(
                 evaluation_execution_domain::DeterministicEvaluatorRegistry::default(),
+            ),
+            stochastic_evaluator_registry: Arc::new(
+                crate::chisei::stochastic_evaluation::production_stochastic_evaluator_registry(
+                    config.clone(),
+                )
+                .expect("compiled stochastic evaluator registry must be valid"),
             ),
             evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
             evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -12658,13 +12924,21 @@ impl ChiseiService for ChiseiServiceImpl {
         };
         let _guard = execution_lock.lock().await;
         let worker_db = self.db.clone();
+        let worker_budget = self.budget.clone();
         let worker_registry = self.evaluator_registry.clone();
+        let worker_stochastic_registry = self.stochastic_evaluator_registry.clone();
+        let stochastic_egress_reasons = BTreeMap::new();
         let worker_manifest = manifest.clone();
         let worker_index = index.clone();
         let projection = tokio::task::spawn_blocking(move || {
             Self::run_evaluation_execution(
                 &worker_db,
-                &worker_registry,
+                EvaluationExecutionRuntime {
+                    deterministic_registry: &worker_registry,
+                    stochastic_registry: &worker_stochastic_registry,
+                    stochastic_egress_reasons: &stochastic_egress_reasons,
+                    budget: &worker_budget,
+                },
                 &worker_manifest,
                 &worker_index,
                 max_total_duration_ms,
@@ -14337,6 +14611,107 @@ mod tests {
             site_id: "local".into(),
             budget_topology: Default::default(),
         }
+    }
+
+    fn stochastic_admission_manifest(
+        provider: &str,
+        egress_policy: &str,
+        max_total_tokens: u32,
+    ) -> evaluation_manifest_domain::ResolvedEvaluationManifest {
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        evaluation_manifest_domain::ResolvedEvaluationManifest {
+            contract_version: evaluation_manifest_domain::MANIFEST_CONTRACT.into(),
+            resolver_version: evaluation_manifest_domain::RESOLVER_VERSION.into(),
+            manifest_id: "manifest:stochastic-admission".into(),
+            manifest_digest: digest('a'),
+            namespace: "acme".into(),
+            plan_version_id: "plan:stochastic-admission".into(),
+            plan_digest: digest('b'),
+            subject_profile: "document/v1".into(),
+            subject_identity: "document:42".into(),
+            subject_content_digest: digest('c'),
+            invariant_set_id: "set:stochastic-admission".into(),
+            invariant_set_digest: digest('d'),
+            invariant_profile_digest: digest('e'),
+            evaluation_time_ms: 1,
+            resolved_by: "operator".into(),
+            requirements: vec![],
+            nodes: vec![evaluation_manifest_domain::ResolvedEvaluationNode {
+                node_id: "model-review".into(),
+                evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                    definition_id: "definition:model-review".into(),
+                    definition_digest: digest('f'),
+                    implementation_digest: digest('1'),
+                    stochastic_policy: Some(evaluation_plan_domain::StochasticEvaluatorPolicy {
+                        provider: provider.into(),
+                        model: format!("{provider}/fixture"),
+                        prompt_profile: "chisei.fixture/v1".into(),
+                        prompt_profile_digest: digest('2'),
+                        result_schema: "chisei.stochastic-trial-result/v1".into(),
+                        trial_count: 2,
+                        temperature_millis: 200,
+                        top_p_millionths: 900_000,
+                        seed_supported: provider != "anthropic",
+                        base_seed: if provider == "anthropic" { 0 } else { 7 },
+                        aggregation_rule:
+                            evaluation_plan_domain::STOCHASTIC_AGGREGATION_MEAN_VARIANCE.into(),
+                        minimum_mean_score_micros: 0,
+                        minimum_pass_rate_basis_points: 0,
+                        maximum_score_variance_micros_squared: 1_000_000_000_000,
+                        gate_eligible: false,
+                        max_retries_per_trial: 0,
+                        max_tokens_per_trial: 1,
+                        max_total_tokens,
+                        egress_policy: egress_policy.into(),
+                        raw_response_retention:
+                            evaluation_plan_domain::STOCHASTIC_RAW_RETENTION_NONE.into(),
+                    }),
+                },
+                depends_on_node_ids: vec![],
+                input_bindings: vec![],
+                parameters_json: "{}".into(),
+                invariants: vec![],
+                evidence_object_ids: vec![],
+                classification: evaluation_plan_domain::NODE_ADVISORY.into(),
+            }],
+            evidence: vec![],
+            waivers: vec![],
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn stochastic_admission_fails_closed_before_external_or_unbudgetable_calls() {
+        let svc = memory_service();
+        let denied = stochastic_admission_manifest(
+            "openai",
+            evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL,
+            2,
+        );
+        assert_eq!(
+            svc.stochastic_egress_reasons(&denied)
+                .get("model-review")
+                .map(String::as_str),
+            Some(evaluation_execution_domain::REASON_STOCHASTIC_EGRESS_DENIED)
+        );
+
+        let mut allowed_config = config(":memory:");
+        allowed_config.safe_egress_providers = vec!["openai".into()];
+        let allowed = ChiseiServiceImpl::new(svc.db.clone(), allowed_config);
+        let unbudgetable = stochastic_admission_manifest(
+            "openai",
+            evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL,
+            u32::MAX,
+        );
+        assert_eq!(
+            ChiseiServiceImpl::stochastic_budget_reason(
+                &allowed.budget,
+                &unbudgetable,
+                &unbudgetable.nodes[0],
+            )
+            .as_deref(),
+            Some(evaluation_execution_domain::REASON_STOCHASTIC_TOKEN_BUDGET)
+        );
     }
 
     fn memory_service() -> ChiseiServiceImpl {

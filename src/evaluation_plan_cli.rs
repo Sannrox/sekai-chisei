@@ -15,8 +15,8 @@ use crate::chisei::evaluation_manifest::{
 };
 use crate::chisei::evaluation_plan::{
     AVAILABILITY_ENABLED, EvaluationInputBinding as DomainInputBinding,
-    EvaluationPlan as DomainPlan, EvaluationPlanNode as DomainPlanNode, prepare_plan,
-    validate_parameters,
+    EvaluationPlan as DomainPlan, EvaluationPlanNode as DomainPlanNode, NODE_REQUIRED,
+    STOCHASTIC_EXECUTION_CLASS, prepare_plan, validate_parameters,
 };
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -714,6 +714,18 @@ async fn validate_live_references(
         let definition = definitions
             .get(&node.evaluator_definition_id)
             .expect("definition inserted");
+        if node.classification == NODE_REQUIRED
+            && definition.execution_class == STOCHASTIC_EXECUTION_CLASS
+            && !definition
+                .stochastic_policy
+                .as_ref()
+                .is_some_and(|policy| policy.gate_eligible)
+        {
+            return Err(EvaluationCliError::validation(format!(
+                "node {:?} requires a stochastic evaluator without explicit gate eligibility",
+                node.node_id
+            )));
+        }
         validate_parameters(&definition.parameter_schema_json, &node.parameters_json).map_err(
             |error| {
                 EvaluationCliError::validation(format!(

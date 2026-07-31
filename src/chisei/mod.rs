@@ -39,5 +39,6 @@ pub use sekai_provider::receipt;
 pub mod residency;
 pub mod sampling;
 pub mod scoring;
+pub mod stochastic_evaluation;
 pub mod tenant_quota;
 pub mod usage_ledger;

@@ -32,6 +32,7 @@ fn manifest(
                 definition_id: "evaluator-definition:fixture".into(),
                 definition_digest: format!("sha256:{}", "e".repeat(64)),
                 implementation_digest: format!("sha256:{}", "f".repeat(64)),
+                stochastic_policy: None,
             },
             depends_on_node_ids: vec![],
             input_bindings: vec![ResolvedInputBinding {

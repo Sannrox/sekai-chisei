@@ -281,6 +281,7 @@ mod tests {
                     definition_id: "definition:1".into(),
                     definition_digest: format!("sha256:{}", "e".repeat(64)),
                     implementation_digest: format!("sha256:{}", "f".repeat(64)),
+                    stochastic_policy: None,
                 },
                 depends_on_node_ids: vec![],
                 input_bindings: vec![ResolvedInputBinding {

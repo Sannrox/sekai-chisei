@@ -287,6 +287,31 @@ message EvaluatorResourceLimits {
   uint64 max_output_bytes = 3;
   uint32 max_evidence_items = 4;
 }
+// Situation-specific model evaluation policy. Integer units make the policy
+// canonical across runtimes: scores are millionths, pass rate is basis points,
+// temperature is thousandths, and top-p is millionths.
+message StochasticEvaluatorPolicy {
+  string provider = 1;
+  string model = 2;
+  string prompt_profile = 3;
+  string prompt_profile_digest = 4;
+  string result_schema = 5;
+  uint32 trial_count = 6;
+  uint32 temperature_millis = 7;
+  uint32 top_p_millionths = 8;
+  bool seed_supported = 9;
+  int64 base_seed = 10;
+  string aggregation_rule = 11; // mean_score_with_variance/v1
+  uint32 minimum_mean_score_micros = 12;
+  uint32 minimum_pass_rate_basis_points = 13;
+  uint64 maximum_score_variance_micros_squared = 14;
+  bool gate_eligible = 15;
+  uint32 max_retries_per_trial = 16;
+  uint32 max_tokens_per_trial = 17;
+  uint32 max_total_tokens = 18;
+  string egress_policy = 19; // local_only/v1 | allowlisted_external/v1
+  string raw_response_retention = 20; // none/v1
+}
 message EvaluatorDefinition {
   string contract_version = 1; // chisei.evaluator-definition/v1
   string definition_id = 2;
@@ -306,6 +331,7 @@ message EvaluatorDefinition {
   string content_digest = 15;
   string created_by = 16;
   int64 created_at_ms = 17;
+  optional StochasticEvaluatorPolicy stochastic_policy = 18;
 }
 message EvaluatorAvailability {
   string definition_id = 1;
@@ -403,6 +429,7 @@ message ResolvedEvaluatorBinding {
   string definition_id = 1;
   string definition_digest = 2;
   string implementation_digest = 3;
+  optional StochasticEvaluatorPolicy stochastic_policy = 4;
 }
 message ResolvedEvidenceBinding {
   string evidence_object_id = 1;
@@ -498,6 +525,43 @@ message EvaluationExecutionRequest {
   string manifest_digest = 4;
   uint64 max_total_duration_ms = 5; // zero selects the bounded server default
 }
+message StochasticTrialEvidence {
+  uint32 trial_index = 1;
+  int64 seed = 2;
+  uint32 attempt_count = 3;
+  string status = 4;
+  string reason_code = 5;
+  uint32 score_micros = 6;
+  uint32 input_tokens = 7;
+  uint32 output_tokens = 8;
+  string result_digest = 9;
+  // Full per-attempt ceiling charged when a retryable provider error cannot
+  // report partial usage.
+  uint32 retry_accounted_tokens = 10;
+}
+message StochasticStepEvidence {
+  string contract_version = 1; // chisei.stochastic-step-evidence/v1
+  string provider = 2;
+  string model = 3;
+  string prompt_profile = 4;
+  string prompt_profile_digest = 5;
+  string result_schema = 6;
+  uint32 trial_count = 7;
+  string aggregation_rule = 8;
+  uint32 minimum_mean_score_micros = 9;
+  uint32 minimum_pass_rate_basis_points = 10;
+  uint64 maximum_score_variance_micros_squared = 11;
+  bool gate_eligible = 12;
+  uint32 completed_trial_count = 13;
+  uint32 mean_score_micros = 14;
+  uint32 pass_rate_basis_points = 15;
+  uint64 score_variance_micros_squared = 16;
+  uint32 total_input_tokens = 17;
+  uint32 total_output_tokens = 18;
+  repeated StochasticTrialEvidence trials = 19;
+  string aggregate_digest = 20;
+  uint32 total_retry_accounted_tokens = 21;
+}
 message EvaluationStepReceipt {
   string contract_version = 1; // chisei.evaluation-step-receipt/v1
   string manifest_digest = 2;
@@ -514,6 +578,7 @@ message EvaluationStepReceipt {
   reserved 13; // evaluator output content is never persisted or disclosed
   string result_digest = 14;
   string step_receipt_digest = 15;
+  optional StochasticStepEvidence stochastic_evidence = 16;
 }
 message InvariantCoverageDecision {
   string invariant_version_id = 1;

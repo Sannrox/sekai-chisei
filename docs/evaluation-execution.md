@@ -1,8 +1,11 @@
-# Deterministic evaluation execution
+# Evaluation execution
 
 `ExecuteEvaluationManifest` executes one exact
 `chisei.resolved-evaluation-manifest/v1` through the
-`chisei.deterministic-evaluation-executor/v1`. The manifest digest is the
+established `chisei.deterministic-evaluation-executor/v1` request protocol.
+The frozen node execution class selects a separate deterministic or stochastic
+registry and execution path; the request identifier is retained for persisted
+execution and client compatibility. The manifest digest is the
 idempotency identity. `GetEvaluationExecution` returns the receipt-derived
 projection, and `CancelEvaluationExecution` durably requests cancellation.
 
@@ -12,7 +15,7 @@ dependencies, and invariant coverage for each subject or domain. The executor
 only supplies bounded acyclic scheduling, exact implementation selection,
 closed result states, and the fixed reducer.
 
-## Compiled evaluator boundary
+## Evaluator boundaries
 
 Evaluator definitions register metadata and an exact implementation digest;
 they never upload code. A deployable evaluator is a compiled Rust
@@ -33,6 +36,15 @@ situations. An unregistered implementation digest produces `unavailable`; a
 subject content mismatch produces `fail` and therefore a `deny` gate. The
 executor never chooses a fallback or a newer definition.
 
+Stochastic definitions use `stochastic_model/v1` and a separate
+`StochasticEvaluatorRegistry`. The shipped stochastic implementation is
+`chisei.bounded-rubric-score/v1`
+(`sha256:1f28a6a6236c2405bcfeffc5730b014280287bf774e669c9f24ce4acb66c8ea9`).
+It accepts only its compiled prompt profile and digest, calls the exact frozen
+provider/model route, requests one normalized `passed`, `score_micros`, and
+bounded `reason_code` result per trial, and has no tools other than that
+structured return. It never falls back to another route.
+
 Each implementation receives one canonical input document containing:
 
 - the exact manifest and node identity;
@@ -41,10 +53,11 @@ Each implementation receives one canonical input document containing:
 - exact retained evidence content selected by the manifest; and
 - exact dependency result digests.
 
-It receives no runtime capability object, network client, clock, randomness,
-filesystem handle, process environment, locale, timezone, model/provider
-client, or action authority. Implementations remain operator-controlled
-compiled code and must pass the conformance harness. The harness repeats
+The deterministic implementation receives no runtime capability object,
+network client, clock, randomness, filesystem handle, process environment,
+locale, timezone, model/provider client, or action authority. Implementations
+remain operator-controlled compiled code and must pass the conformance harness.
+The harness repeats
 golden manifests in child processes with different timezone, locale, and hash
 seed settings, and checks identical semantic receipt bytes.
 
@@ -54,16 +67,60 @@ code, exact input/parameter/evaluator/evidence/dependency digests, the result
 digest, and the step-receipt digest. Evidence or result content is not
 returned.
 
+## Fixed stochastic populations
+
+Each stochastic step executes the frozen two-to-32 trial population in stable
+slot order. A supported seed is `base_seed + trial_index`; a retry reuses that
+same slot and seed. Retries are bounded per slot and cannot add trials.
+When a retryable error cannot report partial provider usage, its full
+per-attempt token ceiling is recorded as `retry_accounted_tokens` and included
+in aggregate budget evidence.
+Provider, model, profile, schema, temperature, top-p, aggregation, thresholds,
+token ceilings, egress, and retention remain frozen for every attempt.
+
+The receipt stores each slot's index, seed, attempt count, typed status,
+bounded reason, score, token counts, and normalized result digest. It then
+stores completed trial count, integer mean score, pass rate in basis points,
+population variance, total token counts, and a deterministic aggregate digest
+over the recorded slots. Those values support statistical comparison and gate
+explanation; they do not claim bit-identical model replay.
+
+The aggregate passes only when every fixed slot completed and all frozen
+mean-score, pass-rate, and maximum-variance thresholds are satisfied.
+Provider unavailability, timeout, cancellation, refusal, schema-invalid
+output, token exhaustion, or any partial population is a typed non-pass state.
+Timeout and cancellation drop the in-flight provider future before recording
+that terminal state; provider work is not detached from the execution receipt.
+An advisory stochastic node remains visible without affecting the reducer. A
+required stochastic node can exist only when its frozen policy explicitly
+declares gate eligibility.
+
+Seeded trial slots are admitted only for the v1 OpenAI provider contract.
+Other provider policies must freeze `seed_supported=false` and seed `0`.
+Recorded seeds are sampling provenance, not a claim of bit-identical replay.
+
+Before provider contact, external routes must be in
+`CHISEI_SAFE_EGRESS_PROVIDERS`. Once a node is ready and its exact evaluator
+implementation is registered, the full frozen token ceiling is reserved
+idempotently against the project/node budget scope immediately before the
+provider path. Blocked, completed, or unavailable nodes do not reserve it.
+Ollama is local-only.
+No prompt, evidence payload, raw provider response, reasoning, or normalized
+result object is persisted. V1 admits only `none/v1` raw-response retention.
+The production evaluator maps output to a closed reason vocabulary
+(`criteria_met`, `criteria_not_met`, or `insufficient_evidence`); arbitrary
+model-generated strings cannot enter a receipt.
+
 ## Closed execution and reduction
 
 Ready nodes run sequentially in deterministic topological order with
 `node_id` as the tie-breaker. V1 has no parallel scheduler, loop, dynamic
-node, expression, script, action, deployment, model call, or caller-selected
-reducer.
+node, expression, script, action, deployment, caller-selected provider/model,
+or caller-selected reducer.
 
 Step status is exactly one of:
 
-- `pass`, `fail`, or `unknown` from a valid deterministic evaluator;
+- `pass`, `fail`, or `unknown` from a valid evaluator;
 - `unavailable` for an unregistered implementation, timeout, or exhausted
   total execution budget;
 - `error` for a panic, invalid result contract, or output-limit violation; or
@@ -146,3 +203,12 @@ executor; otherwise they remain readable evidence and correctly do not produce
 Metrics expose only compiled static evaluator labels, compiled static version
 labels, the closed status vocabulary, and latency. They contain no namespace,
 subject, evidence identifier, digest, parameter, or content label.
+
+The provider-fake tests run in default CI. The ignored live path can be invoked
+when a local model is available:
+
+```bash
+cargo test --test ollama_e2e \
+  bounded_stochastic_evaluator_records_live_variance_evidence \
+  -- --ignored
+```

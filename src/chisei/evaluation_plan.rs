@@ -1,8 +1,9 @@
 //! Immutable evaluator definitions and situation-specific evaluation plans.
 //!
 //! This is deliberately a closed evaluation vocabulary, not a workflow
-//! engine. Plans select exact deterministic evaluator versions, bind typed
-//! inputs, cover exact governed invariant versions, and use one fixed reducer.
+//! engine. Plans select exact evaluator versions and situation-specific policy,
+//! bind typed inputs, cover exact governed invariant versions, and use one
+//! fixed reducer.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +13,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const EVALUATOR_DEFINITION_CONTRACT: &str = "chisei.evaluator-definition/v1";
 pub const EVALUATION_PLAN_CONTRACT: &str = "chisei.evaluation-plan/v1";
 pub const DETERMINISTIC_EXECUTION_CLASS: &str = "deterministic_builtin/v1";
+pub const STOCHASTIC_EXECUTION_CLASS: &str = "stochastic_model/v1";
+pub const STOCHASTIC_AGGREGATION_MEAN_VARIANCE: &str = "mean_score_with_variance/v1";
+pub const STOCHASTIC_RESULT_SCHEMA: &str = "chisei.stochastic-trial-result/v1";
+pub const STOCHASTIC_EGRESS_LOCAL_ONLY: &str = "local_only/v1";
+pub const STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL: &str = "allowlisted_external/v1";
+pub const STOCHASTIC_RAW_RETENTION_NONE: &str = "none/v1";
 pub const FIXED_REDUCER: &str = "required_all_pass_advisory_observed/v1";
 pub const AVAILABILITY_ENABLED: &str = "enabled";
 pub const AVAILABILITY_DISABLED: &str = "disabled";
@@ -31,6 +38,9 @@ pub const MAX_PLAN_BINDINGS: usize = 256;
 pub const MAX_PLAN_INVARIANTS: usize = 256;
 const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 const MAX_STRING_BYTES: usize = 1_024;
+pub const MIN_STOCHASTIC_TRIALS: u32 = 2;
+pub const MAX_STOCHASTIC_TRIALS: u32 = 32;
+pub const MAX_STOCHASTIC_RETRIES_PER_TRIAL: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluatorResourceLimits {
@@ -38,6 +48,35 @@ pub struct EvaluatorResourceLimits {
     pub max_input_bytes: u64,
     pub max_output_bytes: u64,
     pub max_evidence_items: u32,
+}
+
+/// Immutable, situation-specific model evaluation policy.
+///
+/// Integer units keep canonicalization independent of floating-point
+/// implementations. Scores and temperature are millionths and thousandths
+/// respectively; pass rate is expressed in basis points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StochasticEvaluatorPolicy {
+    pub provider: String,
+    pub model: String,
+    pub prompt_profile: String,
+    pub prompt_profile_digest: String,
+    pub result_schema: String,
+    pub trial_count: u32,
+    pub temperature_millis: u32,
+    pub top_p_millionths: u32,
+    pub seed_supported: bool,
+    pub base_seed: i64,
+    pub aggregation_rule: String,
+    pub minimum_mean_score_micros: u32,
+    pub minimum_pass_rate_basis_points: u32,
+    pub maximum_score_variance_micros_squared: u64,
+    pub gate_eligible: bool,
+    pub max_retries_per_trial: u32,
+    pub max_tokens_per_trial: u32,
+    pub max_total_tokens: u32,
+    pub egress_policy: String,
+    pub raw_response_retention: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +94,8 @@ pub struct EvaluatorDefinition {
     pub parameter_schema_json: String,
     pub evidence_classifications: Vec<String>,
     pub resource_limits: EvaluatorResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stochastic_policy: Option<StochasticEvaluatorPolicy>,
     pub source_ref: String,
     pub content_digest: String,
     pub created_by: String,
@@ -121,6 +162,8 @@ struct CanonicalDefinition<'a> {
     parameter_schema: Value,
     evidence_classifications: &'a [String],
     resource_limits: &'a EvaluatorResourceLimits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stochastic_policy: Option<&'a StochasticEvaluatorPolicy>,
     source_ref: &'a str,
 }
 
@@ -150,8 +193,19 @@ pub fn prepare_definition(
     validate_token("evaluator_id", &definition.evaluator_id)?;
     validate_version(&definition.version)?;
     validate_digest("implementation_digest", &definition.implementation_digest)?;
-    if definition.execution_class != DETERMINISTIC_EXECUTION_CLASS {
-        return Err("unknown or non-deterministic execution_class".into());
+    match definition.execution_class.as_str() {
+        DETERMINISTIC_EXECUTION_CLASS if definition.stochastic_policy.is_none() => {}
+        DETERMINISTIC_EXECUTION_CLASS => {
+            return Err("deterministic evaluator cannot declare stochastic policy".into());
+        }
+        STOCHASTIC_EXECUTION_CLASS => {
+            let policy = definition
+                .stochastic_policy
+                .as_ref()
+                .ok_or_else(|| "stochastic evaluator policy is required".to_string())?;
+            validate_stochastic_policy(policy, &definition.supported_result_schemas)?;
+        }
+        _ => return Err("unknown evaluator execution_class".into()),
     }
     normalize_tokens(
         "supported_predicate_kinds",
@@ -198,12 +252,117 @@ pub fn prepare_definition(
         parameter_schema,
         evidence_classifications: &definition.evidence_classifications,
         resource_limits: &definition.resource_limits,
+        stochastic_policy: definition.stochastic_policy.as_ref(),
         source_ref: &definition.source_ref,
     })?;
     definition.created_by = actor.into();
     definition.created_at_ms = now_ms;
     ensure_size(&definition, "evaluator definition")?;
     Ok(definition)
+}
+
+pub fn validate_stochastic_policy(
+    policy: &StochasticEvaluatorPolicy,
+    supported_result_schemas: &[String],
+) -> Result<(), String> {
+    validate_token("stochastic provider", &policy.provider)?;
+    validate_reference("stochastic model", &policy.model)?;
+    validate_reference("stochastic prompt_profile", &policy.prompt_profile)?;
+    validate_digest(
+        "stochastic prompt_profile_digest",
+        &policy.prompt_profile_digest,
+    )?;
+    validate_reference("stochastic result_schema", &policy.result_schema)?;
+    if policy.result_schema != STOCHASTIC_RESULT_SCHEMA {
+        return Err("stochastic v1 requires the normalized trial result schema".into());
+    }
+    if !supported_result_schemas.contains(&policy.result_schema) {
+        return Err("stochastic result_schema must be supported by the evaluator".into());
+    }
+    let resolved_provider = crate::provider_profile::resolve_provider_id(&policy.model)
+        .map_err(|_| "stochastic model must use an explicit supported provider prefix")?;
+    if resolved_provider != policy.provider {
+        return Err("stochastic provider does not match the exact model route".into());
+    }
+    if !(MIN_STOCHASTIC_TRIALS..=MAX_STOCHASTIC_TRIALS).contains(&policy.trial_count) {
+        return Err(format!(
+            "stochastic trial_count must be between {MIN_STOCHASTIC_TRIALS} and {MAX_STOCHASTIC_TRIALS}"
+        ));
+    }
+    if policy.temperature_millis > 2_000
+        || policy.top_p_millionths == 0
+        || policy.top_p_millionths > 1_000_000
+    {
+        return Err("stochastic sampling parameters are out of bounds".into());
+    }
+    if (policy.seed_supported && policy.base_seed <= 0)
+        || (!policy.seed_supported && policy.base_seed != 0)
+    {
+        return Err(
+            "stochastic base_seed must be positive only when the provider supports seeds".into(),
+        );
+    }
+    if policy.seed_supported
+        && policy
+            .base_seed
+            .checked_add(i64::from(policy.trial_count.saturating_sub(1)))
+            .is_none()
+    {
+        return Err("stochastic base_seed cannot cover every fixed trial slot".into());
+    }
+    if policy.seed_supported && policy.provider != "openai" {
+        return Err(
+            "stochastic v1 permits seeded trials only through the OpenAI seed parameter".into(),
+        );
+    }
+    if policy.aggregation_rule != STOCHASTIC_AGGREGATION_MEAN_VARIANCE {
+        return Err("unsupported stochastic aggregation_rule".into());
+    }
+    if policy.minimum_mean_score_micros > 1_000_000
+        || policy.minimum_pass_rate_basis_points > 10_000
+        || policy.maximum_score_variance_micros_squared > 1_000_000_000_000
+    {
+        return Err("stochastic acceptance thresholds are out of bounds".into());
+    }
+    if policy.max_retries_per_trial > MAX_STOCHASTIC_RETRIES_PER_TRIAL {
+        return Err(format!(
+            "stochastic max_retries_per_trial exceeds {MAX_STOCHASTIC_RETRIES_PER_TRIAL}"
+        ));
+    }
+    if policy.max_tokens_per_trial == 0 || policy.max_total_tokens == 0 {
+        return Err("stochastic token budgets must be positive".into());
+    }
+    if i32::try_from(policy.max_total_tokens).is_err() {
+        return Err("stochastic max_total_tokens exceeds the budget tracker range".into());
+    }
+    let maximum_attempts = u64::from(policy.trial_count)
+        .checked_mul(u64::from(policy.max_retries_per_trial) + 1)
+        .and_then(|value| value.checked_mul(u64::from(policy.max_tokens_per_trial)))
+        .ok_or_else(|| "stochastic token budget overflows".to_string())?;
+    if maximum_attempts > u64::from(policy.max_total_tokens) {
+        return Err(
+            "stochastic max_total_tokens must cover every fixed trial slot and bounded retry"
+                .into(),
+        );
+    }
+    match policy.egress_policy.as_str() {
+        STOCHASTIC_EGRESS_LOCAL_ONLY if policy.provider == "ollama" => {}
+        STOCHASTIC_EGRESS_LOCAL_ONLY => {
+            return Err("local-only stochastic egress requires the ollama provider".into());
+        }
+        STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL if policy.provider != "ollama" => {}
+        STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL => {
+            return Err("ollama stochastic evaluation must use local-only egress".into());
+        }
+        _ => return Err("unsupported stochastic egress_policy".into()),
+    }
+    if policy.raw_response_retention != STOCHASTIC_RAW_RETENTION_NONE {
+        return Err(
+            "stochastic v1 supports only no raw prompt/response retention; encrypted retention requires a dedicated governed store"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn prepare_plan(
@@ -870,6 +1029,7 @@ mod tests {
                 max_output_bytes: 1_024,
                 max_evidence_items: 8,
             },
+            stochastic_policy: None,
             source_ref: "repo://evaluators/schema-check@1".into(),
             content_digest: String::new(),
             created_by: String::new(),
@@ -906,6 +1066,31 @@ mod tests {
         }
     }
 
+    fn stochastic_policy() -> StochasticEvaluatorPolicy {
+        StochasticEvaluatorPolicy {
+            provider: "openai".into(),
+            model: "openai/gpt-fixture".into(),
+            prompt_profile: "chisei.fixture-rubric/v1".into(),
+            prompt_profile_digest: format!("sha256:{}", "b".repeat(64)),
+            result_schema: STOCHASTIC_RESULT_SCHEMA.into(),
+            trial_count: 3,
+            temperature_millis: 200,
+            top_p_millionths: 900_000,
+            seed_supported: true,
+            base_seed: 41,
+            aggregation_rule: STOCHASTIC_AGGREGATION_MEAN_VARIANCE.into(),
+            minimum_mean_score_micros: 800_000,
+            minimum_pass_rate_basis_points: 6_667,
+            maximum_score_variance_micros_squared: 10_000_000_000,
+            gate_eligible: false,
+            max_retries_per_trial: 1,
+            max_tokens_per_trial: 100,
+            max_total_tokens: 600,
+            egress_policy: STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL.into(),
+            raw_response_retention: STOCHASTIC_RAW_RETENTION_NONE.into(),
+        }
+    }
+
     #[test]
     fn canonical_definition_and_plan_are_stable() {
         let first = prepare_definition(definition(), "operator", 10).unwrap();
@@ -919,6 +1104,82 @@ mod tests {
         let second_plan = prepare_plan(plan(&first.definition_id), "other", 20).unwrap();
         assert_eq!(first_plan.plan_version_id, second_plan.plan_version_id);
         assert_eq!(first_plan.content_digest, second_plan.content_digest);
+    }
+
+    #[test]
+    fn stochastic_definitions_require_an_exact_bounded_situation_policy() {
+        let mut stochastic = definition();
+        stochastic.execution_class = STOCHASTIC_EXECUTION_CLASS.into();
+        stochastic.supported_result_schemas = vec![STOCHASTIC_RESULT_SCHEMA.into()];
+        assert!(
+            prepare_definition(stochastic.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("policy is required")
+        );
+
+        stochastic.stochastic_policy = Some(stochastic_policy());
+        let prepared = prepare_definition(stochastic.clone(), "operator", 10).unwrap();
+        assert_eq!(prepared.stochastic_policy.as_ref().unwrap().trial_count, 3);
+
+        stochastic.stochastic_policy.as_mut().unwrap().model = "anthropic/fixture".into();
+        assert!(
+            prepare_definition(stochastic.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("does not match")
+        );
+
+        stochastic.stochastic_policy = Some(stochastic_policy());
+        let policy = stochastic.stochastic_policy.as_mut().unwrap();
+        policy.provider = "ollama".into();
+        policy.model = "ollama/fixture".into();
+        policy.egress_policy = STOCHASTIC_EGRESS_LOCAL_ONLY.into();
+        assert!(
+            prepare_definition(stochastic.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("only through the OpenAI seed parameter")
+        );
+
+        stochastic.stochastic_policy = Some(stochastic_policy());
+        stochastic
+            .stochastic_policy
+            .as_mut()
+            .unwrap()
+            .raw_response_retention = "plaintext/v1".into();
+        assert!(
+            prepare_definition(stochastic, "operator", 10)
+                .unwrap_err()
+                .contains("no raw prompt/response retention")
+        );
+
+        let mut overflowing_seed = definition();
+        overflowing_seed.execution_class = STOCHASTIC_EXECUTION_CLASS.into();
+        overflowing_seed.supported_result_schemas = vec![STOCHASTIC_RESULT_SCHEMA.into()];
+        overflowing_seed.stochastic_policy = Some(stochastic_policy());
+        overflowing_seed
+            .stochastic_policy
+            .as_mut()
+            .unwrap()
+            .base_seed = i64::MAX;
+        assert!(
+            prepare_definition(overflowing_seed, "operator", 10)
+                .unwrap_err()
+                .contains("every fixed trial slot")
+        );
+
+        let mut oversized_budget = definition();
+        oversized_budget.execution_class = STOCHASTIC_EXECUTION_CLASS.into();
+        oversized_budget.supported_result_schemas = vec![STOCHASTIC_RESULT_SCHEMA.into()];
+        oversized_budget.stochastic_policy = Some(stochastic_policy());
+        oversized_budget
+            .stochastic_policy
+            .as_mut()
+            .unwrap()
+            .max_total_tokens = u32::MAX;
+        assert!(
+            prepare_definition(oversized_budget, "operator", 10)
+                .unwrap_err()
+                .contains("budget tracker range")
+        );
     }
 
     #[test]

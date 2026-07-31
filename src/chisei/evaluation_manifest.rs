@@ -48,6 +48,8 @@ pub struct ResolvedEvaluatorBinding {
     pub definition_id: String,
     pub definition_digest: String,
     pub implementation_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stochastic_policy: Option<super::evaluation_plan::StochasticEvaluatorPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +394,12 @@ fn normalize_manifest(manifest: &mut ResolvedEvaluationManifest) -> Result<(), S
             "evaluator implementation_digest",
             &node.evaluator.implementation_digest,
         )?;
+        if let Some(policy) = &node.evaluator.stochastic_policy {
+            super::evaluation_plan::validate_stochastic_policy(
+                policy,
+                std::slice::from_ref(&policy.result_schema),
+            )?;
+        }
         if !matches!(
             node.classification.as_str(),
             super::evaluation_plan::NODE_REQUIRED | super::evaluation_plan::NODE_ADVISORY
@@ -773,6 +781,7 @@ mod tests {
                     definition_id: "definition:1".into(),
                     definition_digest: format!("sha256:{}", "e".repeat(64)),
                     implementation_digest: format!("sha256:{}", "f".repeat(64)),
+                    stochastic_policy: None,
                 },
                 depends_on_node_ids: vec![],
                 input_bindings: vec![ResolvedInputBinding {

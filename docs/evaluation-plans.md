@@ -2,8 +2,8 @@
 
 Evaluation plans are Chisei's production evaluation-selection contract. They
 are separate from `EvalSuite`: suites remain reusable test cases, while plans
-bind exact governed invariants to trusted deterministic evaluator
-implementations.
+bind exact governed invariants to trusted deterministic implementations or
+explicitly bounded stochastic model evaluators.
 
 The v1 API adds:
 
@@ -37,8 +37,8 @@ and time are stored provenance but do not change the content digest.
 
 Each evaluator definition declares:
 
-- an exact implementation digest and the
-  `deterministic_builtin/v1` execution class;
+- an exact implementation digest and either the
+  `deterministic_builtin/v1` or `stochastic_model/v1` execution class;
 - supported predicate, input, and result schemas;
 - a closed parameter schema;
 - admitted evidence classifications;
@@ -64,8 +64,37 @@ explicit matching plan restriction before admitting subject-specific facts.
 V1 accepts only the fixed
 `required_all_pass_advisory_observed/v1` reducer. It rejects loops, missing
 nodes, unknown evaluators, disabled evaluators, unversioned aliases, dynamic
-nodes, arbitrary scripts or expressions, action/deployment nodes, and
-stochastic or model-based evaluators.
+nodes, arbitrary scripts or expressions, and action/deployment nodes.
+
+## Bounded stochastic definitions
+
+A stochastic definition adds one immutable policy for its concrete evaluation
+situation. It binds the exact provider, canonical provider-prefixed model,
+compiled implementation digest, prompt profile and digest, result schema,
+integer sampling controls, fixed trial count, aggregation and acceptance
+thresholds, retry and token limits, egress mode, raw-response retention mode,
+and gate eligibility.
+
+V1 accepts two to 32 trials and only
+`mean_score_with_variance/v1`. `max_total_tokens` must cover every fixed trial
+slot and every admitted retry at `max_tokens_per_trial`; retries therefore
+cannot expand the population or exceed its declared ceiling. OpenAI-compatible
+providers may bind stable per-slot seeds. Anthropic policies cannot claim seed
+support. Provider and model prefixes must match exactly.
+
+External model policies require `allowlisted_external/v1`; their provider must
+also be configured in `CHISEI_SAFE_EGRESS_PROVIDERS` at execution time.
+Ollama policies require `local_only/v1`. There is no route fallback.
+
+A required node may reference a stochastic definition only when
+`gate_eligible` is explicitly true. Publication rejects advisory-only
+stochastic policy in a required position. Advisory nodes can record the same
+statistical evidence without changing the fixed reducer.
+
+Raw prompt and response retention is `none/v1` in this contract. Encrypted
+retention is intentionally unavailable until a governed encrypted store and
+retention lifecycle exist. Publishing a different retention value fails
+closed.
 
 The fixed reducer is fail closed: required failures deny; required
 unavailability or execution errors are unavailable; insufficient, stale,
@@ -130,4 +159,5 @@ part of the v1 public API.
 authority are unchanged by these resources.
 
 Execution and recovery semantics are documented in
-[Deterministic evaluation execution](evaluation-execution.md).
+[Evaluation execution](evaluation-execution.md). The durable rationale is
+[ADR 0012](decisions/0012-bound-stochastic-evaluation-by-situation.md).

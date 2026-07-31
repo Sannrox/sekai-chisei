@@ -1,6 +1,6 @@
 use super::{
     ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts,
-    MAX_PROVIDER_RESPONSE_BYTES, Provider, ToolCall, classify_reqwest_error,
+    MAX_PROVIDER_RESPONSE_BYTES, Provider, SamplingOptions, ToolCall, classify_reqwest_error,
     ensure_declared_response_size, read_bounded_response,
 };
 use futures_util::StreamExt;
@@ -36,7 +36,16 @@ impl OpenAI {
 #[async_trait::async_trait]
 impl Provider for OpenAI {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String> {
-        let body = chat_completions_body(req, false);
+        self.chat_with_sampling(req, SamplingOptions::default())
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        req: &ChatRequest,
+        sampling: SamplingOptions,
+    ) -> Result<ChatResponse, String> {
+        let body = chat_completions_body_with_sampling(req, false, sampling);
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let mut rb = self
@@ -191,6 +200,14 @@ impl Provider for OpenAI {
 }
 
 fn chat_completions_body(req: &ChatRequest, stream: bool) -> Value {
+    chat_completions_body_with_sampling(req, stream, SamplingOptions::default())
+}
+
+fn chat_completions_body_with_sampling(
+    req: &ChatRequest,
+    stream: bool,
+    sampling: SamplingOptions,
+) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     if !req.system.is_empty() {
         messages.push(json!({"role": "system", "content": req.system}));
@@ -227,6 +244,15 @@ fn chat_completions_body(req: &ChatRequest, stream: bool) -> Value {
     });
     if req.max_tokens > 0 {
         body["max_tokens"] = json!(req.max_tokens);
+    }
+    if let Some(value) = sampling.temperature_millis {
+        body["temperature"] = json!(f64::from(value) / 1_000.0);
+    }
+    if let Some(value) = sampling.top_p_millionths {
+        body["top_p"] = json!(f64::from(value) / 1_000_000.0);
+    }
+    if let Some(value) = sampling.seed {
+        body["seed"] = json!(value);
     }
     if !req.tools.is_empty() {
         body["tools"] = json!(
@@ -327,8 +353,10 @@ fn outbound_model_name(model: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenAI, outbound_model_name, parse_openai_sse_event};
-    use crate::llm::{ChatRequest, HttpTimeouts, Provider};
+    use super::{
+        OpenAI, chat_completions_body_with_sampling, outbound_model_name, parse_openai_sse_event,
+    };
+    use crate::llm::{ChatRequest, HttpTimeouts, Provider, SamplingOptions};
     use axum::Router;
     use axum::routing::post;
     use std::time::Duration;
@@ -351,6 +379,25 @@ mod tests {
             max_tokens: 16,
             prompt_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn chat_body_forwards_frozen_sampling_controls() {
+        let request = test_chat_request("openai/gpt-fixture");
+        let body = chat_completions_body_with_sampling(
+            &request,
+            false,
+            SamplingOptions {
+                temperature_millis: Some(250),
+                top_p_millionths: Some(875_000),
+                seed: Some(42),
+            },
+        );
+
+        assert_eq!(body["model"], "openai/gpt-fixture");
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["top_p"], 0.875);
+        assert_eq!(body["seed"], 42);
     }
 
     async fn delayed_chat_response() -> axum::Json<serde_json::Value> {

@@ -280,15 +280,16 @@ fn require_enabled_plan_definitions(
     transaction: &mut Transaction<'_>,
     plan: &EvaluationPlan,
 ) -> Result<(), String> {
-    let definition_ids = plan
-        .nodes
-        .iter()
-        .map(|node| node.evaluator_definition_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    for definition_id in definition_ids {
+    let mut definitions = std::collections::BTreeMap::new();
+    for node in &plan.nodes {
+        let definition_id = node.evaluator_definition_id.as_str();
+        if let Some(definition) = definitions.get(definition_id) {
+            require_stochastic_gate_eligibility(node, definition)?;
+            continue;
+        }
         let row = transaction
             .query_opt(
-                "SELECT d.namespace, a.state
+                "SELECT d.namespace, a.state, d.body_json
                  FROM chisei_evaluator_definitions d
                  JOIN chisei_evaluator_availability a
                    ON a.definition_id=d.definition_id
@@ -306,6 +307,28 @@ fn require_enabled_plan_definitions(
         if state != AVAILABILITY_ENABLED {
             return Err("evaluator definition is unavailable for new plans".into());
         }
+        let body: String = row.get(2);
+        let definition = decode_definition(&body)?;
+        require_stochastic_gate_eligibility(node, &definition)?;
+        definitions.insert(definition_id, definition);
+    }
+    Ok(())
+}
+
+fn require_stochastic_gate_eligibility(
+    node: &crate::chisei::evaluation_plan::EvaluationPlanNode,
+    definition: &EvaluatorDefinition,
+) -> Result<(), String> {
+    if node.classification == crate::chisei::evaluation_plan::NODE_REQUIRED
+        && definition.execution_class == crate::chisei::evaluation_plan::STOCHASTIC_EXECUTION_CLASS
+        && !definition
+            .stochastic_policy
+            .as_ref()
+            .is_some_and(|policy| policy.gate_eligible)
+    {
+        return Err(
+            "required stochastic node needs an evaluator with explicit gate eligibility".into(),
+        );
     }
     Ok(())
 }
