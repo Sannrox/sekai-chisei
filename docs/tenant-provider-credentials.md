@@ -41,10 +41,19 @@ env resolution is process-local by definition.
 
 ## Gateway / Chisei consumption
 
-Domain and gateway code should call
-`provider_credentials::resolve_provider_credential` with the authenticated
-context before constructing LLM adapters. Until an enterprise extension is
-installed, unscoped launches continue to use process environment keys.
+`PlanExecution`, `ExecutePlan`, and `ExecutePlanStream` carry the trusted
+authenticated context through the native Chisei path. For tenant-scoped
+execution, Chisei resolves the provider credential from the enterprise
+extension after policy selects the provider and immediately before constructing
+the LLM adapter. Credential resolution happens before budget reservation and
+failure is non-disclosing.
+
+An unscoped enterprise context also resolves through its extension and requires
+an unscoped returned credential; it does not inherit community process keys.
+
+Unscoped community launches continue to use process-wide configuration or
+environment keys. A tenant-scoped request without an enterprise extension
+fails closed rather than falling back to a process key.
 
 ## Non-goals
 

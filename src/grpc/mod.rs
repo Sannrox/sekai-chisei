@@ -275,6 +275,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PutGovernedWaiverVersion"
             | "GetGovernedWaiverVersion"
             | "ResolveInvariantSet"
+            | "PlanExecution"
+            | "ExecutePlan"
+            | "ExecutePlanStream"
     )
 }
 
@@ -949,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_allowlist_includes_guarded_mutations_and_governed_facts() {
+    fn enterprise_allowlist_includes_governed_facts_and_native_execution() {
         for method in [
             "GuardedCreateObject",
             "GuardedUpdateObject",
@@ -960,6 +963,9 @@ mod tests {
             "PutGovernedWaiverVersion",
             "GetGovernedWaiverVersion",
             "ResolveInvariantSet",
+            "PlanExecution",
+            "ExecutePlan",
+            "ExecutePlanStream",
         ] {
             assert!(enterprise_namespace_method(method));
         }

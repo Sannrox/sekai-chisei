@@ -38,12 +38,15 @@ pub async fn execute_chat_request(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatResponse, Status> {
-    execute_chat_request_with_cache(config, budget, r, llm::PromptCacheIntent::default()).await
+    execute_chat_request_with_cache(config, budget, r, llm::PromptCacheIntent::default(), None)
+        .await
 }
 
 pub async fn execute_native_chat_request(
     config: &Config,
     budget: Arc<BudgetTracker>,
+    db: &RuntimeDb,
+    authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
     r: ChatRequest,
     cacheable_message_count: usize,
 ) -> Result<ChatResponse, Status> {
@@ -55,8 +58,18 @@ pub async fn execute_native_chat_request(
             enabled: true,
             cacheable_message_count,
         },
+        Some(ExecutionAuthentication {
+            db,
+            context: authenticated_context,
+        }),
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionAuthentication<'a> {
+    db: &'a RuntimeDb,
+    context: Option<&'a crate::enterprise::AuthenticatedContext>,
 }
 
 async fn execute_chat_request_with_cache(
@@ -64,6 +77,7 @@ async fn execute_chat_request_with_cache(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
     prompt_cache: llm::PromptCacheIntent,
+    execution_authentication: Option<ExecutionAuthentication<'_>>,
 ) -> Result<ChatResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
@@ -71,10 +85,12 @@ async fn execute_chat_request_with_cache(
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.as_deref().unwrap_or("default");
     let estimated = estimate_chat_request(&r);
+    let provider_credential =
+        execution_provider_credential(execution_authentication, &registry, &r.model)?;
     budget
         .check_and_reserve(user_id, estimated)
         .map_err(Status::resource_exhausted)?;
-    let provider = match llm::resolve_with_registry(
+    let provider = match llm::resolve_with_registry_and_provider_credential(
         &r.model,
         &registry,
         Some(&registry_state_path),
@@ -82,6 +98,9 @@ async fn execute_chat_request_with_cache(
         config.openai_api_key.as_deref(),
         &config.ollama_url,
         config.native_llm_url.as_deref(),
+        provider_credential
+            .as_ref()
+            .map(|credential| credential.secret.expose()),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -164,13 +183,21 @@ pub async fn execute_chat_request_stream(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
 ) -> Result<ChatStreamResponse, Status> {
-    execute_chat_request_stream_with_cache(config, budget, r, llm::PromptCacheIntent::default())
-        .await
+    execute_chat_request_stream_with_cache(
+        config,
+        budget,
+        r,
+        llm::PromptCacheIntent::default(),
+        None,
+    )
+    .await
 }
 
 pub async fn execute_native_chat_request_stream(
     config: &Config,
     budget: Arc<BudgetTracker>,
+    db: &RuntimeDb,
+    authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
     r: ChatRequest,
     cacheable_message_count: usize,
 ) -> Result<ChatStreamResponse, Status> {
@@ -182,6 +209,10 @@ pub async fn execute_native_chat_request_stream(
             enabled: true,
             cacheable_message_count,
         },
+        Some(ExecutionAuthentication {
+            db,
+            context: authenticated_context,
+        }),
     )
     .await
 }
@@ -191,6 +222,7 @@ async fn execute_chat_request_stream_with_cache(
     budget: Arc<BudgetTracker>,
     r: ChatRequest,
     prompt_cache: llm::PromptCacheIntent,
+    execution_authentication: Option<ExecutionAuthentication<'_>>,
 ) -> Result<ChatStreamResponse, Status> {
     let registry = refresh_provider_registry(config).await?;
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
@@ -198,10 +230,12 @@ async fn execute_chat_request_stream_with_cache(
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
     let estimated = estimate_chat_request(&r);
+    let provider_credential =
+        execution_provider_credential(execution_authentication, &registry, &r.model)?;
     budget
         .check_and_reserve(&user_id, estimated)
         .map_err(Status::resource_exhausted)?;
-    let provider = match llm::resolve_with_registry(
+    let provider = match llm::resolve_with_registry_and_provider_credential(
         &r.model,
         &registry,
         Some(&registry_state_path),
@@ -209,6 +243,9 @@ async fn execute_chat_request_stream_with_cache(
         config.openai_api_key.as_deref(),
         &config.ollama_url,
         config.native_llm_url.as_deref(),
+        provider_credential
+            .as_ref()
+            .map(|credential| credential.secret.expose()),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -263,6 +300,46 @@ async fn execute_chat_request_stream_with_cache(
     });
 
     Ok(Box::pin(ReceiverStream::new(rx)))
+}
+
+fn execution_provider_credential(
+    authentication: Option<ExecutionAuthentication<'_>>,
+    registry: &crate::provider_profile::ProviderRegistry,
+    model: &str,
+) -> Result<Option<crate::provider_credentials::ResolvedProviderCredential>, Status> {
+    let Some(authentication) = authentication else {
+        return Ok(None);
+    };
+    let Some(context) = authentication.context else {
+        return Ok(None);
+    };
+    let expected_tenant_id = context
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.tenant_id.as_str());
+    let resolved = registry
+        .resolve_model(model)
+        .map_err(Status::failed_precondition)?;
+    let profile = registry
+        .effective_profile(&resolved.provider)
+        .ok_or_else(|| Status::failed_precondition("provider profile unavailable"))?;
+    if profile.endpoint.api_key_env.is_none() {
+        return Ok(None);
+    }
+    let extension = authentication
+        .db
+        .enterprise_extension()
+        .ok_or_else(|| Status::unavailable("provider credential unavailable"))?;
+    let credential = extension
+        .resolve_provider_credential(context, &resolved.provider)
+        .map_err(|_| Status::unavailable("provider credential unavailable"))?;
+    if credential.provider != resolved.provider
+        || credential.tenant_id.as_deref() != expected_tenant_id
+        || credential.secret.expose().trim().is_empty()
+    {
+        return Err(Status::unavailable("provider credential unavailable"));
+    }
+    Ok(Some(credential))
 }
 
 fn provider_error_status(error: String) -> Status {
@@ -486,6 +563,106 @@ async fn refresh_provider_registry_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct TenantCredentialExtension;
+
+    impl crate::enterprise::EnterpriseExtension for TenantCredentialExtension {
+        fn authenticate_bearer(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn authenticate_context(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn tenant_context(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authorize_namespace(
+            &self,
+            _context: &crate::enterprise::TenantContext,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Ok(())
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn resolve_provider_credential(
+            &self,
+            context: &crate::enterprise::AuthenticatedContext,
+            provider: &str,
+        ) -> Result<
+            crate::provider_credentials::ResolvedProviderCredential,
+            crate::enterprise::ExtensionError,
+        > {
+            let (tenant_id, credential_id, secret) = match (context.tenant.as_ref(), provider) {
+                (Some(tenant), "openai") if tenant.tenant_id == "tenant-a" => (
+                    Some(tenant.tenant_id.clone()),
+                    "credential:tenant-a:openai",
+                    "synthetic-secret-a",
+                ),
+                (Some(tenant), "openai") if tenant.tenant_id == "tenant-b" => (
+                    Some(tenant.tenant_id.clone()),
+                    "credential:tenant-b:openai",
+                    "synthetic-secret-b",
+                ),
+                (None, "openai") => (
+                    None,
+                    "credential:unscoped:openai",
+                    "synthetic-unscoped-secret",
+                ),
+                _ => return Err(crate::enterprise::ExtensionError::CredentialNotFound),
+            };
+            Ok(crate::provider_credentials::ResolvedProviderCredential {
+                credential_id: credential_id.into(),
+                tenant_id,
+                provider: provider.into(),
+                generation: 1,
+                secret: crate::enterprise::SecretValue::new(secret),
+            })
+        }
+    }
+
+    fn tenant_context(tenant_id: &str) -> crate::enterprise::AuthenticatedContext {
+        crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            principal: crate::enterprise::AuthenticatedPrincipal {
+                subject: "service:managed-shikigami".into(),
+                credential_id: format!("credential:{tenant_id}"),
+            },
+            credential_kind: crate::enterprise::CredentialKind::Machine,
+            tenant: Some(crate::enterprise::TenantContext {
+                tenant_id: tenant_id.into(),
+                subject: "service:managed-shikigami".into(),
+            }),
+            scopes: vec!["chisei.execute".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "sekai:control-plane".into(),
+            expires_at: i64::MAX,
+        }
+    }
 
     #[tokio::test]
     async fn registry_state_loss_is_reported_as_unavailable() {
@@ -518,6 +695,76 @@ mod tests {
         assert_eq!(precondition.code(), tonic::Code::FailedPrecondition);
         assert_eq!(unavailable.code(), tonic::Code::Unavailable);
         assert_eq!(upstream.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn execution_provider_credentials_are_selected_by_authenticated_tenant() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TenantCredentialExtension)),
+            )
+            .unwrap(),
+        ));
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let tenant_a = tenant_context("tenant-a");
+        let tenant_b = tenant_context("tenant-b");
+
+        let credential_a = execution_provider_credential(
+            Some(ExecutionAuthentication {
+                db: &db,
+                context: Some(&tenant_a),
+            }),
+            &registry,
+            "openai/gpt-5.5",
+        )
+        .unwrap()
+        .unwrap();
+        let credential_b = execution_provider_credential(
+            Some(ExecutionAuthentication {
+                db: &db,
+                context: Some(&tenant_b),
+            }),
+            &registry,
+            "openai/gpt-5.5",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(credential_a.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(credential_b.tenant_id.as_deref(), Some("tenant-b"));
+        assert_eq!(credential_a.secret.expose(), "synthetic-secret-a");
+        assert_eq!(credential_b.secret.expose(), "synthetic-secret-b");
+        assert!(!format!("{credential_a:?}").contains("synthetic-secret-a"));
+        assert!(!format!("{credential_b:?}").contains("synthetic-secret-b"));
+    }
+
+    #[test]
+    fn unscoped_enterprise_context_does_not_inherit_community_provider_key() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TenantCredentialExtension)),
+            )
+            .unwrap(),
+        ));
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let mut context = tenant_context("tenant-a");
+        context.tenant = None;
+
+        let credential = execution_provider_credential(
+            Some(ExecutionAuthentication {
+                db: &db,
+                context: Some(&context),
+            }),
+            &registry,
+            "openai/gpt-5.5",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(credential.tenant_id.is_none());
+        assert_eq!(credential.secret.expose(), "synthetic-unscoped-secret");
     }
 
     #[test]

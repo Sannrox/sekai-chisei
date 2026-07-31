@@ -26,7 +26,7 @@ reference pages.
 | [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Retain through 0.2.0; earliest removal is 0.3.0 after reviewed TCP administrator bootstrap/recovery and a distinct client token input |
 | [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Recommend core commands at the root and grouped expert operations under `admin`; implementation requires a Design Discussion |
 | [Kernel and extension boundary](443-kernel-extension-boundary.md) | Keep one published governance product, narrow its public facade, and extract only acyclic leaf libraries with a measured independent-consumer dividend |
-| [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape is sufficient; one focused vertical implementation is required for context-bound provider credentials and streamed tool calls |
+| [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).

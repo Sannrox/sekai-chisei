@@ -31,6 +31,7 @@ struct ConformanceCase {
     id: String,
     class: String,
     summary: String,
+    evidence_tests: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,8 +48,24 @@ fn fixture() -> ConformanceFixture {
     serde_json::from_str(FIXTURE).expect("parse managed Shikigami routing fixture")
 }
 
+fn evidence_source(path: &str) -> &'static str {
+    match path {
+        "crates/sekai-provider/src/llm/anthropic.rs" => {
+            include_str!("../crates/sekai-provider/src/llm/anthropic.rs")
+        }
+        "crates/sekai-provider/src/llm/openai.rs" => {
+            include_str!("../crates/sekai-provider/src/llm/openai.rs")
+        }
+        "src/grpc/chisei_service.rs" => include_str!("../src/grpc/chisei_service.rs"),
+        "src/grpc/llm_service.rs" => include_str!("../src/grpc/llm_service.rs"),
+        "src/grpc/mod.rs" => include_str!("../src/grpc/mod.rs"),
+        "src/provider_credentials.rs" => include_str!("../src/provider_credentials.rs"),
+        other => panic!("fixture references unsupported evidence source {other:?}"),
+    }
+}
+
 #[test]
-fn managed_routing_fixture_is_versioned_bounded_and_complete() {
+fn managed_routing_fixture_binds_every_case_to_executable_evidence() {
     let fixture = fixture();
     assert_eq!(
         fixture.contract_version,
@@ -82,7 +99,21 @@ fn managed_routing_fixture_is_versioned_bounded_and_complete() {
     assert!(fixture.required_cases.iter().all(|case| matches!(
         case.class.as_str(),
         "positive" | "negative"
-    ) && !case.summary.trim().is_empty()));
+    ) && !case.summary.trim().is_empty()
+        && !case.evidence_tests.is_empty()));
+
+    for case in &fixture.required_cases {
+        for evidence in &case.evidence_tests {
+            let (source_path, test_name) = evidence
+                .split_once('#')
+                .unwrap_or_else(|| panic!("invalid evidence reference {evidence:?}"));
+            assert!(
+                evidence_source(source_path).contains(&format!("fn {test_name}(")),
+                "case {:?} references missing executable test {evidence:?}",
+                case.id
+            );
+        }
+    }
 }
 
 #[test]

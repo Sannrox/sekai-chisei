@@ -2,14 +2,15 @@
 
 - Issue: [#471](https://github.com/Sannrox/sekai-chisei/issues/471)
 - Date: 2026-07-31
-- Status: focused implementation required
+- Status: compatibility slice implemented
 - Fixture: `tests/fixtures/managed_shikigami_routing/v1.json`
 - Follow-up: [#484](https://github.com/Sannrox/sekai-chisei/issues/484)
 
 ## Finding
 
-Current public contracts are sufficient in shape, but the implementation is
-not yet sufficient for a managed Shikigami model loop.
+Current public contracts are sufficient in shape, and #484 completed the
+managed Shikigami model-loop compatibility slice without adding another
+protocol or generic evaluation layer.
 
 Do not introduce a generic hosted-workbench abstraction, an Aldunis concept, a
 caller-selected tenant, or another model API. Keep the existing
@@ -17,7 +18,7 @@ caller-selected tenant, or another model API. Keep the existing
 provider-credential resolver, routing, usage, and operation-receipt contracts.
 Complete one vertical compatibility slice behind those contracts.
 
-The required follow-up is implementation, not a new protocol decision:
+The implemented slice:
 
 1. Admit enterprise-authenticated machine credentials to the three native
    execution RPCs and authorize their complete authenticated context against
@@ -43,19 +44,19 @@ products.
 
 | Required behavior | Current evidence | Result |
 |---|---|---|
-| Service principal reaches native plan/execute | Static community credentials authenticate, but enterprise-scoped credentials are rejected because `PlanExecution`, `ExecutePlan`, and `ExecutePlanStream` are absent from `enterprise_namespace_method`. | Blocked |
-| Missing, invalid, expired, wrong-resource, or insufficient-scope credential fails closed | Missing/invalid and expiry tests exist. `AuthenticatedContext` defines issuer, resource, expiry, and scopes, but Chisei execution does not yet consume the complete context. | Partial |
-| Operator policy selects physical route | `route_override` is optional and empty in the fixture. Planning resolves and records the canonical provider/model; caller metadata cannot supply authority. | Pass |
-| Provider secret remains server-side | The resolver contract uses `SecretValue` and opaque credential references, but production Chisei/LLM execution does not call `resolve_provider_credential`. | Blocked |
-| Tool-bearing stream round-trips | The public `ChatStreamChunk` already has `tool_calls`. The OpenAI and Anthropic SSE decoders currently discard tool-call deltas, and capability enforcement rejects tool-bearing streams. | Blocked |
-| Usage and receipt are normalized | Terminal native execution already writes normalized token fields and an operation receipt. This path becomes reusable once tool streaming works. | Partial |
-| Provider failure and fallback are governed | Stream start/read failures record bounded failure reasons. Native execution performs no silent physical-route fallback, which satisfies the issue's fail-closed constraint. A host may submit a separately correlated retry. | Pass |
-| Community SQLite stays tenant-free | Community credentials produce an unscoped machine context; tenant-scoped provider resolution without an enterprise resolver fails closed. | Pass |
+| Service principal reaches native plan/execute | The native planning and execution RPCs admit enterprise authenticated contexts and use the trusted service principal as the planning actor. | Pass |
+| Missing, invalid, expired, wrong-resource, or insufficient-scope credential fails closed | Situation-specific tests exercise the complete context and refuse invalid authority before planning, provider construction, or receipt creation. | Pass |
+| Operator policy selects physical route | Enterprise execution rejects a non-empty `route_override`; the synthetic request leaves it empty, and policy selects and records the canonical provider/model. | Pass |
+| Provider secret remains server-side | Native execution resolves a tenant provider credential immediately before adapter construction. `SecretValue` is exposed only to that constructor and is absent from requests and receipts. | Pass |
+| Tool-bearing stream round-trips | OpenAI and Anthropic decoders assemble fragmented, interleaved tool deltas. The normalized end-to-end stream retains call identity, tool name, and JSON arguments. | Pass |
+| Usage and receipt are normalized | The synthetic execution produces normalized input/output tokens, tool calls, provider identity, and a complete operation receipt. | Pass |
+| Provider failure and fallback are governed | A synthetic upstream failure records `model_stream_start_failed`, retains the planned route, and makes exactly one provider call. An explicit retry creates a distinct attempt under the same logical operation. | Pass |
+| Community SQLite stays tenant-free | Community credentials remain unscoped and tenant-scoped resolution without an enterprise extension fails closed. | Pass |
 
-The versioned fixture fixes this exact evidence set. It deliberately carries
-only synthetic identities and opaque credential references, leaves
-`route_override` empty, and contains no provider secret or private deployment
-configuration.
+The versioned fixture fixes this exact evidence set and binds every case to
+the deterministic test that executes it. It deliberately carries only
+synthetic identities and opaque credential references, leaves `route_override`
+empty, and contains no provider secret or private deployment configuration.
 
 ## Contract and code evidence
 
@@ -84,8 +85,9 @@ not contain the Bash credential isolation merged as
 
 The managed-host floor is therefore the first Shikigami release containing
 that commit, intended as `v1.0.5+`. Local/non-managed compatibility remains
-`v1.0.2+`. Until both that release and the Sekai Chisei follow-up ship, the
-managed route is not compatible.
+`v1.0.2+`. Sekai Chisei now supplies its half of the boundary. Managed
+compatibility still requires the first Shikigami release containing that
+commit.
 
 ## Rejected expansion
 
@@ -103,6 +105,6 @@ managed route is not compatible.
 
 ## Exit
 
-Ship the fixture with this finding, implement the vertical slice in #484, and
-close #471. Do not publish private provider credentials, deployment
-configuration, prompts, or service logs as evidence.
+Retain the fixture as the compatibility evidence for #484. Do not publish
+private provider credentials, deployment configuration, prompts, or service
+logs as evidence.

@@ -60,7 +60,7 @@ pub struct ChiseiServiceImpl {
     pipeline: pipe::Pipeline,
     eval: Arc<EvalStore>,
     portfolio: Arc<PortfolioStore>,
-    planned_executions: Arc<Mutex<HashMap<String, ExecutionPlan>>>,
+    planned_executions: Arc<Mutex<HashMap<String, CachedExecutionPlan>>>,
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
     candidates: Arc<CandidateStore>,
@@ -72,6 +72,12 @@ pub struct ChiseiServiceImpl {
     db: Arc<RuntimeDb>,
     config: Config,
     provider_registry_state_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct CachedExecutionPlan {
+    plan: ExecutionPlan,
+    enterprise_authority: Option<String>,
 }
 
 struct EvaluationExecutionRuntime<'a> {
@@ -94,6 +100,7 @@ const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
 const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
 const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
+const CHISEI_EXECUTE_SCOPE: &str = "chisei.execute";
 
 fn record_reported_memory_outcomes(
     db: &RuntimeDb,
@@ -452,6 +459,12 @@ fn record_reported_memory_outcomes(
 }
 
 fn authenticated_actor<T>(request: &Request<T>) -> String {
+    if let Some(context) = request
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return context.principal.subject.clone();
+    }
     request
         .metadata()
         .get("x-principal")
@@ -460,6 +473,33 @@ fn authenticated_actor<T>(request: &Request<T>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("local")
         .to_string()
+}
+
+fn enterprise_authenticated_context<T>(
+    request: &Request<T>,
+) -> Result<Option<&crate::enterprise::AuthenticatedContext>, Status> {
+    if request
+        .metadata()
+        .get(AUTH_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some("enterprise")
+    {
+        return Ok(None);
+    }
+    request
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .map(Some)
+        .ok_or_else(|| Status::unauthenticated("enterprise execution credential rejected"))
+}
+
+fn enterprise_execution_authority(
+    context: Option<&crate::enterprise::AuthenticatedContext>,
+) -> Option<String> {
+    context.map(|context| match context.tenant.as_ref() {
+        Some(tenant) => format!("tenant:{}", tenant.tenant_id),
+        None => format!("credential:{}", context.principal.credential_id),
+    })
 }
 
 fn required_authenticated_actor<T>(request: &Request<T>) -> Result<String, Status> {
@@ -1050,6 +1090,72 @@ fn require_execution_namespace_access(
         canonical_namespace(namespace).map(|_| ())
     } else {
         require_namespace_access(db, actor, namespace)
+    }
+}
+
+fn require_execution_namespace_access_with_context(
+    db: &RuntimeDb,
+    config: &Config,
+    actor: &str,
+    context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
+) -> Result<(), Status> {
+    if let Some(context) = context {
+        let scope_permitted = match context.credential_kind {
+            crate::enterprise::CredentialKind::Machine => context
+                .scopes
+                .iter()
+                .any(|scope| scope == CHISEI_EXECUTE_SCOPE),
+            crate::enterprise::CredentialKind::HumanSession => {
+                context.scopes.iter().any(|scope| scope == "sekai.write")
+            }
+        };
+        if !scope_permitted {
+            return Err(Status::permission_denied(
+                "enterprise execution authorization denied",
+            ));
+        }
+        let extension = db
+            .enterprise_extension()
+            .ok_or_else(|| Status::unauthenticated("enterprise execution credential rejected"))?;
+        canonical_namespace(namespace)?;
+        return extension
+            .authorize_authenticated_context(
+                context,
+                namespace,
+                crate::enterprise::NamespaceAction::Write,
+            )
+            .map_err(enterprise_execution_status);
+    }
+    require_execution_namespace_access(db, config, actor, namespace)
+}
+
+fn enterprise_execution_status(error: crate::enterprise::ExtensionError) -> Status {
+    match error {
+        crate::enterprise::ExtensionError::CredentialNotFound
+        | crate::enterprise::ExtensionError::Unauthenticated
+        | crate::enterprise::ExtensionError::Expired
+        | crate::enterprise::ExtensionError::Revoked
+        | crate::enterprise::ExtensionError::Replayed
+        | crate::enterprise::ExtensionError::IssuerMismatch
+        | crate::enterprise::ExtensionError::ResourceMismatch => {
+            Status::unauthenticated("enterprise execution credential rejected")
+        }
+        crate::enterprise::ExtensionError::PermissionDenied
+        | crate::enterprise::ExtensionError::MembershipRevoked
+        | crate::enterprise::ExtensionError::TenantSuspended
+        | crate::enterprise::ExtensionError::InvalidState
+        | crate::enterprise::ExtensionError::InvalidNonce
+        | crate::enterprise::ExtensionError::InvalidRedirectUri
+        | crate::enterprise::ExtensionError::InvalidPkce => {
+            Status::permission_denied("enterprise execution authorization denied")
+        }
+        crate::enterprise::ExtensionError::UnsupportedVersion => {
+            Status::failed_precondition("unsupported enterprise identity contract version")
+        }
+        crate::enterprise::ExtensionError::Unavailable(_) => {
+            Status::unavailable("enterprise execution authorization unavailable")
+        }
     }
 }
 
@@ -5083,14 +5189,29 @@ impl ChiseiServiceImpl {
         })
     }
 
+    #[cfg(test)]
     fn cache_plan(&self, plan: ExecutionPlan) {
+        self.cache_plan_for_enterprise_authority(plan, None);
+    }
+
+    fn cache_plan_for_enterprise_authority(
+        &self,
+        plan: ExecutionPlan,
+        enterprise_authority: Option<String>,
+    ) {
         let mut plans = self
             .planned_executions
             .lock()
             .expect("planned executions poisoned");
         prune_expired_plans(&mut plans);
         let inserted_plan_id = plan.plan_id.clone();
-        plans.insert(inserted_plan_id.clone(), plan);
+        plans.insert(
+            inserted_plan_id.clone(),
+            CachedExecutionPlan {
+                plan,
+                enterprise_authority,
+            },
+        );
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
     }
 
@@ -5571,6 +5692,71 @@ impl ChiseiServiceImpl {
             .map(|policy| DataClass::parse(&policy.data_class))
             .filter(|class| *class != DataClass::Unclassified)
             .unwrap_or_else(|| DataClass::parse(&self.config.default_data_class))
+    }
+
+    fn enforce_execution_provider_privacy(
+        &self,
+        plan: &ExecutionPlan,
+        input: &ExecutionInput,
+        actor: &str,
+        provider: &str,
+        data_class: DataClass,
+    ) -> Result<(), Status> {
+        let task_class = TaskClass::parse(&plan.task_class);
+        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
+        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
+        if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
+            self.record_privacy_audit(
+                "blocked",
+                &input.request_id,
+                provider,
+                data_class,
+                task_class,
+                "cached_plan_unsafe_provider",
+            );
+            record_failed_operation_on(&self.db, plan, actor, "provider_became_unsafe")
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                crate::chisei::privacy::gate_reason(data_class, task_class, provider),
+            ));
+        }
+        Ok(())
+    }
+
+    fn enforce_execution_payload_privacy(
+        &self,
+        plan: &ExecutionPlan,
+        input: &ExecutionInput,
+        actor: &str,
+        provider: &str,
+        data_class: DataClass,
+    ) -> Result<(), Status> {
+        let payload =
+            payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
+        let leak_findings =
+            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload);
+        if leak_findings
+            .iter()
+            .any(|finding| finding.action == LeakAction::Block)
+        {
+            self.record_leak_audit(
+                "execute_leak_check",
+                &input.request_id,
+                provider,
+                &leak_findings,
+            );
+            record_failed_operation_on(
+                &self.db,
+                plan,
+                actor,
+                "privacy_leak_detected_after_planning",
+            )
+            .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "privacy leak checker blocked outbound payload",
+            ));
+        }
+        Ok(())
     }
 
     fn leak_findings_for_payload(
@@ -6315,25 +6501,29 @@ fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     scopes.push(scope.to_string());
 }
 
-fn prune_cached_plans(plans: &mut HashMap<String, ExecutionPlan>) {
+fn prune_cached_plans(plans: &mut HashMap<String, CachedExecutionPlan>) {
     prune_expired_plans(plans);
     prune_excess_plans(plans, None);
 }
 
-fn prune_expired_plans(plans: &mut HashMap<String, ExecutionPlan>) {
+fn prune_expired_plans(plans: &mut HashMap<String, CachedExecutionPlan>) {
     let cutoff = chrono::Utc::now().timestamp_millis() - MAX_CACHED_EXECUTION_PLAN_AGE_MS;
-    plans.retain(|_, plan| plan.created_at >= cutoff);
+    plans.retain(|_, cached| cached.plan.created_at >= cutoff);
 }
 
-fn prune_excess_plans(plans: &mut HashMap<String, ExecutionPlan>, protected_plan_id: Option<&str>) {
+fn prune_excess_plans(
+    plans: &mut HashMap<String, CachedExecutionPlan>,
+    protected_plan_id: Option<&str>,
+) {
     while plans.len() > MAX_CACHED_EXECUTION_PLANS {
         let Some(oldest_id) = plans
             .iter()
             .filter(|(plan_id, _)| protected_plan_id != Some(plan_id.as_str()))
             .min_by(|left, right| {
                 left.1
+                    .plan
                     .created_at
-                    .cmp(&right.1.created_at)
+                    .cmp(&right.1.plan.created_at)
                     .then_with(|| left.0.cmp(right.0))
             })
             .map(|(plan_id, _)| plan_id.clone())
@@ -10533,11 +10723,23 @@ impl ChiseiService for ChiseiServiceImpl {
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
             let actor = authenticated_actor(&req);
+            let context = enterprise_authenticated_context(&req)?.cloned();
             let input = req
                 .into_inner()
                 .input
                 .ok_or(Status::invalid_argument("input required"))?;
-            require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
+            if context.is_some() && !input.route_override.trim().is_empty() {
+                return Err(Status::permission_denied(
+                    "enterprise execution route override denied",
+                ));
+            }
+            require_execution_namespace_access_with_context(
+                &self.db,
+                &self.config,
+                &actor,
+                context.as_ref(),
+                &input.namespace,
+            )?;
             let plan = self.plan_from_input(input, &actor).await?;
             if let Some(plan_input) = &plan.input {
                 let namespace_hint = plan_input.namespace.trim().to_string();
@@ -10558,7 +10760,10 @@ impl ChiseiService for ChiseiServiceImpl {
             }
             self.record_planned_operation(&plan, &actor)
                 .map_err(Status::internal)?;
-            self.cache_plan(plan.clone());
+            self.cache_plan_for_enterprise_authority(
+                plan.clone(),
+                enterprise_execution_authority(context.as_ref()),
+            );
             Ok(Response::new(PlanExecutionResponse { plan: Some(plan) }))
         })
         .await
@@ -10569,6 +10774,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ExecutePlanRequest>,
     ) -> Result<Response<ExecutePlanResponse>, Status> {
         let actor = authenticated_actor(&req);
+        let context = enterprise_authenticated_context(&req)?.cloned();
         let requested_plan = req
             .into_inner()
             .plan
@@ -10579,15 +10785,17 @@ impl ChiseiService for ChiseiServiceImpl {
                 .lock()
                 .expect("planned executions poisoned");
             prune_cached_plans(&mut plans);
-            let plan = plans
+            let cached = plans
                 .get(&requested_plan.plan_id)
                 .ok_or(Status::not_found("execution plan not found"))?;
-            if plan.planning_actor != actor {
+            if cached.plan.planning_actor != actor
+                || cached.enterprise_authority != enterprise_execution_authority(context.as_ref())
+            {
                 return Err(Status::permission_denied(
                     "execution plan belongs to a different planning principal",
                 ));
             }
-            plans.remove(&requested_plan.plan_id).unwrap()
+            cached.plan.clone()
         };
         if !plan.executable {
             return Err(Status::failed_precondition(
@@ -10598,14 +10806,26 @@ impl ChiseiService for ChiseiServiceImpl {
             .input
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
-        require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
+        require_execution_namespace_access_with_context(
+            &self.db,
+            &self.config,
+            &actor,
+            context.as_ref(),
+            &input.namespace,
+        )?;
+        {
+            let mut plans = self
+                .planned_executions
+                .lock()
+                .expect("planned executions poisoned");
+            plans
+                .remove(&requested_plan.plan_id)
+                .ok_or(Status::not_found("execution plan not found"))?;
+        }
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
         let data_class = self.data_class(effective_policy.as_ref());
-        let task_class = TaskClass::parse(&plan.task_class);
-        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
-        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
         // Re-check residency on execute so cached plans cannot outrun policy.
         if let Err(error) = self.policy.enforce_residency(
             &input.namespace,
@@ -10617,21 +10837,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
-        if safe_only && !crate::chisei::privacy::provider_safe_to_send(&provider, &safe_providers) {
-            self.record_privacy_audit(
-                "blocked",
-                &input.request_id,
-                &provider,
-                data_class,
-                task_class,
-                "cached_plan_unsafe_provider",
-            );
-            record_failed_operation_on(&self.db, &plan, &actor, "provider_became_unsafe")
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                crate::chisei::privacy::gate_reason(data_class, task_class, &provider),
-            ));
-        }
+        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
@@ -10660,31 +10866,7 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             input.user_id.clone()
         };
-        let payload =
-            payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
-        let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, &provider, data_class, &payload);
-        if leak_findings
-            .iter()
-            .any(|finding| finding.action == LeakAction::Block)
-        {
-            self.record_leak_audit(
-                "execute_leak_check",
-                &input.request_id,
-                &provider,
-                &leak_findings,
-            );
-            record_failed_operation_on(
-                &self.db,
-                &plan,
-                &actor,
-                "privacy_leak_detected_after_planning",
-            )
-            .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "privacy leak checker blocked outbound payload",
-            ));
-        }
+        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
         self.record_egress_audit(
             "execute_context",
             &input.request_id,
@@ -10783,6 +10965,8 @@ impl ChiseiService for ChiseiServiceImpl {
         let chat = match execute_native_chat_request(
             &self.config,
             self.budget.clone(),
+            self.db.as_ref(),
+            context.as_ref(),
             llm_req,
             cacheable_message_count,
         )
@@ -10910,6 +11094,7 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ExecutePlanRequest>,
     ) -> Result<Response<Self::ExecutePlanStreamStream>, Status> {
         let actor = authenticated_actor(&req);
+        let context = enterprise_authenticated_context(&req)?.cloned();
         let requested_plan = req
             .into_inner()
             .plan
@@ -10920,15 +11105,17 @@ impl ChiseiService for ChiseiServiceImpl {
                 .lock()
                 .expect("planned executions poisoned");
             prune_cached_plans(&mut plans);
-            let plan = plans
+            let cached = plans
                 .get(&requested_plan.plan_id)
                 .ok_or(Status::not_found("execution plan not found"))?;
-            if plan.planning_actor != actor {
+            if cached.plan.planning_actor != actor
+                || cached.enterprise_authority != enterprise_execution_authority(context.as_ref())
+            {
                 return Err(Status::permission_denied(
                     "execution plan belongs to a different planning principal",
                 ));
             }
-            plans.remove(&requested_plan.plan_id).unwrap()
+            cached.plan.clone()
         };
         if !plan.executable {
             return Err(Status::failed_precondition(
@@ -10939,7 +11126,22 @@ impl ChiseiService for ChiseiServiceImpl {
             .input
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
-        require_execution_namespace_access(&self.db, &self.config, &actor, &input.namespace)?;
+        require_execution_namespace_access_with_context(
+            &self.db,
+            &self.config,
+            &actor,
+            context.as_ref(),
+            &input.namespace,
+        )?;
+        {
+            let mut plans = self
+                .planned_executions
+                .lock()
+                .expect("planned executions poisoned");
+            plans
+                .remove(&requested_plan.plan_id)
+                .ok_or(Status::not_found("execution plan not found"))?;
+        }
         let namespace_hint = input.namespace.trim().to_string();
         let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
@@ -10954,6 +11156,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
+        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
@@ -10982,6 +11185,7 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             input.user_id.clone()
         };
+        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
         self.record_egress_audit(
             "execute_context",
             &input.request_id,
@@ -11086,6 +11290,8 @@ impl ChiseiService for ChiseiServiceImpl {
         let chat_stream = match execute_native_chat_request_stream(
             &self.config,
             self.budget.clone(),
+            self.db.as_ref(),
+            context.as_ref(),
             llm_req,
             cacheable_message_count,
         )
@@ -13575,8 +13781,14 @@ mod tests {
     };
     use crate::domain::Object;
     use crate::sekai::security::{Grant, Role};
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::response::Response as AxumResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
     use std::fs;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn user_message(content: &str) -> ChatMessage {
         ChatMessage {
@@ -14719,6 +14931,763 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
         ChiseiServiceImpl::new(db, config(":memory:"))
+    }
+
+    struct ManagedExecutionExtension;
+
+    impl crate::enterprise::EnterpriseExtension for ManagedExecutionExtension {
+        fn authenticate_bearer(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn authenticate_context(
+            &self,
+            _bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            Err(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn tenant_context(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::Unauthenticated)
+        }
+
+        fn authorize_namespace(
+            &self,
+            _context: &crate::enterprise::TenantContext,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn authorize_authenticated_context(
+            &self,
+            context: &crate::enterprise::AuthenticatedContext,
+            namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            context.validate(
+                chrono::Utc::now().timestamp(),
+                "https://issuer.test",
+                "sekai:control-plane",
+            )?;
+            if context.credential_kind != crate::enterprise::CredentialKind::Machine
+                || context
+                    .tenant
+                    .as_ref()
+                    .is_none_or(|tenant| !tenant.tenant_id.starts_with("tenant-managed"))
+                || namespace != "managed-conformance"
+            {
+                return Err(crate::enterprise::ExtensionError::PermissionDenied);
+            }
+            Ok(())
+        }
+    }
+
+    fn managed_execution_context(
+        scopes: Vec<String>,
+        resource: &str,
+        expires_at: i64,
+    ) -> crate::enterprise::AuthenticatedContext {
+        managed_execution_context_for_tenant(scopes, resource, expires_at, "tenant-managed")
+    }
+
+    fn managed_execution_context_for_tenant(
+        scopes: Vec<String>,
+        resource: &str,
+        expires_at: i64,
+        tenant_id: &str,
+    ) -> crate::enterprise::AuthenticatedContext {
+        crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            principal: crate::enterprise::AuthenticatedPrincipal {
+                subject: "service:managed-shikigami".into(),
+                credential_id: "credential:managed-shikigami".into(),
+            },
+            credential_kind: crate::enterprise::CredentialKind::Machine,
+            tenant: Some(crate::enterprise::TenantContext {
+                tenant_id: tenant_id.into(),
+                subject: "service:managed-shikigami".into(),
+            }),
+            scopes,
+            issuer: "https://issuer.test".into(),
+            resource: resource.into(),
+            expires_at,
+        }
+    }
+
+    fn attach_managed_context<T>(
+        request: &mut Request<T>,
+        context: crate::enterprise::AuthenticatedContext,
+    ) {
+        request.metadata_mut().insert(
+            AUTH_SOURCE_HEADER,
+            tonic::metadata::MetadataValue::from_static("enterprise"),
+        );
+        request.extensions_mut().insert(context);
+    }
+
+    fn managed_execution_service() -> ChiseiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(ManagedExecutionExtension)),
+            )
+            .unwrap(),
+        )));
+        let mut managed_config = config(":memory:");
+        managed_config.openai_api_key = Some("synthetic-server-side-key".into());
+        let service = ChiseiServiceImpl::new(db, managed_config);
+        service.policy.set_namespace_policy(
+            "managed-conformance",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["openai/gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "openai/gpt-5.5".into(),
+                data_class: "unclassified".into(),
+            },
+        );
+        service
+    }
+
+    fn managed_plan_request(request_id: &str) -> PlanExecutionRequest {
+        PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: request_id.into(),
+                namespace: "managed-conformance".into(),
+                spec: "Use the governed tool loop.".into(),
+                max_tokens: 64,
+                tools: vec![ToolDef {
+                    name: "read".into(),
+                    description: "Read a synthetic fixture.".into(),
+                    input_schema_json: r#"{"type":"object"}"#.into(),
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
+        let service = managed_execution_service();
+        let mut valid = Request::new(managed_plan_request("managed-plan-valid"));
+        valid
+            .metadata_mut()
+            .insert("x-principal", "attacker".parse().unwrap());
+        attach_managed_context(
+            &mut valid,
+            managed_execution_context(
+                vec!["chisei.execute".into()],
+                "sekai:control-plane",
+                i64::MAX,
+            ),
+        );
+
+        let plan = service
+            .plan_execution(valid)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert_eq!(plan.planning_actor, "service:managed-shikigami");
+        assert_eq!(plan.resolved_runtime, "openai");
+        assert_eq!(plan.resolved_model, "openai/gpt-5.5");
+        assert!(plan.input.unwrap().route_override.is_empty());
+
+        let mut injected_route = managed_plan_request("managed-plan-route-injection");
+        injected_route.input.as_mut().unwrap().route_override = "openai/gpt-5.5".into();
+        let mut injected_route = Request::new(injected_route);
+        attach_managed_context(
+            &mut injected_route,
+            managed_execution_context(
+                vec!["chisei.execute".into()],
+                "sekai:control-plane",
+                i64::MAX,
+            ),
+        );
+        assert_eq!(
+            service
+                .plan_execution(injected_route)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        for (request_id, context, expected_code) in [
+            (
+                "managed-plan-missing-scope",
+                managed_execution_context(Vec::new(), "sekai:control-plane", i64::MAX),
+                tonic::Code::PermissionDenied,
+            ),
+            (
+                "managed-plan-wrong-resource",
+                managed_execution_context(
+                    vec!["chisei.execute".into()],
+                    "sekai:other-plane",
+                    i64::MAX,
+                ),
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                "managed-plan-expired",
+                managed_execution_context(
+                    vec!["chisei.execute".into()],
+                    "sekai:control-plane",
+                    chrono::Utc::now().timestamp() - 1,
+                ),
+                tonic::Code::Unauthenticated,
+            ),
+        ] {
+            let receipts_before = service
+                .db
+                .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100)
+                .unwrap()
+                .len();
+            let mut denied = Request::new(managed_plan_request(request_id));
+            attach_managed_context(&mut denied, context);
+            assert_eq!(
+                service.plan_execution(denied).await.unwrap_err().code(),
+                expected_code
+            );
+            assert_eq!(
+                service
+                    .db
+                    .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100,)
+                    .unwrap()
+                    .len(),
+                receipts_before,
+                "denied request created a receipt",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_context_without_enterprise_extension_fails_closed() {
+        let service = memory_service();
+        let mut request = Request::new(managed_plan_request("managed-context-without-extension"));
+        attach_managed_context(
+            &mut request,
+            managed_execution_context(
+                vec!["chisei.execute".into()],
+                "sekai:control-plane",
+                i64::MAX,
+            ),
+        );
+
+        assert_eq!(
+            service.plan_execution(request).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn community_machine_context_keeps_legacy_execution_authorization() {
+        let principal = crate::enterprise::AuthenticatedPrincipal {
+            subject: "agent:community".into(),
+            credential_id: "credential:community".into(),
+        };
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            AUTH_SOURCE_HEADER,
+            tonic::metadata::MetadataValue::from_static("token"),
+        );
+        request
+            .extensions_mut()
+            .insert(crate::enterprise::AuthenticatedContext::machine(principal));
+
+        assert!(
+            enterprise_authenticated_context(&request)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enterprise_execution_marker_without_context_fails_closed() {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            AUTH_SOURCE_HEADER,
+            tonic::metadata::MetadataValue::from_static("enterprise"),
+        );
+
+        assert_eq!(
+            enterprise_authenticated_context(&request)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    async fn synthetic_native_tool_stream() -> AxumResponse {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"fixture.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        AxumResponse::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn synthetic_native_chat(Json(request): Json<serde_json::Value>) -> AxumResponse {
+        if request["stream"].as_bool() == Some(true) {
+            return synthetic_native_tool_stream().await;
+        }
+        AxumResponse::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"fixture.txt\"}"}}]}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn synthetic_ollama_models() -> AxumResponse {
+        AxumResponse::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"models":[{"name":"mistral","details":{"parameter_size":"7B","context_length":32768},"capabilities":["tools"]}]}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn spawn_synthetic_ollama_provider() -> String {
+        let app = Router::new()
+            .route("/api/tags", get(synthetic_ollama_models))
+            .route("/v1/chat/completions", post(synthetic_native_chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn managed_ollama_execution_service(provider_url: String) -> ChiseiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(ManagedExecutionExtension)),
+            )
+            .unwrap(),
+        )));
+        let mut managed_config = config(":memory:");
+        managed_config.ollama_url = provider_url;
+        let service = ChiseiServiceImpl::new(db, managed_config);
+        service.policy.set_namespace_policy(
+            "managed-conformance",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["ollama".into()],
+                allowed_models: vec!["ollama/mistral".into()],
+                default_runtime: "ollama".into(),
+                default_model: "ollama/mistral".into(),
+                data_class: "unclassified".into(),
+            },
+        );
+        service
+    }
+
+    #[tokio::test]
+    async fn managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override() {
+        let provider_url = spawn_synthetic_ollama_provider().await;
+        let service = managed_ollama_execution_service(provider_url);
+        let context = managed_execution_context(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+        );
+        let mut plan_request = Request::new(managed_plan_request("managed-stream"));
+        attach_managed_context(&mut plan_request, context.clone());
+        let plan = service
+            .plan_execution(plan_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert_eq!(plan.resolved_model, "ollama/mistral");
+        assert!(plan.input.as_ref().unwrap().route_override.is_empty());
+        let plan_id = plan.plan_id.clone();
+
+        let mut denied_execute = Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        });
+        attach_managed_context(
+            &mut denied_execute,
+            managed_execution_context(Vec::new(), "sekai:control-plane", i64::MAX),
+        );
+        let denied = match service.execute_plan_stream(denied_execute).await {
+            Ok(_) => panic!("unauthorized execution unexpectedly started a stream"),
+            Err(error) => error,
+        };
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let mut execute_request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute_request, context);
+        let mut stream = service
+            .execute_plan_stream(execute_request)
+            .await
+            .unwrap()
+            .into_inner();
+        let mut terminal = None;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if event.done {
+                terminal = event.response;
+            }
+        }
+        let response = terminal.expect("terminal normalized response");
+        assert_eq!(response.provider, "ollama");
+        assert_eq!(response.input_tokens, 7);
+        assert_eq!(response.output_tokens, 3);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "read");
+        assert_eq!(
+            response.tool_calls[0].args_json,
+            r#"{"path":"fixture.txt"}"#
+        );
+
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan_id)
+            .unwrap()
+            .expect("operation receipt");
+        assert!(receipt.completeness().complete);
+        let attributes = receipt
+            .events
+            .iter()
+            .flat_map(|event| event.attributes.values())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!attributes.contains("credential:managed-shikigami"));
+        assert!(!attributes.contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn managed_cached_plan_is_bound_to_authenticated_tenant() {
+        let provider_url = spawn_synthetic_ollama_provider().await;
+        let service = managed_ollama_execution_service(provider_url);
+        let tenant_a = managed_execution_context_for_tenant(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+            "tenant-managed-a",
+        );
+        let tenant_b = managed_execution_context_for_tenant(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+            "tenant-managed-b",
+        );
+        let mut plan_request = Request::new(managed_plan_request("managed-tenant-bound-plan"));
+        attach_managed_context(&mut plan_request, tenant_a.clone());
+        let plan = service
+            .plan_execution(plan_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        let mut wrong_tenant = Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        });
+        attach_managed_context(&mut wrong_tenant, tenant_b);
+        let error = match service.execute_plan_stream(wrong_tenant).await {
+            Ok(_) => panic!("another tenant unexpectedly acquired the cached plan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut owning_tenant = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut owning_tenant, tenant_a);
+        let mut stream = service
+            .execute_plan_stream(owning_tenant)
+            .await
+            .unwrap()
+            .into_inner();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_unary_execution_accepts_machine_context_and_normalizes_receipt() {
+        let provider_url = spawn_synthetic_ollama_provider().await;
+        let service = managed_ollama_execution_service(provider_url);
+        let context = managed_execution_context(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+        );
+        let mut plan_request = Request::new(managed_plan_request("managed-unary"));
+        attach_managed_context(&mut plan_request, context.clone());
+        let plan = service
+            .plan_execution(plan_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let plan_id = plan.plan_id.clone();
+
+        let mut execute_request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute_request, context);
+        let response = service
+            .execute_plan(execute_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .response
+            .expect("normalized unary response");
+        assert_eq!(response.provider, "ollama");
+        assert_eq!(response.input_tokens, 7);
+        assert_eq!(response.output_tokens, 3);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "read");
+        assert_eq!(
+            response.tool_calls[0].args_json,
+            r#"{"path":"fixture.txt"}"#
+        );
+
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan_id)
+            .unwrap()
+            .expect("completed unary receipt");
+        assert!(receipt.completeness().complete);
+    }
+
+    async fn synthetic_failed_chat(State(requests): State<Arc<AtomicUsize>>) -> AxumResponse {
+        requests.fetch_add(1, Ordering::SeqCst);
+        AxumResponse::builder()
+            .status(503)
+            .body(Body::from("synthetic provider unavailable"))
+            .unwrap()
+    }
+
+    async fn spawn_synthetic_failing_ollama_provider() -> (String, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/tags", get(synthetic_ollama_models))
+            .route("/v1/chat/completions", post(synthetic_failed_chat))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    async fn synthetic_invalid_tool_stream(
+        State(requests): State<Arc<AtomicUsize>>,
+    ) -> AxumResponse {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        AxumResponse::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn spawn_synthetic_invalid_stream_ollama_provider() -> (String, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/tags", get(synthetic_ollama_models))
+            .route("/v1/chat/completions", post(synthetic_invalid_tool_stream))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    #[tokio::test]
+    async fn managed_provider_failure_records_failed_receipt_without_route_switch() {
+        let (provider_url, requests) = spawn_synthetic_failing_ollama_provider().await;
+        let service = managed_ollama_execution_service(provider_url);
+        let context = managed_execution_context(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+        );
+        let mut plan_request = Request::new(managed_plan_request("managed-provider-failure"));
+        attach_managed_context(&mut plan_request, context.clone());
+        let plan = service
+            .plan_execution(plan_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let plan_id = plan.plan_id.clone();
+        assert_eq!(plan.resolved_model, "ollama/mistral");
+
+        let mut execute_request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute_request, context);
+        let error = match service.execute_plan_stream(execute_request).await {
+            Ok(_) => panic!("synthetic provider failure unexpectedly started a stream"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan_id)
+            .unwrap()
+            .expect("failed operation receipt");
+        assert!(receipt.completeness().complete);
+        let outcome = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .expect("failed outcome");
+        assert_eq!(outcome.attributes["status"], "denied");
+        assert_eq!(
+            outcome.attributes["completion_reason"],
+            "model_stream_start_failed"
+        );
+        let route = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+            .expect("recorded route");
+        assert_eq!(route.attributes["runtime"], "ollama");
+        assert_eq!(route.attributes["model"], "ollama/mistral");
+    }
+
+    #[tokio::test]
+    async fn managed_stream_read_failure_records_failed_receipt_without_route_switch() {
+        let (provider_url, requests) = spawn_synthetic_invalid_stream_ollama_provider().await;
+        let service = managed_ollama_execution_service(provider_url);
+        let context = managed_execution_context(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+        );
+        let mut plan_request = Request::new(managed_plan_request("managed-stream-read-failure"));
+        attach_managed_context(&mut plan_request, context.clone());
+        let plan = service
+            .plan_execution(plan_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let plan_id = plan.plan_id.clone();
+
+        let mut execute_request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        attach_managed_context(&mut execute_request, context);
+        let mut stream = service
+            .execute_plan_stream(execute_request)
+            .await
+            .unwrap()
+            .into_inner();
+        let error = stream
+            .next()
+            .await
+            .expect("stream failure event")
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan_id)
+            .unwrap()
+            .expect("failed stream receipt");
+        assert!(receipt.completeness().complete);
+        let outcome = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+            .expect("failed outcome");
+        assert_eq!(outcome.attributes["status"], "denied");
+        assert_eq!(
+            outcome.attributes["completion_reason"],
+            "model_stream_failed"
+        );
+        let route = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+            .expect("recorded route");
+        assert_eq!(route.attributes["model"], "ollama/mistral");
+    }
+
+    #[tokio::test]
+    async fn managed_explicit_retry_creates_distinct_correlated_attempts() {
+        let service = managed_execution_service();
+        let context = managed_execution_context(
+            vec!["chisei.execute".into()],
+            "sekai:control-plane",
+            i64::MAX,
+        );
+        let mut plan_ids = Vec::new();
+
+        for attempt_id in ["attempt-1", "attempt-2"] {
+            let mut input = managed_plan_request(&format!("managed-retry-{attempt_id}"));
+            let execution = input.input.as_mut().unwrap();
+            execution.logical_operation_id = "managed-logical-operation".into();
+            execution.attempt_id = attempt_id.into();
+            let mut request = Request::new(input);
+            attach_managed_context(&mut request, context.clone());
+            let plan = service
+                .plan_execution(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .plan
+                .unwrap();
+            let receipt = service
+                .db
+                .get_operation_receipt(&plan.plan_id)
+                .unwrap()
+                .expect("planned retry receipt");
+            let intent = receipt
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                .expect("retry intent");
+            assert_eq!(
+                intent.attributes["logical_operation_id"],
+                "managed-logical-operation"
+            );
+            assert_eq!(intent.attributes["attempt_id"], attempt_id);
+            plan_ids.push(plan.plan_id);
+        }
+
+        assert_ne!(plan_ids[0], plan_ids[1]);
     }
 
     #[derive(Debug)]
@@ -21486,6 +22455,69 @@ mod tests {
             .get_operation_receipt(&plan.plan_id)
             .unwrap()
             .expect("rejected execution receipt");
+        assert!(receipt.completeness().complete);
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::OutcomeRecorded
+                && event.attributes.get("status").map(String::as_str) == Some("denied")
+                && event
+                    .attributes
+                    .get("completion_reason")
+                    .map(String::as_str)
+                    == Some("provider_became_unsafe")
+        }));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
+        let svc = memory_service();
+        let plan = svc
+            .plan_execution(Request::new(PlanExecutionRequest {
+                input: Some(ExecutionInput {
+                    request_id: "task-stale-stream-policy".into(),
+                    namespace: "alpha".into(),
+                    spec: "do ordinary streamed work".into(),
+                    preferred_model: "native-default".into(),
+                    preferred_runtime: "kiro".into(),
+                    user_id: "user-1".into(),
+                    max_tokens: 512,
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        assert!(plan.executable);
+
+        svc.policy.set_namespace_policy(
+            "alpha",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec![],
+                default_runtime: "kiro".into(),
+                default_model: "native-default".into(),
+                data_class: "sensitive".into(),
+            },
+        );
+
+        let error = match svc
+            .execute_plan_stream(Request::new(ExecutePlanRequest {
+                plan: Some(plan.clone()),
+            }))
+            .await
+        {
+            Ok(_) => panic!("stale streamed external plan bypassed the privacy gate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("privacy gate"));
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .expect("rejected streamed execution receipt");
         assert!(receipt.completeness().complete);
         assert!(receipt.events.iter().any(|event| {
             event.kind == ReceiptEventKind::OutcomeRecorded

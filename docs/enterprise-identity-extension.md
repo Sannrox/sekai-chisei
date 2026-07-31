@@ -25,6 +25,18 @@ revocation, current membership, and current tenant status on the relevant
 operation. A missing, unsupported, or invalid contract version fails closed;
 there is no negotiation fallback to an older authority model.
 
+The native model-loop methods `PlanExecution`, `ExecutePlan`, and
+`ExecutePlanStream` accept enterprise machine contexts. They authorize the
+complete context for namespace write access, use its principal as the planning
+and receipt actor, and ignore caller-supplied principal or tenant metadata.
+Invalid context authority is checked before a plan is consumed or an LLM
+provider is contacted. Machine contexts require the `chisei.execute` scope at
+the Chisei boundary even when an extension uses the default namespace
+authorization implementation; human sessions require `sekai.write`. Cached
+enterprise plans remain bound to the authenticated tenant (or to the
+credential for an unscoped enterprise context), in addition to the principal
+subject.
+
 ## Discovery metadata
 
 The contract can describe RFC 8414 authorization-server metadata and RFC 9728
