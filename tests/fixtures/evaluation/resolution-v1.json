@@ -1,0 +1,12 @@
+{
+  "contract_version": "chisei.evaluation-resolution-request/v1",
+  "resolver_version": "chisei.evaluation-resolver/v1",
+  "namespace": "acme",
+  "request_id": "release-1.0.0-dry-run",
+  "plan_version_id": "evaluation-plan:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "subject_profile": "example.software-release-candidate/v2",
+  "subject_identity": "release:1.0.0",
+  "subject_content_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "evidence_object_ids": [],
+  "evaluation_time_ms": 1785448800000
+}

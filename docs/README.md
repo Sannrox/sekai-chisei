@@ -48,6 +48,8 @@ If you want to deploy or operate the control plane:
   evaluation of externally owned immutable subjects.
 - [Evaluation plans and evaluator definitions](evaluation-plans.md) —
   situation-specific deterministic production evaluation contracts.
+- [Evaluation-plan operator CLI](evaluation-operator-cli.md) — author,
+  validate, publish, inspect, dry-run, and explicitly execute exact plans.
 - [Resolved evaluation manifests](evaluation-manifests.md) — immutable,
   content-bound pre-execution inputs and historical replay.
 - [Deterministic evaluation execution](evaluation-execution.md) — bounded,
