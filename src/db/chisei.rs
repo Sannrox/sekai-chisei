@@ -424,6 +424,11 @@ impl SekaiDb {
     }
 
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        let _span = tracing::info_span!(
+            "stage",
+            stage = crate::obs::correlation::Stage::Persistence.as_str(),
+        )
+        .entered();
         let conn = self.conn();
         upsert_operation_receipt(&conn, receipt)
     }

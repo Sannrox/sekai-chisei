@@ -55,8 +55,10 @@ where
             stage = crate::obs::correlation::Stage::Operation.as_str(),
             operation = %correlation.operation,
             attempt = correlation.attempt,
+            otel.kind = "server",
         );
 
+        crate::obs::otel::set_parent_from_headers(&span, req.headers());
         let future = self.inner.call(req);
         Box::pin(
             async move {

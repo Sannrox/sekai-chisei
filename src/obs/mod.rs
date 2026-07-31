@@ -8,4 +8,5 @@ pub mod labels;
 pub mod logging;
 pub mod metrics;
 pub mod ops;
+pub mod otel;
 pub mod signals;

@@ -3,7 +3,7 @@ use chisei_gateway::gateway_report::{GatewayReportConfig, report_usage, run_repo
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    chisei_gateway::obs::logging::init();
+    let mut telemetry = chisei_gateway::obs::logging::init();
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("report") {
         args.remove(0);
@@ -40,9 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         anthropic_upstream = %config.anthropic_base_url,
         "chisei-gateway starting"
     );
-    serve(config)
+    let result = serve(config)
         .await
-        .map_err(|err| std::io::Error::other(err.to_string()).into())
+        .map_err(|err| std::io::Error::other(err.to_string()).into());
+    telemetry.shutdown();
+    result
 }
 
 fn refresh_usage() -> &'static str {
