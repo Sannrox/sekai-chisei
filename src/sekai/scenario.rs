@@ -4,6 +4,7 @@
 //! returns domain-neutral impact sets. Overlay evaluation never mutates
 //! canonical objects, links, or temporal assertions.
 
+use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{Direction, Link, Object};
 use crate::sekai::retrieval;
@@ -251,6 +252,7 @@ pub struct ImpactRow {
     pub explanation_steps: Vec<String>,
     pub before_value: String,
     pub after_value: String,
+    pub descriptor: EpistemicDescriptor,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -467,7 +469,7 @@ where
         }
 
         match apply_delta(&mut overlay, delta)? {
-            Some(row) => {
+            Some(mut row) => {
                 let step_bytes = row
                     .explanation_steps
                     .iter()
@@ -480,6 +482,21 @@ where
                 }
                 explanation_bytes = explanation_bytes.saturating_add(step_bytes);
                 result.applied_deltas = result.applied_deltas.saturating_add(1);
+                let mut source_refs = row.delta_ids.clone();
+                if !row.object_id.is_empty() {
+                    source_refs.push(row.object_id.clone());
+                }
+                if !row.link_id.is_empty() {
+                    source_refs.push(row.link_id.clone());
+                }
+                row.descriptor = EpistemicDescriptor::from_hypothesis(
+                    &result.scenario_id,
+                    &source_refs,
+                    source_refs.len(),
+                    result.truncation_reasons.iter().any(|reason| {
+                        reason == "objects" || reason == "links" || reason == "expansion_work_units"
+                    }),
+                );
                 impact_rows.push(row);
             }
             None => {
@@ -635,6 +652,7 @@ fn apply_delta(
                 )],
                 before_value: before,
                 after_value: value.clone(),
+                descriptor: EpistemicDescriptor::unknown(),
             }))
         }
         DeltaOp::RemoveProperty { object_id, key } => {
@@ -657,6 +675,7 @@ fn apply_delta(
                 )],
                 before_value: before,
                 after_value: String::new(),
+                descriptor: EpistemicDescriptor::unknown(),
             }))
         }
         DeltaOp::AddLink {
@@ -690,6 +709,7 @@ fn apply_delta(
                 )],
                 before_value: String::new(),
                 after_value: format!("{from_id}->{to_id}:{relation}"),
+                descriptor: EpistemicDescriptor::unknown(),
             }))
         }
         DeltaOp::RemoveLink { link_id } => {
@@ -710,6 +730,7 @@ fn apply_delta(
                     )],
                     before_value: link_id.clone(),
                     after_value: String::new(),
+                    descriptor: EpistemicDescriptor::unknown(),
                 }));
             };
             overlay.removed_link_ids.insert(link_id.clone());
@@ -726,6 +747,7 @@ fn apply_delta(
                 )],
                 before_value: format!("{}->{}:{}", link.from_id, link.to_id, link.relation),
                 after_value: String::new(),
+                descriptor: EpistemicDescriptor::unknown(),
             }))
         }
     }
@@ -930,6 +952,18 @@ mod tests {
         assert_eq!(capacity.before_value, "2");
         assert_eq!(capacity.after_value, "5");
         assert_eq!(capacity.op, "set_property");
+        assert!(result.impact_rows.iter().all(|row| {
+            row.descriptor.origin_class
+                == crate::chisei::epistemic_descriptor::OriginClass::Hypothesis
+                && row.descriptor.evidence_status
+                    == crate::chisei::epistemic_descriptor::EvidenceStatus::Unknown
+                && row.descriptor.lifecycle_status
+                    == crate::chisei::epistemic_descriptor::LifecycleStatus::Unknown
+        }));
+        assert_eq!(
+            capacity.descriptor.derivation_ref.as_deref(),
+            Some("scenario:scenario-1")
+        );
     }
 
     #[test]

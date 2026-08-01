@@ -9,7 +9,7 @@
     },
     {
       "name": "ChiseiEpistemicDescriptor",
-      "description": "A bounded, read-only chisei.epistemic-descriptor/v1 projection that keeps origin, evidence, and lifecycle dimensions separate; it carries no source payload and is not durable epistemic authority.",
+      "description": "A bounded, read-only chisei.epistemic-descriptor/v1 projection over an existing Chisei or Sekai reference that keeps origin, evidence, and lifecycle dimensions separate; it carries no source payload and is not durable epistemic authority.",
       "superclasses": [],
       "properties": [
         {
@@ -37,6 +37,24 @@
           "description": "Closed lifecycle dimension: current, stale, retracted, superseded, or unknown."
         }
       ]
+    },
+    {
+      "name": "SekaiGraphProjectionReference",
+      "description": "An authorization-filtered asserted graph fact or query-time ontology derivation returned by an existing Sekai retrieval surface.",
+      "superclasses": [],
+      "properties": []
+    },
+    {
+      "name": "SekaiEvidenceProjectionReference",
+      "description": "An admitted external evidence submission or retained evidence projection whose lifecycle and source identity remain authoritative outside the descriptor.",
+      "superclasses": [],
+      "properties": []
+    },
+    {
+      "name": "SekaiScenarioHypothesisReference",
+      "description": "A request-scoped, non-durable scenario impact projection that remains a hypothesis and cannot promote evidence status.",
+      "superclasses": [],
+      "properties": []
     }
   ],
   "relations": [
@@ -45,6 +63,39 @@
       "description": "Associates a read-only descriptor projection with an existing context reference without transferring source authority.",
       "domain": "ChiseiEpistemicDescriptor",
       "range": "ChiseiContextReference",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    },
+    {
+      "name": "projects_authorized_graph_reference",
+      "description": "Associates a descriptor with an existing authorization-filtered graph fact or ontology derivation projection.",
+      "domain": "ChiseiEpistemicDescriptor",
+      "range": "SekaiGraphProjectionReference",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    },
+    {
+      "name": "projects_admitted_evidence_reference",
+      "description": "Associates a descriptor with an existing admitted evidence submission projection while preserving source lifecycle and identity.",
+      "domain": "ChiseiEpistemicDescriptor",
+      "range": "SekaiEvidenceProjectionReference",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    },
+    {
+      "name": "projects_scenario_hypothesis_reference",
+      "description": "Associates a descriptor with an existing request-scoped scenario hypothesis projection.",
+      "domain": "ChiseiEpistemicDescriptor",
+      "range": "SekaiScenarioHypothesisReference",
       "cardinality": {
         "min": 0,
         "max": 1
@@ -69,6 +120,36 @@
       "subject": "ChiseiContextReference",
       "source": "sekai-chisei",
       "locator": "src/chisei/pipeline.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGraphProjectionReference",
+      "source": "sekai-chisei",
+      "locator": "src/sekai/retrieval.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGraphProjectionReference",
+      "source": "sekai-chisei",
+      "locator": "src/grpc/sekai_service.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiEvidenceProjectionReference",
+      "source": "sekai-chisei",
+      "locator": "src/sekai/evidence_store.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiScenarioHypothesisReference",
+      "source": "sekai-chisei",
+      "locator": "src/sekai/scenario.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiScenarioHypothesisReference",
+      "source": "sekai-chisei",
+      "locator": "docs/epistemic-descriptor.md",
       "confidence": 1.0
     }
   ]

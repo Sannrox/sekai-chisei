@@ -21,6 +21,8 @@ Catalog entries are ordered by capability name and describe:
 - bounded query, retrieval, or mutation limits;
 - action risk and effective approval behavior;
 - evidence requirements for Kioku candidate retrieval; and
+- bounded epistemic-descriptor projection limits and backend capability
+  metadata where a reusable surface differs by SQLite versus PostgreSQL; and
 - the existing `ObjectType` or `ActionTypeDef` where a schema applies.
 
 `ObjectType` and `ActionTypeDef` remain the schema sources of truth. The
@@ -125,6 +127,15 @@ Each entry advertises:
 A typical compose order is resolve → expand → retrieve → explain. Each step
 rechecks authorization independently; a cached catalog version is observational
 provenance on the receipt (`reported_catalog_version`), not a grant.
+
+The graph retrieval capabilities advertise
+`epistemic_descriptor_projection` and bounded descriptor source-list limits.
+Asserted graph retrieval is available on both reusable community backends.
+Query-time ontology entailment is currently SQLite-only; PostgreSQL advertises
+the unsupported backend value and the RPC fails closed with
+`FAILED_PRECONDITION` rather than returning a partial ontology snapshot.
+Scenario graph reads advertise both backends while remaining request-scoped
+and non-durable.
 
 ## Lookup-first answers (S1 / #281)
 
