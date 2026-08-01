@@ -1464,7 +1464,7 @@ impl RuntimeDb {
     ) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.get_evidence_projection_object_id(submission_id),
-            Self::Postgres(_) => Err("get_evidence_projection_object_id is unavailable on the PostgreSQL community runtime".into()),
+            Self::Postgres(db) => db.get_evidence_projection_object_id(submission_id),
         }
     }
 

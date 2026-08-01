@@ -686,12 +686,33 @@ message ContextExplanation {
   bool derived = 4;
 }
 
+// Versioned, source-neutral epistemic metadata projected from an existing
+// authorization-filtered Sekai reference. It carries no source payload and is
+// not durable epistemic authority.
+message EpistemicDescriptor {
+  string contract_version = 1;
+  string origin_class = 2; // asserted | derived | hypothesis | unknown
+  string evidence_status = 3; // supported | contested | insufficient | unknown
+  string lifecycle_status = 4; // current | stale | retracted | superseded | unknown
+  optional uint32 producer_confidence_bps = 5;
+  string confidence_basis = 6; // producer_input when present
+  optional int64 observed_at_ms = 7;
+  string derivation_ref = 8;
+  repeated string source_refs = 9;
+  repeated string source_digests = 10;
+  optional uint32 source_row_count = 11;
+  bool source_rows_truncated = 12;
+  optional uint32 supporting_evidence_count = 13;
+  optional uint32 contradicting_evidence_count = 14;
+}
+
 message ContextCandidate {
   Object object = 1;
   uint32 depth = 2;
   string via_relation = 3;
   double affinity = 4;
   ContextExplanation explanation = 5;
+  EpistemicDescriptor descriptor = 6;
 }
 
 message RetrieveContextResponse {
@@ -706,6 +727,7 @@ message RetrieveContextResponse {
   uint32 source_rows = 9;
   uint32 derived_rows = 10;
   string ontology_revision = 11;
+  string epistemic_descriptor_version = 12;
 }
 
 // Shared hybrid retrieval candidate envelope (#360 / research #152).
@@ -991,6 +1013,7 @@ message ScenarioImpactRow {
   repeated string explanation_steps = 7;
   string before_value = 8;
   string after_value = 9;
+  EpistemicDescriptor descriptor = 10;
 }
 
 message EvaluateScenarioResponse {
@@ -1006,6 +1029,7 @@ message EvaluateScenarioResponse {
   repeated string truncation_reasons = 7;
   uint32 expansion_work_units = 8;
   uint32 applied_deltas = 9;
+  string epistemic_descriptor_version = 10;
 }
 
 // Semantic catalog capabilities (#151). These are discoverable through
@@ -1063,6 +1087,7 @@ message ExpandRelationsResponse {
   uint32 derived_rows = 10;
   string ontology_revision = 11;
   string reasoning_mode = 12;
+  string epistemic_descriptor_version = 13;
 }
 
 message ExplainDerivationRequest {
@@ -1091,6 +1116,7 @@ message ExplainDerivationResponse {
   string reasoning_mode = 6;
   // Opaque evidence references (source fact ids). Never secrets or tokens.
   repeated string evidence_refs = 7;
+  EpistemicDescriptor descriptor = 8;
 }
 
 message ListSchemaTypesRequest {}
@@ -2042,6 +2068,7 @@ message EvidenceSubmissionRecord {
   optional int64 expires_at_ms = 22;
   int64 received_at_ms = 23;
   int64 updated_at_ms = 24;
+  EpistemicDescriptor descriptor = 25;
 }
 
 message EvidenceSubmissionResult {
@@ -2072,6 +2099,7 @@ message GetEvidenceSubmissionContentResponse {
   string submission_id = 1;
   EvidenceEnvelope envelope = 2;
   string lifecycle_state = 3;
+  EpistemicDescriptor descriptor = 4;
 }
 message ListEvidenceSubmissionsRequest {
   string producer_identity = 1;

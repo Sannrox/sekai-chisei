@@ -125,6 +125,95 @@ impl EpistemicDescriptor {
         }
     }
 
+    /// Project an authorization-filtered graph retrieval explanation.  The
+    /// explanation is already the source of truth for whether a result was
+    /// asserted or entailed; this constructor does not infer evidence
+    /// polarity from graph shape or object properties.
+    pub fn from_graph_explanation(
+        explanation: &crate::sekai::retrieval::Explanation,
+        source_rows_truncated: bool,
+    ) -> Self {
+        Self::from_graph_projection(
+            explanation.derived,
+            &explanation.source_fact_ids,
+            &explanation.ontology_revision,
+            source_rows_truncated,
+        )
+    }
+
+    /// Projection form used by transport adapters that already serialized the
+    /// authorization-filtered explanation.
+    pub fn from_graph_projection(
+        derived: bool,
+        source_fact_ids: &[String],
+        ontology_revision: &str,
+        source_rows_truncated: bool,
+    ) -> Self {
+        let source_row_count = source_fact_ids.len().min(MAX_SOURCE_ROWS) as u32;
+        let derivation_ref = if derived {
+            bounded_optional_string(&format!("ontology_revision:{}", ontology_revision))
+        } else {
+            None
+        };
+        Self {
+            contract_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
+            origin_class: if derived {
+                OriginClass::Derived
+            } else {
+                OriginClass::Asserted
+            },
+            evidence_status: EvidenceStatus::Unknown,
+            lifecycle_status: LifecycleStatus::Current,
+            producer_confidence_bps: None,
+            confidence_basis: None,
+            observed_at_ms: None,
+            derivation_ref,
+            source_refs: source_fact_ids
+                .iter()
+                .filter_map(|value| bounded_source_string(value))
+                .take(MAX_SOURCE_REFS)
+                .collect(),
+            source_digests: Vec::new(),
+            source_row_count: Some(source_row_count),
+            source_rows_truncated: source_rows_truncated || source_fact_ids.len() > MAX_SOURCE_ROWS,
+            supporting_evidence_count: None,
+            contradicting_evidence_count: None,
+        }
+        .fit_byte_bound()
+    }
+
+    /// Project a request-scoped scenario impact row.  Scenario evaluation is
+    /// not evidence evaluation: the hypothesis origin is explicit while the
+    /// evidence and lifecycle dimensions remain unknown.
+    pub fn from_hypothesis(
+        scenario_id: &str,
+        source_refs: &[String],
+        source_row_count: usize,
+        source_rows_truncated: bool,
+    ) -> Self {
+        Self {
+            contract_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
+            origin_class: OriginClass::Hypothesis,
+            evidence_status: EvidenceStatus::Unknown,
+            lifecycle_status: LifecycleStatus::Unknown,
+            producer_confidence_bps: None,
+            confidence_basis: None,
+            observed_at_ms: None,
+            derivation_ref: bounded_optional_string(&format!("scenario:{scenario_id}")),
+            source_refs: source_refs
+                .iter()
+                .filter_map(|value| bounded_source_string(value))
+                .take(MAX_SOURCE_REFS)
+                .collect(),
+            source_digests: Vec::new(),
+            source_row_count: Some(source_row_count.min(MAX_SOURCE_ROWS) as u32),
+            source_rows_truncated: source_rows_truncated || source_row_count > MAX_SOURCE_ROWS,
+            supporting_evidence_count: None,
+            contradicting_evidence_count: None,
+        }
+        .fit_byte_bound()
+    }
+
     /// Project a retrieved Kioku memory after the normal Kioku authorization
     /// and classification checks have succeeded.
     pub fn from_kioku(memory: &KiokuMemory, evidence: &[KiokuEvidenceLink]) -> Self {
@@ -422,6 +511,51 @@ mod tests {
         assert_eq!(descriptor.origin_class, OriginClass::Unknown);
         assert_eq!(descriptor.evidence_status, EvidenceStatus::Unknown);
         assert_eq!(descriptor.lifecycle_status, LifecycleStatus::Unknown);
+        descriptor.validate().unwrap();
+    }
+
+    #[test]
+    fn graph_projection_distinguishes_asserted_and_entailed_results() {
+        let asserted = EpistemicDescriptor::from_graph_projection(
+            false,
+            &["object-1".into(), "link-1".into()],
+            "",
+            false,
+        );
+        assert_eq!(asserted.origin_class, OriginClass::Asserted);
+        assert_eq!(asserted.evidence_status, EvidenceStatus::Unknown);
+        assert_eq!(asserted.lifecycle_status, LifecycleStatus::Current);
+        assert!(asserted.derivation_ref.is_none());
+        asserted.validate().unwrap();
+
+        let derived = EpistemicDescriptor::from_graph_projection(
+            true,
+            &["link-1".into(), "ontology:class:Widget".into()],
+            "rev-1",
+            false,
+        );
+        assert_eq!(derived.origin_class, OriginClass::Derived);
+        assert_eq!(derived.evidence_status, EvidenceStatus::Unknown);
+        assert_eq!(
+            derived.derivation_ref.as_deref(),
+            Some("ontology_revision:rev-1")
+        );
+        assert_eq!(derived.source_refs.len(), 2);
+        derived.validate().unwrap();
+    }
+
+    #[test]
+    fn hypothesis_projection_never_mints_support_or_assertion() {
+        let refs = vec!["delta-1".into(), "object-1".into()];
+        let descriptor = EpistemicDescriptor::from_hypothesis("scenario-1", &refs, 2, false);
+        assert_eq!(descriptor.origin_class, OriginClass::Hypothesis);
+        assert_eq!(descriptor.evidence_status, EvidenceStatus::Unknown);
+        assert_eq!(descriptor.lifecycle_status, LifecycleStatus::Unknown);
+        assert_eq!(
+            descriptor.derivation_ref.as_deref(),
+            Some("scenario:scenario-1")
+        );
+        assert!(descriptor.producer_confidence_bps.is_none());
         descriptor.validate().unwrap();
     }
 

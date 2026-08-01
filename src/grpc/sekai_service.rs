@@ -9,6 +9,9 @@ use tonic::{Request, Response, Status};
 
 use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
+use crate::chisei::epistemic_descriptor::{
+    EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
+};
 use crate::chisei::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
     ReceiptSurface, UncoveredSurface,
@@ -679,6 +682,11 @@ impl SekaiServiceImpl {
         let mut ontology_source_rows = 0u32;
         let mut ontology_source_truncated = false;
         let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
+            if self.db.backend_name() == "postgres" {
+                return Err(Status::failed_precondition(
+                    "sekai.context.retrieve entailment is unavailable on the PostgreSQL community runtime; use asserted_only",
+                ));
+            }
             let class_rows = match self.db.list_readable_ontology_classes(
                 principals,
                 reasoning_deadline,
@@ -841,6 +849,15 @@ impl SekaiServiceImpl {
                         ontology_revision: candidate.explanation.ontology_revision.clone(),
                         derived: candidate.explanation.derived,
                     }),
+                    descriptor: Some(to_proto_epistemic_descriptor(
+                        &DomainEpistemicDescriptor::from_graph_explanation(
+                            &candidate.explanation,
+                            result
+                                .truncation_reasons
+                                .iter()
+                                .any(|reason| reason == "source_rows"),
+                        ),
+                    )),
                 })
                 .collect(),
             links: result.links.iter().map(to_proto_link).collect(),
@@ -853,6 +870,7 @@ impl SekaiServiceImpl {
             source_rows: result.source_rows,
             derived_rows: result.derived_rows,
             ontology_revision: result.ontology_revision,
+            epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
         })
     }
 
@@ -1313,12 +1331,14 @@ impl SekaiServiceImpl {
                     explanation_steps: row.explanation_steps,
                     before_value: row.before_value,
                     after_value: row.after_value,
+                    descriptor: Some(to_proto_epistemic_descriptor(&row.descriptor)),
                 })
                 .collect(),
             truncated: result.truncated,
             truncation_reasons: result.truncation_reasons,
             expansion_work_units: result.expansion_work_units,
             applied_deltas: result.applied_deltas,
+            epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
         })
     }
 
@@ -1963,6 +1983,35 @@ fn semantic_reasoning_limits() -> Vec<CapabilityLimit> {
     ]
 }
 
+fn epistemic_projection_limits() -> [CapabilityLimit; 6] {
+    [
+        CapabilityLimit {
+            name: "epistemic_descriptor_source_refs".into(),
+            value: crate::chisei::epistemic_descriptor::MAX_SOURCE_REFS as u64,
+        },
+        CapabilityLimit {
+            name: "epistemic_descriptor_source_digests".into(),
+            value: crate::chisei::epistemic_descriptor::MAX_SOURCE_DIGESTS as u64,
+        },
+        CapabilityLimit {
+            name: "epistemic_descriptor_source_rows".into(),
+            value: crate::chisei::epistemic_descriptor::MAX_SOURCE_ROWS as u64,
+        },
+        CapabilityLimit {
+            name: "epistemic_descriptor_max_bytes".into(),
+            value: crate::chisei::epistemic_descriptor::MAX_DESCRIPTOR_BYTES as u64,
+        },
+        CapabilityLimit {
+            name: "backend_sqlite_entailment".into(),
+            value: 1,
+        },
+        CapabilityLimit {
+            name: "backend_postgres_entailment".into(),
+            value: 0,
+        },
+    ]
+}
+
 fn resolve_semantic_ref_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_RESOLVE_REF.into(),
@@ -2012,11 +2061,13 @@ fn expand_relations_capability() -> CapabilityEntry {
         "ontology_acl".into(),
     ];
     entry.limits = semantic_reasoning_limits();
+    entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),
         "source_fact_ids".into(),
         "ontology_revision".into(),
         "truncation_metadata".into(),
+        "epistemic_descriptor_projection".into(),
     ];
     entry
 }
@@ -2037,11 +2088,13 @@ fn retrieve_context_capability() -> CapabilityEntry {
         "ontology_acl".into(),
     ];
     entry.limits = semantic_reasoning_limits();
+    entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),
         "source_fact_ids".into(),
         "ontology_revision".into(),
         "truncation_metadata".into(),
+        "epistemic_descriptor_projection".into(),
     ];
     entry
 }
@@ -2062,11 +2115,13 @@ fn explain_derivation_capability() -> CapabilityEntry {
         "ontology_acl".into(),
     ];
     entry.limits = semantic_reasoning_limits();
+    entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),
         "source_fact_ids".into(),
         "ontology_revision".into(),
         "explicit_rules_only".into(),
+        "epistemic_descriptor_projection".into(),
     ];
     entry
 }
@@ -2260,10 +2315,25 @@ fn evaluate_scenario_capability() -> CapabilityEntry {
             name: "mutates_canonical_graph".into(),
             value: 0,
         });
+        limits.extend([
+            CapabilityLimit {
+                name: "epistemic_descriptor_source_refs".into(),
+                value: crate::chisei::epistemic_descriptor::MAX_SOURCE_REFS as u64,
+            },
+            CapabilityLimit {
+                name: "backend_sqlite_graph_reads".into(),
+                value: 1,
+            },
+            CapabilityLimit {
+                name: "backend_postgres_graph_reads".into(),
+                value: 1,
+            },
+        ]);
         limits
     };
     entry.evidence_requirements = vec![
         "epistemic_class_hypothesis".into(),
+        "epistemic_descriptor_projection".into(),
         "domain_neutral_impact_rows".into(),
         "truncation_metadata".into(),
         "no_canonical_mutation".into(),
@@ -2771,6 +2841,29 @@ fn to_proto_evidence_submission(
         expires_at_ms: submission.expires_at_ms,
         received_at_ms: submission.received_at_ms,
         updated_at_ms: submission.updated_at_ms,
+        descriptor: Some(to_proto_epistemic_descriptor(
+            &DomainEpistemicDescriptor::from_external_evidence(submission),
+        )),
+    }
+}
+
+fn to_proto_epistemic_descriptor(descriptor: &DomainEpistemicDescriptor) -> EpistemicDescriptor {
+    debug_assert!(descriptor.validate().is_ok());
+    EpistemicDescriptor {
+        contract_version: descriptor.contract_version.clone(),
+        origin_class: descriptor.origin_class.as_str().into(),
+        evidence_status: descriptor.evidence_status.as_str().into(),
+        lifecycle_status: descriptor.lifecycle_status.as_str().into(),
+        producer_confidence_bps: descriptor.producer_confidence_bps.map(u32::from),
+        confidence_basis: descriptor.confidence_basis.clone().unwrap_or_default(),
+        observed_at_ms: descriptor.observed_at_ms,
+        derivation_ref: descriptor.derivation_ref.clone().unwrap_or_default(),
+        source_refs: descriptor.source_refs.clone(),
+        source_digests: descriptor.source_digests.clone(),
+        source_row_count: descriptor.source_row_count,
+        source_rows_truncated: descriptor.source_rows_truncated,
+        supporting_evidence_count: descriptor.supporting_evidence_count,
+        contradicting_evidence_count: descriptor.contradicting_evidence_count,
     }
 }
 
@@ -8826,6 +8919,7 @@ impl SekaiService for SekaiServiceImpl {
             derived_rows: retrieved.derived_rows,
             ontology_revision: retrieved.ontology_revision,
             reasoning_mode: semantic::reasoning_mode_label(reasoning_mode).into(),
+            epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
         });
         if let Some(operation_id) = operation_id.as_deref() {
             response.metadata_mut().insert(
@@ -8932,6 +9026,17 @@ impl SekaiService for SekaiServiceImpl {
             guard.finalize("allow", "succeeded")?;
         }
         let found = found_explanation.is_some();
+        let descriptor = found_explanation.as_ref().map(|explanation| {
+            to_proto_epistemic_descriptor(&DomainEpistemicDescriptor::from_graph_projection(
+                explanation.derived,
+                &explanation.source_fact_ids,
+                &explanation.ontology_revision,
+                retrieved
+                    .truncation_reasons
+                    .iter()
+                    .any(|reason| reason == "source_rows"),
+            ))
+        });
         let mut response = Response::new(ExplainDerivationResponse {
             explanation: found_explanation,
             found,
@@ -8940,6 +9045,7 @@ impl SekaiService for SekaiServiceImpl {
             ontology_revision: retrieved.ontology_revision,
             reasoning_mode: semantic::reasoning_mode_label(reasoning_mode).into(),
             evidence_refs,
+            descriptor,
         });
         if let Some(operation_id) = operation_id.as_deref() {
             response.metadata_mut().insert(
@@ -15589,6 +15695,9 @@ impl SekaiService for SekaiServiceImpl {
             submission_id,
             envelope: Some(to_proto_evidence_envelope(envelope)),
             lifecycle_state: submission.lifecycle_state.as_str().into(),
+            descriptor: Some(to_proto_epistemic_descriptor(
+                &DomainEpistemicDescriptor::from_external_evidence(&submission),
+            )),
         }))
     }
 
@@ -26827,6 +26936,19 @@ mod tests {
         assert_eq!(candidate_ids, vec!["context-root", "context-allowed"]);
         assert_eq!(response.candidates[0].depth, 0);
         assert_eq!(
+            response.epistemic_descriptor_version,
+            EPISTEMIC_DESCRIPTOR_VERSION
+        );
+        let root_descriptor = response.candidates[0].descriptor.as_ref().unwrap();
+        assert_eq!(
+            root_descriptor.origin_class,
+            crate::chisei::epistemic_descriptor::OriginClass::Asserted.as_str()
+        );
+        assert_eq!(
+            root_descriptor.evidence_status,
+            crate::chisei::epistemic_descriptor::EvidenceStatus::Unknown.as_str()
+        );
+        assert_eq!(
             response.candidates[0].object.as_ref().unwrap().properties["secret_note"],
             REDACTED_VALUE
         );
@@ -27919,6 +28041,10 @@ mod tests {
             response.epistemic_class,
             scenario::EPISTEMIC_CLASS_HYPOTHESIS
         );
+        assert_eq!(
+            response.epistemic_descriptor_version,
+            EPISTEMIC_DESCRIPTOR_VERSION
+        );
         assert_eq!(response.namespace, "ops");
         assert!(response.scenario_id.contains("grpc-test"));
         assert_eq!(response.applied_deltas, 2);
@@ -27936,6 +28062,15 @@ mod tests {
             .unwrap();
         assert_eq!(capacity.before_value, "2");
         assert_eq!(capacity.after_value, "7");
+        let descriptor = capacity.descriptor.as_ref().unwrap();
+        assert_eq!(
+            descriptor.origin_class,
+            crate::chisei::epistemic_descriptor::OriginClass::Hypothesis.as_str()
+        );
+        assert_eq!(
+            descriptor.evidence_status,
+            crate::chisei::epistemic_descriptor::EvidenceStatus::Unknown.as_str()
+        );
 
         let after = svc.db.get_object("wh-1").unwrap().unwrap();
         assert_eq!(
@@ -29403,6 +29538,23 @@ mod tests {
         assert!(submitted.projected);
         let submission = submitted.submission.unwrap();
         assert_eq!(submission.lifecycle_state, "available");
+        let descriptor = submission.descriptor.as_ref().unwrap();
+        assert_eq!(
+            descriptor.origin_class,
+            crate::chisei::epistemic_descriptor::OriginClass::Asserted.as_str()
+        );
+        assert_eq!(
+            descriptor.evidence_status,
+            crate::chisei::epistemic_descriptor::EvidenceStatus::Unknown.as_str()
+        );
+        assert_eq!(
+            descriptor.lifecycle_status,
+            crate::chisei::epistemic_descriptor::LifecycleStatus::Current.as_str()
+        );
+        assert_eq!(
+            descriptor.source_digests,
+            vec![submission.content_digest.clone()]
+        );
 
         let inspected = svc
             .get_evidence_submission(with_named_principal(
@@ -29415,6 +29567,15 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(inspected.lifecycle_history.last().unwrap(), "available");
+        assert_eq!(
+            inspected
+                .submission
+                .unwrap()
+                .descriptor
+                .unwrap()
+                .lifecycle_status,
+            crate::chisei::epistemic_descriptor::LifecycleStatus::Current.as_str()
+        );
         let denied = svc
             .get_evidence_submission(with_named_principal(
                 GetEvidenceSubmissionRequest {

@@ -470,6 +470,16 @@ impl PostgresDb {
         get_submission(&mut *connection, id)
     }
 
+    pub fn get_evidence_projection_object_id(&self, id: &str) -> Result<Option<String>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT evidence_object_id FROM sekai_evidence_projections WHERE submission_id=$1",
+                &[&id],
+            )
+            .map(|row| row.map(|row| row.get(0)))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn evidence_lifecycle_history(
         &self,
         id: &str,
