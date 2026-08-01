@@ -1,5 +1,6 @@
 use crate::chisei::budget::PressureLevel;
 use crate::chisei::egress;
+use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
@@ -56,6 +57,7 @@ pub struct EvidenceContextReference {
     pub classification: String,
     pub projection_version: String,
     pub disclosed_fields: Vec<String>,
+    pub descriptor: EpistemicDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,7 @@ pub struct MemoryContextReference {
     pub applicability: String,
     pub evidence_operation_ids: Vec<String>,
     pub content_digest: String,
+    pub descriptor: EpistemicDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,12 +314,14 @@ fn collect_external_evidence_context(
         let Some(envelope) = submission.envelope.as_ref() else {
             continue;
         };
+        let descriptor = EpistemicDescriptor::from_external_evidence(&submission);
         let mut disclosed_fields = vec![
             "evidence_type".to_string(),
             "signal".to_string(),
             "confidence_bps".to_string(),
             "observed_at_ms".to_string(),
         ];
+        disclosed_fields.extend(epistemic_descriptor_egress_fields(&descriptor));
         let mut details = vec![
             format!("type={}", submission.evidence_type),
             format!("signal={}", envelope.signal.as_str()),
@@ -347,6 +352,7 @@ fn collect_external_evidence_context(
             classification: submission.classification.as_str().to_string(),
             projection_version: item.projection_version,
             disclosed_fields,
+            descriptor,
         });
     }
     lines
@@ -1008,6 +1014,16 @@ fn run_kioku_enrich(
             .iter()
             .map(|link| link.operation_id.clone())
             .collect::<Vec<_>>();
+        let descriptor = EpistemicDescriptor::from_kioku(&item.memory, &item.evidence);
+        let mut included_fields = vec![
+            "claim".into(),
+            "confidence_bps".into(),
+            "uncertainty".into(),
+            "applicability".into(),
+            "supporting_evidence_count".into(),
+            "contradicting_evidence_count".into(),
+        ];
+        included_fields.extend(epistemic_descriptor_egress_fields(&descriptor));
         lines.push(line);
         req.memory_references.push(MemoryContextReference {
             memory_id: item.memory.id.clone(),
@@ -1017,17 +1033,11 @@ fn run_kioku_enrich(
             applicability: item.applicability.clone(),
             evidence_operation_ids,
             content_digest: crate::chisei::kioku::memory_claim_digest(&item.memory),
+            descriptor,
         });
         req.egress_records.push(egress::ContextEgressRecord {
             object_ref: format!("kioku:{}@{}", item.memory.id, item.memory.version),
-            included_fields: vec![
-                "claim".into(),
-                "confidence_bps".into(),
-                "uncertainty".into(),
-                "applicability".into(),
-                "supporting_evidence_count".into(),
-                "contradicting_evidence_count".into(),
-            ],
+            included_fields,
             redacted_fields: vec![],
             reasons: vec![format!(
                 "memory classification {} admitted for governed context",
@@ -1065,6 +1075,44 @@ fn run_kioku_enrich(
             .collect::<Vec<_>>()
             .join(","),
     }
+}
+
+fn epistemic_descriptor_egress_fields(descriptor: &EpistemicDescriptor) -> Vec<String> {
+    let mut fields = vec![
+        "epistemic_descriptor.contract_version".into(),
+        "epistemic_descriptor.origin_class".into(),
+        "epistemic_descriptor.evidence_status".into(),
+        "epistemic_descriptor.lifecycle_status".into(),
+        "epistemic_descriptor.source_rows_truncated".into(),
+    ];
+    if descriptor.producer_confidence_bps.is_some() {
+        fields.push("epistemic_descriptor.producer_confidence_bps".into());
+    }
+    if descriptor.confidence_basis.is_some() {
+        fields.push("epistemic_descriptor.confidence_basis".into());
+    }
+    if descriptor.observed_at_ms.is_some() {
+        fields.push("epistemic_descriptor.observed_at_ms".into());
+    }
+    if descriptor.derivation_ref.is_some() {
+        fields.push("epistemic_descriptor.derivation_ref".into());
+    }
+    if !descriptor.source_refs.is_empty() {
+        fields.push("epistemic_descriptor.source_refs".into());
+    }
+    if !descriptor.source_digests.is_empty() {
+        fields.push("epistemic_descriptor.source_digests".into());
+    }
+    if descriptor.source_row_count.is_some() {
+        fields.push("epistemic_descriptor.source_row_count".into());
+    }
+    if descriptor.supporting_evidence_count.is_some() {
+        fields.push("epistemic_descriptor.supporting_evidence_count".into());
+    }
+    if descriptor.contradicting_evidence_count.is_some() {
+        fields.push("epistemic_descriptor.contradicting_evidence_count".into());
+    }
+    fields
 }
 
 fn render_memory_context(item: &crate::chisei::kioku::RetrievedMemory) -> String {
@@ -1867,6 +1915,19 @@ mod tests {
                 "applicability",
                 "supporting_evidence_count",
                 "contradicting_evidence_count",
+                "epistemic_descriptor.contract_version",
+                "epistemic_descriptor.origin_class",
+                "epistemic_descriptor.evidence_status",
+                "epistemic_descriptor.lifecycle_status",
+                "epistemic_descriptor.source_rows_truncated",
+                "epistemic_descriptor.producer_confidence_bps",
+                "epistemic_descriptor.confidence_basis",
+                "epistemic_descriptor.observed_at_ms",
+                "epistemic_descriptor.derivation_ref",
+                "epistemic_descriptor.source_refs",
+                "epistemic_descriptor.source_row_count",
+                "epistemic_descriptor.supporting_evidence_count",
+                "epistemic_descriptor.contradicting_evidence_count",
             ]
         );
         assert!(
@@ -2153,6 +2214,27 @@ mod tests {
         assert_eq!(
             external_result.evidence_references[0].content_digest.len(),
             64
+        );
+        assert_eq!(
+            external_result.evidence_references[0].disclosed_fields,
+            vec![
+                "evidence_type",
+                "signal",
+                "confidence_bps",
+                "observed_at_ms",
+                "epistemic_descriptor.contract_version",
+                "epistemic_descriptor.origin_class",
+                "epistemic_descriptor.evidence_status",
+                "epistemic_descriptor.lifecycle_status",
+                "epistemic_descriptor.source_rows_truncated",
+                "epistemic_descriptor.producer_confidence_bps",
+                "epistemic_descriptor.confidence_basis",
+                "epistemic_descriptor.observed_at_ms",
+                "epistemic_descriptor.source_refs",
+                "epistemic_descriptor.source_digests",
+                "epistemic_descriptor.source_row_count",
+                "content.result",
+            ]
         );
 
         let mut local = make_req();

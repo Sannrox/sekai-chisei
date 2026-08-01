@@ -56,6 +56,8 @@ If you want to deploy or operate the control plane:
   receipt-authoritative deterministic and stochastic execution.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
+- [Epistemic descriptor](epistemic-descriptor.md) — additive, bounded
+  origin/evidence/lifecycle metadata on existing context references.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 

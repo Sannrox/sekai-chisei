@@ -21,6 +21,7 @@ use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
+use crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::evaluation_execution as evaluation_execution_domain;
 use crate::chisei::evaluation_manifest as evaluation_manifest_domain;
@@ -1231,6 +1232,29 @@ fn context_evidence_reference(
         classification: reference.classification.clone(),
         projection_version: reference.projection_version.clone(),
         disclosed_fields: reference.disclosed_fields.clone(),
+        descriptor: Some(epistemic_descriptor_to_pb(&reference.descriptor)),
+    }
+}
+
+fn epistemic_descriptor_to_pb(
+    descriptor: &crate::chisei::epistemic_descriptor::EpistemicDescriptor,
+) -> super::pb::chisei::EpistemicDescriptor {
+    debug_assert!(descriptor.validate().is_ok());
+    super::pb::chisei::EpistemicDescriptor {
+        contract_version: descriptor.contract_version.clone(),
+        origin_class: descriptor.origin_class.as_str().into(),
+        evidence_status: descriptor.evidence_status.as_str().into(),
+        lifecycle_status: descriptor.lifecycle_status.as_str().into(),
+        producer_confidence_bps: descriptor.producer_confidence_bps.map(u32::from),
+        confidence_basis: descriptor.confidence_basis.clone().unwrap_or_default(),
+        observed_at_ms: descriptor.observed_at_ms,
+        derivation_ref: descriptor.derivation_ref.clone().unwrap_or_default(),
+        source_refs: descriptor.source_refs.clone(),
+        source_digests: descriptor.source_digests.clone(),
+        source_row_count: descriptor.source_row_count,
+        source_rows_truncated: descriptor.source_rows_truncated,
+        supporting_evidence_count: descriptor.supporting_evidence_count,
+        contradicting_evidence_count: descriptor.contradicting_evidence_count,
     }
 }
 
@@ -1243,6 +1267,7 @@ fn memory_context_reference(reference: &pipe::MemoryContextReference) -> MemoryC
         applicability: reference.applicability.clone(),
         evidence_operation_ids: reference.evidence_operation_ids.clone(),
         content_digest: reference.content_digest.clone(),
+        descriptor: Some(epistemic_descriptor_to_pb(&reference.descriptor)),
     }
 }
 
@@ -1255,6 +1280,61 @@ fn memory_lifecycle_allows_execution(
     state == crate::chisei::kioku::MemoryLifecycleState::Active
         && expires_at_ms.is_none_or(|expires_at_ms| expires_at_ms > now_ms)
         && retention_until_ms.is_none_or(|retention_until_ms| retention_until_ms > now_ms)
+}
+
+fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<String, String> {
+    let descriptors = plan
+        .evidence_references
+        .iter()
+        .filter_map(|reference| reference.descriptor.as_ref())
+        .chain(
+            plan.memory_references
+                .iter()
+                .filter_map(|reference| reference.descriptor.as_ref()),
+        )
+        .collect::<Vec<_>>();
+    let source_rows = descriptors
+        .iter()
+        .filter_map(|descriptor| descriptor.source_row_count)
+        .map(u64::from)
+        .sum::<u64>();
+    let source_refs = descriptors
+        .iter()
+        .map(|descriptor| descriptor.source_refs.len() as u64)
+        .sum::<u64>();
+    let source_digests = descriptors
+        .iter()
+        .map(|descriptor| descriptor.source_digests.len() as u64)
+        .sum::<u64>();
+    let truncated = descriptors
+        .iter()
+        .any(|descriptor| descriptor.source_rows_truncated);
+    BTreeMap::from([
+        (
+            "epistemic_descriptor_version".into(),
+            EPISTEMIC_DESCRIPTOR_VERSION.into(),
+        ),
+        (
+            "epistemic_descriptor_count".into(),
+            descriptors.len().min(128).to_string(),
+        ),
+        (
+            "epistemic_descriptor_source_rows".into(),
+            source_rows.min(128 * 128).to_string(),
+        ),
+        (
+            "epistemic_descriptor_source_refs".into(),
+            source_refs.min(128 * 8).to_string(),
+        ),
+        (
+            "epistemic_descriptor_source_digests".into(),
+            source_digests.min(128 * 8).to_string(),
+        ),
+        (
+            "epistemic_descriptor_source_rows_truncated".into(),
+            truncated.to_string(),
+        ),
+    ])
 }
 
 fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
@@ -5368,19 +5448,23 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::ContextGoverned,
                 "chisei.pipeline",
-                BTreeMap::from([
-                    (
-                        "prepared_context_hash".into(),
-                        content_hash(
-                            std::iter::once(plan.prepared_system.as_bytes()).chain(
-                                plan.prepared_messages
-                                    .iter()
-                                    .map(|message| message.content.as_bytes()),
+                {
+                    let mut attributes = BTreeMap::from([
+                        (
+                            "prepared_context_hash".into(),
+                            content_hash(
+                                std::iter::once(plan.prepared_system.as_bytes()).chain(
+                                    plan.prepared_messages
+                                        .iter()
+                                        .map(|message| message.content.as_bytes()),
+                                ),
                             ),
                         ),
-                    ),
-                    ("raw_context_stored".into(), "false".into()),
-                ]),
+                        ("raw_context_stored".into(), "false".into()),
+                    ]);
+                    attributes.extend(epistemic_descriptor_receipt_attributes(plan));
+                    attributes
+                },
             ),
             receipt_event(
                 &operation_id,
@@ -10491,6 +10575,7 @@ impl ChiseiService for ChiseiServiceImpl {
                     .iter()
                     .map(memory_context_reference)
                     .collect(),
+                epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
             }),
         }))
     }
@@ -21556,7 +21641,35 @@ mod tests {
                 submission_id: "submission-7".into(),
                 source_version: "attempt-2".into(),
                 content_digest: digest.clone(),
-                disclosed_fields: vec!["content.result".into(), "signal".into()],
+                disclosed_fields: vec![
+                    "content.result".into(),
+                    "signal".into(),
+                    "epistemic_descriptor.contract_version".into(),
+                    "epistemic_descriptor.origin_class".into(),
+                    "epistemic_descriptor.evidence_status".into(),
+                    "epistemic_descriptor.lifecycle_status".into(),
+                    "epistemic_descriptor.source_rows_truncated".into(),
+                    "epistemic_descriptor.observed_at_ms".into(),
+                    "epistemic_descriptor.source_refs".into(),
+                    "epistemic_descriptor.source_digests".into(),
+                    "epistemic_descriptor.source_row_count".into(),
+                ],
+                descriptor: Some(EpistemicDescriptor {
+                    contract_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
+                    origin_class: "asserted".into(),
+                    evidence_status: "unknown".into(),
+                    lifecycle_status: "current".into(),
+                    producer_confidence_bps: None,
+                    confidence_basis: String::new(),
+                    observed_at_ms: Some(100),
+                    derivation_ref: String::new(),
+                    source_refs: vec!["submission-7".into()],
+                    source_digests: vec![digest.clone()],
+                    source_row_count: Some(1),
+                    source_rows_truncated: false,
+                    supporting_evidence_count: None,
+                    contradicting_evidence_count: None,
+                }),
                 ..Default::default()
             }],
             memory_references: vec![MemoryContextReference {
@@ -21567,6 +21680,7 @@ mod tests {
                 applicability: "verification".into(),
                 evidence_operation_ids: vec!["operation-7".into()],
                 content_digest: "b".repeat(64),
+                descriptor: None,
             }],
             ..Default::default()
         };
@@ -21578,22 +21692,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(receipt.operation_class, "verification");
-        let evidence = receipt
+        let context_event = receipt
             .events
             .iter()
             .find(|event| event.kind == ReceiptEventKind::ContextGoverned)
-            .and_then(|event| {
-                event
-                    .references
-                    .iter()
-                    .find(|reference| reference.kind == "external_evidence")
-            })
+            .expect("context receipt event");
+        assert_eq!(
+            context_event
+                .attributes
+                .get("epistemic_descriptor_version")
+                .map(String::as_str),
+            Some(EPISTEMIC_DESCRIPTOR_VERSION)
+        );
+        assert_eq!(
+            context_event
+                .attributes
+                .get("epistemic_descriptor_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            context_event
+                .attributes
+                .get("epistemic_descriptor_source_rows")
+                .map(String::as_str),
+            Some("1")
+        );
+        let evidence = context_event
+            .references
+            .iter()
+            .find(|reference| reference.kind == "external_evidence")
             .expect("pinned external evidence reference");
         assert_eq!(evidence.reference, "evidence:submission-7@attempt-2");
         assert_eq!(evidence.content_hash.as_deref(), Some(digest.as_str()));
         assert_eq!(
             evidence.disclosed_fields,
-            vec!["content.result".to_string(), "signal".to_string()]
+            vec![
+                "content.result".to_string(),
+                "signal".to_string(),
+                "epistemic_descriptor.contract_version".to_string(),
+                "epistemic_descriptor.origin_class".to_string(),
+                "epistemic_descriptor.evidence_status".to_string(),
+                "epistemic_descriptor.lifecycle_status".to_string(),
+                "epistemic_descriptor.source_rows_truncated".to_string(),
+                "epistemic_descriptor.observed_at_ms".to_string(),
+                "epistemic_descriptor.source_refs".to_string(),
+                "epistemic_descriptor.source_digests".to_string(),
+                "epistemic_descriptor.source_row_count".to_string(),
+            ]
         );
         let memory = receipt
             .events
@@ -21636,6 +21782,7 @@ mod tests {
                     applicability: "verification".into(),
                     evidence_operation_ids: vec![],
                     content_digest: "c".repeat(64),
+                    descriptor: None,
                 }],
             )
             .unwrap_err();
@@ -21898,6 +22045,53 @@ mod tests {
                 && d.evidence.get("provider") == Some(&"native".to_string())
                 && d.evidence.get("redacted_count") == Some(&"2".to_string())
         }));
+    }
+
+    #[test]
+    fn egress_audit_serializes_epistemic_descriptor_fields() {
+        let svc = memory_service();
+        svc.record_egress_audit(
+            "prepare_context",
+            "task-descriptor-egress",
+            "native",
+            "native-default",
+            &[EgressDecision {
+                provider: "native".into(),
+                external: false,
+                included: vec![
+                    "object#1.epistemic_descriptor.contract_version".into(),
+                    "object#1.epistemic_descriptor.source_digests".into(),
+                ],
+                redacted: vec![],
+                reasons: vec![],
+            }],
+        );
+
+        let decision = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                actor: Some("chisei.egress".into()),
+                action: Some("prepare_context".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|decision| decision.target_id == "task-descriptor-egress")
+            .expect("descriptor egress audit should be recorded");
+        let included: Vec<String> = serde_json::from_str(
+            decision
+                .evidence
+                .get("included_fields")
+                .expect("included fields evidence"),
+        )
+        .expect("included fields should remain JSON-serializable");
+        assert_eq!(
+            included,
+            vec![
+                "object#1.epistemic_descriptor.contract_version",
+                "object#1.epistemic_descriptor.source_digests",
+            ]
+        );
     }
 
     #[test]
