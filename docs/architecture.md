@@ -478,4 +478,8 @@ read-only inventory before enabling or remediating a constraint.
 - Measured adoption of strategies and learnings.
 - Incremental integration through compatible gateways and native APIs.
 
+Operational epistemic-context aggregates, denominators, privacy boundaries,
+and backend availability semantics are defined in
+[epistemic-context-operations.md](epistemic-context-operations.md).
+
 Read [VISION.md](../VISION.md) for the long-term direction and non-goals.

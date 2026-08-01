@@ -374,6 +374,72 @@ impl RuntimeDb {
         }
     }
 
+    pub fn count_active_kioku_promotions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.count_active_kioku_promotions_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+            ),
+            Self::Postgres(db) => db.count_active_kioku_promotions_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+            ),
+        }
+    }
+
+    pub fn list_kioku_lifecycle_events_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_kioku_lifecycle_events_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+            Self::Postgres(db) => db.list_kioku_lifecycle_events_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+        }
+    }
+
+    pub fn list_kioku_outcomes_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryOutcomeObservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_kioku_outcomes_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+            Self::Postgres(db) => db.list_kioku_outcomes_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+        }
+    }
+
     pub fn list_compliance_decisions_in_window(
         &self,
         namespace: &str,

@@ -542,7 +542,7 @@ impl SekaiDb {
                    AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?3
                    AND (
                      json_extract(receipt_json, '$.completed_at_ms') IS NULL
-                     OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) > ?2
+                     OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?2
                    )
                  ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
                  LIMIT ?4",
@@ -560,6 +560,119 @@ impl SekaiDb {
             receipts.push(serde_json::from_str(&json).map_err(|error| error.to_string())?);
         }
         Ok(receipts)
+    }
+
+    pub fn count_active_kioku_promotions_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+    ) -> Result<i64, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM chisei_kioku_lifecycle_events AS lifecycle
+             JOIN chisei_kioku_memories AS memory
+               ON memory.id=lifecycle.memory_id AND memory.version=lifecycle.memory_version
+             WHERE memory.namespace=?1 AND memory.state='active'
+               AND lifecycle.action='promoted'
+               AND lifecycle.recorded_at_ms >= ?2
+               AND lifecycle.recorded_at_ms < ?3",
+            rusqlite::params![namespace, start_timestamp_ms, end_timestamp_ms],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn list_kioku_lifecycle_events_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::chisei::kioku::MemoryLifecycleEvent>, String> {
+        let limit = limit.min(5_001) as i64;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT lifecycle.memory_id, lifecycle.memory_version, lifecycle.action,
+                        lifecycle.from_state, lifecycle.to_state, lifecycle.actor,
+                        lifecycle.reason, lifecycle.recorded_at_ms
+                 FROM chisei_kioku_lifecycle_events AS lifecycle
+                 JOIN chisei_kioku_memories AS memory
+                   ON memory.id=lifecycle.memory_id AND memory.version=lifecycle.memory_version
+                 WHERE memory.namespace=?1
+                   AND lifecycle.recorded_at_ms >= ?2
+                   AND lifecycle.recorded_at_ms < ?3
+                 ORDER BY lifecycle.recorded_at_ms, lifecycle.id
+                 LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![namespace, start_timestamp_ms, end_timestamp_ms, limit],
+                |row| {
+                    Ok(crate::chisei::kioku::MemoryLifecycleEvent {
+                        memory_id: row.get(0)?,
+                        memory_version: row.get(1)?,
+                        action: row.get(2)?,
+                        from_state: row.get(3)?,
+                        to_state: row.get(4)?,
+                        actor: row.get(5)?,
+                        reason: row.get(6)?,
+                        recorded_at_ms: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_kioku_outcomes_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::chisei::kioku::MemoryOutcomeObservation>, String> {
+        let limit = limit.min(5_001) as i64;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT outcome.memory_id, outcome.memory_version, outcome.operation_id,
+                        outcome.memory_applied, outcome.outcome_metric, outcome.outcome_value,
+                        outcome.passed, outcome.recorded_at_ms
+                 FROM chisei_kioku_outcomes AS outcome
+                 JOIN chisei_kioku_memories AS memory
+                   ON memory.id=outcome.memory_id AND memory.version=outcome.memory_version
+                 WHERE memory.namespace=?1
+                   AND outcome.recorded_at_ms >= ?2
+                   AND outcome.recorded_at_ms < ?3
+                 ORDER BY outcome.recorded_at_ms, outcome.operation_id
+                 LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![namespace, start_timestamp_ms, end_timestamp_ms, limit],
+                |row| {
+                    Ok(crate::chisei::kioku::MemoryOutcomeObservation {
+                        memory_id: row.get(0)?,
+                        memory_version: row.get(1)?,
+                        operation_id: row.get(2)?,
+                        request_id: String::new(),
+                        memory_applied: row.get(3)?,
+                        outcome_metric: row.get(4)?,
+                        outcome_value: row.get(5)?,
+                        passed: row.get(6)?,
+                        recorded_at_ms: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     pub fn reserve_gateway_request_alias(
