@@ -27,6 +27,7 @@ reference pages.
 | [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Recommend core commands at the root and grouped expert operations under `admin`; implementation requires a Design Discussion |
 | [Kernel and extension boundary](443-kernel-extension-boundary.md) | Keep one published governance product, narrow its public facade, and extract only acyclic leaf libraries with a measured independent-consumer dividend |
 | [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |
+| [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
