@@ -14739,6 +14739,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap();
@@ -15445,6 +15446,7 @@ mod tests {
                 default_runtime: "anthropic".to_string(),
                 default_model: "claude-sonnet-4-6".to_string(),
                 data_class: "open".to_string(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap();
@@ -15757,6 +15759,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap();
@@ -16080,6 +16083,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap();
@@ -16220,6 +16224,7 @@ mod tests {
                 default_runtime: runtime.to_string(),
                 default_model: default_model.to_string(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap();
