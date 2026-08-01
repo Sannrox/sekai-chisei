@@ -7,9 +7,16 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 
-const RECEIPT_PAGE_SIZE: i64 = 128;
 pub const MAX_STATISTICS_WINDOW_MS: i64 = 366 * 24 * 60 * 60 * 1000;
 const MAX_STATISTICS_RECEIPTS: usize = 4096;
+const MAX_EPISTEMIC_OBSERVATIONS: usize = 4096;
+const EPISTEMIC_ACCOUNTING_VERSION: &str = "chisei.epistemic-context-operations/v1";
+
+const EPISTEMIC_DECISION_BUCKETS: [&str; 5] =
+    ["included", "qualified", "held_out", "excluded", "escalated"];
+const EPISTEMIC_EVIDENCE_BUCKETS: [&str; 4] = ["supported", "contested", "insufficient", "unknown"];
+const EPISTEMIC_LIFECYCLE_BUCKETS: [&str; 5] =
+    ["current", "stale", "retracted", "superseded", "unknown"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatisticsTotals {
@@ -62,6 +69,72 @@ pub struct OperationStatistics {
     pub outcomes: OutcomeCounts,
     pub learning: LearningCounts,
     pub outcome_spend: OutcomeAttributedSpend,
+    pub epistemic: EpistemicContextStatistics,
+}
+
+/// Low-cardinality operational facts about epistemic context. This intentionally
+/// contains no claim text, source identity, actor, credential, or namespace
+/// labels; authorization is applied to the enclosing statistics query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpistemicContextStatistics {
+    pub accounting_status: String,
+    pub context_receipts: i64,
+    pub accounted_receipts: i64,
+    pub missing_receipts: i64,
+    pub decision_counts: BTreeMap<String, i64>,
+    pub evidence_status_counts: BTreeMap<String, i64>,
+    pub lifecycle_status_counts: BTreeMap<String, i64>,
+    pub context_bytes_total: u64,
+    pub context_tokens_total: u64,
+    pub projection_latency_ms_total: u64,
+    pub projection_observations: i64,
+    pub truncated_count: i64,
+    pub evaluation_observations: i64,
+    pub evaluation_passes: i64,
+    pub treatment_samples: i64,
+    pub treatment_passes: i64,
+    pub control_samples: i64,
+    pub control_passes: i64,
+    pub treatment_control_delta_micros: i64,
+    pub treatment_control_available: bool,
+    pub reassessment_events: i64,
+    pub retirement_events: i64,
+}
+
+impl Default for EpistemicContextStatistics {
+    fn default() -> Self {
+        Self {
+            accounting_status: "no_observations".into(),
+            context_receipts: 0,
+            accounted_receipts: 0,
+            missing_receipts: 0,
+            decision_counts: zero_buckets(&EPISTEMIC_DECISION_BUCKETS),
+            evidence_status_counts: zero_buckets(&EPISTEMIC_EVIDENCE_BUCKETS),
+            lifecycle_status_counts: zero_buckets(&EPISTEMIC_LIFECYCLE_BUCKETS),
+            context_bytes_total: 0,
+            context_tokens_total: 0,
+            projection_latency_ms_total: 0,
+            projection_observations: 0,
+            truncated_count: 0,
+            evaluation_observations: 0,
+            evaluation_passes: 0,
+            treatment_samples: 0,
+            treatment_passes: 0,
+            control_samples: 0,
+            control_passes: 0,
+            treatment_control_delta_micros: 0,
+            treatment_control_available: false,
+            reassessment_events: 0,
+            retirement_events: 0,
+        }
+    }
+}
+
+fn zero_buckets(buckets: &[&str]) -> BTreeMap<String, i64> {
+    buckets
+        .iter()
+        .map(|bucket| ((*bucket).into(), 0_i64))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +350,14 @@ pub fn query_operation_statistics(
     }
     statistics.learning.learnings_admitted =
         active_admissions_in_window(db, namespaces, start_timestamp_ms, end_timestamp_ms)?;
+    populate_epistemic_statistics(
+        db,
+        namespaces,
+        &receipts,
+        start_timestamp_ms,
+        end_timestamp_ms,
+        &mut statistics.epistemic,
+    );
     Ok(statistics)
 }
 
@@ -295,60 +376,31 @@ fn list_receipts_in_window(
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
 ) -> Result<Vec<OperationReceipt>, String> {
-    let conn = db.conn();
-    let namespace_placeholders = (0..namespaces.len())
-        .map(|index| format!("?{}", index + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let start_index = namespaces.len() + 1;
-    let end_index = namespaces.len() + 2;
-    let limit_index = namespaces.len() + 3;
-    let offset_index = namespaces.len() + 4;
-    let sql = format!(
-        "SELECT receipt_json FROM chisei_operation_receipts
-         WHERE namespace IN ({namespace_placeholders})
-           AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?{end_index}
-           AND (json_extract(receipt_json, '$.completed_at_ms') IS NULL
-                OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?{start_index})
-         ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
-         LIMIT ?{limit_index} OFFSET ?{offset_index}"
-    );
-    let mut offset = 0_i64;
     let mut receipts = Vec::new();
-    loop {
-        let mut values = namespaces
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text)
-            .collect::<Vec<_>>();
-        values.extend([
-            rusqlite::types::Value::Integer(start_timestamp_ms),
-            rusqlite::types::Value::Integer(end_timestamp_ms),
-            rusqlite::types::Value::Integer(RECEIPT_PAGE_SIZE),
-            rusqlite::types::Value::Integer(offset),
-        ]);
-        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-        let page = statement
-            .query_map(rusqlite::params_from_iter(values), |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        let page_len = page.len() as i64;
-        if receipts.len().saturating_add(page.len()) > MAX_STATISTICS_RECEIPTS {
+    for namespace in namespaces {
+        let page = db.list_operation_receipts_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            MAX_STATISTICS_RECEIPTS + 1,
+        )?;
+        if page.len() > MAX_STATISTICS_RECEIPTS {
             return Err(format!(
                 "statistics receipt limit exceeded ({MAX_STATISTICS_RECEIPTS})"
             ));
         }
-        for json in page {
-            receipts.push(serde_json::from_str(&json).map_err(|error| error.to_string())?);
+        receipts.extend(page);
+        if receipts.len() > MAX_STATISTICS_RECEIPTS {
+            return Err(format!(
+                "statistics receipt limit exceeded ({MAX_STATISTICS_RECEIPTS})"
+            ));
         }
-        if page_len < RECEIPT_PAGE_SIZE {
-            break;
-        }
-        offset = offset.saturating_add(page_len);
     }
+    receipts.sort_by(|left, right| {
+        left.started_at_ms
+            .cmp(&right.started_at_ms)
+            .then_with(|| left.operation_id.cmp(&right.operation_id))
+    });
     Ok(receipts)
 }
 
@@ -358,37 +410,280 @@ fn active_admissions_in_window(
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,
 ) -> Result<i64, String> {
-    let conn = db.conn();
-    let placeholders = (0..namespaces.len())
-        .map(|index| format!("?{}", index + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let start_index = namespaces.len() + 1;
-    let end_index = namespaces.len() + 2;
-    let sql = format!(
-        "SELECT COUNT(*)
-         FROM chisei_kioku_lifecycle_events AS lifecycle
-         JOIN chisei_kioku_memories AS memory
-           ON memory.id=lifecycle.memory_id AND memory.version=lifecycle.memory_version
-         WHERE memory.namespace IN ({placeholders})
-           -- Kioku lifecycle is authoritative at query time: admissions that
-           -- are now rejected or superseded are intentionally excluded.
-           AND memory.state='active'
-           AND lifecycle.action='promoted'
-           AND lifecycle.recorded_at_ms >= ?{start_index}
-           AND lifecycle.recorded_at_ms < ?{end_index}"
-    );
-    let mut values = namespaces
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::Text)
-        .collect::<Vec<_>>();
-    values.extend([
-        rusqlite::types::Value::Integer(start_timestamp_ms),
-        rusqlite::types::Value::Integer(end_timestamp_ms),
-    ]);
-    conn.query_row(&sql, rusqlite::params_from_iter(values), |row| row.get(0))
-        .map_err(|error| error.to_string())
+    namespaces.iter().try_fold(0_i64, |total, namespace| {
+        db.count_active_kioku_promotions_in_window(namespace, start_timestamp_ms, end_timestamp_ms)
+            .map(|count| total.saturating_add(count))
+    })
+}
+
+fn populate_epistemic_statistics(
+    db: &RuntimeDb,
+    namespaces: &[String],
+    receipts: &[OperationReceipt],
+    start_timestamp_ms: i64,
+    end_timestamp_ms: i64,
+    statistics: &mut EpistemicContextStatistics,
+) {
+    for receipt in receipts {
+        let Some(context_event) = receipt.events.iter().find(|event| {
+            event.kind == ReceiptEventKind::ContextGoverned
+                && event.timestamp_ms >= start_timestamp_ms
+                && event.timestamp_ms < end_timestamp_ms
+        }) else {
+            continue;
+        };
+        statistics.context_receipts = statistics.context_receipts.saturating_add(1);
+        let descriptor_count = context_event
+            .attributes
+            .get("epistemic_descriptor_count")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .map(|value| value.min(MAX_EPISTEMIC_OBSERVATIONS as i64));
+        let descriptor_version = context_event
+            .attributes
+            .get("epistemic_descriptor_version")
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let accounting_version = context_event
+            .attributes
+            .get("epistemic_accounting_version")
+            .map(String::as_str)
+            .filter(|value| *value == EPISTEMIC_ACCOUNTING_VERSION);
+        if descriptor_count.is_none()
+            || descriptor_version.is_none()
+            || accounting_version.is_none()
+        {
+            statistics.missing_receipts = statistics.missing_receipts.saturating_add(1);
+            continue;
+        }
+        statistics.accounted_receipts = statistics.accounted_receipts.saturating_add(1);
+        let descriptor_count = descriptor_count.unwrap_or_default();
+        let decision = receipt
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    ReceiptEventKind::PolicyDecided | ReceiptEventKind::ContextGoverned
+                ) && event.attributes.contains_key("context_admission_decision")
+            })
+            .and_then(|event| event.attributes.get("context_admission_decision"))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let decision_bucket = match decision {
+            "qualify" => "qualified",
+            "hold_out" => "held_out",
+            "require_review" | "require_verification" => "escalated",
+            "include" if descriptor_count > 0 => "included",
+            "" if descriptor_count > 0 => "included",
+            _ => "excluded",
+        };
+        increment_bucket(&mut statistics.decision_counts, decision_bucket, 1);
+        add_serialized_buckets(
+            &mut statistics.evidence_status_counts,
+            context_event
+                .attributes
+                .get("epistemic_evidence_status_counts")
+                .map(String::as_str),
+            descriptor_count,
+            &EPISTEMIC_EVIDENCE_BUCKETS,
+        );
+        add_serialized_buckets(
+            &mut statistics.lifecycle_status_counts,
+            context_event
+                .attributes
+                .get("epistemic_lifecycle_status_counts")
+                .map(String::as_str),
+            descriptor_count,
+            &EPISTEMIC_LIFECYCLE_BUCKETS,
+        );
+        statistics.context_bytes_total = statistics
+            .context_bytes_total
+            .saturating_add(parse_u64_attr(context_event, "epistemic_context_bytes"));
+        statistics.context_tokens_total = statistics
+            .context_tokens_total
+            .saturating_add(parse_u64_attr(context_event, "epistemic_context_tokens"));
+        let latency = parse_u64_attr(context_event, "epistemic_projection_latency_ms");
+        if context_event
+            .attributes
+            .contains_key("epistemic_projection_latency_ms")
+        {
+            statistics.projection_observations =
+                statistics.projection_observations.saturating_add(1);
+            statistics.projection_latency_ms_total = statistics
+                .projection_latency_ms_total
+                .saturating_add(latency);
+        }
+        if context_event
+            .attributes
+            .get("epistemic_context_truncated")
+            .is_some_and(|value| value == "true")
+        {
+            statistics.truncated_count = statistics.truncated_count.saturating_add(1);
+        }
+        for event in &receipt.events {
+            if event.timestamp_ms < start_timestamp_ms || event.timestamp_ms >= end_timestamp_ms {
+                continue;
+            }
+            if !matches!(
+                event.kind,
+                ReceiptEventKind::OutcomeRecorded | ReceiptEventKind::MemoryOutcomeRecorded
+            ) {
+                continue;
+            }
+            let Some(passed) = event
+                .attributes
+                .get("passed")
+                .and_then(|value| value.parse::<bool>().ok())
+            else {
+                continue;
+            };
+            statistics.evaluation_observations =
+                statistics.evaluation_observations.saturating_add(1);
+            if passed {
+                statistics.evaluation_passes = statistics.evaluation_passes.saturating_add(1);
+            }
+        }
+    }
+
+    let mut backend_unavailable = false;
+    let mut outcome_observations = 0_usize;
+    let mut lifecycle_observations = 0_usize;
+    for namespace in namespaces {
+        let outcome_limit = MAX_EPISTEMIC_OBSERVATIONS
+            .saturating_sub(outcome_observations)
+            .saturating_add(1);
+        match db.list_kioku_outcomes_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            outcome_limit,
+        ) {
+            Ok(outcomes) => {
+                if outcomes.len() > outcome_limit.saturating_sub(1) {
+                    backend_unavailable = true;
+                } else {
+                    outcome_observations = outcome_observations.saturating_add(outcomes.len());
+                    for outcome in outcomes {
+                        if outcome.memory_applied {
+                            statistics.treatment_samples =
+                                statistics.treatment_samples.saturating_add(1);
+                            if outcome.passed {
+                                statistics.treatment_passes =
+                                    statistics.treatment_passes.saturating_add(1);
+                            }
+                        } else {
+                            statistics.control_samples =
+                                statistics.control_samples.saturating_add(1);
+                            if outcome.passed {
+                                statistics.control_passes =
+                                    statistics.control_passes.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => backend_unavailable = true,
+        }
+        let lifecycle_limit = MAX_EPISTEMIC_OBSERVATIONS
+            .saturating_sub(lifecycle_observations)
+            .saturating_add(1);
+        match db.list_kioku_lifecycle_events_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            lifecycle_limit,
+        ) {
+            Ok(events) => {
+                if events.len() > lifecycle_limit.saturating_sub(1) {
+                    backend_unavailable = true;
+                } else {
+                    lifecycle_observations = lifecycle_observations.saturating_add(events.len());
+                    for event in events {
+                        match event.action.as_str() {
+                            "evidence_reassessed" => {
+                                statistics.reassessment_events =
+                                    statistics.reassessment_events.saturating_add(1)
+                            }
+                            "regressed" => {
+                                statistics.retirement_events =
+                                    statistics.retirement_events.saturating_add(1)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Err(_) => backend_unavailable = true,
+        }
+    }
+    if statistics.context_receipts == 0 {
+        statistics.accounting_status = if backend_unavailable {
+            "unavailable".into()
+        } else {
+            "no_observations".into()
+        };
+    } else if backend_unavailable {
+        statistics.accounting_status = "unavailable".into();
+    } else if statistics.missing_receipts > 0 {
+        statistics.accounting_status = "partial".into();
+    } else {
+        statistics.accounting_status = "available".into();
+    }
+    if statistics.treatment_samples > 0 && statistics.control_samples > 0 {
+        let treatment_rate = (statistics.treatment_passes as i128 * 1_000_000)
+            / statistics.treatment_samples as i128;
+        let control_rate =
+            (statistics.control_passes as i128 * 1_000_000) / statistics.control_samples as i128;
+        statistics.treatment_control_delta_micros = treatment_rate
+            .saturating_sub(control_rate)
+            .clamp(i64::MIN as i128, i64::MAX as i128)
+            as i64;
+        statistics.treatment_control_available = true;
+    }
+}
+
+fn parse_u64_attr(event: &OperationReceiptEvent, key: &str) -> u64 {
+    event
+        .attributes
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+fn increment_bucket(buckets: &mut BTreeMap<String, i64>, bucket: &str, amount: i64) {
+    if let Some(value) = buckets.get_mut(bucket) {
+        *value = value.saturating_add(amount);
+    }
+}
+
+fn add_serialized_buckets(
+    buckets: &mut BTreeMap<String, i64>,
+    encoded: Option<&str>,
+    fallback_count: i64,
+    allowed: &[&str],
+) {
+    let mut observed = 0_i64;
+    if let Some(encoded) = encoded {
+        for pair in encoded.split(',') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let count = value
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value >= 0)
+                .unwrap_or(0)
+                .min(MAX_EPISTEMIC_OBSERVATIONS as i64);
+            if allowed.contains(&key) {
+                increment_bucket(buckets, key, count);
+                observed = observed.saturating_add(count);
+            }
+        }
+    }
+    if observed == 0 && fallback_count > 0 {
+        increment_bucket(buckets, "unknown", fallback_count);
+    }
 }
 
 fn logical_operation_id(receipt: &OperationReceipt) -> String {
@@ -1101,5 +1396,77 @@ mod tests {
 
         let statistics = query_operation_statistics(&db, &["alpha".into()], 100, 200).unwrap();
         assert_eq!(statistics.learning.learnings_admitted, 1);
+    }
+
+    #[test]
+    fn reports_bounded_epistemic_usage_and_explicit_accounting() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.put_operation_receipt(&receipt(
+            "epistemic-report",
+            "alpha",
+            100,
+            Some(200),
+            vec![
+                event(
+                    "epistemic-report",
+                    0,
+                    100,
+                    ReceiptEventKind::ContextGoverned,
+                    &[
+                        (
+                            "epistemic_accounting_version",
+                            "chisei.epistemic-context-operations/v1",
+                        ),
+                        (
+                            "epistemic_descriptor_version",
+                            "chisei.epistemic-descriptor/v1",
+                        ),
+                        ("epistemic_descriptor_count", "2"),
+                        (
+                            "epistemic_evidence_status_counts",
+                            "contested=1,supported=1",
+                        ),
+                        ("epistemic_lifecycle_status_counts", "current=2"),
+                        ("epistemic_context_bytes", "20"),
+                        ("epistemic_context_tokens", "5"),
+                        ("epistemic_projection_latency_ms", "3"),
+                        ("epistemic_context_truncated", "true"),
+                    ],
+                ),
+                event(
+                    "epistemic-report",
+                    1,
+                    100,
+                    ReceiptEventKind::PolicyDecided,
+                    &[("context_admission_decision", "qualify")],
+                ),
+                event(
+                    "epistemic-report",
+                    2,
+                    150,
+                    ReceiptEventKind::OutcomeRecorded,
+                    &[("passed", "true")],
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let statistics = query_operation_statistics(&db, &["alpha".into()], 0, 1_000).unwrap();
+        let epistemic = statistics.epistemic;
+        assert_eq!(epistemic.accounting_status, "available");
+        assert_eq!(epistemic.context_receipts, 1);
+        assert_eq!(epistemic.accounted_receipts, 1);
+        assert_eq!(epistemic.missing_receipts, 0);
+        assert_eq!(epistemic.decision_counts["qualified"], 1);
+        assert_eq!(epistemic.evidence_status_counts["supported"], 1);
+        assert_eq!(epistemic.evidence_status_counts["contested"], 1);
+        assert_eq!(epistemic.lifecycle_status_counts["current"], 2);
+        assert_eq!(epistemic.context_bytes_total, 20);
+        assert_eq!(epistemic.context_tokens_total, 5);
+        assert_eq!(epistemic.projection_latency_ms_total, 3);
+        assert_eq!(epistemic.projection_observations, 1);
+        assert_eq!(epistemic.truncated_count, 1);
+        assert_eq!(epistemic.evaluation_observations, 1);
+        assert_eq!(epistemic.evaluation_passes, 1);
     }
 }

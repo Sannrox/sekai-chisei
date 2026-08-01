@@ -1286,6 +1286,41 @@ fn memory_context_reference(reference: &pipe::MemoryContextReference) -> MemoryC
     }
 }
 
+fn context_bytes(system: &str, messages: &[ChatMessage]) -> u64 {
+    let message_bytes = messages
+        .iter()
+        .map(|message| {
+            let tool_call_bytes = message
+                .tool_calls
+                .iter()
+                .map(|tool_call| {
+                    (tool_call.id.len() + tool_call.name.len() + tool_call.args_json.len()) as u64
+                })
+                .fold(0_u64, u64::saturating_add);
+            ((message.role.len() + message.content.len() + message.tool_call_id.len()) as u64)
+                .saturating_add(tool_call_bytes)
+        })
+        .fold(0_u64, u64::saturating_add);
+    (system.len() as u64).saturating_add(message_bytes)
+}
+
+fn estimate_context_tokens(system: &str, messages: &[ChatMessage]) -> u64 {
+    context_bytes(system, messages).div_ceil(4)
+}
+
+fn epistemic_statistics_values(
+    values: BTreeMap<String, i64>,
+    label: &str,
+) -> Vec<OperationStatisticValue> {
+    values
+        .into_iter()
+        .map(|(bucket, value)| OperationStatisticValue {
+            labels: HashMap::from([(label.to_string(), bucket)]),
+            value,
+        })
+        .collect()
+}
+
 fn memory_lifecycle_allows_execution(
     state: crate::chisei::kioku::MemoryLifecycleState,
     expires_at_ms: Option<i64>,
@@ -1324,7 +1359,28 @@ fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<Str
     let truncated = descriptors
         .iter()
         .any(|descriptor| descriptor.source_rows_truncated);
+    let mut evidence_status_counts = BTreeMap::<String, u64>::new();
+    let mut lifecycle_status_counts = BTreeMap::<String, u64>::new();
+    for descriptor in &descriptors {
+        *evidence_status_counts
+            .entry(descriptor.evidence_status.clone())
+            .or_default() += 1;
+        *lifecycle_status_counts
+            .entry(descriptor.lifecycle_status.clone())
+            .or_default() += 1;
+    }
+    let encode_counts = |counts: &BTreeMap<String, u64>| {
+        counts
+            .iter()
+            .map(|(status, count)| format!("{status}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let mut attributes = BTreeMap::from([
+        (
+            "epistemic_accounting_version".into(),
+            "chisei.epistemic-context-operations/v1".into(),
+        ),
         (
             "epistemic_descriptor_version".into(),
             EPISTEMIC_DESCRIPTOR_VERSION.into(),
@@ -1349,6 +1405,30 @@ fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<Str
             "epistemic_descriptor_source_rows_truncated".into(),
             truncated.to_string(),
         ),
+        (
+            "epistemic_evidence_status_counts".into(),
+            encode_counts(&evidence_status_counts),
+        ),
+        (
+            "epistemic_lifecycle_status_counts".into(),
+            encode_counts(&lifecycle_status_counts),
+        ),
+        (
+            "epistemic_context_bytes".into(),
+            plan.context_bytes.to_string(),
+        ),
+        (
+            "epistemic_context_tokens".into(),
+            plan.context_tokens.to_string(),
+        ),
+        (
+            "epistemic_projection_latency_ms".into(),
+            plan.context_projection_latency_ms.to_string(),
+        ),
+        (
+            "epistemic_context_truncated".into(),
+            plan.context_truncated.to_string(),
+        ),
     ]);
     if !plan.context_admission_policy_version.is_empty() {
         attributes.insert(
@@ -1359,6 +1439,8 @@ fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<Str
             "context_admission_descriptor_version".into(),
             plan.context_admission_descriptor_version.clone(),
         );
+    }
+    if !plan.context_admission_decision.is_empty() {
         attributes.insert(
             "context_admission_decision".into(),
             plan.context_admission_decision.clone(),
@@ -4860,6 +4942,7 @@ impl ChiseiServiceImpl {
         authenticated_actor: &str,
     ) -> Result<ExecutionPlan, Status> {
         let plan_id = uuid::Uuid::new_v4().to_string();
+        let mut context_projection_latency_ms = 0_u64;
         let normalized_user_id =
             execution_budget_scope(&input.namespace, authenticated_actor, &input.user_id);
         let scoped_pressure = self.budget.scope_pressure(&normalized_user_id);
@@ -4919,11 +5002,15 @@ impl ChiseiServiceImpl {
                 evidence_type: class_gate.evidence_type.clone(),
             })
             .collect::<HashSet<_>>();
+        let projection_started = Instant::now();
         let initial_run = self.pipeline.run_with_context_admission(
             &mut pipeline_req,
             &self.db,
             context_expansion_gate.allowed,
             allowed_evidence_classes.clone(),
+        );
+        context_projection_latency_ms = context_projection_latency_ms.saturating_add(
+            u64::try_from(projection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
         let fallback_runtime = pipeline_req.runtime.clone();
         let (initial_runtime, initial_model, initial_pref_runtime, initial_pref_model) = self
@@ -4986,11 +5073,15 @@ impl ChiseiServiceImpl {
                 risk_signals: vec![],
                 operation_risk_override: None,
             };
+            let projection_started = Instant::now();
             let local_run = self.pipeline.run_with_context_admission(
                 &mut local_pipeline_req,
                 &self.db,
                 context_expansion_gate.allowed,
                 allowed_evidence_classes,
+            );
+            context_projection_latency_ms = context_projection_latency_ms.saturating_add(
+                u64::try_from(projection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             let (local_runtime, local_model, local_pref_runtime, local_pref_model) = self
                 .resolve_model_for_run(
@@ -5260,6 +5351,16 @@ impl ChiseiServiceImpl {
             &resolved_model,
             &egress_decisions,
         );
+        let context_bytes = context_bytes(&input.system, &prepared_messages);
+        let context_tokens = estimate_context_tokens(&input.system, &prepared_messages);
+        let context_truncated = run
+            .evidence_references
+            .iter()
+            .any(|reference| reference.descriptor.source_rows_truncated)
+            || run
+                .memory_references
+                .iter()
+                .any(|reference| reference.descriptor.source_rows_truncated);
         Ok(ExecutionPlan {
             plan_id,
             input: Some(normalized_input),
@@ -5335,6 +5436,10 @@ impl ChiseiServiceImpl {
             context_admission_source_digests: run.context_admission.source_digests.clone(),
             context_admission_requires_review: run.context_admission.requires_review,
             context_admission_requires_verification: run.context_admission.requires_verification,
+            context_bytes,
+            context_tokens,
+            context_projection_latency_ms,
+            context_truncated,
         })
     }
 
@@ -13241,6 +13346,7 @@ impl ChiseiService for ChiseiServiceImpl {
         let totals = statistics.totals;
         let outcomes = statistics.outcomes;
         let learning = statistics.learning;
+        let epistemic = statistics.epistemic;
         Ok(Response::new(QueryOperationStatisticsResponse {
             totals: Some(OperationStatisticsTotals {
                 logical_operations: totals.logical_operations,
@@ -13312,6 +13418,36 @@ impl ChiseiService for ChiseiServiceImpl {
                 .collect(),
             cost_per_verified_usd_micros: statistics.outcome_spend.cost_per_verified_usd_micros,
             cost_per_failed_usd_micros: statistics.outcome_spend.cost_per_failed_usd_micros,
+            epistemic: Some(EpistemicContextStatistics {
+                accounting_status: epistemic.accounting_status,
+                context_receipts: epistemic.context_receipts,
+                accounted_receipts: epistemic.accounted_receipts,
+                missing_receipts: epistemic.missing_receipts,
+                decision_counts: epistemic_statistics_values(epistemic.decision_counts, "decision"),
+                evidence_status_counts: epistemic_statistics_values(
+                    epistemic.evidence_status_counts,
+                    "status",
+                ),
+                lifecycle_status_counts: epistemic_statistics_values(
+                    epistemic.lifecycle_status_counts,
+                    "status",
+                ),
+                context_bytes_total: epistemic.context_bytes_total,
+                context_tokens_total: epistemic.context_tokens_total,
+                projection_latency_ms_total: epistemic.projection_latency_ms_total,
+                projection_observations: epistemic.projection_observations,
+                truncated_count: epistemic.truncated_count,
+                evaluation_observations: epistemic.evaluation_observations,
+                evaluation_passes: epistemic.evaluation_passes,
+                treatment_samples: epistemic.treatment_samples,
+                treatment_passes: epistemic.treatment_passes,
+                control_samples: epistemic.control_samples,
+                control_passes: epistemic.control_passes,
+                treatment_control_delta_micros: epistemic.treatment_control_delta_micros,
+                treatment_control_available: epistemic.treatment_control_available,
+                reassessment_events: epistemic.reassessment_events,
+                retirement_events: epistemic.retirement_events,
+            }),
         }))
     }
 
@@ -23255,6 +23391,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         svc.cache_plan(plan.clone());
 
@@ -23280,6 +23420,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
             executable: true,
             created_at: chrono::Utc::now().timestamp_millis(),
             ..Default::default()
@@ -23365,6 +23509,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         svc.cache_plan(plan.clone());
 
@@ -23483,6 +23631,10 @@ mod tests {
                 context_admission_requires_review: false,
                 context_admission_requires_verification: false,
                 memory_holdouts: vec![],
+                context_bytes: 0,
+                context_tokens: 0,
+                context_projection_latency_ms: 0,
+                context_truncated: false,
             });
         }
         let newest = ExecutionPlan {
@@ -23522,6 +23674,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         svc.cache_plan(newest.clone());
 
@@ -23575,6 +23731,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -23634,6 +23794,10 @@ mod tests {
                 context_admission_requires_review: false,
                 context_admission_requires_verification: false,
                 memory_holdouts: vec![],
+                context_bytes: 0,
+                context_tokens: 0,
+                context_projection_latency_ms: 0,
+                context_truncated: false,
             });
         }
         let inserted = ExecutionPlan {
@@ -23673,6 +23837,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         svc.cache_plan(inserted.clone());
 
@@ -23955,6 +24123,10 @@ mod tests {
             context_admission_requires_review: false,
             context_admission_requires_verification: false,
             memory_holdouts: vec![],
+            context_bytes: 0,
+            context_tokens: 0,
+            context_projection_latency_ms: 0,
+            context_truncated: false,
         };
         svc.record_planned_operation(&plan, "local").unwrap();
         svc.cache_plan(plan.clone());

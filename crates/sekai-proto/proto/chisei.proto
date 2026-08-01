@@ -251,6 +251,10 @@ message ExecutionPlan {
   repeated string context_admission_source_digests = 34;
   bool context_admission_requires_review = 35;
   bool context_admission_requires_verification = 36;
+  uint64 context_bytes = 37;
+  uint64 context_tokens = 38;
+  uint64 context_projection_latency_ms = 39;
+  bool context_truncated = 40;
 }
 
 message EgressDecision {
@@ -1289,6 +1293,34 @@ message QueryOperationStatisticsResponse {
   // Mean priced spend for verified / failed logical operations (0 when empty).
   int64 cost_per_verified_usd_micros = 9;
   int64 cost_per_failed_usd_micros = 10;
+  // Bounded, namespace-authorized epistemic-context usage and outcome impact.
+  EpistemicContextStatistics epistemic = 11;
+}
+
+message EpistemicContextStatistics {
+  // available | no_observations | partial | unavailable.
+  string accounting_status = 1;
+  int64 context_receipts = 2;
+  int64 accounted_receipts = 3;
+  int64 missing_receipts = 4;
+  repeated OperationStatisticValue decision_counts = 5;
+  repeated OperationStatisticValue evidence_status_counts = 6;
+  repeated OperationStatisticValue lifecycle_status_counts = 7;
+  uint64 context_bytes_total = 8;
+  uint64 context_tokens_total = 9;
+  uint64 projection_latency_ms_total = 10;
+  int64 projection_observations = 11;
+  int64 truncated_count = 12;
+  int64 evaluation_observations = 13;
+  int64 evaluation_passes = 14;
+  int64 treatment_samples = 15;
+  int64 treatment_passes = 16;
+  int64 control_samples = 17;
+  int64 control_passes = 18;
+  int64 treatment_control_delta_micros = 19;
+  bool treatment_control_available = 20;
+  int64 reassessment_events = 21;
+  int64 retirement_events = 22;
 }
 
 message GetAffinityRequest {
