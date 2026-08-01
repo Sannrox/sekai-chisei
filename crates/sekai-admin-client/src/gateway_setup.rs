@@ -294,6 +294,7 @@ pub async fn run_setup(
             default_runtime: default_runtime.clone(),
             default_model: default_model.clone(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await?;
 
@@ -309,6 +310,7 @@ pub async fn run_setup(
                 default_runtime: scope_default_runtime.clone(),
                 default_model: scope_default_model.clone(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await?;
     }

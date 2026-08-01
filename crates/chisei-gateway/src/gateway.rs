@@ -2250,6 +2250,10 @@ async fn proxy_gateway_inner_scoped(
         route_bias: None,
         policy_scope: None,
         policy_version: None,
+        context_admission_policy_version: None,
+        context_admission_descriptor_version: None,
+        context_admission_decision: None,
+        context_admission_reasons: Vec::new(),
         task_class: task_class.clone(),
         data_class: caller_data_class.clone(),
         request_hash: request_hash.clone(),
@@ -2652,6 +2656,12 @@ async fn proxy_gateway_inner_scoped(
             route_bias: resolved.route_bias.clone(),
             policy_scope: resolved.policy_scope.clone(),
             policy_version: resolved.policy_version.clone(),
+            context_admission_policy_version: resolved.context_admission_policy_version.clone(),
+            context_admission_descriptor_version: resolved
+                .context_admission_descriptor_version
+                .clone(),
+            context_admission_decision: resolved.context_admission_decision.clone(),
+            context_admission_reasons: resolved.context_admission_reasons.clone(),
             task_class,
             data_class: effective_data_class(&caller_data_class, resolved.data_class.as_deref()),
             request_hash,
@@ -3141,6 +3151,10 @@ struct UsageContext {
     route_bias: Option<String>,
     policy_scope: Option<String>,
     policy_version: Option<String>,
+    context_admission_policy_version: Option<String>,
+    context_admission_descriptor_version: Option<String>,
+    context_admission_decision: Option<String>,
+    context_admission_reasons: Vec<String>,
     task_class: String,
     data_class: String,
     request_hash: String,
@@ -3193,6 +3207,10 @@ fn early_refusal_context(
         route_bias: None,
         policy_scope: None,
         policy_version: None,
+        context_admission_policy_version: None,
+        context_admission_descriptor_version: None,
+        context_admission_decision: None,
+        context_admission_reasons: Vec::new(),
         task_class,
         data_class: "unclassified".into(),
         request_hash,
@@ -3298,6 +3316,10 @@ struct GatewayDecisionAdmit {
     fallback_models: Vec<String>,
     eval_regressed: bool,
     eval_regression_reason: String,
+    context_admission_policy_version: Option<String>,
+    context_admission_descriptor_version: Option<String>,
+    context_admission_decision: Option<String>,
+    context_admission_reasons: Vec<String>,
     metadata_operation: bool,
 }
 
@@ -3396,6 +3418,10 @@ async fn apply_gateway_decision(
         policy_version: Some(admit.policy_version.clone()).filter(|v| !v.is_empty()),
         fallback_models: admit.fallback_models,
         data_class: admit.data_class,
+        context_admission_policy_version: admit.context_admission_policy_version.clone(),
+        context_admission_descriptor_version: admit.context_admission_descriptor_version.clone(),
+        context_admission_decision: admit.context_admission_decision.clone(),
+        context_admission_reasons: admit.context_admission_reasons.clone(),
     };
     if admit.provisional_local_free
         && resolved.resolved_provider != ProviderKind::OpenAi(OpenAiRuntime::Ollama)
@@ -3599,6 +3625,17 @@ async fn gateway_decision_preflight(
                             fallback_models: decision.fallback_models,
                             eval_regressed: decision.eval_regressed,
                             eval_regression_reason: decision.eval_regression_reason,
+                            context_admission_policy_version: Some(
+                                decision.context_admission_policy_version,
+                            )
+                            .filter(|value| !value.is_empty()),
+                            context_admission_descriptor_version: Some(
+                                decision.context_admission_descriptor_version,
+                            )
+                            .filter(|value| !value.is_empty()),
+                            context_admission_decision: Some(decision.context_admission_decision)
+                                .filter(|value| !value.is_empty()),
+                            context_admission_reasons: decision.context_admission_reasons,
                             metadata_operation: model_metadata_request,
                         })
                     } else {
@@ -3676,6 +3713,10 @@ struct PolicyPreflight {
     policy_version: Option<String>,
     fallback_models: Vec<String>,
     data_class: Option<String>,
+    context_admission_policy_version: Option<String>,
+    context_admission_descriptor_version: Option<String>,
+    context_admission_decision: Option<String>,
+    context_admission_reasons: Vec<String>,
 }
 
 /// Maximum distinct upstream providers tried for one client call (primary + failover).
@@ -8046,6 +8087,31 @@ fn build_gateway_operation_receipt(
     } else {
         "not_evaluated"
     };
+    let mut context_attributes = BTreeMap::from([
+        ("egress_applied".into(), context.egress_applied.to_string()),
+        ("raw_context_stored".into(), "false".into()),
+    ]);
+    if let Some(version) = &context.context_admission_policy_version {
+        context_attributes.insert("context_admission_policy_version".into(), version.clone());
+        context_attributes.insert(
+            "context_admission_descriptor_version".into(),
+            context
+                .context_admission_descriptor_version
+                .clone()
+                .unwrap_or_default(),
+        );
+        context_attributes.insert(
+            "context_admission_decision".into(),
+            context
+                .context_admission_decision
+                .clone()
+                .unwrap_or_default(),
+        );
+        context_attributes.insert(
+            "context_admission_reasons".into(),
+            context.context_admission_reasons.join(","),
+        );
+    }
     let mut context_event = gateway_receipt_event(
         &operation_id,
         "context",
@@ -8053,10 +8119,7 @@ fn build_gateway_operation_receipt(
         context.started_ms,
         ReceiptEventKind::ContextGoverned,
         "chisei.gateway",
-        BTreeMap::from([
-            ("egress_applied".into(), context.egress_applied.to_string()),
-            ("raw_context_stored".into(), "false".into()),
-        ]),
+        context_attributes,
     );
     context_event.references.push(GovernedReference {
         kind: "gateway_request".into(),
@@ -8108,14 +8171,38 @@ fn build_gateway_operation_receipt(
             context.started_ms,
             ReceiptEventKind::PolicyDecided,
             "chisei.policy",
-            BTreeMap::from([
-                ("status".into(), policy_status.into()),
-                ("policy_version".into(), policy_version.clone()),
-                (
-                    "policy_scope".into(),
-                    context.policy_scope.clone().unwrap_or_default(),
-                ),
-            ]),
+            {
+                let mut attributes = BTreeMap::from([
+                    ("status".into(), policy_status.into()),
+                    ("policy_version".into(), policy_version.clone()),
+                    (
+                        "policy_scope".into(),
+                        context.policy_scope.clone().unwrap_or_default(),
+                    ),
+                ]);
+                if let Some(version) = &context.context_admission_policy_version {
+                    attributes.insert("context_admission_policy_version".into(), version.clone());
+                    attributes.insert(
+                        "context_admission_descriptor_version".into(),
+                        context
+                            .context_admission_descriptor_version
+                            .clone()
+                            .unwrap_or_default(),
+                    );
+                    attributes.insert(
+                        "context_admission_decision".into(),
+                        context
+                            .context_admission_decision
+                            .clone()
+                            .unwrap_or_default(),
+                    );
+                    attributes.insert(
+                        "context_admission_reasons".into(),
+                        context.context_admission_reasons.join(","),
+                    );
+                }
+                attributes
+            },
         ),
         gateway_receipt_event(
             &operation_id,
@@ -12166,6 +12253,10 @@ mod tests {
             route_bias: None,
             policy_scope: Some("project-a".into()),
             policy_version: Some("policy-v1".into()),
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
             task_class: "primary".into(),
             data_class: "sensitive".into(),
             request_hash: "request-hash".into(),
@@ -12508,6 +12599,10 @@ mod tests {
             route_bias: None,
             policy_scope: None,
             policy_version: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
             task_class: "primary".into(),
             data_class: "unclassified".into(),
             request_hash: "request-hash".into(),
@@ -13049,6 +13144,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["ollama/llama3.2".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         let selected = select_healthy_policy_fallback(
             &runtime,
@@ -13086,6 +13185,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["ollama/llama3.2".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         let selected = select_healthy_policy_fallback(
             &runtime,
@@ -13123,6 +13226,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["native/native-default".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         let rejection = select_healthy_policy_fallback(
             &runtime,
@@ -13160,6 +13267,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["openai/gpt-5.5".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         assert!(
             select_healthy_policy_fallback(
@@ -13190,6 +13301,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["ollama/llama3.2".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         let next = select_next_failover_candidate(
             &runtime,
@@ -13239,6 +13354,10 @@ mod tests {
             policy_version: Some("v1".into()),
             fallback_models: vec!["ollama/llama3.2".into()],
             data_class: None,
+            context_admission_policy_version: None,
+            context_admission_descriptor_version: None,
+            context_admission_decision: None,
+            context_admission_reasons: Vec::new(),
         };
         // Exclude openai (failed live) and ollama is circuit-open → no candidate.
         assert!(

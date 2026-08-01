@@ -1,7 +1,354 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::chisei::epistemic_descriptor::{
+    EpistemicDescriptor, EvidenceStatus, LifecycleStatus, OriginClass,
+};
 use crate::chisei::residency::{ResidencyDecision, ResidencyPolicy, ResidencyResolver};
+
+pub const CONTEXT_ADMISSION_POLICY_VERSION: &str = "chisei.context-admission/v1";
+const MAX_CONTEXT_ADMISSION_RULES: usize = 32;
+const MAX_CONTEXT_ADMISSION_VALUES: usize = 8;
+const MAX_CONTEXT_ADMISSION_SELECTOR_BYTES: usize = 128;
+
+/// A context action is deliberately narrower than a truth judgement. It says
+/// how a previously-authorized projection may be used by Chisei; it never
+/// changes the source descriptor or promotes evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAdmissionAction {
+    #[default]
+    Include,
+    Qualify,
+    HoldOut,
+    RequireReview,
+    RequireVerification,
+}
+
+impl ContextAdmissionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Include => "include",
+            Self::Qualify => "qualify",
+            Self::HoldOut => "hold_out",
+            Self::RequireReview => "require_review",
+            Self::RequireVerification => "require_verification",
+        }
+    }
+}
+
+/// Domain-neutral operation risk used only for policy matching. A numeric risk
+/// score remains the pipeline source of truth; these buckets are a
+/// deterministic policy vocabulary rather than a domain-specific taxonomy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl OperationRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn from_score(score: f64) -> Self {
+        if !score.is_finite() || score < 0.3 {
+            Self::Low
+        } else if score < 0.7 {
+            Self::Medium
+        } else if score < 0.9 {
+            Self::High
+        } else {
+            Self::Critical
+        }
+    }
+
+    /// Gateway requests do not carry a pipeline risk score. Their operation
+    /// and task labels still provide a conservative, deterministic bucket for
+    /// rules that intentionally match risk without needing context metadata.
+    pub fn from_labels(operation_class: &str, task_class: &str) -> Self {
+        let value = format!("{} {}", operation_class, task_class).to_ascii_lowercase();
+        if ["critical", "destructive", "delete", "security"]
+            .iter()
+            .any(|label| value.contains(label))
+        {
+            Self::Critical
+        } else if ["high", "write", "migration", "admin"]
+            .iter()
+            .any(|label| value.contains(label))
+        {
+            Self::High
+        } else if ["medium", "review", "change"]
+            .iter()
+            .any(|label| value.contains(label))
+        {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextAdmissionRule {
+    pub action: ContextAdmissionAction,
+    #[serde(default)]
+    pub origin_classes: Vec<OriginClass>,
+    #[serde(default)]
+    pub evidence_statuses: Vec<EvidenceStatus>,
+    #[serde(default)]
+    pub lifecycle_statuses: Vec<LifecycleStatus>,
+    #[serde(default)]
+    pub applicability: Option<String>,
+    #[serde(default)]
+    pub confidence_basis: Option<String>,
+    #[serde(default)]
+    pub min_confidence_bps: Option<u16>,
+    #[serde(default)]
+    pub max_confidence_bps: Option<u16>,
+    #[serde(default)]
+    pub operation_risk: Option<OperationRisk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextAdmissionPolicy {
+    pub contract_version: String,
+    #[serde(default)]
+    pub default_action: ContextAdmissionAction,
+    /// Unknown metadata is never silently treated as a stronger state. The
+    /// safe default for a configured policy is to hold it out; operators may
+    /// explicitly choose another action and that choice is versioned.
+    #[serde(default = "default_unknown_context_action")]
+    pub unknown_action: ContextAdmissionAction,
+    #[serde(default)]
+    pub rules: Vec<ContextAdmissionRule>,
+}
+
+fn default_unknown_context_action() -> ContextAdmissionAction {
+    ContextAdmissionAction::HoldOut
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAdmissionDecision {
+    pub action: ContextAdmissionAction,
+    pub policy_version: String,
+    pub descriptor_version: String,
+    pub reason_code: String,
+}
+
+impl ContextAdmissionDecision {
+    pub fn admits_context(&self) -> bool {
+        matches!(
+            self.action,
+            ContextAdmissionAction::Include
+                | ContextAdmissionAction::Qualify
+                | ContextAdmissionAction::RequireReview
+        )
+    }
+
+    pub fn qualifies_context(&self) -> bool {
+        matches!(
+            self.action,
+            ContextAdmissionAction::Qualify | ContextAdmissionAction::RequireReview
+        )
+    }
+
+    pub fn blocks_provider(&self) -> bool {
+        matches!(
+            self.action,
+            ContextAdmissionAction::RequireReview | ContextAdmissionAction::RequireVerification
+        )
+    }
+}
+
+impl ContextAdmissionPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.contract_version != CONTEXT_ADMISSION_POLICY_VERSION {
+            return Err(format!(
+                "unsupported context admission policy version {}",
+                self.contract_version
+            ));
+        }
+        if self.rules.len() > MAX_CONTEXT_ADMISSION_RULES {
+            return Err("context admission policy rule bound exceeded".into());
+        }
+        for rule in &self.rules {
+            validate_selector_values(&rule.origin_classes, "origin_classes")?;
+            validate_selector_values(&rule.evidence_statuses, "evidence_statuses")?;
+            validate_selector_values(&rule.lifecycle_statuses, "lifecycle_statuses")?;
+            if rule
+                .applicability
+                .as_deref()
+                .is_some_and(|value| !valid_selector_string(value))
+            {
+                return Err("context admission applicability selector is invalid".into());
+            }
+            if rule
+                .confidence_basis
+                .as_deref()
+                .is_some_and(|value| !valid_selector_string(value))
+            {
+                return Err("context admission confidence basis selector is invalid".into());
+            }
+            if rule.min_confidence_bps.is_some_and(|value| value > 10_000)
+                || rule.max_confidence_bps.is_some_and(|value| value > 10_000)
+                || matches!(
+                    (rule.min_confidence_bps, rule.max_confidence_bps),
+                    (Some(min), Some(max)) if min > max
+                )
+            {
+                return Err("context admission confidence bounds are invalid".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        format!("{:x}", Sha256::digest(canonical))
+    }
+
+    pub fn decide(
+        &self,
+        descriptor: &EpistemicDescriptor,
+        applicability: Option<&str>,
+        operation_risk: OperationRisk,
+    ) -> Result<ContextAdmissionDecision, String> {
+        self.validate()?;
+        descriptor.validate()?;
+        let action = self
+            .rules
+            .iter()
+            .find(|rule| rule.matches(descriptor, applicability, operation_risk))
+            .map(|rule| rule.action)
+            .unwrap_or_else(|| {
+                if descriptor_has_unknown_dimension(descriptor) {
+                    self.unknown_action
+                } else {
+                    self.default_action
+                }
+            });
+        Ok(ContextAdmissionDecision {
+            action,
+            policy_version: self.version(),
+            descriptor_version: descriptor.contract_version.clone(),
+            reason_code: format!("context_admission:{}", action.as_str()),
+        })
+    }
+
+    /// Apply only rules whose selectors are operation-level. This is used by
+    /// the compatible gateway path, which has no authorized context reference
+    /// to inspect. Descriptor-specific rules are left to native enrichment.
+    pub fn operation_gate(
+        &self,
+        operation_risk: OperationRisk,
+    ) -> Result<Option<ContextAdmissionDecision>, String> {
+        self.validate()?;
+        let unknown = EpistemicDescriptor::unknown();
+        for rule in &self.rules {
+            if !rule.has_descriptor_selectors() && rule.matches(&unknown, None, operation_risk) {
+                return Ok(Some(ContextAdmissionDecision {
+                    action: rule.action,
+                    policy_version: self.version(),
+                    descriptor_version: unknown.contract_version.clone(),
+                    reason_code: format!("context_admission:{}", rule.action.as_str()),
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl ContextAdmissionRule {
+    fn has_descriptor_selectors(&self) -> bool {
+        !self.origin_classes.is_empty()
+            || !self.evidence_statuses.is_empty()
+            || !self.lifecycle_statuses.is_empty()
+            || self.applicability.is_some()
+            || self.confidence_basis.is_some()
+            || self.min_confidence_bps.is_some()
+            || self.max_confidence_bps.is_some()
+    }
+
+    fn matches(
+        &self,
+        descriptor: &EpistemicDescriptor,
+        applicability: Option<&str>,
+        operation_risk: OperationRisk,
+    ) -> bool {
+        (self.origin_classes.is_empty() || self.origin_classes.contains(&descriptor.origin_class))
+            && (self.evidence_statuses.is_empty()
+                || self.evidence_statuses.contains(&descriptor.evidence_status))
+            && (self.lifecycle_statuses.is_empty()
+                || self
+                    .lifecycle_statuses
+                    .contains(&descriptor.lifecycle_status))
+            && self
+                .applicability
+                .as_deref()
+                .is_none_or(|expected| applicability == Some(expected))
+            && self
+                .confidence_basis
+                .as_deref()
+                .is_none_or(|expected| descriptor.confidence_basis.as_deref() == Some(expected))
+            && self.min_confidence_bps.is_none_or(|minimum| {
+                descriptor
+                    .producer_confidence_bps
+                    .is_some_and(|value| value >= minimum)
+            })
+            && self.max_confidence_bps.is_none_or(|maximum| {
+                descriptor
+                    .producer_confidence_bps
+                    .is_some_and(|value| value <= maximum)
+            })
+            && self
+                .operation_risk
+                .is_none_or(|minimum| operation_risk >= minimum)
+    }
+}
+
+fn descriptor_has_unknown_dimension(descriptor: &EpistemicDescriptor) -> bool {
+    matches!(descriptor.origin_class, OriginClass::Unknown)
+        || matches!(descriptor.evidence_status, EvidenceStatus::Unknown)
+        || matches!(descriptor.lifecycle_status, LifecycleStatus::Unknown)
+        || descriptor.producer_confidence_bps.is_none()
+        || descriptor.confidence_basis.is_none()
+}
+
+fn valid_selector_string(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= MAX_CONTEXT_ADMISSION_SELECTOR_BYTES
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn validate_selector_values<T>(values: &[T], name: &str) -> Result<(), String>
+where
+    T: Eq,
+{
+    if values.len() > MAX_CONTEXT_ADMISSION_VALUES {
+        return Err(format!("context admission {name} bound exceeded"));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if values[..index].contains(value) {
+            return Err(format!("context admission {name} contains duplicates"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -38,6 +385,7 @@ impl Policy {
 
 pub struct PolicyResolver {
     namespace_policies: Mutex<HashMap<String, Policy>>,
+    context_admission_policies: Mutex<HashMap<String, Result<ContextAdmissionPolicy, String>>>,
     residency: ResidencyResolver,
 }
 
@@ -51,12 +399,55 @@ impl PolicyResolver {
     pub fn new() -> Self {
         Self {
             namespace_policies: Mutex::new(HashMap::new()),
+            context_admission_policies: Mutex::new(HashMap::new()),
             residency: ResidencyResolver::new(),
         }
     }
 
     pub fn set_namespace_policy(&self, ns: &str, p: Policy) {
         self.namespace_policies.lock().unwrap().insert(ns.into(), p);
+    }
+
+    pub fn set_context_admission_policy(
+        &self,
+        namespace: &str,
+        policy: ContextAdmissionPolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        self.context_admission_policies
+            .lock()
+            .map_err(|_| "context admission policy lock poisoned".to_string())?
+            .insert(namespace.trim().into(), Ok(policy));
+        Ok(())
+    }
+
+    pub fn set_context_admission_error(&self, namespace: &str, error: impl Into<String>) {
+        if let Ok(mut policies) = self.context_admission_policies.lock() {
+            policies.insert(namespace.trim().into(), Err(error.into()));
+        }
+    }
+
+    pub fn clear_context_admission_policy(&self, namespace: &str) {
+        if let Ok(mut policies) = self.context_admission_policies.lock() {
+            policies.remove(namespace.trim());
+        }
+    }
+
+    /// Return the configured context policy or its durable configuration
+    /// error. An error is intentionally not converted into an implicit allow.
+    pub fn context_admission_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<ContextAdmissionPolicy>, String> {
+        let policies = self
+            .context_admission_policies
+            .lock()
+            .map_err(|_| "context admission policy lock poisoned".to_string())?;
+        match policies.get(namespace.trim()) {
+            Some(Ok(policy)) => Ok(Some(policy.clone())),
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(None),
+        }
     }
 
     pub fn set_residency_policy(
@@ -430,6 +821,166 @@ mod tests {
         assert_eq!(policy.version(), same.version());
         assert_eq!(policy.version().len(), 64);
         assert_ne!(policy.version(), changed.version());
+    }
+
+    fn descriptor(origin: OriginClass, evidence: EvidenceStatus) -> EpistemicDescriptor {
+        let mut descriptor = EpistemicDescriptor::unknown();
+        descriptor.origin_class = origin;
+        descriptor.evidence_status = evidence;
+        descriptor.lifecycle_status = LifecycleStatus::Current;
+        descriptor.producer_confidence_bps = Some(9_000);
+        descriptor.confidence_basis = Some("producer_input".into());
+        descriptor
+    }
+
+    #[test]
+    fn context_admission_rules_are_deterministic_and_do_not_adjudicate_truth() {
+        let policy = ContextAdmissionPolicy {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::Qualify,
+                    origin_classes: vec![OriginClass::Hypothesis],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: Some(OperationRisk::High),
+                },
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::HoldOut,
+                    origin_classes: vec![],
+                    evidence_statuses: vec![EvidenceStatus::Contested],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: None,
+                },
+            ],
+        };
+        policy.validate().unwrap();
+        let contested = policy
+            .decide(
+                &descriptor(OriginClass::Asserted, EvidenceStatus::Contested),
+                None,
+                OperationRisk::Low,
+            )
+            .unwrap();
+        assert_eq!(contested.action, ContextAdmissionAction::HoldOut);
+        let hypothesis = policy
+            .decide(
+                &descriptor(OriginClass::Hypothesis, EvidenceStatus::Unknown),
+                None,
+                OperationRisk::High,
+            )
+            .unwrap();
+        assert_eq!(hypothesis.action, ContextAdmissionAction::Qualify);
+        assert_eq!(
+            hypothesis.descriptor_version,
+            crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION
+        );
+        let unknown = policy
+            .decide(
+                &EpistemicDescriptor::from_hypothesis("scenario-1", &[], 0, false),
+                None,
+                OperationRisk::Low,
+            )
+            .unwrap();
+        assert_eq!(unknown.action, ContextAdmissionAction::HoldOut);
+    }
+
+    #[test]
+    fn invalid_context_policy_values_fail_closed() {
+        let policy = ContextAdmissionPolicy {
+            contract_version: "unknown/v9".into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![],
+        };
+        assert!(policy.validate().is_err());
+        assert!(
+            serde_json::from_str::<ContextAdmissionPolicy>(
+                r#"{"contract_version":"chisei.context-admission/v1","unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn operation_gate_only_applies_operation_level_rules() {
+        let policy = ContextAdmissionPolicy {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::RequireReview,
+                    origin_classes: vec![],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: Some(OperationRisk::High),
+                },
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::HoldOut,
+                    origin_classes: vec![OriginClass::Hypothesis],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: None,
+                },
+            ],
+        };
+        let decision = policy.operation_gate(OperationRisk::High).unwrap().unwrap();
+        assert_eq!(decision.action, ContextAdmissionAction::RequireReview);
+        assert!(policy.operation_gate(OperationRisk::Low).unwrap().is_none());
+    }
+
+    #[test]
+    fn operation_gate_does_not_reinterpret_unknown_descriptor_rules() {
+        let policy = ContextAdmissionPolicy {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::HoldOut,
+                    origin_classes: vec![OriginClass::Unknown],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: None,
+                },
+                ContextAdmissionRule {
+                    action: ContextAdmissionAction::RequireReview,
+                    origin_classes: vec![],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: None,
+                    confidence_basis: None,
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: Some(OperationRisk::High),
+                },
+            ],
+        };
+        let decision = policy.operation_gate(OperationRisk::High).unwrap().unwrap();
+        assert_eq!(decision.action, ContextAdmissionAction::RequireReview);
     }
 
     #[test]

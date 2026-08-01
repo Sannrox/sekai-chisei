@@ -1,6 +1,9 @@
 use crate::chisei::budget::PressureLevel;
 use crate::chisei::egress;
 use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
+use crate::chisei::policy::{
+    ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
+};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
@@ -34,6 +37,14 @@ pub struct PipelineRequest {
     pub memory_references: Vec<MemoryContextReference>,
     pub memory_holdouts: Vec<MemoryHoldoutReference>,
     pub allowed_evidence_classes: HashSet<EvidenceContextClass>,
+    pub context_admission_policy: Option<ContextAdmissionPolicy>,
+    pub context_admission: ContextAdmissionSummary,
+    /// True after the risk pre-pass has evaluated only admitted context.
+    /// This keeps later risk-policy and sampling steps from re-reading held-out
+    /// context after enrichment has begun.
+    pub(crate) risk_score_ready: bool,
+    pub(crate) risk_signals: Vec<String>,
+    pub(crate) operation_risk_override: Option<OperationRisk>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,6 +91,113 @@ pub struct MemoryHoldoutReference {
     pub content_digest: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextAdmissionSummary {
+    pub policy_version: String,
+    pub descriptor_version: String,
+    pub decision: String,
+    pub reason_codes: Vec<String>,
+    pub source_digests: Vec<String>,
+    pub requires_review: bool,
+    pub requires_verification: bool,
+}
+
+impl ContextAdmissionSummary {
+    fn reset(&mut self, policy: Option<&ContextAdmissionPolicy>) {
+        *self = Self {
+            policy_version: policy
+                .map(ContextAdmissionPolicy::version)
+                .unwrap_or_default(),
+            descriptor_version: crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION
+                .into(),
+            ..Self::default()
+        };
+    }
+
+    fn record(
+        &mut self,
+        decision: &ContextAdmissionDecision,
+        source_digests: impl IntoIterator<Item = String>,
+    ) {
+        self.policy_version = decision.policy_version.clone();
+        self.descriptor_version = decision.descriptor_version.clone();
+        if self.decision.is_empty()
+            || context_admission_action_rank(decision.action)
+                > context_admission_action_rank_from_str(&self.decision)
+        {
+            self.decision = decision.action.as_str().into();
+        }
+        if !self.reason_codes.contains(&decision.reason_code) {
+            self.reason_codes.push(decision.reason_code.clone());
+            self.reason_codes.sort();
+            self.reason_codes.truncate(8);
+        }
+        if decision.action == ContextAdmissionAction::RequireReview {
+            self.requires_review = true;
+        }
+        if decision.action == ContextAdmissionAction::RequireVerification {
+            self.requires_verification = true;
+        }
+        if decision.admits_context() {
+            for digest in source_digests {
+                let digest = digest.trim();
+                if digest.is_empty()
+                    || digest.len() > 256
+                    || digest.bytes().any(|b| b.is_ascii_control())
+                {
+                    continue;
+                }
+                if !self
+                    .source_digests
+                    .iter()
+                    .any(|existing| existing == digest)
+                {
+                    self.source_digests.push(digest.to_string());
+                    self.source_digests.sort();
+                    self.source_digests.truncate(32);
+                }
+            }
+        }
+    }
+
+    fn unavailable(&mut self, policy: Option<&ContextAdmissionPolicy>) {
+        self.policy_version = policy
+            .map(ContextAdmissionPolicy::version)
+            .unwrap_or_default();
+        self.descriptor_version =
+            crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION.into();
+        self.decision = ContextAdmissionAction::RequireVerification.as_str().into();
+        self.reason_codes = vec!["context_admission:unavailable".into()];
+        self.requires_verification = true;
+    }
+
+    pub fn blocks_provider(&self) -> bool {
+        self.requires_review || self.requires_verification
+    }
+}
+
+fn context_admission_action_rank(action: ContextAdmissionAction) -> u8 {
+    match action {
+        ContextAdmissionAction::Include => 0,
+        ContextAdmissionAction::Qualify => 1,
+        ContextAdmissionAction::HoldOut => 2,
+        ContextAdmissionAction::RequireReview => 3,
+        ContextAdmissionAction::RequireVerification => 4,
+    }
+}
+
+fn context_admission_action_rank_from_str(action: &str) -> u8 {
+    match action {
+        "qualify" => context_admission_action_rank(ContextAdmissionAction::Qualify),
+        "hold_out" => context_admission_action_rank(ContextAdmissionAction::HoldOut),
+        "require_review" => context_admission_action_rank(ContextAdmissionAction::RequireReview),
+        "require_verification" => {
+            context_admission_action_rank(ContextAdmissionAction::RequireVerification)
+        }
+        _ => context_admission_action_rank(ContextAdmissionAction::Include),
+    }
+}
+
 fn memory_holdout(assignment_id: &str, memory_id: &str, version: u32) -> bool {
     if assignment_id.is_empty() {
         return false;
@@ -91,6 +209,53 @@ fn memory_holdout(assignment_id: &str, memory_id: &str, version: u32) -> bool {
     }
     digest.update(version.to_be_bytes());
     digest.finalize()[0] % 5 == 0
+}
+
+fn operation_risk(req: &PipelineRequest) -> OperationRisk {
+    let label_risk = OperationRisk::from_labels(&req.task_type, &req.task_type);
+    req.operation_risk_override
+        .unwrap_or_else(|| OperationRisk::from_score(req.risk_score))
+        .max(label_risk)
+}
+
+fn admit_context(
+    req: &mut PipelineRequest,
+    descriptor: &EpistemicDescriptor,
+    applicability: Option<&str>,
+    source_digests: impl IntoIterator<Item = String>,
+) -> ContextAdmissionDecision {
+    let Some(policy) = req.context_admission_policy.as_ref() else {
+        return ContextAdmissionDecision {
+            action: ContextAdmissionAction::Include,
+            policy_version: String::new(),
+            descriptor_version: descriptor.contract_version.clone(),
+            reason_code: String::new(),
+        };
+    };
+    match policy.decide(descriptor, applicability, operation_risk(req)) {
+        Ok(decision) => {
+            req.context_admission.record(&decision, source_digests);
+            decision
+        }
+        Err(_) => {
+            req.context_admission.unavailable(Some(policy));
+            ContextAdmissionDecision {
+                action: ContextAdmissionAction::RequireVerification,
+                policy_version: policy.version(),
+                descriptor_version: descriptor.contract_version.clone(),
+                reason_code: "context_admission:unavailable".into(),
+            }
+        }
+    }
+}
+
+fn epistemic_qualification(descriptor: &EpistemicDescriptor) -> String {
+    format!(
+        "epistemic_qualification(origin={},evidence={},lifecycle={})",
+        descriptor.origin_class.as_str(),
+        descriptor.evidence_status.as_str(),
+        descriptor.lifecycle_status.as_str()
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +288,7 @@ pub struct RunResult {
     pub evidence_references: Vec<EvidenceContextReference>,
     pub memory_references: Vec<MemoryContextReference>,
     pub memory_holdouts: Vec<MemoryHoldoutReference>,
+    pub context_admission: ContextAdmissionSummary,
 }
 
 impl RunResult {
@@ -315,6 +481,10 @@ fn collect_external_evidence_context(
             continue;
         };
         let descriptor = EpistemicDescriptor::from_external_evidence(&submission);
+        let decision = admit_context(req, &descriptor, None, descriptor.source_digests.clone());
+        if !decision.admits_context() {
+            continue;
+        }
         let mut disclosed_fields = vec![
             "evidence_type".to_string(),
             "signal".to_string(),
@@ -328,6 +498,9 @@ fn collect_external_evidence_context(
             format!("confidence_bps={}", envelope.confidence_bps),
             format!("observed_at_ms={}", submission.observed_at_ms),
         ];
+        if decision.qualifies_context() {
+            details.push(epistemic_qualification(&descriptor));
+        }
         if let Some(content) = envelope.content.as_object() {
             for field in DISCLOSABLE_FIELDS {
                 if let Some(value) = content.get(field).and_then(safe_evidence_scalar) {
@@ -437,7 +610,7 @@ fn filter_context_property(
 }
 
 fn collect_related_verdict_context(
-    req: &PipelineRequest,
+    req: &mut PipelineRequest,
     obj: &Object,
     db: &RuntimeDb,
     external_egress: bool,
@@ -458,6 +631,11 @@ fn collect_related_verdict_context(
             continue;
         }
         if candidate.kind == KIND_LEARNING {
+            continue;
+        }
+        let descriptor = EpistemicDescriptor::unknown();
+        let decision = admit_context(req, &descriptor, None, std::iter::empty());
+        if !decision.admits_context() {
             continue;
         }
         let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
@@ -482,13 +660,26 @@ fn collect_related_verdict_context(
         };
         if !external_egress || egress::include_identity(&candidate) {
             record.included_fields.push("identity".into());
-            lines.push(format!("related_verdict: {} - {}", candidate.name, verdict));
+            let qualification = if decision.qualifies_context() {
+                format!(" ({})", epistemic_qualification(&descriptor))
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "related_verdict: {} - {}{}",
+                candidate.name, verdict, qualification
+            ));
         } else {
             record.redacted_fields.push("identity".into());
             record
                 .reasons
                 .push("identity denied by default egress policy".into());
-            lines.push(format!("related_verdict: {}", verdict));
+            let qualification = if decision.qualifies_context() {
+                format!(" ({})", epistemic_qualification(&descriptor))
+            } else {
+                String::new()
+            };
+            lines.push(format!("related_verdict: {}{}", verdict, qualification));
         }
         records.push(record);
         if lines.len() >= 3 {
@@ -551,9 +742,18 @@ fn run_object_context_enrich(
         .collect::<Vec<_>>();
     let mut type_cache = HashMap::new();
     for obj in context_objects {
+        let descriptor = EpistemicDescriptor::unknown();
+        let decision = admit_context(req, &descriptor, None, std::iter::empty());
+        if !decision.admits_context() {
+            continue;
+        }
         let mut egress_record = egress::new_record(&obj);
         let mut has_content = false;
         let mut details = Vec::new();
+        if decision.qualifies_context() {
+            details.push(epistemic_qualification(&descriptor));
+            has_content = true;
+        }
         if let Some(verdict_key) = VERDICT_KEYS.iter().find(|key| {
             obj.properties
                 .get(**key)
@@ -659,6 +859,11 @@ fn run_object_context_enrich(
                     continue;
                 }
                 if candidate.kind == KIND_LEARNING {
+                    let descriptor = EpistemicDescriptor::unknown();
+                    let decision = admit_context(req, &descriptor, None, std::iter::empty());
+                    if !decision.admits_context() {
+                        continue;
+                    }
                     let mut learning_record = egress::new_record(&candidate);
                     let title = filter_context_property(
                         db,
@@ -677,7 +882,12 @@ fn run_object_context_enrich(
                         req.external_egress,
                     );
                     if let (Some(title), Some(prevention)) = (title, prevention) {
-                        pitfalls.push(format!("{title} - {prevention}"));
+                        let qualification = if decision.qualifies_context() {
+                            format!(" ({})", epistemic_qualification(&descriptor))
+                        } else {
+                            String::new()
+                        };
+                        pitfalls.push(format!("{title} - {prevention}{qualification}"));
                     }
                     req.egress_records.push(learning_record);
                 }
@@ -856,6 +1066,16 @@ impl Pipeline {
         req.memory_references.clear();
         req.memory_holdouts.clear();
         req.allowed_evidence_classes = allowed_evidence_classes;
+        req.context_admission
+            .reset(req.context_admission_policy.as_ref());
+        req.risk_score_ready = false;
+        req.risk_signals.clear();
+        req.operation_risk_override = None;
+        // Context admission rules may depend on operation risk.  Establish the
+        // risk projection before enrichment so every admission decision sees
+        // the same risk, and so risk-driven routing cannot consume held-out
+        // context later in the pipeline.
+        RiskStep.run(req, db);
         let decisions: Vec<StepDecision> = self
             .steps
             .iter()
@@ -878,6 +1098,7 @@ impl Pipeline {
             evidence_references: req.evidence_references.clone(),
             memory_references: req.memory_references.clone(),
             memory_holdouts: req.memory_holdouts.clone(),
+            context_admission: req.context_admission.clone(),
         }
     }
 }
@@ -1015,6 +1236,15 @@ fn run_kioku_enrich(
             .map(|link| link.operation_id.clone())
             .collect::<Vec<_>>();
         let descriptor = EpistemicDescriptor::from_kioku(&item.memory, &item.evidence);
+        let decision = admit_context(
+            req,
+            &descriptor,
+            Some(item.applicability.as_str()),
+            std::iter::once(crate::chisei::kioku::memory_claim_digest(&item.memory)),
+        );
+        if !decision.admits_context() {
+            continue;
+        }
         let mut included_fields = vec![
             "claim".into(),
             "confidence_bps".into(),
@@ -1024,6 +1254,11 @@ fn run_kioku_enrich(
             "contradicting_evidence_count".into(),
         ];
         included_fields.extend(epistemic_descriptor_egress_fields(&descriptor));
+        let line = if decision.qualifies_context() {
+            format!("{}\n  {}", line, epistemic_qualification(&descriptor))
+        } else {
+            line
+        };
         lines.push(line);
         req.memory_references.push(MemoryContextReference {
             memory_id: item.memory.id.clone(),
@@ -1226,6 +1461,11 @@ fn run_learnings_enrich(
                 if obj.kind != KIND_LEARNING {
                     continue;
                 }
+                let descriptor = EpistemicDescriptor::unknown();
+                let decision = admit_context(req, &descriptor, None, std::iter::empty());
+                if !decision.admits_context() {
+                    continue;
+                }
                 let mut learning_record = egress::new_record(&obj);
                 let title = filter_context_property(
                     db,
@@ -1244,7 +1484,12 @@ fn run_learnings_enrich(
                     req.external_egress,
                 );
                 if let (Some(title), Some(prevention)) = (title, prevention) {
-                    pitfalls.push(format!("{title} - {prevention}"));
+                    let qualification = if decision.qualifies_context() {
+                        format!(" ({})", epistemic_qualification(&descriptor))
+                    } else {
+                        String::new()
+                    };
+                    pitfalls.push(format!("{title} - {prevention}{qualification}"));
                     req.expanded_context_items = req.expanded_context_items.saturating_add(1);
                 }
                 req.egress_records.push(learning_record);
@@ -1323,6 +1568,11 @@ impl Step for SpecEnrichStep {
                 if !is_evaluable_context(db, &comp) {
                     continue;
                 }
+                let descriptor = EpistemicDescriptor::unknown();
+                let decision = admit_context(req, &descriptor, None, std::iter::empty());
+                if !decision.admits_context() {
+                    continue;
+                }
                 let mut comp_record = egress::new_record(&comp);
                 let Some(safe_total) = filter_context_property(
                     db,
@@ -1355,10 +1605,20 @@ impl Step for SpecEnrichStep {
                 if total >= 3 && rate < 50 {
                     if !req.external_egress || egress::include_identity(&comp) {
                         comp_record.included_fields.push("identity".into());
+                        let qualification = if decision.qualifies_context() {
+                            format!(" ({})", epistemic_qualification(&descriptor))
+                        } else {
+                            String::new()
+                        };
                         hints.push(format!(
                             "{} {} is degraded ({}% success)",
                             comp.kind, comp.name, safe_rate
                         ));
+                        if !qualification.is_empty()
+                            && let Some(last) = hints.last_mut()
+                        {
+                            last.push_str(&qualification);
+                        }
                     } else {
                         comp_record.redacted_fields.push("identity".into());
                         comp_record
@@ -1413,6 +1673,21 @@ impl Step for RiskStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+        if req.risk_score_ready {
+            return risk_step_decision(&req.risk_signals, req.risk_score);
+        }
+        // First establish a conservative operation-risk bucket from the
+        // authorized risk projection.  Context admission is then evaluated
+        // against that stable bucket, and the committed pipeline score is
+        // recomputed from admitted context only.  A held-out object can make
+        // the gate more conservative, but it cannot remain in routing,
+        // review, or sampling inputs.
+        let raw_risk = raw_risk_score(req, db);
+        req.risk_score = raw_risk;
+        req.operation_risk_override = Some(
+            OperationRisk::from_labels(&req.task_type, &req.task_type)
+                .max(OperationRisk::from_score(raw_risk)),
+        );
         let mut signals = Vec::new();
         let mut risk = 0.0f64;
         let mut type_cache = HashMap::new();
@@ -1432,11 +1707,32 @@ impl Step for RiskStep {
             }
         }
         for context in resolve_context_objects(req, db) {
-            let components = db
+            let context_decision = admit_context(
+                req,
+                &EpistemicDescriptor::unknown(),
+                None,
+                std::iter::empty(),
+            );
+            if !context_decision.admits_context() {
+                continue;
+            }
+            let authorized_components = db
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|object| context_object_authorized(req, db, object))
+                .collect::<Vec<_>>();
+            let components = authorized_components
+                .into_iter()
+                .filter(|_| {
+                    admit_context(
+                        req,
+                        &EpistemicDescriptor::unknown(),
+                        None,
+                        std::iter::empty(),
+                    )
+                    .admits_context()
+                })
                 .collect::<Vec<_>>();
             let degraded = components
                 .iter()
@@ -1490,24 +1786,66 @@ impl Step for RiskStep {
             }
         }
         req.risk_score = risk;
-        if signals.is_empty() {
-            return StepDecision {
-                step: String::new(),
-                action: "none".into(),
-                reasoning: "no risk signals".into(),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: "0.00".into(),
-            };
+        req.risk_score_ready = true;
+        req.risk_signals = signals.clone();
+        risk_step_decision(&signals, risk)
+    }
+}
+
+fn raw_risk_score(req: &PipelineRequest, db: &RuntimeDb) -> f64 {
+    let mut risk = 0.0f64;
+    let snapshots = capacity::latest_snapshots(db, 24).unwrap_or_default();
+    if snapshots.len() >= 3 {
+        let latest = &snapshots[0];
+        if latest.agent_count > 0 && latest.queue_depth > latest.agent_count * 2 {
+            risk = risk.max(0.5);
         }
-        StepDecision {
+        if latest.avg_wait_seconds >= 1800 {
+            risk = risk.max(0.6);
+        }
+    }
+    for context in resolve_context_objects(req, db) {
+        let components = db
+            .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|object| context_object_authorized(req, db, object))
+            .collect::<Vec<_>>();
+        if components
+            .iter()
+            .any(|component| is_degraded_evaluable(db, component, 30))
+        {
+            risk = risk.max(0.7);
+        }
+        if std::iter::once(&context)
+            .chain(components.iter())
+            .filter(|candidate| object_implements(db, candidate, INTERFACE_RISK_SCORED))
+            .any(|candidate| risk_score_value(candidate).is_some_and(|score| score >= 0.7))
+        {
+            risk = risk.max(0.7);
+        }
+    }
+    risk
+}
+
+fn risk_step_decision(signals: &[String], risk: f64) -> StepDecision {
+    if signals.is_empty() {
+        return StepDecision {
             step: String::new(),
-            action: "warn".into(),
-            reasoning: format!("{} risk signal(s) detected", signals.len()),
-            confidence: 0.7,
-            suggestion: format!("risk warning: {}", signals[0]),
-            value: format!("{risk:.2}"),
-        }
+            action: "none".into(),
+            reasoning: "no risk signals".into(),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: "0.00".into(),
+        };
+    }
+    StepDecision {
+        step: String::new(),
+        action: "warn".into(),
+        reasoning: format!("{} risk signal(s) detected", signals.len()),
+        confidence: 0.7,
+        suggestion: format!("risk warning: {}", signals[0]),
+        value: format!("{risk:.2}"),
     }
 }
 
@@ -1793,6 +2131,11 @@ mod tests {
             memory_references: vec![],
             memory_holdouts: vec![],
             allowed_evidence_classes: HashSet::new(),
+            context_admission_policy: None,
+            context_admission: ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
         }
     }
 
@@ -2426,6 +2769,11 @@ mod tests {
             memory_references: vec![],
             memory_holdouts: vec![],
             allowed_evidence_classes: HashSet::new(),
+            context_admission_policy: None,
+            context_admission: ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");
@@ -2570,6 +2918,152 @@ mod tests {
                 .iter()
                 .any(|record| record.redacted_fields.contains(&"verdict".to_string()))
         );
+    }
+
+    #[test]
+    fn context_admission_holds_unknown_and_explicitly_qualifies_it() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_object(&Object {
+            id: "asset-admission".into(),
+            kind: "asset".into(),
+            name: "AdmissionCo".into(),
+            namespace: "".into(),
+            external_id: "asset:ADMISSION".into(),
+            properties: HashMap::from([("verdict".into(), "untrusted context".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let policy = crate::chisei::policy::ContextAdmissionPolicy {
+            contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![],
+        };
+        let mut req = make_req();
+        req.namespace = "asset:ADMISSION".into();
+        req.external_egress = false;
+        req.context_admission_policy = Some(policy.clone());
+        let held_out = default_pipeline().run(&mut req, &db);
+        assert_eq!(held_out.context_admission.decision, "hold_out");
+        assert!(!held_out.context_admission.blocks_provider());
+        assert!(!held_out.prepared_spec.contains("untrusted context"));
+
+        let mut qualified_policy = policy;
+        qualified_policy.unknown_action = ContextAdmissionAction::Qualify;
+        let mut qualified_req = make_req();
+        qualified_req.namespace = "asset:ADMISSION".into();
+        qualified_req.external_egress = false;
+        qualified_req.context_admission_policy = Some(qualified_policy);
+        let qualified = default_pipeline().run(&mut qualified_req, &db);
+        assert_eq!(qualified.context_admission.decision, "qualify");
+        assert!(qualified.prepared_spec.contains("epistemic_qualification"));
+        assert!(qualified.prepared_spec.contains("untrusted context"));
+    }
+
+    #[test]
+    fn context_admission_summary_keeps_the_strongest_decision() {
+        let mut summary = ContextAdmissionSummary::default();
+        let decision = |action| ContextAdmissionDecision {
+            action,
+            policy_version: "policy".into(),
+            descriptor_version: crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION
+                .into(),
+            reason_code: format!("context_admission:{}", action.as_str()),
+        };
+        summary.record(&decision(ContextAdmissionAction::RequireReview), []);
+        summary.record(&decision(ContextAdmissionAction::Include), []);
+        assert_eq!(summary.decision, "require_review");
+        assert!(summary.blocks_provider());
+        assert!(
+            summary
+                .reason_codes
+                .contains(&"context_admission:include".into())
+        );
+    }
+
+    #[test]
+    fn context_admission_holdout_excludes_risk_from_routing_inputs() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![prop("risk_score", PropertyType::Float)],
+        );
+        db.create_object(&Object {
+            id: "service-held-out-risk".into(),
+            kind: "service".into(),
+            name: "held-out-risk".into(),
+            namespace: String::new(),
+            external_id: "service:held-out-risk".into(),
+            properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let policy = ContextAdmissionPolicy {
+            contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![],
+        };
+        let mut req = make_req();
+        req.namespace = "service:held-out-risk".into();
+        req.context_admission_policy = Some(policy);
+        let result = default_pipeline().run(&mut req, &db);
+
+        assert_eq!(result.risk_score, 0.0);
+        assert_eq!(result.context_admission.decision, "hold_out");
+        assert!(!result.context_admission.blocks_provider());
+        assert!(!result.prepared_spec.contains("risk_score: 0.95"));
+    }
+
+    #[test]
+    fn context_admission_operation_risk_sees_the_prepass_score() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        register_object_type(
+            &db,
+            "service",
+            vec![INTERFACE_RISK_SCORED],
+            vec![prop("risk_score", PropertyType::Float)],
+        );
+        db.create_object(&Object {
+            id: "service-review-risk".into(),
+            kind: "service".into(),
+            name: "review-risk".into(),
+            namespace: String::new(),
+            external_id: "service:review-risk".into(),
+            properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let policy = ContextAdmissionPolicy {
+            contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::Include,
+            rules: vec![crate::chisei::policy::ContextAdmissionRule {
+                action: ContextAdmissionAction::RequireReview,
+                origin_classes: vec![],
+                evidence_statuses: vec![],
+                lifecycle_statuses: vec![],
+                applicability: None,
+                confidence_basis: None,
+                min_confidence_bps: None,
+                max_confidence_bps: None,
+                operation_risk: Some(OperationRisk::High),
+            }],
+        };
+        let mut req = make_req();
+        req.namespace = "service:review-risk".into();
+        req.context_admission_policy = Some(policy);
+        let result = default_pipeline().run(&mut req, &db);
+
+        assert_eq!(result.risk_score, 0.7);
+        assert_eq!(result.context_admission.decision, "require_review");
+        assert!(result.context_admission.blocks_provider());
+        assert!(result.prepared_spec.contains("epistemic_qualification"));
     }
 
     #[test]

@@ -95,6 +95,12 @@ message PipelineRunResult {
   repeated MemoryContextReference memory_references = 6;
   // Projection contract carried additively by planning/execution results.
   string epistemic_descriptor_version = 7;
+  string context_admission_policy_version = 8;
+  string context_admission_descriptor_version = 9;
+  string context_admission_decision = 10;
+  repeated string context_admission_reasons = 11;
+  bool context_admission_requires_review = 12;
+  bool context_admission_requires_verification = 13;
 }
 
 // Versioned, source-neutral epistemic metadata. The three status dimensions
@@ -238,6 +244,13 @@ message ExecutionPlan {
   repeated MemoryContextReference memory_references = 27;
   string planning_actor = 28;
   repeated MemoryHoldoutReference memory_holdouts = 29;
+  string context_admission_policy_version = 30;
+  string context_admission_descriptor_version = 31;
+  string context_admission_decision = 32;
+  repeated string context_admission_reasons = 33;
+  repeated string context_admission_source_digests = 34;
+  bool context_admission_requires_review = 35;
+  bool context_admission_requires_verification = 36;
 }
 
 message EgressDecision {
@@ -860,6 +873,10 @@ message DecideGatewayExecutionResponse {
   repeated string fallback_models = 15;
   bool eval_regressed = 16;
   string eval_regression_reason = 17;
+  string context_admission_policy_version = 18;
+  string context_admission_descriptor_version = 19;
+  string context_admission_decision = 20;
+  repeated string context_admission_reasons = 21;
 }
 message RecordUsageRequest {
   string user_id = 1;
@@ -927,6 +944,9 @@ message SetNamespacePolicyRequest {
   string default_runtime = 4;
   string default_model = 5;
   string data_class = 6;
+  // Canonical JSON for the opt-in chisei.context-admission/v1 policy.
+  // Empty preserves an existing context policy; JSON null clears it.
+  string context_admission_policy_json = 7;
 }
 message SetNamespacePolicyResponse { PolicyResolution resolution = 1; }
 

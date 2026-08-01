@@ -58,6 +58,8 @@ If you want to deploy or operate the control plane:
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Epistemic descriptor](epistemic-descriptor.md) — additive, bounded
   origin/evidence/lifecycle metadata on existing context references.
+- [Context admission policy](context-admission-policy.md) — opt-in,
+  versioned rules for using or holding out epistemically qualified context.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 

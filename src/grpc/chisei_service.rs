@@ -31,7 +31,7 @@ use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::pipeline as pipe;
-use crate::chisei::policy::{Policy, PolicyResolver};
+use crate::chisei::policy::{ContextAdmissionAction, Policy, PolicyResolver};
 use crate::chisei::portfolio::{
     Objective, ObjectiveMode, Observation, PortfolioStore, TaskDemand as PortfolioDemand,
 };
@@ -1309,7 +1309,7 @@ fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<Str
     let truncated = descriptors
         .iter()
         .any(|descriptor| descriptor.source_rows_truncated);
-    BTreeMap::from([
+    let mut attributes = BTreeMap::from([
         (
             "epistemic_descriptor_version".into(),
             EPISTEMIC_DESCRIPTOR_VERSION.into(),
@@ -1334,7 +1334,30 @@ fn epistemic_descriptor_receipt_attributes(plan: &ExecutionPlan) -> BTreeMap<Str
             "epistemic_descriptor_source_rows_truncated".into(),
             truncated.to_string(),
         ),
-    ])
+    ]);
+    if !plan.context_admission_policy_version.is_empty() {
+        attributes.insert(
+            "context_admission_policy_version".into(),
+            plan.context_admission_policy_version.clone(),
+        );
+        attributes.insert(
+            "context_admission_descriptor_version".into(),
+            plan.context_admission_descriptor_version.clone(),
+        );
+        attributes.insert(
+            "context_admission_decision".into(),
+            plan.context_admission_decision.clone(),
+        );
+        attributes.insert(
+            "context_admission_reasons".into(),
+            plan.context_admission_reasons.join(","),
+        );
+        attributes.insert(
+            "context_admission_source_digests".into(),
+            plan.context_admission_source_digests.join(","),
+        );
+    }
+    attributes
 }
 
 fn receipt_mutation_transport_allowed<T>(request: &Request<T>, config: &Config) -> bool {
@@ -1971,10 +1994,11 @@ fn persist_namespace_policy(
     db: &RuntimeDb,
     namespace: &str,
     policy: &Policy,
+    context_admission_policy: Option<&crate::chisei::policy::ContextAdmissionPolicy>,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp_millis();
     let external_id = format!("policy:{namespace}");
-    let mut properties = policy_properties(policy);
+    let mut properties = policy_properties(policy, context_admission_policy);
     properties.insert("namespace".to_string(), namespace.to_string());
 
     if let Some(mut existing) = db.find_by_external_id(&external_id)? {
@@ -4830,6 +4854,10 @@ impl ChiseiServiceImpl {
         let budget_pressure = strongest_pressure(scoped_pressure, namespace_pressure);
         let namespace_hint = input.namespace.trim().to_string();
         let effective_policy = self.policy.effective_policy(&input.namespace);
+        let context_admission_policy = self
+            .policy
+            .context_admission_policy(&input.namespace)
+            .map_err(Status::failed_precondition)?;
         let data_class = self.data_class(effective_policy.as_ref());
         let task_class = TaskClass::parse(&input.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
@@ -4858,6 +4886,11 @@ impl ChiseiServiceImpl {
             memory_assignment_id: plan_id.clone(),
             memory_token_budget: 512,
             allowed_evidence_classes: std::collections::HashSet::new(),
+            context_admission_policy: context_admission_policy.clone(),
+            context_admission: pipe::ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
@@ -4932,6 +4965,11 @@ impl ChiseiServiceImpl {
                 memory_assignment_id: plan_id.clone(),
                 memory_token_budget: 512,
                 allowed_evidence_classes: std::collections::HashSet::new(),
+                context_admission_policy: context_admission_policy.clone(),
+                context_admission: pipe::ContextAdmissionSummary::default(),
+                risk_score_ready: false,
+                risk_signals: vec![],
+                operation_risk_override: None,
             };
             let local_run = self.pipeline.run_with_context_admission(
                 &mut local_pipeline_req,
@@ -5091,6 +5129,15 @@ impl ChiseiServiceImpl {
             .map(|signal| signal.reason.clone())
             .unwrap_or_default();
         let mut executable = allowed && !eval_regressed;
+        if run.context_admission.blocks_provider() {
+            executable = false;
+            if run.context_admission.requires_review {
+                warnings.push("context admission requires review".into());
+            }
+            if run.context_admission.requires_verification {
+                warnings.push("context admission requires verification".into());
+            }
+        }
         let low_success_namespace = affinity.low_success;
         // Sampling: the pipeline decides from request metadata; the eval-driven
         // adaptive trigger (oversample regressed namespaces) is applied here since the
@@ -5266,6 +5313,13 @@ impl ChiseiServiceImpl {
                     content_digest: holdout.content_digest.clone(),
                 })
                 .collect(),
+            context_admission_policy_version: run.context_admission.policy_version.clone(),
+            context_admission_descriptor_version: run.context_admission.descriptor_version.clone(),
+            context_admission_decision: run.context_admission.decision.clone(),
+            context_admission_reasons: run.context_admission.reason_codes.clone(),
+            context_admission_source_digests: run.context_admission.source_digests.clone(),
+            context_admission_requires_review: run.context_admission.requires_review,
+            context_admission_requires_verification: run.context_admission.requires_verification,
         })
     }
 
@@ -5473,19 +5527,44 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::PolicyDecided,
                 "chisei.policy",
-                BTreeMap::from([
-                    ("policy_version".into(), policy_version.clone()),
-                    ("executable".into(), plan.executable.to_string()),
-                    ("risk_score".into(), plan.risk_score.to_string()),
-                    (
-                        "route_policy_decision".into(),
-                        if plan.resolved_runtime.is_empty() && plan.resolved_model.is_empty() {
-                            "deny".into()
-                        } else {
-                            "allow".into()
-                        },
-                    ),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("policy_version".into(), policy_version.clone()),
+                        ("executable".into(), plan.executable.to_string()),
+                        ("risk_score".into(), plan.risk_score.to_string()),
+                        (
+                            "route_policy_decision".into(),
+                            if plan.resolved_runtime.is_empty() && plan.resolved_model.is_empty() {
+                                "deny".into()
+                            } else {
+                                "allow".into()
+                            },
+                        ),
+                    ]);
+                    if !plan.context_admission_policy_version.is_empty() {
+                        attributes.insert(
+                            "context_admission_policy_version".into(),
+                            plan.context_admission_policy_version.clone(),
+                        );
+                        attributes.insert(
+                            "context_admission_descriptor_version".into(),
+                            plan.context_admission_descriptor_version.clone(),
+                        );
+                        attributes.insert(
+                            "context_admission_decision".into(),
+                            plan.context_admission_decision.clone(),
+                        );
+                        attributes.insert(
+                            "context_admission_reasons".into(),
+                            plan.context_admission_reasons.join(","),
+                        );
+                        attributes.insert(
+                            "context_admission_source_digests".into(),
+                            plan.context_admission_source_digests.join(","),
+                        );
+                    }
+                    attributes
+                },
             ),
             receipt_event(
                 &operation_id,
@@ -6635,6 +6714,13 @@ fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver) {
                 &namespace,
                 normalize_persisted_legacy_policy(policy_from_properties(&obj.properties)),
             );
+            match context_admission_policy_from_properties(&obj.properties) {
+                Ok(Some(policy)) => {
+                    let _ = resolver.set_context_admission_policy(&namespace, policy);
+                }
+                Ok(None) => resolver.clear_context_admission_policy(&namespace),
+                Err(error) => resolver.set_context_admission_error(&namespace, error),
+            }
         }
     }
 }
@@ -6666,14 +6752,44 @@ fn policy_from_properties(properties: &std::collections::HashMap<String, String>
     }
 }
 
-fn policy_properties(policy: &Policy) -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::from([
+fn context_admission_policy_from_properties(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<Option<crate::chisei::policy::ContextAdmissionPolicy>, String> {
+    let Some(encoded) = properties
+        .get("context_admission_policy_json")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if encoded == "null" {
+        return Ok(None);
+    }
+    let policy = serde_json::from_str::<crate::chisei::policy::ContextAdmissionPolicy>(encoded)
+        .map_err(|error| format!("invalid context admission policy: {error}"))?;
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
+fn policy_properties(
+    policy: &Policy,
+    context_admission_policy: Option<&crate::chisei::policy::ContextAdmissionPolicy>,
+) -> std::collections::HashMap<String, String> {
+    let mut properties = std::collections::HashMap::from([
         ("allowed_runtimes".into(), policy.allowed_runtimes.join(",")),
         ("allowed_models".into(), policy.allowed_models.join(",")),
         ("default_runtime".into(), policy.default_runtime.clone()),
         ("default_model".into(), policy.default_model.clone()),
         ("data_class".into(), policy.data_class.clone()),
-    ])
+    ]);
+    if let Some(context_admission_policy) = context_admission_policy {
+        properties.insert(
+            "context_admission_policy_json".into(),
+            serde_json::to_string(context_admission_policy).unwrap_or_default(),
+        );
+    }
+    properties
 }
 
 fn policy_from_request(r: &SetNamespacePolicyRequest) -> Policy {
@@ -8922,6 +9038,49 @@ impl ChiseiService for ChiseiServiceImpl {
                 ..Default::default()
             }));
         }
+        let context_admission_policy = match self.policy.context_admission_policy(namespace) {
+            Ok(policy) => policy,
+            Err(_error) => {
+                return Ok(Response::new(DecideGatewayExecutionResponse {
+                    contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                    admitted: false,
+                    deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
+                    deny_message: "context admission policy unavailable".into(),
+                    context_admission_reasons: vec!["context_admission:unavailable".into()],
+                    ..Default::default()
+                }));
+            }
+        };
+        let context_admission_policy_version = context_admission_policy
+            .as_ref()
+            .map(crate::chisei::policy::ContextAdmissionPolicy::version)
+            .unwrap_or_default();
+        let context_admission_descriptor_version =
+            crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION.to_string();
+        let operation_risk =
+            crate::chisei::policy::OperationRisk::from_labels(&r.operation_class, &r.task_class);
+        let operation_context_gate = context_admission_policy
+            .as_ref()
+            .map(|policy| policy.operation_gate(operation_risk))
+            .transpose()
+            .map_err(Status::failed_precondition)?
+            .flatten();
+        if let Some(gate) = operation_context_gate
+            .as_ref()
+            .filter(|gate| gate.blocks_provider())
+        {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
+                deny_message: "context admission policy requires review or verification".into(),
+                context_admission_policy_version: gate.policy_version.clone(),
+                context_admission_descriptor_version: gate.descriptor_version.clone(),
+                context_admission_decision: gate.action.as_str().into(),
+                context_admission_reasons: vec![gate.reason_code.clone()],
+                ..Default::default()
+            }));
+        }
 
         let project = if r.project.trim().is_empty() {
             namespace
@@ -9136,6 +9295,21 @@ impl ChiseiService for ChiseiServiceImpl {
             eval_regression_reason: policy_resolution
                 .as_ref()
                 .map(|resolution| resolution.eval_regression_reason.clone())
+                .unwrap_or_default(),
+            context_admission_policy_version: context_admission_policy_version.clone(),
+            context_admission_descriptor_version: context_admission_descriptor_version.clone(),
+            context_admission_decision: operation_context_gate
+                .as_ref()
+                .map(|gate| gate.action.as_str().to_string())
+                .unwrap_or_else(|| {
+                    context_admission_policy
+                        .as_ref()
+                        .map(|_| ContextAdmissionAction::Include.as_str().to_string())
+                        .unwrap_or_default()
+                }),
+            context_admission_reasons: operation_context_gate
+                .as_ref()
+                .map(|gate| vec![gate.reason_code.clone()])
                 .unwrap_or_default(),
         };
         match &composed.outcome {
@@ -9542,6 +9716,24 @@ impl ChiseiService for ChiseiServiceImpl {
             }
             let policy = normalize_legacy_policy_provider_pairs(policy_from_request(&r));
             validate_policy_provider_pairs(&policy).map_err(Status::invalid_argument)?;
+            let context_admission_policy = if r.context_admission_policy_json.trim().is_empty() {
+                self.policy
+                    .context_admission_policy(&r.namespace)
+                    .map_err(Status::failed_precondition)?
+            } else if r.context_admission_policy_json.trim() == "null" {
+                None
+            } else {
+                let context_policy = serde_json::from_str::<
+                    crate::chisei::policy::ContextAdmissionPolicy,
+                >(&r.context_admission_policy_json)
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid context admission policy: {error}"))
+                })?;
+                context_policy
+                    .validate()
+                    .map_err(Status::invalid_argument)?;
+                Some(context_policy)
+            };
             let policy_data_class = policy.data_class.clone();
             let policy_version = policy.version();
             let current_registry = self.refresh_provider_registry_for_resolution().await?;
@@ -9550,10 +9742,23 @@ impl ChiseiService for ChiseiServiceImpl {
                     "provider registry changed while validating namespace policy",
                 ));
             }
-            persist_namespace_policy(&self.db, &r.namespace, &policy).map_err(Status::internal)?;
+            persist_namespace_policy(
+                &self.db,
+                &r.namespace,
+                &policy,
+                context_admission_policy.as_ref(),
+            )
+            .map_err(Status::internal)?;
             let default_runtime = policy.default_runtime.clone();
             let default_model = policy.default_model.clone();
             self.policy.set_namespace_policy(&r.namespace, policy);
+            if let Some(context_policy) = context_admission_policy {
+                self.policy
+                    .set_context_admission_policy(&r.namespace, context_policy)
+                    .map_err(Status::invalid_argument)?;
+            } else {
+                self.policy.clear_context_admission_policy(&r.namespace);
+            }
             let (runtime, model) = self
                 .policy
                 .resolve(&r.namespace, &default_runtime, &default_model)
@@ -10495,6 +10700,10 @@ impl ChiseiService for ChiseiServiceImpl {
             delegated_principal.as_deref(),
             &r.namespace,
         )?;
+        let context_admission_policy = self
+            .policy
+            .context_admission_policy(&r.namespace)
+            .map_err(Status::failed_precondition)?;
         let mut pr = pipe::PipelineRequest {
             request_id: r.request_id,
             namespace: r.namespace,
@@ -10517,6 +10726,11 @@ impl ChiseiService for ChiseiServiceImpl {
             memory_assignment_id: String::new(),
             memory_token_budget: 512,
             allowed_evidence_classes: std::collections::HashSet::new(),
+            context_admission_policy,
+            context_admission: pipe::ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
         let evidence_context_gates =
@@ -10576,6 +10790,14 @@ impl ChiseiService for ChiseiServiceImpl {
                     .map(memory_context_reference)
                     .collect(),
                 epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
+                context_admission_policy_version: result.context_admission.policy_version,
+                context_admission_descriptor_version: result.context_admission.descriptor_version,
+                context_admission_decision: result.context_admission.decision,
+                context_admission_reasons: result.context_admission.reason_codes,
+                context_admission_requires_review: result.context_admission.requires_review,
+                context_admission_requires_verification: result
+                    .context_admission
+                    .requires_verification,
             }),
         }))
     }
@@ -20544,6 +20766,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20577,6 +20800,7 @@ mod tests {
                 default_runtime: "openai".into(),
                 default_model: "native-default".into(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap()
@@ -20603,6 +20827,7 @@ mod tests {
                 default_runtime: "kiro".into(),
                 default_model: "gpt-5.5".into(),
                 data_class: String::new(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap_err();
@@ -20624,6 +20849,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-mini".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20634,6 +20860,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20663,6 +20890,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20710,6 +20938,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20756,6 +20985,7 @@ mod tests {
             default_runtime: "native".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: String::new(),
         }))
         .await
         .unwrap();
@@ -20852,6 +21082,13 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let svc = file_service(&path);
+        let context_policy_json = serde_json::json!({
+            "contract_version": crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION,
+            "default_action": "include",
+            "unknown_action": "qualify",
+            "rules": []
+        })
+        .to_string();
         svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
             namespace: "sekai-chisei".into(),
             allowed_runtimes: vec!["openai".into()],
@@ -20859,6 +21096,7 @@ mod tests {
             default_runtime: "openai".into(),
             default_model: "native-default".into(),
             data_class: String::new(),
+            context_admission_policy_json: context_policy_json,
         }))
         .await
         .unwrap();
@@ -20879,6 +21117,15 @@ mod tests {
 
         assert_eq!(resolved.runtime, "native");
         assert_eq!(resolved.model, "native-default");
+        let context_policy = reloaded
+            .policy
+            .context_admission_policy("sekai-chisei")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context_policy.unknown_action,
+            ContextAdmissionAction::Qualify
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -22154,6 +22401,7 @@ mod tests {
                 default_runtime: "native".into(),
                 default_model: "native-default".into(),
                 data_class: "sensitive".into(),
+                context_admission_policy_json: String::new(),
             }))
             .await
             .unwrap()
@@ -22781,6 +23029,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: "local".into(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         svc.cache_plan(plan.clone());
@@ -22799,6 +23054,13 @@ mod tests {
         let plan = ExecutionPlan {
             plan_id: "actor-bound-plan".into(),
             planning_actor: "agent:planner".into(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
             executable: true,
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -22877,6 +23139,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: "local".into(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         svc.cache_plan(plan.clone());
@@ -22988,6 +23257,13 @@ mod tests {
                 evidence_references: vec![],
                 memory_references: vec![],
                 planning_actor: String::new(),
+                context_admission_policy_version: String::new(),
+                context_admission_descriptor_version: String::new(),
+                context_admission_decision: String::new(),
+                context_admission_reasons: Vec::new(),
+                context_admission_source_digests: Vec::new(),
+                context_admission_requires_review: false,
+                context_admission_requires_verification: false,
                 memory_holdouts: vec![],
             });
         }
@@ -23020,6 +23296,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         svc.cache_plan(newest.clone());
@@ -23066,6 +23349,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         let fresh = ExecutionPlan {
@@ -23118,6 +23408,13 @@ mod tests {
                 evidence_references: vec![],
                 memory_references: vec![],
                 planning_actor: String::new(),
+                context_admission_policy_version: String::new(),
+                context_admission_descriptor_version: String::new(),
+                context_admission_decision: String::new(),
+                context_admission_reasons: Vec::new(),
+                context_admission_source_digests: Vec::new(),
+                context_admission_requires_review: false,
+                context_admission_requires_verification: false,
                 memory_holdouts: vec![],
             });
         }
@@ -23150,6 +23447,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: String::new(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         svc.cache_plan(inserted.clone());
@@ -23224,6 +23528,69 @@ mod tests {
         assert!(!admitted.eval_regressed);
         assert!(admitted.deny_reason.is_empty());
         assert!(!admitted.budget_grant_id.is_empty());
+
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy {
+                    contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION
+                        .into(),
+                    default_action: ContextAdmissionAction::Include,
+                    unknown_action: ContextAdmissionAction::HoldOut,
+                    rules: vec![crate::chisei::policy::ContextAdmissionRule {
+                        action: ContextAdmissionAction::RequireReview,
+                        origin_classes: vec![],
+                        evidence_statuses: vec![],
+                        lifecycle_statuses: vec![],
+                        applicability: None,
+                        confidence_basis: None,
+                        min_confidence_bps: None,
+                        max_confidence_bps: None,
+                        operation_risk: Some(crate::chisei::policy::OperationRisk::High),
+                    }],
+                },
+            )
+            .unwrap();
+        let mut context_denied = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "write".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "op-decide-context-review".into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "local".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: false,
+            user_id: "local".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
+        });
+        context_denied
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let context_denied = svc
+            .decide_gateway_execution(context_denied)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!context_denied.admitted);
+        assert_eq!(context_denied.context_admission_decision, "require_review");
+        assert_eq!(
+            context_denied.context_admission_reasons,
+            vec!["context_admission:require_review"]
+        );
+        assert_eq!(
+            context_denied.deny_message,
+            "context admission policy requires review or verification"
+        );
+        svc.policy.clear_context_admission_policy("team-a");
 
         svc.budget
             .set_limit_with_metric(
@@ -23362,6 +23729,13 @@ mod tests {
             evidence_references: vec![],
             memory_references: vec![],
             planning_actor: "local".into(),
+            context_admission_policy_version: String::new(),
+            context_admission_descriptor_version: String::new(),
+            context_admission_decision: String::new(),
+            context_admission_reasons: Vec::new(),
+            context_admission_source_digests: Vec::new(),
+            context_admission_requires_review: false,
+            context_admission_requires_verification: false,
             memory_holdouts: vec![],
         };
         svc.record_planned_operation(&plan, "local").unwrap();
