@@ -5,6 +5,9 @@ projections carry an additive, source-neutral projection named
 `chisei.epistemic-descriptor/v1`. It does not create a new RPC, durable
 resource, or source of truth. Older protobuf clients ignore the new fields and
 continue to read the original reference fields.
+The [#502 resource decision](research/502-epistemic-assertion-resource.md)
+records why this projection remains sufficient and when that boundary may be
+reopened.
 
 Each descriptor keeps three closed dimensions independent:
 

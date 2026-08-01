@@ -29,6 +29,7 @@ reference pages.
 | [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |
 | [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
 | [Epistemic RDF/OWL/PROV-O boundary](501-epistemic-rdf-owl-prov-o.md) | Small edge projection with explicit loss metadata; no RDF parser or reasoner in core; see the conformance fixture |
+| [Durable `EpistemicAssertion` resource decision](502-epistemic-assertion-resource.md) | Projection remains sufficient; no new core resource, endpoint, or persistence family without independent unmet requirements |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
