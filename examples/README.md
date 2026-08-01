@@ -26,6 +26,26 @@ Evidence adapter examples (`evidence_*`) and the batch Responses harness live
 under `examples/` as thin runners and are documented in
 [adapters/README.md](../adapters/README.md).
 
+## epistemic_replication
+
+[epistemic_replication.rs](epistemic_replication.rs) is a local, deterministic
+computational-replication fixture. Its versioned research-domain schema stays
+under `examples/epistemic-replication/`; the executable exercises the existing
+schema, evidence, governed-subject, evaluation-plan, receipt, context-policy,
+and Kioku contracts without adding domain-specific core types or endpoints.
+Its governed-subject check covers the replication artifact through the existing
+software-release reference shape; the research-claim plan remains a separate
+domain-local evaluation profile. The governed source-tree digest covers both
+the executable fixture and its versioned domain package.
+
+```bash
+cargo run --locked --example epistemic_replication
+cargo test --locked --test epistemic_replication_example
+```
+
+See [the fixture walkthrough](../docs/epistemic-replication-example.md) for the
+exact commands and the bounded report fields.
+
 ## governed_fact_profile
 
 [governed_fact_profile.rs](governed_fact_profile.rs) shows an external software

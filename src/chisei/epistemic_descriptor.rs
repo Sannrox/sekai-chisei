@@ -6,7 +6,9 @@
 //! single trust enum.  Constructors in this module only use fields that are
 //! already authoritative for the source being projected.
 
-use crate::chisei::kioku::{KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance};
+use crate::chisei::kioku::{
+    KIOKU_EVIDENCE_REASSESSMENT_METHOD, KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance,
+};
 use crate::sekai::evidence::EvidenceLifecycleState;
 use crate::sekai::evidence_store::EvidenceSubmissionRecord;
 use serde::{Deserialize, Serialize};
@@ -217,14 +219,44 @@ impl EpistemicDescriptor {
     /// Project a retrieved Kioku memory after the normal Kioku authorization
     /// and classification checks have succeeded.
     pub fn from_kioku(memory: &KiokuMemory, evidence: &[KiokuEvidenceLink]) -> Self {
-        let supporting = evidence
-            .iter()
-            .filter(|link| link.stance == MemoryEvidenceStance::Supporting)
-            .count();
-        let contradicting = evidence
-            .iter()
-            .filter(|link| link.stance == MemoryEvidenceStance::Contradicting)
-            .count();
+        // Reassessment versions carry the authoritative evidence lifecycle and
+        // stance in `evidence_basis`; their copied operation links are only
+        // continuity references. Project counts from the basis whenever it is
+        // present so a stale/retracted or newly contested basis cannot be
+        // mistaken for the prior supported projection.
+        let has_authoritative_basis = memory.derivation_method
+            == KIOKU_EVIDENCE_REASSESSMENT_METHOD
+            && !memory.evidence_basis.is_empty();
+        let supporting = if has_authoritative_basis {
+            memory
+                .evidence_basis
+                .iter()
+                .filter(|basis| {
+                    basis.lifecycle_state.is_usable()
+                        && basis.stance == MemoryEvidenceStance::Supporting
+                })
+                .count()
+        } else {
+            evidence
+                .iter()
+                .filter(|link| link.stance == MemoryEvidenceStance::Supporting)
+                .count()
+        };
+        let contradicting = if has_authoritative_basis {
+            memory
+                .evidence_basis
+                .iter()
+                .filter(|basis| {
+                    basis.lifecycle_state.is_usable()
+                        && basis.stance == MemoryEvidenceStance::Contradicting
+                })
+                .count()
+        } else {
+            evidence
+                .iter()
+                .filter(|link| link.stance == MemoryEvidenceStance::Contradicting)
+                .count()
+        };
         let evidence_status = if supporting == 0 {
             if contradicting == 0 {
                 EvidenceStatus::Insufficient
@@ -236,27 +268,75 @@ impl EpistemicDescriptor {
         } else {
             EvidenceStatus::Supported
         };
-        let lifecycle_status = match memory.state.as_str() {
-            "active" => LifecycleStatus::Current,
-            "superseded" => LifecycleStatus::Superseded,
-            "rejected" => LifecycleStatus::Retracted,
-            // Candidate is not an admitted planning reference.  Keep this
-            // branch conservative if a future caller projects one anyway.
-            _ => LifecycleStatus::Unknown,
+        let lifecycle_status = if has_authoritative_basis {
+            // A reassessment snapshot can invalidate an otherwise active
+            // memory. Preserve the strongest inactive state so context policy
+            // cannot admit a projection backed only by stale or retracted
+            // evidence. Mixed available/inactive bases remain conservative.
+            if memory
+                .evidence_basis
+                .iter()
+                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Retracted)
+            {
+                LifecycleStatus::Retracted
+            } else if memory
+                .evidence_basis
+                .iter()
+                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Stale)
+            {
+                LifecycleStatus::Stale
+            } else if memory
+                .evidence_basis
+                .iter()
+                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Superseded)
+            {
+                LifecycleStatus::Superseded
+            } else if memory
+                .evidence_basis
+                .iter()
+                .all(|basis| basis.lifecycle_state == EvidenceLifecycleState::Available)
+            {
+                match memory.state.as_str() {
+                    "active" => LifecycleStatus::Current,
+                    "superseded" => LifecycleStatus::Superseded,
+                    "rejected" => LifecycleStatus::Retracted,
+                    _ => LifecycleStatus::Unknown,
+                }
+            } else {
+                LifecycleStatus::Unknown
+            }
+        } else {
+            match memory.state.as_str() {
+                "active" => LifecycleStatus::Current,
+                "superseded" => LifecycleStatus::Superseded,
+                "rejected" => LifecycleStatus::Retracted,
+                // Candidate is not an admitted planning reference. Keep this
+                // branch conservative if a future caller projects one anyway.
+                _ => LifecycleStatus::Unknown,
+            }
         };
         let origin_class = match memory.derivation_method.as_str() {
             // This is the only derivation contract currently authoritative in
             // Kioku.  Other producer labels must remain unknown, not guessed.
-            "verified_binary_outcomes/v1" => OriginClass::Derived,
+            "verified_binary_outcomes/v1" | KIOKU_EVIDENCE_REASSESSMENT_METHOD => {
+                OriginClass::Derived
+            }
             _ => OriginClass::Unknown,
         };
-        let observed_at_ms = evidence
+        let observed_at_ms = memory
+            .evidence_basis
             .iter()
-            .map(|link| link.observed_at_ms)
+            .map(|basis| basis.observed_at_ms)
+            .chain(evidence.iter().map(|link| link.observed_at_ms))
             .filter(|value| (0..=MAX_OBSERVED_AT_MS).contains(value))
             .max()
             .or_else(|| memory.last_confirmed_at_ms.and_then(bounded_observed_at))
             .or_else(|| bounded_observed_at(memory.created_at_ms));
+        // Evidence-basis references are reassessment snapshots, not an
+        // authorization grant for the underlying source. Keep descriptor
+        // references operation-scoped, just as the ordinary projection does;
+        // a caller that needs source-level detail must re-authorize it through
+        // the evidence store.
         let source_refs = evidence
             .iter()
             .filter_map(|link| bounded_source_string(&link.operation_id))
@@ -279,8 +359,16 @@ impl EpistemicDescriptor {
             derivation_ref: bounded_optional_string(&memory.derivation_method),
             source_refs,
             source_digests,
-            source_row_count: Some(evidence.len().min(MAX_SOURCE_ROWS) as u32),
-            source_rows_truncated: evidence.len() > MAX_SOURCE_ROWS,
+            source_row_count: Some(if has_authoritative_basis {
+                memory.evidence_basis.len().min(MAX_SOURCE_ROWS) as u32
+            } else {
+                evidence.len().min(MAX_SOURCE_ROWS) as u32
+            }),
+            source_rows_truncated: if has_authoritative_basis {
+                memory.evidence_basis.len() > MAX_SOURCE_ROWS
+            } else {
+                evidence.len() > MAX_SOURCE_ROWS
+            },
             supporting_evidence_count: Some(supporting.min(u32::MAX as usize) as u32),
             contradicting_evidence_count: Some(contradicting.min(u32::MAX as usize) as u32),
         }
@@ -460,8 +548,10 @@ fn serialized_len(descriptor: &EpistemicDescriptor) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::kioku::{KiokuEvidenceLink, KiokuMemory, MemoryKind, MemoryLifecycleState};
-    use crate::sekai::evidence::{EvidenceClassification, EvidenceIntent};
+    use crate::chisei::kioku::{
+        KiokuEvidenceBasis, KiokuEvidenceLink, KiokuMemory, MemoryKind, MemoryLifecycleState,
+    };
+    use crate::sekai::evidence::{EvidenceClassification, EvidenceIntent, EvidenceLifecycleState};
 
     fn memory(state: MemoryLifecycleState) -> KiokuMemory {
         KiokuMemory {
@@ -579,6 +669,54 @@ mod tests {
         assert_eq!(descriptor.contradicting_evidence_count, Some(1));
         assert!(descriptor.source_digests.is_empty());
         descriptor.validate().unwrap();
+    }
+
+    #[test]
+    fn reassessment_projection_uses_authoritative_basis_counts() {
+        let mut memory = memory(MemoryLifecycleState::Active);
+        memory.derivation_method = KIOKU_EVIDENCE_REASSESSMENT_METHOD.into();
+        memory.evidence_basis = vec![
+            KiokuEvidenceBasis {
+                evidence_reference: "supporting-submission".into(),
+                evidence_digest: "supporting-digest".into(),
+                source_submission_id: "supporting-submission".into(),
+                stance: MemoryEvidenceStance::Supporting,
+                lifecycle_state: EvidenceLifecycleState::Available,
+                observed_at_ms: 40,
+            },
+            KiokuEvidenceBasis {
+                evidence_reference: "contradicting-submission".into(),
+                evidence_digest: "contradicting-digest".into(),
+                source_submission_id: "contradicting-submission".into(),
+                stance: MemoryEvidenceStance::Contradicting,
+                lifecycle_state: EvidenceLifecycleState::Available,
+                observed_at_ms: 50,
+            },
+        ];
+        memory.evidence_basis_digest =
+            crate::chisei::kioku::canonical_evidence_basis_digest(&memory.evidence_basis);
+        let descriptor =
+            EpistemicDescriptor::from_kioku(&memory, &[link(MemoryEvidenceStance::Supporting, 10)]);
+        assert_eq!(descriptor.origin_class, OriginClass::Derived);
+        assert_eq!(descriptor.evidence_status, EvidenceStatus::Contested);
+        assert_eq!(descriptor.supporting_evidence_count, Some(1));
+        assert_eq!(descriptor.contradicting_evidence_count, Some(1));
+        assert_eq!(descriptor.observed_at_ms, Some(50));
+        assert_eq!(descriptor.source_refs, vec!["operation-10"]);
+        assert_eq!(descriptor.lifecycle_status, LifecycleStatus::Current);
+
+        let mut stale_memory = memory.clone();
+        stale_memory.evidence_basis[0].lifecycle_state = EvidenceLifecycleState::Stale;
+        let stale_descriptor = EpistemicDescriptor::from_kioku(&stale_memory, &[]);
+        assert_eq!(stale_descriptor.lifecycle_status, LifecycleStatus::Stale);
+
+        let mut retracted_memory = memory;
+        retracted_memory.evidence_basis[0].lifecycle_state = EvidenceLifecycleState::Retracted;
+        let retracted_descriptor = EpistemicDescriptor::from_kioku(&retracted_memory, &[]);
+        assert_eq!(
+            retracted_descriptor.lifecycle_status,
+            LifecycleStatus::Retracted
+        );
     }
 
     #[test]

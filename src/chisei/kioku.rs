@@ -307,45 +307,164 @@ fn baseline_evidence_basis(
         .collect())
 }
 
+fn validate_merged_evidence_basis(merged: &[KiokuEvidenceBasis]) -> Result<(), String> {
+    let mut source_ids = std::collections::HashSet::new();
+    let mut bound_content = std::collections::HashSet::new();
+    let mut unbound_content = std::collections::HashSet::new();
+    for entry in merged {
+        let content_identity = (
+            entry.evidence_reference.clone(),
+            entry.evidence_digest.clone(),
+        );
+        if !entry.source_submission_id.is_empty()
+            && !source_ids.insert(entry.source_submission_id.as_str())
+        {
+            return Err(format!(
+                "evidence submission {} appears more than once",
+                entry.source_submission_id
+            ));
+        }
+        if entry.source_submission_id.is_empty() {
+            if !unbound_content.insert(content_identity) {
+                return Err("unbound evidence basis contains duplicate identities".into());
+            }
+        } else {
+            // Distinct admitted submissions may legitimately carry identical
+            // content. Their submission IDs remain the authoritative identity.
+            bound_content.insert(content_identity);
+        }
+    }
+    if bound_content
+        .intersection(&unbound_content)
+        .next()
+        .is_some()
+    {
+        return Err("bound and unbound evidence basis entries share an identity".into());
+    }
+    Ok(())
+}
+
+fn normalize_legacy_evidence_basis(baseline: &[KiokuEvidenceBasis]) -> Vec<KiokuEvidenceBasis> {
+    let bound_content = baseline
+        .iter()
+        .filter(|entry| !entry.source_submission_id.is_empty())
+        .map(|entry| {
+            (
+                entry.evidence_reference.clone(),
+                entry.evidence_digest.clone(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    baseline
+        .iter()
+        .filter(|entry| {
+            !entry.source_submission_id.is_empty()
+                || !bound_content.contains(&(
+                    entry.evidence_reference.clone(),
+                    entry.evidence_digest.clone(),
+                ))
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn merge_evidence_basis(
     baseline: &[KiokuEvidenceBasis],
     updates: &[KiokuEvidenceBasis],
     now_ms: i64,
 ) -> Result<Vec<KiokuEvidenceBasis>, String> {
-    let mut merged = baseline.to_vec();
+    // Older reassessment code could append a bound representation beside its
+    // prior unbound entry. Prefer the bound representation before enforcing
+    // the current invariant so persisted memories remain reassessable.
+    let mut merged = normalize_legacy_evidence_basis(baseline);
+    validate_merged_evidence_basis(&merged)?;
     for basis in updates {
         basis.validate()?;
         if basis.observed_at_ms > now_ms {
             return Err("evidence observed_at_ms cannot be in the future".into());
         }
-        if let Some(existing) = merged.iter_mut().find(|existing| {
-            (existing.source_submission_id == basis.source_submission_id
-                && !basis.source_submission_id.is_empty())
-                || (existing.source_submission_id.is_empty()
-                    && basis.source_submission_id.is_empty()
-                    && existing.evidence_reference == basis.evidence_reference
-                    && existing.evidence_digest == basis.evidence_digest)
-        }) {
-            if !basis.source_submission_id.is_empty()
-                && existing.evidence_reference != basis.evidence_reference
-            {
+        let identity_matches = merged
+            .iter()
+            .enumerate()
+            .filter(|(_, existing)| {
+                existing.evidence_reference == basis.evidence_reference
+                    && existing.evidence_digest == basis.evidence_digest
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let source_matches = if basis.source_submission_id.is_empty() {
+            Vec::new()
+        } else {
+            merged
+                .iter()
+                .enumerate()
+                .filter(|(_, existing)| existing.source_submission_id == basis.source_submission_id)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        if source_matches.len() > 1 {
+            return Err(format!(
+                "evidence submission {} appears more than once",
+                basis.source_submission_id
+            ));
+        }
+        let index = if let Some(index) = source_matches.into_iter().next() {
+            let existing = &merged[index];
+            if existing.evidence_reference != basis.evidence_reference {
                 return Err(format!(
                     "evidence identity {} cannot change its evidence reference",
                     basis.source_submission_id
                 ));
             }
-            if !basis.source_submission_id.is_empty()
-                && existing.evidence_digest != basis.evidence_digest
-            {
+            if existing.evidence_digest != basis.evidence_digest {
                 return Err(format!(
                     "evidence identity {} conflicts with a different digest",
                     basis.source_submission_id
                 ));
             }
-            *existing = basis.clone();
+            Some(index)
+        } else if basis.source_submission_id.is_empty() {
+            if identity_matches.len() > 1 {
+                return Err("unbound evidence basis identity is ambiguous".into());
+            }
+            identity_matches.into_iter().next()
+        } else {
+            let unbound_matches = identity_matches
+                .iter()
+                .copied()
+                .filter(|index| merged[*index].source_submission_id.is_empty())
+                .collect::<Vec<_>>();
+            if unbound_matches.len() > 1 {
+                return Err("unbound evidence basis identity is ambiguous".into());
+            }
+            if let Some(index) = unbound_matches.into_iter().next() {
+                if identity_matches.len() > 1 {
+                    return Err("evidence basis identity is ambiguous".into());
+                }
+                Some(index)
+            } else {
+                // A new bound submission may share content identity with
+                // other bound submissions; the source submission ID is its
+                // distinct key.
+                None
+            }
+        };
+        if let Some(index) = index {
+            if basis.source_submission_id.is_empty()
+                && !merged[index].source_submission_id.is_empty()
+            {
+                // An unbound refresh may update stance/lifecycle metadata, but
+                // it must never erase an already-authorized submission binding.
+                let mut refreshed = basis.clone();
+                refreshed.source_submission_id = merged[index].source_submission_id.clone();
+                merged[index] = refreshed;
+            } else {
+                merged[index] = basis.clone();
+            }
         } else {
             merged.push(basis.clone());
         }
+        validate_merged_evidence_basis(&merged)?;
     }
     Ok(merged)
 }
@@ -2631,6 +2750,107 @@ mod tests {
             outcome_value: 1.0,
             observed_at_ms: 100,
         }
+    }
+
+    #[test]
+    fn reassessment_can_bind_an_existing_unbound_basis() {
+        let baseline = KiokuEvidenceBasis {
+            evidence_reference: "submission:42".into(),
+            evidence_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            source_submission_id: String::new(),
+            stance: MemoryEvidenceStance::Supporting,
+            lifecycle_state: EvidenceLifecycleState::Available,
+            observed_at_ms: 100,
+        };
+        let bound = KiokuEvidenceBasis {
+            source_submission_id: "evidence-submission-42".into(),
+            ..baseline.clone()
+        };
+        let merged = merge_evidence_basis(
+            std::slice::from_ref(&baseline),
+            std::slice::from_ref(&bound),
+            200,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source_submission_id, "evidence-submission-42");
+
+        let normalized_legacy =
+            merge_evidence_basis(&[baseline.clone(), bound.clone()], &[], 200).unwrap();
+        assert_eq!(normalized_legacy.len(), 1);
+        assert_eq!(
+            normalized_legacy[0].source_submission_id,
+            "evidence-submission-42"
+        );
+
+        let second_bound = KiokuEvidenceBasis {
+            source_submission_id: "evidence-submission-99".into(),
+            ..bound.clone()
+        };
+        let distinct_bound_submissions = merge_evidence_basis(
+            std::slice::from_ref(&bound),
+            std::slice::from_ref(&second_bound),
+            200,
+        )
+        .unwrap();
+        assert_eq!(distinct_bound_submissions.len(), 2);
+        assert!(
+            merge_evidence_basis(
+                &distinct_bound_submissions,
+                std::slice::from_ref(&baseline),
+                200,
+            )
+            .is_err()
+        );
+
+        let refreshed_bound = merge_evidence_basis(
+            std::slice::from_ref(&bound),
+            std::slice::from_ref(&baseline),
+            200,
+        )
+        .unwrap();
+        assert_eq!(refreshed_bound.len(), 1);
+        assert_eq!(
+            refreshed_bound[0].source_submission_id,
+            "evidence-submission-42"
+        );
+
+        let already_bound = KiokuEvidenceBasis {
+            evidence_reference: "other-reference".into(),
+            source_submission_id: "evidence-submission-42".into(),
+            ..bound.clone()
+        };
+        let unbound_other = KiokuEvidenceBasis {
+            evidence_reference: "unbound-other".into(),
+            source_submission_id: String::new(),
+            ..bound.clone()
+        };
+        assert!(
+            merge_evidence_basis(
+                &[unbound_other.clone(), already_bound.clone()],
+                &[KiokuEvidenceBasis {
+                    evidence_reference: unbound_other.evidence_reference.clone(),
+                    ..already_bound.clone()
+                }],
+                200,
+            )
+            .is_err()
+        );
+        assert!(
+            merge_evidence_basis(
+                &[already_bound, unbound_other.clone()],
+                &[KiokuEvidenceBasis {
+                    evidence_reference: unbound_other.evidence_reference,
+                    ..KiokuEvidenceBasis {
+                        source_submission_id: "evidence-submission-42".into(),
+                        ..bound.clone()
+                    }
+                }],
+                200,
+            )
+            .is_err()
+        );
     }
 
     #[test]
