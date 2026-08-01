@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ChiseiContextReference",
+      "description": "An existing, authorization-filtered Chisei planning or execution reference whose source remains authoritative outside the projection.",
+      "superclasses": [],
+      "properties": []
+    },
+    {
+      "name": "ChiseiEpistemicDescriptor",
+      "description": "A bounded, read-only chisei.epistemic-descriptor/v1 projection that keeps origin, evidence, and lifecycle dimensions separate; it carries no source payload and is not durable epistemic authority.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "contract_version",
+          "type": "string",
+          "required": true,
+          "description": "Projection semantics identifier: chisei.epistemic-descriptor/v1."
+        },
+        {
+          "name": "origin_class",
+          "type": "string",
+          "required": true,
+          "description": "Closed origin dimension: asserted, derived, hypothesis, or unknown."
+        },
+        {
+          "name": "evidence_status",
+          "type": "string",
+          "required": true,
+          "description": "Closed evidence dimension: supported, contested, insufficient, or unknown."
+        },
+        {
+          "name": "lifecycle_status",
+          "type": "string",
+          "required": true,
+          "description": "Closed lifecycle dimension: current, stale, retracted, superseded, or unknown."
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "name": "describes_existing_context_reference",
+      "description": "Associates a read-only descriptor projection with an existing context reference without transferring source authority.",
+      "domain": "ChiseiEpistemicDescriptor",
+      "range": "ChiseiContextReference",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ChiseiEpistemicDescriptor",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/epistemic_descriptor.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiEpistemicDescriptor",
+      "source": "sekai-chisei",
+      "locator": "docs/epistemic-descriptor.md",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiContextReference",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/pipeline.rs",
+      "confidence": 1.0
+    }
+  ]
+}

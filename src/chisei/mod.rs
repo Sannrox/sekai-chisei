@@ -6,6 +6,7 @@ pub mod capability;
 pub mod controller;
 pub mod egress;
 pub mod entitlements;
+pub mod epistemic_descriptor;
 pub mod epistemic_eval;
 pub mod eval;
 pub mod evaluation_execution;

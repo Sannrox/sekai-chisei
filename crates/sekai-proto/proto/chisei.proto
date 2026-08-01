@@ -93,6 +93,28 @@ message PipelineRunResult {
   string prepared_spec = 4;
   repeated ContextEvidenceReference evidence_references = 5;
   repeated MemoryContextReference memory_references = 6;
+  // Projection contract carried additively by planning/execution results.
+  string epistemic_descriptor_version = 7;
+}
+
+// Versioned, source-neutral epistemic metadata. The three status dimensions
+// are independent; "unknown" is explicit when the authoritative projection
+// cannot establish a value. Payload content is never carried here.
+message EpistemicDescriptor {
+  string contract_version = 1;
+  string origin_class = 2; // asserted | derived | hypothesis | unknown
+  string evidence_status = 3; // supported | contested | insufficient | unknown
+  string lifecycle_status = 4; // current | stale | retracted | superseded | unknown
+  optional uint32 producer_confidence_bps = 5;
+  string confidence_basis = 6; // producer_input when present
+  optional int64 observed_at_ms = 7;
+  string derivation_ref = 8;
+  repeated string source_refs = 9;
+  repeated string source_digests = 10;
+  optional uint32 source_row_count = 11;
+  bool source_rows_truncated = 12;
+  optional uint32 supporting_evidence_count = 13;
+  optional uint32 contradicting_evidence_count = 14;
 }
 
 message MemoryContextReference {
@@ -103,6 +125,7 @@ message MemoryContextReference {
   string applicability = 5;
   repeated string evidence_operation_ids = 6;
   string content_digest = 7;
+  EpistemicDescriptor descriptor = 8;
 }
 
 message MemoryHoldoutReference {
@@ -126,6 +149,7 @@ message ContextEvidenceReference {
   string classification = 11;
   string projection_version = 12;
   repeated string disclosed_fields = 13;
+  EpistemicDescriptor descriptor = 14;
 }
 
 message ChatMessage {
