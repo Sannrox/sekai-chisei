@@ -101,6 +101,74 @@
       ]
     },
     {
+      "name": "ChiseiKiokuMemory",
+      "description": "A versioned, namespace-scoped Chisei institutional memory whose active version remains immutable when governed evidence is reassessed; successor candidates require human review.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "contract_version",
+          "type": "string",
+          "required": true,
+          "description": "Memory contract identifier: kioku.memory/v1."
+        },
+        {
+          "name": "lifecycle_state",
+          "type": "string",
+          "required": true,
+          "description": "Candidate, active, superseded, or rejected memory lifecycle state."
+        },
+        {
+          "name": "evidence_basis_digest",
+          "type": "string",
+          "required": false,
+          "description": "Digest of the canonical exact evidence basis used by a reassessment candidate."
+        },
+        {
+          "name": "reassessment_key",
+          "type": "string",
+          "required": false,
+          "description": "Bounded idempotency key for an evidence reassessment."
+        }
+      ]
+    },
+    {
+      "name": "ChiseiKiokuEvidenceBasis",
+      "description": "An identity-and-digest-only snapshot of one admitted evidence item used to recalculate a Kioku successor candidate; the source submission remains authoritative.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "evidence_reference",
+          "type": "string",
+          "required": true,
+          "description": "Exact source evidence reference."
+        },
+        {
+          "name": "evidence_digest",
+          "type": "string",
+          "required": true,
+          "description": "Exact content digest for the referenced evidence."
+        },
+        {
+          "name": "source_submission_id",
+          "type": "string",
+          "required": false,
+          "description": "Authoritative admitted evidence submission identity when newly attached."
+        },
+        {
+          "name": "lifecycle_state",
+          "type": "string",
+          "required": true,
+          "description": "Admitted evidence lifecycle state at reassessment."
+        },
+        {
+          "name": "stance",
+          "type": "string",
+          "required": true,
+          "description": "Supporting or contradicting relation to the memory claim."
+        }
+      ]
+    },
+    {
       "name": "SekaiGraphProjectionReference",
       "description": "An authorization-filtered asserted graph fact or query-time ontology derivation returned by an existing Sekai retrieval surface.",
       "superclasses": [],
@@ -185,6 +253,28 @@
         "max": 1
       },
       "transitive": false
+    },
+    {
+      "name": "supersedes_kioku_memory_version",
+      "description": "Associates a reviewable Kioku successor candidate with the exact prior memory version it may supersede after human promotion.",
+      "domain": "ChiseiKiokuMemory",
+      "range": "ChiseiKiokuMemory",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    },
+    {
+      "name": "binds_kioku_evidence_basis",
+      "description": "Associates a Kioku memory version with each bounded exact evidence-basis snapshot used to derive its support and uncertainty.",
+      "domain": "ChiseiKiokuMemory",
+      "range": "ChiseiKiokuEvidenceBasis",
+      "cardinality": {
+        "min": 0,
+        "max": 1024
+      },
+      "transitive": false
     }
   ],
   "provenance": [
@@ -228,6 +318,30 @@
       "subject": "ChiseiContextAdmissionDecision",
       "source": "sekai-chisei",
       "locator": "src/grpc/chisei_service.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiKiokuMemory",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/kioku.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiKiokuMemory",
+      "source": "sekai-chisei",
+      "locator": "docs/kioku-evidence-reassessment.md",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiKiokuEvidenceBasis",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/kioku.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiKiokuEvidenceBasis",
+      "source": "sekai-chisei",
+      "locator": "docs/kioku-evidence-reassessment.md",
       "confidence": 1.0
     },
     {

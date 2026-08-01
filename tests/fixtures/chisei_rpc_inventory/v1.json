@@ -603,6 +603,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ReassessKiokuMemory",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/chisei_kioku.rs",
+        "src/db/postgres_kioku.rs",
+        "docs/kioku-evidence-reassessment.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "IssueGunshiRecommendations",
       "kind": "computed",
       "surfaces": [],

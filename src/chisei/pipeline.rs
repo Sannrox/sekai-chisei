@@ -2197,6 +2197,10 @@ mod tests {
             expires_at_ms: Some(i64::MAX - 1),
             last_confirmed_at_ms: Some(100),
             supersedes: None,
+            evidence_basis: vec![],
+            evidence_basis_digest: String::new(),
+            reassessment_key: String::new(),
+            reassessment_actor: String::new(),
         };
         db.insert_kioku_memory(
             &memory,
@@ -2330,6 +2334,10 @@ mod tests {
             expires_at_ms: Some(i64::MAX),
             last_confirmed_at_ms: Some(100),
             supersedes: None,
+            evidence_basis: vec![],
+            evidence_basis_digest: String::new(),
+            reassessment_key: String::new(),
+            reassessment_actor: String::new(),
         };
         let memory_id = memory.id.clone();
         let memory_version = memory.version;

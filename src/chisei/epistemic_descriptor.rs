@@ -487,6 +487,10 @@ mod tests {
             expires_at_ms: None,
             last_confirmed_at_ms: Some(20),
             supersedes: None,
+            evidence_basis: vec![],
+            evidence_basis_digest: String::new(),
+            reassessment_key: String::new(),
+            reassessment_actor: String::new(),
         }
     }
 

@@ -20,6 +20,7 @@ use crate::chisei::kioku::*;
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
+use crate::db::chisei_kioku::ChiseiKiokuBackend;
 use crate::domain::{Direction, Link, ListFilter, Object, ObjectSet};
 use crate::sekai::action::ActionTypeDef;
 use crate::sekai::action_approval::{ActionApproval, ApprovalStatus};
@@ -1856,7 +1857,27 @@ impl RuntimeDb {
     ) -> Result<EvidenceClassification, String> {
         match self {
             Self::Sqlite(db) => db.kioku_authorized_classification_ceiling(namespace, actor),
-            Self::Postgres(_) => Err("kioku_authorized_classification_ceiling is unavailable on the PostgreSQL community runtime".into()),
+            Self::Postgres(db) => db.kioku_authorized_classification_ceiling(namespace, actor),
+        }
+    }
+
+    pub fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        match self {
+            Self::Sqlite(db) => db.reassess_kioku_memory(request),
+            Self::Postgres(db) => db.reassess_kioku_memory(request),
+        }
+    }
+
+    pub fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.authorize_kioku_evidence(request),
+            Self::Postgres(db) => db.authorize_kioku_evidence(request),
         }
     }
 
@@ -2661,6 +2682,18 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.list_kioku_candidates(namespace, operation_class, limit),
             Self::Postgres(db) => db.list_kioku_candidates(namespace, operation_class, limit),
+        }
+    }
+
+    pub fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&crate::chisei::kioku::KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_kioku_candidate_page(namespace, limit, cursor),
+            Self::Postgres(db) => db.list_kioku_candidate_page(namespace, limit, cursor),
         }
     }
 
