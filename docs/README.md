@@ -60,6 +60,9 @@ If you want to deploy or operate the control plane:
   review-gated successor candidates when admitted evidence changes.
 - [Epistemic descriptor](epistemic-descriptor.md) — additive, bounded
   origin/evidence/lifecycle metadata on existing context references.
+- [Epistemic metadata conformance](epistemic-metadata-conformance.md) —
+  black-box non-disclosure evidence across graph, scenario, receipt, and
+  descriptor projections.
 - [Context admission policy](context-admission-policy.md) — opt-in,
   versioned rules for using or holding out epistemically qualified context.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,

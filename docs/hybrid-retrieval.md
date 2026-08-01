@@ -22,13 +22,14 @@ representation-specific `score_kind`.
     representation is selected and `fusion_profile` is empty)
 - **No silent cross-kind score comparison.** Each candidate retains
   `representation_id`, `score`, and `score_kind`
-  (`graph.context_affinity/v1` or `text.fts5_bm25/v1`).
+  (`graph.context_affinity/v1` or `text.authorized_bm25/v1`).
 - **Partial failure is first-class.** Per-adapter status is
   `ok | truncated | denied_empty | error`. Healthy adapters still contribute
   candidates when another side fails.
 - **Authz re-check.** Graph and text adapters re-use live ACL / marking /
-  evidence checks. Hidden material is omitted; fusion order, counts, and error
-  messages must not name denied sources.
+  evidence checks. Hidden material is omitted; fusion order, public counts, and
+  error messages must not expose denied sources. Denial accounting stays
+  internal to the adapter.
 - **Similarity never mints identity.** `entity_ref` is set only when a source
   of truth already asserts the id.
 - **SQLite complete baseline.** No external vector service is required.
@@ -38,9 +39,9 @@ representation-specific `score_kind`.
 ```text
 HybridRetrieve
   representations[]          # required, non-empty
-                             # graph.retrieve_context | text.fts5
+                             # graph.retrieve_context | text.authorized
   graph: HybridGraphParams   # RetrieveContext-compatible bounds
-  text:  HybridTextParams    # query + source_kinds + optional rebuild
+  text:  HybridTextParams    # query + source_kinds; legacy rebuild is ignored
   fusion_profile             # required when len(representations) > 1
   max_candidates             # default 40, cap 200
   max_per_representation     # default 20, cap 100
@@ -61,7 +62,7 @@ Response:
 | Representation | Adapter | Score kind |
 | --- | --- | --- |
 | `graph.retrieve_context` | Wraps existing `RetrieveContext` semantics (#144) | `graph.context_affinity/v1` |
-| `text.fts5` | Wraps `SearchText` / FTS projection (#360) | `text.fts5_bm25/v1` |
+| `text.authorized` | Wraps the authorization-built SearchText corpus (#497) | `text.authorized_bm25/v1` |
 
 ## Capability catalog
 
@@ -82,7 +83,7 @@ semantic retrieval surfaces (`x-sekai-capability`, `x-sekai-namespace`,
 
 ## Non-goals
 
-- Building the FTS index (done in #360).
+- Maintaining the internal global FTS projection (done in #360).
 - Multi-hop pattern IR (delivered as [#375](https://github.com/Sannrox/sekai-chisei/issues/375);
   see [pattern-plan.md](pattern-plan.md) / research [#145](research/145-semantic-pattern-query.md)).
 - Automatic NL adapter selection or embedding training.

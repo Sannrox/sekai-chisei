@@ -2631,6 +2631,30 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_evidence_submissions_for_text(
+        &self,
+        namespace: &str,
+        principals: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<EvidenceSubmissionRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_evidence_submissions_for_text(
+                namespace,
+                principals,
+                allowed_markings,
+                trusted,
+                limit,
+                offset,
+            ),
+            Self::Postgres(_) => Err(
+                "authorization-built text evidence visibility is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
     pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
         match self {
             Self::Sqlite(db) => db.list_evolve_enhancements(),
@@ -2787,6 +2811,50 @@ impl RuntimeDb {
                 let _ = excluded_kinds;
                 db.list_objects_with_total_for_principals(filter, principals)
             }
+        }
+    }
+
+    pub fn list_objects_with_text_visibility(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        match self {
+            Self::Sqlite(db) => db.list_objects_with_text_visibility(
+                filter,
+                principals,
+                excluded_kinds,
+                allowed_markings,
+                trusted,
+            ),
+            Self::Postgres(_) => Err(
+                "authorization-built text visibility is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn list_objects_with_text_visibility_page(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_objects_with_text_visibility_page(
+                filter,
+                principals,
+                excluded_kinds,
+                allowed_markings,
+                trusted,
+            ),
+            Self::Postgres(_) => Err(
+                "authorization-built text visibility is unavailable on the PostgreSQL community runtime".into(),
+            ),
         }
     }
 

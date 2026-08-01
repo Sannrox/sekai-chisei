@@ -991,6 +991,69 @@ impl SekaiDb {
         principals: &[&str],
         excluded_kinds: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            None,
+            false,
+            true,
+        )
+    }
+
+    /// List object rows for the text adapter after applying ACL, namespace,
+    /// and classification visibility in SQL. This keeps denied marking rows
+    /// out of the bounded public corpus scan rather than filtering them after
+    /// a deadline/page cutoff.
+    pub fn list_objects_with_text_visibility(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            Some(allowed_markings),
+            trusted,
+            true,
+        )
+    }
+
+    /// Count-free page for the authorization-built text corpus. The collector
+    /// advances by page length and does not need a full visible total for every
+    /// page; avoiding that count keeps the shared request budget useful.
+    pub fn list_objects_with_text_visibility_page(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<Vec<Object>, String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            Some(allowed_markings),
+            trusted,
+            false,
+        )
+        .map(|(objects, _)| objects)
+    }
+
+    fn list_objects_with_total_for_principals_and_markings(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        allowed_markings: Option<&[&str]>,
+        trusted: bool,
+        include_total: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         // Static (no-bind) exclusion of internal governance kinds so pagination
         // and totals are computed over the visible set. Kinds are internal
@@ -1013,18 +1076,19 @@ impl SekaiDb {
                 .join(",");
             format!(" AND kind NOT IN ({quoted})")
         };
-        // Keep visibility params and order-by params disjoint to avoid placeholder
-        // number collision for both list and count queries.
+        // Keep visibility, marking, and order-by params disjoint to avoid
+        // placeholder collisions for both list and count queries.
         let (visibility_filter, mut visibility_params) =
             build_visibility_filter(principals, query.params.len());
         query.params.append(&mut visibility_params);
+        let (marking_filter, mut marking_params) =
+            build_marking_visibility_filter(allowed_markings, trusted, query.params.len());
+        query.params.append(&mut marking_params);
         let order_sql = build_order_by_sql(
             filter.order_by.as_str(),
             filter.descending,
             &mut query.params,
         )?;
-        let (count_visibility_filter, count_visibility_params) =
-            build_visibility_filter_for_count_query(principals, query.where_param_count);
         let effective_limit = if filter.limit == i32::MAX {
             i32::MAX
         } else if filter.limit <= 0 {
@@ -1033,8 +1097,8 @@ impl SekaiDb {
             filter.limit.min(MAX_LIST_LIMIT)
         };
         let mut list_sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}",
-            query.where_sql, visibility_filter, kind_exclusion
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}",
+            query.where_sql, visibility_filter, marking_filter, kind_exclusion
         );
         if let Some(order_sql) = order_sql.as_deref() {
             list_sql.push_str(order_sql);
@@ -1062,6 +1126,16 @@ impl SekaiDb {
         let objects: Vec<Object> = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        if !include_total {
+            return Ok((objects, 0));
+        }
+        let (count_visibility_filter, count_visibility_params) =
+            build_visibility_filter_for_count_query(principals, query.where_param_count);
+        let (count_marking_filter, count_marking_params) = build_marking_visibility_filter(
+            allowed_markings,
+            trusted,
+            query.where_param_count + count_visibility_params.len(),
+        );
         let mut count_params: Vec<&dyn rusqlite::types::ToSql> = query
             .params
             .iter()
@@ -1076,10 +1150,17 @@ impl SekaiDb {
         let total = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM sekai_objects{}{}{}",
-                    query.where_sql, count_visibility_filter, kind_exclusion
+                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}",
+                    query.where_sql, count_visibility_filter, count_marking_filter, kind_exclusion
                 ),
-                count_params.as_slice(),
+                {
+                    count_params.extend(
+                        count_marking_params
+                            .iter()
+                            .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+                    );
+                    count_params.as_slice()
+                },
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|e| e.to_string())?;
@@ -1724,6 +1805,41 @@ fn build_visibility_filter_internal(
         ),
         params,
     )
+}
+
+fn build_marking_visibility_filter(
+    allowed_markings: Option<&[&str]>,
+    trusted: bool,
+    start_param: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let Some(allowed_markings) = allowed_markings else {
+        return (String::new(), Vec::new());
+    };
+    if trusted {
+        return (String::new(), Vec::new());
+    }
+    // Unknown/empty markings are legacy domain values and are treated as
+    // unmarked by `object_classification`; only the closed v1 lattice needs a
+    // clearance predicate here.
+    let marking_expr = "LOWER(TRIM(json_extract(sekai_objects.properties, '$.access_marking')))";
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut sql = format!(
+        " AND ({marking_expr} IS NULL OR {marking_expr} = '' OR {marking_expr} NOT IN ('public','internal','confidential','restricted')"
+    );
+    if !allowed_markings.is_empty() {
+        let placeholders = allowed_markings
+            .iter()
+            .enumerate()
+            .map(|(offset, marking)| {
+                params.push(Box::new((*marking).to_string()));
+                format!("?{}", start_param + offset + 1)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" OR {marking_expr} IN ({placeholders})"));
+    }
+    sql.push(')');
+    (sql, params)
 }
 
 fn build_property_filter_condition(

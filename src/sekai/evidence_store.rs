@@ -870,6 +870,144 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    /// List evidence rows whose projected source object is already visible to
+    /// the supplied principals. This is the source-of-truth provider used by
+    /// the authorization-built text adapter; denied lifecycle, ACL, namespace,
+    /// and marking rows never enter its bounded page scan.
+    pub fn list_evidence_submissions_for_text(
+        &self,
+        namespace: &str,
+        principals: &[&str],
+        allowed_markings: &[&str],
+        trusted: bool,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<EvidenceSubmissionRecord>, String> {
+        let effective = principals
+            .iter()
+            .copied()
+            .filter(|principal| !principal.is_empty() && *principal != "anonymous")
+            .collect::<Vec<_>>();
+        let effective = if effective.is_empty() {
+            vec![""]
+        } else {
+            effective
+        };
+        let principal_placeholders = effective
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let marking_start = effective.len() + 2;
+        // Evidence classification is authoritative on the submission row. The
+        // projection mirrors it as `classification`, but it is not the object
+        // marking field (`access_marking`) used for ordinary objects.
+        let classification_expr = "LOWER(TRIM(s.classification))";
+        let object_marking_expr =
+            "LOWER(TRIM(json_extract(evidence_object.properties, '$.access_marking')))";
+        let marking_filter = if trusted {
+            String::new()
+        } else {
+            let placeholders = allowed_markings
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", marking_start + index))
+                .collect::<Vec<_>>()
+                .join(",");
+            let visible_expr = |expr: &str| {
+                let mut visibility = format!(
+                    "({expr} IS NULL OR {expr} = '' OR {expr} NOT IN ('public','internal','confidential','restricted')"
+                );
+                if !placeholders.is_empty() {
+                    visibility.push_str(&format!(" OR {expr} IN ({placeholders})"));
+                }
+                visibility.push(')');
+                visibility
+            };
+            format!(
+                " AND {} AND {}",
+                visible_expr(classification_expr),
+                visible_expr(object_marking_expr)
+            )
+        };
+        let team_filter = if trusted {
+            String::new()
+        } else {
+            format!(
+                " AND (NOT EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    WHERE team_namespace.kind='namespace'
+                      AND team_namespace.external_id='namespace:' || s.namespace
+                      AND json_extract(team_namespace.properties, '$.team_managed')='true'
+                 ) OR EXISTS (
+                    SELECT 1 FROM sekai_objects team_namespace
+                    JOIN sekai_grants team_grant ON team_grant.object_id=team_namespace.id
+                    WHERE team_namespace.kind='namespace'
+                      AND team_namespace.external_id='namespace:' || s.namespace
+                      AND json_extract(team_namespace.properties, '$.team_managed')='true'
+                      AND team_grant.principal IN ({principal_placeholders})
+                 ))"
+            )
+        };
+        let sql = format!(
+            "SELECT s.id, s.producer_identity, s.source_type, s.source_instance,
+                    s.source_record_id, s.source_version, s.source_sequence, s.namespace,
+                    s.target_external_id, s.target_kind, s.evidence_type, s.schema_id,
+                    s.schema_version, s.idempotency_key, s.content_digest, s.classification,
+                    s.intent, s.lifecycle_state, s.rejection_code, s.rejection_summary,
+                    s.observed_at_ms, s.collected_at_ms, s.expires_at_ms,
+                    s.received_at_ms, s.updated_at_ms, s.envelope_json
+             FROM sekai_evidence_submissions s
+             JOIN sekai_evidence_projections projection
+               ON projection.submission_id=s.id
+             JOIN sekai_objects evidence_object
+               ON evidence_object.id=projection.evidence_object_id
+             WHERE (?1='' OR s.namespace=?1)
+               AND s.envelope_json IS NOT NULL
+               AND s.lifecycle_state IN ('available','superseded')
+               AND (
+                    s.producer_identity IN ({principal_placeholders})
+                    OR NOT EXISTS (
+                        SELECT 1 FROM sekai_grants grant_row
+                        WHERE grant_row.object_id=evidence_object.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM sekai_grants grant_row
+                        WHERE grant_row.object_id=evidence_object.id
+                          AND grant_row.principal IN ({principal_placeholders})
+                    )
+               ){team_filter}{marking_filter}
+             ORDER BY s.received_at_ms DESC, s.id DESC
+             LIMIT ?{} OFFSET ?{}",
+            marking_start + allowed_markings.len(),
+            marking_start + allowed_markings.len() + 1,
+        );
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        values.push(Box::new(namespace.to_string()));
+        values.extend(effective.iter().map(|principal| {
+            Box::new((*principal).to_string()) as Box<dyn rusqlite::types::ToSql>
+        }));
+        values.extend(
+            allowed_markings
+                .iter()
+                .map(|marking| Box::new((*marking).to_string()) as Box<dyn rusqlite::types::ToSql>),
+        );
+        values.push(Box::new(limit.clamp(0, 500)));
+        values.push(Box::new(offset.max(0)));
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let parameters = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+        let rows = statement
+            .query_map(parameters.as_slice(), row_to_submission)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn list_usable_evidence_for_targets(
         &self,
         target_object_ids: &[String],
