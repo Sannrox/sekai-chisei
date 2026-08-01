@@ -12,6 +12,9 @@ properties. Relations declare domain and range classes plus metadata that later
 validation and reasoning work can consume. Names are stable external
 identifiers suitable for mapping in future RDF or OWL adapters; this release
 does not claim RDF, OWL, GraphQL, SPARQL, or Cypher compatibility.
+The bounded interoperability research in [#501](research/501-epistemic-rdf-owl-prov-o.md)
+defines what a future edge projection may preserve without changing that
+boundary.
 
 ## First-run product loop (`sekaictl`)
 
