@@ -749,14 +749,14 @@ message HybridAuthzContext {
 }
 
 message HybridCandidate {
-  // e.g. text.fts5, graph.retrieve_context
+  // e.g. text.authorized, graph.retrieve_context
   string representation_id = 1;
-  // e.g. sqlite.text_fts5
+  // e.g. sqlite.authorized_text
   string source = 2;
-  // Index generation and/or content hash, e.g. gen:3#sha256...
+  // Fixed adapter source version, e.g. authorized-text/v1.
   string source_version = 3;
   double score = 4;
-  // e.g. text.fts5_bm25/v1 (higher is better for FTS BM25 as -bm25(table))
+  // e.g. text.authorized_bm25/v1 (higher is better for -bm25(table))
   string score_kind = 5;
   HybridEntityRef entity_ref = 6;
   HybridAuthzContext authz_context = 7;
@@ -765,8 +765,9 @@ message HybridCandidate {
   bool denied = 9;
 }
 
-// Lexical text search over the rebuildable SQLite FTS5 projection (#360).
-// Does not perform late fusion (see #361). Authz is re-checked per hit.
+// Lexical text search over an authorization-built per-request SQLite FTS5
+// corpus (#497). The legacy global projection is internal-only. Does not
+// perform late fusion (see #361); authz is re-checked per hit.
 message SearchTextRequest {
   string query = 1;
   // Optional namespace filter; empty means all namespaces the principal may see.
@@ -777,7 +778,8 @@ message SearchTextRequest {
   uint32 max_candidates = 4;
   // 0 defaults to 100; absolute cap is 1000
   uint32 max_time_ms = 5;
-  // When true, rebuild the FTS projection from sources of truth before search.
+  // Legacy compatibility flag. Public SearchText ignores it; operator rebuilds
+  // stay off the authorization-built request deadline path.
   bool rebuild = 6;
 }
 
@@ -818,12 +820,14 @@ message HybridTextParams {
   string namespace = 2;
   // all | evidence | object_props (empty defaults to all)
   string source_kinds = 3;
-  // When true, rebuild the FTS projection from sources of truth before search.
+  // Legacy compatibility flag. Public HybridRetrieve ignores it for text;
+  // operator rebuilds stay off the request deadline path.
   bool rebuild = 4;
 }
 
 message HybridRetrieveRequest {
-  // Explicit representation ids (graph.retrieve_context, text.fts5). Non-empty.
+  // Explicit representation ids (graph.retrieve_context, text.authorized).
+  // Non-empty.
   repeated string representations = 1;
   HybridGraphParams graph = 2;
   HybridTextParams text = 3;

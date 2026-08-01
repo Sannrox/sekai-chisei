@@ -141,6 +141,13 @@ pub struct RetrievalResult {
     pub links: Vec<Link>,
     pub truncated: bool,
     pub unresolved_roots: u32,
+    /// Count of roots that resolved to a reserved or unauthorized object.
+    ///
+    /// This is deliberately kept separate from `unresolved_roots` so the
+    /// gRPC projection can make root denial observationally equivalent to a
+    /// missing root without changing the retrieval engine's internal
+    /// accounting or its unit-test diagnostics.
+    pub denied_roots: u32,
     pub denied_objects: u32,
     pub truncated_objects: u32,
     pub truncated_links: u32,
@@ -385,11 +392,12 @@ where
                     continue;
                 };
                 if is_forbidden(&object) {
-                    result.unresolved_roots = result.unresolved_roots.saturating_add(1);
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 if !can_read(&object) {
                     denied_ids.insert(object.id);
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 let origin = format!("object:{}", object.id);
@@ -406,11 +414,12 @@ where
                 };
                 object_cache.insert(object.id.clone(), Some(object.clone()));
                 if is_forbidden(&object) {
-                    result.unresolved_roots = result.unresolved_roots.saturating_add(1);
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 if !can_read(&object) {
                     denied_ids.insert(object.id);
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 let origin = format!("external:{}", object.external_id);
@@ -429,7 +438,7 @@ where
                     continue;
                 };
                 if is_forbidden(&from) || is_forbidden(&to) {
-                    result.unresolved_roots = result.unresolved_roots.saturating_add(1);
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 let from_allowed = can_read(&from);
@@ -443,6 +452,7 @@ where
                 // A link root is a relationship, so exposing or expanding only
                 // one side would reveal an inaccessible endpoint.
                 if !from_allowed || !to_allowed {
+                    result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
                 }
                 if entailment_requested && !counted_source_ids.contains(&link.id) {

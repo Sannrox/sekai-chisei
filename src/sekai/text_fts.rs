@@ -6,21 +6,23 @@
 //! against live sources of truth and omit denied or deleted material
 //! (non-disclosure). Similarity scores never mint durable object identities.
 //!
-//! Score kind: [`crate::sekai::hybrid::SCORE_KIND_TEXT_FTS5_BM25_V1`]
-//! (`text.fts5_bm25/v1`). Score values are `-bm25(table)` so higher is better.
+//! Public score kind: [`crate::sekai::hybrid::SCORE_KIND_AUTHORIZED_TEXT_BM25_V1`]
+//! (`text.authorized_bm25/v1`). Score values are `-bm25(table)` so higher is
+//! better. The legacy global projection below is internal-only.
 
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::evidence::EvidenceLifecycleState;
+use crate::sekai::evidence_store::EvidenceSubmissionRecord;
 use crate::sekai::hybrid::{
     AuthzContextSummary, ENTITY_KIND_EVIDENCE_SUBMISSION, ENTITY_KIND_OBJECT, EntityRef,
-    HybridCandidate, HybridError, REPRESENTATION_TEXT_FTS5, SCORE_KIND_TEXT_FTS5_BM25_V1,
+    HybridCandidate, HybridError, REPRESENTATION_AUTHORIZED_TEXT, REPRESENTATION_TEXT_FTS5,
+    SCORE_KIND_AUTHORIZED_TEXT_BM25_V1, SCORE_KIND_TEXT_FTS5_BM25_V1, SOURCE_AUTHORIZED_TEXT,
     SOURCE_SQLITE_TEXT_FTS5,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
 
 /// Index generation meta key (monotonic generation string `gen:<n>`).
 pub const META_GENERATION: &str = "generation";
@@ -35,11 +37,25 @@ pub const SOURCE_KIND_OBJECT_PROPERTY: &str = "object_property";
 
 pub const DEFAULT_MAX_CANDIDATES: u32 = 20;
 pub const MAX_CANDIDATES: u32 = 100;
-pub const DEFAULT_MAX_TIME_MS: u32 = 100;
-pub const MAX_TIME_MS: u32 = 1000;
 pub const MAX_QUERY_CHARS: usize = 512;
 /// Cap property values and evidence string leaves so the index stays bounded.
 pub const MAX_INDEXED_TEXT_CHARS: usize = 8_192;
+/// Stable source version for the authorization-built per-request corpus.
+pub const AUTHORIZED_TEXT_SOURCE_VERSION: &str = "authorized-text/v1";
+/// Bound the amount of authorized source material copied into one request's
+/// private FTS index. This cap is applied after authorization and therefore
+/// cannot be changed by adding hidden rows.
+pub const MAX_AUTHORIZED_TEXT_DOCUMENTS: usize = 100_000;
+/// Bound the private FTS input even when every authorized row contains a large
+/// (but individually capped) text value.
+pub const MAX_AUTHORIZED_TEXT_BYTES: usize = 64 * 1024 * 1024;
+/// Page the rebuildable index while authorization is rechecked outside the
+/// pooled connection.  A page is always rechecked against the index generation
+/// before it is added to a result assembled across pooled connections.
+#[allow(dead_code)]
+const TEXT_FTS_PAGE_SIZE: i64 = 64;
+#[allow(dead_code)]
+const MAX_TEXT_FTS_GENERATION_RESTARTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextSourceFilter {
@@ -83,6 +99,9 @@ pub struct TextSearchQuery {
     pub namespace: String,
     pub source_kinds: TextSourceFilter,
     pub max_candidates: u32,
+    /// Shared-plan deadline budget. Public adapters stop at the budget with a
+    /// generic `max_time_ms` truncation reason; raw internal FTS callers may
+    /// leave enforcement to their enclosing operation.
     pub max_time_ms: u32,
 }
 
@@ -95,6 +114,89 @@ pub struct TextSearchResult {
     pub truncation_reasons: Vec<String>,
     pub denied_count: u32,
     pub scanned: u32,
+}
+
+/// A source-of-truth text row that has already passed the caller's visibility
+/// checks. These documents, and only these documents, enter the public text
+/// adapter's private FTS index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorizedTextDocument {
+    pub doc_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_key: String,
+    pub namespace: String,
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub content_hash: String,
+    pub text_body: String,
+}
+
+impl AuthorizedTextDocument {
+    /// Convert one visible object property into an indexed document.
+    pub(crate) fn object_property(object: &Object, key: &str, value: &str) -> Option<Self> {
+        if key.trim().is_empty()
+            || key.starts_with('_')
+            || value.trim().is_empty()
+            || object.id.trim().is_empty()
+        {
+            return None;
+        }
+        let text_body = truncate_chars(value, MAX_INDEXED_TEXT_CHARS);
+        if text_body.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            doc_id: format!("object_prop:{}:{key}", object.id),
+            source_kind: SOURCE_KIND_OBJECT_PROPERTY.into(),
+            source_id: object.id.clone(),
+            source_key: key.into(),
+            namespace: object.namespace.clone(),
+            entity_kind: ENTITY_KIND_OBJECT.into(),
+            entity_id: object.id.clone(),
+            content_hash: object_property_content_hash(key, &text_body),
+            text_body,
+        })
+    }
+
+    /// Convert readable admitted evidence into an indexed document.
+    pub(crate) fn evidence(submission: &EvidenceSubmissionRecord) -> Option<Self> {
+        if !public_evidence_content_readable(submission.lifecycle_state) {
+            return None;
+        }
+        let envelope = submission.envelope.as_ref()?;
+        let text_body = truncate_chars(
+            &flatten_json_text(&envelope.content),
+            MAX_INDEXED_TEXT_CHARS,
+        );
+        if text_body.trim().is_empty() {
+            return None;
+        }
+        let content_hash = if submission.content_digest.trim().is_empty() {
+            sha256_hex(text_body.as_bytes())
+        } else {
+            submission.content_digest.clone()
+        };
+        Some(Self {
+            doc_id: format!("evidence:{}", submission.id),
+            source_kind: SOURCE_KIND_EVIDENCE.into(),
+            source_id: submission.id.clone(),
+            source_key: String::new(),
+            namespace: submission.namespace.clone(),
+            entity_kind: ENTITY_KIND_EVIDENCE_SUBMISSION.into(),
+            entity_id: submission.id.clone(),
+            content_hash,
+            text_body,
+        })
+    }
+}
+
+/// Hash the exact bounded property material used by the authorized adapter.
+/// The gRPC live re-check uses this helper so a changed property cannot keep a
+/// stale ranked hit alive after the corpus was assembled.
+pub(crate) fn object_property_content_hash(key: &str, value: &str) -> String {
+    let text_body = truncate_chars(value, MAX_INDEXED_TEXT_CHARS);
+    sha256_hex(format!("{key}\0{text_body}").as_bytes())
 }
 
 #[derive(Debug, Clone)]
@@ -156,29 +258,370 @@ impl SekaiDb {
     }
 
     /// Search the FTS projection and re-check authorization per hit.
-    pub fn search_text_fts(
+    #[allow(dead_code)]
+    pub(crate) fn search_text_fts(
         &self,
         query: &TextSearchQuery,
         principal_class: &str,
         authz: &AuthzRecheck<'_>,
     ) -> Result<TextSearchResult, HybridError> {
-        let (hits, generation, max_candidates, max_time, started, namespace_filter, source_kinds) = {
+        let (match_expr, mut generation, max_candidates, namespace_filter, source_kinds) = {
             let conn = self.conn();
-            collect_text_fts_hits(&conn, query)?
+            prepare_text_fts_query(&conn, query)?
         };
-        // Pooled connection released before authz callbacks (may re-enter the DB).
-        finalize_text_fts_hits(
-            hits,
-            generation,
-            max_candidates,
-            max_time,
-            started,
-            &namespace_filter,
-            source_kinds,
-            principal_class,
-            authz,
-        )
+        let mut generation_restarts = 0_u8;
+
+        'search: loop {
+            let mut result = empty_text_fts_result(generation.clone());
+            let mut offset = 0_i64;
+            loop {
+                // Release the pooled connection before rechecking authorization:
+                // the callback may query the same database for live ACL state.
+                let (page_generation, hits) = {
+                    let conn = self.conn();
+                    fetch_text_fts_hits(
+                        &conn,
+                        &match_expr,
+                        &namespace_filter,
+                        source_kinds,
+                        offset,
+                        TEXT_FTS_PAGE_SIZE,
+                    )?
+                };
+                if page_generation != generation {
+                    generation_restarts = generation_restarts.saturating_add(1);
+                    if generation_restarts > MAX_TEXT_FTS_GENERATION_RESTARTS {
+                        return Err(HybridError::Storage(
+                            "text FTS generation changed during search".into(),
+                        ));
+                    }
+                    generation = page_generation;
+                    continue 'search;
+                }
+                if hits.is_empty() {
+                    break;
+                }
+                let page_len = hits.len() as i64;
+                append_text_fts_hits(
+                    &mut result,
+                    &generation,
+                    hits,
+                    max_candidates,
+                    &namespace_filter,
+                    source_kinds,
+                    principal_class,
+                    authz,
+                );
+                if result.candidates.len() as u32 >= max_candidates || result.truncated {
+                    break;
+                }
+
+                offset = offset.saturating_add(page_len);
+                if page_len < TEXT_FTS_PAGE_SIZE {
+                    break;
+                }
+            }
+
+            // Authorization callbacks run after the page connection is
+            // released. Recheck the generation before returning so a rebuild
+            // during those callbacks cannot label a mixed result as complete.
+            let final_generation = {
+                let conn = self.conn();
+                meta_get(&conn, META_GENERATION)
+                    .map_err(HybridError::Storage)?
+                    .unwrap_or_else(|| "gen:0".into())
+            };
+            if final_generation != generation {
+                generation_restarts = generation_restarts.saturating_add(1);
+                if generation_restarts > MAX_TEXT_FTS_GENERATION_RESTARTS {
+                    return Err(HybridError::Storage(
+                        "text FTS generation changed during search".into(),
+                    ));
+                }
+                generation = final_generation;
+                continue 'search;
+            }
+            break Ok(result);
+        }
     }
+}
+
+/// Validate a text request without touching the durable corpus.
+pub fn validate_text_search_query(query: &TextSearchQuery) -> Result<(), HybridError> {
+    let q = query.query.trim();
+    if q.is_empty() {
+        return Err(HybridError::InvalidArgument(
+            "query must be non-empty".into(),
+        ));
+    }
+    if q.chars().count() > MAX_QUERY_CHARS {
+        return Err(HybridError::InvalidArgument(format!(
+            "query exceeds {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    let namespace = query.namespace.trim();
+    if !query.namespace.is_empty() && namespace != query.namespace {
+        return Err(HybridError::InvalidArgument(
+            "canonical namespace required".into(),
+        ));
+    }
+    let _ = fts_match_expression(q)?;
+    Ok(())
+}
+
+/// Search a corpus that was assembled after authorization and marking checks.
+#[allow(dead_code)]
+pub(crate) fn search_authorized_text(
+    query: &TextSearchQuery,
+    principal_class: &str,
+    documents: &[AuthorizedTextDocument],
+) -> Result<TextSearchResult, HybridError> {
+    let allow_all = |_input: &AuthzRecheckInput<'_>| AuthzDecision::Allow;
+    search_authorized_text_with_options(query, principal_class, documents, false, None, &allow_all)
+}
+
+/// Search an authorization-built corpus with a shared deadline and a final
+/// source-of-truth authorization re-check for every candidate that is about to
+/// be emitted.
+pub(crate) fn search_authorized_text_with_options(
+    query: &TextSearchQuery,
+    principal_class: &str,
+    documents: &[AuthorizedTextDocument],
+    corpus_truncated: bool,
+    deadline: Option<std::time::Instant>,
+    authz: &AuthzRecheck<'_>,
+) -> Result<TextSearchResult, HybridError> {
+    validate_text_search_query(query)?;
+    let q = query.query.trim();
+    let namespace = query.namespace.trim();
+    let match_expr = fts_match_expression(q)?;
+    let max_candidates = normalize_max_candidates(query.max_candidates) as usize;
+
+    let mut result = TextSearchResult {
+        candidates: Vec::new(),
+        source_version: AUTHORIZED_TEXT_SOURCE_VERSION.into(),
+        representation_id: REPRESENTATION_AUTHORIZED_TEXT.into(),
+        truncated: corpus_truncated,
+        truncation_reasons: if corpus_truncated {
+            vec!["authorized_corpus".into()]
+        } else {
+            Vec::new()
+        },
+        denied_count: 0,
+        scanned: 0,
+    };
+
+    let mut deadline_exceeded = false;
+    let mark_deadline = |result: &mut TextSearchResult| {
+        result.truncated = true;
+        push_reason(&mut result.truncation_reasons, "max_time_ms");
+    };
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        mark_deadline(&mut result);
+        return Ok(result);
+    }
+
+    let authorized = documents
+        .iter()
+        .filter(|document| {
+            query.source_kinds.matches(&document.source_kind)
+                && (namespace.is_empty() || document.namespace == namespace)
+        })
+        .take(MAX_AUTHORIZED_TEXT_DOCUMENTS)
+        .collect::<Vec<_>>();
+    let filtered_document_count = documents
+        .iter()
+        .filter(|document| {
+            query.source_kinds.matches(&document.source_kind)
+                && (namespace.is_empty() || document.namespace == namespace)
+        })
+        .count();
+    if filtered_document_count > MAX_AUTHORIZED_TEXT_DOCUMENTS {
+        result.truncated = true;
+        push_reason(&mut result.truncation_reasons, "authorized_corpus");
+    }
+
+    let conn = Connection::open_in_memory().map_err(|error| {
+        HybridError::Storage(format!("authorized text adapter database: {error}"))
+    })?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE authorized_text_fts USING fts5(
+            doc_id UNINDEXED,
+            source_kind UNINDEXED,
+            source_id UNINDEXED,
+            source_key UNINDEXED,
+            namespace UNINDEXED,
+            entity_kind UNINDEXED,
+            entity_id UNINDEXED,
+            content_hash UNINDEXED,
+            text_body,
+            tokenize='porter unicode61 remove_diacritics 2'
+        );",
+    )
+    .map_err(|error| HybridError::Storage(error.to_string()))?;
+    {
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO authorized_text_fts(
+                    doc_id, source_kind, source_id, source_key, namespace,
+                    entity_kind, entity_id, content_hash, text_body
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )
+            .map_err(|error| HybridError::Storage(error.to_string()))?;
+        for document in authorized {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                deadline_exceeded = true;
+                break;
+            }
+            insert
+                .execute(params![
+                    document.doc_id,
+                    document.source_kind,
+                    document.source_id,
+                    document.source_key,
+                    document.namespace,
+                    document.entity_kind,
+                    document.entity_id,
+                    document.content_hash,
+                    document.text_body,
+                ])
+                .map_err(|error| HybridError::Storage(error.to_string()))?;
+        }
+    }
+
+    if deadline_exceeded {
+        mark_deadline(&mut result);
+    }
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        mark_deadline(&mut result);
+    }
+    if deadline_exceeded || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Ok(result);
+    }
+
+    // Fetch the bounded authorized corpus, not just the first candidate window,
+    // so a concurrent revocation can be rechecked without dropping a later
+    // authorized hit into a false-empty response.
+    let query_limit = MAX_AUTHORIZED_TEXT_DOCUMENTS;
+    let mut statement = conn
+        .prepare(
+            "SELECT doc_id, source_kind, source_id, source_key, namespace,
+                    entity_kind, entity_id, content_hash,
+                    bm25(authorized_text_fts) AS rank
+             FROM authorized_text_fts
+             WHERE authorized_text_fts MATCH ?1
+             ORDER BY rank, rowid
+             LIMIT ?2",
+        )
+        .map_err(|error| HybridError::Storage(error.to_string()))?;
+    let mut rows = statement
+        .query(params![match_expr, query_limit as i64])
+        .map_err(|error| HybridError::Storage(error.to_string()))?;
+    let mut hits = Vec::new();
+    loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            mark_deadline(&mut result);
+            return Ok(result);
+        }
+        let Some(row) = rows
+            .next()
+            .map_err(|error| HybridError::Storage(error.to_string()))?
+        else {
+            break;
+        };
+        hits.push(IndexedHit {
+            doc_id: row
+                .get(0)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            source_kind: row
+                .get(1)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            source_id: row
+                .get(2)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            source_key: row
+                .get(3)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            namespace: row
+                .get(4)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            entity_kind: row
+                .get(5)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            entity_id: row
+                .get(6)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            content_hash: row
+                .get(7)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+            bm25_raw: row
+                .get(8)
+                .map_err(|error| HybridError::Storage(error.to_string()))?,
+        });
+    }
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        mark_deadline(&mut result);
+        return Ok(result);
+    }
+    let mut authorized_match_count = 0_usize;
+    let mut completed_hit_scan = true;
+    for hit in hits {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            mark_deadline(&mut result);
+            completed_hit_scan = false;
+            break;
+        }
+        let decision = authz(&AuthzRecheckInput {
+            source_kind: &hit.source_kind,
+            source_id: &hit.source_id,
+            source_key: &hit.source_key,
+            entity_kind: &hit.entity_kind,
+            entity_id: &hit.entity_id,
+            namespace: &hit.namespace,
+            content_hash: &hit.content_hash,
+        });
+        if decision != AuthzDecision::Allow {
+            continue;
+        }
+        authorized_match_count = authorized_match_count.saturating_add(1);
+        if result.candidates.len() >= max_candidates {
+            continue;
+        }
+        let entity_ref =
+            (!hit.entity_kind.is_empty() && !hit.entity_id.is_empty()).then_some(EntityRef {
+                kind: hit.entity_kind,
+                id: hit.entity_id,
+            });
+        let candidate = HybridCandidate::authorized_text(
+            AUTHORIZED_TEXT_SOURCE_VERSION,
+            -hit.bm25_raw,
+            entity_ref,
+            AuthzContextSummary {
+                namespace: hit.namespace,
+                principal_class: principal_class.into(),
+                classification_ceiling: String::new(),
+            },
+        );
+        debug_assert_eq!(candidate.score_kind, SCORE_KIND_AUTHORIZED_TEXT_BM25_V1);
+        debug_assert_eq!(candidate.source, SOURCE_AUTHORIZED_TEXT);
+        let _ = hit.doc_id;
+        let _ = hit.source_kind;
+        let _ = hit.source_id;
+        let _ = hit.source_key;
+        let _ = hit.content_hash;
+        result.candidates.push(candidate);
+        result.scanned = result.scanned.saturating_add(1);
+    }
+    if completed_hit_scan && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
+        mark_deadline(&mut result);
+        completed_hit_scan = false;
+    }
+    if completed_hit_scan && authorized_match_count > max_candidates {
+        result.truncated = true;
+        push_reason(&mut result.truncation_reasons, "max_candidates");
+    }
+    Ok(result)
 }
 
 fn migrate_text_fts_on(conn: &Connection) -> Result<(), String> {
@@ -236,19 +679,35 @@ fn migrate_text_fts_on(conn: &Connection) -> Result<(), String> {
 fn rebuild_text_fts_on(conn: &Connection, now_ms: i64) -> Result<String, String> {
     migrate_text_fts_on(conn)?;
 
-    // Clear external-content FTS and shadow docs.
-    conn.execute_batch(
-        "INSERT INTO sekai_text_fts(sekai_text_fts) VALUES('delete-all');
-         DELETE FROM sekai_text_fts_docs;",
-    )
-    .map_err(|e| e.to_string())?;
-
     let mut docs: Vec<DocRow> = Vec::new();
     collect_evidence_docs(conn, now_ms, &mut docs)?;
     collect_object_property_docs(conn, now_ms, &mut docs)?;
 
-    {
+    let generation = {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let prev = tx
+            .query_row(
+                "SELECT value FROM sekai_text_fts_meta WHERE key = ?1",
+                params![META_GENERATION],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .and_then(|value| {
+                value
+                    .strip_prefix("gen:")
+                    .and_then(|number| number.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        let generation = format!("gen:{}", prev.saturating_add(1));
+        // Replace the external-content FTS projection and publish its new
+        // generation in one transaction. Readers either see the old complete
+        // corpus or the new complete corpus, never an intermediate one.
+        tx.execute_batch(
+            "INSERT INTO sekai_text_fts(sekai_text_fts) VALUES('delete-all');
+             DELETE FROM sekai_text_fts_docs;",
+        )
+        .map_err(|e| e.to_string())?;
         for doc in &docs {
             tx.execute(
                 "INSERT INTO sekai_text_fts_docs (
@@ -276,16 +735,27 @@ fn rebuild_text_fts_on(conn: &Connection, now_ms: i64) -> Result<String, String>
              SELECT rowid, text_body FROM sekai_text_fts_docs;",
         )
         .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_text_fts_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_GENERATION, generation],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_text_fts_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_REBUILT_AT_MS, now_ms.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_text_fts_meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_CORPUS_PROFILE, CORPUS_PROFILE_V1],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-    }
-
-    let prev = meta_get(conn, META_GENERATION)?
-        .and_then(|v| v.strip_prefix("gen:").and_then(|n| n.parse::<u64>().ok()))
-        .unwrap_or(0);
-    let generation = format!("gen:{}", prev.saturating_add(1));
-    meta_set(conn, META_GENERATION, &generation)?;
-    meta_set(conn, META_REBUILT_AT_MS, &now_ms.to_string())?;
-    meta_set(conn, META_CORPUS_PROFILE, CORPUS_PROFILE_V1)?;
+        generation
+    };
     Ok(generation)
 }
 
@@ -413,21 +883,11 @@ fn collect_object_property_docs(
 }
 
 #[allow(clippy::type_complexity)]
-fn collect_text_fts_hits(
+#[allow(dead_code)]
+fn prepare_text_fts_query(
     conn: &Connection,
     query: &TextSearchQuery,
-) -> Result<
-    (
-        Vec<IndexedHit>,
-        String,
-        u32,
-        Duration,
-        Instant,
-        String,
-        TextSourceFilter,
-    ),
-    HybridError,
-> {
+) -> Result<(String, String, u32, String, TextSourceFilter), HybridError> {
     let q = query.query.trim();
     if q.is_empty() {
         return Err(HybridError::InvalidArgument(
@@ -448,16 +908,33 @@ fn collect_text_fts_hits(
     }
 
     let max_candidates = normalize_max_candidates(query.max_candidates);
-    let max_time = Duration::from_millis(u64::from(normalize_max_time_ms(query.max_time_ms)));
-    let started = Instant::now();
 
     let generation = meta_get(conn, META_GENERATION)
         .map_err(HybridError::Storage)?
         .unwrap_or_else(|| "gen:0".into());
 
     let match_expr = fts_match_expression(q)?;
-    let fetch_limit = (max_candidates as i64).saturating_mul(4).clamp(1, 400);
+    Ok((
+        match_expr,
+        generation,
+        max_candidates,
+        namespace.to_string(),
+        query.source_kinds,
+    ))
+}
 
+#[allow(dead_code)]
+fn fetch_text_fts_hits(
+    conn: &Connection,
+    match_expr: &str,
+    namespace: &str,
+    source_kinds: TextSourceFilter,
+    offset: i64,
+    limit: i64,
+) -> Result<(String, Vec<IndexedHit>), HybridError> {
+    let generation = meta_get(conn, META_GENERATION)
+        .map_err(HybridError::Storage)?
+        .unwrap_or_else(|| "gen:0".into());
     let mut stmt = conn
         .prepare(
             "SELECT d.doc_id, d.source_kind, d.source_id, d.source_key, d.namespace,
@@ -465,80 +942,72 @@ fn collect_text_fts_hits(
              FROM sekai_text_fts
              JOIN sekai_text_fts_docs AS d ON d.rowid = sekai_text_fts.rowid
              WHERE sekai_text_fts MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
+               AND (?2 = '' OR d.namespace = ?2)
+               AND (
+                    ?3 = 'all'
+                    OR (?3 = 'evidence' AND d.source_kind = 'evidence')
+                    OR (?3 = 'object_props' AND d.source_kind = 'object_property')
+               )
+             ORDER BY rank, d.rowid
+             LIMIT ?4 OFFSET ?5",
         )
         .map_err(|e| HybridError::Storage(e.to_string()))?;
-
     let rows = stmt
-        .query_map(params![match_expr, fetch_limit], |row| {
-            Ok(IndexedHit {
-                doc_id: row.get(0)?,
-                source_kind: row.get(1)?,
-                source_id: row.get(2)?,
-                source_key: row.get(3)?,
-                namespace: row.get(4)?,
-                entity_kind: row.get(5)?,
-                entity_id: row.get(6)?,
-                content_hash: row.get(7)?,
-                bm25_raw: row.get(8)?,
-            })
-        })
+        .query_map(
+            params![match_expr, namespace, source_kinds.as_str(), limit, offset],
+            |row| {
+                Ok(IndexedHit {
+                    doc_id: row.get(0)?,
+                    source_kind: row.get(1)?,
+                    source_id: row.get(2)?,
+                    source_key: row.get(3)?,
+                    namespace: row.get(4)?,
+                    entity_kind: row.get(5)?,
+                    entity_id: row.get(6)?,
+                    content_hash: row.get(7)?,
+                    bm25_raw: row.get(8)?,
+                })
+            },
+        )
         .map_err(|e| HybridError::Storage(e.to_string()))?;
-
-    let mut hits = Vec::new();
-    for row in rows {
-        if started.elapsed() >= max_time {
-            break;
-        }
-        hits.push(row.map_err(|e| HybridError::Storage(e.to_string()))?);
+    let hits = rows
+        .map(|row| row.map_err(|e| HybridError::Storage(e.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let stable_generation = meta_get(conn, META_GENERATION)
+        .map_err(HybridError::Storage)?
+        .unwrap_or_else(|| "gen:0".into());
+    if generation != stable_generation {
+        return Ok((stable_generation, Vec::new()));
     }
-
-    Ok((
-        hits,
-        generation,
-        max_candidates,
-        max_time,
-        started,
-        namespace.to_string(),
-        query.source_kinds,
-    ))
+    Ok((generation, hits))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finalize_text_fts_hits(
-    hits: Vec<IndexedHit>,
-    generation: String,
-    max_candidates: u32,
-    max_time: Duration,
-    started: Instant,
-    namespace: &str,
-    source_kinds: TextSourceFilter,
-    principal_class: &str,
-    authz: &AuthzRecheck<'_>,
-) -> Result<TextSearchResult, HybridError> {
-    let mut result = TextSearchResult {
+#[allow(dead_code)]
+fn empty_text_fts_result(generation: String) -> TextSearchResult {
+    TextSearchResult {
         candidates: Vec::new(),
-        source_version: generation.clone(),
+        source_version: generation,
         representation_id: REPRESENTATION_TEXT_FTS5.into(),
         truncated: false,
         truncation_reasons: Vec::new(),
         denied_count: 0,
         scanned: 0,
-    };
-    if started.elapsed() >= max_time && !hits.is_empty() {
-        result.truncated = true;
-        push_reason(&mut result.truncation_reasons, "max_time_ms");
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn append_text_fts_hits(
+    result: &mut TextSearchResult,
+    generation: &str,
+    hits: Vec<IndexedHit>,
+    max_candidates: u32,
+    namespace: &str,
+    source_kinds: TextSourceFilter,
+    principal_class: &str,
+    authz: &AuthzRecheck<'_>,
+) {
     for hit in hits {
-        if started.elapsed() >= max_time {
-            result.truncated = true;
-            push_reason(&mut result.truncation_reasons, "max_time_ms");
-            break;
-        }
-        result.scanned = result.scanned.saturating_add(1);
-
         if !source_kinds.matches(&hit.source_kind) {
             continue;
         }
@@ -557,12 +1026,16 @@ fn finalize_text_fts_hits(
         });
         match decision {
             AuthzDecision::Deny | AuthzDecision::Gone => {
-                // Stale or denied — omit without disclosing names.
-                result.denied_count = result.denied_count.saturating_add(1);
+                // Stale or denied — omit without disclosing names or a
+                // denial count that could be used as an existence oracle.
                 continue;
             }
             AuthzDecision::Allow => {}
         }
+
+        // `scanned` is deliberately an authorized-work count.  Counting raw
+        // index hits would let hidden rows change a public aggregate.
+        result.scanned = result.scanned.saturating_add(1);
 
         // entity_ref only when SoT already asserts the id (re-check path confirmed).
         let entity_ref = if !hit.entity_kind.is_empty() && !hit.entity_id.is_empty() {
@@ -597,8 +1070,6 @@ fn finalize_text_fts_hits(
             break;
         }
     }
-
-    Ok(result)
 }
 
 fn normalize_max_candidates(value: u32) -> u32 {
@@ -606,14 +1077,6 @@ fn normalize_max_candidates(value: u32) -> u32 {
         DEFAULT_MAX_CANDIDATES
     } else {
         value.min(MAX_CANDIDATES)
-    }
-}
-
-fn normalize_max_time_ms(value: u32) -> u32 {
-    if value == 0 {
-        DEFAULT_MAX_TIME_MS
-    } else {
-        value.min(MAX_TIME_MS)
     }
 }
 
@@ -707,16 +1170,6 @@ fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
-fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO sekai_text_fts_meta(key, value) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Helper: re-check evidence content readability against live submission state.
 pub fn evidence_content_readable(state: EvidenceLifecycleState) -> bool {
     matches!(
@@ -725,6 +1178,16 @@ pub fn evidence_content_readable(state: EvidenceLifecycleState) -> bool {
             | EvidenceLifecycleState::Superseded
             | EvidenceLifecycleState::Retracted
             | EvidenceLifecycleState::Stale
+    )
+}
+
+/// Lifecycle states admitted to the public authorization-built text corpus.
+/// Retraction and staleness remain readable to some internal maintenance paths,
+/// but they are never copied into a caller-visible search corpus.
+fn public_evidence_content_readable(state: EvidenceLifecycleState) -> bool {
+    matches!(
+        state,
+        EvidenceLifecycleState::Available | EvidenceLifecycleState::Superseded
     )
 }
 
@@ -956,11 +1419,65 @@ mod tests {
                 .map(|e| e.id.as_str()),
             Some("public")
         );
-        assert!(result.denied_count >= 1);
+        assert_eq!(result.denied_count, 0);
         // No secret names in truncation reasons.
         for reason in &result.truncation_reasons {
             assert!(!reason.contains("secret"));
         }
+    }
+
+    #[test]
+    fn paged_authz_recheck_reaches_allowed_hit_beyond_initial_window() {
+        let db = test_db();
+        // Insert more denied rows than the old 4 * max_candidates window.  A
+        // later authorized row must still be returned after page-by-page
+        // authorization filtering.
+        for i in 0..70 {
+            db.create_object(&make_object(
+                &format!("hidden-{i}"),
+                "ns",
+                &[("body", "shared paging token")],
+            ))
+            .unwrap();
+        }
+        db.create_object(&make_object(
+            "visible-after-hidden",
+            "ns",
+            &[("body", "shared paging token")],
+        ))
+        .unwrap();
+        db.rebuild_text_fts(1).unwrap();
+
+        let result = db
+            .search_text_fts(
+                &TextSearchQuery {
+                    query: "shared paging".into(),
+                    namespace: "ns".into(),
+                    source_kinds: TextSourceFilter::ObjectProperties,
+                    max_candidates: 1,
+                    max_time_ms: 500,
+                },
+                "user:alice",
+                &|input: &AuthzRecheckInput<'_>| {
+                    if input.entity_id == "visible-after-hidden" {
+                        AuthzDecision::Allow
+                    } else {
+                        AuthzDecision::Deny
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            result.candidates[0]
+                .entity_ref
+                .as_ref()
+                .map(|entity| entity.id.as_str()),
+            Some("visible-after-hidden")
+        );
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.denied_count, 0);
     }
 
     #[test]
@@ -1019,7 +1536,7 @@ mod tests {
             )
             .unwrap();
         assert!(after_delete.candidates.is_empty());
-        assert!(after_delete.denied_count >= 1);
+        assert_eq!(after_delete.denied_count, 0);
 
         // Rebuild removes the stale row entirely.
         db.rebuild_text_fts(2).unwrap();
@@ -1143,6 +1660,92 @@ mod tests {
                 .truncation_reasons
                 .iter()
                 .any(|r| r == "max_candidates")
+        );
+    }
+
+    #[test]
+    fn authorized_adapter_ranks_only_the_prechecked_corpus() {
+        let visible = make_object(
+            "authorized",
+            "ns",
+            &[("body", "shared authorization token")],
+        );
+        let hidden = make_object(
+            "hidden",
+            "ns",
+            &[("body", "shared authorization token"), ("rank", "hidden")],
+        );
+        let documents = [
+            AuthorizedTextDocument::object_property(&visible, "body", "shared authorization token")
+                .unwrap(),
+            // The caller's source-of-truth authorization layer simply does not
+            // pass the hidden row to this adapter.
+            AuthorizedTextDocument::object_property(&hidden, "body", "shared authorization token")
+                .unwrap(),
+        ];
+        let result = search_authorized_text(
+            &TextSearchQuery {
+                query: "shared authorization".into(),
+                namespace: "ns".into(),
+                source_kinds: TextSourceFilter::ObjectProperties,
+                max_candidates: 1,
+                max_time_ms: 1,
+            },
+            "user:alice",
+            &documents[..1],
+        )
+        .unwrap();
+        assert_eq!(result.source_version, AUTHORIZED_TEXT_SOURCE_VERSION);
+        assert_eq!(result.representation_id, REPRESENTATION_AUTHORIZED_TEXT);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            result.candidates[0]
+                .entity_ref
+                .as_ref()
+                .map(|entity| entity.id.as_str()),
+            Some("authorized")
+        );
+        assert_eq!(result.denied_count, 0);
+        assert_eq!(result.scanned, 1);
+        assert!(!format!("{result:?}").contains("hidden"));
+    }
+
+    #[test]
+    fn authorized_adapter_does_not_truncate_on_denied_tail() {
+        let first = make_object("first", "ns", &[("body", "shared race token")]);
+        let second = make_object("second", "ns", &[("body", "shared race token")]);
+        let documents = [
+            AuthorizedTextDocument::object_property(&first, "body", "shared race token").unwrap(),
+            AuthorizedTextDocument::object_property(&second, "body", "shared race token").unwrap(),
+        ];
+        let result = search_authorized_text_with_options(
+            &TextSearchQuery {
+                query: "shared race".into(),
+                namespace: "ns".into(),
+                source_kinds: TextSourceFilter::ObjectProperties,
+                max_candidates: 1,
+                max_time_ms: 500,
+            },
+            "user:alice",
+            &documents,
+            false,
+            None,
+            &|input: &AuthzRecheckInput<'_>| {
+                if input.source_id == "first" {
+                    AuthzDecision::Allow
+                } else {
+                    AuthzDecision::Deny
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert!(!result.truncated);
+        assert!(
+            !result
+                .truncation_reasons
+                .iter()
+                .any(|reason| reason == "max_candidates")
         );
     }
 

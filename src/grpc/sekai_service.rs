@@ -802,10 +802,17 @@ impl SekaiServiceImpl {
             |object| is_reserved_governance_kind(&object.kind),
         )
         .map_err(map_retrieval_error)?;
+        // Retrieval performs detailed internal accounting so the engine can
+        // test ACL and governance boundaries.  The public projection must not
+        // expose that accounting: denied neighbors must not change counts,
+        // and a denied root must be observationally equivalent to a missing
+        // root.  Preserve only the generic unresolved-root shape for denied
+        // roots; never return a denied-object count.
+        let denied_roots = result.denied_roots;
+        result.denied_objects = 0;
+        result.unresolved_roots = result.unresolved_roots.saturating_add(denied_roots);
+        result.denied_roots = 0;
         if reasoning_mode == retrieval::ReasoningMode::Entailment {
-            // Hidden objects are intentionally indistinguishable from absent
-            // objects in inference metadata.
-            result.denied_objects = 0;
             if reasoning_started.elapsed() >= reasoning_timeout
                 && !result
                     .truncation_reasons
@@ -879,11 +886,11 @@ impl SekaiServiceImpl {
         principals: &[String],
         inner: SearchTextRequest,
     ) -> Result<SearchTextResponse, Status> {
-        let sqlite = self.db.as_sqlite().ok_or_else(|| {
-            Status::failed_precondition(
-                "SearchText requires the SQLite complete baseline; PostgreSQL text FTS parity is not in this vertical",
-            )
-        })?;
+        if self.db.as_sqlite().is_none() {
+            return Err(Status::failed_precondition(
+                "SearchText requires the SQLite complete baseline; PostgreSQL authorization-built text parity is not in this vertical",
+            ));
+        }
         let namespace = inner.namespace.trim().to_string();
         if !inner.namespace.is_empty() && namespace != inner.namespace {
             return Err(Status::invalid_argument("canonical namespace required"));
@@ -893,44 +900,118 @@ impl SekaiServiceImpl {
         }
         let source_kinds =
             text_fts::TextSourceFilter::parse(&inner.source_kinds).map_err(map_hybrid_error)?;
-        if inner.rebuild {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            sqlite.rebuild_text_fts(now_ms).map_err(Status::internal)?;
-        }
         let principal_class = principals
             .iter()
             .find(|p| p.as_str() != "anonymous")
             .cloned()
             .unwrap_or_else(|| "anonymous".into());
+        let query = text_fts::TextSearchQuery {
+            query: inner.query,
+            namespace: namespace.clone(),
+            source_kinds,
+            max_candidates: inner.max_candidates,
+            max_time_ms: inner.max_time_ms,
+        };
+        text_fts::validate_text_search_query(&query).map_err(map_hybrid_error)?;
+        let max_time_ms = if inner.max_time_ms == 0 {
+            retrieval::DEFAULT_MAX_TIME_MS
+        } else {
+            inner.max_time_ms.min(retrieval::MAX_TIME_MS)
+        };
+        let authority = resolve_principal_authority(&self.db, principals)?;
+        let trusted = markings::is_trusted_service_principal(&authority.principal);
+        let marking_levels = [
+            evidence_domain::EvidenceClassification::Public,
+            evidence_domain::EvidenceClassification::Internal,
+            evidence_domain::EvidenceClassification::Confidential,
+            evidence_domain::EvidenceClassification::Restricted,
+        ];
+        let allowed_markings = authority
+            .classification_ceiling
+            .map(|ceiling| {
+                marking_levels
+                    .into_iter()
+                    .filter(|level| *level <= ceiling)
+                    .map(evidence_domain::EvidenceClassification::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(max_time_ms));
+        let (documents, corpus_truncated, collection_timed_out) = self
+            .collect_authorized_text_documents(
+                principals,
+                &namespace,
+                source_kinds,
+                deadline,
+                &allowed_markings,
+                trusted,
+            )?;
+        let schema = self
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
         let security = Arc::clone(&self.security);
         let db = Arc::clone(&self.db);
         let principals_owned = principals.to_vec();
         let authz = move |input: &text_fts::AuthzRecheckInput<'_>| {
-            let principal_refs: Vec<&str> = principals_owned.iter().map(String::as_str).collect();
-            search_text_authz_recheck(
+            let principal_refs = principals_owned
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let decision = search_text_authz_recheck(
                 db.as_ref(),
                 security.as_ref(),
                 &principals_owned,
                 &principal_refs,
                 input,
-            )
+            );
+            if decision != text_fts::AuthzDecision::Allow
+                || input.source_kind != text_fts::SOURCE_KIND_OBJECT_PROPERTY
+            {
+                return decision;
+            }
+            let Ok(Some(object)) = db.get_object(input.entity_id) else {
+                return text_fts::AuthzDecision::Gone;
+            };
+            let restricted = restricted_property_names_for_kind(&schema, &object.kind);
+            if restricted.contains(input.source_key)
+                && !can_read_restricted_properties(security.as_ref(), &object, &principals_owned)
+            {
+                return text_fts::AuthzDecision::Deny;
+            }
+            match object.properties.get(input.source_key) {
+                Some(value) if !value.trim().is_empty() => {
+                    if text_fts::object_property_content_hash(input.source_key, value)
+                        != input.content_hash
+                    {
+                        return text_fts::AuthzDecision::Gone;
+                    }
+                    decision
+                }
+                _ => text_fts::AuthzDecision::Gone,
+            }
         };
-        let result = sqlite
-            .search_text_fts(
-                &text_fts::TextSearchQuery {
-                    query: inner.query,
-                    namespace: namespace.clone(),
-                    source_kinds,
-                    max_candidates: inner.max_candidates,
-                    max_time_ms: inner.max_time_ms,
-                },
-                &principal_class,
-                &authz,
-            )
-            .map_err(map_hybrid_error)?;
+        let result = text_fts::search_authorized_text_with_options(
+            &query,
+            &principal_class,
+            &documents,
+            corpus_truncated,
+            Some(deadline),
+            &authz,
+        )
+        .map_err(map_hybrid_error)?;
+        let mut result = result;
+        if collection_timed_out {
+            result.truncated = true;
+            if !result
+                .truncation_reasons
+                .iter()
+                .any(|reason| reason == "max_time_ms")
+            {
+                result.truncation_reasons.push("max_time_ms".into());
+            }
+        }
         Ok(SearchTextResponse {
             candidates: result
                 .candidates
@@ -944,6 +1025,245 @@ impl SekaiServiceImpl {
             denied_count: result.denied_count,
             scanned: result.scanned,
         })
+    }
+
+    /// Build the public text corpus exclusively from rows that already passed
+    /// source-of-truth visibility, namespace, ACL, and marking checks. The
+    /// legacy global FTS projection is intentionally not consulted here.
+    fn collect_authorized_text_documents(
+        &self,
+        principals: &[String],
+        namespace: &str,
+        source_kinds: text_fts::TextSourceFilter,
+        deadline: std::time::Instant,
+        allowed_markings: &[&str],
+        trusted: bool,
+    ) -> Result<(Vec<text_fts::AuthorizedTextDocument>, bool, bool), Status> {
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut documents = Vec::new();
+        let mut corpus_bytes = 0_usize;
+        let mut corpus_truncated = false;
+        let mut collection_timed_out = false;
+        let balanced_sources = source_kinds == text_fts::TextSourceFilter::All;
+        let per_source_document_limit = if balanced_sources {
+            text_fts::MAX_AUTHORIZED_TEXT_DOCUMENTS / 2
+        } else {
+            text_fts::MAX_AUTHORIZED_TEXT_DOCUMENTS
+        };
+        let per_source_byte_limit = if balanced_sources {
+            text_fts::MAX_AUTHORIZED_TEXT_BYTES / 2
+        } else {
+            text_fts::MAX_AUTHORIZED_TEXT_BYTES
+        };
+        let mut object_document_count = 0_usize;
+        let mut evidence_document_count = 0_usize;
+        let mut object_bytes = 0_usize;
+        let mut evidence_bytes = 0_usize;
+        let collection_started = std::time::Instant::now();
+        let object_deadline = if balanced_sources {
+            collection_started
+                + deadline
+                    .saturating_duration_since(collection_started)
+                    .div_f32(2.0)
+        } else {
+            deadline
+        };
+
+        let mut push_document = |document: text_fts::AuthorizedTextDocument| {
+            let document_bytes = document
+                .doc_id
+                .len()
+                .saturating_add(document.source_kind.len())
+                .saturating_add(document.source_id.len())
+                .saturating_add(document.source_key.len())
+                .saturating_add(document.namespace.len())
+                .saturating_add(document.entity_kind.len())
+                .saturating_add(document.entity_id.len())
+                .saturating_add(document.content_hash.len())
+                .saturating_add(document.text_body.len());
+            let is_evidence = document.source_kind == text_fts::SOURCE_KIND_EVIDENCE;
+            let (source_count, source_bytes) = if is_evidence {
+                (&mut evidence_document_count, &mut evidence_bytes)
+            } else {
+                (&mut object_document_count, &mut object_bytes)
+            };
+            if documents.len() >= text_fts::MAX_AUTHORIZED_TEXT_DOCUMENTS
+                || *source_count >= per_source_document_limit
+                || corpus_bytes.saturating_add(document_bytes) > text_fts::MAX_AUTHORIZED_TEXT_BYTES
+                || (*source_bytes).saturating_add(document_bytes) > per_source_byte_limit
+            {
+                return false;
+            }
+            corpus_bytes = corpus_bytes.saturating_add(document_bytes);
+            *source_count = (*source_count).saturating_add(1);
+            *source_bytes = (*source_bytes).saturating_add(document_bytes);
+            documents.push(document);
+            true
+        };
+
+        if matches!(
+            source_kinds,
+            text_fts::TextSourceFilter::All | text_fts::TextSourceFilter::ObjectProperties
+        ) {
+            let filter = domain::ListFilter {
+                namespace: (!namespace.is_empty()).then_some(namespace.to_string()),
+                limit: i32::MAX,
+                ..Default::default()
+            };
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            let mut scan_offset = 0_i32;
+            'objects: loop {
+                let now = std::time::Instant::now();
+                if now >= object_deadline {
+                    corpus_truncated = true;
+                    collection_timed_out = now >= deadline;
+                    break;
+                }
+                let mut scan_filter = filter.clone();
+                scan_filter.offset = scan_offset;
+                scan_filter.limit = 500;
+                let objects = self
+                    .db
+                    .list_objects_with_text_visibility_page(
+                        &scan_filter,
+                        &principal_refs,
+                        RESERVED_GOVERNANCE_KINDS,
+                        allowed_markings,
+                        trusted,
+                    )
+                    .map_err(Status::internal)?;
+                let now = std::time::Instant::now();
+                if now >= object_deadline {
+                    corpus_truncated = true;
+                    collection_timed_out = now >= deadline;
+                    break;
+                }
+                if objects.is_empty() {
+                    break;
+                }
+                let page_len = objects.len() as i32;
+                for object in objects {
+                    let now = std::time::Instant::now();
+                    if now >= object_deadline {
+                        corpus_truncated = true;
+                        collection_timed_out = now >= deadline;
+                        break 'objects;
+                    }
+                    // Keep the team-namespace boundary explicit at the
+                    // adapter boundary as well as in the SQL visibility
+                    // predicate. A namespace-denied row must never enter the
+                    // private FTS corpus, where it could affect ranking,
+                    // bounded admission, or truncation metadata.
+                    if check_team_namespace(&self.db, principals, &object.namespace, false).is_err()
+                    {
+                        continue;
+                    }
+                    let restricted_properties =
+                        restricted_property_names_for_kind(&schema, &object.kind);
+                    let can_read_restricted =
+                        can_read_restricted_properties(&self.security, &object, principals);
+                    let mut properties = object.properties.iter().collect::<Vec<_>>();
+                    properties.sort_unstable_by_key(|(left, _)| *left);
+                    for (key, value) in properties {
+                        if restricted_properties.contains(key) && !can_read_restricted {
+                            continue;
+                        }
+                        if let Some(document) =
+                            text_fts::AuthorizedTextDocument::object_property(&object, key, value)
+                            && !push_document(document)
+                        {
+                            corpus_truncated = true;
+                            break 'objects;
+                        }
+                    }
+                }
+                scan_offset = scan_offset.saturating_add(page_len);
+                if page_len < 500 {
+                    break;
+                }
+            }
+        }
+
+        if !collection_timed_out
+            && matches!(
+                source_kinds,
+                text_fts::TextSourceFilter::All | text_fts::TextSourceFilter::Evidence
+            )
+        {
+            const PAGE_SIZE: i32 = 500;
+            let mut offset = 0_i32;
+            let mut evidence_corpus_exhausted = false;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    corpus_truncated = true;
+                    collection_timed_out = true;
+                    break;
+                }
+                let page = self
+                    .db
+                    .list_evidence_submissions_for_text(
+                        namespace,
+                        &principal_refs,
+                        allowed_markings,
+                        trusted,
+                        PAGE_SIZE,
+                        offset,
+                    )
+                    .map_err(Status::internal)?;
+                if std::time::Instant::now() >= deadline {
+                    corpus_truncated = true;
+                    collection_timed_out = true;
+                    break;
+                }
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len() as i32;
+                for submission in page {
+                    if std::time::Instant::now() >= deadline {
+                        corpus_truncated = true;
+                        collection_timed_out = true;
+                        break;
+                    }
+                    let Some(document) = text_fts::AuthorizedTextDocument::evidence(&submission)
+                    else {
+                        continue;
+                    };
+                    let decision = search_text_authz_recheck(
+                        &self.db,
+                        &self.security,
+                        principals,
+                        &principal_refs,
+                        &text_fts::AuthzRecheckInput {
+                            source_kind: &document.source_kind,
+                            source_id: &document.source_id,
+                            source_key: &document.source_key,
+                            entity_kind: &document.entity_kind,
+                            entity_id: &document.entity_id,
+                            namespace: &document.namespace,
+                            content_hash: &document.content_hash,
+                        },
+                    );
+                    if decision == text_fts::AuthzDecision::Allow && !push_document(document) {
+                        corpus_truncated = true;
+                        evidence_corpus_exhausted = true;
+                        break;
+                    }
+                }
+                if evidence_corpus_exhausted || collection_timed_out {
+                    break;
+                }
+                offset = offset.saturating_add(page_len);
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+            }
+        }
+
+        Ok((documents, corpus_truncated, collection_timed_out))
     }
 
     fn execute_hybrid_retrieve(
@@ -990,7 +1310,7 @@ impl SekaiServiceImpl {
                     remaining_ms,
                     max_per_representation,
                 ),
-                hybrid::REPRESENTATION_TEXT_FTS5 => self.run_hybrid_text_adapter(
+                hybrid::REPRESENTATION_AUTHORIZED_TEXT => self.run_hybrid_text_adapter(
                     principals,
                     &principal_class,
                     inner.text.as_ref(),
@@ -1207,9 +1527,9 @@ impl SekaiServiceImpl {
     ) -> hybrid::AdapterResult {
         let Some(text) = text else {
             return hybrid::AdapterResult::error(
-                hybrid::REPRESENTATION_TEXT_FTS5,
+                hybrid::REPRESENTATION_AUTHORIZED_TEXT,
                 "invalid_argument",
-                "text params required when text.fts5 is selected",
+                "text params required when text.authorized is selected",
             );
         };
         let request = SearchTextRequest {
@@ -1233,7 +1553,7 @@ impl SekaiServiceImpl {
                     response.truncated,
                 );
                 let mut result = hybrid::AdapterResult {
-                    representation_id: hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                    representation_id: hybrid::REPRESENTATION_AUTHORIZED_TEXT.into(),
                     status,
                     candidates,
                     truncation_reasons: response.truncation_reasons,
@@ -1250,7 +1570,9 @@ impl SekaiServiceImpl {
                 result = hybrid::apply_max_per_representation(result, max_per_representation);
                 result
             }
-            Err(status) => hybrid_adapter_status_error(hybrid::REPRESENTATION_TEXT_FTS5, status),
+            Err(status) => {
+                hybrid_adapter_status_error(hybrid::REPRESENTATION_AUTHORIZED_TEXT, status)
+            }
         }
     }
 
@@ -2129,7 +2451,7 @@ fn explain_derivation_capability() -> CapabilityEntry {
 fn search_text_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_SEARCH_TEXT.into(),
-        "Search the rebuildable SQLite FTS5 text projection and return HybridCandidate rows with authz re-check.".into(),
+        "Search a per-request SQLite FTS5 corpus built from authorization-visible source rows and return HybridCandidate rows.".into(),
         "retrieval",
         "sekai.SearchTextRequest",
         "sekai.SearchTextResponse",
@@ -2159,8 +2481,8 @@ fn search_text_capability() -> CapabilityEntry {
     };
     entry.evidence_requirements = vec![
         "hybrid_candidate_envelope".into(),
-        "score_kind_text_fts5_bm25_v1".into(),
-        "authz_recheck_per_hit".into(),
+        "score_kind_text_authorized_bm25_v1".into(),
+        "authorized_corpus_before_ranking".into(),
         "entity_ref_from_source_of_truth_only".into(),
     ];
     entry
@@ -2243,7 +2565,7 @@ fn explain_pattern_plan_capability() -> CapabilityEntry {
 fn hybrid_retrieve_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_HYBRID_RETRIEVE.into(),
-        "Late-fuse explicit graph and/or text.fts5 adapters into HybridCandidate rows under a versioned fusion profile.".into(),
+        "Late-fuse explicit graph and/or text.authorized adapters into HybridCandidate rows under a versioned fusion profile.".into(),
         "retrieval",
         "sekai.HybridRetrieveRequest",
         "sekai.HybridRetrieveResponse",
@@ -2280,7 +2602,7 @@ fn hybrid_retrieve_capability() -> CapabilityEntry {
         "hybrid_candidate_envelope".into(),
         "per_adapter_status".into(),
         "versioned_fusion_profile".into(),
-        "authz_recheck_per_hit".into(),
+        "authorized_corpus_before_ranking".into(),
         "entity_ref_from_source_of_truth_only".into(),
         "partial_adapter_failure_metadata".into(),
     ];
@@ -5631,8 +5953,26 @@ fn search_text_authz_recheck(
             let Ok(Some(submission)) = db.get_evidence_submission(input.source_id) else {
                 return text_fts::AuthzDecision::Gone;
             };
-            if !text_fts::evidence_content_readable(submission.lifecycle_state) {
+            if !matches!(
+                submission.lifecycle_state,
+                evidence_domain::EvidenceLifecycleState::Available
+                    | evidence_domain::EvidenceLifecycleState::Superseded
+            ) {
                 return text_fts::AuthzDecision::Gone;
+            }
+            let authority = match resolve_principal_authority(db, principals) {
+                Ok(authority) => authority,
+                Err(_) => return text_fts::AuthzDecision::Deny,
+            };
+            if markings::evaluate_marking_access(
+                "text.authorized.evidence",
+                Some(submission.classification),
+                &authority,
+            )
+            .decision
+                == markings::MarkingDecision::Deny
+            {
+                return text_fts::AuthzDecision::Deny;
             }
             if !submission.namespace.is_empty()
                 && check_team_namespace(db, principals, &submission.namespace, false).is_err()
@@ -5645,6 +5985,15 @@ fn search_text_authz_recheck(
                 // Content path requires a projected object for ACL; without it fail closed.
                 return text_fts::AuthzDecision::Gone;
             };
+            let Ok(Some(evidence_object)) = db.get_object(&evidence_object_id) else {
+                // Classification and purpose markings live on the projected
+                // source-of-truth object. A missing projection cannot be
+                // treated as readable, even for the producer principal.
+                return text_fts::AuthzDecision::Gone;
+            };
+            if !object_passes_marking(db, &evidence_object, principals).unwrap_or(false) {
+                return text_fts::AuthzDecision::Deny;
+            }
             let producer_ok = principals
                 .iter()
                 .any(|principal| principal == &submission.producer_identity);
@@ -8574,7 +8923,8 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
-        let response = self.execute_search_text(&principals, req.into_inner())?;
+        let request = req.into_inner();
+        let response = self.execute_search_text(&principals, request)?;
         if let Some((_, guard)) = receipt_guard.as_mut() {
             guard.finalize("allow", "succeeded")?;
         }
@@ -26952,7 +27302,8 @@ mod tests {
             response.candidates[0].object.as_ref().unwrap().properties["secret_note"],
             REDACTED_VALUE
         );
-        assert_eq!(response.denied_objects, 2);
+        assert_eq!(response.denied_objects, 0);
+        assert_eq!(response.unresolved_roots, 0);
         assert_eq!(response.links.len(), 1);
         assert_eq!(response.links[0].id, "context-visible-link");
         assert!(!response.truncated);
@@ -26972,7 +27323,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(denied_root.candidates.is_empty());
-        assert_eq!(denied_root.denied_objects, 1);
+        assert_eq!(denied_root.denied_objects, 0);
+        assert_eq!(denied_root.unresolved_roots, 1);
     }
 
     #[tokio::test]
@@ -27025,17 +27377,26 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        assert_eq!(response.representation_id, hybrid::REPRESENTATION_TEXT_FTS5);
-        assert!(response.source_version.starts_with("gen:"));
+        assert_eq!(
+            response.representation_id,
+            hybrid::REPRESENTATION_AUTHORIZED_TEXT
+        );
+        assert_eq!(
+            response.source_version,
+            text_fts::AUTHORIZED_TEXT_SOURCE_VERSION
+        );
         assert_eq!(response.candidates.len(), 1);
         let candidate = &response.candidates[0];
-        assert_eq!(candidate.score_kind, hybrid::SCORE_KIND_TEXT_FTS5_BM25_V1);
-        assert_eq!(candidate.source, hybrid::SOURCE_SQLITE_TEXT_FTS5);
+        assert_eq!(
+            candidate.score_kind,
+            hybrid::SCORE_KIND_AUTHORIZED_TEXT_BM25_V1
+        );
+        assert_eq!(candidate.source, hybrid::SOURCE_AUTHORIZED_TEXT);
         assert_eq!(
             candidate.entity_ref.as_ref().map(|e| e.id.as_str()),
             Some("fts-public")
         );
-        assert!(response.denied_count >= 1);
+        assert_eq!(response.denied_count, 0);
         for reason in &response.truncation_reasons {
             assert!(!reason.contains("secret"));
             assert!(!reason.contains("fts-secret"));
@@ -27080,7 +27441,7 @@ mod tests {
                 HybridRetrieveRequest {
                     representations: vec![
                         hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
-                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                        hybrid::REPRESENTATION_AUTHORIZED_TEXT.into(),
                     ],
                     fusion_profile: String::new(),
                     max_time_ms: 500,
@@ -27235,7 +27596,7 @@ mod tests {
                 HybridRetrieveRequest {
                     representations: vec![
                         hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
-                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                        hybrid::REPRESENTATION_AUTHORIZED_TEXT.into(),
                     ],
                     graph: Some(HybridGraphParams {
                         roots: vec![ContextRoot {
@@ -27273,13 +27634,9 @@ mod tests {
                 .iter()
                 .any(|c| c.representation_id == hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT)
         );
-        assert!(
-            response
-                .candidates
-                .iter()
-                .any(|c| c.representation_id == hybrid::REPRESENTATION_TEXT_FTS5
-                    && c.score_kind == hybrid::SCORE_KIND_TEXT_FTS5_BM25_V1)
-        );
+        assert!(response.candidates.iter().any(|c| c.representation_id
+            == hybrid::REPRESENTATION_AUTHORIZED_TEXT
+            && c.score_kind == hybrid::SCORE_KIND_AUTHORIZED_TEXT_BM25_V1));
         // graph_priority: first candidate is graph.
         assert_eq!(
             response.candidates[0].representation_id,
@@ -27326,7 +27683,7 @@ mod tests {
                 HybridRetrieveRequest {
                     representations: vec![
                         hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
-                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                        hybrid::REPRESENTATION_AUTHORIZED_TEXT.into(),
                     ],
                     graph: Some(HybridGraphParams {
                         roots: vec![ContextRoot {
@@ -27362,7 +27719,7 @@ mod tests {
         let text_adapter = response
             .adapter_results
             .iter()
-            .find(|a| a.representation_id == hybrid::REPRESENTATION_TEXT_FTS5)
+            .find(|a| a.representation_id == hybrid::REPRESENTATION_AUTHORIZED_TEXT)
             .expect("text adapter result");
         assert_eq!(text_adapter.status, hybrid::ADAPTER_STATUS_ERROR);
         assert_eq!(text_adapter.error_code, "invalid_argument");
@@ -27413,7 +27770,7 @@ mod tests {
                 HybridRetrieveRequest {
                     representations: vec![
                         hybrid::REPRESENTATION_GRAPH_RETRIEVE_CONTEXT.into(),
-                        hybrid::REPRESENTATION_TEXT_FTS5.into(),
+                        hybrid::REPRESENTATION_AUTHORIZED_TEXT.into(),
                     ],
                     graph: Some(HybridGraphParams {
                         roots: vec![ContextRoot {
@@ -27461,9 +27818,9 @@ mod tests {
         let text_adapter = response
             .adapter_results
             .iter()
-            .find(|a| a.representation_id == hybrid::REPRESENTATION_TEXT_FTS5)
+            .find(|a| a.representation_id == hybrid::REPRESENTATION_AUTHORIZED_TEXT)
             .expect("text adapter");
-        assert!(text_adapter.denied_count >= 1);
+        assert_eq!(text_adapter.denied_count, 0);
         assert!(
             response
                 .candidates
@@ -27507,7 +27864,7 @@ mod tests {
         let response = svc
             .hybrid_retrieve(with_named_principal(
                 HybridRetrieveRequest {
-                    representations: vec![hybrid::REPRESENTATION_TEXT_FTS5.into()],
+                    representations: vec![hybrid::REPRESENTATION_AUTHORIZED_TEXT.into()],
                     text: Some(HybridTextParams {
                         query: "tokenizable payload".into(),
                         namespace: "default".into(),
@@ -28606,7 +28963,8 @@ mod tests {
             .map(|candidate| candidate.object.as_ref().unwrap().id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(expand_ids, vec!["sem-root", "sem-allowed"]);
-        assert_eq!(expand.denied_objects, 1);
+        assert_eq!(expand.denied_objects, 0);
+        assert_eq!(expand.unresolved_roots, 0);
         assert_eq!(expand.reasoning_mode, "asserted_only");
 
         let retrieve = svc

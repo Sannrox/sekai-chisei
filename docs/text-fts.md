@@ -5,25 +5,35 @@ Research freeze: [152-hybrid-retrieval.md](research/152-hybrid-retrieval.md).
 
 ## Purpose
 
-Provide a **rebuildable lexical text projection** on the SQLite complete
-baseline and a durable **HybridCandidate** envelope so text scores can later
-participate in hybrid plans without silent cross-kind comparison or identity
-minting. Late fusion across adapters is a separate vertical (#361).
+Provide a durable **HybridCandidate** envelope backed by an authorization-built
+per-request lexical corpus. The existing rebuildable global FTS projection is
+kept as an internal optimization, but public SearchText never ranks against it.
+Late fusion across adapters is a separate vertical (#361).
 
 ## Guarantees
 
-- **Sources of truth stay writable only through existing APIs.** The FTS index
-  is a projection rebuilt from evidence submission content and selected object
-  property text.
-- **Authz re-check on read.** Each hit is re-validated against live ACL,
-  classification markings, evidence lifecycle, and content digests. Denied or
-  deleted material is omitted (non-disclosure). Response `denied_count` never
-  names hidden objects.
+- **Authorization precedes ranking.** SearchText enumerates source-of-truth
+  object properties and readable evidence for the caller, then builds a private
+  in-memory FTS5 table from those rows only. Hidden, stale, retracted, or
+  unprojected material never enters the candidate set, rank calculation, or
+  truncation accounting. Public denial counts remain zero and `scanned` counts
+  only returned authorized hits.
+- **Both source kinds make progress.** When `source_kinds=all`, the bounded
+  authorized corpus gives object properties and evidence an even document and
+  byte share so a large authorized object corpus cannot starve evidence rows.
+- **The global projection is internal.** `sekai_text_fts` and its rebuild
+  generation are retained for internal maintenance and migration compatibility;
+  `text.fts5` is not a public representation id and is rejected by HybridRetrieve.
+- **Stable non-disclosure behavior.** The adapter uses the fixed source version
+  `authorized-text/v1`; deadline exhaustion is reported only as the generic
+  `max_time_ms` truncation reason and never includes hidden identifiers or
+  denial counts. The enclosing hybrid plan owns the shared budget.
 - **Similarity never mints identity.** `entity_ref` is set only when a source
   of truth already asserts the id (`object`, `evidence_submission`). Text
   scores do not create, merge, or equate durable ids.
-- **Versioned score meaning.** Text hits use `score_kind = text.fts5_bm25/v1`.
-  The numeric `score` is `-bm25(sekai_text_fts)` so higher is better. Scores
+- **Versioned score meaning.** Text hits use `score_kind =
+  text.authorized_bm25/v1`. The numeric `score` is `-bm25(authorized_text_fts)`
+  so higher is better. Scores
   must not be compared with `graph.context_affinity/v1` without a named fusion
   profile (#361).
 - **SQLite complete.** This vertical does not require PostgreSQL. `SearchText`
@@ -34,9 +44,9 @@ minting. Late fusion across adapters is a separate vertical (#361).
 
 | Field | Meaning |
 | --- | --- |
-| `representation_id` | Stable adapter id (`text.fts5` for this vertical) |
-| `source` / `source_version` | Projection origin and generation (`sqlite.text_fts5`, `gen:N#content_hash`) |
-| `score` / `score_kind` | Rank value and versioned meaning (`text.fts5_bm25/v1`) |
+| `representation_id` | Stable public adapter id (`text.authorized`) |
+| `source` / `source_version` | Authorization-built origin and fixed version (`sqlite.authorized_text`, `authorized-text/v1`) |
+| `score` / `score_kind` | Rank value and versioned meaning (`text.authorized_bm25/v1`) |
 | `entity_ref` | Optional SoT-asserted id only |
 | `authz_context` | Namespace + principal class summary for audit (not a grant) |
 | `truncated` / `denied` | Per-candidate flags; denied rows are normally omitted |
@@ -49,12 +59,13 @@ SearchText
   namespace (optional filter)
   source_kinds: all | evidence | object_props
   max_candidates (default 20, cap 100)
-  max_time_ms (default 100, cap 1000)
-  rebuild (optional operator rebuild-before-search)
+  max_time_ms (shared-plan deadline bound)
+  rebuild (legacy compatibility flag; ignored by public SearchText)
 ```
 
 Response: `HybridCandidate[]`, representation/source_version, truncation
-reasons (`max_candidates`, `max_time_ms`), `denied_count`, `scanned`.
+reasons (`max_candidates`, `authorized_corpus`, or `max_time_ms`),
+`denied_count`, `scanned`.
 
 Optional catalog binding uses capability `sekai.text.search` with the same
 receipt metadata contract as other semantic retrieval surfaces
@@ -69,7 +80,7 @@ Migration creates:
 - `sekai_text_fts_docs` — shadow rows keyed by `doc_id`
 - `sekai_text_fts` — FTS5 external-content virtual table over `text_body`
 
-Rebuild (`rebuild_text_fts` / `SearchText.rebuild=true`):
+Internal rebuild (`rebuild_text_fts`, outside the public SearchText request):
 
 1. Clears the virtual table and docs.
 2. Indexes string leaves of retained evidence `envelope.content` for lifecycle
@@ -78,9 +89,11 @@ Rebuild (`rebuild_text_fts` / `SearchText.rebuild=true`):
 3. Indexes non-empty object property values (keys not starting with `_`).
 4. Advances `generation` to `gen:<n+1>`.
 
-Operators should rebuild after bulk evidence or object imports. Query-time
-authz re-check keeps stale ACL or deletes fail-closed even before the next
-rebuild.
+Operators may rebuild after bulk evidence or object imports for internal
+consumers. Public SearchText does not depend on rebuild freshness for ranking
+and never performs the global rebuild synchronously. It reads the authorized
+source rows directly on every request; the legacy `rebuild` flag is retained
+only for wire compatibility.
 
 ## Non-goals
 
@@ -98,8 +111,8 @@ rebuild.
   `evidence_content_acl`;
 - limits including `max_candidates`, `max_query_chars`, and
   `mints_identity_from_similarity=0`;
-- evidence requirements for the HybridCandidate envelope, BM25 score kind,
-  per-hit authz re-check, and SoT-only entity refs.
+- evidence requirements for the HybridCandidate envelope, authorization-built
+  BM25 score kind, pre-ranking authorization, and SoT-only entity refs.
 
 ## Related
 

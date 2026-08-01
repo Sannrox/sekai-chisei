@@ -12,16 +12,30 @@ use std::fmt;
 
 /// Graph representation used by `RetrieveContext` (#144).
 pub const REPRESENTATION_GRAPH_RETRIEVE_CONTEXT: &str = "graph.retrieve_context";
-/// Lexical SQLite FTS5 text representation (#360).
-pub const REPRESENTATION_TEXT_FTS5: &str = "text.fts5";
+/// Authorization-built SQLite FTS5 text representation (#497).
+///
+/// This is the only text representation accepted by public hybrid plans. The
+/// older global projection remains an internal rebuildable implementation
+/// detail and is deliberately not registered below.
+pub const REPRESENTATION_AUTHORIZED_TEXT: &str = "text.authorized";
+/// Lexical score kind for the authorization-built corpus.
+pub const SCORE_KIND_AUTHORIZED_TEXT_BM25_V1: &str = "text.authorized_bm25/v1";
+/// Source identity for the authorization-built in-memory FTS projection.
+pub const SOURCE_AUTHORIZED_TEXT: &str = "sqlite.authorized_text";
+/// Legacy global SQLite FTS5 representation. Internal only; never accept this
+/// identifier from public representation selection.
+#[allow(dead_code)]
+pub(crate) const REPRESENTATION_TEXT_FTS5: &str = "text.fts5";
 
 /// Deterministic graph affinity score kind (depth + multi-root corroboration).
 pub const SCORE_KIND_GRAPH_CONTEXT_AFFINITY_V1: &str = "graph.context_affinity/v1";
 /// SQLite FTS5 BM25 score kind. Score is `-bm25(table)` so higher is better.
-pub const SCORE_KIND_TEXT_FTS5_BM25_V1: &str = "text.fts5_bm25/v1";
+#[allow(dead_code)]
+pub(crate) const SCORE_KIND_TEXT_FTS5_BM25_V1: &str = "text.fts5_bm25/v1";
 
 /// Projection source identity for the SQLite FTS text index.
-pub const SOURCE_SQLITE_TEXT_FTS5: &str = "sqlite.text_fts5";
+#[allow(dead_code)]
+pub(crate) const SOURCE_SQLITE_TEXT_FTS5: &str = "sqlite.text_fts5";
 /// Source identity for graph retrieve-context candidates.
 pub const SOURCE_GRAPH_RETRIEVE_CONTEXT: &str = "sekai.retrieve_context";
 
@@ -95,8 +109,31 @@ pub struct HybridCandidate {
 }
 
 impl HybridCandidate {
+    /// Build a candidate from the authorization-built text corpus. The corpus
+    /// is assembled from source-of-truth rows that already passed the caller's
+    /// authorization and marking checks.
+    pub fn authorized_text(
+        source_version: impl Into<String>,
+        score: f64,
+        entity_ref: Option<EntityRef>,
+        authz: AuthzContextSummary,
+    ) -> Self {
+        Self {
+            representation_id: REPRESENTATION_AUTHORIZED_TEXT.into(),
+            source: SOURCE_AUTHORIZED_TEXT.into(),
+            source_version: source_version.into(),
+            score,
+            score_kind: SCORE_KIND_AUTHORIZED_TEXT_BM25_V1.into(),
+            entity_ref,
+            authz_context: authz,
+            truncated: false,
+            denied: false,
+        }
+    }
+
     /// Build a text-FTS candidate. Does not invent entity ids.
-    pub fn text_fts(
+    #[allow(dead_code)]
+    pub(crate) fn text_fts(
         source_version: impl Into<String>,
         score: f64,
         entity_ref: Option<EntityRef>,
@@ -140,7 +177,7 @@ impl HybridCandidate {
 pub fn known_score_kinds() -> &'static [&'static str] {
     &[
         SCORE_KIND_GRAPH_CONTEXT_AFFINITY_V1,
-        SCORE_KIND_TEXT_FTS5_BM25_V1,
+        SCORE_KIND_AUTHORIZED_TEXT_BM25_V1,
     ]
 }
 
@@ -148,7 +185,7 @@ pub fn known_score_kinds() -> &'static [&'static str] {
 pub fn known_representation_ids() -> &'static [&'static str] {
     &[
         REPRESENTATION_GRAPH_RETRIEVE_CONTEXT,
-        REPRESENTATION_TEXT_FTS5,
+        REPRESENTATION_AUTHORIZED_TEXT,
     ]
 }
 
@@ -625,8 +662,8 @@ mod tests {
     }
 
     fn text_cand(id: &str, score: f64) -> HybridCandidate {
-        HybridCandidate::text_fts(
-            "gen:1",
+        HybridCandidate::authorized_text(
+            "authorized-text/v1",
             score,
             Some(EntityRef {
                 kind: ENTITY_KIND_OBJECT.into(),
@@ -638,24 +675,34 @@ mod tests {
 
     #[test]
     fn score_kinds_are_versioned_and_distinct() {
-        assert!(SCORE_KIND_TEXT_FTS5_BM25_V1.ends_with("/v1"));
+        assert!(SCORE_KIND_AUTHORIZED_TEXT_BM25_V1.ends_with("/v1"));
         assert_ne!(
             SCORE_KIND_GRAPH_CONTEXT_AFFINITY_V1,
-            SCORE_KIND_TEXT_FTS5_BM25_V1
+            SCORE_KIND_AUTHORIZED_TEXT_BM25_V1
         );
-        assert!(known_score_kinds().contains(&SCORE_KIND_TEXT_FTS5_BM25_V1));
-        assert!(known_representation_ids().contains(&REPRESENTATION_TEXT_FTS5));
+        assert!(known_score_kinds().contains(&SCORE_KIND_AUTHORIZED_TEXT_BM25_V1));
+        assert!(known_representation_ids().contains(&REPRESENTATION_AUTHORIZED_TEXT));
+        assert!(!known_score_kinds().contains(&SCORE_KIND_TEXT_FTS5_BM25_V1));
+        assert!(!known_representation_ids().contains(&REPRESENTATION_TEXT_FTS5));
         assert!(known_fusion_profiles().contains(&FUSION_PROFILE_RRF_V1));
         assert!(known_fusion_profiles().contains(&FUSION_PROFILE_GRAPH_PRIORITY_V1));
     }
 
     #[test]
     fn text_candidate_never_requires_entity_ref() {
-        let candidate = HybridCandidate::text_fts("gen:1", 1.5, None, authz("ns"));
-        assert_eq!(candidate.representation_id, REPRESENTATION_TEXT_FTS5);
-        assert_eq!(candidate.score_kind, SCORE_KIND_TEXT_FTS5_BM25_V1);
+        let candidate =
+            HybridCandidate::authorized_text("authorized-text/v1", 1.5, None, authz("ns"));
+        assert_eq!(candidate.representation_id, REPRESENTATION_AUTHORIZED_TEXT);
+        assert_eq!(candidate.score_kind, SCORE_KIND_AUTHORIZED_TEXT_BM25_V1);
         assert!(candidate.entity_ref.is_none());
         assert!(!candidate.denied);
+    }
+
+    #[test]
+    fn legacy_global_text_representation_is_not_publicly_selectable() {
+        let err = parse_representation_id(REPRESENTATION_TEXT_FTS5).unwrap_err();
+        assert!(matches!(err, HybridError::InvalidArgument(_)));
+        assert!(err.to_string().contains(REPRESENTATION_AUTHORIZED_TEXT));
     }
 
     #[test]
@@ -678,7 +725,7 @@ mod tests {
     fn graph_priority_orders_graph_before_text() {
         let adapters = vec![
             AdapterResult::ok(
-                REPRESENTATION_TEXT_FTS5,
+                REPRESENTATION_AUTHORIZED_TEXT,
                 vec![text_cand("t1", 9.0), text_cand("t2", 8.0)],
             ),
             AdapterResult::ok(
@@ -703,8 +750,8 @@ mod tests {
             vec![
                 (REPRESENTATION_GRAPH_RETRIEVE_CONTEXT, "g1"),
                 (REPRESENTATION_GRAPH_RETRIEVE_CONTEXT, "g2"),
-                (REPRESENTATION_TEXT_FTS5, "t1"),
-                (REPRESENTATION_TEXT_FTS5, "t2"),
+                (REPRESENTATION_AUTHORIZED_TEXT, "t1"),
+                (REPRESENTATION_AUTHORIZED_TEXT, "t2"),
             ]
         );
         // Scores and score_kinds preserved; no silent cross-kind comparison.
@@ -712,7 +759,10 @@ mod tests {
             fused.candidates[0].score_kind,
             SCORE_KIND_GRAPH_CONTEXT_AFFINITY_V1
         );
-        assert_eq!(fused.candidates[2].score_kind, SCORE_KIND_TEXT_FTS5_BM25_V1);
+        assert_eq!(
+            fused.candidates[2].score_kind,
+            SCORE_KIND_AUTHORIZED_TEXT_BM25_V1
+        );
     }
 
     #[test]
@@ -726,7 +776,7 @@ mod tests {
                 vec![graph_cand("g1", 0.1), graph_cand("g2", 0.05)],
             ),
             AdapterResult::ok(
-                REPRESENTATION_TEXT_FTS5,
+                REPRESENTATION_AUTHORIZED_TEXT,
                 vec![text_cand("t1", 100.0), text_cand("t2", 99.0)],
             ),
         ];
@@ -745,7 +795,7 @@ mod tests {
     #[test]
     fn fusion_profile_versions_are_additive_and_testable() {
         let adapters = vec![
-            AdapterResult::ok(REPRESENTATION_TEXT_FTS5, vec![text_cand("t1", 5.0)]),
+            AdapterResult::ok(REPRESENTATION_AUTHORIZED_TEXT, vec![text_cand("t1", 5.0)]),
             AdapterResult::ok(
                 REPRESENTATION_GRAPH_RETRIEVE_CONTEXT,
                 vec![graph_cand("g1", 1.0)],
@@ -770,12 +820,12 @@ mod tests {
         assert!(
             rrf.candidates
                 .iter()
-                .any(|c| c.representation_id == REPRESENTATION_TEXT_FTS5)
+                .any(|c| c.representation_id == REPRESENTATION_AUTHORIZED_TEXT)
         );
         assert!(
             gp.candidates
                 .iter()
-                .any(|c| c.representation_id == REPRESENTATION_TEXT_FTS5)
+                .any(|c| c.representation_id == REPRESENTATION_AUTHORIZED_TEXT)
         );
     }
 
@@ -787,7 +837,7 @@ mod tests {
                 vec![graph_cand("g1", 1.0)],
             ),
             AdapterResult::error(
-                REPRESENTATION_TEXT_FTS5,
+                REPRESENTATION_AUTHORIZED_TEXT,
                 "invalid_argument",
                 "query must be non-empty",
             ),
@@ -847,7 +897,7 @@ mod tests {
     #[test]
     fn denied_empty_contributes_no_candidates() {
         let adapters = vec![
-            AdapterResult::denied_empty(REPRESENTATION_TEXT_FTS5, 3),
+            AdapterResult::denied_empty(REPRESENTATION_AUTHORIZED_TEXT, 3),
             AdapterResult::ok(
                 REPRESENTATION_GRAPH_RETRIEVE_CONTEXT,
                 vec![graph_cand("g1", 1.0)],

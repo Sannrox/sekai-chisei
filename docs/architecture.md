@@ -158,13 +158,14 @@ bounded retrieval surfaces, and governed actions before invocation. Catalog
 visibility is filtered for the authenticated authorization context and never
 acts as an authorization token; invocation always rechecks live controls.
 
-`SearchText` exposes the rebuildable SQLite FTS5 text representation and the
-shared `HybridCandidate` envelope (research #152 / issue #360). Scores use
-`text.fts5_bm25/v1` and never mint durable identities; authz is re-checked per
-hit. See [text-fts.md](text-fts.md).
+`SearchText` exposes an authorization-built SQLite FTS5 text representation and
+the shared `HybridCandidate` envelope (issue #497). Scores use
+`text.authorized_bm25/v1` and never mint durable identities; hidden rows are
+excluded before ranking. The older global FTS projection is internal. See
+[text-fts.md](text-fts.md).
 
 `HybridRetrieve` late-fuses explicit adapters (`graph.retrieve_context`,
-`text.fts5`) under a versioned fusion profile (`late_fusion.rrf/v1`,
+`text.authorized`) under a versioned fusion profile (`late_fusion.rrf/v1`,
 `late_fusion.graph_priority/v1`) and returns mixed `HybridCandidate` rows with
 per-adapter status (`ok | truncated | denied_empty | error`). Callers must name
 representations; pure graph remains on `RetrieveContext`. See
