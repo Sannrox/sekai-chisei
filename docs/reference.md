@@ -109,6 +109,8 @@ lives in the separate [research index](research/README.md).
   export packages.
 - [Provider residency](residency-policy.md) — provider and data-class policy
   for a single control plane.
+- [Context admission policy](context-admission-policy.md) — bounded,
+  namespace-scoped context use rules and native/gateway parity.
 - [Federation profile](federation-profile.md) — multi-control-plane trust and
   exchange contract.
 - [Region/site pins](region-pins.md) — single-writer pins for leases and online

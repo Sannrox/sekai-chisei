@@ -154,6 +154,11 @@ mod tests {
             memory_references: vec![],
             memory_holdouts: vec![],
             allowed_evidence_classes: std::collections::HashSet::new(),
+            context_admission_policy: None,
+            context_admission: Default::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
         }
     }
 

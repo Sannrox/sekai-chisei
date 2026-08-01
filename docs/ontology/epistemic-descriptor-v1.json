@@ -39,6 +39,68 @@
       ]
     },
     {
+      "name": "ChiseiContextAdmissionPolicy",
+      "description": "A versioned, opt-in Chisei policy that governs use of already-authorized epistemic context projections without adjudicating their truth or changing their source lifecycle.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "contract_version",
+          "type": "string",
+          "required": true,
+          "description": "Policy semantics identifier: chisei.context-admission/v1."
+        },
+        {
+          "name": "default_action",
+          "type": "string",
+          "required": true,
+          "description": "Action used when a complete descriptor matches no rule."
+        },
+        {
+          "name": "unknown_action",
+          "type": "string",
+          "required": true,
+          "description": "Bounded action used when descriptor dimensions or confidence basis are unknown."
+        },
+        {
+          "name": "rules_json",
+          "type": "string",
+          "required": true,
+          "description": "Canonical bounded first-match rule set."
+        }
+      ]
+    },
+    {
+      "name": "ChiseiContextAdmissionDecision",
+      "description": "A bounded decision record describing how a configured Chisei context-admission policy treated an authorized descriptor before enrichment or provider execution.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "action",
+          "type": "string",
+          "required": true,
+          "description": "Include, qualify, hold_out, require_review, or require_verification."
+        },
+        {
+          "name": "policy_version",
+          "type": "string",
+          "required": true,
+          "description": "Content hash of the policy that produced the decision."
+        },
+        {
+          "name": "descriptor_version",
+          "type": "string",
+          "required": true,
+          "description": "Descriptor contract version used for the decision."
+        },
+        {
+          "name": "reason_code",
+          "type": "string",
+          "required": true,
+          "description": "Bounded, non-content-bearing reason code."
+        }
+      ]
+    },
+    {
       "name": "SekaiGraphProjectionReference",
       "description": "An authorization-filtered asserted graph fact or query-time ontology derivation returned by an existing Sekai retrieval surface.",
       "superclasses": [],
@@ -101,6 +163,28 @@
         "max": 1
       },
       "transitive": false
+    },
+    {
+      "name": "governs_context_admission",
+      "description": "Associates a configured context-admission policy with the read-only descriptor projection it evaluates.",
+      "domain": "ChiseiContextAdmissionPolicy",
+      "range": "ChiseiEpistemicDescriptor",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
+    },
+    {
+      "name": "records_context_admission_decision",
+      "description": "Associates a bounded context-admission decision with the descriptor projection and policy versions used to produce it.",
+      "domain": "ChiseiContextAdmissionDecision",
+      "range": "ChiseiEpistemicDescriptor",
+      "cardinality": {
+        "min": 0,
+        "max": 1
+      },
+      "transitive": false
     }
   ],
   "provenance": [
@@ -120,6 +204,30 @@
       "subject": "ChiseiContextReference",
       "source": "sekai-chisei",
       "locator": "src/chisei/pipeline.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiContextAdmissionPolicy",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/policy.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiContextAdmissionPolicy",
+      "source": "sekai-chisei",
+      "locator": "docs/context-admission-policy.md",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiContextAdmissionDecision",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/pipeline.rs",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiContextAdmissionDecision",
+      "source": "sekai-chisei",
+      "locator": "src/grpc/chisei_service.rs",
       "confidence": 1.0
     },
     {
