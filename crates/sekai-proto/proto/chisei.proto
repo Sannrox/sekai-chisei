@@ -1367,6 +1367,7 @@ message ListKiokuCandidatesRequest {
   string namespace = 1;
   string operation_class = 2;
   uint32 limit = 3;
+  string page_token = 4;
 }
 message KiokuCandidateRecord {
   string memory_json = 1;
@@ -1376,7 +1377,10 @@ message KiokuCandidateRecord {
   uint32 supporting_evidence = 5;
   uint32 contradicting_evidence = 6;
 }
-message ListKiokuCandidatesResponse { repeated KiokuCandidateRecord candidates = 1; }
+message ListKiokuCandidatesResponse {
+  repeated KiokuCandidateRecord candidates = 1;
+  string next_page_token = 2;
+}
 message ReviewKiokuMemoryRequest {
   string memory_id = 1;
   uint32 memory_version = 2;
@@ -1386,6 +1390,18 @@ message ReviewKiokuMemoryRequest {
 message ReviewKiokuMemoryResponse {
   string memory_json = 1;
   repeated string lifecycle_events_json = 2;
+}
+message ReassessKiokuMemoryRequest {
+  string memory_id = 1;
+  uint32 memory_version = 2;
+  string reassessment_key = 3;
+  repeated string evidence_basis_json = 4;
+}
+message ReassessKiokuMemoryResponse {
+  string memory_json = 1;
+  repeated string evidence_json = 2;
+  repeated string lifecycle_events_json = 3;
+  bool idempotent = 4;
 }
 message RecordGunshiFeedbackRequest {
   string plan_json = 1;
@@ -1868,6 +1884,7 @@ service ChiseiService {
   rpc QueryOperationStatistics(QueryOperationStatisticsRequest) returns (QueryOperationStatisticsResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
   rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);
+  rpc ReassessKiokuMemory(ReassessKiokuMemoryRequest) returns (ReassessKiokuMemoryResponse);
   rpc IssueGunshiRecommendations(IssueGunshiRecommendationsRequest) returns (IssueGunshiRecommendationsResponse);
   rpc RecordGunshiFeedback(RecordGunshiFeedbackRequest) returns (RecordGunshiFeedbackResponse);
   rpc GetGunshiScorecard(GetGunshiScorecardRequest) returns (GetGunshiScorecardResponse);

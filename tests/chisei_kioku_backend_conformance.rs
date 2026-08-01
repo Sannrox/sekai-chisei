@@ -36,6 +36,10 @@ fn candidate(prefix: &str) -> KiokuMemory {
         expires_at_ms: Some(200),
         last_confirmed_at_ms: Some(100),
         supersedes: None,
+        evidence_basis: vec![],
+        evidence_basis_digest: String::new(),
+        reassessment_key: String::new(),
+        reassessment_actor: String::new(),
     }
 }
 

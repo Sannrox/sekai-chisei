@@ -27,6 +27,7 @@ pub async fn run_memory_command(args: Vec<String>) -> Result<(), BoxErr> {
                     namespace,
                     operation_class,
                     limit,
+                    page_token: String::new(),
                 })
                 .await?
                 .into_inner();

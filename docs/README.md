@@ -56,6 +56,8 @@ If you want to deploy or operate the control plane:
   receipt-authoritative deterministic and stochastic execution.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
+- [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,
+  review-gated successor candidates when admitted evidence changes.
 - [Epistemic descriptor](epistemic-descriptor.md) — additive, bounded
   origin/evidence/lifecycle metadata on existing context references.
 - [Context admission policy](context-admission-policy.md) — opt-in,

@@ -4,9 +4,9 @@ use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 #[cfg(test)]
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
-use crate::sekai::evidence::EvidenceClassification;
+use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 use crate::sekai::security::Role;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -23,6 +23,10 @@ pub fn memory_claim_digest(memory: &KiokuMemory) -> String {
         digest.update(value);
     }
     digest.update(memory.version.to_be_bytes());
+    if !memory.evidence_basis.is_empty() || !memory.reassessment_key.is_empty() {
+        digest.update(memory.reassessment_key.as_bytes());
+        digest.update(memory.evidence_basis_digest.as_bytes());
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -91,11 +95,68 @@ pub struct KiokuMemory {
     pub last_confirmed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<MemoryVersionRef>,
+    #[serde(default)]
+    pub evidence_basis: Vec<KiokuEvidenceBasis>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence_basis_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reassessment_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reassessment_actor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryVersionRef {
     pub memory_id: String,
+    pub version: u32,
+}
+
+/// The immutable, identity-and-digest-only basis used to derive a Kioku
+/// memory version.  The source submission remains authoritative for lifecycle
+/// and authorization; this record is a bounded reassessment snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KiokuEvidenceBasis {
+    pub evidence_reference: String,
+    pub evidence_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_submission_id: String,
+    pub stance: MemoryEvidenceStance,
+    pub lifecycle_state: EvidenceLifecycleState,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct KiokuEvidenceReassessmentRequest {
+    pub memory_id: String,
+    pub memory_version: u32,
+    pub reassessment_key: String,
+    pub actor: String,
+    pub evidence_basis: Vec<KiokuEvidenceBasis>,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct KiokuEvidenceAuthorizationRequest {
+    pub source_submission_id: String,
+    pub namespace: String,
+    pub memory_classification: EvidenceClassification,
+    pub evidence_digest: String,
+    pub lifecycle_state: EvidenceLifecycleState,
+    pub observed_at_ms: i64,
+    pub actor: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiokuEvidenceReassessmentResult {
+    pub candidate: KiokuMemory,
+    pub evidence: Vec<KiokuEvidenceLink>,
+    pub idempotent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KiokuCandidateCursor {
+    pub id: String,
     pub version: u32,
 }
 
@@ -134,6 +195,284 @@ pub struct CandidateDerivation {
     pub created_at_ms: i64,
     pub expires_at_ms: Option<i64>,
     pub retention_until_ms: Option<i64>,
+}
+
+pub const KIOKU_EVIDENCE_REASSESSMENT_METHOD: &str = "evidence_reassessment/v1";
+
+pub fn kioku_reassessment_candidate_id(memory_id: &str, memory_version: u32, key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(memory_id.as_bytes());
+    digest.update(memory_version.to_be_bytes());
+    digest.update(key.as_bytes());
+    format!("kioku-reassessment-{:x}", digest.finalize())
+}
+
+pub fn canonical_evidence_basis_digest(basis: &[KiokuEvidenceBasis]) -> String {
+    let mut canonical = basis.to_vec();
+    canonical.sort_by(|left, right| {
+        left.source_submission_id
+            .cmp(&right.source_submission_id)
+            .then_with(|| left.evidence_reference.cmp(&right.evidence_reference))
+            .then_with(|| left.evidence_digest.cmp(&right.evidence_digest))
+            .then_with(|| {
+                let left_stance = match left.stance {
+                    MemoryEvidenceStance::Supporting => 0,
+                    MemoryEvidenceStance::Contradicting => 1,
+                };
+                let right_stance = match right.stance {
+                    MemoryEvidenceStance::Supporting => 0,
+                    MemoryEvidenceStance::Contradicting => 1,
+                };
+                left_stance.cmp(&right_stance)
+            })
+            .then_with(|| {
+                left.lifecycle_state
+                    .as_str()
+                    .cmp(right.lifecycle_state.as_str())
+            })
+            .then_with(|| left.observed_at_ms.cmp(&right.observed_at_ms))
+    });
+    let encoded = serde_json::to_vec(&canonical).expect("Kioku evidence basis is serializable");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+fn contains_control(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+impl KiokuEvidenceBasis {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("evidence_reference", self.evidence_reference.as_str()),
+            ("evidence_digest", self.evidence_digest.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{field} is required"));
+            }
+            if value.chars().count() > 512 || contains_control(value) {
+                return Err(format!("{field} is malformed"));
+            }
+        }
+        if self.source_submission_id.chars().count() > 256
+            || contains_control(&self.source_submission_id)
+        {
+            return Err("source_submission_id is malformed".into());
+        }
+        if self.observed_at_ms <= 0 {
+            return Err("observed_at_ms must be positive".into());
+        }
+        if !self.lifecycle_state.is_admitted()
+            || self.lifecycle_state == EvidenceLifecycleState::Quarantined
+        {
+            return Err(format!(
+                "evidence lifecycle state {} is not admitted for Kioku reassessment",
+                self.lifecycle_state.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn basis_identity(basis: &KiokuEvidenceBasis) -> String {
+    if basis.source_submission_id.is_empty() {
+        format!(
+            "reference:{}:{}",
+            basis.evidence_reference, basis.evidence_digest
+        )
+    } else {
+        format!("submission:{}", basis.source_submission_id)
+    }
+}
+
+fn baseline_evidence_basis(
+    memory: &KiokuMemory,
+    evidence: &[KiokuEvidenceLink],
+) -> Result<Vec<KiokuEvidenceBasis>, String> {
+    if !memory.evidence_basis.is_empty() {
+        return Ok(memory.evidence_basis.clone());
+    }
+    if evidence.is_empty() {
+        return Err("active memory has no evidence basis".into());
+    }
+    Ok(evidence
+        .iter()
+        .map(|link| KiokuEvidenceBasis {
+            evidence_reference: link.evidence_reference.clone(),
+            evidence_digest: link.evidence_digest.clone(),
+            source_submission_id: String::new(),
+            stance: link.stance,
+            lifecycle_state: EvidenceLifecycleState::Available,
+            observed_at_ms: link.observed_at_ms,
+        })
+        .collect())
+}
+
+pub fn merge_evidence_basis(
+    baseline: &[KiokuEvidenceBasis],
+    updates: &[KiokuEvidenceBasis],
+    now_ms: i64,
+) -> Result<Vec<KiokuEvidenceBasis>, String> {
+    let mut merged = baseline.to_vec();
+    for basis in updates {
+        basis.validate()?;
+        if basis.observed_at_ms > now_ms {
+            return Err("evidence observed_at_ms cannot be in the future".into());
+        }
+        if let Some(existing) = merged.iter_mut().find(|existing| {
+            (existing.source_submission_id == basis.source_submission_id
+                && !basis.source_submission_id.is_empty())
+                || (existing.source_submission_id.is_empty()
+                    && basis.source_submission_id.is_empty()
+                    && existing.evidence_reference == basis.evidence_reference
+                    && existing.evidence_digest == basis.evidence_digest)
+        }) {
+            if !basis.source_submission_id.is_empty()
+                && existing.evidence_reference != basis.evidence_reference
+            {
+                return Err(format!(
+                    "evidence identity {} cannot change its evidence reference",
+                    basis.source_submission_id
+                ));
+            }
+            if !basis.source_submission_id.is_empty()
+                && existing.evidence_digest != basis.evidence_digest
+            {
+                return Err(format!(
+                    "evidence identity {} conflicts with a different digest",
+                    basis.source_submission_id
+                ));
+            }
+            *existing = basis.clone();
+        } else {
+            merged.push(basis.clone());
+        }
+    }
+    Ok(merged)
+}
+
+/// Deterministically derive a reviewable successor without mutating the
+/// active memory. Backend persistence and authorization are handled by the
+/// backend trait.
+pub fn derive_evidence_reassessment_candidate(
+    prior: &KiokuMemory,
+    prior_evidence: &[KiokuEvidenceLink],
+    request: &KiokuEvidenceReassessmentRequest,
+) -> Result<(KiokuMemory, Vec<KiokuEvidenceLink>), String> {
+    if prior.state != MemoryLifecycleState::Active {
+        return Err("only active memories can be reassessed".into());
+    }
+    if request.memory_id != prior.id || request.memory_version != prior.version {
+        return Err("reassessment memory reference does not match active memory".into());
+    }
+    if request.actor.trim().is_empty() {
+        return Err("reassessment actor is required".into());
+    }
+    if request.reassessment_key.trim().is_empty()
+        || request.reassessment_key.chars().count() > 128
+        || contains_control(&request.reassessment_key)
+    {
+        return Err("reassessment_key is required and must be bounded".into());
+    }
+    if request.evidence_basis.is_empty() {
+        return Err("reassessment requires at least one evidence basis entry".into());
+    }
+    if prior
+        .expires_at_ms
+        .is_some_and(|expires| expires <= request.now_ms)
+        || prior
+            .retention_until_ms
+            .is_some_and(|retention| retention <= request.now_ms)
+    {
+        return Err("expired or retained memory cannot be reassessed".into());
+    }
+
+    let baseline = baseline_evidence_basis(prior, prior_evidence)?;
+    let prior_digest = canonical_evidence_basis_digest(&baseline);
+    let merged = merge_evidence_basis(&baseline, &request.evidence_basis, request.now_ms)?;
+    let basis_digest = canonical_evidence_basis_digest(&merged);
+    if basis_digest == prior_digest {
+        return Err("reassessment does not materially change the evidence basis".into());
+    }
+
+    let mut copied_evidence = Vec::with_capacity(prior_evidence.len());
+    let candidate_id =
+        kioku_reassessment_candidate_id(&prior.id, prior.version, &request.reassessment_key);
+    for link in prior_evidence {
+        let mut copied = link.clone();
+        copied.memory_id = candidate_id.clone();
+        copied.memory_version = 1;
+        copied_evidence.push(copied);
+    }
+    if copied_evidence.is_empty() {
+        return Err("active memory has no operation evidence to carry forward".into());
+    }
+
+    let usable = merged
+        .iter()
+        .filter(|basis| basis.lifecycle_state.is_usable())
+        .collect::<Vec<_>>();
+    let supporting = usable
+        .iter()
+        .filter(|basis| basis.stance == MemoryEvidenceStance::Supporting)
+        .count();
+    let contradicting = usable.len().saturating_sub(supporting);
+    let confidence_bps = if usable.is_empty() {
+        0
+    } else {
+        ((supporting as u64 * 10_000) / usable.len() as u64) as u16
+    };
+    let last_confirmed_at_ms = merged
+        .iter()
+        .filter(|basis| {
+            basis.lifecycle_state.is_usable() && basis.stance == MemoryEvidenceStance::Supporting
+        })
+        .map(|basis| basis.observed_at_ms)
+        .max()
+        .or(prior.last_confirmed_at_ms);
+    let inactive = merged.len().saturating_sub(usable.len());
+    let candidate = KiokuMemory {
+        contract_version: KIOKU_MEMORY_VERSION.into(),
+        id: candidate_id,
+        version: 1,
+        kind: prior.kind,
+        claim: prior.claim.clone(),
+        namespace: prior.namespace.clone(),
+        operation_classes: prior.operation_classes.clone(),
+        affinity_object_ids: prior.affinity_object_ids.clone(),
+        outcome_definition: prior.outcome_definition.clone(),
+        confidence_bps,
+        sample_size: u32::try_from(merged.len())
+            .map_err(|_| "evidence basis exceeds u32 sample size".to_string())?,
+        uncertainty: format!(
+            "evidence reassessment: {} total, {} usable, {} supporting, {} contradicting, {} inactive",
+            merged.len(),
+            usable.len(),
+            supporting,
+            contradicting,
+            inactive
+        ),
+        producer_identity: prior.producer_identity.clone(),
+        derivation_method: KIOKU_EVIDENCE_REASSESSMENT_METHOD.into(),
+        classification: prior.classification,
+        retention_until_ms: prior.retention_until_ms,
+        state: MemoryLifecycleState::Candidate,
+        created_at_ms: request.now_ms,
+        reviewed_at_ms: None,
+        expires_at_ms: prior.expires_at_ms,
+        last_confirmed_at_ms,
+        supersedes: Some(MemoryVersionRef {
+            memory_id: prior.id.clone(),
+            version: prior.version,
+        }),
+        evidence_basis: merged,
+        evidence_basis_digest: basis_digest,
+        reassessment_key: request.reassessment_key.clone(),
+        reassessment_actor: request.actor.trim().into(),
+    };
+    candidate
+        .validate_contract()
+        .map_err(|errors| errors.join("; "))?;
+    Ok((candidate, copied_evidence))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +697,17 @@ pub fn derive_verified_outcome_candidate(
         .map_err(|_| "candidate sample size exceeds u32".to_string())?;
     let confidence_bps = ((u64::from(supporting) * 10_000) / u64::from(sample_size)) as u16;
     let contradicting = sample_size - supporting;
+    let evidence_basis = evidence
+        .iter()
+        .map(|link| KiokuEvidenceBasis {
+            evidence_reference: link.evidence_reference.clone(),
+            evidence_digest: link.evidence_digest.clone(),
+            source_submission_id: String::new(),
+            stance: link.stance,
+            lifecycle_state: EvidenceLifecycleState::Available,
+            observed_at_ms: link.observed_at_ms,
+        })
+        .collect::<Vec<_>>();
     let memory = KiokuMemory {
         contract_version: KIOKU_MEMORY_VERSION.into(),
         id: input.id,
@@ -383,6 +733,10 @@ pub fn derive_verified_outcome_candidate(
         expires_at_ms: input.expires_at_ms,
         last_confirmed_at_ms,
         supersedes: None,
+        evidence_basis_digest: canonical_evidence_basis_digest(&evidence_basis),
+        evidence_basis,
+        reassessment_key: String::new(),
+        reassessment_actor: String::new(),
     };
     memory
         .validate_contract()
@@ -467,6 +821,42 @@ impl KiokuMemory {
             .is_some_and(|(retention, expires)| retention < expires)
         {
             errors.push("retention_until_ms must not precede expires_at_ms".into());
+        }
+        if self.evidence_basis.len() > 1024 {
+            errors.push("evidence_basis must not exceed 1024 entries".into());
+        }
+        let mut identities = std::collections::HashSet::new();
+        for basis in &self.evidence_basis {
+            if let Err(error) = basis.validate() {
+                errors.push(error);
+            }
+            if !matches!(
+                self.derivation_method.as_str(),
+                "verified_binary_outcomes/v1" | KIOKU_EVIDENCE_REASSESSMENT_METHOD
+            ) && !identities.insert(basis_identity(basis).to_string())
+            {
+                errors.push("evidence_basis contains duplicate identities".into());
+            }
+        }
+        if self.evidence_basis.is_empty() {
+            if !self.evidence_basis_digest.is_empty() {
+                errors.push("evidence_basis_digest requires evidence_basis".into());
+            }
+            if !self.reassessment_key.is_empty() || !self.reassessment_actor.is_empty() {
+                errors.push("reassessment metadata requires evidence_basis".into());
+            }
+        } else if self.evidence_basis_digest
+            != canonical_evidence_basis_digest(&self.evidence_basis)
+        {
+            errors.push("evidence_basis_digest does not match evidence_basis".into());
+        }
+        if self.reassessment_key.chars().count() > 128 || contains_control(&self.reassessment_key) {
+            errors.push("reassessment_key is malformed".into());
+        }
+        if self.reassessment_actor.chars().count() > 256
+            || contains_control(&self.reassessment_actor)
+        {
+            errors.push("reassessment_actor is malformed".into());
         }
         if errors.is_empty() {
             Ok(())
@@ -626,11 +1016,28 @@ impl SekaiDb {
             &MemoryLifecycleEvent {
                 memory_id: memory.id.clone(),
                 memory_version: memory.version,
-                action: "created".into(),
+                action: if memory.derivation_method == KIOKU_EVIDENCE_REASSESSMENT_METHOD {
+                    "evidence_reassessed".into()
+                } else {
+                    "created".into()
+                },
                 from_state: None,
                 to_state: memory.state.as_str().into(),
-                actor: memory.producer_identity.clone(),
-                reason: memory.derivation_method.clone(),
+                actor: if memory.reassessment_actor.is_empty() {
+                    memory.producer_identity.clone()
+                } else {
+                    memory.reassessment_actor.clone()
+                },
+                reason: if memory.reassessment_key.is_empty() {
+                    memory.derivation_method.clone()
+                } else {
+                    format!(
+                        "{} key={} basis={}",
+                        memory.derivation_method,
+                        memory.reassessment_key,
+                        memory.evidence_basis_digest
+                    )
+                },
                 recorded_at_ms: memory.created_at_ms,
             },
         )?;
@@ -708,6 +1115,43 @@ impl SekaiDb {
         .collect()
     }
 
+    pub fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        if namespace.trim().is_empty() {
+            return Err("candidate namespace is required".into());
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|_| "candidate page limit is too large")?;
+        let cursor_id = cursor.map(|cursor| cursor.id.as_str());
+        let cursor_version = cursor.map(|cursor| i64::from(cursor.version));
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT memory_json FROM chisei_kioku_memories
+                 WHERE namespace=?1 AND state='candidate'
+                   AND (?2 IS NULL OR id < ?2 OR (id=?2 AND version < ?3))
+                 ORDER BY id DESC, version DESC LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![namespace.trim(), cursor_id, cursor_version, limit],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            row.map_err(|error| error.to_string())
+                .and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        })
+        .collect()
+    }
+
     pub fn list_kioku_evidence(
         &self,
         id: &str,
@@ -743,21 +1187,76 @@ impl SekaiDb {
         if memory.state != MemoryLifecycleState::Candidate {
             errors.push("only candidate memories can be validated for review".into());
         }
-        let supporting_evidence = evidence
-            .iter()
-            .filter(|link| link.stance == MemoryEvidenceStance::Supporting)
-            .count();
-        let contradicting_evidence = evidence.len().saturating_sub(supporting_evidence);
-        if supporting_evidence == 0 {
-            errors.push("candidate requires supporting evidence".into());
-        }
-        if evidence.len() != memory.sample_size as usize {
-            errors.push(format!(
-                "sample_size {} does not match {} evidence links",
-                memory.sample_size,
-                evidence.len()
-            ));
-        }
+        let (supporting_evidence, contradicting_evidence, expected_confidence) =
+            if memory.evidence_basis.is_empty() {
+                let supporting = evidence
+                    .iter()
+                    .filter(|link| link.stance == MemoryEvidenceStance::Supporting)
+                    .count();
+                if supporting == 0 {
+                    errors.push("candidate requires supporting evidence".into());
+                }
+                if evidence.len() != memory.sample_size as usize {
+                    errors.push(format!(
+                        "sample_size {} does not match {} evidence links",
+                        memory.sample_size,
+                        evidence.len()
+                    ));
+                }
+                let expected = if evidence.is_empty() {
+                    0
+                } else {
+                    ((supporting as u64 * 10_000) / evidence.len() as u64) as u16
+                };
+                (
+                    supporting,
+                    evidence.len().saturating_sub(supporting),
+                    expected,
+                )
+            } else {
+                let supporting = memory
+                    .evidence_basis
+                    .iter()
+                    .filter(|basis| basis.stance == MemoryEvidenceStance::Supporting)
+                    .count();
+                let contradicting = memory
+                    .evidence_basis
+                    .iter()
+                    .filter(|basis| basis.stance == MemoryEvidenceStance::Contradicting)
+                    .count();
+                let usable = memory
+                    .evidence_basis
+                    .iter()
+                    .filter(|basis| basis.lifecycle_state.is_usable())
+                    .collect::<Vec<_>>();
+                let usable_supporting = usable
+                    .iter()
+                    .filter(|basis| basis.stance == MemoryEvidenceStance::Supporting)
+                    .count();
+                if usable_supporting == 0
+                    && memory.derivation_method != KIOKU_EVIDENCE_REASSESSMENT_METHOD
+                {
+                    errors.push("candidate requires usable supporting evidence".into());
+                }
+                if memory.evidence_basis.len() != memory.sample_size as usize {
+                    errors.push(format!(
+                        "sample_size {} does not match {} evidence basis entries",
+                        memory.sample_size,
+                        memory.evidence_basis.len()
+                    ));
+                }
+                let expected = if usable.is_empty() {
+                    0
+                } else {
+                    ((usable_supporting as u64 * 10_000) / usable.len() as u64) as u16
+                };
+                for basis in &memory.evidence_basis {
+                    if let Err(error) = basis.validate() {
+                        errors.push(error);
+                    }
+                }
+                (supporting, contradicting, expected)
+            };
         let mut operations = std::collections::HashSet::new();
         let mut metrics = std::collections::HashSet::new();
         for link in &evidence {
@@ -775,14 +1274,15 @@ impl SekaiDb {
         if metrics.len() != 1 {
             errors.push("candidate evidence must share one outcome metric".into());
         }
-        if memory.derivation_method == "verified_binary_outcomes/v1" && !evidence.is_empty() {
-            let expected = ((supporting_evidence as u64 * 10_000) / evidence.len() as u64) as u16;
-            if memory.confidence_bps != expected {
-                errors.push(format!(
-                    "confidence_bps {} does not match verified outcome rate {expected}",
-                    memory.confidence_bps
-                ));
-            }
+        if (memory.derivation_method == "verified_binary_outcomes/v1"
+            || memory.derivation_method == KIOKU_EVIDENCE_REASSESSMENT_METHOD)
+            && (!evidence.is_empty() || !memory.evidence_basis.is_empty())
+            && memory.confidence_bps != expected_confidence
+        {
+            errors.push(format!(
+                "confidence_bps {} does not match deterministic evidence rate {expected_confidence}",
+                memory.confidence_bps,
+            ));
         }
         errors.sort();
         errors.dedup();
@@ -816,6 +1316,40 @@ impl SekaiDb {
         if memory.state != MemoryLifecycleState::Candidate {
             return Err("memory is no longer awaiting review".into());
         }
+        if review.action == HumanReviewAction::Promote
+            && (memory
+                .expires_at_ms
+                .is_some_and(|expires| expires <= review.reviewed_at_ms)
+                || memory
+                    .retention_until_ms
+                    .is_some_and(|retention| retention <= review.reviewed_at_ms))
+        {
+            return Err("candidate expiry or retention deadline has elapsed".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if review.action == HumanReviewAction::Promote {
+            for basis in &memory.evidence_basis {
+                if basis.source_submission_id.is_empty() {
+                    continue;
+                }
+                authorize_kioku_evidence_tx(
+                    &tx,
+                    &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest {
+                        source_submission_id: basis.source_submission_id.clone(),
+                        namespace: memory.namespace.clone(),
+                        memory_classification: memory.classification,
+                        evidence_digest: basis.evidence_digest.clone(),
+                        lifecycle_state: basis.lifecycle_state,
+                        observed_at_ms: basis.observed_at_ms,
+                        actor: review.reviewer.trim().into(),
+                        now_ms: review.reviewed_at_ms,
+                    },
+                )?;
+            }
+        }
         let next_state = match review.action {
             HumanReviewAction::Promote => MemoryLifecycleState::Active,
             HumanReviewAction::Reject => MemoryLifecycleState::Rejected,
@@ -825,9 +1359,18 @@ impl SekaiDb {
                 .supersedes
                 .as_ref()
                 .map(|reference| {
-                    let mut prior = self
-                        .get_kioku_memory(&reference.memory_id, reference.version)?
+                    let prior_json: String = tx
+                        .query_row(
+                            "SELECT memory_json FROM chisei_kioku_memories
+                             WHERE id=?1 AND version=?2",
+                            params![reference.memory_id, reference.version],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?
                         .ok_or_else(|| "superseded memory version not found".to_string())?;
+                    let mut prior: KiokuMemory =
+                        serde_json::from_str(&prior_json).map_err(|error| error.to_string())?;
                     if prior.state != MemoryLifecycleState::Active {
                         return Err(String::from("superseded memory is not active"));
                     }
@@ -848,8 +1391,6 @@ impl SekaiDb {
         memory.reviewed_at_ms = Some(review.reviewed_at_ms);
         let memory_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
 
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
         let updated = tx
             .execute(
                 "UPDATE chisei_kioku_memories
@@ -1047,7 +1588,18 @@ impl SekaiDb {
                 continue;
             }
             let evidence = self.list_kioku_evidence(&memory.id, memory.version)?;
-            validate_resolvable_evidence(&memory, &evidence)?;
+            if let Err(error) = validate_resolvable_evidence(&memory, &evidence) {
+                let reassessment_without_support = memory.derivation_method
+                    == KIOKU_EVIDENCE_REASSESSMENT_METHOD
+                    && memory.evidence_basis.iter().all(|basis| {
+                        !(basis.lifecycle_state.is_usable()
+                            && basis.stance == MemoryEvidenceStance::Supporting)
+                    });
+                if reassessment_without_support {
+                    continue;
+                }
+                return Err(error);
+            }
             let affinity_hits = memory
                 .affinity_object_ids
                 .iter()
@@ -1127,6 +1679,9 @@ impl SekaiDb {
         namespace: &str,
         actor: &str,
     ) -> Result<EvidenceClassification, String> {
+        if matches!(actor, "root" | "local") {
+            return Ok(EvidenceClassification::Restricted);
+        }
         let namespace_object = self
             .find_by_external_id(&format!("namespace:{namespace}"))?
             .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
@@ -1146,6 +1701,61 @@ impl SekaiDb {
             }
         };
         Ok(authorized_ceiling)
+    }
+
+    pub fn authorize_kioku_evidence(
+        &self,
+        request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String> {
+        if request.source_submission_id.trim().is_empty() || request.actor.trim().is_empty() {
+            return Err("evidence submission and actor are required".into());
+        }
+        let submission = self
+            .get_evidence_submission(&request.source_submission_id)?
+            .ok_or_else(|| "evidence submission not found".to_string())?;
+        if submission.namespace != request.namespace {
+            return Err("evidence namespace does not match memory namespace".into());
+        }
+        if submission.content_digest != request.evidence_digest {
+            return Err("evidence digest does not match the governed submission".into());
+        }
+        if submission.lifecycle_state != request.lifecycle_state
+            || !request.lifecycle_state.is_admitted()
+            || request.lifecycle_state == EvidenceLifecycleState::Quarantined
+        {
+            return Err("evidence lifecycle changed; reassessment must be retried".into());
+        }
+        if submission.observed_at_ms != request.observed_at_ms {
+            return Err("evidence observation time does not match the governed submission".into());
+        }
+        if submission
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at <= request.now_ms)
+        {
+            return Err("evidence submission is outside its retention window".into());
+        }
+        if submission.classification > request.memory_classification {
+            return Err("evidence classification exceeds memory classification".into());
+        }
+        let ceiling =
+            self.kioku_authorized_classification_ceiling(&request.namespace, &request.actor)?;
+        if submission.classification > ceiling {
+            return Err("evidence classification exceeds actor grant".into());
+        }
+        if let Some(object_id) =
+            self.get_evidence_projection_object_id(&request.source_submission_id)?
+        {
+            let grants = self.list_grants(&object_id)?;
+            if !grants.is_empty()
+                && !matches!(request.actor.as_str(), "root" | "local")
+                && !grants.iter().any(|grant| grant.principal == request.actor)
+            {
+                return Err("actor is not authorized to read evidence projection".into());
+            }
+        } else {
+            return Err("evidence submission has no authorized projection".into());
+        }
+        Ok(())
     }
 
     pub fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
@@ -1680,6 +2290,49 @@ fn validate_resolvable_evidence(
     memory: &KiokuMemory,
     evidence: &[KiokuEvidenceLink],
 ) -> Result<(), String> {
+    if !memory.evidence_basis.is_empty() {
+        if memory.evidence_basis.len() != memory.sample_size as usize {
+            return Err(format!(
+                "memory {} version {} has an invalid evidence basis size",
+                memory.id, memory.version
+            ));
+        }
+        if memory.derivation_method == "verified_binary_outcomes/v1"
+            && evidence.len() != memory.sample_size as usize
+        {
+            return Err(format!(
+                "memory {} version {} has unresolved evidence links",
+                memory.id, memory.version
+            ));
+        }
+        let mut identities = std::collections::HashSet::new();
+        let mut usable_supporting = false;
+        for basis in &memory.evidence_basis {
+            basis.validate()?;
+            if !matches!(
+                memory.derivation_method.as_str(),
+                "verified_binary_outcomes/v1" | KIOKU_EVIDENCE_REASSESSMENT_METHOD
+            ) && !identities.insert(basis_identity(basis).to_string())
+            {
+                return Err(format!(
+                    "memory {} version {} repeats evidence basis",
+                    memory.id, memory.version
+                ));
+            }
+            usable_supporting |= basis.lifecycle_state.is_usable()
+                && basis.stance == MemoryEvidenceStance::Supporting;
+        }
+        if !usable_supporting {
+            return Err(format!(
+                "memory {} version {} lacks usable supporting evidence",
+                memory.id, memory.version
+            ));
+        }
+        for link in evidence {
+            link.validate(memory)?;
+        }
+        return Ok(());
+    }
     if evidence.len() != memory.sample_size as usize {
         return Err(format!(
             "memory {} version {} has unresolved evidence",
@@ -1727,6 +2380,148 @@ fn insert_lifecycle_event(
         ],
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn authorize_kioku_evidence_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request: &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest,
+) -> Result<(), String> {
+    if request.source_submission_id.trim().is_empty() || request.actor.trim().is_empty() {
+        return Err("evidence submission and actor are required".into());
+    }
+    let submission = tx
+        .query_row(
+            "SELECT namespace, content_digest, classification, lifecycle_state,
+                    observed_at_ms, expires_at_ms
+             FROM sekai_evidence_submissions WHERE id=?1",
+            params![request.source_submission_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "evidence submission not found".to_string())?;
+    if submission.0 != request.namespace {
+        return Err("evidence namespace does not match memory namespace".into());
+    }
+    if submission.1 != request.evidence_digest {
+        return Err("evidence digest does not match the governed submission".into());
+    }
+    let classification = match submission.2.as_str() {
+        "public" => EvidenceClassification::Public,
+        "internal" => EvidenceClassification::Internal,
+        "confidential" => EvidenceClassification::Confidential,
+        "restricted" => EvidenceClassification::Restricted,
+        value => return Err(format!("unknown evidence classification {value}")),
+    };
+    let lifecycle = EvidenceLifecycleState::parse(&submission.3)
+        .ok_or_else(|| format!("unknown evidence lifecycle state {}", submission.3))?;
+    if lifecycle != request.lifecycle_state
+        || !request.lifecycle_state.is_admitted()
+        || request.lifecycle_state == EvidenceLifecycleState::Quarantined
+    {
+        return Err("evidence lifecycle changed; reassessment must be retried".into());
+    }
+    if submission.4 != request.observed_at_ms {
+        return Err("evidence observation time does not match the governed submission".into());
+    }
+    if submission
+        .5
+        .is_some_and(|expires_at| expires_at <= request.now_ms)
+    {
+        return Err("evidence submission is outside its retention window".into());
+    }
+    if classification > request.memory_classification {
+        return Err("evidence classification exceeds memory classification".into());
+    }
+    let privileged = matches!(request.actor.as_str(), "root" | "local");
+    if !privileged {
+        let namespace_external_id = format!("namespace:{}", request.namespace);
+        let namespace_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM sekai_objects WHERE external_id=?1",
+                params![namespace_external_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(namespace_id) = namespace_id else {
+            return Err("memory namespace is not an authorized graph scope".into());
+        };
+        let role: Option<String> = tx
+            .query_row(
+                "SELECT role FROM sekai_grants WHERE object_id=?1 AND principal=?2",
+                params![namespace_id, request.actor],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let authorized_ceiling = match role.as_deref() {
+            None => {
+                let any_grant: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sekai_grants WHERE object_id=?1)",
+                        params![namespace_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if any_grant {
+                    return Err("actor is not authorized for memory namespace".into());
+                }
+                EvidenceClassification::Public
+            }
+            Some("viewer") => EvidenceClassification::Internal,
+            Some("editor") => EvidenceClassification::Confidential,
+            Some("admin") => EvidenceClassification::Restricted,
+            Some(role) => return Err(format!("unknown namespace grant role {role}")),
+        };
+        if classification > authorized_ceiling {
+            return Err("evidence classification exceeds actor grant".into());
+        }
+    }
+    let projection_id: Option<String> = tx
+        .query_row(
+            "SELECT evidence_object_id FROM sekai_evidence_projections
+             WHERE submission_id=?1",
+            params![request.source_submission_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(projection_id) = projection_id else {
+        return Err("evidence submission has no authorized projection".into());
+    };
+    if !privileged {
+        let has_grants: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_grants WHERE object_id=?1)",
+                params![projection_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_grants {
+            let actor_granted: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sekai_grants
+                     WHERE object_id=?1 AND principal=?2)",
+                    params![projection_id, request.actor],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !actor_granted {
+                return Err("actor is not authorized to read evidence projection".into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1816,6 +2611,10 @@ mod tests {
             expires_at_ms: Some(200),
             last_confirmed_at_ms: Some(100),
             supersedes: None,
+            evidence_basis: vec![],
+            evidence_basis_digest: String::new(),
+            reassessment_key: String::new(),
+            reassessment_actor: String::new(),
         }
     }
 
@@ -2064,6 +2863,136 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn evidence_reassessment_is_idempotent_and_preserves_active_lineage() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_object(&Object {
+            id: "namespace-payments".into(),
+            kind: "namespace".into(),
+            name: "payments".into(),
+            namespace: "payments".into(),
+            external_id: "namespace:payments".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.create_grant(&Grant {
+            id: "grant-payments".into(),
+            object_id: "namespace-payments".into(),
+            principal: "reviewer".into(),
+            role: Role::Admin,
+            created: 1,
+        })
+        .unwrap();
+        active_memory(
+            &db,
+            "reassessable",
+            "reassessment-operation",
+            vec![],
+            EvidenceClassification::Internal,
+        );
+        let prior = db.get_kioku_memory("reassessable", 1).unwrap().unwrap();
+        let prior_link = db
+            .list_kioku_evidence("reassessable", 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = KiokuEvidenceReassessmentRequest {
+            memory_id: prior.id.clone(),
+            memory_version: prior.version,
+            reassessment_key: "evidence-change-1".into(),
+            actor: "reviewer".into(),
+            evidence_basis: vec![KiokuEvidenceBasis {
+                evidence_reference: prior_link.evidence_reference.clone(),
+                evidence_digest: prior_link.evidence_digest.clone(),
+                source_submission_id: String::new(),
+                stance: MemoryEvidenceStance::Contradicting,
+                lifecycle_state: EvidenceLifecycleState::Stale,
+                observed_at_ms: 100,
+            }],
+            now_ms: 150,
+        };
+        let first = db.reassess_kioku_memory(request.clone()).unwrap();
+        assert!(!first.idempotent);
+        assert_eq!(first.candidate.state, MemoryLifecycleState::Candidate);
+        assert_eq!(
+            first.candidate.supersedes,
+            Some(MemoryVersionRef {
+                memory_id: prior.id.clone(),
+                version: prior.version,
+            })
+        );
+        assert_eq!(
+            db.get_kioku_memory(&prior.id, prior.version)
+                .unwrap()
+                .unwrap()
+                .state,
+            MemoryLifecycleState::Active
+        );
+        assert!(
+            db.list_kioku_lifecycle_events(&first.candidate.id, 1)
+                .unwrap()
+                .iter()
+                .any(|event| event.action == "evidence_reassessed")
+        );
+
+        assert!(
+            db.validate_kioku_candidate(&first.candidate.id, 1)
+                .unwrap()
+                .valid
+        );
+        let replay = db.reassess_kioku_memory(request.clone()).unwrap();
+        assert!(replay.idempotent);
+        assert_eq!(replay.candidate, first.candidate);
+
+        let mut conflict = KiokuEvidenceReassessmentRequest {
+            memory_id: prior.id,
+            memory_version: 1,
+            reassessment_key: "evidence-change-1".into(),
+            actor: "reviewer".into(),
+            evidence_basis: vec![KiokuEvidenceBasis {
+                evidence_reference: prior_link.evidence_reference,
+                evidence_digest: "different-digest".into(),
+                source_submission_id: String::new(),
+                stance: MemoryEvidenceStance::Contradicting,
+                lifecycle_state: EvidenceLifecycleState::Stale,
+                observed_at_ms: 100,
+            }],
+            now_ms: 150,
+        };
+        let error = db.reassess_kioku_memory(conflict.clone()).unwrap_err();
+        assert!(error.contains("exact prior digest"));
+        conflict.reassessment_key = "evidence-change-2".into();
+        conflict.evidence_basis[0].evidence_digest = prior_link.evidence_digest;
+        let second = db.reassess_kioku_memory(conflict).unwrap();
+        assert!(!second.idempotent);
+        assert_ne!(second.candidate.id, first.candidate.id);
+
+        let promoted = db
+            .review_kioku_candidate(
+                &first.candidate.id,
+                1,
+                HumanMemoryReview {
+                    action: HumanReviewAction::Promote,
+                    reviewer: "reviewer".into(),
+                    rationale: "reviewed evidence invalidation".into(),
+                    reviewed_at_ms: 160,
+                },
+            )
+            .unwrap();
+        assert_eq!(promoted.state, MemoryLifecycleState::Active);
+        assert_eq!(
+            db.get_kioku_memory("reassessable", 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            MemoryLifecycleState::Superseded
+        );
+        let replay_after_promotion = db.reassess_kioku_memory(request).unwrap();
+        assert!(replay_after_promotion.idempotent);
     }
 
     #[test]
