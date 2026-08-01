@@ -1,0 +1,76 @@
+{
+  "contract_version": "example.epistemic-replication-domain/v1",
+  "schema_id": "example.epistemic-replication",
+  "version": "1.0.0",
+  "classes": [
+    {
+      "name": "ResearchQuestion",
+      "description": "A question that motivates a reproducible claim.",
+      "properties": [
+        { "name": "prompt", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Claim",
+      "description": "A versioned proposition evaluated by the replication fixture.",
+      "properties": [
+        { "name": "text", "property_type": "string", "required": true },
+        { "name": "protocol_id", "property_type": "string", "required": true },
+        { "name": "artifact_id", "property_type": "string", "required": true },
+        { "name": "content_digest", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Protocol",
+      "description": "The exact procedure identity used by an experiment run.",
+      "properties": [
+        { "name": "name", "property_type": "string", "required": true },
+        { "name": "version", "property_type": "string", "required": true },
+        { "name": "digest", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "ExperimentRun",
+      "description": "One independently attributed execution of a protocol.",
+      "properties": [
+        { "name": "run_id", "property_type": "string", "required": true },
+        { "name": "producer", "property_type": "string", "required": true },
+        { "name": "result", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Replication",
+      "description": "The comparison of independent runs for one claim.",
+      "properties": [
+        { "name": "claim_id", "property_type": "string", "required": true },
+        { "name": "protocol_id", "property_type": "string", "required": true },
+        { "name": "run_ids", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Observation",
+      "description": "A bounded measurement emitted by an experiment run.",
+      "properties": [
+        { "name": "run_id", "property_type": "string", "required": true },
+        { "name": "metric", "property_type": "string", "required": true },
+        { "name": "value", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Outcome",
+      "description": "The normalized pass/fail outcome for a run.",
+      "properties": [
+        { "name": "run_id", "property_type": "string", "required": true },
+        { "name": "status", "property_type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "Context",
+      "description": "The selected claim-only or epistemically framed context arm.",
+      "properties": [
+        { "name": "claim_id", "property_type": "string", "required": true },
+        { "name": "variant", "property_type": "string", "required": true }
+      ]
+    }
+  ]
+}
