@@ -987,6 +987,16 @@ pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String>
     serde_json::to_vec(&sort_json(value)).map_err(|error| error.to_string())
 }
 
+/// Canonical JSON for contracts whose schemas permit finite JSON numbers.
+/// `serde_json` rejects non-finite Rust floats while converting to `Value`, so
+/// the resulting representation remains deterministic and safe to sign.
+pub(crate) fn canonical_json_with_finite_numbers<T: Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, String> {
+    let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    serde_json::to_vec(&sort_json(value)).map_err(|error| error.to_string())
+}
+
 pub(crate) fn digest_serializable<T: Serialize>(value: &T) -> Result<String, String> {
     Ok(encode_hex(&Sha256::digest(canonical_json(value)?)))
 }
@@ -1170,6 +1180,21 @@ mod tests {
     #[test]
     fn finite_float_values_are_rejected() {
         assert!(canonical_json(&serde_json::json!({"score": 1.5})).is_err());
+    }
+
+    #[test]
+    fn finite_float_values_have_stable_extended_canonical_json() {
+        assert_eq!(
+            String::from_utf8(
+                canonical_json_with_finite_numbers(&serde_json::json!({
+                    "z": 1.5,
+                    "a": {"threshold": 0.25}
+                }))
+                .unwrap()
+            )
+            .unwrap(),
+            r#"{"a":{"threshold":0.25},"z":1.5}"#
+        );
     }
 
     #[test]

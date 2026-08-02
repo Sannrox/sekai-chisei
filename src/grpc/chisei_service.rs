@@ -2172,6 +2172,7 @@ fn from_proto_evaluator_definition(
             max_output_bytes: limits.max_output_bytes,
             max_evidence_items: limits.max_evidence_items,
         },
+        adapter_endpoint: value.adapter_endpoint,
         stochastic_policy: value
             .stochastic_policy
             .map(from_proto_stochastic_evaluator_policy),
@@ -2204,6 +2205,7 @@ fn to_proto_evaluator_definition(
             max_output_bytes: value.resource_limits.max_output_bytes,
             max_evidence_items: value.resource_limits.max_evidence_items,
         }),
+        adapter_endpoint: value.adapter_endpoint.clone(),
         stochastic_policy: value
             .stochastic_policy
             .as_ref()
@@ -2287,6 +2289,8 @@ fn to_proto_evaluator_availability(
 fn evaluator_record(
     db: &RuntimeDb,
     definition: &evaluation_plan_domain::EvaluatorDefinition,
+    implementation_executable: bool,
+    implementation_status: &str,
 ) -> Result<EvaluatorDefinitionRecord, Status> {
     let availability = db
         .get_evaluator_availability(&definition.definition_id)
@@ -2295,16 +2299,22 @@ fn evaluator_record(
     Ok(evaluator_record_with_availability(
         definition,
         &availability,
+        implementation_executable,
+        implementation_status,
     ))
 }
 
 fn evaluator_record_with_availability(
     definition: &evaluation_plan_domain::EvaluatorDefinition,
     availability: &evaluation_plan_domain::EvaluatorAvailability,
+    implementation_executable: bool,
+    implementation_status: &str,
 ) -> EvaluatorDefinitionRecord {
     EvaluatorDefinitionRecord {
         definition: Some(to_proto_evaluator_definition(definition)),
         availability: Some(to_proto_evaluator_availability(availability)),
+        implementation_executable,
+        implementation_status: implementation_status.into(),
     }
 }
 
@@ -3962,6 +3972,68 @@ impl ChiseiServiceImpl {
         }
     }
 
+    fn ensure_external_evaluator_registered(
+        &self,
+        definition: &evaluation_plan_domain::EvaluatorDefinition,
+    ) {
+        if definition.execution_class != evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS {
+            return;
+        }
+        if let Err(error) = self.evaluator_registry.register_external_adapter(
+            &definition.namespace,
+            &definition.content_digest,
+            &definition.implementation_digest,
+            &definition.adapter_endpoint,
+        ) {
+            tracing::warn!(
+                namespace = %definition.namespace,
+                implementation_digest = %definition.implementation_digest,
+                error = %error,
+                "external evaluator adapter is not executable"
+            );
+        }
+    }
+
+    fn evaluator_capability(
+        &self,
+        definition: &evaluation_plan_domain::EvaluatorDefinition,
+    ) -> (bool, String) {
+        self.ensure_external_evaluator_registered(definition);
+        let executable = match definition.execution_class.as_str() {
+            evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS => self
+                .evaluator_registry
+                .contains(&definition.implementation_digest),
+            evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS => {
+                evaluation_execution_domain::external_adapter_secret_configured()
+                    && self.evaluator_registry.contains_external_adapter(
+                        &definition.namespace,
+                        &definition.content_digest,
+                        &definition.implementation_digest,
+                    )
+            }
+            evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS => self
+                .stochastic_evaluator_registry
+                .contains(&definition.implementation_digest),
+            _ => false,
+        };
+        (
+            executable,
+            if executable {
+                "executable"
+            } else if matches!(
+                definition.execution_class.as_str(),
+                evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS
+                    | evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
+                    | evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
+            ) {
+                "unavailable"
+            } else {
+                "unsupported"
+            }
+            .into(),
+        )
+    }
+
     fn get_evaluation_projection(
         db: &RuntimeDb,
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
@@ -4272,6 +4344,21 @@ impl ChiseiServiceImpl {
                         .saturating_sub(elapsed_before_invocation)
                         .saturating_sub(invocation_started.elapsed());
                     if definition.execution_class
+                        == evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
+                        && !runtime.deterministic_registry.contains_external_adapter(
+                            &definition.namespace,
+                            &definition.content_digest,
+                            &definition.implementation_digest,
+                        )
+                    {
+                        evaluation_execution_domain::make_nonexecuted_node(
+                            manifest,
+                            node,
+                            &input,
+                            evaluation_execution_domain::STATUS_UNAVAILABLE,
+                            evaluation_execution_domain::REASON_EVALUATOR_UNAVAILABLE,
+                        )
+                    } else if definition.execution_class
                         == evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
                     {
                         if let Some(reason) = runtime.stochastic_egress_reasons.get(&node.node_id) {
@@ -4424,9 +4511,11 @@ impl ChiseiServiceImpl {
                             .stochastic_registry
                             .metric_labels(&node.evaluator.implementation_digest)
                     } else {
-                        runtime
-                            .deterministic_registry
-                            .metric_labels(&node.evaluator.implementation_digest)
+                        runtime.deterministic_registry.metric_labels_for_namespace(
+                            &manifest.namespace,
+                            &node.evaluator.definition_digest,
+                            &node.evaluator.implementation_digest,
+                        )
                     };
                 crate::obs::signals::record_evaluation_step(
                     metrics_evaluator,
@@ -4542,6 +4631,15 @@ impl ChiseiServiceImpl {
         actor: &str,
         max_total_duration_ms: u64,
     ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
+        for node in &manifest.nodes {
+            if let Some(definition) = self
+                .db
+                .get_evaluator_definition(&node.evaluator.definition_id)
+                .map_err(Status::internal)?
+            {
+                self.ensure_external_evaluator_registered(&definition);
+            }
+        }
         let index = self.ensure_evaluation_execution(manifest, actor, max_total_duration_ms)?;
         let receipt = self
             .db
@@ -13484,8 +13582,15 @@ impl ChiseiService for ChiseiServiceImpl {
             .db
             .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
             .map_err(map_evaluation_resource_error)?;
+        let (implementation_executable, implementation_status) =
+            self.evaluator_capability(&definition);
         Ok(Response::new(PutEvaluatorDefinitionResponse {
-            record: Some(evaluator_record(&self.db, &definition)?),
+            record: Some(evaluator_record(
+                &self.db,
+                &definition,
+                implementation_executable,
+                &implementation_status,
+            )?),
         }))
     }
 
@@ -13502,8 +13607,15 @@ impl ChiseiService for ChiseiServiceImpl {
         if require_namespace_access(&self.db, &actor, &definition.namespace).is_err() {
             return Err(Status::not_found("evaluator definition not found"));
         }
+        let (implementation_executable, implementation_status) =
+            self.evaluator_capability(&definition);
         Ok(Response::new(GetEvaluatorDefinitionResponse {
-            record: Some(evaluator_record(&self.db, &definition)?),
+            record: Some(evaluator_record(
+                &self.db,
+                &definition,
+                implementation_executable,
+                &implementation_status,
+            )?),
         }))
     }
 
@@ -13521,7 +13633,16 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::internal)?;
         let records = definitions
             .iter()
-            .map(|definition| evaluator_record(&self.db, definition))
+            .map(|definition| {
+                let (implementation_executable, implementation_status) =
+                    self.evaluator_capability(definition);
+                evaluator_record(
+                    &self.db,
+                    definition,
+                    implementation_executable,
+                    &implementation_status,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Response::new(ListEvaluatorDefinitionsResponse { records }))
     }
@@ -13551,10 +13672,14 @@ impl ChiseiService for ChiseiServiceImpl {
                 chrono::Utc::now().timestamp_millis(),
             )
             .map_err(map_evaluation_resource_error)?;
+        let (implementation_executable, implementation_status) =
+            self.evaluator_capability(&definition);
         Ok(Response::new(SetEvaluatorAvailabilityResponse {
             record: Some(evaluator_record_with_availability(
                 &definition,
                 &availability,
+                implementation_executable,
+                &implementation_status,
             )),
         }))
     }

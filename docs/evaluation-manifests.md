@@ -33,7 +33,8 @@ A resolved manifest binds:
   provenance-evidence reference;
 - every selected evaluator-definition and implementation digest, including
   its complete stochastic policy when the selected class is
-  `stochastic_model/v1`;
+  `stochastic_model/v1`, or its exact operator adapter binding when the
+  selected class is `external_adapter/v1`;
 - exact node dependencies, typed inputs, canonical parameters, invariant
   contracts, and required/advisory classification;
 - every valid waiver, its exact target invariant-version IDs, and its

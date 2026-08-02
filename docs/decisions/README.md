@@ -35,3 +35,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0010: Retire deprecated `sekaictl` aliases at `0.2.0`](0010-retire-sekaictl-aliases-at-0.2.0.md)
 - [ADR 0011: Separate invariant facts from configurable evaluation plans](0011-separate-invariant-facts-and-evaluation-plans.md)
 - [ADR 0012: Bound stochastic evaluation by situation](0012-bound-stochastic-evaluation-by-situation.md)
+- [ADR 0013: Govern external evaluator adapters outside the Chisei process](0013-governed-external-evaluator-adapters.md)

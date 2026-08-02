@@ -37,8 +37,10 @@ and time are stored provenance but do not change the content digest.
 
 Each evaluator definition declares:
 
-- an exact implementation digest and either the
-  `deterministic_builtin/v1` or `stochastic_model/v1` execution class;
+- an exact implementation digest and one of the
+  `deterministic_builtin/v1`, `external_adapter/v1`, or
+  `stochastic_model/v1` execution classes. External definitions also bind an
+  operator-deployed HTTPS adapter endpoint; they never upload executable code;
 - supported predicate, input, and result schemas;
 - a closed parameter schema;
 - admitted evidence classifications;
@@ -65,6 +67,13 @@ V1 accepts only the fixed
 `required_all_pass_advisory_observed/v1` reducer. It rejects loops, missing
 nodes, unknown evaluators, disabled evaluators, unversioned aliases, dynamic
 nodes, arbitrary scripts or expressions, and action/deployment nodes.
+
+External adapter registration is part of the immutable definition metadata. A
+successful `PutEvaluatorDefinition` therefore means only that the definition
+is published. `EvaluatorDefinitionRecord` separately reports whether the exact
+implementation is executable in this process. The adapter contract, signing
+headers, endpoint restrictions, and fail-closed availability behavior are
+documented in [External evaluator adapters](evaluator-adapters.md).
 
 ## Bounded stochastic definitions
 

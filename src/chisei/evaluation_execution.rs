@@ -1,22 +1,29 @@
 //! Bounded execution contracts for resolved evaluation manifests.
 //!
-//! Deterministic evaluators are compiled, operator-controlled implementations
-//! selected by exact digest. Stochastic evaluators use a separate registry and
-//! only receive a frozen policy plus stable trial slot. Provider access remains
-//! behind that registered implementation; the execution engine itself receives
-//! no ambient provider, persistence, filesystem, or action capability.
+//! Deterministic evaluators are compiled or operator-deployed external
+//! implementations selected by exact digest. Stochastic evaluators use a
+//! separate registry and only receive a frozen policy plus stable trial slot.
+//! Provider access remains behind that registered implementation; the execution
+//! engine itself receives no ambient provider, persistence, filesystem, or
+//! action capability.
 
 use crate::chisei::evaluation_manifest::{
     ResolvedEvaluationManifest, ResolvedEvaluationNode, ResolvedInvariantBinding,
 };
+#[cfg(test)]
+use crate::chisei::evaluation_plan::validate_adapter_endpoint;
 use crate::chisei::evaluation_plan::{
     EvaluatorResourceLimits, FIXED_REDUCER, NODE_REQUIRED, StochasticEvaluatorPolicy,
+    validate_runtime_adapter_endpoint,
 };
+use base64::Engine as _;
 use futures_util::FutureExt;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, Mutex, RwLock,
@@ -29,6 +36,8 @@ pub const EXECUTION_REQUEST_CONTRACT: &str = "chisei.evaluation-execution-reques
 pub const EXECUTOR_VERSION: &str = "chisei.deterministic-evaluation-executor/v1";
 pub const EVALUATOR_INPUT_CONTRACT: &str = "chisei.deterministic-evaluator-input/v1";
 pub const EVALUATOR_RESULT_CONTRACT: &str = "chisei.deterministic-evaluator-result/v1";
+pub const EXTERNAL_ADAPTER_REQUEST_CONTRACT: &str = "chisei.external-evaluator-request/v1";
+pub const EXTERNAL_ADAPTER_SHARED_SECRET_ENV: &str = "CHISEI_EVALUATOR_ADAPTER_SHARED_SECRET";
 pub const STOCHASTIC_TRIAL_INPUT_CONTRACT: &str = "chisei.stochastic-trial-input/v1";
 pub const STOCHASTIC_TRIAL_RESULT_CONTRACT: &str =
     crate::chisei::evaluation_plan::STOCHASTIC_RESULT_SCHEMA;
@@ -87,6 +96,8 @@ pub const MAX_EXECUTION_DOCUMENT_BYTES: usize = 512 * 1024;
 const CANCELLATION_POLL_MS: u64 = 10;
 pub const DEFAULT_EVALUATOR_THREAD_CAPACITY: usize = 32;
 pub const MAX_EVALUATOR_THREAD_CAPACITY: usize = 256;
+const EXTERNAL_ADAPTER_TIMEOUT_MS: u64 = 300_000;
+const EXTERNAL_REGISTRATION_SEPARATOR: char = '\u{1f}';
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluationExecutionRequest {
@@ -129,6 +140,7 @@ pub struct DeterministicEvaluatorInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeterministicEvaluatorOutput {
     pub contract_version: String,
     pub status: String,
@@ -184,6 +196,223 @@ pub trait DeterministicEvaluator: Send + Sync + 'static {
         &self,
         input: &DeterministicEvaluatorInput,
     ) -> Result<DeterministicEvaluatorOutput, String>;
+
+    fn evaluate_with_timeout(
+        &self,
+        input: &DeterministicEvaluatorInput,
+        _timeout: Duration,
+    ) -> Result<DeterministicEvaluatorOutput, String> {
+        self.evaluate(input)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalAdapterRequest<'a> {
+    contract_version: &'static str,
+    namespace: &'a str,
+    implementation_digest: &'a str,
+    input: &'a DeterministicEvaluatorInput,
+}
+
+/// Operator-deployed evaluator adapter invoked through a bounded JSON/HTTP
+/// contract. The adapter receives no Chisei credentials or ambient capability;
+/// it can only return the closed evaluator result contract.
+#[derive(Debug)]
+pub struct ExternalHttpEvaluator {
+    namespace: String,
+    implementation_digest: String,
+    endpoint: String,
+    secret_override: Option<String>,
+}
+
+impl ExternalHttpEvaluator {
+    pub fn new(
+        namespace: &str,
+        implementation_digest: &str,
+        endpoint: &str,
+    ) -> Result<Self, String> {
+        validate_runtime_adapter_endpoint(endpoint)?;
+        if namespace.trim().is_empty() || implementation_digest.trim().is_empty() {
+            return Err("external evaluator registration requires namespace and digest".into());
+        }
+        Ok(Self {
+            namespace: namespace.into(),
+            implementation_digest: implementation_digest.into(),
+            endpoint: endpoint.into(),
+            secret_override: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_secret(
+        namespace: &str,
+        implementation_digest: &str,
+        endpoint: &str,
+        secret: &str,
+    ) -> Result<Self, String> {
+        validate_adapter_endpoint(endpoint)?;
+        if namespace.trim().is_empty() || implementation_digest.trim().is_empty() {
+            return Err("external evaluator registration requires namespace and digest".into());
+        }
+        Ok(Self {
+            namespace: namespace.into(),
+            implementation_digest: implementation_digest.into(),
+            endpoint: endpoint.into(),
+            secret_override: Some(secret.to_string()),
+        })
+    }
+
+    fn shared_secret() -> Option<String> {
+        std::env::var(EXTERNAL_ADAPTER_SHARED_SECRET_ENV)
+            .ok()
+            .map(|secret| secret.trim().to_string())
+            .filter(|secret| !secret.is_empty())
+    }
+
+    fn request_secret(&self) -> Option<String> {
+        self.secret_override.clone().or_else(Self::shared_secret)
+    }
+
+    fn signature(secret: &str, request_digest: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of every non-empty length");
+        mac.update(request_digest.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    #[cfg(test)]
+    fn response_signature(
+        secret: &str,
+        request_digest: &str,
+        response_digest: &str,
+        implementation_digest: &str,
+    ) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of every non-empty length");
+        mac.update(EXTERNAL_ADAPTER_REQUEST_CONTRACT.as_bytes());
+        mac.update(b"\n");
+        mac.update(request_digest.as_bytes());
+        mac.update(b"\n");
+        mac.update(response_digest.as_bytes());
+        mac.update(b"\n");
+        mac.update(implementation_digest.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    fn response_signature_valid(
+        secret: &str,
+        request_digest: &str,
+        response_digest: &str,
+        implementation_digest: &str,
+        encoded_signature: &str,
+    ) -> bool {
+        let Ok(signature) =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded_signature)
+        else {
+            return false;
+        };
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of every non-empty length");
+        mac.update(EXTERNAL_ADAPTER_REQUEST_CONTRACT.as_bytes());
+        mac.update(b"\n");
+        mac.update(request_digest.as_bytes());
+        mac.update(b"\n");
+        mac.update(response_digest.as_bytes());
+        mac.update(b"\n");
+        mac.update(implementation_digest.as_bytes());
+        mac.verify_slice(&signature).is_ok()
+    }
+}
+
+pub fn external_adapter_secret_configured() -> bool {
+    ExternalHttpEvaluator::shared_secret().is_some()
+}
+
+impl DeterministicEvaluator for ExternalHttpEvaluator {
+    fn evaluate(
+        &self,
+        input: &DeterministicEvaluatorInput,
+    ) -> Result<DeterministicEvaluatorOutput, String> {
+        self.evaluate_with_timeout(input, Duration::from_millis(EXTERNAL_ADAPTER_TIMEOUT_MS))
+    }
+
+    fn evaluate_with_timeout(
+        &self,
+        input: &DeterministicEvaluatorInput,
+        timeout: Duration,
+    ) -> Result<DeterministicEvaluatorOutput, String> {
+        let Some(secret) = self.request_secret() else {
+            return Err(REASON_EVALUATOR_UNAVAILABLE.into());
+        };
+        let request = ExternalAdapterRequest {
+            contract_version: EXTERNAL_ADAPTER_REQUEST_CONTRACT,
+            namespace: &self.namespace,
+            implementation_digest: &self.implementation_digest,
+            input,
+        };
+        let body = crate::shomei::canonical_json_with_finite_numbers(&request)?;
+        let request_digest = format!("sha256:{:x}", Sha256::digest(&body));
+        let signature = Self::signature(&secret, &request_digest);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout.max(Duration::from_millis(1)))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        let response = client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .header(
+                "x-sekai-adapter-contract",
+                EXTERNAL_ADAPTER_REQUEST_CONTRACT,
+            )
+            .header("x-sekai-adapter-request-digest", &request_digest)
+            .header("x-sekai-adapter-signature", signature)
+            .body(body)
+            .send()
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        if !response.status().is_success() {
+            return Err(REASON_EVALUATOR_UNAVAILABLE.into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESULT_BYTES as u64)
+        {
+            return Err(REASON_OUTPUT_LIMIT.into());
+        }
+        let response_digest_header = response
+            .headers()
+            .get("x-sekai-adapter-response-digest")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let response_signature_header = response
+            .headers()
+            .get("x-sekai-adapter-response-signature")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut bytes = Vec::with_capacity(MAX_RESULT_BYTES.min(8 * 1024));
+        let mut limited_response = response.take((MAX_RESULT_BYTES as u64) + 1);
+        limited_response
+            .read_to_end(&mut bytes)
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        if bytes.len() > MAX_RESULT_BYTES {
+            return Err(REASON_OUTPUT_LIMIT.into());
+        }
+        let response_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        if response_digest_header.as_deref() != Some(response_digest.as_str())
+            || !response_signature_header.is_some_and(|signature| {
+                Self::response_signature_valid(
+                    &secret,
+                    &request_digest,
+                    &response_digest,
+                    &self.implementation_digest,
+                    &signature,
+                )
+            })
+        {
+            return Err(REASON_EVALUATOR_UNAVAILABLE.into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| REASON_INVALID_RESULT.into())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +513,15 @@ struct RegisteredEvaluator {
     evaluator: Arc<dyn DeterministicEvaluator>,
     metrics_evaluator: &'static str,
     metrics_version: &'static str,
+    external_binding: Option<ExternalAdapterBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalAdapterBinding {
+    namespace: String,
+    definition_digest: String,
+    implementation_digest: String,
+    endpoint: String,
 }
 
 #[derive(Debug)]
@@ -359,19 +597,81 @@ impl DeterministicEvaluatorRegistry {
         validate_digest("implementation_digest", implementation_digest)?;
         validate_metrics_label("metrics_evaluator", metrics_evaluator)?;
         validate_metrics_label("metrics_version", metrics_version)?;
+        self.register_key(
+            implementation_digest.to_string(),
+            metrics_evaluator,
+            metrics_version,
+            evaluator,
+        )
+    }
+
+    fn register_key(
+        &self,
+        key: String,
+        metrics_evaluator: &'static str,
+        metrics_version: &'static str,
+        evaluator: Arc<dyn DeterministicEvaluator>,
+    ) -> Result<(), String> {
         let mut implementations = self
             .implementations
             .write()
             .map_err(|_| "deterministic evaluator registry lock poisoned".to_string())?;
-        if implementations.contains_key(implementation_digest) {
+        if implementations.contains_key(&key) {
             return Err("deterministic evaluator implementation digest already registered".into());
         }
         implementations.insert(
-            implementation_digest.to_string(),
+            key,
             RegisteredEvaluator {
                 evaluator,
                 metrics_evaluator,
                 metrics_version,
+                external_binding: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn register_external_adapter(
+        &self,
+        namespace: &str,
+        definition_digest: &str,
+        implementation_digest: &str,
+        endpoint: &str,
+    ) -> Result<(), String> {
+        validate_digest("definition_digest", definition_digest)?;
+        validate_digest("implementation_digest", implementation_digest)?;
+        let evaluator = Arc::new(ExternalHttpEvaluator::new(
+            namespace,
+            implementation_digest,
+            endpoint,
+        )?);
+        let binding = ExternalAdapterBinding {
+            namespace: namespace.into(),
+            definition_digest: definition_digest.into(),
+            implementation_digest: implementation_digest.into(),
+            endpoint: endpoint.into(),
+        };
+        let key = external_registration_key(namespace, definition_digest);
+        let mut implementations = self
+            .implementations
+            .write()
+            .map_err(|_| "deterministic evaluator registry lock poisoned".to_string())?;
+        if let Some(existing) = implementations.get(&key) {
+            if existing.external_binding.as_ref() == Some(&binding) {
+                return Ok(());
+            }
+            return Err(
+                "external evaluator definition is already bound to a different adapter endpoint"
+                    .into(),
+            );
+        }
+        implementations.insert(
+            key,
+            RegisteredEvaluator {
+                evaluator,
+                metrics_evaluator: "external_adapter",
+                metrics_version: "v1",
+                external_binding: Some(binding),
             },
         );
         Ok(())
@@ -381,6 +681,29 @@ impl DeterministicEvaluatorRegistry {
         self.implementations
             .read()
             .is_ok_and(|implementations| implementations.contains_key(implementation_digest))
+    }
+
+    pub fn contains_external_adapter(
+        &self,
+        namespace: &str,
+        definition_digest: &str,
+        implementation_digest: &str,
+    ) -> bool {
+        self.implementations
+            .read()
+            .ok()
+            .is_some_and(|implementations| {
+                implementations
+                    .get(&external_registration_key(namespace, definition_digest))
+                    .is_some_and(|entry| {
+                        external_binding_matches(
+                            entry,
+                            namespace,
+                            definition_digest,
+                            implementation_digest,
+                        )
+                    })
+            })
     }
 
     pub fn metric_labels(&self, implementation_digest: &str) -> (&'static str, &'static str) {
@@ -395,11 +718,55 @@ impl DeterministicEvaluatorRegistry {
             .unwrap_or(("unregistered", "unknown"))
     }
 
-    fn get(&self, implementation_digest: &str) -> Option<Arc<dyn DeterministicEvaluator>> {
+    pub fn metric_labels_for_namespace(
+        &self,
+        namespace: &str,
+        definition_digest: &str,
+        implementation_digest: &str,
+    ) -> (&'static str, &'static str) {
         self.implementations
             .read()
             .ok()
             .and_then(|implementations| {
+                if let Some(entry) =
+                    implementations.get(&external_registration_key(namespace, definition_digest))
+                {
+                    return external_binding_matches(
+                        entry,
+                        namespace,
+                        definition_digest,
+                        implementation_digest,
+                    )
+                    .then_some((entry.metrics_evaluator, entry.metrics_version));
+                }
+                implementations
+                    .get(implementation_digest)
+                    .map(|entry| (entry.metrics_evaluator, entry.metrics_version))
+            })
+            .unwrap_or(("unregistered", "unknown"))
+    }
+
+    fn get_for_namespace(
+        &self,
+        namespace: &str,
+        definition_digest: &str,
+        implementation_digest: &str,
+    ) -> Option<Arc<dyn DeterministicEvaluator>> {
+        self.implementations
+            .read()
+            .ok()
+            .and_then(|implementations| {
+                if let Some(entry) =
+                    implementations.get(&external_registration_key(namespace, definition_digest))
+                {
+                    return external_binding_matches(
+                        entry,
+                        namespace,
+                        definition_digest,
+                        implementation_digest,
+                    )
+                    .then(|| entry.evaluator.clone());
+                }
                 implementations
                     .get(implementation_digest)
                     .map(|entry| entry.evaluator.clone())
@@ -416,6 +783,26 @@ impl DeterministicEvaluatorRegistry {
             capacity: self.thread_capacity.clone(),
         })
     }
+}
+
+fn external_registration_key(namespace: &str, definition_digest: &str) -> String {
+    format!(
+        "external{}{}{}",
+        EXTERNAL_REGISTRATION_SEPARATOR, namespace, EXTERNAL_REGISTRATION_SEPARATOR
+    ) + definition_digest
+}
+
+fn external_binding_matches(
+    entry: &RegisteredEvaluator,
+    namespace: &str,
+    definition_digest: &str,
+    implementation_digest: &str,
+) -> bool {
+    entry.external_binding.as_ref().is_some_and(|binding| {
+        binding.namespace == namespace
+            && binding.definition_digest == definition_digest
+            && binding.implementation_digest == implementation_digest
+    })
 }
 
 #[derive(Clone)]
@@ -807,7 +1194,11 @@ pub fn execute_registered_node(
         return Err(reason);
     }
 
-    let Some(evaluator) = registry.get(&node.evaluator.implementation_digest) else {
+    let Some(evaluator) = registry.get_for_namespace(
+        &manifest.namespace,
+        &node.evaluator.definition_digest,
+        &node.evaluator.implementation_digest,
+    ) else {
         return make_framework_step(
             manifest,
             node,
@@ -873,7 +1264,9 @@ pub fn execute_registered_node(
         .name(format!("chisei-evaluator-{}", node.node_id))
         .spawn(move || {
             let _thread_permit = thread_permit;
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| evaluator.evaluate(&input)));
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                evaluator.evaluate_with_timeout(&input, node_budget)
+            }));
             let _ = sender.send(result);
         })
         .map_err(|error| format!("start deterministic evaluator: {error}"))?;
@@ -947,11 +1340,21 @@ pub fn execute_registered_node(
             Value::Null,
             elapsed,
         ),
-        Some(Ok(Ok(Err(_error)))) => make_framework_step(
+        Some(Ok(Ok(Err(error)))) => make_framework_step(
             manifest,
             node,
-            STATUS_ERROR,
-            REASON_INVALID_RESULT,
+            if error == REASON_EVALUATOR_UNAVAILABLE {
+                STATUS_UNAVAILABLE
+            } else {
+                STATUS_ERROR
+            },
+            if error == REASON_EVALUATOR_UNAVAILABLE {
+                REASON_EVALUATOR_UNAVAILABLE
+            } else if error == REASON_OUTPUT_LIMIT {
+                REASON_OUTPUT_LIMIT
+            } else {
+                REASON_INVALID_RESULT
+            },
             input_digest,
             parameters_digest,
             evidence_digests,
@@ -2235,6 +2638,8 @@ mod tests {
     };
     use crate::chisei::evaluation_plan::NODE_ADVISORY;
     use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
@@ -2407,6 +2812,194 @@ mod tests {
         node: &ResolvedEvaluationNode,
     ) -> DeterministicEvaluatorInput {
         build_evaluator_input(manifest, node, Vec::new(), &BTreeMap::new()).unwrap()
+    }
+
+    #[test]
+    fn external_adapter_registration_is_namespace_scoped() {
+        let registry = DeterministicEvaluatorRegistry::default();
+        let definition_digest = digest('d');
+        let implementation_digest = digest('e');
+        registry
+            .register_external_adapter(
+                "acme",
+                &definition_digest,
+                &implementation_digest,
+                "https://adapter.example/evaluate",
+            )
+            .unwrap();
+        assert!(registry.contains_external_adapter(
+            "acme",
+            &definition_digest,
+            &implementation_digest
+        ));
+        assert!(!registry.contains_external_adapter(
+            "other",
+            &definition_digest,
+            &implementation_digest
+        ));
+        assert!(!registry.contains_external_adapter("acme", &definition_digest, &digest('a')));
+    }
+
+    #[test]
+    fn external_adapter_registration_binds_the_definition_endpoint() {
+        let registry = DeterministicEvaluatorRegistry::default();
+        let implementation_digest = digest('e');
+        let first_definition = digest('d');
+        let second_definition = digest('f');
+        registry
+            .register_external_adapter(
+                "acme",
+                &first_definition,
+                &implementation_digest,
+                "https://adapter-a.example/evaluate",
+            )
+            .unwrap();
+        registry
+            .register_external_adapter(
+                "acme",
+                &second_definition,
+                &implementation_digest,
+                "https://adapter-b.example/evaluate",
+            )
+            .unwrap();
+        assert!(registry.contains_external_adapter(
+            "acme",
+            &first_definition,
+            &implementation_digest
+        ));
+        assert!(registry.contains_external_adapter(
+            "acme",
+            &second_definition,
+            &implementation_digest
+        ));
+        assert_eq!(
+            registry.metric_labels_for_namespace("acme", &first_definition, &implementation_digest),
+            ("external_adapter", "v1")
+        );
+        let implementations = registry.implementations.read().unwrap();
+        assert_eq!(
+            implementations[&external_registration_key("acme", &first_definition)]
+                .external_binding
+                .as_ref()
+                .unwrap()
+                .endpoint,
+            "https://adapter-a.example/evaluate"
+        );
+        assert_eq!(
+            implementations[&external_registration_key("acme", &second_definition)]
+                .external_binding
+                .as_ref()
+                .unwrap()
+                .endpoint,
+            "https://adapter-b.example/evaluate"
+        );
+    }
+
+    #[test]
+    fn external_adapter_invocation_uses_signed_bounded_json_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let implementation_digest = digest('e');
+        let server_implementation_digest = implementation_digest.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4 * 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .or_else(|| line.strip_prefix("Content-Length:"))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let body = &request[header_end + 4..];
+            let header_value = |name: &str| {
+                headers.lines().find_map(|line| {
+                    line.strip_prefix(name)
+                        .or_else(|| line.strip_prefix(&name.to_ascii_uppercase()))
+                        .map(str::trim)
+                })
+            };
+            let request_digest = header_value("x-sekai-adapter-request-digest:").unwrap();
+            assert_eq!(request_digest, format!("sha256:{:x}", Sha256::digest(body)));
+            assert_eq!(
+                header_value("x-sekai-adapter-contract:"),
+                Some(EXTERNAL_ADAPTER_REQUEST_CONTRACT)
+            );
+            let expected_signature =
+                ExternalHttpEvaluator::signature("fixture-secret", request_digest);
+            assert_eq!(
+                header_value("x-sekai-adapter-signature:"),
+                Some(expected_signature.as_str())
+            );
+            let request_json: Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(request_json["namespace"], "acme");
+            assert_eq!(request_json["input"]["parameters"]["threshold"], 1.5);
+            let result_body = r#"{"contract_version":"chisei.deterministic-evaluator-result/v1","status":"pass","reason_code":"fixture_pass","result":{"ok":true}}"#;
+            let response_digest = format!("sha256:{:x}", Sha256::digest(result_body.as_bytes()));
+            let response_signature = ExternalHttpEvaluator::response_signature(
+                "fixture-secret",
+                request_digest,
+                &response_digest,
+                &server_implementation_digest,
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-sekai-adapter-response-digest: {}\r\nx-sekai-adapter-response-signature: {}\r\nConnection: close\r\n\r\n{}",
+                result_body.len(),
+                response_digest,
+                response_signature,
+                result_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let evaluator = ExternalHttpEvaluator::new_with_secret(
+            "acme",
+            &implementation_digest,
+            &format!("http://{address}/evaluate"),
+            "fixture-secret",
+        )
+        .unwrap();
+        let manifest = manifest(vec![node("check", NODE_REQUIRED, &[])]);
+        let node = &manifest.nodes[0];
+        let mut evaluator_input = input(&manifest, node);
+        evaluator_input.parameters = serde_json::json!({"threshold": 1.5});
+        let output = evaluator.evaluate(&evaluator_input).unwrap();
+        assert_eq!(output.status, STATUS_PASS);
+        assert_eq!(output.reason_code, "fixture_pass");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deterministic_evaluator_result_rejects_unknown_fields() {
+        let result = serde_json::from_value::<DeterministicEvaluatorOutput>(serde_json::json!({
+            "contract_version": EVALUATOR_RESULT_CONTRACT,
+            "status": STATUS_PASS,
+            "reason_code": "fixture_pass",
+            "result": {"ok": true},
+            "unexpected": true
+        }));
+        assert!(result.is_err());
     }
 
     fn fixed_receipt() -> EvaluationStepReceipt {

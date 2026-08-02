@@ -18,10 +18,9 @@ closed result states, and the fixed reducer.
 ## Evaluator boundaries
 
 Evaluator definitions register metadata and an exact implementation digest;
-they never upload code. A deployable evaluator is a compiled Rust
-`DeterministicEvaluator` registered under that exact digest. The registry
-contains only implementations compiled into the server or installed by its
-embedding product integration. The shipped server registers one deliberately
+they never upload code. A deployable evaluator is either a compiled Rust
+`DeterministicEvaluator` or an operator-deployed `external_adapter/v1` endpoint
+registered under that exact digest. The shipped server registers one deliberately
 narrow implementation:
 `subject_content_digest_equals.v1`
 (`sha256:fb7617ab821a130efe66c43a22df2923e4648c1cb58ae2d793b958a31e94f155`).
@@ -34,7 +33,11 @@ It accepts only that invariant predicate and exactly one
 subject content digest. It is not a fallback and cannot evaluate other
 situations. An unregistered implementation digest produces `unavailable`; a
 subject content mismatch produces `fail` and therefore a `deny` gate. The
-executor never chooses a fallback or a newer definition.
+executor never chooses a fallback or a newer definition. External adapters
+receive the canonical input document through the bounded authenticated
+contract in [External evaluator adapters](evaluator-adapters.md); the adapter
+has no Chisei credentials or action authority and its output is validated by
+the same closed result contract.
 
 Stochastic definitions use `stochastic_model/v1` and a separate
 `StochasticEvaluatorRegistry`. The shipped stochastic implementation is
@@ -55,8 +58,10 @@ Each implementation receives one canonical input document containing:
 
 The deterministic implementation receives no runtime capability object,
 network client, clock, randomness, filesystem handle, process environment,
-locale, timezone, model/provider client, or action authority. Implementations
-remain operator-controlled compiled code and must pass the conformance harness.
+locale, timezone, model/provider client, or action authority. External adapters
+receive only the signed canonical request and the input document; they do not
+receive Chisei credentials or ambient capabilities. Implementations remain
+operator-controlled and must pass the conformance harness.
 The harness repeats
 golden manifests in child processes with different timezone, locale, and hash
 seed settings, and checks identical semantic receipt bytes.
@@ -133,14 +138,16 @@ Every invariant must be satisfied by a passing required node or an exact
 manifest waiver before `allow` is possible.
 
 Definition limits bound each node's timeout, canonical input bytes, ephemeral
-output bytes, and evidence-item count. The first request may lower total
-duration; zero selects 60 seconds and the hard maximum is 300 seconds. That
+output bytes, and evidence-item count. External adapter HTTP timeouts use the
+effective node budget, including the remaining total budget. The first request
+may lower total duration; zero selects 60 seconds and the hard maximum is 300
+seconds. That
 budget is frozen in the initial receipt, includes time across disconnects and
 restarts, and cannot be reset by replaying the request. Zero is normalized
 before persistence. A reuse request with a tighter bound fails closed when the
 existing manifest execution froze a larger bound; the response never
-misrepresents the actual execution limit. A timed-out compiled
-evaluator runs on an isolated thread with no supplied effects or capabilities;
+misrepresents the actual execution limit. A timed-out compiled evaluator or
+adapter request runs on an isolated thread with no supplied effects or capabilities;
 its result is ignored if it returns later. Because Rust threads cannot be
 force-killed safely, the registry has a hard global evaluator-thread capacity
 (32 by default). A timed-out or cancelled evaluator retains its slot until it
@@ -175,8 +182,9 @@ not force-killed; its output is discarded and the step closes as cancelled.
 
 Disabling or superseding an evaluator blocks new plan publication and manifest
 resolution but does not invalidate an already resolved manifest. Historical
-execution still requires the exact retained definition and a compiled registry
-entry with its exact implementation digest.
+execution still requires the exact retained definition and an executable
+registry entry with its exact implementation digest. A missing adapter
+endpoint, shared secret, or operator deployment fails closed as `unavailable`.
 
 ## Operations
 
@@ -200,8 +208,8 @@ receipts. Partially completed receipts remain resumable by a compatible
 executor; otherwise they remain readable evidence and correctly do not produce
 `allow`.
 
-Metrics expose only compiled static evaluator labels, compiled static version
-labels, the closed status vocabulary, and latency. They contain no namespace,
+Metrics expose only evaluator labels (`compiled_builtin` or `external_adapter`),
+version labels, the closed status vocabulary, and latency. They contain no namespace,
 subject, evidence identifier, digest, parameter, or content label.
 
 The provider-fake tests run in default CI. The ignored live path can be invoked

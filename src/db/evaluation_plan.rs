@@ -564,6 +564,7 @@ mod tests {
                 max_output_bytes: 100,
                 max_evidence_items: 1,
             },
+            adapter_endpoint: String::new(),
             stochastic_policy: None,
             source_ref: "repo://schema-check".into(),
             content_digest: String::new(),
