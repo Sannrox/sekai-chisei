@@ -5,6 +5,7 @@
 //! bind typed inputs, cover exact governed invariant versions, and use one
 //! fixed reducer.
 
+use http::Uri;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const EVALUATOR_DEFINITION_CONTRACT: &str = "chisei.evaluator-definition/v1";
 pub const EVALUATION_PLAN_CONTRACT: &str = "chisei.evaluation-plan/v1";
 pub const DETERMINISTIC_EXECUTION_CLASS: &str = "deterministic_builtin/v1";
+pub const EXTERNAL_ADAPTER_EXECUTION_CLASS: &str = "external_adapter/v1";
 pub const STOCHASTIC_EXECUTION_CLASS: &str = "stochastic_model/v1";
 pub const STOCHASTIC_AGGREGATION_MEAN_VARIANCE: &str = "mean_score_with_variance/v1";
 pub const STOCHASTIC_RESULT_SCHEMA: &str = "chisei.stochastic-trial-result/v1";
@@ -94,6 +96,10 @@ pub struct EvaluatorDefinition {
     pub parameter_schema_json: String,
     pub evidence_classifications: Vec<String>,
     pub resource_limits: EvaluatorResourceLimits,
+    /// Operator-deployed adapter endpoint. This is never executable code and is
+    /// only valid for `external_adapter/v1` definitions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub adapter_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stochastic_policy: Option<StochasticEvaluatorPolicy>,
     pub source_ref: String,
@@ -168,6 +174,24 @@ struct CanonicalDefinition<'a> {
 }
 
 #[derive(Serialize)]
+struct CanonicalExternalDefinition<'a> {
+    contract_version: &'a str,
+    namespace: &'a str,
+    evaluator_id: &'a str,
+    version: &'a str,
+    implementation_digest: &'a str,
+    execution_class: &'a str,
+    adapter_endpoint: &'a str,
+    supported_predicate_kinds: &'a [String],
+    supported_input_schemas: &'a [String],
+    supported_result_schemas: &'a [String],
+    parameter_schema: Value,
+    evidence_classifications: &'a [String],
+    resource_limits: &'a EvaluatorResourceLimits,
+    source_ref: &'a str,
+}
+
+#[derive(Serialize)]
 struct CanonicalPlan<'a> {
     contract_version: &'a str,
     namespace: &'a str,
@@ -198,7 +222,16 @@ pub fn prepare_definition(
         DETERMINISTIC_EXECUTION_CLASS => {
             return Err("deterministic evaluator cannot declare stochastic policy".into());
         }
+        EXTERNAL_ADAPTER_EXECUTION_CLASS if definition.stochastic_policy.is_none() => {
+            validate_adapter_endpoint(&definition.adapter_endpoint)?;
+        }
+        EXTERNAL_ADAPTER_EXECUTION_CLASS => {
+            return Err("external adapter evaluator cannot declare stochastic policy".into());
+        }
         STOCHASTIC_EXECUTION_CLASS => {
+            if !definition.adapter_endpoint.is_empty() {
+                return Err("stochastic evaluator cannot declare an adapter endpoint".into());
+            }
             let policy = definition
                 .stochastic_policy
                 .as_ref()
@@ -224,6 +257,11 @@ pub fn prepare_definition(
     )?;
     normalize_classifications(&mut definition.evidence_classifications)?;
     validate_resource_limits(&definition.resource_limits)?;
+    if definition.execution_class == DETERMINISTIC_EXECUTION_CLASS
+        && !definition.adapter_endpoint.is_empty()
+    {
+        return Err("deterministic evaluator cannot declare an adapter endpoint".into());
+    }
     validate_reference("source_ref", &definition.source_ref)?;
     let parameter_schema = parse_parameter_schema(&definition.parameter_schema_json)?;
     definition.parameter_schema_json =
@@ -239,22 +277,43 @@ pub fn prepare_definition(
             &definition.version,
         ],
     );
-    definition.content_digest = digest_json(&CanonicalDefinition {
-        contract_version: &definition.contract_version,
-        namespace: &definition.namespace,
-        evaluator_id: &definition.evaluator_id,
-        version: &definition.version,
-        implementation_digest: &definition.implementation_digest,
-        execution_class: &definition.execution_class,
-        supported_predicate_kinds: &definition.supported_predicate_kinds,
-        supported_input_schemas: &definition.supported_input_schemas,
-        supported_result_schemas: &definition.supported_result_schemas,
-        parameter_schema,
-        evidence_classifications: &definition.evidence_classifications,
-        resource_limits: &definition.resource_limits,
-        stochastic_policy: definition.stochastic_policy.as_ref(),
-        source_ref: &definition.source_ref,
-    })?;
+    definition.content_digest = if definition.execution_class == EXTERNAL_ADAPTER_EXECUTION_CLASS {
+        digest_json(&CanonicalExternalDefinition {
+            contract_version: &definition.contract_version,
+            namespace: &definition.namespace,
+            evaluator_id: &definition.evaluator_id,
+            version: &definition.version,
+            implementation_digest: &definition.implementation_digest,
+            execution_class: &definition.execution_class,
+            adapter_endpoint: &definition.adapter_endpoint,
+            supported_predicate_kinds: &definition.supported_predicate_kinds,
+            supported_input_schemas: &definition.supported_input_schemas,
+            supported_result_schemas: &definition.supported_result_schemas,
+            parameter_schema,
+            evidence_classifications: &definition.evidence_classifications,
+            resource_limits: &definition.resource_limits,
+            source_ref: &definition.source_ref,
+        })?
+    } else {
+        // Keep the deterministic and stochastic v1 content digest contract
+        // stable for definitions persisted before external adapters existed.
+        digest_json(&CanonicalDefinition {
+            contract_version: &definition.contract_version,
+            namespace: &definition.namespace,
+            evaluator_id: &definition.evaluator_id,
+            version: &definition.version,
+            implementation_digest: &definition.implementation_digest,
+            execution_class: &definition.execution_class,
+            supported_predicate_kinds: &definition.supported_predicate_kinds,
+            supported_input_schemas: &definition.supported_input_schemas,
+            supported_result_schemas: &definition.supported_result_schemas,
+            parameter_schema,
+            evidence_classifications: &definition.evidence_classifications,
+            resource_limits: &definition.resource_limits,
+            stochastic_policy: definition.stochastic_policy.as_ref(),
+            source_ref: &definition.source_ref,
+        })?
+    };
     definition.created_by = actor.into();
     definition.created_at_ms = now_ms;
     ensure_size(&definition, "evaluator definition")?;
@@ -948,6 +1007,55 @@ fn validate_reference(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_adapter_endpoint(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > 2_048 || value.chars().any(char::is_whitespace) {
+        return Err("adapter_endpoint must be bounded absolute URI text".into());
+    }
+    let uri: Uri = value
+        .parse()
+        .map_err(|_| "adapter_endpoint must be a valid absolute URI".to_string())?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| "adapter_endpoint must include a URI scheme".to_string())?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| "adapter_endpoint must include a URI authority".to_string())?;
+    if authority.as_str().contains('@') {
+        return Err("adapter_endpoint must not contain userinfo".into());
+    }
+    if uri.path_and_query().and_then(|path| path.query()).is_some() {
+        return Err("adapter_endpoint must not contain a query string".into());
+    }
+    if scheme != "https" && scheme != "http" {
+        return Err("adapter_endpoint must use https or loopback http".into());
+    }
+    if scheme == "http" {
+        let host = authority.host().trim_matches(['[', ']']);
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !loopback {
+            return Err("non-TLS adapter endpoints must use a loopback host".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_runtime_adapter_endpoint(value: &str) -> Result<(), String> {
+    validate_adapter_endpoint(value)?;
+    let uri: Uri = value
+        .parse()
+        .map_err(|_| "adapter_endpoint must be a valid absolute URI".to_string())?;
+    let insecure_development = std::env::var("SEKAI_INSECURE")
+        .ok()
+        .is_some_and(|value| value == "1");
+    if uri.scheme_str() == Some("http") && !insecure_development {
+        return Err("loopback HTTP adapter endpoints require SEKAI_INSECURE=1".into());
+    }
+    Ok(())
+}
+
 fn validate_digest(name: &str, value: &str) -> Result<(), String> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(format!("{name} must be a sha256 digest"));
@@ -1029,6 +1137,7 @@ mod tests {
                 max_output_bytes: 1_024,
                 max_evidence_items: 8,
             },
+            adapter_endpoint: String::new(),
             stochastic_policy: None,
             source_ref: "repo://evaluators/schema-check@1".into(),
             content_digest: String::new(),
@@ -1180,6 +1289,58 @@ mod tests {
                 .unwrap_err()
                 .contains("budget tracker range")
         );
+    }
+
+    #[test]
+    fn external_adapter_definitions_require_a_secure_operator_endpoint() {
+        let mut external = definition();
+        external.execution_class = EXTERNAL_ADAPTER_EXECUTION_CLASS.into();
+        assert!(
+            prepare_definition(external.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("adapter_endpoint")
+        );
+
+        external.adapter_endpoint = "http://adapter.example/evaluate".into();
+        assert!(
+            prepare_definition(external.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("loopback")
+        );
+
+        external.adapter_endpoint = "https://adapter.example/evaluate?token=secret".into();
+        assert!(
+            prepare_definition(external.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("query")
+        );
+
+        external.adapter_endpoint = "https://adapter.example/evaluate".into();
+        let prepared = prepare_definition(external, "operator", 10).unwrap();
+        assert_eq!(prepared.execution_class, EXTERNAL_ADAPTER_EXECUTION_CLASS);
+        assert_eq!(
+            prepared.adapter_endpoint,
+            "https://adapter.example/evaluate"
+        );
+    }
+
+    #[test]
+    fn loopback_http_requires_explicit_insecure_runtime_opt_in() {
+        let result = validate_runtime_adapter_endpoint("http://127.0.0.1:43123/evaluate");
+        if std::env::var("SEKAI_INSECURE").ok().as_deref() == Some("1") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().contains("SEKAI_INSECURE=1"));
+        }
+    }
+
+    #[test]
+    fn existing_definition_digests_ignore_the_empty_adapter_endpoint() {
+        let first = prepare_definition(definition(), "operator", 10).unwrap();
+        let mut second = definition();
+        second.adapter_endpoint = String::new();
+        let second = prepare_definition(second, "operator", 20).unwrap();
+        assert_eq!(first.content_digest, second.content_digest);
     }
 
     #[test]

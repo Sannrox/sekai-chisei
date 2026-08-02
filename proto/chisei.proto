@@ -373,6 +373,9 @@ message EvaluatorDefinition {
   string created_by = 16;
   int64 created_at_ms = 17;
   optional StochasticEvaluatorPolicy stochastic_policy = 18;
+  // HTTPS endpoint for an operator-deployed external_adapter/v1 evaluator.
+  // This never uploads executable code and is empty for built-in/stochastic definitions.
+  string adapter_endpoint = 19;
 }
 message EvaluatorAvailability {
   string definition_id = 1;
@@ -387,6 +390,10 @@ message EvaluatorAvailability {
 message EvaluatorDefinitionRecord {
   EvaluatorDefinition definition = 1;
   EvaluatorAvailability availability = 2;
+  // Capability discovery: metadata may be published while the exact implementation
+  // is not executable in this Chisei process.
+  bool implementation_executable = 3;
+  string implementation_status = 4; // executable | unavailable | unsupported
 }
 message PutEvaluatorDefinitionRequest { EvaluatorDefinition definition = 1; }
 message PutEvaluatorDefinitionResponse { EvaluatorDefinitionRecord record = 1; }

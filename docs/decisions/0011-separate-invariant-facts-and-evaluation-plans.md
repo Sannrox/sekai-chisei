@@ -74,11 +74,14 @@ The fixed v1 reducer is fail closed for required nodes:
   covered by a passing required node or an exact valid waiver.
 
 V1 permits deterministic typed evaluator nodes with explicit dependencies and
-hard bounds. It excludes loops, dynamic nodes, arbitrary scripts or
-expressions, action, deployment, or rollback nodes, ambient filesystem or
-network authority, caller-selected reducers, unversioned aliases, hidden
-fallback evaluators, tenant-uploaded executable code, and stochastic or
-model-based evaluator semantics.
+hard bounds. They may use either a compiled operator implementation or the
+bounded operator-deployed `external_adapter/v1` contract defined by
+[ADR 0013](0013-governed-external-evaluator-adapters.md). It excludes loops,
+dynamic nodes, arbitrary scripts or expressions, action, deployment, or
+rollback nodes, ambient filesystem or network authority granted to evaluator
+code, caller-selected reducers, unversioned aliases, hidden fallback
+evaluators, tenant-uploaded executable code, and stochastic or model-based
+evaluator semantics in the deterministic class.
 
 The public contract is additive. Existing `EvalSuite`, `EvalRun`,
 governed-subject v1 profiles, the internal Chisei decision pipeline, and

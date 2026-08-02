@@ -94,6 +94,7 @@ Operator runbook and data model: [budget-topology.md](budget-topology.md). Desig
 | `CHISEI_DEFAULT_DATA_CLASS` | `unclassified` | Default classification for egress decisions |
 | `CHISEI_SAFE_EGRESS_PROVIDERS` | empty | Comma-separated providers allowed by egress policy |
 | `LEAK_REVIEW_MODEL` | unset | Optional local model used for leak review |
+| `CHISEI_EVALUATOR_ADAPTER_SHARED_SECRET` | unset | Shared secret for authenticated operator-deployed `external_adapter/v1` evaluator calls; unset keeps those implementations unavailable |
 
 Build with `--features secret-command` to resolve opaque provider-key
 references through an external secrets-manager adapter:

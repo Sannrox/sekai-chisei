@@ -384,9 +384,11 @@ lifecycle. Exact successful request replay remains available after evaluator
 disablement or supersession; new requests fail closed against current
 availability. See [Resolved evaluation manifests](evaluation-manifests.md).
 
-The evaluation executor selects only compiled implementations whose exact
-digest matches the manifest. Deterministic and stochastic nodes use separate
-registries; stochastic policies additionally freeze exact routing, sampling,
+The evaluation executor selects only compiled or explicitly registered external
+implementations whose exact digest matches the manifest. Deterministic and
+stochastic nodes use separate registries; external adapters run through a
+bounded authenticated contract and never receive Chisei credentials.
+Stochastic policies additionally freeze exact routing, sampling,
 fixed trials, aggregation, variance, budget, egress, retention, and gate
 eligibility. The executor runs ready nodes in stable topological order and
 applies one fixed fail-closed reducer. Step and terminal truth are appended to

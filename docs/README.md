@@ -54,6 +54,8 @@ If you want to deploy or operate the control plane:
   content-bound pre-execution inputs and historical replay.
 - [Evaluation execution](evaluation-execution.md) — bounded,
   receipt-authoritative deterministic and stochastic execution.
+- [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
+  authenticated execution for operator-deployed domain evaluators.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,

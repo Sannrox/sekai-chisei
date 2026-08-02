@@ -91,8 +91,11 @@ lives in the separate [research index](research/README.md).
   content-bound evaluation through registered profiles.
 - [Resolved evaluation manifests](evaluation-manifests.md) — authorized,
   content-bound evaluation-plan resolution without evaluator execution.
-- [Evaluation execution](evaluation-execution.md) — exact-digest compiled
-  deterministic and bounded stochastic evaluators, receipts, and fixed gates.
+- [Evaluation execution](evaluation-execution.md) — exact-digest compiled or
+  external deterministic and bounded stochastic evaluators, receipts, and
+  fixed gates.
+- [External evaluator adapters](evaluator-adapters.md) — authenticated,
+  bounded operator-deployed evaluator contract.
 - [Governed requirement and invariant facts](governed-facts.md) — versioned
   normative facts, exact supersession, governed waivers, and set resolution.
 - [Host-executor permit conformance](host-executor-permit-conformance.md) —

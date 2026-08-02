@@ -25,6 +25,7 @@ fn definition(namespace: &str, suffix: &str) -> EvaluatorDefinition {
             max_output_bytes: 1_024,
             max_evidence_items: 8,
         },
+        adapter_endpoint: String::new(),
         stochastic_policy: None,
         source_ref: "repo://evaluators/schema-check@1".into(),
         content_digest: String::new(),
