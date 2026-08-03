@@ -36,3 +36,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0011: Separate invariant facts from configurable evaluation plans](0011-separate-invariant-facts-and-evaluation-plans.md)
 - [ADR 0012: Bound stochastic evaluation by situation](0012-bound-stochastic-evaluation-by-situation.md)
 - [ADR 0013: Govern external evaluator adapters outside the Chisei process](0013-governed-external-evaluator-adapters.md)
+- [ADR 0014: Expose bounded runtime claim pressure to external capacity managers](0014-runtime-claim-pressure.md)

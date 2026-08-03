@@ -275,6 +275,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "ListRunEvents"
                 | "ReconcileWorkUnits"
                 | "GetCoordinationSnapshot"
+                | "GetRuntimeWorkPressure"
         ),
         "chisei.ChiseiService" => matches!(
             method,
@@ -457,6 +458,14 @@ mod tests {
                 ("sekai.SekaiService".into(), method.into())
             );
         }
+    }
+
+    #[test]
+    fn recognizes_runtime_work_pressure_rpc_path() {
+        assert_eq!(
+            parse_grpc_path("/sekai.SekaiService/GetRuntimeWorkPressure"),
+            ("sekai.SekaiService".into(), "GetRuntimeWorkPressure".into())
+        );
     }
 }
 

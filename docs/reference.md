@@ -81,6 +81,8 @@ lives in the separate [research index](research/README.md).
   `runtime_dispatch` and `notify` effects.
 - [Runtime claim API](runtime-claim.md) — claim, heartbeat, and terminal
   acknowledgement.
+- [Runtime claim pressure](runtime-claim-pressure.md) — bounded namespace /
+  runtime capacity signals for external worker-pool managers.
 - [Action harvest binding](action-harvest-binding.md) — instance, effect, and
   operation correlation.
 - [Evidence producer contract](action-evidence-producer-contract.md) —

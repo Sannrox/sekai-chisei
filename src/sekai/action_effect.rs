@@ -13,7 +13,9 @@ use crate::sekai::parked_work::{
     validate_checkpoint_tuple, validate_reason, validate_request_id,
 };
 use rusqlite::{OptionalExtension, params};
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, fmt};
 
 pub const EFFECT_STATUS_PENDING: &str = "pending";
 pub const EFFECT_STATUS_CLAIMED: &str = "claimed";
@@ -41,6 +43,12 @@ pub const DEFAULT_MAX_PARK_CYCLES: u32 = 3;
 pub const ACK_OUTCOME_COMPLETED: &str = "completed";
 pub const ACK_OUTCOME_FAILED: &str = "failed";
 pub const ACK_OUTCOME_PARKED: &str = "parked";
+
+/// Versioned, read-only pressure projection for external worker-pool managers.
+pub const RUNTIME_WORK_PRESSURE_CONTRACT_VERSION: &str = "sekai.runtime-work-pressure/v1";
+pub const RUNTIME_WORK_PRESSURE_STATUS_CURRENT: &str = "current";
+pub const RUNTIME_WORK_PRESSURE_STATUS_DEGRADED: &str = "degraded";
+pub const RUNTIME_WORK_PRESSURE_STATUS_UNKNOWN: &str = "unknown";
 
 const MAX_CLAIM_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_CLAIM_TTL_MS: i64 = 60_000;
@@ -99,8 +107,479 @@ pub struct ActionEffect {
     pub max_park_cycles: u32,
 }
 
+/// Bounded, payload-free pressure for one namespace/runtime scope.
+///
+/// The projection is intentionally separate from [`ActionEffect`]. It contains
+/// no effect, operation, or task identifiers and is computed by the storage
+/// backend with aggregate queries so large queues are never materialized in
+/// the control-plane process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWorkPressure {
+    pub contract_version: String,
+    pub schema_version: u32,
+    pub namespace: String,
+    pub runtime_id: String,
+    pub sampled_at_ms: i64,
+    /// current | degraded | unknown
+    pub sample_status: String,
+    /// Fixed machine-readable reason when the sample is not authoritative.
+    pub degraded_reason: String,
+    pub authoritative: bool,
+    pub approximate: bool,
+    pub claimable_count: u64,
+    pub oldest_claimable_age_ms: u64,
+    pub active_claim_count: u64,
+    pub expired_claim_count: u64,
+    pub parked_count: u64,
+    pub failed_count: u64,
+    pub dead_lettered_count: u64,
+}
+
+impl RuntimeWorkPressure {
+    pub fn validate_scope(namespace: &str, runtime_id: &str) -> Result<(), String> {
+        validate_no_nul("namespace", namespace)?;
+        validate_no_nul("runtime_id", runtime_id)?;
+        if namespace.trim().is_empty() {
+            return Err("namespace required".into());
+        }
+        if runtime_id_is_blank(runtime_id) {
+            return Err("runtime_id required".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_aggregate(
+        namespace: &str,
+        runtime_id: &str,
+        sampled_at_ms: i64,
+        aggregate: RuntimeWorkPressureAggregate,
+    ) -> Self {
+        let oldest_claimable_age_ms = aggregate
+            .oldest_claimable_created_at_ms
+            .map(|created_at_ms| sampled_at_ms.saturating_sub(created_at_ms).max(0) as u64)
+            .unwrap_or(0);
+        Self {
+            contract_version: RUNTIME_WORK_PRESSURE_CONTRACT_VERSION.into(),
+            schema_version: 1,
+            namespace: namespace.into(),
+            runtime_id: runtime_id.into(),
+            sampled_at_ms,
+            sample_status: RUNTIME_WORK_PRESSURE_STATUS_CURRENT.into(),
+            degraded_reason: String::new(),
+            authoritative: true,
+            approximate: false,
+            claimable_count: aggregate.claimable_count,
+            oldest_claimable_age_ms,
+            active_claim_count: aggregate.active_claim_count,
+            expired_claim_count: aggregate.expired_claim_count,
+            parked_count: aggregate.parked_count,
+            failed_count: aggregate.failed_count,
+            dead_lettered_count: aggregate.dead_lettered_count,
+        }
+    }
+
+    pub fn unknown(namespace: &str, runtime_id: &str, sampled_at_ms: i64, reason: &str) -> Self {
+        Self {
+            contract_version: RUNTIME_WORK_PRESSURE_CONTRACT_VERSION.into(),
+            schema_version: 1,
+            namespace: namespace.into(),
+            runtime_id: runtime_id.into(),
+            sampled_at_ms,
+            sample_status: RUNTIME_WORK_PRESSURE_STATUS_UNKNOWN.into(),
+            degraded_reason: reason.into(),
+            authoritative: false,
+            approximate: false,
+            claimable_count: 0,
+            oldest_claimable_age_ms: 0,
+            active_claim_count: 0,
+            expired_claim_count: 0,
+            parked_count: 0,
+            failed_count: 0,
+            dead_lettered_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RuntimeWorkPressureAggregate {
+    pub(crate) claimable_count: u64,
+    pub(crate) oldest_claimable_created_at_ms: Option<i64>,
+    pub(crate) active_claim_count: u64,
+    pub(crate) expired_claim_count: u64,
+    pub(crate) parked_count: u64,
+    pub(crate) failed_count: u64,
+    pub(crate) dead_lettered_count: u64,
+}
+
+pub(crate) fn aggregate_count(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn json_value_contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(values) => values.iter().any(json_value_contains_nul),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains('\0') || json_value_contains_nul(value)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+struct DuplicateObjectKeyDetector;
+
+struct DuplicateObjectValueSeed;
+
+impl<'de> DeserializeSeed<'de> for DuplicateObjectValueSeed {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateObjectKeyDetector)
+    }
+}
+
+impl<'de> Visitor<'de> for DuplicateObjectKeyDetector {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        let mut duplicate = false;
+        while let Some(key) = access.next_key::<String>()? {
+            if !keys.insert(key) {
+                duplicate = true;
+            }
+            duplicate |= access.next_value_seed(DuplicateObjectValueSeed)?;
+        }
+        Ok(duplicate)
+    }
+
+    fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut duplicate = false;
+        while let Some(value) = access.next_element_seed(DuplicateObjectValueSeed)? {
+            duplicate |= value;
+        }
+        Ok(duplicate)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(false)
+    }
+}
+
+fn json_contains_duplicate_keys(input: &str) -> Result<bool, String> {
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let duplicate = deserializer
+        .deserialize_any(DuplicateObjectKeyDetector)
+        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
+    Ok(duplicate)
+}
+
+/// Rewrite JSON while preserving the original lexical representation of
+/// numbers. This is used only for legacy duplicate-key repair; round-tripping
+/// through `serde_json::Value` would otherwise coerce large or exponent-form
+/// numbers through `f64`.
+struct JsonKeyCanonicalizer<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    offset: usize,
+    duplicate_keys: bool,
+}
+
+impl<'a> JsonKeyCanonicalizer<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            offset: 0,
+            duplicate_keys: false,
+        }
+    }
+
+    fn finish(mut self) -> Result<(String, bool), String> {
+        let value = self.parse_value()?;
+        self.skip_whitespace();
+        if self.offset != self.bytes.len() {
+            return Err("trailing characters after JSON value".into());
+        }
+        Ok((value, self.duplicate_keys))
+    }
+
+    fn parse_value(&mut self) -> Result<String, String> {
+        self.skip_whitespace();
+        match self.bytes.get(self.offset).copied() {
+            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_array(),
+            Some(b'"') => self.parse_string().map(|(raw, _)| raw),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(b't') => self.parse_literal("true"),
+            Some(b'f') => self.parse_literal("false"),
+            Some(b'n') => self.parse_literal("null"),
+            Some(_) => Err(format!("invalid JSON value at byte {}", self.offset)),
+            None => Err("missing JSON value".into()),
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<String, String> {
+        self.expect_byte(b'{')?;
+        self.skip_whitespace();
+        let mut entries: Vec<(String, String)> = Vec::new();
+        if self.consume_byte(b'}') {
+            return Ok("{}".into());
+        }
+        loop {
+            self.skip_whitespace();
+            let (raw_key, decoded_key) = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            let value = self.parse_value()?;
+            let entry = format!("{raw_key}:{value}");
+            if let Some(existing) = entries.iter_mut().find(|(key, _)| key == &decoded_key) {
+                self.duplicate_keys = true;
+                existing.1 = entry;
+            } else {
+                entries.push((decoded_key, entry));
+            }
+            self.skip_whitespace();
+            if self.consume_byte(b'}') {
+                break;
+            }
+            self.expect_byte(b',')?;
+        }
+        Ok(format!(
+            "{{{}}}",
+            entries
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+
+    fn parse_array(&mut self) -> Result<String, String> {
+        self.expect_byte(b'[')?;
+        self.skip_whitespace();
+        let mut values = Vec::new();
+        if self.consume_byte(b']') {
+            return Ok("[]".into());
+        }
+        loop {
+            values.push(self.parse_value()?);
+            self.skip_whitespace();
+            if self.consume_byte(b']') {
+                break;
+            }
+            self.expect_byte(b',')?;
+        }
+        Ok(format!("[{}]", values.join(",")))
+    }
+
+    fn parse_string(&mut self) -> Result<(String, String), String> {
+        let start = self.offset;
+        self.expect_byte(b'"')?;
+        let mut escaped = false;
+        while let Some(byte) = self.bytes.get(self.offset).copied() {
+            self.offset += 1;
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => {
+                    let raw = self.input[start..self.offset].to_string();
+                    let decoded = serde_json::from_str::<String>(&raw)
+                        .map_err(|error| format!("invalid JSON string: {error}"))?;
+                    return Ok((raw, decoded));
+                }
+                0..=0x1f => return Err("unescaped control character in JSON string".into()),
+                _ => {}
+            }
+        }
+        Err("unterminated JSON string".into())
+    }
+
+    fn parse_number(&mut self) -> Result<String, String> {
+        let start = self.offset;
+        self.consume_byte(b'-');
+        match self.bytes.get(self.offset).copied() {
+            Some(b'0') => {
+                self.offset += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.offset += 1;
+                while matches!(self.bytes.get(self.offset), Some(b'0'..=b'9')) {
+                    self.offset += 1;
+                }
+            }
+            _ => return Err(format!("invalid JSON number at byte {start}")),
+        }
+        if self.consume_byte(b'.') {
+            let fraction_start = self.offset;
+            while matches!(self.bytes.get(self.offset), Some(b'0'..=b'9')) {
+                self.offset += 1;
+            }
+            if self.offset == fraction_start {
+                return Err(format!("invalid JSON number at byte {start}"));
+            }
+        }
+        if matches!(self.bytes.get(self.offset), Some(b'e' | b'E')) {
+            self.offset += 1;
+            if !self.consume_byte(b'+') {
+                self.consume_byte(b'-');
+            }
+            let exponent_start = self.offset;
+            while matches!(self.bytes.get(self.offset), Some(b'0'..=b'9')) {
+                self.offset += 1;
+            }
+            if self.offset == exponent_start {
+                return Err(format!("invalid JSON number at byte {start}"));
+            }
+        }
+        Ok(self.input[start..self.offset].into())
+    }
+
+    fn parse_literal(&mut self, literal: &str) -> Result<String, String> {
+        let end = self.offset.saturating_add(literal.len());
+        if self.bytes.get(self.offset..end) == Some(literal.as_bytes()) {
+            self.offset = end;
+            Ok(literal.into())
+        } else {
+            Err(format!("invalid JSON literal at byte {}", self.offset))
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.bytes.get(self.offset),
+            Some(b' ' | b'\n' | b'\r' | b'\t')
+        ) {
+            self.offset += 1;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), String> {
+        if self.consume_byte(expected) {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {:?} at byte {}",
+                expected as char, self.offset
+            ))
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.bytes.get(self.offset).copied() == Some(expected) {
+            self.offset += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn canonicalize_json_preserving_numbers(input: &str) -> Result<(String, bool), String> {
+    JsonKeyCanonicalizer::new(input).finish()
+}
+
+pub(crate) fn runtime_id_is_blank(value: &str) -> bool {
+    value.chars().all(|character| {
+        matches!(
+            character,
+            ' ' | '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r'
+        )
+    })
+}
+
+pub(crate) fn validate_no_nul(label: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        Err(format!("{label} must not contain NUL"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve the runtime selector stored in an effect payload using the same
+/// ASCII-blank compatibility rule as admission, claiming, and SQLite reads.
+pub(crate) fn canonical_runtime_from_payload(payload_json: &str) -> Result<String, String> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
+    if !payload.is_object() {
+        return Err("payload_json must be a JSON object".into());
+    }
+    Ok(payload
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .filter(|runtime| !runtime_id_is_blank(runtime))
+        .unwrap_or("default")
+        .into())
+}
+
 impl ActionEffect {
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate_structure(&self, reject_duplicate_keys: bool) -> Result<serde_json::Value, String> {
         if self.effect_id.trim().is_empty() {
             return Err("effect_id required".into());
         }
@@ -134,7 +613,76 @@ impl ActionEffect {
         if !payload.is_object() {
             return Err("payload_json must be a JSON object".into());
         }
+        if reject_duplicate_keys && json_contains_duplicate_keys(&self.payload_json)? {
+            return Err("payload_json must not contain duplicate object keys".into());
+        }
+        Ok(payload)
+    }
+
+    /// Validate a newly written effect. New JSONB-backed records must not
+    /// contain NUL-bearing strings because PostgreSQL cannot index them.
+    pub fn validate(&self) -> Result<(), String> {
+        let payload = self.validate_structure(true)?;
+        if json_value_contains_nul(&payload)
+            || serde_json::to_value(self)
+                .map(|value| json_value_contains_nul(&value))
+                .unwrap_or(false)
+        {
+            return Err("action effect JSON strings must not contain NUL".into());
+        }
         Ok(())
+    }
+
+    /// Validate an effect loaded from the durable store before a lifecycle
+    /// transition. Legacy rows may contain NUL-bearing JSON strings; keeping
+    /// this path permissive lets claim/heartbeat/ack advance them while the
+    /// PostgreSQL compatibility marker remains false and pressure stays
+    /// fail-closed.
+    pub(crate) fn validate_for_lifecycle_update(&self) -> Result<(), String> {
+        self.validate_structure(false).map(|_| ())
+    }
+
+    /// Permit a lifecycle call to finish a claim that was created before the
+    /// NUL boundary was enforced. The exact owner/fence pair is still required
+    /// and the effect remains pressure-incompatible until a clean rewrite.
+    pub(crate) fn legacy_claim_fence_matches(&self, runtime_id: &str, fencing_token: &str) -> bool {
+        self.legacy_claim_identity_matches(runtime_id, fencing_token)
+            && self.status == EFFECT_STATUS_CLAIMED
+    }
+
+    pub(crate) fn legacy_claim_terminal_replay_matches(
+        &self,
+        runtime_id: &str,
+        fencing_token: &str,
+    ) -> bool {
+        self.legacy_claim_identity_matches(runtime_id, fencing_token)
+            && matches!(
+                self.status.as_str(),
+                EFFECT_STATUS_COMPLETED | EFFECT_STATUS_FAILED
+            )
+    }
+
+    pub(crate) fn legacy_claim_replay_matches(&self, runtime_id: &str, request_id: &str) -> bool {
+        !self.jsonb_compatible()
+            && self.status == EFFECT_STATUS_CLAIMED
+            && self.claim_owner == runtime_id
+            && self.claim_request_id == request_id
+    }
+
+    fn legacy_claim_identity_matches(&self, runtime_id: &str, fencing_token: &str) -> bool {
+        !self.jsonb_compatible()
+            && self.claim_owner == runtime_id
+            && self.claim_fencing_token == fencing_token
+    }
+
+    pub(crate) fn jsonb_compatible(&self) -> bool {
+        let payload_is_compatible = serde_json::from_str::<serde_json::Value>(&self.payload_json)
+            .map(|payload| !json_value_contains_nul(&payload))
+            .unwrap_or(false);
+        payload_is_compatible
+            && serde_json::to_value(self)
+                .map(|value| !json_value_contains_nul(&value))
+                .unwrap_or(false)
     }
 
     pub fn is_claimable_at(&self, now_ms: i64) -> bool {
@@ -221,11 +769,7 @@ pub fn plan_effects_for_admit(
         }
         match kind.as_str() {
             EFFECT_KIND_RUNTIME_DISPATCH => {
-                let runtime = params
-                    .get("runtime")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
+                let runtime = canonical_runtime_from_payload(parameters_json)?;
                 let payload = serde_json::json!({
                     "runtime": runtime,
                     "instance_id": instance_id,
@@ -366,6 +910,9 @@ pub fn plan_effects_for_admit(
             }
         }
     }
+    for effect in &effects {
+        effect.validate()?;
+    }
     Ok(effects)
 }
 
@@ -385,9 +932,73 @@ fn retry_policy_digest() -> String {
     )
 }
 
+/// Canonicalize duplicate payload keys left by pre-v1 writers. The lexical
+/// parser keeps the last value, matching PostgreSQL JSONB's behavior, without
+/// coercing large or exponent-form numbers through `f64`. Bounded batches keep
+/// startup memory independent of the effect-history size.
+fn canonicalize_legacy_payload_keys(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    const BATCH_SIZE: i64 = 128;
+    let mut cursor = String::new();
+    loop {
+        let rows: Vec<(String, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT effect_id, body_json
+                     FROM sekai_action_effects
+                     WHERE effect_id > ?1
+                     ORDER BY effect_id
+                     LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![cursor, BATCH_SIZE], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let next_cursor = rows.last().map(|(effect_id, _)| effect_id.clone());
+        let mut updates = Vec::new();
+        for (effect_id, body) in rows.iter() {
+            let Ok(mut effect) = serde_json::from_str::<ActionEffect>(body) else {
+                continue;
+            };
+            let Ok((payload, has_duplicate_keys)) =
+                canonicalize_json_preserving_numbers(&effect.payload_json)
+            else {
+                continue;
+            };
+            if !has_duplicate_keys {
+                continue;
+            }
+            effect.payload_json = payload;
+            let body = serde_json::to_string(&effect).map_err(|error| error.to_string())?;
+            updates.push((effect_id, effect.payload_json, body));
+        }
+        for (effect_id, payload_json, body_json) in updates {
+            tx.execute(
+                "UPDATE sekai_action_effects
+                 SET payload_json = ?1, body_json = ?2
+                 WHERE effect_id = ?3",
+                params![payload_json, body_json, effect_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        cursor = next_cursor.expect("non-empty legacy action effect batch");
+        if rows.len() < BATCH_SIZE as usize {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl SekaiDb {
     pub fn migrate_action_effects(&self) -> Result<(), String> {
-        let conn = self.conn();
+        let mut conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sekai_action_effects (
                 effect_id TEXT PRIMARY KEY,
@@ -408,6 +1019,22 @@ impl SekaiDb {
                 ON sekai_action_effects(kind, status);
             CREATE INDEX IF NOT EXISTS idx_action_effects_ns
                 ON sekai_action_effects(namespace, created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_action_effects_pressure_runtime_prefix
+                ON sekai_action_effects(
+                    namespace,
+                    kind,
+                    substr(
+                        CASE
+                            WHEN json_type(payload_json, '$.runtime') = 'text'
+                            AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
+                            THEN json_extract(payload_json, '$.runtime')
+                            ELSE 'default'
+                        END,
+                        1,
+                        128
+                    ),
+                    created_at_ms
+                );
             CREATE TABLE IF NOT EXISTS sekai_action_work_parks (
                 park_id TEXT PRIMARY KEY,
                 effect_id TEXT NOT NULL,
@@ -447,9 +1074,36 @@ impl SekaiDb {
                 request_digest TEXT NOT NULL,
                 body_json TEXT NOT NULL,
                 PRIMARY KEY(effect_id, request_id)
+            );
+            CREATE TABLE IF NOT EXISTS sekai_action_effect_migrations (
+                name TEXT PRIMARY KEY
             );",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+        let needs_payload_key_canonicalization = conn
+            .query_row(
+                "SELECT 1 FROM sekai_action_effect_migrations WHERE name = ?1",
+                params!["canonicalize_payload_keys_v1"],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_none();
+        if needs_payload_key_canonicalization {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO sekai_action_effect_migrations(name) VALUES (?1)",
+                    params!["canonicalize_payload_keys_v1"],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 1 {
+                canonicalize_legacy_payload_keys(&tx)?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn put_action_effect(&self, effect: &ActionEffect) -> Result<ActionEffect, String> {
@@ -578,6 +1232,19 @@ impl SekaiDb {
     pub fn update_action_effect(&self, effect: &ActionEffect) -> Result<ActionEffect, String> {
         self.migrate_action_effects()?;
         effect.validate()?;
+        self.update_action_effect_row(effect)
+    }
+
+    fn update_action_effect_lifecycle(
+        &self,
+        effect: &ActionEffect,
+    ) -> Result<ActionEffect, String> {
+        self.migrate_action_effects()?;
+        effect.validate_for_lifecycle_update()?;
+        self.update_action_effect_row(effect)
+    }
+
+    fn update_action_effect_row(&self, effect: &ActionEffect) -> Result<ActionEffect, String> {
         let body_json = serde_json::to_string(effect).map_err(|e| e.to_string())?;
         let conn = self.conn();
         let updated = conn
@@ -636,12 +1303,13 @@ impl SekaiDb {
             if !effect.is_claimable_at(now_ms) {
                 continue;
             }
-            if let Some(runtime_id) = runtime_id.filter(|r| !r.trim().is_empty()) {
+            if let Some(runtime_id) = runtime_id.filter(|r| !runtime_id_is_blank(r)) {
                 let payload: serde_json::Value =
                     serde_json::from_str(&effect.payload_json).unwrap_or(serde_json::json!({}));
                 let runtime = payload
                     .get("runtime")
                     .and_then(|v| v.as_str())
+                    .filter(|runtime| !runtime_id_is_blank(runtime))
                     .unwrap_or("default");
                 if runtime != runtime_id {
                     continue;
@@ -655,6 +1323,90 @@ impl SekaiDb {
         Ok(out)
     }
 
+    /// Aggregate pressure for one namespace/runtime without loading effect
+    /// bodies or task payloads into the process.
+    pub fn runtime_work_pressure(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        sampled_at_ms: i64,
+    ) -> Result<RuntimeWorkPressure, String> {
+        RuntimeWorkPressure::validate_scope(namespace, runtime_id)?;
+        self.migrate_action_effects()?;
+        let conn = self.conn();
+        let aggregate = conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE
+                        WHEN status = 'pending'
+                          OR (status = 'claimed'
+                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
+                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4)
+                        THEN 1 ELSE 0 END), 0),
+                    MIN(CASE
+                        WHEN status = 'pending'
+                          OR (status = 'claimed'
+                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
+                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4)
+                        THEN created_at_ms END),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'claimed'
+                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > ?4
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'claimed'
+                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
+                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'parked' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'dead_lettered' THEN 1 ELSE 0 END), 0)
+                 FROM sekai_action_effects
+                 WHERE namespace = ?1
+                   AND kind = ?2
+                   AND substr(
+                         CASE
+                             WHEN json_type(payload_json, '$.runtime') = 'text'
+                              AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
+                             THEN json_extract(payload_json, '$.runtime')
+                             ELSE 'default'
+                         END,
+                         1,
+                         128
+                       ) = substr(?3, 1, 128)
+                   AND CASE
+                         WHEN json_type(payload_json, '$.runtime') = 'text'
+                          AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
+                         THEN json_extract(payload_json, '$.runtime')
+                         ELSE 'default'
+                       END = ?3",
+                params![
+                    namespace,
+                    EFFECT_KIND_RUNTIME_DISPATCH,
+                    runtime_id,
+                    sampled_at_ms,
+                ],
+                |row| {
+                    Ok(RuntimeWorkPressureAggregate {
+                        claimable_count: aggregate_count(row.get::<_, i64>(0)?),
+                        oldest_claimable_created_at_ms: row.get(1)?,
+                        active_claim_count: aggregate_count(row.get::<_, i64>(2)?),
+                        expired_claim_count: aggregate_count(row.get::<_, i64>(3)?),
+                        parked_count: aggregate_count(row.get::<_, i64>(4)?),
+                        failed_count: aggregate_count(row.get::<_, i64>(5)?),
+                        dead_lettered_count: aggregate_count(row.get::<_, i64>(6)?),
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(RuntimeWorkPressure::from_aggregate(
+            namespace,
+            runtime_id,
+            sampled_at_ms,
+            aggregate,
+        ))
+    }
+
     pub fn claim_action_work(
         &self,
         effect_id: &str,
@@ -663,7 +1415,7 @@ impl SekaiDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        if runtime_id.trim().is_empty() {
+        if runtime_id_is_blank(runtime_id) {
             return Err("runtime_id required".into());
         }
         if request_id.trim().is_empty() {
@@ -677,6 +1429,12 @@ impl SekaiDb {
         let mut effect = self
             .get_action_effect(effect_id)?
             .ok_or_else(|| "action effect not found".to_string())?;
+        let legacy_replay = effect.claim_expires_at_ms > now_ms
+            && effect.legacy_claim_replay_matches(runtime_id, request_id);
+        if !legacy_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("request_id", request_id)?;
+        }
         if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
             return Err("only runtime_dispatch effects are claimable".into());
         }
@@ -703,7 +1461,7 @@ impl SekaiDb {
                 effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
                 effect.failure_reason = "lease_expiry_limit_exceeded".into();
                 effect.updated_at_ms = now_ms;
-                self.update_action_effect(&effect)?;
+                self.update_action_effect_lifecycle(&effect)?;
                 return Err("lease expiry retry limit exceeded; effect dead-lettered".into());
             }
         }
@@ -713,7 +1471,7 @@ impl SekaiDb {
             effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
             effect.failure_reason = "claim_attempt_limit_exceeded".into();
             effect.updated_at_ms = now_ms;
-            self.update_action_effect(&effect)?;
+            self.update_action_effect_lifecycle(&effect)?;
             return Err("claim retry limit exceeded; effect dead-lettered".into());
         }
         let generation = effect.claim_generation.saturating_add(1).max(1);
@@ -727,7 +1485,7 @@ impl SekaiDb {
         effect.claim_request_id = request_id.into();
         effect.updated_at_ms = now_ms;
         effect.failure_reason.clear();
-        self.update_action_effect(&effect)
+        self.update_action_effect_lifecycle(&effect)
     }
 
     pub fn heartbeat_action_claim(
@@ -743,6 +1501,10 @@ impl SekaiDb {
         let mut effect = self
             .get_action_effect(effect_id)?
             .ok_or_else(|| "action effect not found".to_string())?;
+        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
+        }
         if effect.status != EFFECT_STATUS_CLAIMED {
             return Err(format!("effect not claimed (status={})", effect.status));
         }
@@ -754,7 +1516,7 @@ impl SekaiDb {
         }
         effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
         effect.updated_at_ms = now_ms;
-        self.update_action_effect(&effect)
+        self.update_action_effect_lifecycle(&effect)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -768,6 +1530,7 @@ impl SekaiDb {
         reason: &str,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
+        validate_no_nul("reason", reason)?;
         let status = match outcome {
             ACK_OUTCOME_COMPLETED => EFFECT_STATUS_COMPLETED,
             ACK_OUTCOME_FAILED => EFFECT_STATUS_FAILED,
@@ -782,6 +1545,13 @@ impl SekaiDb {
             .ok_or_else(|| "action effect not found".to_string())?;
         if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
             return Err("only runtime_dispatch effects support ack".into());
+        }
+        let legacy_ack_replay = effect.legacy_claim_fence_matches(runtime_id, fencing_token_in)
+            || (effect.status == status
+                && effect.legacy_claim_terminal_replay_matches(runtime_id, fencing_token_in));
+        if !legacy_ack_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
         }
         // Terminal already with same outcome: idempotent.
         if effect.status == status {
@@ -806,7 +1576,7 @@ impl SekaiDb {
         .into();
         effect.failure_reason = reason.to_string();
         effect.updated_at_ms = now_ms;
-        self.update_action_effect(&effect)
+        self.update_action_effect_lifecycle(&effect)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -824,6 +1594,16 @@ impl SekaiDb {
         parked_by: &str,
         now_ms: i64,
     ) -> Result<ParkResult, String> {
+        for (label, value) in [
+            ("reason", reason),
+            ("request_id", request_id),
+            ("checkpoint_store_id", checkpoint_store_id),
+            ("checkpoint_ref", checkpoint_ref),
+            ("checkpoint_digest", checkpoint_digest),
+            ("parked_by", parked_by),
+        ] {
+            validate_no_nul(label, value)?;
+        }
         validate_request_id(request_id)?;
         validate_reason(reason)?;
         validate_checkpoint_tuple(checkpoint_store_id, checkpoint_ref, checkpoint_digest)?;
@@ -876,6 +1656,10 @@ impl SekaiDb {
         }
         if effect.status != EFFECT_STATUS_CLAIMED {
             return Err(format!("effect not claimed (status={})", effect.status));
+        }
+        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
         }
         if effect.claim_expires_at_ms <= now_ms {
             return Err("claim lease expired".into());
@@ -1536,7 +2320,7 @@ fn load_effect_tx(tx: &rusqlite::Transaction<'_>, effect_id: &str) -> Result<Act
 }
 
 fn update_effect_tx(tx: &rusqlite::Transaction<'_>, effect: &ActionEffect) -> Result<(), String> {
-    effect.validate()?;
+    effect.validate_for_lifecycle_update()?;
     let body = serde_json::to_string(effect).map_err(|error| error.to_string())?;
     let updated = tx
         .execute(
@@ -1757,6 +2541,38 @@ mod tests {
     }
 
     #[test]
+    fn action_effect_rejects_jsonb_incompatible_nul_strings() {
+        let mut effect = plan_effects_for_admit(
+            "nul-effect",
+            "acme",
+            "op-nul",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        effect.claim_owner = "worker\0one".into();
+        assert!(effect.validate().is_err());
+
+        let mut payload_effect = effect;
+        payload_effect.claim_owner.clear();
+        payload_effect.payload_json = serde_json::json!({
+            "runtime": "shikigami",
+            "task": "secret\0payload"
+        })
+        .to_string();
+        assert!(payload_effect.validate().is_err());
+
+        payload_effect.payload_json = serde_json::json!({"\0key": "value"}).to_string();
+        assert!(payload_effect.validate().is_err());
+
+        payload_effect.payload_json = r#"{"runtime":"old","runtime":"new"}"#.into();
+        assert!(payload_effect.validate().is_err());
+    }
+
+    #[test]
     fn rejects_unknown_kind() {
         let err = plan_effects_for_admit(
             "ai-1",
@@ -1800,6 +2616,480 @@ mod tests {
     }
 
     #[test]
+    fn runtime_work_pressure_is_runtime_scoped_and_aggregate_only() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let ready = plan_effects_for_admit(
+            "ai-ready",
+            "acme",
+            "op-ready",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            100,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let other_runtime = plan_effects_for_admit(
+            "ai-other",
+            "acme",
+            "op-other",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"other"}"#,
+            50,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut active = plan_effects_for_admit(
+            "ai-active",
+            "acme",
+            "op-active",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            200,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut expired = plan_effects_for_admit(
+            "ai-expired",
+            "acme",
+            "op-expired",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            300,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut unleased = plan_effects_for_admit(
+            "ai-unleased",
+            "acme",
+            "op-unleased",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            320,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut parked = plan_effects_for_admit(
+            "ai-parked",
+            "acme",
+            "op-parked",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            350,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut failed = plan_effects_for_admit(
+            "ai-failed",
+            "acme",
+            "op-failed",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            360,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let mut dead_lettered = plan_effects_for_admit(
+            "ai-dead",
+            "acme",
+            "op-dead",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            370,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+
+        active.claim_owner = "shikigami".into();
+        active.claim_generation = 1;
+        active.claim_fencing_token = "active-fence".into();
+        active.claim_expires_at_ms = 1_000;
+        active.status = EFFECT_STATUS_CLAIMED.into();
+        active.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        expired.claim_owner = "shikigami".into();
+        expired.claim_generation = 1;
+        expired.claim_fencing_token = "expired-fence".into();
+        expired.claim_expires_at_ms = 400;
+        expired.status = EFFECT_STATUS_CLAIMED.into();
+        expired.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        unleased.status = EFFECT_STATUS_CLAIMED.into();
+        unleased.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        parked.status = EFFECT_STATUS_PARKED.into();
+        parked.lifecycle_state = EFFECT_LIFECYCLE_AWAITING_CONTINUATION.into();
+        failed.status = EFFECT_STATUS_FAILED.into();
+        failed.lifecycle_state = EFFECT_LIFECYCLE_FAILED.into();
+        dead_lettered.status = EFFECT_STATUS_DEAD_LETTERED.into();
+        dead_lettered.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
+
+        db.put_action_effects(&[
+            ready.clone(),
+            other_runtime,
+            active.clone(),
+            expired.clone(),
+            unleased,
+            parked.clone(),
+            failed.clone(),
+            dead_lettered.clone(),
+        ])
+        .unwrap();
+
+        let pressure = db.runtime_work_pressure("acme", "shikigami", 500).unwrap();
+        assert_eq!(
+            pressure.contract_version,
+            RUNTIME_WORK_PRESSURE_CONTRACT_VERSION
+        );
+        assert_eq!(pressure.schema_version, 1);
+        assert_eq!(pressure.sample_status, RUNTIME_WORK_PRESSURE_STATUS_CURRENT);
+        assert!(pressure.authoritative);
+        assert!(!pressure.approximate);
+        assert_eq!(pressure.claimable_count, 2);
+        assert_eq!(pressure.oldest_claimable_age_ms, 400);
+        assert_eq!(pressure.active_claim_count, 1);
+        assert_eq!(pressure.expired_claim_count, 1);
+        assert_eq!(pressure.parked_count, 1);
+        assert_eq!(pressure.failed_count, 1);
+        assert_eq!(pressure.dead_lettered_count, 1);
+
+        let other_pressure = db.runtime_work_pressure("acme", "other", 500).unwrap();
+        assert_eq!(other_pressure.claimable_count, 1);
+        assert_eq!(other_pressure.oldest_claimable_age_ms, 450);
+        assert_eq!(other_pressure.active_claim_count, 0);
+        assert_eq!(other_pressure.parked_count, 0);
+    }
+
+    #[test]
+    fn runtime_work_pressure_rejects_unscoped_runtime() {
+        assert!(RuntimeWorkPressure::validate_scope("acme", "").is_err());
+        assert!(RuntimeWorkPressure::validate_scope("acme", "\t").is_err());
+        assert!(RuntimeWorkPressure::validate_scope("acme", "\u{000b}").is_err());
+        assert!(RuntimeWorkPressure::validate_scope("acme", "\0").is_err());
+        // Runtime selectors preserve the identifiers accepted by the existing
+        // list/claim APIs, including spaces and long deployment-generated ids.
+        assert!(RuntimeWorkPressure::validate_scope("acme", "runtime id").is_ok());
+        assert!(RuntimeWorkPressure::validate_scope("acme", &"r".repeat(512)).is_ok());
+        assert!(RuntimeWorkPressure::validate_scope("acme", "\u{2003}").is_ok());
+    }
+
+    #[test]
+    fn unicode_runtime_filter_is_not_a_wildcard() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let unicode_runtime = "\u{2003}";
+        let scoped = plan_effects_for_admit(
+            "unicode-runtime",
+            "acme",
+            "op-unicode-runtime",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            &serde_json::json!({"runtime": unicode_runtime}).to_string(),
+            10,
+            false,
+        )
+        .unwrap();
+        let other = plan_effects_for_admit(
+            "other-runtime",
+            "acme",
+            "op-other-runtime",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"other"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        db.put_action_effects(&[scoped[0].clone(), other[0].clone()])
+            .unwrap();
+
+        let listed = db
+            .list_claimable_action_work("acme", Some(unicode_runtime), 100, 10)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].effect_id, scoped[0].effect_id);
+    }
+
+    #[test]
+    fn legacy_nul_effect_can_advance_lifecycle() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut effect = plan_effects_for_admit(
+            "legacy-nul",
+            "acme",
+            "op-legacy-nul",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"legacy"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        effect.payload_json = serde_json::json!({"runtime":"\0"}).to_string();
+        let body = serde_json::to_string(&effect).unwrap();
+        db.migrate_action_effects().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_action_effects
+                 (effect_id,instance_id,namespace,operation_id,kind,status,
+                  payload_json,failure_reason,created_at_ms,updated_at_ms,body_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    effect.effect_id,
+                    effect.instance_id,
+                    effect.namespace,
+                    effect.operation_id,
+                    effect.kind,
+                    effect.status,
+                    effect.payload_json,
+                    effect.failure_reason,
+                    effect.created_at_ms,
+                    effect.updated_at_ms,
+                    body,
+                ],
+            )
+            .unwrap();
+
+        let claimed = db
+            .claim_action_work(
+                &effect.effect_id,
+                "legacy-worker",
+                "legacy-claim",
+                1000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(claimed.status, EFFECT_STATUS_CLAIMED);
+        assert_eq!(claimed.claim_owner, "legacy-worker");
+    }
+
+    #[test]
+    fn legacy_nul_claim_owner_can_finish_lifecycle() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let insert_legacy = |db: &SekaiDb, effect: &ActionEffect| {
+            let body = serde_json::to_string(effect).unwrap();
+            db.migrate_action_effects().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO sekai_action_effects
+                     (effect_id,instance_id,namespace,operation_id,kind,status,
+                      payload_json,failure_reason,created_at_ms,updated_at_ms,body_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    params![
+                        effect.effect_id,
+                        effect.instance_id,
+                        effect.namespace,
+                        effect.operation_id,
+                        effect.kind,
+                        effect.status,
+                        effect.payload_json,
+                        effect.failure_reason,
+                        effect.created_at_ms,
+                        effect.updated_at_ms,
+                        body,
+                    ],
+                )
+                .unwrap();
+        };
+
+        let mut acknowledged = plan_effects_for_admit(
+            "legacy-owner-ack",
+            "acme",
+            "op-legacy-owner-ack",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"legacy"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        acknowledged.status = EFFECT_STATUS_CLAIMED.into();
+        acknowledged.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        acknowledged.claim_owner = "legacy\0worker".into();
+        acknowledged.claim_generation = 1;
+        acknowledged.claim_fencing_token = "legacy-fence".into();
+        acknowledged.claim_expires_at_ms = 1_000;
+        acknowledged.claim_request_id = "legacy-request".into();
+        acknowledged.claim_attempt_count = 1;
+        insert_legacy(&db, &acknowledged);
+
+        let heartbeated = db
+            .heartbeat_action_claim(
+                &acknowledged.effect_id,
+                "legacy\0worker",
+                1,
+                "legacy-fence",
+                1_000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(heartbeated.claim_expires_at_ms, 1_100);
+        let completed = db
+            .ack_action_work(
+                &acknowledged.effect_id,
+                "legacy\0worker",
+                1,
+                "legacy-fence",
+                ACK_OUTCOME_COMPLETED,
+                "done",
+                200,
+            )
+            .unwrap();
+        assert_eq!(completed.status, EFFECT_STATUS_COMPLETED);
+        let replayed = db
+            .ack_action_work(
+                &acknowledged.effect_id,
+                "legacy\0worker",
+                1,
+                "legacy-fence",
+                ACK_OUTCOME_COMPLETED,
+                "done",
+                201,
+            )
+            .unwrap();
+        assert_eq!(replayed.status, EFFECT_STATUS_COMPLETED);
+
+        let mut parked = plan_effects_for_admit(
+            "legacy-owner-park",
+            "acme",
+            "op-legacy-owner-park",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"legacy"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        parked.status = EFFECT_STATUS_CLAIMED.into();
+        parked.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        parked.claim_owner = "legacy\0worker".into();
+        parked.claim_generation = 1;
+        parked.claim_fencing_token = "legacy-park-fence".into();
+        parked.claim_expires_at_ms = 1_000;
+        parked.claim_request_id = "legacy-park-request".into();
+        parked.claim_attempt_count = 1;
+        insert_legacy(&db, &parked);
+
+        let parked_result = db
+            .park_action_work(
+                &parked.effect_id,
+                "legacy\0worker",
+                1,
+                "legacy-park-fence",
+                "",
+                "park-request",
+                "",
+                "",
+                "",
+                "legacy",
+                300,
+            )
+            .unwrap();
+        assert_eq!(parked_result.effect.status, EFFECT_STATUS_PARKED);
+    }
+
+    #[test]
+    fn legacy_duplicate_payload_canonicalization_preserves_number_tokens() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut effect = plan_effects_for_admit(
+            "legacy-duplicate-number",
+            "acme",
+            "op-legacy-duplicate-number",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"legacy"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        effect.payload_json =
+            r#"{"runtime":"legacy","large":9007199254740993.0,"runtime":"legacy"}"#.into();
+        let body = serde_json::to_string(&effect).unwrap();
+        db.migrate_action_effects().unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM sekai_action_effect_migrations
+                 WHERE name = ?1",
+                params!["canonicalize_payload_keys_v1"],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_action_effects
+                 (effect_id,instance_id,namespace,operation_id,kind,status,
+                  payload_json,failure_reason,created_at_ms,updated_at_ms,body_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    effect.effect_id,
+                    effect.instance_id,
+                    effect.namespace,
+                    effect.operation_id,
+                    effect.kind,
+                    effect.status,
+                    effect.payload_json,
+                    effect.failure_reason,
+                    effect.created_at_ms,
+                    effect.updated_at_ms,
+                    body,
+                ],
+            )
+            .unwrap();
+
+        db.migrate_action_effects().unwrap();
+        let migrated = db.get_action_effect(&effect.effect_id).unwrap().unwrap();
+        assert!(migrated.payload_json.contains("\"runtime\":\"legacy\""));
+        assert!(
+            migrated
+                .payload_json
+                .contains("\"large\":9007199254740993.0")
+        );
+        assert!(!json_contains_duplicate_keys(&migrated.payload_json).unwrap());
+    }
+
+    #[test]
+    fn blank_runtime_targets_default_pressure_scope() {
+        let effects = plan_effects_for_admit(
+            "blank-runtime",
+            "acme",
+            "op-blank-runtime",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"\t\n"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&effects[0].payload_json).unwrap();
+        assert_eq!(payload["runtime"], "default");
+
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut legacy_effect = effects[0].clone();
+        legacy_effect.payload_json = r#"{"runtime":"\t\n"}"#.into();
+        db.put_action_effects(&[legacy_effect]).unwrap();
+        let pressure = db.runtime_work_pressure("acme", "default", 100).unwrap();
+        assert_eq!(pressure.claimable_count, 1);
+    }
+
+    #[test]
+    fn long_runtime_ids_remain_pressure_addressable() {
+        let runtime = "r".repeat(4_096);
+        let parameters = serde_json::json!({"runtime": runtime}).to_string();
+        let effects = plan_effects_for_admit(
+            "long-runtime",
+            "acme",
+            "op-long-runtime",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            &parameters,
+            10,
+            false,
+        )
+        .unwrap();
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.put_action_effects(&effects).unwrap();
+        let pressure = db.runtime_work_pressure("acme", &runtime, 100).unwrap();
+        assert_eq!(pressure.claimable_count, 1);
+    }
+
+    #[test]
     fn claim_exclusivity_fence_expiry_and_ack() {
         let db = SekaiDb::new(":memory:").unwrap();
         let effects = plan_effects_for_admit(
@@ -1819,6 +3109,11 @@ mod tests {
             .list_claimable_action_work("acme", Some("shikigami"), 100, 10)
             .unwrap();
         assert_eq!(claimable.len(), 1);
+
+        assert!(
+            db.claim_action_work(&effect_id, "shikigami", "request\0id", 1000, 100)
+                .is_err()
+        );
 
         let claimed = db
             .claim_action_work(&effect_id, "shikigami", "req-1", 1000, 100)
