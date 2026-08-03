@@ -11,6 +11,8 @@ lives in the separate [research index](research/README.md).
 - [Capability catalog](capability-catalog.md) — discover core governed
   capabilities for agents and SDKs.
 - [Native gRPC protocol](../proto/) — service and message definitions.
+- [Sample observation readback](sample-observation-readback.md) — authenticated,
+  redacted telemetry admission projection.
 - [SDK facade](../sdk/README.md) — generated-client layering and capability
   code generation.
 - [Available models](available-models.md) — enumerate the governed routable

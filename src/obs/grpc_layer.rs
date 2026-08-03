@@ -288,6 +288,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "RunPipeline"
                 | "ListPipelineRuns"
                 | "RecordSampleObservation"
+                | "GetSampleObservation"
                 | "RecordGatewayAudit"
                 | "PlanExecution"
                 | "ExecutePlan"

@@ -1561,6 +1561,86 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Read one bounded observation admission record for an authorized
+    /// telemetry projection. The service hashes the returned content and never
+    /// exposes the stored prompt or output through the public readback RPC.
+    pub fn get_sample_observation(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        if request_id.trim().is_empty() {
+            return Err("request_id required".into());
+        }
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT request_id, namespace, spec, resolved_model, output_content,
+                    sample_reason, input_tokens, output_tokens, stop_reason,
+                    timestamp, scored, task_class, cost_usd_micros
+             FROM chisei_sample_observations WHERE request_id = ?1",
+            params![request_id],
+            |row| {
+                Ok(crate::chisei::scoring::SampleObservation {
+                    request_id: row.get(0)?,
+                    namespace: row.get(1)?,
+                    spec: row.get(2)?,
+                    resolved_model: row.get(3)?,
+                    output_content: row.get(4)?,
+                    sample_reason: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    stop_reason: row.get(8)?,
+                    timestamp: row.get(9)?,
+                    scored: row.get::<_, i64>(10)? != 0,
+                    task_class: row.get(11)?,
+                    cost_usd_micros: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// Read one observation only when both its request identity and namespace
+    /// match. The namespace predicate keeps unauthorized rows out of the
+    /// backend result before payload deserialization.
+    pub fn get_sample_observation_in_namespace(
+        &self,
+        request_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        if request_id.trim().is_empty() || namespace.trim().is_empty() {
+            return Err("request_id and namespace required".into());
+        }
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT request_id, namespace, spec, resolved_model, output_content,
+                    sample_reason, input_tokens, output_tokens, stop_reason,
+                    timestamp, scored, task_class, cost_usd_micros
+             FROM chisei_sample_observations
+             WHERE request_id = ?1 AND namespace = ?2",
+            params![request_id, namespace],
+            |row| {
+                Ok(crate::chisei::scoring::SampleObservation {
+                    request_id: row.get(0)?,
+                    namespace: row.get(1)?,
+                    spec: row.get(2)?,
+                    resolved_model: row.get(3)?,
+                    output_content: row.get(4)?,
+                    sample_reason: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    stop_reason: row.get(8)?,
+                    timestamp: row.get(9)?,
+                    scored: row.get::<_, i64>(10)? != 0,
+                    task_class: row.get(11)?,
+                    cost_usd_micros: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
     /// Oldest-first batch of observations the scoring job has not yet consumed.
     pub fn list_unscored_observations(
         &self,

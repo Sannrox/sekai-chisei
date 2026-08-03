@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 92);
+        assert_eq!(inventory.entries.len(), 93);
         assert!(inventory.entry("EvaluateGovernedSubject").is_some());
         assert!(inventory.entry("ExportGovernedSubjectProvenance").is_some());
         assert!(

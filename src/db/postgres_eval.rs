@@ -360,6 +360,53 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    /// Read one observation admission record for an authorized bounded
+    /// projection. Callers must hash and redact the payload before returning it.
+    pub fn get_sample_observation(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        if request_id.trim().is_empty() {
+            return Err("request_id required".into());
+        }
+        let row = self
+            .connection()?
+            .query_opt(
+                "SELECT request_id, namespace, spec, resolved_model, output_content,
+                        sample_reason, input_tokens, output_tokens, stop_reason,
+                        timestamp, scored, task_class, cost_usd_micros
+                 FROM chisei_sample_observations WHERE request_id = $1",
+                &[&request_id],
+            )
+            .map_err(|error| error.to_string())?;
+        row.map(row_to_sample_observation).transpose()
+    }
+
+    /// Read one observation only when both its request identity and namespace
+    /// match. The namespace predicate keeps unauthorized rows out of the
+    /// backend result before payload deserialization.
+    pub fn get_sample_observation_in_namespace(
+        &self,
+        request_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        if request_id.trim().is_empty() || namespace.trim().is_empty() {
+            return Err("request_id and namespace required".into());
+        }
+        let row = self
+            .connection()?
+            .query_opt(
+                "SELECT request_id, namespace, spec, resolved_model, output_content,
+                        sample_reason, input_tokens, output_tokens, stop_reason,
+                        timestamp, scored, task_class, cost_usd_micros
+                 FROM chisei_sample_observations
+                 WHERE request_id = $1 AND namespace = $2",
+                &[&request_id, &namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        row.map(row_to_sample_observation).transpose()
+    }
+
     pub fn list_unscored_observations(
         &self,
         limit: i32,
