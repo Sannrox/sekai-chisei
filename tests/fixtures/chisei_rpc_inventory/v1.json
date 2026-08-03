@@ -402,6 +402,20 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "GetSampleObservation",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/chisei_service.rs",
+        "src/db/postgres_eval.rs",
+        "docs/sample-observation-readback.md"
+      ],
+      "durable_dependencies": [
+        "chisei.observations"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RecordGatewayAudit",
       "kind": "persistent",
       "surfaces": [

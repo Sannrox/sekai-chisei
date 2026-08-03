@@ -3215,6 +3215,27 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_sample_observation(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_sample_observation(request_id),
+            Self::Postgres(db) => db.get_sample_observation(request_id),
+        }
+    }
+
+    pub fn get_sample_observation_in_namespace(
+        &self,
+        request_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::chisei::scoring::SampleObservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_sample_observation_in_namespace(request_id, namespace),
+            Self::Postgres(db) => db.get_sample_observation_in_namespace(request_id, namespace),
+        }
+    }
+
     pub fn query_rows(
         &self,
         dataset_id: &str,

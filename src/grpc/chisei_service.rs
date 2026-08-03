@@ -609,6 +609,22 @@ fn require_telemetry_writer<T>(request: &Request<T>, config: &Config) -> Result<
     }
 }
 
+fn require_telemetry_reader<T>(request: &Request<T>, config: &Config) -> Result<String, Status> {
+    let actor = authenticated_actor(request);
+    let allowed = matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+        || config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor);
+    if allowed {
+        Ok(actor)
+    } else {
+        Err(Status::permission_denied(
+            "telemetry readback requires an authorized service principal",
+        ))
+    }
+}
+
 fn canonical_namespace(namespace: &str) -> Result<&str, Status> {
     let canonical = namespace.trim();
     if canonical.is_empty() {
@@ -631,6 +647,31 @@ fn content_version(value: &impl serde::Serialize) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[derive(serde::Serialize)]
+struct SampleObservationReadbackDigest<'a> {
+    version: &'static str,
+    request_id: &'a str,
+    namespace: &'a str,
+    state: &'a str,
+    observed_at: i64,
+}
+
+fn sample_observation_readback_digest(
+    request_id: &str,
+    namespace: &str,
+    state: &str,
+    observed_at: i64,
+) -> String {
+    let projection = SampleObservationReadbackDigest {
+        version: "chisei.sample_observation.readback.v1",
+        request_id,
+        namespace,
+        state,
+        observed_at,
+    };
+    format!("sha256:{}", content_version(&projection))
 }
 
 fn external_request_from_proto(request: ExternalActionRequest) -> external::ExternalActionRequest {
@@ -11075,6 +11116,50 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn get_sample_observation(
+        &self,
+        req: Request<GetSampleObservationRequest>,
+    ) -> Result<Response<GetSampleObservationResponse>, Status> {
+        let actor = require_telemetry_reader(&req, &self.config)?;
+        let request = req.into_inner();
+        let request_id = request.request_id.as_str();
+        let namespace = request.namespace.as_str();
+        if request_id.trim().is_empty() {
+            return Err(Status::invalid_argument("request_id required"));
+        }
+        if namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
+        }
+        if !matches!(actor.as_str(), "root" | "local") {
+            // Admission preserves exact v1 namespace identity, including
+            // legacy padding. Authorize the canonical namespace boundary but
+            // keep the original value for the exact row lookup below.
+            require_namespace_access(&self.db, &actor, namespace.trim())?;
+        }
+        let observation = self
+            .db
+            .get_sample_observation_in_namespace(request_id, namespace)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("sample observation not found"))?;
+        let state = "recorded";
+        let observation_digest = sample_observation_readback_digest(
+            &observation.request_id,
+            &observation.namespace,
+            state,
+            observation.timestamp,
+        );
+        Ok(Response::new(GetSampleObservationResponse {
+            observation: Some(SampleObservationReadback {
+                request_id: observation.request_id,
+                namespace: observation.namespace,
+                observation_digest,
+                state: state.into(),
+                observed_at: observation.timestamp,
+                read_at: chrono::Utc::now().timestamp_millis(),
+            }),
+        }))
+    }
+
     async fn record_gateway_audit(
         &self,
         req: Request<RecordGatewayAuditRequest>,
@@ -20209,6 +20294,176 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_observation_readback_is_authenticated_namespace_bound_and_redacted() {
+        let svc = memory_service();
+        svc.db
+            .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                request_id: "outcome-1".into(),
+                namespace: "tenkai-outcome".into(),
+                spec: "tenkai.terminal_outcome.v1".into(),
+                resolved_model: String::new(),
+                output_content: "private-terminal-payload".into(),
+                sample_reason: "deployment_failed".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                stop_reason: "terminal".into(),
+                timestamp: 1_000,
+                scored: false,
+                task_class: String::new(),
+                cost_usd_micros: 0,
+            })
+            .unwrap();
+
+        let mut allowed = Request::new(GetSampleObservationRequest {
+            request_id: "outcome-1".into(),
+            namespace: "tenkai-outcome".into(),
+        });
+        allowed
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let response = svc
+            .get_sample_observation(allowed)
+            .await
+            .unwrap()
+            .into_inner()
+            .observation
+            .unwrap();
+        assert_eq!(response.request_id, "outcome-1");
+        assert_eq!(response.namespace, "tenkai-outcome");
+        assert_eq!(response.state, "recorded");
+        assert_eq!(response.observed_at, 1_000);
+        assert!(response.observation_digest.starts_with("sha256:"));
+
+        let mut wrong_namespace = Request::new(GetSampleObservationRequest {
+            request_id: "outcome-1".into(),
+            namespace: "other-namespace".into(),
+        });
+        wrong_namespace
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(wrong_namespace)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+
+        let mut denied = Request::new(GetSampleObservationRequest {
+            request_id: "outcome-1".into(),
+            namespace: "tenkai-outcome".into(),
+        });
+        denied
+            .metadata_mut()
+            .insert("x-principal", "alice".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(denied).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let mut gateway_denied = Request::new(GetSampleObservationRequest {
+            request_id: "outcome-1".into(),
+            namespace: "tenkai-outcome".into(),
+        });
+        gateway_denied
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(gateway_denied)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        svc.db
+            .ensure_team_namespace(
+                "tenkai-outcome",
+                "chisei-gateway",
+                crate::sekai::security::Role::Viewer,
+                "local",
+            )
+            .unwrap();
+        let mut gateway_allowed = Request::new(GetSampleObservationRequest {
+            request_id: "outcome-1".into(),
+            namespace: "tenkai-outcome".into(),
+        });
+        gateway_allowed
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(gateway_allowed)
+                .await
+                .unwrap()
+                .into_inner()
+                .observation
+                .unwrap()
+                .request_id,
+            "outcome-1"
+        );
+
+        let mut scoring_config = config(":memory:");
+        scoring_config.scoring_enabled = true;
+        let recorder = ChiseiServiceImpl::new(svc.db.clone(), scoring_config);
+        let mut padded = Request::new(RecordSampleObservationRequest {
+            observation: Some(SampleObservation {
+                request_id: " outcome-2 ".into(),
+                namespace: " tenkai-outcome ".into(),
+                spec: "tenkai.terminal_outcome.v1".into(),
+                output_content: "private-terminal-payload-2".into(),
+                ..Default::default()
+            }),
+        });
+        padded
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert!(
+            recorder
+                .record_sample_observation(padded)
+                .await
+                .unwrap()
+                .into_inner()
+                .recorded
+        );
+
+        let mut exact_lookup = Request::new(GetSampleObservationRequest {
+            request_id: " outcome-2 ".into(),
+            namespace: " tenkai-outcome ".into(),
+        });
+        exact_lookup
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(exact_lookup)
+                .await
+                .unwrap()
+                .into_inner()
+                .observation
+                .unwrap()
+                .request_id,
+            " outcome-2 "
+        );
+
+        let mut padded_gateway_lookup = Request::new(GetSampleObservationRequest {
+            request_id: " outcome-2 ".into(),
+            namespace: " tenkai-outcome ".into(),
+        });
+        padded_gateway_lookup
+            .metadata_mut()
+            .insert("x-principal", "chisei-gateway".parse().unwrap());
+        assert_eq!(
+            svc.get_sample_observation(padded_gateway_lookup)
+                .await
+                .unwrap()
+                .into_inner()
+                .observation
+                .unwrap()
+                .namespace,
+            " tenkai-outcome "
         );
     }
 

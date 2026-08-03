@@ -11,6 +11,24 @@ pub trait ChiseiEvalBackend: Send + Sync {
     fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String>;
     fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String>;
     fn put_sample_observation(&self, observation: &SampleObservation) -> Result<(), String>;
+    /// Optional readback support for bounded telemetry projections. Existing
+    /// downstream backends remain source-compatible and fail closed as an
+    /// empty surface until they implement the getter.
+    fn get_sample_observation(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<SampleObservation>, String> {
+        Ok(None)
+    }
+    /// Optional namespace-bound readback support. The default remains an
+    /// empty surface for downstream backends that have not adopted it.
+    fn get_sample_observation_in_namespace(
+        &self,
+        _request_id: &str,
+        _namespace: &str,
+    ) -> Result<Option<SampleObservation>, String> {
+        Ok(None)
+    }
     fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String>;
     fn delete_observation(&self, request_id: &str) -> Result<(), String>;
 }
@@ -40,6 +58,19 @@ macro_rules! forward {
         }
         fn put_sample_observation(&self, observation: &SampleObservation) -> Result<(), String> {
             <$target>::put_sample_observation(self, observation)
+        }
+        fn get_sample_observation(
+            &self,
+            request_id: &str,
+        ) -> Result<Option<SampleObservation>, String> {
+            <$target>::get_sample_observation(self, request_id)
+        }
+        fn get_sample_observation_in_namespace(
+            &self,
+            request_id: &str,
+            namespace: &str,
+        ) -> Result<Option<SampleObservation>, String> {
+            <$target>::get_sample_observation_in_namespace(self, request_id, namespace)
         }
         fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String> {
             <$target>::bump_observation_attempts(self, request_id)

@@ -1153,6 +1153,21 @@ message SampleObservation {
 }
 message RecordSampleObservationRequest { SampleObservation observation = 1; }
 message RecordSampleObservationResponse { bool recorded = 1; }
+message GetSampleObservationRequest {
+  string request_id = 1;
+  string namespace = 2;
+}
+message SampleObservationReadback {
+  string request_id = 1;
+  string namespace = 2;
+  string observation_digest = 3;
+  string state = 4;
+  int64 observed_at = 5;
+  int64 read_at = 6;
+}
+message GetSampleObservationResponse {
+  SampleObservationReadback observation = 1;
+}
 message GatewayAuditEvent {
   string id = 1;
   int64 timestamp = 2;
@@ -1910,6 +1925,7 @@ service ChiseiService {
   rpc RunPipeline(RunPipelineRequest) returns (RunPipelineResponse);
   rpc ListPipelineRuns(ListPipelineRunsRequest) returns (ListPipelineRunsResponse);
   rpc RecordSampleObservation(RecordSampleObservationRequest) returns (RecordSampleObservationResponse);
+  rpc GetSampleObservation(GetSampleObservationRequest) returns (GetSampleObservationResponse);
   rpc RecordGatewayAudit(RecordGatewayAuditRequest) returns (RecordGatewayAuditResponse);
   // Native governed entry path. Planning resolves policy, context, routing,
   // budget, and evaluation state before a provider call is allowed.
