@@ -47,6 +47,8 @@ const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation
 const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluation_executions.sql");
 const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0027_governed_subject_provenance.sql");
+const ACTION_EFFECT_PRESSURE_SCHEMA: &str =
+    include_str!("postgres/0028_action_effect_pressure.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -190,6 +192,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         name: "governed_subject_provenance",
         sql: GOVERNED_SUBJECT_PROVENANCE_SCHEMA,
+    },
+    Migration {
+        version: 28,
+        name: "action_effect_pressure",
+        sql: ACTION_EFFECT_PRESSURE_SCHEMA,
     },
 ];
 
@@ -733,6 +740,14 @@ mod tests {
         for excluded in ["tenant", "oauth", "oidc"] {
             assert!(!BUDGET_TOPOLOGY_SCHEMA.contains(excluded));
         }
+        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("pressure_runtime"));
+        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("pressure_jsonb_compatible"));
+        assert!(
+            ACTION_EFFECT_PRESSURE_SCHEMA
+                .contains("CREATE TRIGGER trg_action_effects_pressure_metadata")
+        );
+        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("chr(11)"));
+        assert!(!ACTION_EFFECT_PRESSURE_SCHEMA.contains("LIKE '%\\\\u0000%'"));
     }
 
     #[test]

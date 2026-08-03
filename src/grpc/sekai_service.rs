@@ -6755,6 +6755,29 @@ fn to_proto_action_effect(
     }
 }
 
+fn to_proto_runtime_work_pressure(
+    domain: &crate::sekai::action_effect::RuntimeWorkPressure,
+) -> RuntimeWorkPressure {
+    RuntimeWorkPressure {
+        schema_version: domain.schema_version,
+        contract_version: domain.contract_version.clone(),
+        namespace: domain.namespace.clone(),
+        runtime_id: domain.runtime_id.clone(),
+        sampled_at_ms: domain.sampled_at_ms,
+        sample_status: domain.sample_status.clone(),
+        degraded_reason: domain.degraded_reason.clone(),
+        authoritative: domain.authoritative,
+        approximate: domain.approximate,
+        claimable_count: domain.claimable_count,
+        oldest_claimable_age_ms: domain.oldest_claimable_age_ms,
+        active_claim_count: domain.active_claim_count,
+        expired_claim_count: domain.expired_claim_count,
+        parked_count: domain.parked_count,
+        failed_count: domain.failed_count,
+        dead_lettered_count: domain.dead_lettered_count,
+    }
+}
+
 fn to_proto_action_work_park(value: &crate::sekai::parked_work::ActionWorkPark) -> ActionWorkPark {
     ActionWorkPark {
         park_id: value.park_id.clone(),
@@ -11391,6 +11414,36 @@ impl SekaiService for SekaiServiceImpl {
             decided_at_ms: now,
         };
 
+        // Build and validate materialized effects before the admission record is
+        // committed. A malformed effect must not leave an admitted instance
+        // without its claimable child records.
+        let planned_effects = if status == STATUS_ADMITTED {
+            let force_notify_fail =
+                serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("notify_delivery")
+                            .and_then(|delivery| delivery.as_str())
+                            .map(|delivery| delivery == "fail")
+                    })
+                    .unwrap_or(false);
+            Some(
+                crate::sekai::action_effect::plan_effects_for_admit(
+                    &instance.instance_id,
+                    &instance.namespace,
+                    &instance.operation_id,
+                    &type_def.allowed_effect_kinds,
+                    &instance.parameters_json,
+                    now,
+                    force_notify_fail,
+                )
+                .map_err(Status::invalid_argument)?,
+            )
+        } else {
+            None
+        };
+
         let stored = self.db.put_action_instance(&instance).map_err(|e| {
             if e.contains("conflict") {
                 Status::already_exists(e)
@@ -11540,28 +11593,13 @@ impl SekaiService for SekaiServiceImpl {
                     budget.record(&budget_subject, 1);
                 }
                 // #398: materialize typed effects after durable admit (internal SoR first).
-                // Notify delivery is best-effort: failure does not un-admit.
-                let force_notify_fail =
-                    serde_json::from_str::<serde_json::Value>(&stored.parameters_json)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("notify_delivery")
-                                .and_then(|d| d.as_str())
-                                .map(|s| s == "fail")
-                        })
-                        .unwrap_or(false);
-                let effects = crate::sekai::action_effect::plan_effects_for_admit(
-                    &stored.instance_id,
-                    &stored.namespace,
-                    &stored.operation_id,
-                    &type_def.allowed_effect_kinds,
-                    &stored.parameters_json,
-                    now,
-                    force_notify_fail,
-                )
-                .map_err(Status::invalid_argument)?;
+                // Notify delivery is best-effort: failure does not un-admit. The
+                // records were fully validated before the admission commit above.
+                let effects = planned_effects
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("admitted instance effects missing"))?;
                 self.db
-                    .put_action_effects(&effects)
+                    .put_action_effects(effects)
                     .map_err(Status::internal)?;
             }
         }
@@ -11707,7 +11745,7 @@ impl SekaiService for SekaiServiceImpl {
             return Err(Status::invalid_argument("namespace required"));
         }
         authorize_action_instance_read(self, &principals, &inner.namespace)?;
-        let runtime = if inner.runtime_id.trim().is_empty() {
+        let runtime = if crate::sekai::action_effect::runtime_id_is_blank(&inner.runtime_id) {
             None
         } else {
             Some(inner.runtime_id.as_str())
@@ -11727,6 +11765,55 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(ListClaimableActionWorkResponse { effects }))
     }
 
+    async fn get_runtime_work_pressure(
+        &self,
+        req: Request<GetRuntimeWorkPressureRequest>,
+    ) -> Result<Response<GetRuntimeWorkPressureResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let inner = req.into_inner();
+        crate::sekai::action_effect::RuntimeWorkPressure::validate_scope(
+            &inner.namespace,
+            &inner.runtime_id,
+        )
+        .map_err(Status::invalid_argument)?;
+        // Namespace membership is the read boundary. The required runtime
+        // selector prevents wildcard or cross-runtime projection responses;
+        // no task/effect identifiers are returned.
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &inner.namespace,
+            false,
+        )?;
+        authorize_action_instance_read(self, &principals, &inner.namespace)?;
+        let sampled_at_ms = now_millis();
+        let pressure =
+            match self
+                .db
+                .runtime_work_pressure(&inner.namespace, &inner.runtime_id, sampled_at_ms)
+            {
+                Ok(pressure) => pressure,
+                Err(error) => {
+                    tracing::warn!(
+                        namespace = %inner.namespace,
+                        runtime_id = %inner.runtime_id,
+                        error = %error,
+                        "runtime work pressure projection unavailable"
+                    );
+                    crate::sekai::action_effect::RuntimeWorkPressure::unknown(
+                        &inner.namespace,
+                        &inner.runtime_id,
+                        sampled_at_ms,
+                        "storage_unavailable",
+                    )
+                }
+            };
+        Ok(Response::new(GetRuntimeWorkPressureResponse {
+            pressure: Some(to_proto_runtime_work_pressure(&pressure)),
+        }))
+    }
+
     async fn claim_action_work(
         &self,
         req: Request<ClaimActionWorkRequest>,
@@ -11737,7 +11824,7 @@ impl SekaiService for SekaiServiceImpl {
         if inner.effect_id.trim().is_empty() {
             return Err(Status::invalid_argument("effect_id required"));
         }
-        if inner.runtime_id.trim().is_empty() {
+        if crate::sekai::action_effect::runtime_id_is_blank(&inner.runtime_id) {
             return Err(Status::invalid_argument("runtime_id required"));
         }
         if inner.request_id.trim().is_empty() {
@@ -11766,7 +11853,7 @@ impl SekaiService for SekaiServiceImpl {
                     || e.contains("dead-lettered")
                 {
                     Status::failed_precondition(e)
-                } else if e.contains("required") || e.contains("ttl") {
+                } else if e.contains("required") || e.contains("ttl") || e.contains("NUL") {
                     Status::invalid_argument(e)
                 } else if e.contains("not found") {
                     Status::not_found(e)
@@ -11884,6 +11971,7 @@ impl SekaiService for SekaiServiceImpl {
                     } else if error.contains("required")
                         || error.contains("checkpoint")
                         || error.contains("bounds")
+                        || error.contains("NUL")
                     {
                         Status::invalid_argument(error)
                     } else if error.contains("conflict") {
@@ -11931,7 +12019,7 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(|e| {
                 if e.contains("fencing") || e.contains("expired") || e.contains("not claimed") {
                     Status::failed_precondition(e)
-                } else if e.contains("invalid") {
+                } else if e.contains("invalid") || e.contains("NUL") {
                     Status::invalid_argument(e)
                 } else if e.contains("not found") {
                     Status::not_found(e)
@@ -21391,6 +21479,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_rejects_invalid_materialized_effect_before_admit() {
+        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+
+        let svc = service();
+        grant_action_admin(&svc);
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "dispatch.nul".into(),
+                version: "1.0.0".into(),
+                description: "reject malformed effect".into(),
+                parameter_schema_json: r#"{"type":"object"}"#.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+            }),
+            request_id: "put-nul".into(),
+        }))
+        .await
+        .unwrap();
+
+        let error = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "dispatch.nul".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"runtime":"\u0000"}"#.into(),
+                idempotency_key: "nul-admission".into(),
+                evidence_submission_ids: vec![],
+                request_id: "req-nul".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            svc.db
+                .get_action_instance_by_idempotency("acme", "nul-admission")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_claim_api_exclusivity_and_ack() {
         // #399: claim exclusivity, fence, reclaim, ack.
         use crate::sekai::action_effect::{
@@ -21554,6 +21690,164 @@ mod tests {
             .await;
         // may be not_found or permission depending on path; ensure not success for random id
         assert!(unauth.is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_work_pressure_is_namespace_and_runtime_scoped() {
+        use crate::sekai::action_effect::plan_effects_for_admit;
+        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+
+        let svc = service();
+        for (namespace, principal) in [("acme", "tester"), ("beta", "other")] {
+            svc.ensure_team_namespace(with_named_principal(
+                EnsureTeamNamespaceRequest {
+                    namespace: namespace.into(),
+                    principal: principal.into(),
+                    role: "viewer".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        }
+        let effects = plan_effects_for_admit(
+            "pressure-instance",
+            "acme",
+            "pressure-operation",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami","task":"secret payload"}"#,
+            100,
+            false,
+        )
+        .unwrap();
+        let other_runtime = plan_effects_for_admit(
+            "pressure-instance-other",
+            "acme",
+            "pressure-operation-other",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"other"}"#,
+            200,
+            false,
+        )
+        .unwrap();
+        svc.db
+            .put_action_effects(&[effects[0].clone(), other_runtime[0].clone()])
+            .unwrap();
+
+        let pressure = svc
+            .get_runtime_work_pressure(with_named_principal(
+                GetRuntimeWorkPressureRequest {
+                    namespace: "acme".into(),
+                    runtime_id: "shikigami".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .pressure
+            .unwrap();
+        assert_eq!(pressure.schema_version, 1);
+        assert_eq!(pressure.contract_version, "sekai.runtime-work-pressure/v1");
+        assert_eq!(pressure.namespace, "acme");
+        assert_eq!(pressure.runtime_id, "shikigami");
+        assert_eq!(pressure.sample_status, "current");
+        assert!(pressure.authoritative);
+        assert!(!pressure.approximate);
+        assert_eq!(pressure.claimable_count, 1);
+        assert!(pressure.oldest_claimable_age_ms > 0);
+
+        let other_scope = svc
+            .get_runtime_work_pressure(with_named_principal(
+                GetRuntimeWorkPressureRequest {
+                    namespace: "acme".into(),
+                    runtime_id: "other".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .pressure
+            .unwrap();
+        assert_eq!(other_scope.claimable_count, 1);
+        assert!(other_scope.oldest_claimable_age_ms > 0);
+
+        let cross_namespace = svc
+            .get_runtime_work_pressure(with_named_principal(
+                GetRuntimeWorkPressureRequest {
+                    namespace: "beta".into(),
+                    runtime_id: "shikigami".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(cross_namespace.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn runtime_work_pressure_honors_enterprise_namespace_read_scope() {
+        use crate::enterprise::{AuthenticatedContext, AuthenticatedPrincipal};
+        use crate::sekai::action_effect::plan_effects_for_admit;
+        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+
+        let db = RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        ));
+        let svc = SekaiServiceImpl::new(Arc::new(db));
+        for namespace in ["community", "tenant-private"] {
+            svc.db
+                .ensure_team_namespace(namespace, "community-user", security::Role::Viewer, "local")
+                .unwrap();
+        }
+        let effects = plan_effects_for_admit(
+            "tenant-pressure",
+            "tenant-private",
+            "tenant-pressure-operation",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        svc.db.put_action_effects(&effects).unwrap();
+
+        let request = |namespace: &str| {
+            let mut request = with_named_principal(
+                GetRuntimeWorkPressureRequest {
+                    namespace: namespace.into(),
+                    runtime_id: "shikigami".into(),
+                },
+                "attacker",
+            );
+            request
+                .extensions_mut()
+                .insert(AuthenticatedContext::machine(AuthenticatedPrincipal {
+                    subject: "community-user".into(),
+                    credential_id: "community-credential".into(),
+                }));
+            request
+        };
+
+        let community = svc
+            .get_runtime_work_pressure(request("community"))
+            .await
+            .unwrap()
+            .into_inner()
+            .pressure
+            .unwrap();
+        assert_eq!(community.claimable_count, 0);
+
+        let denied = svc
+            .get_runtime_work_pressure(request("tenant-private"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

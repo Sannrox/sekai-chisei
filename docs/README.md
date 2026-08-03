@@ -42,6 +42,8 @@ If you want to deploy or operate the control plane:
   retrieval, and actions.
 - [Governed actions](governed-action-types.md) — start of the action type,
   instance, effect, runtime claim, and evidence lifecycle.
+- [Runtime claim pressure](runtime-claim-pressure.md) — bounded, read-only
+  capacity signals for an external worker-pool manager.
 - [External-action execution](external-action-execution.md) — permits,
   execution observations, and reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free

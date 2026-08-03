@@ -2312,6 +2312,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn runtime_work_pressure(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        sampled_at_ms: i64,
+    ) -> Result<crate::sekai::action_effect::RuntimeWorkPressure, String> {
+        match self {
+            Self::Sqlite(db) => db.runtime_work_pressure(namespace, runtime_id, sampled_at_ms),
+            Self::Postgres(db) => db.runtime_work_pressure(namespace, runtime_id, sampled_at_ms),
+        }
+    }
+
     pub fn claim_action_work(
         &self,
         effect_id: &str,

@@ -1,7 +1,10 @@
 //! PostgreSQL ActionEffect store (#398).
 
 use crate::db::postgres::PostgresDb;
-use crate::sekai::action_effect::{ActionEffect, EFFECT_STATUS_PENDING};
+use crate::sekai::action_effect::{
+    ActionEffect, EFFECT_STATUS_PENDING, RuntimeWorkPressure, RuntimeWorkPressureAggregate,
+    aggregate_count, canonical_runtime_from_payload, runtime_id_is_blank, validate_no_nul,
+};
 use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
 use crate::sekai::parked_work::{
     ActionWorkContinuation, ActionWorkPark, ParkResult, ParkedWorkResolutionAction,
@@ -28,6 +31,16 @@ impl PostgresDb {
         use crate::sekai::action_effect::{
             EFFECT_LIFECYCLE_AWAITING_CONTINUATION, EFFECT_STATUS_CLAIMED, EFFECT_STATUS_PARKED,
         };
+        for (label, value) in [
+            ("reason", reason),
+            ("request_id", request_id),
+            ("checkpoint_store_id", checkpoint_store_id),
+            ("checkpoint_ref", checkpoint_ref),
+            ("checkpoint_digest", checkpoint_digest),
+            ("parked_by", parked_by),
+        ] {
+            validate_no_nul(label, value)?;
+        }
         validate_request_id(request_id)?;
         validate_reason(reason)?;
         validate_checkpoint_tuple(checkpoint_store_id, checkpoint_ref, checkpoint_digest)?;
@@ -77,6 +90,10 @@ impl PostgresDb {
         }
         if effect.status != EFFECT_STATUS_CLAIMED {
             return Err(format!("effect not claimed (status={})", effect.status));
+        }
+        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
         }
         if effect.claim_expires_at_ms <= now_ms {
             return Err("claim lease expired".into());
@@ -706,12 +723,14 @@ impl PostgresDb {
     pub fn put_action_effect(&self, effect: &ActionEffect) -> Result<ActionEffect, String> {
         effect.validate()?;
         let body_json = serde_json::to_string(effect).map_err(|e| e.to_string())?;
+        let pressure_runtime = pressure_runtime_for_postgres(effect);
         self.connection()?
             .execute(
                 "INSERT INTO sekai_action_effects
                  (effect_id, instance_id, namespace, operation_id, kind, status,
-                  payload_json, failure_reason, created_at_ms, updated_at_ms, body_json)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                  payload_json, failure_reason, created_at_ms, updated_at_ms, body_json,
+                  pressure_runtime, pressure_jsonb_compatible)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE)",
                 &[
                     &effect.effect_id,
                     &effect.instance_id,
@@ -724,6 +743,7 @@ impl PostgresDb {
                     &effect.created_at_ms,
                     &effect.updated_at_ms,
                     &body_json,
+                    &pressure_runtime,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -814,19 +834,24 @@ impl PostgresDb {
     ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
         effect.validate()?;
         let body_json = serde_json::to_string(effect).map_err(|e| e.to_string())?;
+        let pressure_runtime = pressure_runtime_for_postgres(effect);
+        let pressure_jsonb_compatible = effect.jsonb_compatible();
         let updated = self
             .connection()?
             .execute(
                 "UPDATE sekai_action_effects
-                 SET status = $1, payload_json = $2, failure_reason = $3,
-                     updated_at_ms = $4, body_json = $5
-                 WHERE effect_id = $6",
+                     SET status = $1, payload_json = $2, failure_reason = $3,
+                     updated_at_ms = $4, body_json = $5, pressure_runtime = $6,
+                     pressure_jsonb_compatible = $7
+                 WHERE effect_id = $8",
                 &[
                     &effect.status,
                     &effect.payload_json,
                     &effect.failure_reason,
                     &effect.updated_at_ms,
                     &body_json,
+                    &pressure_runtime,
+                    &pressure_jsonb_compatible,
                     &effect.effect_id,
                 ],
             )
@@ -864,12 +889,13 @@ impl PostgresDb {
             if !effect.is_claimable_at(now_ms) {
                 continue;
             }
-            if let Some(runtime_id) = runtime_id.filter(|r| !r.trim().is_empty()) {
+            if let Some(runtime_id) = runtime_id.filter(|r| !runtime_id_is_blank(r)) {
                 let payload: serde_json::Value =
                     serde_json::from_str(&effect.payload_json).unwrap_or(serde_json::json!({}));
                 let runtime = payload
                     .get("runtime")
                     .and_then(|v| v.as_str())
+                    .filter(|runtime| !runtime_id_is_blank(runtime))
                     .unwrap_or("default");
                 if runtime != runtime_id {
                     continue;
@@ -881,6 +907,82 @@ impl PostgresDb {
             }
         }
         Ok(out)
+    }
+
+    /// Aggregate pressure for one namespace/runtime without loading effect
+    /// bodies or task payloads into the process.
+    pub fn runtime_work_pressure(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        sampled_at_ms: i64,
+    ) -> Result<RuntimeWorkPressure, String> {
+        RuntimeWorkPressure::validate_scope(namespace, runtime_id)?;
+        let kind = EFFECT_KIND_RUNTIME_DISPATCH;
+        let mut connection = self.connection()?;
+        let rows = connection
+            .query_one(
+                "SELECT
+                    (SELECT EXISTS (
+                         SELECT 1
+                         FROM sekai_action_effects AS compatibility
+                         WHERE compatibility.namespace = $1
+                           AND compatibility.kind = $2
+                           AND NOT compatibility.pressure_jsonb_compatible
+                     )),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'pending'
+                          OR (status = 'claimed'
+                              AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) > 0
+                              AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) <= $4)
+                        THEN 1 ELSE 0 END), 0),
+                    MIN(CASE
+                        WHEN status = 'pending'
+                          OR (status = 'claimed'
+                              AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) > 0
+                              AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) <= $4)
+                        THEN created_at_ms END),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'claimed'
+                         AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) > $4
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'claimed'
+                         AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) > 0
+                         AND COALESCE((body_json::jsonb ->> 'claim_expires_at_ms')::BIGINT, 0) <= $4
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'parked' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'dead_lettered' THEN 1 ELSE 0 END), 0)
+                 FROM sekai_action_effects
+                 WHERE namespace = $1
+                   AND kind = $2
+                   AND left(pressure_runtime, 128) = left($3, 128)
+                   AND pressure_runtime = $3",
+                &[&namespace, &kind, &runtime_id, &sampled_at_ms],
+            )
+            .map_err(|e| e.to_string())?;
+        let has_jsonb_incompatible_effect: bool = rows.get(0);
+        if has_jsonb_incompatible_effect {
+            return Err(
+                "runtime work pressure contains an effect unsupported by PostgreSQL jsonb".into(),
+            );
+        }
+        let aggregate = RuntimeWorkPressureAggregate {
+            claimable_count: aggregate_count(rows.get::<_, i64>(1)),
+            oldest_claimable_created_at_ms: rows.get(2),
+            active_claim_count: aggregate_count(rows.get::<_, i64>(3)),
+            expired_claim_count: aggregate_count(rows.get::<_, i64>(4)),
+            parked_count: aggregate_count(rows.get::<_, i64>(5)),
+            failed_count: aggregate_count(rows.get::<_, i64>(6)),
+            dead_lettered_count: aggregate_count(rows.get::<_, i64>(7)),
+        };
+        Ok(RuntimeWorkPressure::from_aggregate(
+            namespace,
+            runtime_id,
+            sampled_at_ms,
+            aggregate,
+        ))
     }
 
     pub fn claim_action_work(
@@ -896,7 +998,7 @@ impl PostgresDb {
             EFFECT_STATUS_DEAD_LETTERED,
         };
         use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
-        if runtime_id.trim().is_empty() {
+        if runtime_id_is_blank(runtime_id) {
             return Err("runtime_id required".into());
         }
         if request_id.trim().is_empty() {
@@ -905,6 +1007,12 @@ impl PostgresDb {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
+        let legacy_replay = effect.claim_expires_at_ms > now_ms
+            && effect.legacy_claim_replay_matches(runtime_id, request_id);
+        if !legacy_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("request_id", request_id)?;
+        }
         if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
             return Err("only runtime_dispatch effects are claimable".into());
         }
@@ -990,6 +1098,10 @@ impl PostgresDb {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
+        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
+        }
         if effect.status != EFFECT_STATUS_CLAIMED {
             return Err(format!("effect not claimed (status={})", effect.status));
         }
@@ -1023,6 +1135,7 @@ impl PostgresDb {
             EFFECT_STATUS_COMPLETED, EFFECT_STATUS_FAILED, EFFECT_STATUS_PARKED,
         };
         use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+        validate_no_nul("reason", reason)?;
         let status = match outcome {
             ACK_OUTCOME_COMPLETED => EFFECT_STATUS_COMPLETED,
             ACK_OUTCOME_FAILED => EFFECT_STATUS_FAILED,
@@ -1037,6 +1150,13 @@ impl PostgresDb {
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
         if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
             return Err("only runtime_dispatch effects support ack".into());
+        }
+        let legacy_ack_replay = effect.legacy_claim_fence_matches(runtime_id, fencing_token_in)
+            || (effect.status == status
+                && effect.legacy_claim_terminal_replay_matches(runtime_id, fencing_token_in));
+        if !legacy_ack_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
         }
         if effect.status == status {
             return Ok(effect);
@@ -1082,6 +1202,13 @@ fn pg_checkpoint_store_allowed(store_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn pressure_runtime_for_postgres(effect: &ActionEffect) -> String {
+    match canonical_runtime_from_payload(&effect.payload_json) {
+        Ok(runtime) if !runtime.contains('\0') => runtime,
+        _ => "invalid".into(),
+    }
+}
+
 fn pg_load_effect(
     tx: &mut postgres::Transaction<'_>,
     effect_id: &str,
@@ -1103,18 +1230,23 @@ fn pg_update_effect(
     tx: &mut postgres::Transaction<'_>,
     effect: &ActionEffect,
 ) -> Result<(), String> {
-    effect.validate()?;
+    effect.validate_for_lifecycle_update()?;
     let body = serde_json::to_string(effect).map_err(|error| error.to_string())?;
+    let pressure_runtime = pressure_runtime_for_postgres(effect);
+    let pressure_jsonb_compatible = effect.jsonb_compatible();
     let updated = tx
         .execute(
             "UPDATE sekai_action_effects SET status=$1,payload_json=$2,failure_reason=$3,
-             updated_at_ms=$4,body_json=$5 WHERE effect_id=$6",
+             updated_at_ms=$4,body_json=$5,pressure_runtime=$6,
+             pressure_jsonb_compatible=$7 WHERE effect_id=$8",
             &[
                 &effect.status,
                 &effect.payload_json,
                 &effect.failure_reason,
                 &effect.updated_at_ms,
                 &body,
+                &pressure_runtime,
+                &pressure_jsonb_compatible,
                 &effect.effect_id,
             ],
         )

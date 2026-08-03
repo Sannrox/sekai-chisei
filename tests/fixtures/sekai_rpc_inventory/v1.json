@@ -1408,6 +1408,19 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetRuntimeWorkPressure",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/action_effect.rs",
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "SubmitParkedWorkResolutionAction",
       "kind": "persistent",
       "surfaces": [

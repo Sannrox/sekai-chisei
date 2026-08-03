@@ -1527,6 +1527,34 @@ message ListClaimableActionWorkRequest {
   uint32 limit = 3;
 }
 message ListClaimableActionWorkResponse { repeated ActionEffect effects = 1; }
+
+// Versioned, bounded read-only pressure for one namespace/runtime scope.
+message GetRuntimeWorkPressureRequest {
+  string namespace = 1;
+  string runtime_id = 2;
+}
+message RuntimeWorkPressure {
+  uint32 schema_version = 1;
+  string contract_version = 2;
+  string namespace = 3;
+  string runtime_id = 4;
+  int64 sampled_at_ms = 5;
+  // current | degraded | unknown. Consumers may scale only on current.
+  string sample_status = 6;
+  string degraded_reason = 7;
+  bool authoritative = 8;
+  bool approximate = 9;
+  uint64 claimable_count = 10;
+  uint64 oldest_claimable_age_ms = 11;
+  uint64 active_claim_count = 12;
+  uint64 expired_claim_count = 13;
+  uint64 parked_count = 14;
+  uint64 failed_count = 15;
+  uint64 dead_lettered_count = 16;
+}
+message GetRuntimeWorkPressureResponse {
+  RuntimeWorkPressure pressure = 1;
+}
 message ClaimActionWorkRequest {
   string effect_id = 1;
   string runtime_id = 2;
@@ -2386,6 +2414,7 @@ service SekaiService {
   rpc ListActionEffects(ListActionEffectsRequest) returns (ListActionEffectsResponse);
 
   rpc ListClaimableActionWork(ListClaimableActionWorkRequest) returns (ListClaimableActionWorkResponse);
+  rpc GetRuntimeWorkPressure(GetRuntimeWorkPressureRequest) returns (GetRuntimeWorkPressureResponse);
   rpc ClaimActionWork(ClaimActionWorkRequest) returns (ClaimActionWorkResponse);
   rpc HeartbeatActionClaim(HeartbeatActionClaimRequest) returns (HeartbeatActionClaimResponse);
   rpc AckActionWork(AckActionWorkRequest) returns (AckActionWorkResponse);

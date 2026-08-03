@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 159);
+        assert_eq!(inventory.entries.len(), 160);
         for rpc in [
             "ApplyGovernedFactProfile",
             "PutGovernedFactVersion",
@@ -385,6 +385,7 @@ mod tests {
         );
         assert!(inventory.entry("ReportActionClaimEvent").is_some());
         assert!(inventory.entry("ListClaimableActionWork").is_some());
+        assert!(inventory.entry("GetRuntimeWorkPressure").is_some());
         assert!(inventory.entry("HeartbeatActionClaim").is_some());
         assert!(inventory.entry("AckActionWork").is_some());
         assert!(inventory.entry("TransitionCapabilityPackage").is_some());
